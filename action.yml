@@ -1,0 +1,175 @@
+name: 'Featureflip Flag Cleanup'
+description: >-
+  Deterministically remove dead/stale feature flags from TypeScript, TSX,
+  JavaScript, PHP, Ruby, ERB, Dart, Java, C#, Go, Python, Kotlin and Swift
+  source
+  using
+  Featureflip's
+  removal-candidates API
+  and AST-level source transforms, opening one pull request per flag (draft for
+  Stale, ready for review for Dead). No LLM.
+author: 'Featureflip'
+branding:
+  icon: 'trash-2'
+  color: 'purple'
+
+inputs:
+  api-token:
+    description: >-
+      Your Featureflip API token, scoped to read removal candidates for
+      `org`/`project`. This is YOUR token, not a Featureflip-internal one —
+      store it as a repository or organization secret, never as plain text.
+    required: true
+  org:
+    description: 'Featureflip organization slug.'
+    required: true
+  project:
+    description: 'Featureflip project slug.'
+    required: true
+  mode:
+    description: >-
+      What this invocation does. `remove` (the default) fetches removal
+      candidates and opens one pull request per dead flag — everything this
+      Action did before archive-on-merge existed. `archive-on-merge` archives
+      the flag whose removal pull request just merged, and does nothing else:
+      no checkout, no source is read, no pull request is opened.
+
+      The two are separate workflows on separate triggers, never two steps of
+      one job. `remove` runs on a schedule; `archive-on-merge` runs on
+      `pull_request` with `types: [closed]`.
+
+      IMPORTANT — `archive-on-merge` needs a DIFFERENT token. Archiving
+      requires the Member role, while fetching removal candidates needs only
+      read access. Give this workflow its own secret rather than reusing the
+      read-only one, or a leaked token stops meaning "flag names disclosed" and
+      starts meaning "flag state changed". In `archive-on-merge` every input
+      below except `api-url` is ignored.
+    required: false
+    default: 'remove'
+  api-url:
+    description: >-
+      Featureflip public API origin. Override only for a staging or
+      self-hosted instance.
+    required: false
+    default: 'https://api.featureflip.io'
+  staleness:
+    description: >-
+      Which removal candidates to fetch from the API: `dead` or `stale`.
+      `dead` flags open ready-for-review PRs; `stale` flags open draft PRs.
+    required: false
+    default: 'dead'
+  accessors:
+    description: >-
+      Comma-separated function names your code uses to read a flag, on top of
+      the SDK's own. Most codebases wrap the SDK — `useFlag('my-flag')` over a
+      typed registry — and without this the wrapper is invisible: every flag
+      reports no changes, the run goes green, and nothing says why. Give the
+      wrapper's name here and it is matched exactly as an SDK call would be.
+      Each name must be a plain function name (`[A-Za-z_][A-Za-z0-9_]*`); the
+      run fails immediately (exit 2) otherwise, because these are substituted
+      into the rewrite rules. Names are matched by callee name only — a wrapper
+      whose flag key is not a literal at the call site still cannot be matched.
+    required: false
+    default: ''
+  languages:
+    description: >-
+      Comma-separated Piranha languages to run. Leave unset to run every
+      language this Action currently supports (`ts`, `tsx`, `js`, `php`,
+      `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift` — see README). An unsupported value fails the run immediately (exit 2),
+      before
+      anything is modified, rather than surfacing deep in the transform engine.
+    required: false
+    default: ''
+  directories:
+    description: >-
+      Comma-separated directories, relative to the checkout, to scan for
+      flag reads. Each must exist and be inside the git checkout; each must
+      also have no uncommitted changes to tracked files, since the run undoes
+      its own edits between flags and cannot tell those apart from yours.
+      Either condition fails the run immediately (exit 2) before anything is
+      modified. Both are satisfied by a normal `actions/checkout` step.
+    required: false
+    default: '.'
+  ignore:
+    description: >-
+      Comma-separated flag keys to skip even if the API reports them as
+      removal candidates. Also the way to silence a flag this Action refuses to
+      process — an unrepresentable key, or a file whose rewrite fails the
+      post-transform syntax check — which otherwise fails the run on every
+      future invocation (by design; see "Exit codes" in the README).
+    required: false
+    default: ''
+  base-branch:
+    description: >-
+      Base branch each removal pull request targets. Leave unset to use the
+      repository's own default branch, looked up once per run — do not assume
+      `main`, which silently rejected every pull request in a `master`
+      repository. The run also refuses to start (exit 2) if the checkout
+      carries commits the base branch does not, since a removal branch is cut
+      from the checkout and would otherwise drag them into every PR: run this
+      Action from a checkout of the base branch (`on: schedule` or `on: push`),
+      not from a `pull_request` merge commit.
+    required: false
+    default: ''
+  pr-labels:
+    description: >-
+      Comma-separated labels applied to each opened pull request. A label
+      that fails to apply is logged as a warning and does not fail the PR.
+      Note the blast radius: these names are sent to GitHub's add-labels API,
+      which may CREATE a label that does not already exist in your repository
+      (with a default colour) rather than rejecting it. Create the labels you
+      want first if you care about their colour or description.
+    required: false
+    default: ''
+  max-prs:
+    description: >-
+      Most pull requests one run may propose before it stops (default `10`;
+      set `0` for no limit). A blast-radius limit, not a correctness one: if
+      something about a run is wrong, this bounds how many pull requests are
+      wrong before a human sees one. Nothing is lost — the next run continues
+      where this one stopped, since flags already proposed are skipped.
+      Candidates that are ignored, already handled, or have nothing to change
+      do not count against it. The limit applies to `dry-run` too, so a dry
+      run previews the run that would actually happen.
+    required: false
+    default: '10'
+  dry-run:
+    description: >-
+      When `true`, compute and print the diff for every removal candidate but
+      open no branch, commit, or pull request — nothing touches the GitHub
+      API at all. When this input is omitted, the underlying tool's own
+      default is `false` (it opens real PRs), so a first-time run should set
+      this explicitly. See README's "Dry run" section.
+    required: false
+    default: 'false'
+
+runs:
+  using: 'docker'
+  image: 'docker://ghcr.io/canopy-labs/featureflip-flag-cleanup-action@sha256:aef16c0adb8223f8f59d471d14ff58bfa2a4e94d9f9e15ff2efe1ddb24f4d420'
+  # GitHub maps an input `foo-bar` to `INPUT_FOO-BAR`, which is not a name
+  # `flag_cleanup.config` reads. This block bridges each declared input to
+  # the exact `FEATUREFLIP_*` environment variable `Config.from_env` expects
+  # (see src/flag_cleanup/config.py) — do not rename these; config.py is the
+  # authority on the names.
+  #
+  # GITHUB_TOKEN is deliberately NOT declared as an input here: it is a
+  # secret, not a default runner-provided env var, so the calling workflow
+  # must pass it through explicitly (see README). GITHUB_REPOSITORY,
+  # GITHUB_API_URL and GITHUB_SERVER_URL ARE default environment variables
+  # the runner already injects into the container, so no bridging is needed
+  # for those three.
+  env:
+    FEATUREFLIP_API_TOKEN: ${{ inputs.api-token }}
+    FEATUREFLIP_ORG: ${{ inputs.org }}
+    FEATUREFLIP_PROJECT: ${{ inputs.project }}
+    FEATUREFLIP_API_URL: ${{ inputs.api-url }}
+    FEATUREFLIP_MODE: ${{ inputs.mode }}
+    FEATUREFLIP_STALENESS: ${{ inputs.staleness }}
+    FEATUREFLIP_LANGUAGES: ${{ inputs.languages }}
+    FEATUREFLIP_ACCESSORS: ${{ inputs.accessors }}
+    FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
+    FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
+    FEATUREFLIP_BASE_BRANCH: ${{ inputs.base-branch }}
+    FEATUREFLIP_PR_LABELS: ${{ inputs.pr-labels }}
+    FEATUREFLIP_MAX_PRS: ${{ inputs.max-prs }}
+    FEATUREFLIP_DRY_RUN: ${{ inputs.dry-run }}
