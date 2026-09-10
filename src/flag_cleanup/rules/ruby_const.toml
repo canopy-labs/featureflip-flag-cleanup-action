@@ -1,0 +1,128 @@
+# KEY-const propagation for Ruby — the flag key hoisted to a constant, as in
+#
+#     class Gate
+#       FLAG_KEY = 'old-checkout'
+#       ...
+#       if client.bool_variation(FLAG_KEY, ctx, false)
+#     end
+#
+# `piranha_runner` prepends this file to `ruby.toml` for files that pass the
+# Gate 2 shadow check (see `flag_cleanup.key_const`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+#
+# --- RUBY HAS NO COMPILE-TIME CONSTANT, AND THAT CHANGES THE ARGUMENT --------
+#
+# `FLAG_KEY = 'x'` is an ordinary assignment. Ruby WARNS on reassignment and
+# does not prevent it, so unlike C#'s `const`, Go's `const` or Java's `final`
+# there is no language guarantee behind the declaration these rules resolve.
+# The safety therefore rests ENTIRELY on Gate 2, and specifically on its
+# bound-exactly-once half: a reassignment is itself an `assignment` with the
+# constant on the left, so `key_const._ruby_is_binding` counts it, the total
+# goes past one, and the file is withheld. That is a weaker footing than the
+# typed languages have; it is stated here rather than glossed over.
+#
+# A lowercase local is spelled `identifier`, not `constant`, so
+# `flag_key = '...'` is structurally unmatchable rather than merely refused.
+#
+# --- `.freeze` IS MATCHED, AND HAS TO BE ------------------------------------
+#
+# `FLAG_KEY = 'old-checkout'.freeze` is idiomatic Ruby and common enough that
+# ignoring it would leave most real codebases unmatched. It parses as a `call`
+# whose RECEIVER is the string, so every pattern below carries both shapes, and
+# `key_const._ruby_string_content` sees through the same two.
+#
+# --- THE SAFETY ARGUMENT IS GATE 2, NOT THE QUERIES --------------------------
+#
+# Two concrete losses if that check is weakened:
+#
+#   1. WRONG BRANCH. `enclosing_node` finds a top-level constant from anywhere
+#      in the file, so a class that rebinds the name to a different key would
+#      have that other flag's read folded to THIS flag's value.
+#   2. DANGLING REFERENCE. The delete rule removes the assignment; anything
+#      else still naming the constant then raises `NameError` at run time —
+#      which is WORSE here than in a compiled language, because nothing catches
+#      it until the line executes.
+#
+# --- indentation ------------------------------------------------------------
+#
+# The engine cannot re-indent, so a folded Ruby `if` leaves its body at the old
+# depth and a blank line where the condition was. That is pre-existing and
+# language-wide — `tests/fixtures/ruby/if_boolvariation` records exactly the
+# same residue for a plain literal read — not something these rules introduce.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+# --- fold the read ----------------------------------------------------------
+# Both receiver shapes `ruby.toml` matches are carried here for the same reason
+# it carries them: `client.bool_variation`, `Featureflip.bool_variation`, and a
+# bare call (what an `accessors` wrapper looks like once re-exported).
+[[rules]]
+name = "replace_bool_variation_const_key_read_with_boolean_literal"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list . (constant) @key_const))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list . (constant) @key_const))] @call
+  (#eq? @sdk_fn "bool_variation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(program
+     (assignment
+       left: (constant) @decl_name
+       right: [(string . (string_content) @flag_name .)
+               (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)]))
+   (body_statement
+     (assignment
+       left: (constant) @decl_name
+       right: [(string . (string_content) @flag_name .)
+               (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)]))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- delete the now-unused assignment ----------------------------------------
+# Flag-key-scoped, so there is no blast radius on unrelated constants. The
+# filter is a SEQUENCING guard, not the safety argument (Gate 2 is): while any
+# call still takes this constant as its first argument, the assignment stays.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(program
+     (assignment
+       left: (constant) @variable_name
+       right: [(string . (string_content) @flag_name .)
+               (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)]) @declaration)
+   (body_statement
+     (assignment
+       left: (constant) @variable_name
+       right: [(string . (string_content) @flag_name .)
+               (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)]) @declaration)] @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(program) (class) (module) (method)] @container)"""
+not_contains = ["""(
+  (call arguments: (argument_list . (constant) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

@@ -1,0 +1,189 @@
+# KEY-const propagation for PHP — the flag key hoisted to a `const`, as in
+#
+#     class Gate {
+#         const FLAG_KEY = 'old-checkout';
+#         ...
+#         if ($client->boolVariation(self::FLAG_KEY, $ctx, false)) { ... }
+#     }
+#
+# `piranha_runner` prepends this file to `php.toml` for files that pass the
+# Gate 2 shadow check (see `flag_cleanup.key_const`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+#
+# --- WHAT THIS FIXES ---------------------------------------------------------
+#
+# `php.toml`'s seed rule anchors a string LITERAL first argument, so a constant
+# reference there is not a weak match — it is structurally unmatchable, and the
+# whole file reported `no-changes` with nothing saying why. Same silent no-op
+# class #2525 closed for C#.
+#
+# --- PHP REACHES A CONSTANT TWO DIFFERENT WAYS, AND BOTH ARE MATCHED ---------
+#
+# A top-level `const` is referenced BARE (`FLAG_KEY`), a class constant through
+# a `class_constant_access_expression` (`self::FLAG_KEY`, `Gate::FLAG_KEY`).
+# Those are different node shapes, so each argument alternative carries both.
+# The `(name) @key_const .` anchor inside the access expression captures the
+# CONSTANT half — the first child is the scope (`self`, a class name) and
+# comparing that to the declaration would match the wrong thing.
+# `key_const._php_is_removable_read` walks the same two shapes; the two halves
+# must agree or the delete rule can strand a live reference.
+#
+# --- WHAT IS DELIBERATELY NOT MATCHED ----------------------------------------
+#
+#   * `public static $flagKey = '...'` is a `property_declaration`, an entirely
+#     different node type, so a mutable static property is unmatchable rather
+#     than refused. That is right: it may be reassigned, so its declaration is
+#     not a resolvable value.
+#   * `define('FLAG_KEY', '...')` is a runtime FUNCTION CALL. It can sit behind
+#     a condition or inside a loop, so deleting it is a different question from
+#     deleting a declaration. Left alone on purpose, and listed as a gap.
+#   * A scoping subtlety worth knowing: a class constant is correctly scoped for
+#     free, because `enclosing_node` searches only ANCESTORS — a second class in
+#     the same file is not an ancestor of this class's reads, so its `const` of
+#     the same name cannot be found from here. Only the top-level alternative
+#     needs `program`, and a class constant is not a direct child of `program`,
+#     so the two alternatives cannot cross-match.
+#
+# --- THE SAFETY ARGUMENT IS GATE 2, NOT THE QUERIES --------------------------
+#
+# `key_const.path_is_safe` withholds this whole file from any source where the
+# name is bound more than once (two classes each declaring `FLAG_KEY` is the
+# realistic case) or is referenced by anything other than a flag read these
+# rules themselves remove. Gate 1 sees neither hazard: a wrong-branch fold is
+# valid PHP, and a stranded reference is a name-resolution error one layer below
+# a re-parse.
+#
+# PHP spells a string literal as TWO node types — `'single'` is `string`,
+# `"double"` is `encapsed_string` — and both are matched, exactly as in
+# `php.toml`.
+#
+# --- THE ANCHORING, WHICH HAS TO SATISFY TWO OPPOSING CONSTRAINTS -----------
+#
+# `["const" type: (_)] . (const_element …) .` reads as: the element is the
+# IMMEDIATE successor of either the `const` keyword or the declaration's `type:`
+# child, and it is the last named child. Both halves are load-bearing and they
+# pull in opposite directions (#2702 / #2700).
+#
+# The TRAILING `.` is what says EXACTLY ONE element, so `const A = 'x', B = 'y';`
+# matches nothing and the delete rule can never take a statement that also
+# declares something else. PHP needs the rules to carry that, because the gate
+# cannot: `key_const._php_key_consts` does not resolve a multi-element
+# declaration at all, so `path_is_safe` finds no hoisted key, calls the file
+# trivially safe, and these rules would run UNGATED — the delete rule taking a
+# constant nobody asked about. Do not relax it.
+#
+# The LEADING side used to be a bare `.`, requiring the element to be the
+# declaration's first NAMED child. That is what #2702 was: `visibility_modifier`,
+# `final_modifier` and a PHP 8.3 `type:` are each a named child ahead of the
+# element, so `public const` — the idiomatic spelling — matched nothing and the
+# whole file reported `no-changes`, the same silent no-op this file exists to
+# close. Anchoring forward from the `const` KEYWORD instead is immune to
+# everything before it, which is exactly the set that may legally appear there:
+# modifiers in any order, and an `attribute_list`.
+#
+# Two details that are easy to get wrong, both measured:
+#
+#   * `type: (_)` must keep its FIELD NAME. A bare `(_)` also matches the
+#     preceding `const_element` of a multi-element declaration, which puts the
+#     multi-element shape straight back in — AND it fails `public const string`,
+#     so it is simultaneously too loose and too tight. The field is what makes
+#     the alternation mean "the type slot" rather than "any named node".
+#   * Anchors skip anonymous nodes UNLESS the query names them. That is why
+#     `"const"` has to be written out: it is what stops `const A = 'x', B = 'y';`
+#     from matching on `B` across the `,`.
+#
+# `test_the_rules_and_the_gate_resolve_the_same_declaration_forms` pins both
+# directions, and `tests/fixtures/php/const_key_modifiers` carries the shapes.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+# --- fold the read ----------------------------------------------------------
+# Declared BEFORE the delete rule: seed rules fire in declaration order, and the
+# delete rule's filter additionally refuses while any such call survives.
+[[rules]]
+name = "replace_boolvariation_const_key_read_with_boolean_literal"
+query = """(
+  [(member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments
+        . (argument [(class_constant_access_expression (name) @key_const .)
+                     (name) @key_const])))
+   (function_call_expression
+      function: (name) @sdk_fn
+      arguments: (arguments
+        . (argument [(class_constant_access_expression (name) @key_const .)
+                     (name) @key_const])))] @call
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(declaration_list
+     (const_declaration
+       ["const" type: (_)] . (const_element
+           (name) @decl_name
+           [(string (string_content) @flag_name)
+            (encapsed_string (string_content) @flag_name)]) .))
+   (program
+     (const_declaration
+       ["const" type: (_)] . (const_element
+           (name) @decl_name
+           [(string (string_content) @flag_name)
+            (encapsed_string (string_content) @flag_name)]) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- delete the now-unused declaration ---------------------------------------
+# Flag-key-scoped, so there is no blast radius on unrelated constants. Rooted
+# at the PARENT and deleting the declaration as a child of it, for the reason
+# every other `*_const.toml` delete rule is: matching the declaration alone
+# ignores what encloses it, and an unanticipated wrapper would have its insides
+# removed and its shell left behind.
+#
+# The filter is a SEQUENCING guard, not the safety argument (Gate 2 is): while
+# any call still takes this constant as its first argument, the declaration
+# stays. It carries both reference shapes for the same reason the fold does.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(declaration_list
+     (const_declaration
+       ["const" type: (_)] . (const_element
+           (name) @variable_name
+           [(string (string_content) @flag_name)
+            (encapsed_string (string_content) @flag_name)]) .) @declaration)
+   (program
+     (const_declaration
+       ["const" type: (_)] . (const_element
+           (name) @variable_name
+           [(string (string_content) @flag_name)
+            (encapsed_string (string_content) @flag_name)]) .) @declaration)] @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(class_declaration) (program)] @container)"""
+not_contains = ["""(
+  [(member_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))
+   (function_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))] @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

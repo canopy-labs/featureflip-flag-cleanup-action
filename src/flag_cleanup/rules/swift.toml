@@ -1,0 +1,369 @@
+# Piranha flag-cleanup rules for Swift (swift SDK).
+#
+# Like java.toml and go.toml, short: Piranha ships built-in feature-flag cleanup
+# rules for Swift, so the seed rules drive the whole cascade. There are TWO of
+# them rather than one, and the reason is a grammar defect — see below.
+#
+# There is deliberately NO swift_edges.toml. Supplying edges REPLACES the
+# built-in wiring, and the built-in wiring is what routes
+# `replace_expression_with_boolean_literal` through `boolean_literal_cleanup`
+# into `boolean_expression_simplify` (where the engine's own correct
+# `not_true`/`not_false` live) and on to `if_cleanup`/`guard_cleanup`. An
+# earlier version of this file credited a `swift_edges.toml` with taking the
+# built-in cascade from 67s to ~2s and warned that dropping the built-in
+# `boolean_literal_cleanup` group inverted treatments. That file never existed
+# in any commit, so neither half was ever true of shipped code: the 67s was the
+# BUILT-IN cascade's cost (now ~1.9s on fork 0.10.0, measured), and the
+# inversion had nothing to do with edges at all — it is the grammar defect
+# below, which reproduces under the full built-in wiring.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+
+
+# ===========================================================================
+# 1. The flag read
+# ===========================================================================
+
+# THE BANG IS INSIDE THE CALL. tree-sitter-swift gives prefix `!` the WRONG
+# precedence: `!client.boolVariation("k", default: false)` parses as
+# `(!client).boolVariation(...)`, so the `!` lands in a `prefix_expression`
+# nested inside the `navigation_expression` inside the `call_expression`. The
+# bang is therefore INSIDE the `@call` span, and replacing `@call` with
+# `@treated` silently DELETES it — `!read` became `true` where it must become
+# `!true`, i.e. every negated read shipped INVERTED. Verified on fork 0.10.0,
+# and both grammars agree (the engine's bundled one and the `tree-sitter-swift`
+# wheel Gate 1 parses with), so this is not a version seam.
+#
+# The two rules below are a MATCHED SET and must stay that way: the negated one
+# claims exactly the spans whose text begins with a bang, and the generic one
+# refuses them. Splitting them by text rather than by structure is deliberate —
+# the bang can sit arbitrarily deep in the receiver chain
+# (`!Featureflip.shared.client.boolVariation(...)` nests it three levels down),
+# so no fixed structural pattern spans the cases, whereas "does the span I am
+# about to replace start with a bang" is exactly the question being asked.
+#
+# It is also correct under BOTH grammars, which is why it is safe to leave in
+# place if tree-sitter-swift ever fixes the precedence: with a correct grammar
+# the `!` falls outside `call_expression`, `^!` stops matching, the generic rule
+# fires against the inner call and the surviving outer `prefix_expression`
+# leaves `!@treated` for the built-ins to fold. Same output, other route.
+#
+# `!!read` matches NEITHER rule (`^![^!]` excludes it, `^!` excludes it from the
+# generic) and is left standing. That is the safe direction: the read survives,
+# the flag reports as not fully removed, and nothing is inverted.
+#
+# BOTH rules alternate on the callee, the same way go.toml does, because
+# `rule_synthesis` clones these blocks with the callee name swapped to build
+# the accessor rules — and a customer's wrapper is typically a FREE FUNCTION
+# where the SDK's `boolVariation` is always a method. Teaching the rules only
+# the method form passes every SDK fixture and silently fails every idiomatic
+# Swift accessor. The alternatives differ between the two rules because the
+# bang lands in a different place in each: on a method call it nests INSIDE the
+# `navigation_expression` (so that alternative serves negated and plain alike),
+# while on a free function the callee is a bare `simple_identifier` and the
+# bang wraps it in a `prefix_expression` directly under the call.
+
+# --- !<obj>.boolVariation("KEY", default: ...) -> !@treated
+[[rules]]
+name = "replace_negated_boolvariation_read_with_negated_literal"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn))
+     (prefix_expression (simple_identifier) @sdk_fn)]
+    (call_suffix
+      (value_arguments
+        . (value_argument (line_string_literal (_) @flag_name))))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+  (#match? @call "^![^!]")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# --- <obj>.boolVariation("KEY", default: ...) -> @treated
+#
+# The Swift SDK's read takes the key positionally and the fallback as a LABELLED
+# argument (`default:`), so only the first argument is anchored — the label on
+# the second is irrelevant to the match and is left unconstrained.
+#
+# The key is matched through a WILDCARD child of the string literal rather than
+# by naming the content node. Capturing the literal whole is useless either way
+# — its text includes the quotes, which `#eq?` cannot accept — see go.toml for
+# the full account.
+#
+# The wildcard was originally forced: the bundled Swift grammar had no
+# `line_str_text` node to name. That is no longer true as of fork 0.10.0
+# (probed, not assumed — a rule naming `line_str_text` matches). The wildcard
+# stays anyway, because it is correct under both grammars and this file already
+# has one grammar-version dependency too many; see the bang note above.
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn))
+     (simple_identifier) @sdk_fn]
+    (call_suffix
+      (value_arguments
+        . (value_argument (line_string_literal (_) @flag_name))))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-match? @call "^!")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# ===========================================================================
+# 2. Boolean simplification is the ENGINE's, not ours
+# ===========================================================================
+# This file used to carry seven `boolean_expression_simplify` rules of its own,
+# to be wired up by the `swift_edges.toml` that never existed. With no edges
+# file the group is unreachable, so they were dead code — proven by deleting
+# them and re-running: byte-identical output on every shape, both treatments.
+#
+# They were also two kinds of wrong, which is why they are gone rather than
+# wired up. `simplify_not_true` had no `simplify_not_false` counterpart, so the
+# "complete replacement for boolean_literal_cleanup" they advertised would have
+# left `!false` standing. And their queries matched `prefix_expression`'s
+# children positionally where the engine's own rules bind `operation:` and
+# `target:` by field.
+#
+# The engine's built-ins cover this group correctly. Do not re-add local copies,
+# and do not add an edges file to reach them — that is what unwires the correct
+# ones.
+
+
+# ===========================================================================
+# 3. The @FeatureFlag SwiftUI property wrapper
+# ===========================================================================
+# The swift SDK ships a `@FeatureFlag` property wrapper, and it is what the SDK's
+# own docs tell a SwiftUI user to reach for:
+#
+#     @FeatureFlag("old-checkout") var oldCheckout = false
+#
+# The key is the ATTRIBUTE ARGUMENT and the fallback is the property's
+# INITIALISER, with no `boolVariation` token anywhere between them, so the two
+# call-anchored rules above cannot see it and the file came back byte-identical
+# (#2727). Every other rule in this tool replaces an EXPRESSION with a literal;
+# these replace a DECLARATION, which is why they rebuild it from captures the
+# way java.toml and go.toml rebuild a trailing `else if`.
+#
+# WHY A PLAIN STORED PROPERTY IS THE RIGHT ANSWER, written down rather than
+# assumed. `FeatureFlag` is a `DynamicProperty` whose `wrappedValue` computes
+# `provider.boolVariation(key, default: defaultValue)`, so it participates in
+# SwiftUI's update cycle. Once the flag is permanently on or off there is
+# nothing left to update FROM, and the wrapper's whole contribution collapses to
+# a constant — so `var oldCheckout = @treated` is exact, not an approximation.
+#
+# THE INITIALISER MUST BE REWRITTEN, NOT KEPT. It is the wrapper's DEFAULT
+# value, i.e. what the SDK serves when the provider has no opinion — not the
+# flag's value. Deleting the attribute alone would leave `var oldCheckout =
+# false` for a treated=true run, which compiles and is wrong. That is also why
+# these are single ATOMIC rules rather than a fold-then-delete pair like
+# swift_const.toml's: deleting the attribute destroys the only thing that
+# identifies the declaration, so a pair is order-dependent in a way that fails
+# by silently changing a default. Swift additionally cannot reach for the
+# parent/child rule pattern that would sequence it safely — that needs a
+# `swift_edges.toml`, and supplying edges unwires the built-in cascade (see the
+# file header).
+#
+# THE GROUP IS LOAD-BEARING DESPITE READING ODDLY. These rules are declaration
+# rewrites in a group named for expression rewrites, and that is deliberate:
+# group membership is what routes the result into the built-in
+# `boolean_literal_cleanup` cascade. It pays off immediately on a `private`
+# wrapper, which the engine then inlines at its use sites and deletes outright
+# — verified, and correct because `private` in Swift is file-scoped, so one
+# file is the whole visibility surface. The engine declines to do this for
+# `public`/`internal`, which is the answer we want there.
+#
+# FOUR RULES, TWO DIMENSIONS, ENUMERATED RATHER THAN QUANTIFIED. A declaration
+# rebuilt from captures can only emit what it captured, so every part that must
+# survive needs its own capture, and tree-sitter's `?` quantifier CANNOT supply
+# one: probed on the engine, an unmatched `(visibility_modifier)? @vis` leaves
+# the template's `@vis` unsubstituted and the ENTIRE DECLARATION WAS DELETED —
+# a silent, total loss of the line. So the visibility modifier (absent /
+# present) and the type annotation (absent / present) are spelled out as four
+# explicit rules instead.
+#
+# The `.` anchors around the modifiers are what makes the set SAFE rather than
+# merely incomplete: they require the modifiers node to hold EXACTLY the
+# attribute, or exactly the attribute and one visibility modifier. Anything else
+# — `@FeatureFlag("k") @State var f`, `static`, an ownership modifier — matches
+# no rule and is left byte-identical, because rebuilding from captures would
+# silently DROP the modifier it did not capture. Dropping `private` compiles and
+# widens access; that is the failure this anchoring exists to prevent, and an
+# uncovered shape costs a manual edit instead.
+#
+# NOT COVERED, DELIBERATELY: a wrapper on a FUNCTION-LOCAL variable. Its grammar
+# shape differs — at function scope the `attribute` is a DIRECT child of
+# `property_declaration` with no `modifiers` wrapper at all — but the reason not
+# to chase it is semantic: `FeatureFlag` reads its provider from
+# `@EnvironmentObject`, which SwiftUI only injects into a View's stored
+# property, so a local one never had a working value to remove.
+#
+# Not accessor-cloned, and it needs no `accessor-template: none` marker to stay
+# that way: `rule_synthesis._seed_blocks` selects on `(#eq? @sdk_fn "...")`, and
+# these bind `@attr_name` instead. `accessors` names a customer's wrapper
+# FUNCTION; a customer's own property wrapper is a different feature.
+
+
+# --- @FeatureFlag("KEY") var f = <default>  ->  var f = @treated
+[[rules]]
+name = "replace_property_wrapper_read_with_boolean_literal"
+query = """(
+  (property_declaration
+    (modifiers
+      . (attribute
+          (user_type (type_identifier) @attr_name)
+          (line_string_literal (_) @flag_name)) .)
+    (value_binding_pattern) @binding
+    name: (pattern (simple_identifier) @prop_name)
+    . value: (_)
+  ) @decl
+  (#eq? @attr_name "FeatureFlag")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "decl"
+replace = "@binding @prop_name = @treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# THE PROJECTED VALUE AND THE SYNTHESISED STORAGE, refused on sight.
+#
+# A property wrapper synthesises `_f` (the wrapper instance) alongside `f`, and
+# `$f` (the projected value) where the wrapper defines one. Both are ordinary
+# `simple_identifier`s, and BOTH STOP EXISTING the moment the declaration
+# becomes a plain stored property — so a file that names either must keep its
+# wrapper. `FeatureFlag` ships no `projectedValue`, which makes `$f` uncompilable
+# against OUR wrapper today; it is refused anyway, because the attribute name is
+# all these rules match on and a customer's same-named wrapper may well have one.
+#
+# This is the `key_const` DANGLING-REFERENCE argument in a new place, and it
+# fails the same way: the rewrite parses, so Gate 1 is blind to it. Scoped to
+# `source_file` because that is the wrapper's whole reachable surface for the
+# two spellings that matter — `_f` is private to the file, and `$f` outside it
+# would have to come through a member reference this pattern does not match.
+#
+# Verified to have teeth AND to be non-vacuous: `_f` and `$f` each withhold the
+# rewrite, while an unrelated `_somethingElse` in the same file does not. The
+# second half is the one worth keeping — capture substitution inside a longer
+# string is what makes `"_@prop_name"` work at all, and a guard that silently
+# stopped substituting would refuse nothing while still reading as a guard.
+[[rules.filters]]
+enclosing_node = "((source_file) @container)"
+not_contains = [
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "_@prop_name"))""",
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "$@prop_name"))""",
+]
+
+
+# --- @FeatureFlag("KEY") var f: Bool = <default>  ->  var f: Bool = @treated
+#
+# The annotation is captured and re-emitted rather than dropped. It can only
+# ever be `Bool` (it annotates the wrapped value, and `FeatureFlag.wrappedValue`
+# is `Bool`), so dropping it would be type-safe — but it would also be an
+# unrelated edit in someone else's diff, which is the thing this tool spends
+# `delete_consecutive_new_lines` and a whole reindent pass avoiding.
+[[rules]]
+name = "replace_property_wrapper_read_with_boolean_literal_annotated"
+query = """(
+  (property_declaration
+    (modifiers
+      . (attribute
+          (user_type (type_identifier) @attr_name)
+          (line_string_literal (_) @flag_name)) .)
+    (value_binding_pattern) @binding
+    name: (pattern (simple_identifier) @prop_name)
+    . (type_annotation) @annotation
+    . value: (_)
+  ) @decl
+  (#eq? @attr_name "FeatureFlag")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "decl"
+replace = "@binding @prop_name@annotation = @treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = "((source_file) @container)"
+not_contains = [
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "_@prop_name"))""",
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "$@prop_name"))""",
+]
+
+
+# --- @FeatureFlag("KEY") private var f = <default>  ->  private var f = @treated
+#
+# The rebuilt declaration puts the visibility modifier FIRST regardless of where
+# it started, because that is the only position left once the attribute it
+# followed is gone.
+[[rules]]
+name = "replace_property_wrapper_read_with_boolean_literal_with_visibility"
+query = """(
+  (property_declaration
+    (modifiers
+      . (attribute
+          (user_type (type_identifier) @attr_name)
+          (line_string_literal (_) @flag_name))
+      . (visibility_modifier) @vis .)
+    (value_binding_pattern) @binding
+    name: (pattern (simple_identifier) @prop_name)
+    . value: (_)
+  ) @decl
+  (#eq? @attr_name "FeatureFlag")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "decl"
+replace = "@vis @binding @prop_name = @treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = "((source_file) @container)"
+not_contains = [
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "_@prop_name"))""",
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "$@prop_name"))""",
+]
+
+
+# --- @FeatureFlag("KEY") private var f: Bool = <default>
+[[rules]]
+name = "replace_property_wrapper_read_with_boolean_literal_with_visibility_annotated"
+query = """(
+  (property_declaration
+    (modifiers
+      . (attribute
+          (user_type (type_identifier) @attr_name)
+          (line_string_literal (_) @flag_name))
+      . (visibility_modifier) @vis .)
+    (value_binding_pattern) @binding
+    name: (pattern (simple_identifier) @prop_name)
+    . (type_annotation) @annotation
+    . value: (_)
+  ) @decl
+  (#eq? @attr_name "FeatureFlag")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "decl"
+replace = "@vis @binding @prop_name@annotation = @treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = "((source_file) @container)"
+not_contains = [
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "_@prop_name"))""",
+"""((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "$@prop_name"))""",
+]

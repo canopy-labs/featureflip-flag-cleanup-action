@@ -407,14 +407,51 @@ wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
 key is not at the call site and no name will make it matchable. Those reads are
 reported as unremoved rather than guessed at.
 
-**The wrapper's own machinery is left behind, and the PR body says so.** A
-typed wrapper usually comes with a registry (`FLAGS` above), and often with
-tests that stub flags by name. Neither is a flag read — the registry entry is an
-object key and the wrapper's own body passes a *parameter*, not a literal — so
-no rule can match them, and after a run the key is still declared in
-`src/flags.ts` and still named in your tests. Those files are listed in the PR
-body under "still reference this flag". Delete those lines as part of reviewing
-the pull request; the diff will not do it for you.
+**The wrapper's own registry is cleaned up too.** A typed wrapper usually
+comes with a registry (`FLAGS` above), and tests that stub flags by name.
+Neither is a flag read, so no read rule touches them — instead a separate set
+of rules deletes an **entry keyed by the flag** when one of two things is
+true:
+
+* another key in the same object is a different flag of your project (the
+  object is a flag registry) — the run fetches your project's flag list, live
+  and archived, to decide this; or
+* the entry's value is a boolean (`{ 'old-checkout': true }` in a test
+  override).
+
+That covers the registry line, a test's override property, and a type alias or
+inline object type beside it (`type Overrides = { 'old-checkout'?: boolean }`)
+— in every supported language except Java and Swift, whose map entries wait on
+an engine change, and the pull request lists each one under "flag-keyed
+entries were removed". An `interface` body is **not** covered yet: the members
+look identical, but they are a different node to the rules, so an
+`interface Overrides { 'old-checkout'?: boolean }` member is left for you and
+listed under "still reference this flag".
+One TypeScript shape is only half covered for now: in a `;`-separated object
+type the rules delete the flag's member when it is the first one (or when the
+type uses commas); a middle or last `;`-terminated member is left for you and
+listed under "still reference this flag", because the engine cannot yet delete
+the member and its `;` in one edit.
+What it does **not** do is rewrite a test whose *assertion* was the gate:
+`it('hides the link when the flag is off')` mentions no key, fails because the
+gate is gone, and is yours to delete. Nor does it touch statements that write a
+map (`flags.put("old-checkout", true)`).
+
+**A comment is not moved with the entry it annotated.** Deleting an entry
+deletes the entry, not the line, so a comment that shared that line stays
+exactly where it lands — which is the end of the line above, attached to the
+entry *before* the one that went:
+
+```ts
+export type Overrides = {
+  'old-checkout'?: boolean; // gone soon
+  'legacy-banner'?: boolean;
+};
+```
+
+becomes `export type Overrides = {// gone soon` with the surviving member
+below it. Nothing is lost, but the comment now annotates the wrong thing;
+delete or move it in review.
 
 ## The key hoisted to a constant
 
@@ -782,6 +819,9 @@ literal, but the binding and the `if` reading it are left in place. The cost is
 one uncleaned `val useLegacy = true`, which is the conservative half of the
 same trade Gate 2 makes for TypeScript and C#.
 
+An override map emptied by this cleanup becomes `mutableMapOf()`; add the type
+arguments if inference needed the entry.
+
 ## Supported Java flag-read shapes
 
 `client.boolVariation("KEY", context, default)` — the Java SDK's only boolean
@@ -942,6 +982,12 @@ to discard the value, so whatever it called still runs.
 
 Fold output itself is `gofmt`-clean, including a multi-statement branch, so a
 repo gating on `gofmt -l` will not flag the pull request over the fold.
+
+**A flag-keyed map entry is the one exception, and only when `gofmt` aligned
+it.** `gofmt` pads a multi-line map literal's values into a column sized by its
+longest key, so deleting the longest key leaves the survivors padded for a key
+that is no longer there — still valid Go, but `gofmt -l` will list the file.
+Run `gofmt -w` on the branch before merging.
 
 Files under a `go mod vendor` tree are skipped, detected by the
 `vendor/modules.txt` manifest rather than by directory name.
@@ -1170,12 +1216,15 @@ means no PR.
      those `.erb` files;
   2. the engine could not parse the file, so it was quarantined (see the
      grammar gap further down);
-  3. **the mention is not a flag read.** This is the common one. The rules
-     rewrite reads — a call taking the key as a string literal — so a key that
-     appears anywhere else is left exactly where it is: a registry or constants
-     map declaring your flag keys, a test that stubs the flag by name, a type
-     listing the keys, a comment. Each is a line you have to delete yourself,
-     and none of them is in the diff.
+  3. **the mention is not a flag read and not a flag-keyed entry.** The rules
+     rewrite reads (a call taking the key as a string literal) and delete
+     entries keyed by the flag in a literal that is provably about flags (see
+     "Wrapping the SDK"). What is left: a test whose assertion was the gate, a
+     comment, a string passed to something other than an accessor, a map
+     entry whose siblings are not flags and whose value is not a boolean, a
+     middle or last member of a `;`-separated TypeScript object type, a Java
+     `Map.of` or Swift dictionary entry (not yet). Each is a line you have to
+     delete yourself.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift

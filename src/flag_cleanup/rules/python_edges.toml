@@ -1,0 +1,33 @@
+# Wires the Python flag-cleanup cascade (see python.toml). Piranha reads
+# [[edges]] only from this file, never from rules.toml.
+#
+# Identical in shape to ts_edges.toml, and for the same reason: Python is the
+# other language with no built-in cleanup rules, so the whole graph is ours.
+# Every edge uses scope = "Parent", which matches the target rule against the
+# ANCESTOR NODES of the node just edited. "Global" would re-apply a rule to
+# every file in the codebase, and named scopes need a language scope_config
+# Piranha does not ship for Python.
+
+# A flag read became a boolean literal: fold it into the expression around it,
+# into the enclosing `if`, or drop the statement it left behind.
+[[edges]]
+scope = "Parent"
+from = "replace_expression_with_boolean_literal"
+to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
+
+# Simplifying an expression can expose another simplification (`not (a and
+# True)`), a foldable `if`, or a dead statement. Self-edge = cascade to a
+# fixpoint.
+[[edges]]
+scope = "Parent"
+from = "boolean_expression_simplify"
+to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
+
+# Folding an if can expose a statement that is now dead (`True`) or another
+# foldable `if`. Unlike the C-family languages an `elif` chain does not
+# collapse one nesting level at a time here — it is flat — but a fold can
+# still uncover an outer `if` whose condition became a literal.
+[[edges]]
+scope = "Parent"
+from = "if_cleanup"
+to = ["if_cleanup", "statement_cleanup"]

@@ -1,0 +1,248 @@
+# Piranha flag-cleanup rules for PHP (php SDK).
+#
+# C#-TIER, not TypeScript-tier: the engine's PHP built-ins (canopy-labs/piranha
+# #21) ship a full cleanup cascade, so the seed rule below buys the enclosing
+# `if` fold, `!read`, `read && other`, a ternary, and inlining a local bound to
+# the read. Two downstream rules are added on top, both for the trailing
+# `elseif` shape the built-ins do not cover — see "the elseif gap" below.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+#
+# --- grammar facts (tree-sitter-php 0.24.x) ---------------------------------
+#
+# Everything here was measured by parsing real SDK call shapes and by running
+# the rules end to end, never read from documentation.
+#
+# 1. PHP SPELLS A STRING LITERAL TWO WAYS, and they are different NODE TYPES:
+#    a single-quoted `'k'` is `(string)`, a double-quoted `"k"` is
+#    `(encapsed_string)`. Both carry the unquoted text in a `string_content`
+#    child, so `#eq?` compares against that — never against the whole literal
+#    with escaped quotes, which fails with "Wrong number of arguments to #eq?
+#    predicate" (see CLAUDE.md). A rule matching only `(string)` silently
+#    ignores every double-quoted read, so the alternation is load-bearing:
+#    verified by measuring a `(string)`-only rule, which matched the
+#    single-quoted call and NOT the double-quoted one.
+#
+# 2. THE CALL SHAPE IS TWO NODE TYPES TOO. `$client->boolVariation(...)` is a
+#    `member_call_expression`; a bare `boolVariation(...)` is a
+#    `function_call_expression`. Both are matched, mirroring csharp.toml/go.toml
+#    — the bare arm is what makes the `accessors` input work, since
+#    `rule_synthesis` clones this rule and swaps the `@sdk_fn` predicate, and a
+#    project's own wrapper is virtually always a plain function.
+#
+# 3. TWO SHAPES ARE EXCLUDED BY CONSTRUCTION, which is worth knowing because
+#    TypeScript needs a filter to achieve the same thing:
+#      - `$client?->boolVariation(...)` is `nullsafe_member_call_expression`,
+#        a DIFFERENT node type, so it is never matched. That is deliberate and
+#        matches the TS optional-call exclusion: if the receiver is null the
+#        expression is `null`, not a boolean, so folding it to a literal would
+#        change behaviour.
+#      - `Client::boolVariation(...)` is `scoped_call_expression`. The SDK has
+#        no static accessor (`FeatureflipClient::boolVariation` does not
+#        exist), so a static call of that name is somebody else's method.
+#    Neither needs a filter; the node types simply do not match.
+#
+# 4. THE BOOLEAN NODE IS `(boolean)`, NOT `(true)`/`(false)`. Java and Go have
+#    separate node types per literal and their rules match `(false)` directly;
+#    copying that shape here fails at query-compile time with
+#    `QueryError { message: "false", kind: NodeType }` — measured. PHP needs
+#    `(boolean) @lit` plus `(#eq? @lit "false")`.
+#
+# 5. The leading `.` anchors the key to the FIRST argument, so arity is
+#    otherwise unconstrained. The SDK's `boolVariation(string $key, array
+#    $context, bool $default): bool` is three arguments today, but an accessor
+#    cloned from this rule may take one — and does not have to be re-authored
+#    for it.
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  [(member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments
+        . (argument [(string (string_content) @flag_name)
+                     (encapsed_string (string_content) @flag_name)])))
+   (function_call_expression
+      function: (name) @sdk_fn
+      arguments: (arguments
+        . (argument [(string (string_content) @flag_name)
+                     (encapsed_string (string_content) @flag_name)])))] @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- the elseif gap ---------------------------------------------------------
+#
+# PHP's `if/elseif/else` is ONE `if_statement` owning a flat LIST of
+# `alternative:` children (`else_if_clause`, then optionally `else_clause`) —
+# like Python's `elif`, and unlike the C family's nesting. That makes the
+# dangling-else disaster that costs TypeScript a bespoke rule and Java/Go a
+# rebuild-from-captures cheap here: deleting a clause cannot strand an `else`,
+# because the `else` is a SIBLING rather than a child.
+#
+# The built-ins cover the shape where the LEADING `if` is false
+# (`promote_else_if_clause`). They do not cover a boolean in a TRAILING
+# `elseif`, which is exactly what a flag read in that position folds to.
+# Measured against 0.6.0: without the two rules below, `elseif (true)` and
+# `elseif (false)` are both left standing. That is safe — the code is correct —
+# but the flag key is gone from the file, so the leftover is permanent: every
+# later run sees a clean removal. TypeScript, Java and C# all clean this shape,
+# so leaving it would make PHP the only language that does not.
+[[rules]]
+name = "delete_trailing_else_if_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+# No POSITIONAL anchoring needed, and that is a property of the flat chain
+# rather than an oversight: deleting an `else_if_clause` is safe wherever it
+# sits, because its siblings (a following `elseif`, a trailing `else`) are
+# children of the same `if_statement` and are untouched. Verified in all three
+# positions — last, mid-chain, and followed by an `else`.
+#
+# `body: (compound_statement)` IS load-bearing, and its absence shipped wrong
+# code (#2693). The claim above — that a clause's siblings are untouched by its
+# deletion — is a claim about the BRACED syntax, where the clause node owns its
+# body. In the ALTERNATIVE syntax it does not: `elseif (false):` ends at the
+# colon and the arm that follows is a sibling of the clause, not a child. So an
+# unconstrained deletion removed the guard and left its markup behind, handing
+# the dead branch to the rung before it:
+#
+#     <?php if ($ctx->isAdmin()): ?>   <li>Admin</li>
+#     <?php  ?>                        <li>Legacy checkout</li>   <-- now admin's
+#     <?php elseif ($ctx->isTrial()): ?>
+#
+# Nothing could see it. It parses, no literal is left for `literal_residues` to
+# count, and Gate 1's error count does not move — the only symptom is an admin
+# seeing both branches. The colon form is handled by `flag_cleanup.php_fold`
+# instead, where a deletion can span an arm as raw text; see that module for why
+# no rule can. Pinned by `tests/fixtures/php/phtml_alternative_syntax`
+# (`chain.phtml`, false treatment) and by
+# `test_a_dead_phtml_arm_is_never_spliced_onto_the_rung_before_it`.
+query = """(
+  (else_if_clause condition: (_ (boolean) @lit) body: (compound_statement)) @clause
+  (#eq? @lit "false")
+)"""
+replace_node = "clause"
+replace = ""
+
+[[rules]]
+name = "promote_trailing_else_if_true"
+groups = ["if_cleanup"]
+is_seed_rule = false
+# ANCHORED ON BOTH SIDES, and that IS load-bearing — this is the one rule here
+# that is unsafe without it. `elseif (true)` may only become `else` when it is
+# the LAST alternative; promoting one that is followed by another `elseif` or
+# by an `else` emits `else { … } elseif { … }`, which does not parse, so
+# Piranha's own self-check panics and the flag is abandoned. Measured both
+# ways: the unanchored form panics on exactly those two shapes, this form
+# leaves them untouched as residue instead.
+#
+# THAT RESIDUE IS NOW FOLDED, and the anchoring below is still unchanged — the
+# work happens one layer up, in `flag_cleanup.php_fold` (#2693). It first became
+# a REFUSAL, via `syntax.py`'s `literal_residues`, on the argument that
+# `elseif (true)` is a live guard in front of a branch that now always runs and
+# the flag key is gone by then, so no later run will look again. That argument
+# still holds; what changed is that there is now something better than refusing.
+# Where the clause is mid-chain, every rung AFTER it is unreachable, so dropping
+# the tail makes the clause last and the promotion this rule declines becomes
+# legal. It cannot be done here: Piranha's `Parent` scope only matches a rule
+# whose `replace_node` IS the ancestor it was offered, and a variable-length
+# chain prefix cannot be templated from captures — measured, both ways round.
+# The gate stays exactly as strict, and is what catches any shape the fold
+# declines. Pinned by `tests/fixtures/php/mid_chain_elseif` and by
+# `test_a_php_mid_chain_elseif_restructures_on_true_and_cleans_on_false`, which
+# also pins that the FALSE treatment is unchanged — the delete rule needs no
+# positional anchoring, so a mid-chain dead rung is removed in any position.
+#
+# The `.` after `body:` and the `.` after the clause together say "the
+# else_if_clause is the last named child". Anchoring only after the clause does
+# NOT fire — the same family as the constrained-grandchild finding in
+# CLAUDE.md, where a query Piranha accepts silently never matches.
+query = """(
+  (if_statement
+     condition: (_) @cond
+     body: (compound_statement) @body .
+     (else_if_clause
+        condition: (parenthesized_expression (boolean) @lit)
+        body: (_) @alt) .) @if_statement
+  (#eq? @lit "true")
+)"""
+replace_node = "if_statement"
+replace = "if @cond @body else @alt"
+
+
+# --- the TWO-WORD `else if` spelling ----------------------------------------
+#
+# PHP accepts `elseif` and `else if`, and they are DIFFERENT TREES: the one-word
+# form is a flat `else_if_clause` (the two rules above delete or promote it),
+# while the two-word form is an `else_clause` wrapping a nested `if_statement`.
+# On the false treatment the built-ins delete that inner `if (false) {…}` — and
+# they replace it with the literal text `{ }` rather than with nothing, because
+# an empty deletion there strands a dangling `else`, which does not parse and
+# aborts the whole run. So `} else if (<read>) { … }` used to clean to
+# `} else { }`, where the `elseif` spelling of the same source cleaned
+# completely: the one place in this tool where the same source, spelled two
+# legal ways, got two different outcomes.
+#
+# For the ordinary (non-`else`) case the built-in graph clears that `{ }` via
+# `if_cleanup -> remove_unnecessary_nested_block`, which hoists a bare nested
+# block out of a `compound_statement` or a `program`. An `else_clause` is
+# NEITHER, so the block survived there and the `else` survived with it.
+#
+# REACHABILITY WAS THE WHOLE PROBLEM, NOT THE QUERY. Three earlier attempts
+# (recorded in CLAUDE.md) all failed for one reason: `if_cleanup`'s only
+# outgoing edge is to `remove_unnecessary_nested_block`, so once a built-in
+# if-fold has fired, nothing in the `if_cleanup` group is consulted again for
+# that node. This rule is in a group of its own, reached by the single edge in
+# `php_edges.toml`; read that file before touching either. Mutation-checked
+# both ways — deleting the edge and deleting the rule each restore the residue.
+[[rules]]
+name = "delete_emptied_else_clause"
+groups = ["php_emptied_else_cleanup"]
+is_seed_rule = false
+# SCOPED BY REACHABILITY, NOT BY THE QUERY, and that distinction is the design.
+# The rule is not a seed rule and its group has exactly one incoming edge, from
+# `if_cleanup` under Parent scope — so Piranha only ever offers it the
+# ANCESTORS of a node an if-fold just rewrote, and only matches when an
+# ancestor IS the query's root (`recursive = false`). An `else` block the
+# customer wrote empty cannot be an ancestor of an edit, because it holds
+# nothing to edit, so the only empty `else` this can reach is one THIS RUN
+# emptied. Deleting a pre-existing empty `else` would be an unrelated rewrite
+# in the customer's diff; nothing in the query prevents that, the edge does.
+# `tests/fixtures/php/else_if_two_word` carries a hand-written `else { }` as a
+# sibling of the transformed one for exactly this reason, and it is a live
+# guard: flipping `is_seed_rule` to true reddens BOTH treatments.
+#
+# `. "}"` is the emptiness test, and it is structural rather than textual.
+# Measured across 14 shapes: it matches `{ }`, `{}` and `{\n}`, and declines
+# `{ ; }`, `{ return; }`, `{ {} }`, a heredoc, an `?>html<?php` escape and —
+# the one that matters — `{ // todo }` and `{ /* todo */ }`. A COMMENT IS A
+# NAMED NODE, so a comment-only block is not empty and is left alone; that is
+# the hazard Dart and Ruby both record. It is also why this shape is NOT the
+# Ruby `elsif` residue in disguise: Ruby's stays open because promoting a chain
+# means rebuilding it from captures, and rebuilding drops comments. Nothing is
+# rebuilt here — an already-empty block is deleted whole.
+#
+# The two anchored spellings are NOT interchangeable AS QUERIES: the
+# symmetric-looking `(compound_statement "{" . "}")` matches EVERY block, empty
+# or not, because an anchor between two anonymous patterns constrains nothing.
+# Keep the leading form. Honesty about how much that is worth: swapping in the
+# broad form does NOT redden this suite, and no shape could be constructed
+# where it over-deletes — the edge scoping and the rule ordering behind
+# `remove_unnecessary_nested_block` mask it in every case measured. So the
+# precision here is defence in depth, not the load-bearing guard, and a future
+# reader should not go looking for the failing test that justifies it.
+#
+# Deleting an `else_clause` strands the space in `} else` at end of line, the
+# same artefact TypeScript's `delete_else_if_false` leaves; it is removed
+# downstream by `strip_introduced_trailing_whitespace`, which is language-
+# general and already covers PHP.
+query = """(
+  (else_clause body: (compound_statement . "}")) @clause
+)"""
+replace_node = "clause"
+replace = ""

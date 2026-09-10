@@ -1,0 +1,109 @@
+# JSX cleanup for the TSX grammar — loaded ONLY by languages that parse with it.
+#
+# SEPARATE FILE BECAUSE THE QUERY WOULD NOT COMPILE OTHERWISE. `ts`, `tsx` and
+# `js` all share `rule_base = "ts"` and therefore `rules/ts.toml`, but they do
+# NOT share a grammar: `ts` is the engine's `typescript` arm, whose grammar has
+# no `jsx_expression` node at all. A tree-sitter query naming an unknown node
+# type is not an unmatched query, it is a QUERY COMPILE ERROR — the engine
+# panics before it looks at a single file, so putting these rules in ts.toml
+# aborted every `.ts` run in the suite with `QueryError { kind: NodeType }`.
+# `piranha_runner._Language.parses_jsx` is what selects this file, and it is set
+# from the grammar each language actually uses (`tsx`, and `js` via piranha#25).
+
+# ===========================================================================
+# 6. jsx_cleanup: drop the expression container a folded JSX gate leaves behind
+# ===========================================================================
+# Numbered as a continuation of `rules/ts.toml`, whose cascade ends at 5
+# (`statement_cleanup`); this is the same cascade, reached by the edges in
+# `ts_jsx_edges.toml`, and only the grammar split keeps it in another file.
+#
+# A FRAGMENT IS A `jsx_element` HERE, not a `jsx_fragment`. This grammar gives
+# `<>…</>` a `jsx_element` with `<>` as its `jsx_opening_element`, so the two
+# alternatives below cover fragments without naming one — and naming
+# `jsx_fragment` would be the same kind of compile error the file header
+# describes, since this grammar has no such node.
+# `{flag && (<Panel />)}` folds to `{(<Panel />)}` and `{flag && <Panel />}` to
+# `{<Panel />}`; with the flag serving the other way both become `{false}`. All
+# three are correct and all three are residue — a reviewer reads them as a
+# half-finished rewrite, and `{(` is not something anyone would write. These
+# rules finish the fold.
+#
+# Only ever reached on this tool's own rewrites: edges are scoped to the
+# ancestors of the node just edited, so a `{<Panel />}` a customer wrote
+# themselves elsewhere in the file is not touched.
+#
+# EVERY RULE HERE IS ANCHORED TO A JSX *CHILD* AND MUST STAY THAT WAY. The
+# grammar gives an attribute value and a child the same `jsx_expression` node,
+# and the three rewrites below are each a syntax error in attribute position:
+# `attr={(x)}` -> `attr=x`, `icon={<C />}` -> `icon=<C />`, `disabled={false}`
+# -> `disabled=`. The last is worse than a parse failure would be if it ever
+# parsed — `disabled={false}` is a live, meaningful value, not residue. A
+# `not_enclosing_node` filter is what separates them, because the query cannot:
+# `Parent`-scope edges only fire a rule whose `replace_node` IS the offered
+# ancestor (see CLAUDE.md), so the query has to be rooted at the
+# `jsx_expression` itself and cannot name the parent that would tell them apart.
+#
+# The filter is deliberately blunt: it rejects ANY `jsx_attribute` ancestor, so
+# a child nested inside an attribute's own element (`icon={<div>{(<B />)}</div>}`)
+# is skipped too. That is a missed tidy-up, which costs a reviewer nothing; the
+# alternative error costs them a broken build.
+
+# `{(<Panel />)}` -> `<Panel />`.
+#
+# The inner node must be a JSX element, NOT `(_)`. `{(flag)}` folds to
+# `{(true)}`, and unwrapping that yields a bare `true` in child position, which
+# React renders as the four-character string `true` — a visible behaviour change
+# out of a rule whose whole purpose is cosmetic. Unwrapping an element is
+# exactly equivalent; unwrapping an arbitrary expression is not.
+[[rules]]
+name = "unwrap_parenthesized_jsx_child"
+groups = ["jsx_cleanup"]
+is_seed_rule = false
+query = """(
+  (jsx_expression
+    (parenthesized_expression
+      [(jsx_element) (jsx_self_closing_element)] @inner)) @container
+)"""
+replace_node = "container"
+replace = "@inner"
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (jsx_attribute) @attribute
+)"""
+
+# `{<Panel />}` -> `<Panel />`. Same reasoning, one layer shallower: this is
+# what a gate without the wrapping parens folds to, and what the ternary rules
+# leave behind (`{flag ? <A /> : <B />}` -> `{<A />}`).
+[[rules]]
+name = "unwrap_jsx_element_child"
+groups = ["jsx_cleanup"]
+is_seed_rule = false
+query = """(
+  (jsx_expression [(jsx_element) (jsx_self_closing_element)] @inner) @container
+)"""
+replace_node = "container"
+replace = "@inner"
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (jsx_attribute) @attribute
+)"""
+
+# `{false}` / `{true}` in child position -> nothing. React renders neither, so
+# the container is pure residue: it is what `{flag && <Panel />}` collapses to
+# when the flag serves the branch that drops the panel.
+[[rules]]
+name = "delete_boolean_jsx_child"
+groups = ["jsx_cleanup"]
+is_seed_rule = false
+query = """(
+  (jsx_expression [(true) (false)]) @container
+)"""
+replace_node = "container"
+replace = ""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (jsx_attribute) @attribute
+)"""

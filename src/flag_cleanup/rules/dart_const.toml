@@ -1,0 +1,185 @@
+# KEY-const propagation for Dart — the flag key hoisted to a constant, as in
+#
+#     const flagKey = 'old-checkout';
+#     ...
+#     if (client.boolVariation(flagKey, ctx, false)) { ... }
+#
+# `piranha_runner` prepends this file to `dart.toml` for files that pass the
+# Gate 2 shadow check (see `flag_cleanup.key_const`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+#
+# --- IMMUTABILITY IS STRUCTURAL HERE, WHICH IS UNUSUALLY LUCKY --------------
+#
+# `const`/`final` declarations parse into `static_final_declaration_list`, while
+# a mutable `var x = '...'` or `String x = '...'` parses into
+# `initialized_identifier_list` — a DIFFERENT node type. So the "must not be
+# reassignable" requirement needs no predicate at all: a mutable key is
+# structurally unmatchable rather than refused. Java needed a `#match?` for the
+# same requirement because its modifiers live in one flat node.
+#
+# Verified against the installed wheel across `const`, `final`, `const String`,
+# `final String`, `var`, bare-typed and `late var` — the first four match, the
+# last three do not.
+#
+# --- TWO GRAMMARS, AND THIS IS THE LANGUAGE WHERE THAT BITES ----------------
+#
+# The engine queries with tree-sitter-dart 0.2.0; Gate 1 and Gate 2 parse with
+# PyPI's 0.1.0. They are different grammars, not two versions of one (see
+# `dart.toml` and this tool's CLAUDE.md), and Dart's history in this repo is
+# that corruption hides in the SEAM between them.
+#
+# On the specific question these rules turn on, the two AGREE, and that was
+# checked rather than assumed: BOTH spell a `const`/`final` declaration
+# `static_final_declaration_list > static_final_declaration` and a mutable one
+# `initialized_identifier_list`. That agreement is what makes it safe for the
+# gate to decide what the engine may rewrite. The grammars differ elsewhere —
+# 0.2.0 has no `const_builtin` and its root is `source_file`, 0.1.0's root is
+# `program` and it carries `const_builtin` as a SIBLING of the declaration list
+# — so do not assume a shape checked on one side holds on the other.
+#
+# --- the node chain, enumerated rather than wildcarded ----------------------
+#
+#   top level:  source_file > top_level_variable_declaration
+#                           > static_final_declaration_list > static_final_declaration
+#   class level: class_body > class_member > declaration
+#                           > static_final_declaration_list > static_final_declaration
+#
+# The class-level chain has TWO intermediate nodes. `(class_body (_ (_ …)))`
+# matches and was the first thing that worked, but it is deliberately NOT used:
+# a wildcard chain in a DELETE rule is exactly the "unanticipated wrapper gets
+# its insides removed and its shell left behind" hazard every other
+# `*_const.toml` delete rule is written to avoid. The names were recovered by
+# probing (an unknown node type is a hard query error, which makes a usable
+# oracle) and are spelled out.
+#
+# `. (static_final_declaration …) .` means EXACTLY ONE declarator in the list,
+# and it is load-bearing for a reason specific to Dart (#2700). Unlike Go, the
+# name and its value are paired correctly here — they are children of the same
+# `static_final_declaration` — and unlike Go the GATE recognises the key const
+# and is right to approve removing it. The defect was BLAST RADIUS: both delete
+# rules take the whole `top_level_variable_declaration` / `class_member`, one
+# node ABOVE the declarator the gate approved, so
+# `const k = 'old-checkout', other = 'x';` lost `other` too and `dart analyze`
+# reported `Undefined name 'other'` and exited non-zero. Deleting the declarator
+# alone is NOT the alternative: that would leave a dangling `const` or a comma,
+# so bounding the match to a single-declarator list is what keeps the coarse
+# deletion honest.
+#
+# --- THE SAFETY ARGUMENT IS GATE 2, NOT THE QUERIES --------------------------
+#
+# `key_const.path_is_safe` withholds this whole file where the name is bound
+# more than once, or is referenced by anything other than a flag read these
+# rules themselves remove. Gate 1 catches neither hazard — a wrong-branch fold
+# is valid Dart, and a stranded reference is a name-resolution error one layer
+# below a re-parse.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+# --- fold the read: `boolVariation(flagKey, …)` -> @treated -----------------
+# Both callee shapes `dart.toml` matches are carried here for its reasons.
+# Declared BEFORE the delete rules; the delete rules additionally refuse while
+# any such call survives.
+[[rules]]
+name = "replace_boolvariation_const_key_read_with_boolean_literal"
+query = """(
+  [(call_expression
+      function: (member_expression property: (identifier) @sdk_fn)
+      arguments: (arguments . (identifier) @key_const))
+   (call_expression
+      function: (identifier) @sdk_fn
+      arguments: (arguments . (identifier) @key_const))] @call
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(source_file
+     (top_level_variable_declaration
+       (static_final_declaration_list
+         . (static_final_declaration
+           (identifier) @decl_name
+           (string_literal (_ . [(template_chars_single_single)
+                                 (template_chars_double_single)] @flag_name .))) .)))
+   (class_body
+     (class_member
+       (declaration
+         (static_final_declaration_list
+           . (static_final_declaration
+             (identifier) @decl_name
+             (string_literal (_ . [(template_chars_single_single)
+                                   (template_chars_double_single)] @flag_name .))) .))))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- delete the now-unused top-level declaration -----------------------------
+# Rooted at `source_file` and deleting the whole `top_level_variable_declaration`
+# so the trailing `;` goes with it.
+#
+# The filter is a SEQUENCING guard, not the safety argument (Gate 2 is): while
+# any call still takes this constant as its first argument, the declaration
+# stays.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  (source_file
+    (top_level_variable_declaration
+      (static_final_declaration_list
+        . (static_final_declaration
+          (identifier) @variable_name
+          (string_literal (_ . [(template_chars_single_single)
+                                (template_chars_double_single)] @flag_name .))) .)) @declaration) @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((source_file) @container)"""
+not_contains = ["""(
+  (call_expression arguments: (arguments . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]
+
+# --- delete the now-unused class-level declaration ---------------------------
+# The whole `class_member` goes, not the `declaration` inside it: leaving the
+# member shell behind would not parse.
+[[rules]]
+name = "delete_flag_key_class_const_declaration"
+query = """(
+  (class_body
+    (class_member
+      (declaration
+        (static_final_declaration_list
+          . (static_final_declaration
+            (identifier) @variable_name
+            (string_literal (_ . [(template_chars_single_single)
+                                  (template_chars_double_single)] @flag_name .))) .))) @declaration) @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(class_body) (source_file)] @container)"""
+not_contains = ["""(
+  (call_expression arguments: (arguments . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

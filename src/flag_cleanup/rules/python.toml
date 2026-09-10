@@ -1,0 +1,509 @@
+# Piranha flag-cleanup rules for Python (python SDK).
+#
+# Like ts.toml and unlike java.toml/go.toml, this file carries the WHOLE
+# cascade: Piranha ships built-in feature-flag cleanup rules for
+# go/java/kt/ruby/scala/swift, and none at all for TypeScript or Python. So the
+# seed rules, the boolean simplification, the `if` fold and the statement
+# cleanup are all authored here.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "True" | "False"   (NOT lowercase — see below)
+#
+# Two things make Python different from every other language here, and both
+# shape the rules rather than merely decorating them.
+#
+# 1. THE ENGINE CANNOT RE-INDENT. Measured against 0.4.8: replacing an
+#    `if_statement` with the statements of its block pastes the first line at
+#    the `if`'s column and leaves every later line at its ORIGINAL column, and
+#    capturing the whole `(block)` instead leaves every line over-indented.
+#    Both produce source CPython rejects. So there is no `*_splice` rule here:
+#    a branch is folded only when it is a SINGLE SIMPLE STATEMENT, which needs
+#    no re-indentation because only its first line moves. A multi-statement
+#    branch is left alone, and the residual-condition gate in `syntax.py` then
+#    refuses the file rather than shipping `if True:` as a "removal".
+#
+# 2. THE SDK HAS NO BOOLEAN-SPECIFIC READ. `variation(key, context, default)`
+#    is generic over the flag's type, so the call alone is no evidence that the
+#    flag is a boolean — folding a string or JSON flag to `True` would be a
+#    silent type change. The seed rules therefore require the `default`
+#    argument to be a boolean LITERAL, which is the only type evidence the call
+#    site carries. `variation("k", ctx, "control")` is left alone.
+#
+# `@treated` is pasted as TEXT, so it must be spelled `True`/`False`. The
+# engine will happily emit `if true:` — a NameError at run time, not a syntax
+# error, so it survives every parse check this tool has. See
+# `piranha_runner._Language.true_literal`.
+
+
+# ===========================================================================
+# 1. The flag read
+# ===========================================================================
+
+# --- <obj>.variation("KEY", ctx, <bool literal>) -> @treated
+#
+# The key is matched through `(string (string_content) @flag_name)`.
+# `string_content` is the node holding the text WITHOUT its quotes, and it must
+# be reached that way because `#eq?` cannot be handed a value containing a `"`:
+# `(#eq? @flag_name "\"KEY\"")` fails with *Wrong number of arguments to #eq?
+# predicate. Expected 2, got 4* — the query parser does not honour the escape,
+# it splits on the raw quote. Verified both ways: the right key matches, a
+# different key does not.
+#
+# THE ANCHORS ARE LOAD-BEARING, not tidiness. `variation`'s signature is
+# `(key, context, default, track=True)`, so a bare "there is a boolean
+# somewhere in the argument list" would match
+# `variation("KEY", ctx, fallback, False)` — where the boolean is `track` and
+# the default is a variable of unknown type — and fold a possibly-non-boolean
+# flag. `. (string …) . (_) . [(true) (false)]` pins the literal to the THIRD
+# positional argument. Measured: that call is left alone, and
+# `variation("KEY", ctx, "control")` with a string default is too.
+#
+# `variation_detail` returns an EvaluationDetail rather than the value, so
+# folding it to a literal would be a type error; `#eq?` is exact, so the longer
+# name simply does not match.
+#
+# `#eq?` throughout and never `#any-of?`, which Piranha's bundled tree-sitter
+# silently ignores — an ignored predicate does not fail the query, it just
+# stops constraining it, which would leave the callee unconstrained and rewrite
+# any call whose first argument is the flag key. See ts.toml for the full
+# account; `test_rules_use_no_ignored_predicates` fails the build if it returns.
+[[rules]]
+name = "replace_variation_read_with_boolean_literal"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (string (string_content) @flag_name)
+      . (_)
+      . [(true) (false)])
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- <obj>.variation("KEY", ctx, default=<bool literal>) -> @treated
+#
+# The keyword form needs its own rule because the argument is a
+# `keyword_argument` node rather than the literal itself, and because it may
+# sit anywhere in the list (`variation("KEY", context=ctx, default=False)` is
+# ordinary). The name is pinned with `#eq? @kw "default"`, which is what stops
+# `variation("KEY", ctx, fallback, track=False)` from matching — `track` is
+# also a keyword argument with a boolean value, and it says nothing about the
+# flag's type. Measured: that call is left alone, as is `default=fallback`.
+#
+# Only the KEY is anchored (`.`), because the keyword may legitimately follow
+# any number of positional arguments.
+[[rules]]
+name = "replace_variation_keyword_read_with_boolean_literal"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (string (string_content) @flag_name)
+      (keyword_argument
+        name: (identifier) @kw
+        value: [(true) (false)]))
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @kw "default")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# --- <obj>.get_boolean_value("KEY", default, ctx) -> @treated
+# The OpenFeature Python provider (`featureflip-openfeature-provider`). The read
+# comes from the `openfeature-sdk` client, not from our provider, so neither
+# `variation` rule above matches it.
+#
+# This client is SYNCHRONOUS — `get_boolean_value` returns a `bool` directly —
+# so unlike the JS and .NET providers there is no `await` to account for and
+# this is an ordinary call replacement. (`openfeature-python`'s README
+# quickstart is the reference shape: `client.get_boolean_value("new-checkout",
+# False, EvaluationContext(...))`.)
+#
+# Only the FIRST argument is anchored, and deliberately: unlike `variation`,
+# which serves every flag type and therefore needs a boolean-literal default to
+# prove the read is a boolean one, `get_boolean_value` is type-specific by name.
+# Constraining the default as well would only lose reads that pass a variable
+# default, which are just as safe to fold. A keyword-form key
+# (`get_boolean_value(flag_key="...")`) never binds `string`, so it is left
+# alone — conservative, and consistent with every other rule here.
+[[rules]]
+name = "replace_get_boolean_value_read_with_boolean_literal"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (string (string_content) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "get_boolean_value")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# ===========================================================================
+# 2. boolean_expression_simplify: fold the literal into its enclosing expression
+# ===========================================================================
+
+# `not True` -> False, `not False` -> True.
+[[rules]]
+name = "simplify_not_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (not_operator argument: (true)) @not
+)"""
+replace_node = "not"
+replace = "False"
+
+[[rules]]
+name = "simplify_not_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (not_operator argument: (false)) @not
+)"""
+replace_node = "not"
+replace = "True"
+
+# `a if True else b` -> a, `a if False else b` -> b.
+#
+# `conditional_expression` carries NO field names in this grammar — its
+# children are positional (consequence, condition, alternative) — so the
+# anchors are what identify them. Without the anchors a nested conditional
+# could bind the wrong child.
+[[rules]]
+name = "simplify_ternary_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (conditional_expression . (_) @consequence . (true) . (_)) @ternary
+)"""
+replace_node = "ternary"
+replace = "@consequence"
+
+[[rules]]
+name = "simplify_ternary_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (conditional_expression . (_) . (false) . (_) @alternative) @ternary
+)"""
+replace_node = "ternary"
+replace = "@alternative"
+
+# Short-circuit operators, LITERAL ON THE LEFT ONLY. These four rewrites are
+# exactly semantics-preserving in Python: `and`/`or` return one of their
+# OPERANDS (not a bool), the dropped operand is the one the runtime would not
+# have evaluated, and the kept operand is returned verbatim.
+#
+# The mirrored right-hand forms are deliberately NOT implemented, for the same
+# reason as in ts.toml: `x and True` -> `x` changes the produced VALUE whenever
+# `x` is falsy-but-not-`False` (`0`, `""`, `[]`, `None`), and `x and False` ->
+# `False` discards `x`'s side effects entirely. Leaving `x and True` in place
+# is ugly but correct, which is the trade this tool always makes.
+[[rules]]
+name = "simplify_and_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (boolean_operator left: (true) operator: "and" right: (_) @right) @expr
+)"""
+replace_node = "expr"
+replace = "@right"
+
+[[rules]]
+name = "simplify_and_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (boolean_operator left: (false) operator: "and" right: (_)) @expr
+)"""
+replace_node = "expr"
+replace = "False"
+
+[[rules]]
+name = "simplify_or_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (boolean_operator left: (true) operator: "or" right: (_)) @expr
+)"""
+replace_node = "expr"
+replace = "True"
+
+[[rules]]
+name = "simplify_or_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (boolean_operator left: (false) operator: "or" right: (_) @right) @expr
+)"""
+replace_node = "expr"
+replace = "@right"
+
+# Comparison against a boolean literal, BOTH SIDES LITERAL ONLY.
+# `client.variation("k", ctx, False) == True` becomes `True == True` once the
+# read is folded, and without these it stops there: correct, but the `if` never
+# disappears.
+#
+# The single-literal forms are deliberately NOT implemented, for the same reason
+# as `x and True`. `True == x` is not `x` — `==` yields a bool while `x` yields
+# whatever `x` is, and Python is full of objects with a custom `__eq__` whose
+# result is neither. With both sides literal the comparison has one answer and
+# neither operand can carry a side effect.
+#
+# `is` rides along with `==`: `True is True` and `True == True` agree for the
+# two singletons, and `if flag is True:` is a shape real code uses.
+# `comparison_operator`'s operands are POSITIONAL — only the operator carries a
+# field name — so the literals are matched by position, exactly as
+# `conditional_expression` above.
+[[rules]]
+name = "simplify_comparison_true_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (true) operators: ["==" "is"] (true)) @expr
+)"""
+replace_node = "expr"
+replace = "True"
+
+[[rules]]
+name = "simplify_comparison_true_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (true) operators: ["==" "is"] (false)) @expr
+)"""
+replace_node = "expr"
+replace = "False"
+
+[[rules]]
+name = "simplify_comparison_false_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (false) operators: ["==" "is"] (true)) @expr
+)"""
+replace_node = "expr"
+replace = "False"
+
+[[rules]]
+name = "simplify_comparison_false_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (false) operators: ["==" "is"] (false)) @expr
+)"""
+replace_node = "expr"
+replace = "True"
+
+[[rules]]
+name = "simplify_negated_comparison_true_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (true) operators: ["!=" "is not"] (true)) @expr
+)"""
+replace_node = "expr"
+replace = "False"
+
+[[rules]]
+name = "simplify_negated_comparison_true_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (true) operators: ["!=" "is not"] (false)) @expr
+)"""
+replace_node = "expr"
+replace = "True"
+
+[[rules]]
+name = "simplify_negated_comparison_false_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (false) operators: ["!=" "is not"] (true)) @expr
+)"""
+replace_node = "expr"
+replace = "True"
+
+[[rules]]
+name = "simplify_negated_comparison_false_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (comparison_operator (false) operators: ["!=" "is not"] (false)) @expr
+)"""
+replace_node = "expr"
+replace = "False"
+
+
+# ===========================================================================
+# 3. if_cleanup: fold `if True:` / `if False:`
+# ===========================================================================
+# Python's `elif` chain is FLAT — one `if_statement` carries a list of
+# `alternative:` children (`elif_clause`s then an optional `else_clause`)
+# rather than nesting another `if` inside an else. That makes the dangling-else
+# disaster the C-family languages all share (see java.toml section 2) simply
+# not exist here: a dead `elif` is one node to delete, and the `else` that
+# follows it is its SIBLING, not its child.
+#
+# What Python has instead is the re-indentation wall. Every rule below either
+# deletes a node that starts its own line, or replaces a node with a single
+# simple statement whose first line is the only one that moves. Nothing here
+# changes the indentation of a line it did not already own.
+
+# `if True: <one simple statement>` -> that statement, with any `elif`/`else`
+# branches dropped with it (they are unreachable once the condition is `True`).
+#
+# The consequence must be a block holding EXACTLY ONE statement (`. … .`) drawn
+# from an allow-list of SIMPLE statements. Both halves matter:
+#
+#   * one statement, because two would need the second and later lines
+#     re-indented and the engine cannot do that;
+#   * simple, because a COMPOUND statement (`for`, `with`, a nested `if`)
+#     carries its own indented block, and moving its header to a shallower
+#     column while its body stays put is exactly the breakage above.
+#
+# A simple statement may still span lines — via brackets or a backslash — but
+# in both cases the continuation lines' indentation is insignificant to Python,
+# and a triple-quoted string's content is untouched because only the FIRST line
+# of the statement moves.
+#
+# The allow-list is the safe direction to be wrong in: omitting a statement
+# type costs a missed cleanup (the file is then refused, loudly, by the
+# residual-condition gate), whereas admitting a compound statement produces
+# source that does not run.
+[[rules]]
+name = "simplify_if_true_single_statement"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    condition: (true)
+    consequence: (block . [(expression_statement)
+                           (return_statement)
+                           (pass_statement)
+                           (raise_statement)
+                           (break_statement)
+                           (continue_statement)
+                           (assert_statement)
+                           (delete_statement)
+                           (global_statement)
+                           (nonlocal_statement)
+                           (import_statement)
+                           (import_from_statement)] @only .)) @if_statement
+)"""
+replace_node = "if_statement"
+replace = "@only"
+
+# `if False: … else: <one simple statement>` -> that statement.
+#
+# The `else_clause` is anchored as the child IMMEDIATELY AFTER the consequence
+# and the LAST child, which is how "there are no `elif` branches in between" is
+# expressed. Without those anchors this would match
+# `if False: a elif c: b else: d` and collapse the whole chain to `d`,
+# discarding a live `elif` branch — the sharpest available way to produce code
+# that runs and is wrong.
+[[rules]]
+name = "simplify_if_false_else_single_statement"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    condition: (false)
+    consequence: (_)
+    . (else_clause
+        body: (block . [(expression_statement)
+                        (return_statement)
+                        (pass_statement)
+                        (raise_statement)
+                        (break_statement)
+                        (continue_statement)
+                        (assert_statement)
+                        (delete_statement)
+                        (global_statement)
+                        (nonlocal_statement)
+                        (import_statement)
+                        (import_from_statement)] @only .)) .) @if_statement
+)"""
+replace_node = "if_statement"
+replace = "@only"
+
+# `elif False:` -> gone. Flat `elif` chains make this the whole fix: the clause
+# begins its own line, so deleting it re-indents nothing, and any `else` after
+# it is a sibling that simply stays. This is the case that needs a bespoke
+# rule and a documented artefact in every C-family language here.
+[[rules]]
+name = "delete_elif_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (elif_clause condition: (false)) @clause
+)"""
+replace_node = "clause"
+replace = ""
+
+# `if False: …` with no `elif`/`else` -> gone.
+#
+# Rooted at the PARENT, and only when the parent holds another statement.
+# Deleting the sole statement of a block leaves `def f():` with no body, which
+# CPython rejects (`IndentationError: expected an indented block`) — and which
+# tree-sitter-python accepts without an ERROR node, so the tree-sitter half of
+# Gate 1 would not have caught it. The two `block` alternatives cover "a
+# sibling before" and "a sibling after"; `module` needs no guard because an
+# empty file is valid Python.
+#
+# This is the same parent-position question ts.toml's splice rules answer, with
+# Python's answer driven by indentation rather than by scope.
+[[rules]]
+name = "delete_if_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  [(block (_) (if_statement condition: (false) !alternative) @if_statement)
+   (block (if_statement condition: (false) !alternative) @if_statement (_))
+   (module (if_statement condition: (false) !alternative) @if_statement)] @container
+)"""
+replace_node = "if_statement"
+replace = ""
+
+
+# ===========================================================================
+# 4. statement_cleanup: drop statements the fold made dead
+# ===========================================================================
+# A bare `True` / `False` on its own line has no effect — it is what
+# `flag_read and do_it()` collapses to when the flag serves the branch that
+# skips `do_it()`.
+#
+# Rooted at the parent for the same reason as `delete_if_false`: a lone `True`
+# can be the entire body of a function, and deleting it would leave that
+# function bodiless.
+[[rules]]
+name = "delete_boolean_literal_statement"
+groups = ["statement_cleanup"]
+is_seed_rule = false
+query = """(
+  [(block (_) (expression_statement [(true) (false)]) @statement)
+   (block (expression_statement [(true) (false)]) @statement (_))
+   (module (expression_statement [(true) (false)]) @statement)] @container
+)"""
+replace_node = "statement"
+replace = ""

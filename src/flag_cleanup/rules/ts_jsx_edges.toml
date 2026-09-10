@@ -1,0 +1,21 @@
+# Edges for `rules/ts_jsx.toml`, appended to `ts_edges.toml` for the languages
+# that parse with the TSX grammar. They live beside the rules they reach rather
+# than in the shared edges file for the same reason the rules do: an edge whose
+# target group has no rules under the `typescript` grammar is a rule set that
+# differs between languages sharing a file, which is exactly the coupling the
+# split exists to remove.
+
+# A fold that finished inside a JSX expression container leaves the container
+# behind: `{(<Panel />)}`, `{<Panel />}` or `{false}`. Both the literal
+# substitution and the boolean simplification can be the last step before it,
+# so both reach the cleanup — `{flag}` folds straight to `{true}` without ever
+# forming an expression for `boolean_expression_simplify` to touch.
+[[edges]]
+scope = "Parent"
+from = "replace_expression_with_boolean_literal"
+to = ["jsx_cleanup"]
+
+[[edges]]
+scope = "Parent"
+from = "boolean_expression_simplify"
+to = ["jsx_cleanup"]

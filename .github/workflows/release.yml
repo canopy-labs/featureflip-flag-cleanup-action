@@ -1,0 +1,334 @@
+name: Release
+
+# This file is authored in a private repository, where it is INERT: GitHub only
+# reads `.github/workflows` at a repository ROOT, and there it sits one
+# directory down. The mirror job copies that directory to the root of THIS
+# repository, at which point this becomes its real workflow and is what
+# actually cuts releases.
+#
+# Publishing from the public repository rather than from the monorepo is the
+# whole point, and it is not cosmetic. GHCR binds a package to the repository
+# whose workflow pushed it, and that binding is what decides the package page's
+# README, its "Source" link, and the visibility a new package inherits. Pushed
+# from the private monorepo, the package came out private, linked to a
+# repository no customer can open, and no `org.opencontainers.image.source`
+# annotation moved it afterwards. Pushed from here, all three are right by
+# construction and there is nothing to correct after the fact.
+
+on:
+  # The mirror pushes master with a PAT, and a PAT-authored push DOES trigger
+  # workflows (a GITHUB_TOKEN-authored one would not). So a release in the
+  # monorepo lands here on its own.
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  version:
+    name: Read the version and decide whether to release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      major: ${{ steps.v.outputs.major }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Read pyproject.toml
+        id: v
+        run: |
+          # pyproject.toml is the single source of the version, mirrored from
+          # the monorepo. Nothing here derives a version from a tag, because in
+          # this repository the tag is an OUTPUT of the release rather than its
+          # trigger.
+          VERSION="$(python3 -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          case "$VERSION" in
+            ''|*[!0-9.]*) echo "refusing a non-numeric version '${VERSION}'" >&2; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "major=v${VERSION%%.*}" >> "$GITHUB_OUTPUT"
+
+          # An immutable vX.Y.Z is never re-cut. A master push that does not
+          # bump the version is a source change with no release in it, which is
+          # a normal thing to happen and must not fail the run.
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "v${VERSION} already exists; nothing to release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build & smoke (${{ matrix.arch }})
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          # GitHub-hosted arm64, free on public repositories. The monorepo had
+          # to use a self-hosted ARM runner for this; a public repository does
+          # not, and pointing a public repository at our self-hosted pool would
+          # be a bad trade regardless.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The Dockerfile bind-mounts wheels/ out of the build context to install
+      # the fork's polyglot-piranha, which is a GitHub-release wheel rather than
+      # a PyPI one. canopy-labs/piranha is PRIVATE, so this is the one step here
+      # that needs a credential this repository cannot derive for itself.
+      - name: Fetch the forked wheels into the build context
+        env:
+          PIRANHA_WHEEL_TOKEN: ${{ secrets.PIRANHA_WHEEL_TOKEN }}
+        run: python scripts/fetch_piranha_wheels.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No `platforms:` — each leg builds natively for its own runner. Emulating
+      # a Rust extension under QEMU would be slow AND a different code path from
+      # the one customers run.
+      - name: Build for this runner and load it locally
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: flag-cleanup-action:smoke
+
+      # Before the push, deliberately: a broken image is never published, so no
+      # manifest can reference one.
+      - name: Smoke the image that was just built
+        run: tests/smoke/run_image.sh flag-cleanup-action:smoke
+
+      # Same context on the same builder, so every layer is a local cache hit
+      # and this publishes the bytes the smoke just approved rather than a
+      # second, unsmoked build.
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+
+  manifest:
+    name: Assemble the multi-arch manifest
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the manifest
+        working-directory: /tmp/digests
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          MAJOR: ${{ needs.version.outputs.major }}
+        run: |
+          # `$(printf ...)` is unquoted ON PURPOSE: each digest file's NAME is a
+          # digest and every one must become its own argument. This step runs
+          # under bash, which word-splits it.
+          #
+          # The source annotation is belt and braces here rather than the fix it
+          # was in the monorepo: this workflow already runs in the repository the
+          # package should belong to, so GHCR binds it correctly with or without
+          # this line. It is kept because an index that names its own source is
+          # correct independently of who happens to push it.
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            -t "${IMAGE}:v${VERSION}" \
+            -t "${IMAGE}:${MAJOR}" \
+            -t "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Read back the manifest digest
+        id: manifest
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:v${VERSION}" \
+            --format '{{json .Manifest}}' | jq -r '.digest')"
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "expected a sha256 digest, got '${DIGEST}'" >&2; exit 1 ;;
+          esac
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+          SOURCE="$(docker buildx imagetools inspect --raw "${IMAGE}:v${VERSION}" \
+            | jq -r '.annotations["org.opencontainers.image.source"] // ""')"
+          if [ "$SOURCE" != "https://github.com/${GITHUB_REPOSITORY}" ]; then
+            echo "the index names source '${SOURCE}'" >&2
+            exit 1
+          fi
+          echo "verified: the index names ${SOURCE}"
+
+  publish:
+    name: Tag the version and publish a Release
+    needs: [version, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Generate action.yml pinned to this release's digest
+        env:
+          DIGEST: ${{ needs.manifest.outputs.digest }}
+        run: |
+          python3 scripts/generate_wrapper_action.py \
+            --digest "$DIGEST" \
+            --source action.yml \
+            --output /tmp/action.yml
+          grep -q "image: 'docker://.*@sha256:" /tmp/action.yml
+
+      - name: Commit it onto a release commit and tag it
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # The digest-pinned action.yml is committed to the TAG only, never to
+          # master. master keeps `image: 'Dockerfile'`, which is honest (a
+          # `uses: ...@master` builds from source and works) and keeps the file
+          # a human edits free of a machine-written line. Each vX.Y.Z is a
+          # commit whose only difference from its master parent is that one
+          # line.
+          cp /tmp/action.yml action.yml
+          git add action.yml
+          git commit -m "Release v${VERSION}"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+
+          # One ref per push, never `--tags`: a push carrying more than one tag
+          # suppresses the workflow runs that would otherwise fire on them.
+          # Unforced, so re-running this against an existing version is
+          # rejected rather than silently re-pointing an immutable tag.
+          git push origin "v${VERSION}"
+
+      # Every other published artefact in this organisation gets a Release, and
+      # this one did not for its first two versions. A Release is also what the
+      # GitHub Marketplace listing requires, so its absence blocked that too.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DIGEST: ${{ needs.manifest.outputs.digest }}
+        run: |
+          NOTES="$(mktemp)"
+          {
+            echo "## Using this release"
+            echo
+            echo '```yaml'
+            echo "      - uses: ${GITHUB_REPOSITORY}@v${VERSION}"
+            echo '```'
+            echo
+            echo "Pinned image: \`${IMAGE}@${DIGEST}\`"
+            echo
+            echo "\`@v${VERSION%%.*}\` tracks the newest v${VERSION%%.*} release."
+          } > "$NOTES"
+
+          # Idempotent, so a re-run of a partially-failed release converges.
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release edit "v${VERSION}" --title "v${VERSION}" --notes-file "$NOTES"
+          else
+            gh release create "v${VERSION}" --title "v${VERSION}" --notes-file "$NOTES" --verify-tag
+          fi
+
+  verify-published:
+    name: Verify the published release before promoting it
+    needs: [version, manifest, publish]
+    runs-on: ubuntu-latest
+    # Deliberately NO docker/login-action. An unauthenticated pull is what
+    # catches a package that is not actually public.
+    steps:
+      - name: Check the published action.yml pins this digest
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          DIGEST: ${{ needs.manifest.outputs.digest }}
+        run: |
+          URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/v${VERSION}/action.yml"
+          curl -fsSL "$URL" -o /tmp/published.yml
+          grep -q "image: 'docker://${IMAGE}@${DIGEST}'" /tmp/published.yml
+          echo "verified: the published v-tag pins ${DIGEST}"
+
+      - name: Pull and smoke the published image anonymously
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker pull "${IMAGE}:v${VERSION}"
+          git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}" /tmp/src
+          /tmp/src/tests/smoke/run_image.sh "${IMAGE}:v${VERSION}"
+
+  promote:
+    name: Promote the major tag to the verified release
+    needs: [version, manifest, verify-published]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # The major tag is the PROMISE — it is what every customer's `@v1` already
+      # resolves to — so it moves only after the published artefact has been
+      # pulled and smoked by the job above.
+      - name: Move the major tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          MAJOR: ${{ needs.version.outputs.major }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin "refs/tags/v${VERSION}:refs/tags/v${VERSION}" -f
+          git tag -f -a "${MAJOR}" "v${VERSION}^{}" -m "Release ${MAJOR} (v${VERSION})"
+          git push origin "refs/tags/${MAJOR}" --force

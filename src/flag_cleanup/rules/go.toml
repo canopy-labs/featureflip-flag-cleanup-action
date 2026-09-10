@@ -1,0 +1,240 @@
+# Piranha flag-cleanup rules for Go (go SDK).
+#
+# Like java.toml and unlike ts.toml, this is short: Piranha ships built-in
+# feature-flag cleanup rules for Go, so one seed rule yields the whole cascade —
+# the enclosing `if` folds, `!read` and `read && other` simplify, and a local
+# `enabled := <read>` is inlined and its declaration deleted.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+
+
+# ===========================================================================
+# 1. The flag read
+# ===========================================================================
+
+# --- <obj>.BoolVariation("KEY", ...) AS A WHOLE STATEMENT -> deleted
+#
+# The same shape and the same fix as java.toml's rule of this name — see there
+# for the ordering constraint and the safety argument, both of which apply
+# unchanged. Go is if anything the clearer case: the compiler will not even let
+# the value be discarded, so the folded `true` is `true (untyped bool constant)
+# is not used` and the flag was refused permanently (#2691).
+#
+# THIS RULE MUST STAY ABOVE `replace_boolvariation_read_with_boolean_literal`,
+# for the reason given in java.toml. Declared second it never fires.
+#
+# The one-argument-list filter carries the whole safety argument here too, and
+# Go needs LESS around it than Java does: there is no `++` and no assignment
+# among Go's expressions — both are statements, so neither can appear as an
+# argument — which is why this rule has no `not_contains` to Java's two. A
+# composite literal (`Context{User: "u"}`) has a `literal_value`, not an
+# argument list, and is genuinely pure: Go has no constructors, so deleting one
+# loses nothing. `Context{User: build()}` puts a call back inside and is refused
+# by the count, at any depth.
+#
+# `unary_expression` IS listed, and only Go needs it: `<-ch` receives from a
+# channel, which is a side effect written with no call and no argument list. It
+# takes `!strict` and `-1` with it, which is over-refusal in a position where
+# neither is a plausible argument to a boolean flag read — the direction this
+# tool errs in everywhere else.
+[[rules]]
+name = "delete_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list . (interpreted_string_literal (_) @flag_name)))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+
+# --- <obj>.BoolVariation("KEY", ...) -> @treated
+#
+# The key is matched through a WILDCARD child of the string literal, not by
+# naming the content node. That is deliberate and is the only shape that works:
+# Piranha's bundled Go grammar has no `interpreted_string_literal_content` (the
+# name the current grammar uses) and capturing the literal WHOLE is useless
+# because its text includes the quotes — and `#eq?` cannot be handed a value
+# containing a `"`. Writing `(#eq? @flag_name "\"KEY\"")` fails with
+# `Wrong number of arguments to #eq? predicate. Expected 2, got 4.`: the query
+# parser does not honour the escape, it splits on the raw quote.
+#
+# `(_)` binds the sole named child of an escape-free literal. It cannot bind an
+# escape sequence for a key this tool accepts, because `ensure_supported_key`
+# already restricts keys to [A-Za-z0-9_-]. Verified positively AND negatively:
+# the right key matches, a different key does not.
+#
+# Both callee shapes are accepted so a dot-imported or re-exported helper is
+# covered, exactly as in ts.toml. `#eq?` throughout and never `#any-of?`, which
+# Piranha's bundled tree-sitter silently ignores — an ignored predicate does not
+# fail the query, it just stops constraining it, which would leave the callee
+# unconstrained and rewrite any call whose first argument is the flag key.
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (interpreted_string_literal (_) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# --- <obj>.Boolean(ctx, "KEY", ...) AS A WHOLE STATEMENT -> deleted
+#
+# The OpenFeature counterpart of `delete_discarded_boolvariation_statement`
+# above, and it exists for the same reason that one does: Go will not let a
+# value be discarded, so folding a warm-up read to a bare `true` yields
+# `true (untyped bool constant) is not used`, the engine's self-check rejects
+# the transform, and the flag is refused on every run forever (#2691). Adding
+# the `Boolean` read rule WITHOUT this one would re-create that defect for a
+# new shape.
+#
+# THIS RULE MUST STAY ABOVE
+# `replace_openfeature_boolean_read_with_boolean_literal`, for the same reason
+# its BoolVariation twin must stay above its own. Declared second it never
+# fires, because the read has already become a literal by the time it is
+# reached.
+#
+# Same two filters and the same safety argument as the twin, and the same
+# second-argument anchor as the OpenFeature read rule below.
+[[rules]]
+name = "delete_discarded_openfeature_boolean_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (_)
+        . (interpreted_string_literal (_) @flag_name)))) @statement
+  (#eq? @sdk_fn "Boolean")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+
+# --- <obj>.Boolean(ctx, "KEY", ...) -> @treated   (OpenFeature Go client)
+#
+# The read a customer of `packages/openfeature-go` actually writes. It is the
+# OpenFeature CLIENT's method, not our provider's `BooleanEvaluation` — that is
+# our side of the contract and is never a call site.
+#
+# TWO THINGS ARE DIFFERENT HERE FROM EVERY OTHER LANGUAGE'S OPENFEATURE RULE,
+# and both are Go conventions rather than choices:
+#
+# 1. THE KEY IS THE SECOND ARGUMENT. Go takes `context.Context` first
+#    (`Boolean(ctx, flag, defaultValue, evalCtx)`), where the TS, Python and C#
+#    clients all put the key first. So the anchor is `. (_) .` — first named
+#    child is anything, the string literal is immediately after it — rather
+#    than the `. (interpreted_string_literal …)` the BoolVariation rule above
+#    uses. Copying that rule's anchor across would silently match nothing: the
+#    query stays valid, so there is no error, just a read left live.
+#
+# 2. IT PINS `Boolean`, NOT `BooleanValue`. The OpenFeature Go client spells
+#    the same read twice: `BooleanValue(...) (bool, error)` and
+#    `Boolean(...) bool`, the latter being the error-swallowing convenience
+#    form. Only the single-value form is substitutable — `enabled, err :=
+#    client.BooleanValue(...)` folds to `enabled, err := true`, which is not
+#    valid Go. This is the same judgement ts.toml makes when it declines the
+#    un-awaited call: match only what can be safely stood in for, and leave the
+#    rest to the refusal path. `openfeature_untouched_shapes` holds the
+#    two-value form precisely so that stays true.
+#
+# `#eq?` is exact, so pinning `Boolean` cannot match `BooleanValue` or
+# `BooleanValueDetails`.
+[[rules]]
+name = "replace_openfeature_boolean_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (_)
+      . (interpreted_string_literal (_) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "Boolean")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# ===========================================================================
+# 2. The one gap in Piranha's built-in cascade
+# ===========================================================================
+
+# `} else if <read> { … }` with NO trailing `else`, on the false treatment.
+# Identical defect to Java's and TypeScript's — see java.toml for the full
+# account. Deleting just the inner `if` leaves a dangling `else`, Piranha's own
+# self-check panics, and the flag is abandoned on every run, forever.
+#
+# Go's `if_statement` has no wrapper node around the alternative either, so the
+# fix rebuilds the outer statement from its captures. Unlike Java the condition
+# carries no parentheses, which is exactly why it is rebuilt from `@condition`
+# rather than assumed: the same rule text would be wrong in the other language.
+#
+# `!initializer` is the second thing Java does not need, and leaving it out was
+# a real bug. Go's `if` may carry one — `if v, err := load(); err != nil {…}` —
+# and it is a SIBLING FIELD of the condition, not part of it. Rebuilding the
+# statement from `@condition` and `@consequence` alone therefore dropped it:
+#
+#   if v, err := load(); err != nil { handle(v, err) } else if <read> { … }
+#   ->  if err != nil { handle(v, err) }        // v and err now undefined
+#
+# Copying the rule shape across from java.toml is exactly how that got in —
+# Java's grammar has no initializer, so the omission is invisible there.
+# Rather than capture and re-emit the initializer, the rule declines the shape:
+# the built-in then leaves a dangling `else`, the engine's self-check rejects
+# the whole transform, and the flag is skipped. A refusal is the right answer
+# anyway, because there is no rewrite of this shape that both drops the dead
+# branch and keeps the initializer's binding where the rest of the function can
+# see it. `syntax.py`'s `preserved_fields` check is the backstop for every
+# other route to the same damage.
+[[rules]]
+name = "delete_trailing_else_if_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    !initializer
+    condition: (_) @condition
+    consequence: (_) @consequence
+    alternative: (if_statement
+      condition: (false)
+      !alternative)) @if_statement
+)"""
+replace_node = "if_statement"
+replace = "if @condition @consequence"

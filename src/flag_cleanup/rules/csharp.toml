@@ -1,0 +1,293 @@
+# Piranha flag-cleanup rules for C# (csharp SDK).
+#
+# SHORTER than java.toml, not just short like it: Piranha's C# built-ins (added
+# by the same fork program that unlocked this grammar) already include the
+# "trailing else-if-false" fix java.toml has to carry as a second rule
+# (`delete_trailing_else_if_false` ships in the engine's own
+# crates/core/src/cleanup_rules/cs/rules.toml under the `if_cleanup` group).
+# So the seed rule below is the WHOLE file: the enclosing `if` folds, `!read`
+# and `read && other` simplify, a ternary/`??`/`is true`/switch-expression arm
+# collapses, a local `bool useNew = <read>;` is inlined and its declaration
+# deleted (with a reassignment guard — a local that is later reassigned is
+# correctly left standing), and the dangling-else gap that bites Java/Go is
+# already closed upstream. All of this was verified empirically against the
+# installed 0.5.0 wheel before being trusted, not read from Piranha's docs.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+#
+# --- grammar facts (tree-sitter-c-sharp 0.23.5, the version this fork's
+#     tree-sitter 0.25 migration pins) ---------------------------------------
+#
+# A C# string literal's unquoted text lives in `string_literal_content`, a
+# child of `string_literal` — the direct C# analogue of Java's
+# `string_fragment` and unlike Java, it is a NAMED node the current bundled
+# grammar actually exposes (verified by parsing `client.BoolVariation("k", ctx,
+# false)` with the installed `tree-sitter-c-sharp` 0.23.5 wheel and by running
+# the rule below through `execute_piranha` end-to-end). `#eq?` compares against
+# it UNQUOTED, exactly like java.toml — never against the whole `string_literal`
+# with escaped quotes: that shape (`"\"key\""`) is what fails elsewhere in this
+# tool with "Wrong number of arguments to #eq? predicate" (see CLAUDE.md), and
+# there is no need to risk it when the grammar hands us the unwrapped content
+# node directly.
+#
+# Each call argument is wrapped in its own `argument` node (C# has no
+# equivalent of Java's bare `argument_list . (string_literal …)` — the anchor
+# has to walk through `argument` first): `arguments: (argument_list . (argument
+# (string_literal (string_literal_content) @flag_name)))`. The leading `.`
+# anchors the match to the FIRST argument only, so arity is otherwise
+# unconstrained — this SDK's `BoolVariation(string key, EvaluationContext
+# context, bool defaultValue)` is fixed at three arguments today, but the rule
+# does not assume that.
+#
+# The callee is matched both as a member call (`client.BoolVariation(...)`,
+# the only shape this SDK's DI-injected `IFeatureflipClient` produces) and as a
+# bare identifier, mirroring go.toml/ts.toml, in case a project re-exports or
+# locally aliases the call. `#eq?` throughout, never `#any-of?` — the 0.5.0
+# wheel is the FIRST whose engine honours that predicate (every older bundled
+# engine silently accepted-and-ignored it, leaving the callee unconstrained to
+# fold any call whose first argument happened to be the flag key; see
+# CLAUDE.md's `#any-of?` history section), and one exact comparison per
+# capture is the shape every rule file here sticks to.
+#
+# `#eq? @sdk_fn "BoolVariation"` also means this rule structurally cannot match
+# `VariationDetail<T>(...)` (the SDK's detail-returning accessor, analogous to
+# Java's `boolVariationDetail`) — different name, exact comparison, no match.
+#
+# --- the nullable-bool hazard, verified NOT to apply here -------------------
+#
+# Piranha's C# built-ins fold `x == true` -> `x`, which is a CS0266 compile
+# error if `x` is `bool?` rather than `bool`. This SDK's `BoolVariation` always
+# returns a plain `bool` (checked against `packages/csharp-sdk` at authoring
+# time), so the value this seed rule substitutes is always a genuine boolean
+# literal, and every downstream fold (`== true`, inlining into a `bool?`
+# declaration, etc.) operates on that literal rather than on a
+# nullable-typed identifier — confirmed empirically: `bool? cached =
+# client.BoolVariation("key", ctx, false); if (cached == true) { … }` folds
+# cleanly to the live branch with no dangling `bool?` operand, because the
+# variable-inline pass replaces every use of `cached` with the literal before
+# the equality fold ever runs. The hazard the engine's own rules.toml documents
+# as unfixed is real only for a `bool?` that is populated from something OTHER
+# than this call — ordinary, unrelated code in the same file was verified to be
+# left untouched (Piranha's edges only reach ancestors of the actual rewrite
+# site), so this tool cannot trigger it.
+# --- reads whose value is DISCARDED -> the whole statement is deleted
+#
+# Same defect as Java's and Go's (#2691), reached by a different route and so
+# invisible beside them. A read that is a whole statement — a warm-up call made
+# for the SDK's own exposure event — folds to `true;`, which C# does not accept
+# (CS0201: only assignment, call, increment, decrement, await and `new` may be
+# used as a statement). Java and Go got a Gate 1 REFUSAL there because
+# tree-sitter parses `true;` happily for them; the C# grammar calls it an ERROR
+# instead, so the engine's own self-check panics first and the flag is
+# abandoned with `PiranhaTransformError` rather than `UnsafeRewriteError`.
+# Different exception, identical consequence: the flag can never be cleaned
+# from that repository, and `ignore` — the only escape — is per-run, so it
+# excludes the key from every other flag's run too.
+#
+# BOTH read shapes are affected and both need a rule: measured, the plain
+# `_client.BoolVariation("KEY", ctx, false);` and the OpenFeature
+# `await _client.GetBooleanValueAsync("KEY", false, ctx);` each abort the
+# engine today.
+#
+# THESE RULES MUST STAY ABOVE the two `replace_*` rules below. Seed rules fire
+# in declaration order and those rewrite the CALL — the child of the statement
+# these want — so declared second these never fire and C# silently goes back to
+# aborting. See java.toml for the full account; the ordering is pinned by
+# `test_a_discarded_read_rule_declared_second_stops_firing`.
+#
+# The safety argument is java.toml's, unchanged: the statement may hold exactly
+# ONE argument list, its own. Every C# invocation carries one and so does every
+# `new X(...)`, so this says "no call in this statement but the read itself"
+# without naming a method, at any depth. `mock.Verify(c => c.BoolVariation(…))`
+# cannot match these queries at all — the read is a lambda body inside an
+# argument, not the statement's own expression — and would be excluded by the
+# count regardless, so the expression-tree filter the `BoolVariation` seed rule
+# carries is deliberately NOT repeated here: an unreachable filter is noise.
+#
+# `not_contains` covers what C# can mutate without a call. `++i` and `!strict`
+# are the SAME node (`prefix_unary_expression`) in this grammar, so excluding
+# the mutation costs the negation too — over-refusal, in the direction this
+# tool errs everywhere else, and no worse than the abort it replaces.
+#
+# Deleting the `await` statement is safe and that was MEASURED rather than
+# reasoned about, because "async method lacks await" (CS1998) would be a
+# warning some customers build with `TreatWarningsAsErrors`. It does not fire:
+# an `async Task` method whose only `await` is removed compiles with zero
+# warnings on net8.0, net9.0 AND net10.0, checked with `TreatWarningsAsErrors`
+# on and confirmed live by making an unused local error out in the same build.
+[[rules]]
+name = "delete_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (string_literal (string_literal_content) @flag_name))))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+# The OpenFeature half. Rooted at the `expression_statement` and requiring the
+# `await` inside it, for the same reason the `replace_*` rule below is rooted at
+# the `await_expression`: a bare `GetBooleanValueAsync(...)` is a `Task<bool>`,
+# and a discarded Task is a fire-and-forget the customer may well have meant.
+# Only the awaited form is a completed read whose value was thrown away.
+[[rules]]
+name = "delete_discarded_getbooleanvalueasync_statement"
+query = """(
+  (expression_statement
+    (await_expression
+      (invocation_expression
+        function: [(member_access_expression name: (identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (argument_list
+          . (argument (string_literal (string_literal_content) @flag_name)))))) @statement
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+
+# --- await <obj>.GetBooleanValueAsync("KEY", default, ctx) -> @treated
+# The OpenFeature .NET provider (`Featureflip.OpenFeature`). As with the
+# JS provider, the customer's read comes from the `OpenFeature` SDK and not
+# from ours, so the rule above never sees it.
+#
+# THE MATCHED NODE IS THE `await_expression`. For C# this is not a quality
+# choice but a compile-correctness one: replacing only the inner invocation
+# leaves `await true`, and `bool` has no `GetAwaiter`, so the file no longer
+# builds (CS1061). Gate 1 would not catch that — it re-parses, and `await true`
+# PARSES perfectly well; it is a type error, one layer below anything the
+# gates can see. Measured against the shipped rules before this was added:
+# `if (await client.BoolVariation("k", ctx, false))` came back as
+# `if (await false)` with both branches intact.
+#
+# Requiring the `await` is also what makes the rewrite type-correct in the
+# other direction: an un-awaited `GetBooleanValueAsync(...)` is a `Task<bool>`,
+# not a `bool`, so substituting a boolean literal for it would be wrong even
+# where it happens to compile. A bare call is therefore left alone by design —
+# see `tests/fixtures/csharp/openfeature_untouched_shapes`.
+#
+# No `await` counterpart is needed for `BoolVariation` itself: that method
+# returns a plain `bool`, so `await client.BoolVariation(...)` could not have
+# compiled in the customer's ORIGINAL source either and cannot reach us. (The
+# TS side does need one, because awaiting a non-thenable is legal JS — hence
+# `simplify_await_*` in `ts.toml`.)
+[[rules]]
+name = "replace_getbooleanvalueasync_read_with_boolean_literal"
+query = """(
+  (await_expression
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (string_literal (string_literal_content) @flag_name))))
+  ) @await
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  (invocation_expression
+    function: [(member_access_expression name: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (argument (string_literal (string_literal_content) @flag_name)))
+  ) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- the expression-tree guard (Moq) ---------------------------------------
+#
+# `c => c.BoolVariation("KEY", …)` is not a call. It is an
+# `Expression<Func<T, bool>>` — a DESCRIPTION of a call, which Moq reads at
+# runtime to decide which member the setup or verification is about. Folding
+# the read there produces `client.Setup(c => true)`, and the damage is worse
+# than a broken build precisely because it is NOT a broken build: `c => true`
+# is a perfectly valid `Expression<Func<T, bool>>`, so it compiles, and Gate 1
+# re-parses it happily. The test then throws at run time
+# (`NotSupportedException: Expression c => True is not supported`) or, where
+# the shape does still bind, silently stops asserting anything. Every read this
+# tool folds is meant to be a read it is deleting; a mock setup is the one
+# place where the *text* of the call is the payload.
+#
+# The discriminator is structural, not a list of mocking-library method names:
+# the read's receiver is the LAMBDA'S OWN PARAMETER. That is what "describe a
+# call on the mock" looks like in every library that takes an expression tree,
+# and it is precise in the other direction too — a genuine `Func<>` lambda
+# reads the flag off a captured client, so `list.Where(x => flags.BoolVariation
+# ("KEY", ctx, false))` has receiver `flags` against parameter `x`, does not
+# match this filter, and is still folded. Name-matching `Setup`/`Verify`/
+# `SetupSequence`/… would have been both longer (no `#any-of?`, so one filter
+# per name) and wrong for the next library.
+#
+# `#eq?` here compares TWO CAPTURES rather than a capture and a hole. That form
+# is honoured by the bundled engine — verified empirically against the
+# installed 0.7.0 wheel, the same way every other predicate in these files was,
+# and pinned by `tests/fixtures/csharp/moq_expression_tree` (which contains a
+# non-mock lambda read specifically so a silently-ignored predicate shows up as
+# an over-refusal rather than passing).
+#
+# NOTE THE `@mock_expression` CAPTURE ON THE ROOT. A `not_enclosing_node` query
+# whose outermost pattern is uncaptured NEVER MATCHES — it does not error, it
+# just stops guarding, which is indistinguishable from the bug it was added to
+# fix. Confirmed by probing both forms against the wheel.
+#
+# Only `BoolVariation` needs this. The `GetBooleanValueAsync` rule above
+# requires an enclosing `await_expression`, and `await` cannot appear in an
+# expression tree at all (nor can an `async` lambda be converted to one), so
+# `Setup(c => c.GetBooleanValueAsync("KEY", false, ctx))` is already unmatched
+# — verified, not assumed. Adding an unreachable filter there would be noise.
+[[rules.filters]]
+not_enclosing_node = """(
+  (lambda_expression
+    parameters: [(implicit_parameter) @lambda_param
+                 (parameter_list (parameter (identifier) @lambda_param .))]
+    body: (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @lambda_receiver))
+  ) @mock_expression
+  (#eq? @lambda_receiver @lambda_param)
+)"""

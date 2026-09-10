@@ -1,0 +1,30 @@
+# Extra polyglot_piranha.PiranhaArguments keyword flags, passed through by
+# piranha_runner.run_piranha. (language, substitutions, paths and rule-graph
+# are supplied by the runner, not here.)
+[piranha_arguments]
+
+# `delete_consecutive_new_lines` is deliberately NOT set here, unlike
+# ts/java/go/swift — Python is the one language where it does more harm than
+# the hole it fills. MEASURED both ways on the same file:
+#
+#   on  -> every run of two-or-more newlines in the WHOLE file collapses to
+#          one. PEP 8 puts two blank lines between top-level definitions, so
+#          this rewrites the spacing of code the removal never touched:
+#          `import log` / blank / blank / `def route` came back with one blank
+#          line, i.e. `E302 expected 2 blank lines, got 1` in a file whose only
+#          intended change was three lines away. That is precisely the
+#          "unrelated formatting change" the flag exists to PREVENT elsewhere.
+#   off -> deleting a module-level guard leaves the two blank lines that were
+#          above it and the two that were below, so four in a row
+#          (`E303 too many blank lines`) — at the deletion site only.
+#
+# Local damage beats global damage: a reviewer can see why extra blank lines
+# sit where a guard used to be, and nothing else in the file moves. Inside a
+# function the residue is at most one extra blank line, which PEP 8 tolerates.
+# Recorded in README "Known gaps"; revisit if the engine ever grows a
+# language-aware blank-line policy.
+#
+# The empty table above is load-bearing: `_load_argument_flags` reads
+# `[piranha_arguments]` and passes it through as **kwargs, so an absent table
+# and an empty one behave identically — but an empty one says the omission was
+# a decision. Do not delete the file.

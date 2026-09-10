@@ -1,0 +1,159 @@
+# Piranha flag-cleanup rules for Kotlin (android SDK).
+#
+# ONE rule, and that is the whole file — but only because a Python pre-pass has
+# already done the part the engine cannot. Read
+# `src/flag_cleanup/kotlin_sentinel.py` before changing anything here.
+#
+# Holes filled per invocation via substitutions:
+#   @sentinel -> the unique identifier the pre-pass substituted for the callee
+#   @treated  -> "true" | "false"
+#
+# Note what is NOT here: no `@stale_flag_name`. The key never reaches these
+# rules — not because it structurally can't anymore, but because this file
+# deliberately keeps not routing it there. HISTORY: Piranha's OLD bundled
+# Kotlin grammar (the danieltrt fork, dropped in the 0.5.0 migration — see the
+# M4 section of ../../CLAUDE.md) gave `string_literal` NO named children
+# whatsoever — `((string_literal (_) @in) @lit)` returned no match and
+# `string_content` was not even a known node type — so there was nothing for
+# `#eq?` to compare against, and capturing the literal whole failed too
+# because `#eq?` cannot take a value containing a `"`.
+#
+# UPDATE (0.5.0, tree-sitter-kotlin-ng): re-verified against the new bundled
+# grammar and the wall is GONE. `string_literal` now has a real
+# `string_content` child (confirmed via node-types.json and by probing the
+# installed wheel directly), and `#eq?` matches its text — a direct rule like
+# `((call_expression (navigation_expression (_) (identifier) @m)
+# (value_arguments (value_argument (string_literal (string_content) @k))))
+# (#eq? @m "boolVariation") (#eq? @k "@stale_flag_name"))` DOES fire (measured
+# against a real `client.boolVariation("key", false)` call, no sentinel
+# involved). So a `java.toml`-shaped direct rule set is now technically
+# possible for Kotlin.
+#
+# Deliberately NOT done here. The sentinel pre-pass used to earn its keep on a
+# second axis too — it backed a refusal of the "dead `else if` deletes the live
+# branch ahead of it" engine defect — but 0.7.0 fixed that defect upstream
+# (piranha#32/#33) and the refusal is gone with it. What remains is still
+# enough: cutting over to direct rules would mean re-proving the
+# `!`-precedence workaround from scratch against string-literal-keyed rules
+# instead of the already-proven, already-tested sentinel path, for no
+# behavioural gain. Treat this file's not-taking of the direct-rule shortcut as
+# a decision, not an oversight.
+#
+# The pre-pass resolves the key with the wheel-installed tree-sitter-kotlin
+# grammar (a third, independently-versioned grammar from either of the above
+# — see `kotlin_sentinel`'s module docstring — and unaffected by the 0.5.0
+# engine-grammar migration) and rewrites just the callee:
+#
+#   client.boolVariation("old-checkout", false)
+#   -> __ff_cleanup_<hash>("old-checkout", false)
+#
+# leaving the engine a bare identifier callee to match, which is the one shape
+# it CAN constrain.
+
+
+# ===========================================================================
+# 1. The flag read (already marked by the pre-pass)
+# ===========================================================================
+
+# --- @sentinel(…) -> @treated
+#
+# GRAMMAR UPDATE (0.5.0: tree-sitter-kotlin-ng replaces the danieltrt fork —
+# see the M4 section of ../../CLAUDE.md): `simple_identifier` is gone,
+# unified into plain `identifier`. `(call_expression (identifier) @sdk_fn)`
+# is the bare-callee form. Measured, and the choice is not free: the sibling
+# shape `(navigation_expression (identifier) @f)` binds the RECEIVER rather
+# than the method (verified empirically against the 0.5.0 wheel, same as
+# before the migration), so `#eq?` on it never matches. Rewriting the callee
+# to a bare identifier is what sidesteps all of it.
+#
+# The arguments are deliberately unconstrained. They still hold the original
+# key, but this rule does not need to look: the pre-pass has already proved the
+# key matched, and it only ever writes this identifier over a call it proved.
+# `#eq?` on `@sentinel` is therefore an exact, engine-side re-check that the
+# identifier is ours and not something the customer happens to have written —
+# and `kotlin_sentinel.rewrite` refuses to run at all over a file that already
+# contains the name, so the two checks cannot disagree.
+#
+# `#eq?` and never `#any-of?`. UPDATE (0.5.0): `#any-of?` is now HONOURED by
+# the engine (measured — see `test_an_ignored_predicate_does_not_constrain`'s
+# docstring in `tests/test_piranha_rules.py`), where earlier engine versions
+# silently ignored it. That makes the old "silently ignored" hazard this
+# comment used to warn about unnecessary rather than dangerous. `#eq?` stays
+# the choice anyway: it is the exact-match guarantee this rule needs (one
+# sentinel per invocation), and `#any-of?` would buy nothing here even though
+# it would now work. `test_rules_use_no_ignored_predicates` still fails the
+# build if `#any-of?` appears in an uncommented rule line.
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (call_expression (identifier) @sdk_fn) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
+# --- !@sentinel(…) -> !@treated
+#
+# UPSTREAM GRAMMAR BUG (tree-sitter-grammars/tree-sitter-kotlin #3, open,
+# unfixed): a prefix `!` immediately before a postfix chain binds to the
+# RECEIVER instead of the whole chain. This bites even a bare, receiver-less
+# call: `!sentinel(k, false)` parses as `(!sentinel)(k, false)` — confirmed
+# empirically against the 0.5.0 wheel by probing `(call_expression) @top`
+# against `val r = !sentinel_id("k", false)`, which matched (and replaced)
+# the WHOLE `!sentinel_id("k", false)` span, while
+# `(call_expression (identifier) @sdk_fn)` (the base rule above) does NOT
+# match it at all — the callee positioned there is a `unary_expression`
+# wrapping the identifier, not a bare `identifier`.
+#
+# Left unhandled, the sentinel would simply never be consumed for a negated
+# read: `kotlin_sentinel.survived()` would see it still in the output and the
+# whole file would be refused. Fixed the same way the fork's own port fixes
+# it (see `replace_isToggleEnabled_with_boolean_literal_negated` and friends
+# in the piranha fork's kt test-resource rules, and
+# `test_kotlin_boolean_simplification_negated_flag_read` in its
+# tests/test_piranha.py): a companion rule matching the `!`-inclusive call
+# and replacing the WHOLE thing — receiver-`!` included — with the literal
+# text `!@treated`, so the leading `!` survives textually and the engine's
+# own `simplify_not_true`/`simplify_not_false` (reachable via the same
+# `boolean_expression_simplify` group this rule's edge already feeds) folds
+# it on the next pass. Listed BEFORE the base rule for readability/symmetry
+# with the fork's layout; not load-bearing here either — this rule's
+# `unary_expression`-callee shape and the base rule's bare-`identifier`-callee
+# shape are mutually exclusive on the same `call_expression`, so declaration
+# order cannot change which one a given call matches.
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal_negated"
+query = """(
+  (call_expression (unary_expression operator: "!" argument: (identifier) @sdk_fn)) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
+
+# ===========================================================================
+# 2. Everything else is Piranha's own
+# ===========================================================================
+# Kotlin has built-in feature-flag cleanup rules and they are the most complete
+# of any language here — MORE complete than Swift's. Verified end to end on a
+# sentinel-ified file, both treatments:
+#
+#   * `if (<read>) { … }` folds, with or without an `else`;
+#   * `!<read>` simplifies;
+#   * `return if (<read>) a() else b()` collapses to the surviving branch;
+#   * `val enabled = <read>` is INLINED and its declaration deleted — the job
+#     `ts_const.toml` plus Gate 2 do by hand for TypeScript, and the one Swift
+#     does not do at all.
+#
+# So there is no edges file and no cleanup rule of ours: `kt_edges.toml` does
+# not exist, and the seed rule's `replace_expression_with_boolean_literal`
+# group is what the built-in graph already keys off.
+#
+# The `else if (<read>)`-with-no-trailing-else gap that costs Java, Go and
+# TypeScript a bespoke rule has not been reproduced here. Do NOT assume it is
+# absent — it has not been probed, and if it turns up the fix will look like
+# java.toml's (rebuild the outer `if` from captures), not TypeScript's.

@@ -1,0 +1,80 @@
+# Flag-keyed ENTRIES — the residue a read-anchored rule cannot see: the
+# registry line (`"k": {"default": False},`), a test's override entry
+# (`{"k": True}`), a plain flag -> value map keyed the same way.
+# Design notes: CLAUDE.md, "Flag-keyed entries are RULES, not a Python pass".
+#
+# Holes: @stale_flag_name (the flag key) and @known_flag_keys — the project's
+# OTHER flag keys, rendered by `piranha_runner.render_known_flag_keys` as
+# space-separated quoted literals for `#any-of?`. Empty when the list could
+# not be fetched, which makes the registry prong match nothing (measured).
+#
+# `#any-of?` is banned in every other rule file (see python.toml). It is
+# allowed here because the alternatives are runtime data;
+# `test_entry_rules_use_any_of_only_against_the_hole` keeps it to exactly this
+# one use.
+#
+# Two prongs per shape. Both may match the same entry; the engine applies one,
+# re-parses, and the other no longer matches. No edges: a deleted entry
+# cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
+# `piranha_runner._flag_keyed_entries` reports them.
+#
+# The engine swallows the entry's comma itself (measured in every position);
+# `syntax.collapse_introduced_double_spaces` tidies the space a single-line
+# middle deletion leaves.
+#
+# EVERY KEY IS ANCHORED BETWEEN `string_start` AND `string_end`, and that is
+# what makes the comparison a WHOLE-KEY comparison rather than a prefix one.
+# Python's `string` is the one grammar in this directory whose delimiters are
+# NAMED nodes, so a bare `.` anchor would pin the content against the opening
+# quote and mean nothing; naming them is the same requirement the other
+# languages spell `(string . (string_content) @flag_name .)`. Without it an
+# f-string matches on its literal head: `f"old-checkout{x}"` parses as
+# `(string_start)(string_content "old-checkout")(interpolation)(string_end)`,
+# so the single-child form deleted an entry whose key is not the flag at all
+# (measured). `INTERP` in the fixture pins it. An escape does NOT split this
+# grammar's content — `"old-checkout\x41"` keeps one `string_content` whose
+# text is the whole thing, escape included — so the escape case was never a
+# match here.
+
+# ===========================================================================
+# Dict entries: `{"k": …}`
+# ===========================================================================
+
+# STUB PRONG — the value is a boolean literal: a test override, or a plain
+# flag -> value map. May empty its dict (`{"k": True}` -> `{}`), which is the
+# right shape for an override.
+[[rules]]
+name = "delete_flag_keyed_boolean_pair"
+query = """(
+  (pair key: (string (string_start) . (string_content) @flag_name . (string_end)) value: [(true) (false)]) @entry
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name"]
+
+# REGISTRY PRONG — another pair in the SAME dict is keyed by a different flag
+# of this project, so the dict is a flag-keyed map. The evidence cannot be
+# satisfied by the target's own key; sibling evidence inside the target's own
+# VALUE is accepted, because `contains` searches the whole subtree and a nested
+# flag map is still a flag map. So this prong CAN empty a dict whose sole pair
+# nests another flag key — measured, and the same trade the stub prong makes.
+[[rules]]
+name = "delete_flag_keyed_registry_pair"
+query = """(
+  (pair key: (string (string_start) . (string_content) @flag_name . (string_end))) @entry
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary) @registry"
+contains = """(
+  (pair key: (string (string_start) . (string_content) @sibling . (string_end)))
+  (#any-of? @sibling @known_flag_keys)
+)"""
+at_least = 1

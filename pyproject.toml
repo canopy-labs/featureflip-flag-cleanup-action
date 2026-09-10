@@ -1,0 +1,289 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flag-cleanup"
+version = "1.0.0"
+description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
+readme = "README.md"
+license = "Apache-2.0"
+# The fork wheel (see the polyglot-piranha entry below) is built for cp312
+# specifically, matching the Docker action's python:3.12-slim target — building
+# it for another interpreter is a `maturin build` rerun, not a version bump
+# here. (PyPI's upstream polyglot-piranha, for reference, ships cp39-cp312
+# only as of 0.4.8 — no 3.13/3.14 — which is the other reason this stayed capped.)
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # Pinned: Piranha rules are tree-sitter-grammar-version-sensitive, so the
+    # transform engine must not float. Bump deliberately + re-run the fixtures.
+    #
+    # 0.8.0, NOT a PyPI release: this is a privately-built engine (tree-sitter
+    # 0.27, PyO3 0.29, C# support via tree-sitter-c-sharp 0.23.5) installed
+    # from a wheel placed in wheels/ before the build (the Dockerfile
+    # bind-mounts it; CI fetches it first). A bare `pip install .` anywhere
+    # else resolves `polyglot-piranha` from PyPI, which tops out at 0.4.8 and
+    # has no C# grammar — so this pin only resolves with the local-wheel path.
+    #
+    # 0.6.0 added php/ruby/javascript languages, let one language claim several
+    # extensions, and shipped TS/TSX and Python cleanup cascades of its own —
+    # none of which changes this tool (no `_LANGUAGES` entries for the ones we
+    # do not claim; our cascade is reached only through our own edges). What it
+    # DID change is the bundled TypeScript grammar, which is why
+    # tree-sitter-typescript below is pinned to a matching build rather than a
+    # PyPI range.
+    #
+    # 0.7.0 moves the engine's own tree-sitter core 0.25 -> 0.27 and fixes two
+    # Kotlin built-ins this tool had to work around — the dead trailing
+    # `else if` that deleted the live branch ahead of it (piranha#32) and the
+    # unbraced-slot variant (#33). The refusal in `kotlin_sentinel` is gone
+    # with them; `tests/fixtures/kt/dead_end_else_if` is now a positive case
+    # and pins the fix. Every bundled GRAMMAR version is unchanged from 0.6.0
+    # (verified against the fork's `crates/core/Cargo.toml`), so none of the
+    # grammar pins below had to move with it.
+    #
+    # 0.8.0 registers Dart as a built-in with its own cascade (piranha#70/#71)
+    # — inert here, since `_LANGUAGES` does not claim `.dart` and a built-in is
+    # only ever reached through our own edges — and makes three refusals the
+    # engine previously did not make. Only one of them is reachable from this
+    # tool, and it is a corruption fix rather than a nicety: #68 stops the
+    # Kotlin inline from rewriting a name that is bound a SECOND time in scope,
+    # which until now emitted `for (true in items)` and `{ true -> … }` to
+    # disk. kotlin-ng parses `true` as an `identifier`, so no ERROR node
+    # appeared and Gate 1 could not see it — `tests/fixtures/kt/shadowed_binding`
+    # pins the fixed behaviour and fails against a 0.7.0 wheel. (#69 refuses a
+    # rewrite rule whose edit reproduces its own input, which used to hang the
+    # engine; #67 keeps every statement of a promoted Ruby `else`, and Ruby is
+    # not a language this tool claims.) Bundled grammar versions are again
+    # unchanged apart from the new tree-sitter-dart, so no pin below moved.
+    #
+    # 0.9.0 fixes three SILENT residues, and all three are reachable from here
+    # because Ruby and Dart delegate their cleanup wholesale to the engine's
+    # built-ins. Each left the flag key GONE from the file while the guard it
+    # fed stayed standing, so the next run saw a clean removal and never
+    # revisited: a top-level Ruby binding was never inlined (piranha#79, the
+    # `config.ru`/initializer/`Rakefile` shape); a Ruby read compared against a
+    # boolean literal stalled at `if true == true` (#78); and a Dart local
+    # named with one of the seventeen built-in identifiers the grammar wraps in
+    # an unnamed token was never counted as a binding, so its declaration
+    # survived (#77). `tests/fixtures/ruby/{top_level_flag,compared_to_literal}`
+    # and `tests/fixtures/dart/builtin_identifier_name` pin the three, and all
+    # three fail against a 0.8.0 wheel.
+    #
+    # The fourth change, #76, is a GRAMMAR fix rather than an engine one, and
+    # it is the reason the tree-sitter-typescript pin below moved in the same
+    # commit: the engine's TypeScript fork went from `a491d96` to `f65cc11`, so
+    # leaving Gate 1 on the old wheel would have re-opened the exact parity gap
+    # that pin exists to close. Measured while the two were apart — the gate
+    # errored on four of six `accessor` shapes the engine parsed, and the ERROR
+    # spans re-partitioned across the edit whenever the read sat inside a
+    # member named `accessor`.
+    #
+    # 0.11.0 adds `erb` as a language and changes NOTHING this tool already
+    # relied on: the manifest diff between the two tags is the workspace version
+    # plus one new crates.io dependency (`tree-sitter-embedded-template`), with
+    # no grammar git rev moved, so the tree-sitter-typescript pin below stays at
+    # `+canopy.3`. That check is the one worth repeating on every bump rather
+    # than comparing grammar version numbers, which read as clean for 0.10.0
+    # while its TypeScript fork had in fact moved.
+    #
+    # 0.12.0 (piranha#90) is the release that makes claiming `.erb` worth
+    # doing, and the manifest diff against 0.11.0 is the workspace version and
+    # nothing else -- no grammar moved, so the tree-sitter-typescript pin below
+    # stays at `+canopy.3` for the same check described above. It fixes the
+    # `elsif` reconstruction gap: a read in an `elsif` rung with a LIVE rung
+    # after it made the engine refuse the promotion, so the file came back
+    # byte-identical on the treatment that should have cleaned it -- a green
+    # run that silently does nothing for half a repository's flags, which is
+    # worse than a refusal because nothing says so. Re-measured against a
+    # 0.11.0 wheel while writing `tests/fixtures/erb/dead_elsif`, so that
+    # fixture fails against one; the oracle is `.rb`, since the same shape in
+    # plain Ruby and in a template must reach the same decision.
+    #
+    # `.erb` IS claimed as of this bump. The Gate 1 question that held it is
+    # answered in `syntax.py`: the profile parses the TEMPLATE grammar and the
+    # host-language checks judge a derived code view under Ruby's profile. A
+    # gate pointed at a bare Ruby grammar reads a template's markup as damage
+    # -- measured, 22 false refusals over 324 real engine runs and zero true
+    # positives.
+    #
+    # 0.10.0 is the same shape again, and for the same reason the pin below goes
+    # to `+canopy.3` in this commit: piranha#86 moved the engine's TypeScript
+    # fork from `f65cc11` to `dbac36b`, which parses `f<typeof import('m')>()`
+    # and `f<import('m')>()` — the first is the Vitest
+    # `importOriginal<typeof import('…')>()` idiom, and both were ERRORs before.
+    # Under `--on-parse-error abort` (the default) one such file failed the whole
+    # invocation, so this is a file the tool could not touch at all rather than a
+    # residue it left behind. Both sides are now `dbac36b`.
+    "polyglot-piranha==0.12.0",
+    # Featureflip public API client (removal-candidates fetch). Floated on
+    # major version only — this tool has no other httpx-version-sensitive
+    # surface to pin against.
+    "httpx>=0.27,<1",
+    # Backs the two safety gates in flag_cleanup.ts_syntax (post-transform parse
+    # check + pre-flight shadow check). Pure wheels, no Node in the action image.
+    # Grammar-version-sensitive like polyglot-piranha, so capped on minor.
+    "tree-sitter>=0.23,<0.26",
+    # One grammar per supported language — each backs the SAME post-transform
+    # parse check, so a language without its grammar would have no Gate 1 at
+    # all. Capped on minor for the same reason as tree-sitter itself: a grammar
+    # bump can rename node types, and the gate's checks name some of them.
+    # TypeScript/TSX. NOT a PyPI release, and pinned EXACTLY for the same
+    # reason tree-sitter-c-sharp is: Gate 1 must see the same node shapes the
+    # engine rewrites against. polyglot-piranha bundles upstream 0.23.2 plus
+    # THREE grammar patches, and this wheel is cut from the same commit the
+    # engine pins so the pair cannot drift:
+    #
+    #   a491d96  a bare `&` in JSX text (`<p>Terms & Conditions</p>`, which
+    #            `tsc` accepts) parses for the engine and ERRORS for stock
+    #            0.23.2 on PyPI.
+    #   f65cc11  `accessor` composes with `static`/`abstract`/`override`, and a
+    #            class member may be NAMED `accessor` (plain ECMAScript, so a
+    #            `.js` file is enough to hit it). Arrived with piranha 0.9.0's
+    #            #76; the wheel moved with it, which is the whole reason the
+    #            local segment went to `canopy.2`.
+    #   dbac36b  `f<typeof import('m')>()` and `f<import('m')>()` parse as type
+    #            arguments rather than as a `<` comparison. Arrived with piranha
+    #            0.10.0's #86, taking the local segment to `canopy.3`. Only
+    #            `import` was affected, and only in FIRST position: the grammar
+    #            ranked `call_expression` above the type-side rule in
+    #            `precedences`, and a reduce/reduce conflict is settled by
+    #            precedence before any declared conflict is consulted.
+    #
+    # When the two disagree, tree-sitter's error recovery re-partitions across
+    # a rewrite and Gate 1's stranded-keyword and ASI-fusion checks read that
+    # shift as damage -- refusing a correct rewrite, which is flag-wide and so
+    # abandons the whole flag on every run. Measured: 1 of 8 realistic bare-`&`
+    # shapes under stock; and with the engine on `f65cc11` while the wheel was
+    # still `a491d96`, the gate errored on 4 of 6 `accessor` shapes the engine
+    # parsed and the ERROR spans re-partitioned across the edit whenever the
+    # read sat inside a member named `accessor`.
+    #
+    # The local segment is what makes this pin safe: PyPI forbids local
+    # versions, so it can NEVER be satisfied silently by upstream's
+    # identically-numbered 0.23.2 -- it resolves only from wheels/, filled by
+    # scripts/fetch_piranha_wheels.py. The GRAMMAR version stays 0.23.2 across
+    # all three patches, so the segment is the only thing that distinguishes the
+    # builds: bump it whenever the engine's pinned commit moves. Verified
+    # against stock across 52 constructs: 9 fixed, 43 identical, 0 made worse.
+    "tree-sitter-typescript==0.23.2+canopy.3",
+    "tree-sitter-java>=0.23,<0.24",
+    "tree-sitter-go>=0.23,<0.26",
+    "tree-sitter-swift>=0.7,<0.8",
+    "tree-sitter-kotlin>=1.1,<2",
+    "tree-sitter-python>=0.23,<0.26",
+    # PHP. Capped on minor like the others. NOT pinned exactly to what the
+    # engine bundles, and it cannot be: the engine pins tree-sitter-php 0.24.2
+    # while PyPI tops out at 0.24.1, so an `==` pin would be unresolvable.
+    #
+    # The version gap is not the thing that matters — the NODE NAMES are, and
+    # they were verified to agree rather than assumed: every node this tool's
+    # rules and Gate 1 profile name (`member_call_expression`,
+    # `function_call_expression`, `name`, `string`, `encapsed_string`,
+    # `string_content`, `arguments`, `argument`, `boolean`, `else_if_clause`,
+    # `parenthesized_expression`, `compound_statement`) was read off the 0.24.1
+    # wheel's parse tree and then compiled and matched INSIDE the 0.6.0 engine.
+    # A query naming a node the engine's grammar lacks fails loudly at
+    # query-compile time (`QueryError { kind: NodeType }`), which is how the
+    # `(false)`-vs-`(boolean)` difference was caught — so this skew cannot rot
+    # silently the way the TypeScript one did (see the grammar-parity section
+    # in CLAUDE.md; that one diverged in error RECOVERY, which no query names).
+    "tree-sitter-php>=0.24.1,<0.25",
+    # Ruby. Pinned EXACTLY, like tree-sitter-c-sharp and unlike the PHP entry
+    # above: the engine's `crates/core/Cargo.toml` reads `tree-sitter-ruby =
+    # "0.23.1"` and PyPI's top version is the same, so there is no skew to
+    # reason about. Gate 1 must see the same node shapes the engine rewrites
+    # against.
+    "tree-sitter-ruby==0.23.1",
+    # ERB. Pinned EXACTLY, on the same argument as the Ruby entry above and
+    # with the same absence of a catch: the engine's `crates/core/Cargo.toml`
+    # reads `tree-sitter-embedded-template = "0.25.0"` and PyPI's top version
+    # is the same, so there is no skew to reason about and none can appear
+    # without someone choosing it. That is the property
+    # `tree-sitter-typescript==0.23.2+canopy.N` buys the hard way — a private
+    # fork, a release, a local version segment and a fetch script — and this
+    # one gets free.
+    #
+    # Exactness matters more here than for a grammar Gate 1 merely differences.
+    # `.erb`'s CODE VIEW is built by collecting every node named `code`, so a
+    # rename in this grammar does not produce a wrong answer, it produces an
+    # EMPTY view — and an empty view is clean Ruby on both sides of every
+    # differential, so all three checks that consume it would go quietly
+    # vacuous. (`test_every_profile_names_node_types_its_own_grammar_has`
+    # asserts the view is non-empty for exactly that reason.) The engine builds
+    # its own view from the same grammar, so the two must not drift either.
+    #
+    # It backs `.erb`'s Gate 1, which is the first profile here whose grammar
+    # is not the language its rules are written for: the STRUCTURE is judged
+    # with this grammar over the real file, and the host-language checks judge
+    # a derived code view under Ruby's profile. See `syntax.py`'s `code_view`.
+    "tree-sitter-embedded-template==0.25.0",
+    # C#. Pinned to the exact grammar version the fork's polyglot-piranha
+    # bundles (verified: `strings` on the built wheel and this PyPI package's
+    # own version both read 0.23.5; still 0.23.5 in 0.8.0) — Gate 1 must see
+    # the SAME node shapes the engine rewrites against, or its checks silently
+    # stop matching.
+    "tree-sitter-c-sharp==0.23.5",
+    # Dart. The ONE grammar here that is NOT the version the engine bundles,
+    # and the gap is a whole restructuring rather than a skew: the engine pins
+    # `tree-sitter-dart 0.2.0` (a conventional `call_expression` /
+    # `member_expression` grammar that exposes string content as
+    # `template_chars_*`), while 0.1.0 is the only release on PyPI and models a
+    # call as a flat selector chain exposing NO node for a string's content at
+    # all. A rule written for one matches nothing under the other.
+    #
+    # It is pinned exactly anyway, and it is sound, because GATE 1 ASKS A MUCH
+    # SMALLER QUESTION THAN THE RULES DO — only "did the error count rise" and
+    # "did a keyword land in a name position", neither of which looks at a call
+    # or a string. Measured rather than assumed: 1,310 real `.dart` files
+    # (flutter/samples, localsend, spotube) parse with ZERO error or missing
+    # nodes under 0.1.0, matching what piranha#70 measured for 0.2.0, and 36
+    # engine rewrites produced zero Gate 1 refusals, zero new parse errors, and
+    # zero rejections from the real Dart front end.
+    #
+    # The durable fix if it ever bites is a canopy-built 0.2.0 wheel, the
+    # `tree-sitter-typescript==0.23.2+canopy.3` arrangement — see CLAUDE.md.
+    # Capped exactly so that a future PyPI 0.2.0 is a deliberate decision rather
+    # than a silent grammar swap under Gate 1.
+    "tree-sitter-dart==0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    # Available for `-n 16`, but deliberately NOT enabled by default — see the
+    # "Test wall-clock" section in CLAUDE.md. Under xdist the metamorphic suite
+    # produces a residue mismatch that never appears serially, and a suite whose
+    # whole purpose is catching nondeterministic rewrites must not be run in a
+    # mode that introduces some.
+    "pytest-xdist>=3.5",
+    # `action.yml` is parsed, not regexed, by the packaging and wrapper guards:
+    # those tests assert a relationship between twelve inputs and twelve env
+    # entries, and a regex that drifts with the file's indentation would fail
+    # for reasons that have nothing to do with the property under test.
+    "pyyaml>=6",
+    # The build backend, so `pip wheel --no-build-isolation` needs no network at
+    # test time. Same package `[build-system].requires` names; pinned to nothing
+    # for the same reason it is unpinned there.
+    "hatchling",
+]
+
+[tool.hatch.build.targets.wheel]
+# Ships the .toml rule files too: they live inside src/flag_cleanup/rules, so
+# hatchling's default packaging already includes them. Do NOT add a
+# force-include for that directory — it re-adds files this line has already
+# added and a non-editable `pip install .` then dies with "A second file is
+# being added to the wheel archive at the same path". Invisible to
+# `pip install -e .` (what local dev and pytest use), so cover any change here
+# with a real wheel build.
+packages = ["src/flag_cleanup"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "-q", "--strict-markers", "-m", "not nondeterministic"]
+markers = [
+    # Preserved engine-bug reproductions. Deselected by default: a test whose
+    # point is that Piranha answers differently for identical input cannot gate
+    # CI. Run with `pytest -m nondeterministic`.
+    "nondeterministic: reproduces a Piranha nondeterminism finding",
+]

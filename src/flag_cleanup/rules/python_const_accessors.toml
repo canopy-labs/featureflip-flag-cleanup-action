@@ -1,0 +1,86 @@
+# Accessor TEMPLATES for Python's KEY-const rules. Never handed to the engine.
+#
+# The `python_accessors.toml` arrangement, one file over, for the same reason
+# and with the same mechanics: `piranha_runner` stages canonically-named files
+# into the engine's config directory, so a file nothing names is inert by
+# construction, and `rule_synthesis.with_accessor_const_rules` emits the clones
+# into the generated `python_const.toml` while the templates below never appear
+# in it. Read that file's header first — it explains why Python alone needs
+# templates at all.
+#
+# WHY THE CONST RULES NEED THEIR OWN TEMPLATE
+#
+# `python_const.toml` ships three fold rules and none of them is the right thing
+# to clone:
+#
+#   * the two `variation` rules carry `. (_) . [(true) (false)]` — the boolean
+#     literal that is the ONLY evidence a generic `variation(key, ctx, default)`
+#     reads a boolean flag. Cloned onto a wrapper it is simply wrong, for the
+#     reason `python_accessors.toml` sets out at length: a wrapper exists to
+#     hide the context and the default, so `use_flag(OLD_CHECKOUT)` could never
+#     match (#2617).
+#   * the `get_boolean_value` rule carries no such anchor and WOULD match, so
+#     without this file Python still works — but it works by cloning three rules
+#     of which two can never usefully differ from the third. Redundant rules
+#     that read like coverage are how the next reader concludes the anchor is
+#     required here.
+#
+# So one template, anchored on the hoisted KEY identifier and nothing else,
+# matching every arity a wrapper can take:
+#
+#   use_flag(OLD_CHECKOUT)                    matched
+#   use_flag(OLD_CHECKOUT, False)             matched
+#   use_flag(OLD_CHECKOUT, ctx, False)        matched
+#   use_flag(OLD_CHECKOUT, default=False)     matched
+#
+# The type evidence for an accessor is the DECLARATION: naming `use_flag` in
+# `accessors` is the customer asserting it is a boolean flag read, which is the
+# same assertion every other language gets from the callee's name.
+#
+# `key_const._python_is_removable_read` mirrors this exactly — it returns True
+# for an accessor callee without looking for the boolean literal. The two halves
+# must agree: Gate 2 withholds this whole file from a source where a surviving
+# reference to the constant is not a read these rules remove, so a gate stricter
+# than the rule makes the clone inert, and a gate looser than the rule lets the
+# declaration delete strand a live call.
+#
+# The callee name is a placeholder. `rule_synthesis` substitutes it per
+# accessor, and this file is never loaded, so the value only has to be something
+# no real rule uses.
+
+
+# --- <callee>(OLD_CHECKOUT, ...) -> @treated
+#
+# `groups` is load-bearing and must match the shipped rules': `python_edges.toml`
+# wires the cleanup cascade on the GROUP and never on a rule name, so a clone
+# that keeps this group inherits the whole cascade with no edge changes.
+#
+# The `enclosing_node` filter is the shipped rules', unchanged — it is what
+# resolves `@key_const` to a module-level assignment holding this flag's key,
+# and it is the entire reason a hoisted key is reachable at all. MODULE LEVEL
+# ONLY, matching `key_const._python_key_consts`; see `python_const.toml`.
+[[rules]]
+name = "accessor_const_template__key_anchored_only"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  (module
+    (expression_statement
+      (assignment
+        left: (identifier) @decl_name
+        right: (string (string_content) @flag_name)))) @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""

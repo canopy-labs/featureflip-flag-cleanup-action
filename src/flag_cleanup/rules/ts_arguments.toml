@@ -1,0 +1,6 @@
+# Extra polyglot_piranha.PiranhaArguments keyword flags, passed through by
+# piranha_runner.run_piranha. (language, substitutions, paths and rule-graph
+# are supplied by the runner, not here.)
+[piranha_arguments]
+# Collapse the blank lines that removing a flag read can leave behind.
+delete_consecutive_new_lines = true

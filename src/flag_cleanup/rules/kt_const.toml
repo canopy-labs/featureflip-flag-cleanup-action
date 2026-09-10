@@ -1,0 +1,114 @@
+# KEY-const propagation for Kotlin — and the ONE language where the resolution
+# is not in this file at all.
+#
+#     const val FLAG_KEY = "old-checkout"
+#     ...
+#     if (client.boolVariation(FLAG_KEY, ctx, false)) { ... }
+#
+# `piranha_runner` prepends this file to `kt.toml` for files that pass the
+# Gate 2 shadow check (see `flag_cleanup.key_const`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+# (Kotlin never reaches `with_accessors` at all — `piranha_runner` excludes it,
+# because its accessor support lives in the pre-pass — but the guard check fires
+# on FILE EXISTENCE rather than on language, so the marker is still required.)
+#
+# accessor-clones: none — see `rule_synthesis.with_accessor_const_rules`. The
+# OTHER accessor question, and the one every other `<base>_const.toml` answers
+# the opposite way (#2730): their key-const fold rules are pinned to an SDK
+# callee by `(#eq? @sdk_fn "…")` and are cloned per accessor, or a wrapper
+# cannot reach a hoisted key. This file ships no fold rule at all — see the next
+# section — so there is nothing to clone, and `kotlin_sentinel._callee_spans`
+# already marks every accessor's call before the engine runs. Written down
+# rather than left to `with_accessors` raising: "no `@sdk_fn` predicate here" is
+# also what a file whose seed rule was renamed looks like, and that one must
+# still fail loudly.
+#
+# --- WHY THERE IS NO FOLD RULE HERE ------------------------------------------
+#
+# Every other `<base>_const.toml` carries a fold rule whose filter resolves the
+# key. Kotlin cannot: its rules match a SENTINEL that `kotlin_sentinel`
+# substitutes for the callee BEFORE the engine runs, so they never see the key
+# argument at all — that is the whole reason the pre-pass exists (see
+# `kt.toml` and the module docstring of `kotlin_sentinel`).
+#
+# So the resolution moved to where the key IS visible:
+# `kotlin_sentinel.const_val_declarations` reads every `const val` holding a
+# plain string, and `_resolved_key` follows an identifier argument through it.
+# Once that matches, the callee is sentinel-ified and the existing rules in
+# `kt.toml` do the fold exactly as they do for a literal key. What is left for
+# this file is only the DECLARATION DELETE, which the pre-pass must not do —
+# the pre-pass restores every byte it writes, so a deletion made there would be
+# undone before the customer ever saw it.
+#
+# --- `const` IS REQUIRED, AND THE GRAMMAR MAKES THAT LOAD-BEARING -----------
+#
+# A plain `val` and a `var` parse IDENTICALLY here — the `val`/`var` keyword is
+# an anonymous node, so nothing in the named tree distinguishes them. Without
+# the `(#eq? @const_modifier "const")` predicate this rule would delete a
+# MUTABLE `var` holding the key. `const val` is Kotlin's genuine compile-time
+# constant, which is also what makes resolving its value sound.
+#
+# --- THE SAFETY ARGUMENT IS SPLIT ACROSS TWO HALVES -------------------------
+#
+# The bound-exactly-once half lives in `const_val_keys`, which drops any name
+# declared twice so the pre-pass will not resolve it. The dangling-reference
+# half lives in `key_const._kotlin_is_removable_read` and reaches this file the
+# same way it reaches every other language, through
+# `syntax.const_path_is_safe`. Both are needed and they refuse different
+# things; see `tests/fixtures/kt/const_key_shadowed` and
+# `tests/fixtures/kt/const_key_other_usage`.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false" — unused
+# here, but the runner substitutes it for every file).
+
+# --- delete the now-unused declaration ---------------------------------------
+# Flag-key-scoped: the initialiser must be THIS flag's key, so there is no blast
+# radius on unrelated constants.
+#
+# THE GUARD EXEMPTS THE SENTINEL, AND THAT IS ORDERING, NOT LAXITY. Every other
+# `<base>_const.toml` declares its fold rule above its delete rule and relies on
+# seed rules firing in declaration order. Kotlin cannot: its fold rules live in
+# `kt.toml`, and `_execute` PREPENDS this file, so the delete rule runs FIRST —
+# at which point every read is still standing as `__ff_cleanup_…(FLAG_KEY, …)`
+# and a plain "no call takes this constant" guard refuses forever. The
+# declaration then survives every run, which is the silent-residue failure this
+# whole feature exists to remove: the key string stays in the file, so the next
+# run reports the flag as still referenced, and the one after that, and so on.
+#
+# So the guard asks the sharper question: does any NON-sentinel call still take
+# this constant as its first argument? A sentinel call is one the pre-pass has
+# already marked and `kt.toml` is about to fold, so it is not a reason to keep
+# the declaration. Anything else is.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(source_file
+     (property_declaration
+       (modifiers (property_modifier) @const_modifier)
+       (variable_declaration (identifier) @variable_name)
+       (string_literal (string_content) @flag_name)) @declaration)
+   (class_body
+     (property_declaration
+       (modifiers (property_modifier) @const_modifier)
+       (variable_declaration (identifier) @variable_name)
+       (string_literal (string_content) @flag_name)) @declaration)] @scope
+  (#eq? @const_modifier "const")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name", "sentinel"]
+
+[[rules.filters]]
+enclosing_node = """([(source_file) (class_body) (object_declaration) (class_declaration)] @container)"""
+not_contains = ["""(
+  (call_expression
+    [(navigation_expression (identifier) (identifier) @callee)
+     (identifier) @callee]
+    (value_arguments . (value_argument (identifier) @first_arg))) @surviving_read
+  (#eq? @first_arg "@variable_name")
+  (#not-eq? @callee "@sentinel")
+)"""]

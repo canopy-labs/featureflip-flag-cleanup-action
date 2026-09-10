@@ -1,0 +1,145 @@
+# Piranha flag-cleanup rules for Dart/Flutter (flutter SDK).
+#
+# C#-tier: the engine's Dart built-ins (piranha#70/#71) ship a full cascade —
+# the `if` fold, `!read`, `read && other`, a conditional expression, the
+# collection-`if` element, and inlining a local bound to the read — so the seed
+# rule below is the whole file. It is reached the way every built-in cascade is
+# reached, by the group name: `replace_expression_with_boolean_literal` is the
+# `from` of the first edge in the engine's `dart/edges.toml`.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+#
+# --- grammar facts (tree-sitter-dart 0.2.0, the version the engine pins) ----
+#
+# THIS IS NOT THE GRAMMAR ON PyPI. PyPI's `tree-sitter-dart` tops out at 0.1.0,
+# which models Dart calls as a flat selector chain (`identifier` +
+# `selector(unconditional_assignable_selector …)` + `selector(argument_part …)`)
+# and exposes NO node for a string literal's content at all. 0.2.0 is a
+# restructured grammar with a conventional `call_expression`. Every query below
+# is written against 0.2.0 — the one the engine parses and rewrites with — and
+# would match nothing under 0.1.0. See CLAUDE.md for what that means for Gate 1,
+# which is a separate question with a separate answer.
+#
+# Three shapes make this the cleanest seed rule of any language here:
+#
+# * **`call_expression` has `function:` and `arguments:` fields.** The member
+#   form is `function: (member_expression property: (identifier))`, the bare
+#   form is `function: (identifier)` — the same two-arm alternation every other
+#   language uses, with no PHP-style split across two node types.
+# * **Null-aware access is its OWN node type.** `client?.boolVariation(…)` is a
+#   `null_aware_member_expression`, not a `member_expression`, so it is excluded
+#   STRUCTURALLY — like PHP's `?->` and unlike Ruby's `&.`, which needed an
+#   explicit anchor. Folding it would be wrong for the usual reason: the
+#   expression is `null` rather than a boolean when the receiver is null.
+# * **The content node's TYPE encodes the quote style.** A single-quoted string
+#   exposes `template_chars_single_single`, a double-quoted one
+#   `template_chars_double_single`, both under a per-style wrapper inside
+#   `string_literal`. Hence the alternation; missing one would silently ignore
+#   every read written the other way, the defect `php.toml` records.
+#
+# --- the anchors -----------------------------------------------------------
+#
+# `(_ . [(template_chars_single_single) (template_chars_double_single)] @flag_name .)`
+# anchors the content as the wrapper's ONLY named child, which is what excludes
+# an interpolated key. `'dark-mode$suffix'` exposes a `template_substitution`
+# sibling and a `template_chars_*` of `dark-mode`, so unanchored a flag really
+# named `dark-mode` would fold a read whose runtime key is something else.
+# Verified by removing the anchors and watching it fold.
+
+# --- why there are TWO seed rules, not one ---------------------------------
+#
+# `A COMMENT IS A NAMED NODE`, so inside a multi-line argument list it becomes
+# the FIRST NAMED CHILD of `arguments` and defeats the `.` anchor on the key:
+#
+#     c.boolVariation(
+#       // legacy
+#       'dark-mode',            <- no longer the first named child
+#       defaultValue: false,
+#     )
+#
+# Dart formats long calls across lines, so this is ordinary code rather than an
+# edge case — the metamorphic harness found it on the `collection_if` fixture,
+# which is the SDK README's own `ListenableBuilder` shape.
+#
+# **No single pattern expresses "the first non-comment named child."** All four
+# obvious forms were measured and every one fails somewhere:
+#
+#   `. (comment)* (string_literal …)`   matches only WITH a comment present
+#   `. (comment)? . (string_literal …)` same — the anchor does not compose
+#                                       with a quantifier over zero matches
+#   `(comment)? . (string_literal …)`   drops the position anchor entirely, so
+#                                       `boolVariation(ctx, 'key', …)` matches
+#   `. (comment)? (comment)? . (…)`     as the first two, plus a false accept
+#
+# So the two shapes are written out. `rule_synthesis` dedupes seed rules by
+# SHAPE and clones each distinct one per accessor, so both are carried into the
+# `accessors` path automatically — a wrapper call can carry a leading comment
+# too. Two or more leading comments fall through to no match, which is a
+# residue rather than a wrong rewrite.
+#
+# Dropping the anchor instead was considered and rejected: every other language
+# here pins the key to the FIRST argument (it is what keeps arity otherwise
+# unconstrained), the README documents accessors as matching the key at any
+# arity but in first position, and Dart diverging alone would be unexplained.
+#
+# --- the named argument, and why nothing anchors it ------------------------
+#
+# The SDK reads `bool boolVariation(String key, {required bool defaultValue})`
+# — the key is positional argument 0, the default is a REQUIRED NAMED
+# parameter, which no other language here has. The leading `.` anchors the key
+# to the first argument; the default is deliberately not matched at all.
+#
+# That is the same reasoning `ruby.toml` records rather than a new one: the
+# METHOD NAME is the type signal (`boolVariation` is boolean-specific under an
+# exact `#eq?`, and `stringVariation`/`numberVariation`/`jsonVariation` cannot
+# match it), and the upstream protection against a non-boolean flag reaching a
+# rule at all is `client.py`'s `_require_bool`. Anchoring `defaultValue:` as
+# well would only constrain the call to a shape the SDK already requires, while
+# breaking on the argument order Dart lets callers choose freely.
+
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  [(call_expression
+      function: (member_expression property: (identifier) @sdk_fn)
+      arguments: (arguments
+        . (string_literal (_ . [(template_chars_single_single)
+                                (template_chars_double_single)] @flag_name .))))
+   (call_expression
+      function: (identifier) @sdk_fn
+      arguments: (arguments
+        . (string_literal (_ . [(template_chars_single_single)
+                                (template_chars_double_single)] @flag_name .))))] @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# The same rule with ONE leading comment inside the argument list. See "why
+# there are TWO seed rules" above; this is not a duplicate but the second of
+# two shapes tree-sitter cannot express as one.
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal_after_comment"
+query = """(
+  [(call_expression
+      function: (member_expression property: (identifier) @sdk_fn)
+      arguments: (arguments
+        . (comment) . (string_literal (_ . [(template_chars_single_single)
+                                (template_chars_double_single)] @flag_name .))))
+   (call_expression
+      function: (identifier) @sdk_fn
+      arguments: (arguments
+        . (comment) . (string_literal (_ . [(template_chars_single_single)
+                                (template_chars_double_single)] @flag_name .))))] @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]

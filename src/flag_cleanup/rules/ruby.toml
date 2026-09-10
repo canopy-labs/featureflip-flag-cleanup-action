@@ -1,0 +1,178 @@
+# Piranha flag-cleanup rules for Ruby (ruby SDK).
+#
+# A seed rule riding the engine's built-ins, the `csharp.toml` shape. The
+# engine's own `cleanup_rules/ruby/rules.toml` is 1,158 lines and carries the
+# whole cascade — the `if`/`unless` fold, `!read`, `read && other`, a ternary,
+# the trailing-`elsif` case, and inlining a local bound to the read — so the
+# seed rule below is the entire file. It is reached the way every built-in
+# cascade is reached, by the group name: `replace_expression_with_boolean_literal`
+# is the `from` of the first edge in the engine's `ruby/edges.toml`.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+#
+# --- grammar facts (tree-sitter-ruby 0.23.1, the version the engine pins) ---
+#
+# Ruby is EASIER than PHP in two ways and harder in one, all three measured
+# against the wheel rather than read from a grammar reference:
+#
+# * **Both quote styles are one node type.** `'k'`, `"k"` and `%q(k)` all parse
+#   as `(string (string_content))`. There is no `encapsed_string` alternation
+#   to write, which is the PHP entry's whole complication.
+# * **Every call form is one node type.** Member, module-singleton, bare, and
+#   bare-without-parens all produce `(call)`; only the receiver differs
+#   (`identifier` / `constant` / `instance_variable` / absent). So the two arms
+#   below are about the RECEIVER's presence, not about different node types.
+# * **`&.` is NOT structurally excluded, unlike PHP's `?->`.** In the
+#   s-expression `client&.bool_variation(...)` is IDENTICAL to the dot form —
+#   the operator is an anonymous node sitting in a named `operator:` field.
+#   Left unhandled, a safe-navigation read folds to a literal when its true
+#   value is `nil`, which is the same class of loss as Kotlin's `client?.`
+#   (see `kt.toml`) with none of the grammar's help in spotting it.
+#
+# --- the two anchors that carry the whole rule -----------------------------
+#
+# Both were verified by REMOVING them and watching a wrong match appear, not by
+# reasoning about the query language:
+#
+# 1. **The `"."` in the first arm is what excludes `&.`**, and the leading `.`
+#    in the second arm is what stops that arm letting `&.` back in — it forces
+#    `method` to be the first NAMED child, which only a receiverless call
+#    satisfies. Drop either and `client&.bool_variation("k", ctx, false)` folds.
+# 2. **`(string . (string_content) @flag_name .)` excludes an interpolated
+#    key.** Unanchored, `"pre#{x}"` exposes a `string_content` of `pre`, so a
+#    flag genuinely named `pre` would fold a read whose runtime key is
+#    something else entirely. The anchors require the content to be the string's
+#    only child.
+#
+# --- why the method name alone is enough -----------------------------------
+#
+# Ruby is untyped, so `default_value` carries no type evidence, and every
+# accessor (`string_variation`, `number_variation`, `json_variation`) has an
+# identical three-positional shape. The METHOD NAME is the only type signal —
+# which is fine, because `bool_variation` is boolean-specific and `#eq?` is an
+# exact comparison. The protection against a non-boolean flag reaching here at
+# all is upstream and deliberate: `client.py`'s `_require_bool` rejects any
+# candidate whose `treatment` is not a boolean before a rule ever runs. A
+# redundant positional anchor on the third argument would only constrain arity
+# for no gain.
+#
+# `#eq?` throughout, never `#any-of?` — one exact comparison per capture is the
+# shape every rule file here sticks to (see CLAUDE.md's `#any-of?` history).
+
+# --- <recv>.bool_variation("KEY", ctx, default) -> @treated -----------------
+#
+# Matches both documented receivers — `client.bool_variation` (the instance
+# method, `packages/ruby-sdk/lib/featureflip/client.rb`) and
+# `Featureflip.bool_variation` (the module-level singleton,
+# `packages/ruby-sdk/lib/featureflip.rb`) — plus a bare call, which is what an
+# `accessors` wrapper looks like once it is re-exported into scope.
+[[rules]]
+name = "replace_bool_variation_read_with_boolean_literal"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list . (string . (string_content) @flag_name .)))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list . (string . (string_content) @flag_name .)))] @call
+  (#eq? @sdk_fn "bool_variation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- the elsif gap ----------------------------------------------------------
+#
+# The engine's built-ins carry `replace_elsif_true` and nothing for the FALSE
+# side, so a flag read in a trailing `elsif` folds to `elsif false` and stays
+# there. Measured against 0.8.0: without the two rules below,
+# `elsif false` survives in every position — last, mid-chain, and followed by
+# an `else`. That is safe (the branch is dead, the code is correct) but the
+# flag key is gone from the file, so the leftover is PERMANENT: every later run
+# sees a clean removal and never comes back for it. TypeScript, Java, C# and
+# PHP all clean this shape, so leaving it would make Ruby the only one that
+# does not.
+#
+# **Ruby's `elsif` NESTS, and that is what makes this two rules rather than
+# PHP's one-line deletion.** PHP's `if` owns a flat list of `else_if_clause`
+# siblings, so deleting one cannot strand anything. Ruby's `elsif` owns the
+# next rung as its own `alternative:` CHILD:
+#
+#     (if condition consequence
+#       alternative: (elsif condition: (false) consequence
+#                      alternative: (else …)))
+#
+# So a bare deletion takes the live `else` down with the dead `elsif` — exactly
+# the defect piranha#32 fixed for Kotlin and #67 fixed for Ruby's own
+# `replace_if_false`. The two rules below split on whether that child exists
+# rather than capturing it optionally: an optional capture is precisely the
+# shape that produced #67, where `(_)? @alternative` bound one child and
+# silently dropped the rest.
+#
+# `replace_elsif_true` needs no counterpart to this, and that asymmetry is
+# correct rather than an oversight: everything after an `elsif true` is
+# unreachable, so discarding the nested alternative is the right answer there.
+
+# `elsif false` with a live rung after it — promote that rung in place of the
+# dead one. Covers both `elsif false … else …` and `elsif false … elsif … `,
+# since the following rung is the same `alternative:` child either way.
+[[rules]]
+name = "promote_alternative_over_dead_elsif"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (elsif
+     condition: [(false) (parenthesized_statements (false))]
+     consequence: (then)
+     alternative: (_) @alternative) @clause
+)"""
+replace_node = "clause"
+replace = "@alternative"
+
+# `elsif false` LAST in the chain — nothing to promote, so the clause goes.
+# The `.` anchor after `consequence:` is what distinguishes this from the rule
+# above: it requires the consequence to be the last named child, i.e. that
+# there is no `alternative:` at all. Without it this rule also matches the
+# shape above and, being a deletion, takes the live rung with it.
+[[rules]]
+name = "delete_dead_trailing_elsif"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (elsif
+     condition: [(false) (parenthesized_statements (false))]
+     consequence: (then) .) @clause
+)"""
+replace_node = "clause"
+replace = ""
+
+# --- a gap that WAS here and is now closed upstream -------------------------
+#
+# This block used to say that a flag read in the LEADING `if` of an `if`/`elsif`
+# chain was left as a permanent residue: folding it to `if false` matched
+# neither built-in (`replace_if_false` wants `alternative: (else ...)`, and
+# `replace_if_statement_false_without_else` wants the consequence to be the last
+# child), so the whole chain survived with a dead leading rung.
+#
+# The engine closed it -- piranha#84, shipped in fork 0.10.0 -- which is exactly
+# where the old note said the fix belonged, since the same rule serves every
+# consumer. Re-measured on the pinned engine, both treatments and both `.rb` and
+# `.erb`: the chain is promoted cleanly and a comment in the promoted rung
+# survives, which was the specific cost that made a LOCAL promotion rule
+# unacceptable here.
+#
+# `tests/fixtures/{ruby,erb}/leading_if_chain` pin it now. That is the part
+# worth keeping: the residue went away one engine bump before anyone noticed,
+# and nothing downstream could see it because no fixture covered the shape --
+# the README carried the stale caveat to customers until #2689 measured it.
+#
+# The reason a local rule was rejected still stands and is why this stays the
+# engine's job rather than being re-attempted here: Ruby's chain NESTS, so the
+# `elsif` node's own text begins with the `elsif` keyword and cannot head a
+# statement, forcing a rebuild from `condition:`/`consequence:` captures -- and
+# a rebuild drops a `(comment)`, which is a SIBLING of `(then)` inside `elsif`
+# and so falls between the captures. Gate 1 cannot see a lost comment, because a
+# comment is not syntax. (PHP closes the same gap locally only because its chain
+# is FLAT, so its clause's siblings are untouched.)

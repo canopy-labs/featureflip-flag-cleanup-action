@@ -1,0 +1,37 @@
+# Wires ONE extra edge onto PHP's built-in cascade (see php.toml). Piranha
+# reads [[edges]] only from this file, never from rules.toml.
+#
+# UNLIKE ts_edges.toml/python_edges.toml, this file does NOT define a cascade.
+# PHP is a built-in engine language, so `get_rule_graph` MERGES what is here
+# with `cleanup_rules/php/edges.toml` (concatenate, then rebuild) rather than
+# replacing it — every built-in edge is still in force and must not be
+# restated. The one edge below exists because the built-in graph has a dead
+# end that a rule alone cannot reach around:
+#
+#     statement_cleanup -> if_cleanup -> remove_unnecessary_nested_block
+#
+# `if_cleanup` fans out to `remove_unnecessary_nested_block` and to NOTHING
+# ELSE — in particular not back to `if_cleanup`. So the moment a built-in
+# if-fold fires, every rule in the `if_cleanup` group is out of reach for the
+# node it just rewrote, including the two this repo adds. That is not a
+# theoretical gap: it is exactly why the two-word `else if` residue could not
+# be closed with a rule (CLAUDE.md's three measured attempts all put the rule
+# in a group the engine never consults at that point).
+#
+# `remove_unnecessary_nested_block` is not a usable target either, and the
+# reason is worth writing down because it looks like the cheap fix: it is a
+# rule NAME as well as an edge endpoint, and `RuleGraph::get_rules_for_group`
+# short-circuits on `get_rule_named` before it ever looks at groups. Declaring
+# `groups = ["remove_unnecessary_nested_block"]` and skipping this file
+# therefore resolves to the built-in rule alone and silently drops ours — a
+# rule that compiles, validates, and never fires. MEASURED, not inferred from
+# the source: done that way, the `} else { }` residue comes straight back.
+#
+# Hence a group name of our own. `from = "if_cleanup"` is the group (there is
+# no rule of that name), so this reaches every built-in if-fold plus our two
+# `elseif` rules; breadth is free here because the target rule's query is
+# exact and Parent scope already confines it to ancestors of the edit.
+[[edges]]
+scope = "Parent"
+from = "if_cleanup"
+to = ["php_emptied_else_cleanup"]

@@ -1,0 +1,75 @@
+# Accessor TEMPLATES for Python. Never handed to the engine.
+#
+# `piranha_runner` stages a config directory holding canonically-named files
+# (`rules.toml`, `edges.toml`) and copies them there by name, so a file that no
+# stage names is inert by construction — this one is a source of blocks to
+# CLONE, not a rule set. `rule_synthesis.with_accessors` emits the clones into
+# the generated `python.toml`; the templates below never appear in it.
+#
+# WHY PYTHON NEEDS THIS AND NO OTHER LANGUAGE DOES
+#
+# Everywhere else the seed rule being cloned is `boolVariation` — boolean by
+# NAME — so its query constrains only the flag key and a clone inherits that
+# looseness for free. A declared accessor is then matched at any arity, which
+# is what README's "Wrapping the SDK" promises and what `useFlag('key')` needs.
+#
+# The Featureflip Python SDK has no boolean-specific read: `variation(key,
+# context, default)` is generic over the flag's type. So `python.toml`'s seed
+# rule anchors `. (string) . (_) . [(true) (false)]` — a boolean literal in the
+# third positional slot — because that is the ONLY evidence the call site
+# carries that this flag is a boolean. Fold `variation("k", ctx, "control")` to
+# `True` and you have silently changed a string flag's type. That anchor must
+# stay exactly where it is; see rules/python.toml's header, point 2.
+#
+# Cloning the seed carried the anchor into every accessor rule too, and there
+# it is simply wrong: a wrapper exists precisely to hide the context and the
+# default, so `useFlag("old-checkout")` — README's own example — could never
+# match. It failed the quiet way: no match, `no-changes`, a green run, no pull
+# request, and nothing saying why (#2617).
+#
+# The type evidence for an accessor is the DECLARATION. A customer naming
+# `useFlag` in `accessors` is asserting it is a boolean flag read, which is
+# the same assertion the other languages get from the callee's name. So the
+# template below anchors the key and nothing else, and one template covers
+# every shape a wrapper can take:
+#
+#   useFlag("KEY")                    matched
+#   useFlag("KEY", False)             matched
+#   useFlag("KEY", ctx, False)        matched  (worked before this file)
+#   useFlag("KEY", default=False)     matched  (worked before this file)
+#
+# One template, not two: `python.toml` needs a separate keyword rule because
+# its boolean literal may sit anywhere in the argument list, but with no
+# constraint past the key there is nothing left for a second shape to say.
+#
+# The callee name is a placeholder. `rule_synthesis` substitutes it per
+# accessor, and this file is never loaded, so the value only has to be
+# something no real rule uses.
+
+
+# --- <callee>("KEY", ...) -> @treated
+#
+# `groups` is load-bearing and must match the seed rule's: `python_edges.toml`
+# wires the cleanup cascade (boolean simplification, the `if` fold, statement
+# cleanup) on the GROUP and never on a rule name, so a clone that keeps this
+# group inherits the whole cascade with no edge changes. Without it the read
+# would be replaced and `if True:` left standing around a live branch.
+#
+# `string_content` rather than the whole `string`, and `#eq?` rather than
+# `#any-of?`, for the reasons `python.toml`'s seed rule documents at length.
+[[rules]]
+name = "accessor_template__key_anchored_only"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (string (string_content) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]

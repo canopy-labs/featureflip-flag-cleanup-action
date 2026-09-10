@@ -1,0 +1,13 @@
+# Extra polyglot_piranha.PiranhaArguments keyword flags, passed through by
+# piranha_runner.run_piranha. (language, substitutions, paths and rule-graph
+# are supplied by the runner, not here.)
+[piranha_arguments]
+# Collapse the blank lines that removing a flag read can leave behind. Without
+# it a deleted guard leaves a two- or three-line hole in the diff, which reads
+# as an unrelated formatting change to whoever reviews the pull request.
+#
+# Safe here in a way it is not for Python: Kotlin is brace-delimited and has no
+# blank-line convention a linter enforces the way PEP 8 does, so collapsing
+# runs of newlines cannot invalidate untouched code. See python_arguments.toml
+# for the case where this had to be turned off.
+delete_consecutive_new_lines = true

@@ -1,0 +1,369 @@
+# KEY-const propagation for C# — the flag key hoisted to a `const string`, as in
+#
+#     private const string FlagKey = "two-factor-auth";
+#     ...
+#     _client.BoolVariation(FlagKey, Context(userId, email), defaultValue: true);
+#
+# `piranha_runner` prepends this file to `csharp.toml` for files that pass the
+# Gate 2 shadow check (see `syntax.const_path_is_safe`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+# The TS const rules DO bind a read and must carry one; that asymmetry is why
+# the marker is explicit rather than inferred from the file's shape.
+#
+# --- WHY THIS IS A DIFFERENT PROBLEM FROM `ts_const.toml` ---------------------
+#
+# Three const mechanisms exist in this tool and they are easy to conflate:
+#
+#   * `ts_const.toml` propagates a const bound to the flag READ's RESULT
+#     (`const on = boolVariation('k')`). The value it moves is a boolean.
+#   * Piranha's C# built-ins already inline a local `bool useNew = <read>;`
+#     (see `csharp.toml`'s header, and `tests/fixtures/csharp/assigned_then_used`).
+#   * THIS file resolves the read's KEY ARGUMENT through a `const string`. The
+#     value it moves is the key, and it moves it at match time rather than by
+#     rewriting anything — the declaration is matched as a FILTER, so the key
+#     never has to be substituted into the source at all.
+#
+# --- THE SAFETY ARGUMENT IS GATE 2, NOT THE QUERIES --------------------------
+#
+# `syntax._csharp_const_path_is_safe` withholds this whole file from any source
+# where the const's name is bound more than once, or is referenced by anything
+# other than a flag read this file's rules will themselves remove. Following the
+# lesson written at the top of `ts_const.toml`: enumerating the unsafe shapes in
+# tree-sitter query guards leaked twice for TS, so the queries below are NOT
+# where the safety lives. Two concrete losses if that check is weakened:
+#
+#   1. WRONG BRANCH. `enclosing_node` finds the class-level const from anywhere
+#      inside the class, INCLUDING a method that shadows the name with a local
+#      const bound to a different key. Without the bound-exactly-once check the
+#      other flag's read folds to THIS flag's value — it compiles, it looks
+#      right, and it is wrong. `tests/fixtures/csharp/const_key_shadowed`.
+#   2. DANGLING REFERENCE. The delete rule below removes the declaration. If
+#      anything else in the file still reads the const, the result does not
+#      compile. `tests/fixtures/csharp/const_key_other_usage`.
+#
+# Gate 1 catches NEITHER: the first produces valid C# with no ERROR nodes, and
+# the second is a name-resolution error one layer below anything a re-parse can
+# see — the same blind spot `await true` sits in (see `csharp.toml`).
+#
+# Because Gate 2 guarantees every remaining reference is a read these rules
+# remove, the delete rule needs no usage census of its own. It carries one
+# anyway (see its filter): that guard is what SEQUENCES the two rules, not what
+# makes them safe.
+#
+# --- grammar facts (tree-sitter-c-sharp 0.23.5) ------------------------------
+#
+# A const declaration is `field_declaration` at class level and
+# `local_declaration_statement` inside a method; both wrap the same
+# `variable_declaration -> variable_declarator`. `const` is a `modifier` CHILD
+# rather than a field, so it is matched by text — and matched at all, because
+# `static readonly string` is NOT a compile-time constant (it may be assigned in
+# a static constructor) and must not be resolved this way.
+#
+# `variable_declarator`'s value has NO field name in this grammar and NO
+# `equals_value_clause` wrapper: the initialiser is a direct positional child
+# after the `=` token, so it is matched positionally.
+#
+# An interpolated (`$"..."`) or concatenated (`"a" + "b"`) initialiser is a
+# different node type entirely (`interpolated_string_expression`,
+# `binary_expression`), so a computed key is structurally unmatchable here
+# rather than needing a guard. A verbatim `@"..."` key is likewise unmatched —
+# a real gap, but one that fails closed to today's silent no-op.
+#
+# The `type: (_) . (variable_declarator …) .` anchors mean EXACTLY ONE
+# declarator: the declarator must immediately follow the type and also be last.
+# `const string A = "k", B = "j";` therefore matches nothing here, so the delete
+# rule can never take a statement that also binds something else.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+# --- BoolVariation(FlagKey, …); AS A WHOLE STATEMENT -> deleted --------------
+#
+# The statement-position read with the key behind a `const string`.
+# `csharp.toml`'s two `delete_discarded_*_statement` rules anchor a string
+# LITERAL, like every seed rule in this tool, so a hoisted key never reached
+# them. C# fails this differently from Java and Go and worse: its grammar calls
+# a bare `true;` an ERROR, so the engine's own "Produced syntactically incorrect
+# source code" self-check panics before Gate 1 is ever consulted, and the flag
+# is abandoned with `PiranhaTransformError` (#2716, #2691).
+#
+# BOTH read shapes need a rule, exactly as they do for the literal key: the
+# plain `_client.BoolVariation(FlagKey, ctx, false);` and the OpenFeature
+# `await _client.GetBooleanValueAsync(FlagKey, false, ctx);` each abort today.
+#
+# THESE RULES MUST STAY ABOVE the three `replace_*` rules below. Seed rules fire
+# in declaration order and those rewrite the CALL (or the `await` around it) —
+# the child of the statement these want — so declared second they never fire and
+# the abort silently comes back. `_execute` PREPENDS this whole file, so being
+# above `csharp.toml`'s rules is already true; being above this file's own read
+# rules is what the position buys, and
+# `test_a_discarded_read_rule_declared_second_stops_firing` pins both.
+#
+# THE FILTERS ARE THE LITERAL RULES', UNCHANGED, plus this file's declaration
+# resolution. The safety argument does not depend on how the key is spelled: the
+# statement may hold exactly ONE argument list, its own, so a computed or
+# allocated argument is refused here exactly as it is there, and `not_contains`
+# covers what C# can mutate without a call. The expression-tree filter the read
+# rule below carries is deliberately NOT repeated, for the reason `csharp.toml`
+# gives: a Moq lambda is an ARGUMENT, never the statement's own expression, so
+# the filter would be unreachable here and an unreachable filter is noise.
+[[rules]]
+name = "delete_discarded_boolvariation_const_key_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (identifier) @key_const)))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(declaration_list
+     (field_declaration
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))
+   (block
+     (local_declaration_statement
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+  (#eq? @const_modifier "const")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+# The OpenFeature half. Rooted at the `expression_statement` and requiring the
+# `await` inside it, for the same reason `csharp.toml`'s is: a bare
+# `GetBooleanValueAsync(...)` is a `Task<bool>`, and a discarded Task is a
+# fire-and-forget the customer may well have meant. Only the awaited form is a
+# completed read whose value was thrown away.
+[[rules]]
+name = "delete_discarded_getbooleanvalueasync_const_key_statement"
+query = """(
+  (expression_statement
+    (await_expression
+      (invocation_expression
+        function: [(member_access_expression name: (identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (argument_list
+          . (argument (identifier) @key_const))))) @statement
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(declaration_list
+     (field_declaration
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))
+   (block
+     (local_declaration_statement
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+  (#eq? @const_modifier "const")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+# --- fold the read: `BoolVariation(FlagKey, …)` -> @treated ------------------
+# Declared BEFORE the delete rule. Seed rules fire in declaration order, and the
+# delete rule's filter additionally refuses while any such call survives, so the
+# declaration cannot be removed out from under a read that still needs it.
+[[rules]]
+name = "replace_boolvariation_const_key_read_with_boolean_literal"
+query = """(
+  (invocation_expression
+    function: [(member_access_expression name: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (argument (identifier) @key_const))
+  ) @call
+  (#eq? @sdk_fn "BoolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(declaration_list
+     (field_declaration
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))
+   (block
+     (local_declaration_statement
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+  (#eq? @const_modifier "const")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# The expression-tree guard, for the same reason and in the same shape as the
+# one on the literal-key rule in `csharp.toml` — see the long comment there.
+# It matters MORE here: a mock setup naming the key const is a live reference
+# to the declaration, so folding it would be wrong and deleting the const
+# underneath it would strand the reference. `syntax.py` refuses to count a
+# read in this position as removable, which makes Gate 2 withhold the whole
+# const path for such a file; this filter is the engine-side half of the same
+# rule, so the two cannot drift into disagreeing.
+[[rules.filters]]
+not_enclosing_node = """(
+  (lambda_expression
+    parameters: [(implicit_parameter) @lambda_param
+                 (parameter_list (parameter (identifier) @lambda_param .))]
+    body: (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @lambda_receiver))
+  ) @mock_expression
+  (#eq? @lambda_receiver @lambda_param)
+)"""
+
+# --- fold the OpenFeature read: `await …GetBooleanValueAsync(FlagKey, …)` ----
+# The `await` is matched for the same compile-correctness reason the literal-key
+# rule in `csharp.toml` matches it: replacing only the invocation leaves
+# `await true`, and `bool` has no `GetAwaiter` (CS1061). See that file's header.
+
+[[rules]]
+name = "replace_getbooleanvalueasync_const_key_read_with_boolean_literal"
+query = """(
+  (await_expression
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (identifier) @key_const)))
+  ) @await
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(declaration_list
+     (field_declaration
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))
+   (block
+     (local_declaration_statement
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @decl_name
+           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+  (#eq? @const_modifier "const")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- delete the now-unused declaration ---------------------------------------
+# Flag-key-scoped: the initialiser must be THIS flag's key, so there is no blast
+# radius on unrelated `const string`s.
+#
+# ROOTED AT THE PARENT and deleting the declaration as a child of it, for the
+# reason `ts_const.toml`'s delete rule is: matching the declaration on its own
+# ignores what encloses it, and a wrapper we did not anticipate would have its
+# insides removed and its shell left behind. Requiring a `declaration_list` or
+# `block` parent makes an unanticipated wrapper unmatchable instead.
+#
+# The filter is a SEQUENCING guard, not the safety argument (Gate 2 is — see the
+# header): while any call still takes this const as its first argument, the
+# declaration stays. Without it the delete rule could fire first and strand the
+# reads it was supposed to follow, which is a broken build rather than a
+# half-finished cleanup.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(declaration_list
+     (field_declaration
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @variable_name
+           (string_literal (string_literal_content) @flag_name)) .)) @declaration)
+   (block
+     (local_declaration_statement
+       (modifier) @const_modifier
+       (variable_declaration
+         type: (_) . (variable_declarator
+           name: (identifier) @variable_name
+           (string_literal (string_literal_content) @flag_name)) .)) @declaration)] @scope
+  (#eq? @const_modifier "const")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(class_declaration) (struct_declaration) (record_declaration) (method_declaration) (compilation_unit)] @container)"""
+not_contains = ["""(
+  (invocation_expression
+    arguments: (argument_list . (argument (identifier) @first_arg))) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

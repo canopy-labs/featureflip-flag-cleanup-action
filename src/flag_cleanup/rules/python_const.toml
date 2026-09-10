@@ -1,0 +1,170 @@
+# KEY-const propagation for Python — the flag key hoisted to a module-level
+# name, as in
+#
+#     OLD_CHECKOUT = "old-checkout"
+#     ...
+#     if client.variation(OLD_CHECKOUT, ctx, False):
+#
+# `piranha_runner` prepends this file to `python.toml` for files that pass the
+# Gate 2 shadow check (see `flag_cleanup.key_const`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+#
+# --- PYTHON HAS NO CONSTANT, AND THIS IS THE WEAKEST FOOTING OF THE ELEVEN ---
+#
+# The UPPER_CASE name is a CONVENTION with nothing behind it: `OLD_CHECKOUT` can
+# be rebound anywhere, and the language neither prevents it nor warns (Ruby at
+# least warns). So the entire safety argument here is Gate 2's
+# bound-exactly-once half — a rebinding is an `assignment` with the name on the
+# left, `key_const._python_is_binding` counts it, and the file is withheld. That
+# is stated plainly rather than glossed: this and `ruby_const.toml` rest on a
+# weaker guarantee than the eight typed languages, and the mitigation is that
+# the gate is deliberately eager to call something a binding.
+#
+# MODULE LEVEL ONLY, which is both where the convention lives and what these
+# queries match: a name assigned inside a function is an ordinary local, and a
+# class-body constant is reached as an ATTRIBUTE (`Flags.OLD`) — a different
+# node shape that neither this file nor the gate handles. Both are left alone,
+# failing closed to today's no-op.
+#
+# --- THE TYPE EVIDENCE MUST BE PRESERVED ------------------------------------
+#
+# `variation` is generic over the flag's type in the Python SDK, so `python.toml`
+# anchors a BOOLEAN LITERAL default as the only evidence the flag is a boolean
+# at all. Every rule below keeps that anchor, and
+# `key_const._python_is_removable_read` mirrors it. Dropping it on either side
+# would fold a string or number flag to `True`/`False`.
+#
+# `get_boolean_value` (the OpenFeature provider) is boolean by name and needs no
+# such anchor, exactly as in `python.toml`.
+#
+# --- THE SAFETY ARGUMENT IS GATE 2, NOT THE QUERIES --------------------------
+#
+# Two concrete losses if that check is weakened: a WRONG-BRANCH fold, where a
+# rebinding to a different key has that other flag's read folded to this flag's
+# value; and a DANGLING REFERENCE, where the delete rule removes the assignment
+# and something else still reading the name raises `NameError` at run time —
+# which, as in Ruby, nothing catches until the line executes.
+#
+# An f-string or a concatenation of adjacent literals is not a resolvable key
+# and is excluded on the gate side; neither binds a lone `string_content` here.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("True" | "False" — Python's
+# literals are capitalised, which `piranha_runner._LANGUAGES` supplies).
+
+[[rules]]
+name = "replace_variation_const_key_read_with_boolean_literal"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (identifier) @key_const
+      . (_)
+      . [(true) (false)])
+  ) @call
+  (#eq? @sdk_fn "variation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  (module
+    (expression_statement
+      (assignment
+        left: (identifier) @decl_name
+        right: (string (string_content) @flag_name)))) @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules]]
+name = "replace_variation_keyword_const_key_read_with_boolean_literal"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (identifier) @key_const
+      (keyword_argument
+        name: (identifier) @kw
+        value: [(true) (false)]))
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @kw "default")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  (module
+    (expression_statement
+      (assignment
+        left: (identifier) @decl_name
+        right: (string (string_content) @flag_name)))) @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules]]
+name = "replace_get_boolean_value_const_key_read_with_boolean_literal"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "get_boolean_value")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  (module
+    (expression_statement
+      (assignment
+        left: (identifier) @decl_name
+        right: (string (string_content) @flag_name)))) @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  (module
+    (expression_statement
+      (assignment
+        left: (identifier) @variable_name
+        right: (string (string_content) @flag_name))) @declaration) @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((module) @container)"""
+not_contains = ["""(
+  (call arguments: (argument_list . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

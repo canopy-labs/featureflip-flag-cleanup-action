@@ -1,0 +1,269 @@
+# Piranha flag-cleanup rules for Java (java SDK).
+#
+# UNLIKE ts.toml, this file is SHORT — and that difference is the whole story of
+# M3. Piranha ships built-in feature-flag cleanup rules for Java, so the seed
+# rule below is all that is needed to get the full cascade: the enclosing `if`
+# folds, `!read` and `read && other` simplify, a ternary collapses, and a local
+# `boolean enabled = <read>;` is inlined and its declaration deleted. All of
+# that had to be hand-authored for TypeScript, which ships no built-ins at all.
+# TypeScript was the worst case, not the representative one.
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+#
+# Verified against Piranha's OWN bundled grammar, which is older than the
+# `tree-sitter-java` wheel the safety gate parses with. `string_fragment` is the
+# node holding a string literal's text WITHOUT its quotes, and it is what makes
+# Java constrainable at all: the same position is an opaque token in the bundled
+# Kotlin grammar, which is why Kotlin needs an entirely different approach.
+#
+# The binding constraint is unchanged from ts.toml: where a rewrite is not
+# confidently correct, emit NO diff. Output that COMPILES and is WRONG is the
+# failure that matters.
+
+
+# ===========================================================================
+# 1. The flag read
+# ===========================================================================
+
+# --- <obj>.boolVariation("KEY", ...); AS A WHOLE STATEMENT -> deleted
+#
+# A read whose value is DISCARDED. It is not a guard and it is not a value: a
+# warm-up call made for the SDK's own exposure event, or the wrapper around one.
+# Substituting a literal leaves `true;` standing, which is not a statement in
+# Java (JLS 14.8) and does not compile, so before this rule the whole flag was
+# refused — permanently, since `ignore` is per-run configuration and excludes
+# the key from every future run of every other flag too (#2691).
+#
+# The statement is dead by definition, so deleting it outright is the rewrite.
+#
+# THIS RULE MUST STAY ABOVE `replace_boolvariation_read_with_boolean_literal`.
+# Seed rules fire in declaration order, and the generic rule rewrites the CALL
+# — the child of the statement this one wants. Declared second, this rule never
+# fires and the language silently goes back to refusing; measured both ways, and
+# pinned by `test_a_discarded_read_rule_declared_second_stops_firing`.
+# It is the same ordering `_execute` relies on when it PREPENDS `*_const.toml`.
+#
+# THE FILTER IS THE WHOLE SAFETY ARGUMENT: the statement may hold exactly ONE
+# argument list, which is the read's own. Every Java call carries one, so this
+# says "no call in this statement but the read itself" without naming a single
+# method — and it holds at any depth, which a query cannot express. It is what
+# refuses:
+#
+#   client.boolVariation("KEY", buildCtx(), false);   // buildCtx() would be lost
+#   verify(client).boolVariation("KEY", ctx, false);  // Mockito: deleting it
+#                                                     // deletes the assertion
+#   client.boolVariation("KEY", new Ctx(), false);    // a constructor is a call
+#   client.boolVariation("KEY", flags[read()], false);// nested, still counted
+#
+# Those keep folding to `true;` and are still refused by `syntax.py`'s
+# `_literal_statements`, so the refusal did not go away — it got narrower, and
+# what is left of it is real. `verify(...)` being caught by the same count as
+# `buildCtx()` is not a coincidence to paper over: the mock's receiver IS a
+# second call, and "one call per discarded statement" is the invariant both
+# halves fall out of.
+#
+# The RECEIVER is deliberately unconstrained. Pinning it to `(identifier)` was
+# the first shape probed and it is redundant — `verify(client)` and
+# `getClient()` are already excluded by their own argument list — while leaving
+# it open is what lets the static-import form (`boolVariation("KEY", ctx,
+# false);`, no receiver at all) through the same rule instead of needing a
+# second one. `this.deps.client.boolVariation(…)` rides in for free.
+#
+# `not_contains` covers the two side effects Java can write WITHOUT a call:
+# `i++` and an assignment used as an expression (`f(x = y)` is legal Java).
+# Neither carries an argument list, so the count above cannot see them.
+[[rules]]
+name = "delete_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @sdk_fn
+      arguments: (argument_list . (string_literal (string_fragment) @flag_name)))) @statement
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((update_expression) @mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+
+# --- <obj>.boolVariation("KEY", ...) -> @treated
+# Matches a call named `boolVariation` whose FIRST argument is the string
+# literal `@stale_flag_name`. Arity is unconstrained — only the first argument
+# is anchored — so both the 2-arg and 3-arg forms match from one rule.
+#
+# `name:` matches the method name in BOTH `client.boolVariation(…)` and a bare
+# `boolVariation(…)` (a static import), because `method_invocation` carries the
+# name in the same field either way.
+#
+# Two things are deliberately NOT matched, and both are safety, not oversight:
+#   * a non-literal key (`boolVariation(key, …)`) never binds `string_fragment`,
+#     so a dynamic key is left alone;
+#   * `boolVariationDetail(…)` returns an EvaluationDetail rather than a
+#     boolean, so folding it to a literal would be a type error. `#eq?` is an
+#     exact comparison, so the longer name simply does not match.
+#
+# `#eq?` and never `#any-of?`: the latter is SILENTLY IGNORED by Piranha's
+# bundled tree-sitter, which does not fail the query — it just stops
+# constraining it, so the rule would match any call whose first argument is the
+# flag key (`trackEvent("KEY")`, `api.deleteFlag("KEY")`). See ts.toml for the
+# full account; `test_rules_use_no_ignored_predicates` fails the build if
+# `#any-of?` reappears in any rule file.
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list . (string_literal (string_fragment) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# ===========================================================================
+# 1b. The OpenFeature client's flag read
+# ===========================================================================
+#
+# The read a customer of `packages/openfeature-java` actually writes. It is the
+# OpenFeature CLIENT's method, not our provider's `getBooleanEvaluation` — a
+# customer never calls that one, and matching it would rewrite the provider's own
+# implementation rather than any call site.
+#
+# Structurally this is the `boolVariation` pair above with a different callee, and
+# that is not a coincidence worth collapsing: OpenFeature's Java client is
+# SYNCHRONOUS (`getBooleanValue(String, Boolean, EvaluationContext)` returns a
+# plain `boolean`) and takes the key FIRST, so it lands on exactly the same node
+# shape. It is the languages that differ — Go puts a `context.Context` ahead of the
+# key, and TS/C# return a promise the read has to be matched THROUGH.
+#
+# Both halves are required, in this order. `test_openfeature_parity.py` demands the
+# replace rule; the deletion rule beside it is what stops #2691 recurring for this
+# callee: a discarded read folds to `true;`, which is not a statement in Java
+# (JLS 14.8), so without it the whole flag is refused — permanently, since `ignore`
+# is per-run configuration that excludes the key from every future run.
+
+
+# --- <obj>.getBooleanValue("KEY", ...); AS A WHOLE STATEMENT -> deleted
+#
+# THIS RULE MUST STAY ABOVE `replace_openfeature_boolean_read_with_boolean_literal`,
+# for the reason spelled out on `delete_discarded_boolvariation_statement`: seed
+# rules fire in declaration order and the generic rule rewrites the CALL, which is
+# this statement's child. Declared second, this rule never fires.
+#
+# The filters are the same safety argument, unchanged: the statement may hold
+# exactly ONE argument list — its own — so a discarded read whose arguments do real
+# work (`getBooleanValue("KEY", false, buildCtx())`, `verify(client).getBooleanValue(…)`)
+# is refused rather than deleted along with the work.
+[[rules]]
+name = "delete_discarded_openfeature_boolean_statement"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @sdk_fn
+      arguments: (argument_list . (string_literal (string_fragment) @flag_name)))) @statement
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((update_expression) @mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+
+# --- <obj>.getBooleanValue("KEY", ...) -> @treated   (OpenFeature Java client)
+#
+# Arity is unconstrained — only the first argument is anchored — so both the
+# 2-arg and 3-arg forms match from one rule.
+#
+# `#eq?` is exact, so this cannot match `getBooleanDetails`, which returns a
+# `FlagEvaluationDetails<Boolean>` rather than a boolean; folding that to a literal
+# would be a type error. A non-literal key never binds `string_fragment`, so a
+# dynamic key is left alone. `openfeature_untouched_shapes` holds both.
+[[rules]]
+name = "replace_openfeature_boolean_read_with_boolean_literal"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list . (string_literal (string_fragment) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+
+# ===========================================================================
+# 2. The one gap in Piranha's built-in cascade
+# ===========================================================================
+
+# `} else if (<read>) { … }` with NO trailing `else`, on the false treatment.
+#
+# Piranha's built-ins carry `else_if_always_false_followed_by_else` and
+# `else_if_always_false_followed_by_else_if` but nothing for the case where the
+# false `else if` is LAST in the chain. Deleting just the inner `if` leaves a
+# dangling `else`, Piranha's own "Produced syntactically incorrect source code"
+# self-check fires, and the whole transform is abandoned.
+#
+# That fails safe, but it fails safe FOREVER: the flag can never be cleaned from
+# that repository, and every scheduled run panics again. Measured — this is not
+# theoretical; it is what the engine does with an ordinary `else if` chain.
+# TypeScript has the identical gap, fixed by `delete_else_if_false` in ts.toml.
+#
+# Java needs a DIFFERENT shape from TypeScript's fix. TS has an `else_clause`
+# node wrapping the branch, so the fix deletes that whole node. Java has no such
+# node — the alternative IS the nested if_statement — so instead the outer `if`
+# is rewritten without its alternative. That is possible here precisely because
+# `alternative:` is a direct CHILD: the constrained-grandchild limitation that
+# forced TS to root at the else_clause does not apply.
+#
+# Rebuilding the statement from captures is exact: the `condition` field spans
+# the parentheses too, so `@condition` already carries them.
+#
+# The condition is matched as `(_)`, a WILDCARD, rather than by node type. Not
+# laziness — `(parenthesized_expression)` is what the current tree-sitter-java
+# grammar calls it and Piranha's bundled one rejects the name outright
+# (`kind: Structure`). The wildcard is both correct today and immune to that
+# divergence, which recurs in every language here.
+[[rules]]
+name = "delete_trailing_else_if_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    condition: (_) @condition
+    consequence: (_) @consequence
+    alternative: (if_statement
+      condition: (_ (false))
+      !alternative)) @if_statement
+)"""
+replace_node = "if_statement"
+replace = "if @condition @consequence"

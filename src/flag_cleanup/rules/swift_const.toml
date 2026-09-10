@@ -1,0 +1,187 @@
+# Key-const indirection for Swift: a flag key hoisted to a `let` constant.
+#
+#     let FlagKey = "old-checkout"
+#     if client.boolVariation(FlagKey, default: false) { … }
+#
+# PREPENDED to swift.toml per invocation by `piranha_runner._execute`, so these
+# seed rules are declared ahead of the literal-anchored ones and see the read
+# before the generic rule can rewrite it.
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+# The TS const rules DO bind a read and must carry one; that asymmetry is why
+# the marker is explicit rather than inferred from the file's shape.
+#
+# The safety argument is NOT here — it is `flag_cleanup.key_const`, which
+# withholds this whole file for a file where the name is bound more than once
+# (a wrong-branch fold) or referenced by something other than a removable flag
+# read (a dangling reference). Both parse fine afterwards, so Gate 1 sees
+# neither. THE INVARIANT: the rules and the gate must accept the SAME set of
+# declaration forms. `_swift_key_consts` accepts a `let` property declaration
+# whose initialiser is exactly the key, at file scope, in a type body, or local
+# to a function — which is what the three scopes below enumerate.
+#
+# `var` is deliberately excluded, matching every other language's treatment of a
+# reassignable binding: its value cannot be read off the declaration, so the key
+# it names is not knowable.
+#
+# THE BANG SPLIT APPLIES HERE TOO. Swift's grammar puts a prefix `!` inside the
+# `call_expression` (see rules/swift.toml — it is the whole reason that file has
+# two seed rules), and that is a property of the call, not of how the key is
+# spelled. So the const path needs the same pair, for the same reason and with
+# the same predicates: without it a negated read through a hoisted key folds to
+# `@treated` with the bang deleted, INVERTED, which is the exact defect the
+# literal path was fixed for.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+
+# --- fold a NEGATED const-key read: `!client.boolVariation(K, …)` -> !@treated
+[[rules]]
+name = "replace_negated_boolvariation_const_key_read_with_negated_literal"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn))
+     (prefix_expression (simple_identifier) @sdk_fn)]
+    (call_suffix
+      (value_arguments
+        . (value_argument (simple_identifier) @key_const)))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#match? @call "^![^!]")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(source_file
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @decl_name)
+       (line_string_literal (_) @flag_name)))
+   (class_body
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @decl_name)
+       (line_string_literal (_) @flag_name)))
+   (statements
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @decl_name)
+       (line_string_literal (_) @flag_name)))] @scope
+  (#eq? @binding "let")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+
+# --- fold the read: `client.boolVariation(K, …)` -> @treated -----------------
+# Declared BEFORE the delete rule. Seed rules fire in declaration order, and the
+# delete rule's filter additionally refuses while any such call survives, so the
+# declaration cannot be removed out from under a read that still needs it.
+[[rules]]
+name = "replace_boolvariation_const_key_read_with_boolean_literal"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn))
+     (simple_identifier) @sdk_fn]
+    (call_suffix
+      (value_arguments
+        . (value_argument (simple_identifier) @key_const)))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @call "^!")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# A file-scope or type-scope constant is a SIBLING of the function holding the
+# read, not an ancestor of it, so `source_file`/`class_body` are named here
+# alongside the function-local `statements` — the same arrangement go_const.toml
+# needs for a package-level const.
+[[rules.filters]]
+enclosing_node = """(
+  [(source_file
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @decl_name)
+       (line_string_literal (_) @flag_name)))
+   (class_body
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @decl_name)
+       (line_string_literal (_) @flag_name)))
+   (statements
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @decl_name)
+       (line_string_literal (_) @flag_name)))] @scope
+  (#eq? @binding "let")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+
+# --- delete the now-unused declaration ---------------------------------------
+# Flag-key-scoped: the initialiser must be THIS flag's key, so there is no blast
+# radius on unrelated constants.
+#
+# ROOTED AT THE PARENT and deleting the declaration as a child of it, for the
+# reason every other `<base>_const.toml` delete rule is: matching the
+# declaration on its own ignores what encloses it, and a wrapper we did not
+# anticipate would have its insides removed and its shell left behind.
+#
+# The filter is a SEQUENCING guard, not the safety argument (Gate 2 is — see the
+# header): while any call still takes this constant as its first argument, the
+# declaration stays. Without it the delete rule could fire first and strand the
+# reads it was supposed to follow, which is a broken build rather than a
+# half-finished cleanup.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(source_file
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @variable_name)
+       (line_string_literal (_) @flag_name)) @declaration)
+   (class_body
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @variable_name)
+       (line_string_literal (_) @flag_name)) @declaration)
+   (statements
+     (property_declaration
+       (value_binding_pattern) @binding
+       (pattern (simple_identifier) @variable_name)
+       (line_string_literal (_) @flag_name)) @declaration)] @scope
+  (#eq? @binding "let")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(source_file) (class_body) (function_declaration)] @container)"""
+not_contains = ["""(
+  (call_expression
+    (call_suffix
+      (value_arguments . (value_argument (simple_identifier) @first_arg)))) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

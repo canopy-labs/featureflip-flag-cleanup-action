@@ -1,0 +1,42 @@
+# Exactly what the mirror publishes to canopy-labs/featureflip-flag-cleanup-action,
+# one path per line, relative to this file's own parent directory.
+#
+# This file SHIPS, so it does not name the private repository it is authored in.
+# That is not fussiness: it is the rule every other published file here follows,
+# and this one is checked by the same guard.
+#
+# DENY BY DEFAULT. This is an allowlist rather than a "copy the tree and delete
+# the private bits" denylist, because the two fail in opposite directions: a
+# denylist that falls out of date publishes something, an allowlist that falls
+# out of date fails to build. Only one of those can be taken back.
+#
+# The bar for an entry is that the PUBLIC REPOSITORY'S BUILD needs it. That
+# repository builds the image and cuts the release; it does not run the pytest
+# suite, which stays where its CI and its self-hosted runners are. `tests/` is
+# therefore deliberately absent apart from `tests/smoke/`,
+# which the release workflow runs against the built image before pushing it.
+#
+# Read by BOTH the mirror job and
+# `test_the_mirror_ships_every_build_input_and_nothing_that_names_the_monorepo`,
+# so the list and its guard cannot disagree.
+
+# The action surface a customer sees.
+action.yml
+README.md
+LICENSE
+
+# Build inputs. The Dockerfile COPYs pyproject.toml, README.md, LICENSE and
+# src/, and bind-mounts wheels/ (fetched at build time, never committed).
+Dockerfile
+pyproject.toml
+.dockerignore
+src
+
+# fetch_piranha_wheels.py (build) and generate_wrapper_action.py (release).
+scripts
+
+# The pre-push smoke. Self-contained: four files, no reference outside itself.
+tests/smoke
+
+# Becomes the public repository's real workflow once this directory is its root.
+.github

@@ -1,0 +1,481 @@
+# Const-propagation rules for TypeScript / TSX — see ts.toml for the full set of
+# Piranha 0.4.8 behaviours these are built around.
+#
+# `piranha_runner` prepends this file to `ts.toml` ONLY for files where
+# `ts_syntax.const_path_is_safe()` holds: the name bound to the flag read must
+# be bound exactly once in the whole file. That check — not the `not_contains`
+# guards below — is the safety argument. Enumerating re-binding forms in a
+# tree-sitter query leaked twice (named function expressions; then every
+# initialiser node type TypeScript keeps adding — `as`, `satisfies`, `!`, class
+# expressions, regex literals). The guards are kept as defence in depth, but
+# nothing should rely on their completeness.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+# Handled BEFORE the generic seed rules so the initialiser is still recognisable
+# as a flag read. Two steps: inline every usage of the bound name, then delete
+# the declaration.
+
+# --- inline usages: `on` -> @treated ---------------------------------------
+# The query matches any identifier; the filters do all the work. Cheapest and
+# most-selective first:
+#   filter 1 — skip identifiers in any BINDING position that is a bare
+#       `(identifier)` node: a declarator's own name (otherwise the declaration
+#       becomes `const true = ...`), `for (const on of …)`, `catch (on)`, a
+#       parameter, a `function on()` name, an import/export specifier. Rewriting
+#       one of these emits `for (const false of …)` / `catch (false)`, which
+#       does NOT parse — and Piranha's syntax self-check does not catch it, so
+#       it would ship as a real PR. Matching an ANCESTOR by name also blocks
+#       every usage inside such a binder's scope, which is exactly right: those
+#       usages refer to the binder, not to our const.
+#   filter 2 — skip type positions. `type T = typeof on;` would become
+#       `typeof true`, which is not valid TS and also does not trip the
+#       self-check.
+#   filter 3 (positive) — some ancestor block/program declares
+#       `const <this identifier> = <flag read for @stale_flag_name>` as a
+#       SINGLE-declarator statement, AND that scope contains no re-binding of
+#       the same name. Any usage that lexically resolves to that const
+#       necessarily has the declaring block as an ancestor, so this finds every
+#       real usage and excludes same-named variables in other scopes.
+#
+# `kind: "const"` is load-bearing: a `let` may be reassigned, so its initial
+# value cannot be propagated. Inlining one produced `true = recompute();` —
+# invalid code that Piranha's own syntax self-check rejected. `var` is a
+# `variable_declaration` and never matches this query at all.
+#
+# The `. … .` anchors restrict the declaration to a single declarator.
+# `const on = <read>, retries = 3;` therefore produces no const-path diff at
+# all: the generic rule below still replaces the read, and both bindings
+# survive. Without the anchors the delete rule took the whole statement and
+# silently dropped `retries`.
+#
+# The `not_contains` re-binding guard is what stops silently-wrong output for
+# nested shadowing (`const on = <read>; for (…) { const on = item.enabled; … }`).
+# When it fires NOTHING in the scope is inlined and the declaration is kept, so
+# the worst case is an uncleaned `const on = true;` — never a wrong branch.
+#
+# WHY THE POSITIVE FILTERS BELOW DO NOT NAME THE SDK FUNCTION. They used to,
+# with `(#any-of? @sdk_fn "boolVariation" "useFeatureFlag")` — a predicate
+# Piranha's bundled tree-sitter SILENTLY IGNORES (measured: with it, all four
+# of {member,bare} x {SDK,non-SDK} callees matched; with `#eq?`, only the SDK
+# ones). An ignored predicate reads like a constraint and is not one, so
+# leaving it in place is worse than not having it: the next person to touch
+# this file would believe the callee is pinned here. `#eq?` cannot express
+# "either of two names" and a query may hold only one top-level pattern, so
+# the alternatives were duplicating both rules (and their ~50 lines of
+# filters) per name, or carrying the constraint where an AND *can* express it.
+#
+# It is carried by the `#not-eq?` pair in the re-binding `not_contains` below
+# (and its twin on the delete rule): "this name is bound to a call whose callee
+# is neither SDK function" blocks the whole scope. That is an AND of two
+# honoured predicates, and it is what actually held when the ignored predicate
+# was doing nothing — verified: `const cfg = loadConfigFor("KEY")`,
+# `const on = useFlag("KEY")` and `const id = trackEvent("KEY")` are all left
+# alone while the real SDK shape still folds. `test_piranha_rules.py`'s
+# `non_sdk_call_with_the_key` fixture pins that, and
+# `test_sdk_function_names_are_consistent_across_the_rules` pins these two
+# names against the seed rules in `ts.toml` so the two lists cannot drift.
+[[rules]]
+name = "inline_flag_const_usage"
+query = """((identifier) @identifier)"""
+replace_node = "identifier"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_enclosing_node = """(
+  [(variable_declarator name: (identifier) @bind)
+   (for_in_statement left: (identifier) @bind)
+   (catch_clause parameter: (identifier) @bind)
+   (required_parameter pattern: (identifier) @bind)
+   (optional_parameter pattern: (identifier) @bind)
+   (function_declaration name: (identifier) @bind)
+   (function_expression name: (identifier) @bind)
+   (generator_function_declaration name: (identifier) @bind)
+   (generator_function name: (identifier) @bind)
+   (class_declaration name: (type_identifier) @bind)
+   (class name: (type_identifier) @bind)
+   (import_specifier name: (identifier) @bind)
+   (export_specifier name: (identifier) @bind)] @binder
+  (#eq? @bind "@identifier")
+)"""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  [(type_annotation) (type_alias_declaration) (type_query)
+   (interface_declaration) (type_arguments) (type_parameters)] @type_context
+)"""
+
+[[rules.filters]]
+enclosing_node = """(
+  [(statement_block
+     (lexical_declaration kind: "const" . (variable_declarator
+       name: (identifier) @decl_name
+       value: (call_expression
+         function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                    (identifier) @sdk_fn]
+         arguments: (arguments . (string (string_fragment) @flag_name)))) .))
+   (program
+     (lexical_declaration kind: "const" . (variable_declarator
+       name: (identifier) @decl_name
+       value: (call_expression
+         function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                    (identifier) @sdk_fn]
+         arguments: (arguments . (string (string_fragment) @flag_name)))) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@identifier")
+)"""
+not_contains = ["""(
+  [(for_in_statement left: (identifier) @rebind)
+   (catch_clause parameter: (identifier) @rebind)
+   (required_parameter pattern: (identifier) @rebind)
+   (optional_parameter pattern: (identifier) @rebind)
+   (function_declaration name: (identifier) @rebind)
+   (function_expression name: (identifier) @rebind)
+   (generator_function_declaration name: (identifier) @rebind)
+   (generator_function name: (identifier) @rebind)
+   (import_specifier name: (identifier) @rebind)
+   (class_declaration name: (type_identifier) @rebind)
+   (class name: (type_identifier) @rebind)
+   (variable_declarator name: (identifier) @rebind !value)
+   (variable_declarator name: (identifier) @rebind
+     value: [(identifier) (member_expression) (subscript_expression)
+             (binary_expression) (unary_expression) (ternary_expression)
+             (true) (false) (number) (string) (template_string) (null)
+             (object) (array) (arrow_function) (function_expression)
+             (new_expression) (await_expression) (parenthesized_expression)])] @rebinder
+  (#eq? @rebind "@identifier")
+)""", """(
+  (variable_declarator name: (identifier) @rebind
+    value: (call_expression
+      function: [(member_expression property: (property_identifier) @callee)
+                 (identifier) @callee])) @rebinding_call
+  (#eq? @rebind "@identifier")
+  (#not-eq? @callee "boolVariation")
+  (#not-eq? @callee "useFeatureFlag")
+)""", """(
+  (variable_declarator name: (identifier) @rebind
+    value: (call_expression
+      arguments: (arguments . (string (string_fragment) @callee_first_arg)))) @rebinding_flag_read
+  (#eq? @rebind "@identifier")
+  (#not-eq? @callee_first_arg "@stale_flag_name")
+)""", """(
+  (shorthand_property_identifier_pattern) @destructured
+  (#eq? @destructured "@identifier")
+)"""]
+
+# --- delete the now-unused declaration --------------------------------------
+# Flag-key-scoped, so it can only ever fire on a declaration whose initialiser
+# is a read of THIS flag — no blast radius on unrelated `const x = true`. The
+# `. … .` anchors keep it to single-declarator statements (see above).
+#
+# Guarded against every usage shape the inline rule deliberately skips
+# (shorthand properties, export specifiers, `typeof on` type references, and any
+# re-binding of the name that blocked inlining): if one is present the
+# declaration stays, the generic seed turns it into `const on = true;`, and the
+# code remains correct. This list must stay in sync with the inline rule's
+# skips — a shape the inline rule leaves behind but the delete rule ignores
+# produces a dangling reference to a deleted binding.
+#
+# The query is ROOTED AT THE PARENT `statement_block`/`program` and deletes the
+# declaration as a child of it. That is not stylistic: matching the
+# `lexical_declaration` on its own ignored its parent, so
+# `export const on = <read>;` had the declaration deleted out of its
+# `export_statement` and left a bare `export ` behind — a hard syntax error that
+# tree-sitter re-reads as an identifier expression, so nothing downstream caught
+# it. Requiring a block/program parent makes the export shape unmatchable
+# instead of relying on a filter to notice it.
+#
+# An exported flag const is therefore never inlined or removed, only its read is
+# (`export const on = true;`). That is the only sound outcome: the binding is
+# module public API and its importers do not contain the flag key, so they are
+# not even in the candidate set — we cannot see, let alone update, them.
+[[rules]]
+name = "delete_flag_const_declaration"
+query = """(
+  [(statement_block
+    (lexical_declaration kind: "const" . (variable_declarator
+      name: (identifier) @variable_name
+      value: (call_expression
+        function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (arguments . (string (string_fragment) @flag_name)))) .) @declaration)
+   (program
+    (lexical_declaration kind: "const" . (variable_declarator
+      name: (identifier) @variable_name
+      value: (call_expression
+        function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (arguments . (string (string_fragment) @flag_name)))) .) @declaration)] @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(function_declaration) (function_expression) (arrow_function) (method_definition) (program)] @enclosing)"""
+not_contains = ["""(
+  (shorthand_property_identifier) @shorthand
+  (#eq? @shorthand "@variable_name")
+)""", """(
+  (export_specifier name: (identifier) @exported) @es
+  (#eq? @exported "@variable_name")
+)""", """(
+  [(for_in_statement left: (identifier) @rebind)
+   (catch_clause parameter: (identifier) @rebind)
+   (required_parameter pattern: (identifier) @rebind)
+   (optional_parameter pattern: (identifier) @rebind)
+   (function_declaration name: (identifier) @rebind)
+   (function_expression name: (identifier) @rebind)
+   (generator_function_declaration name: (identifier) @rebind)
+   (generator_function name: (identifier) @rebind)
+   (import_specifier name: (identifier) @rebind)
+   (class_declaration name: (type_identifier) @rebind)
+   (class name: (type_identifier) @rebind)
+   (variable_declarator name: (identifier) @rebind !value)
+   (variable_declarator name: (identifier) @rebind
+     value: [(identifier) (member_expression) (subscript_expression)
+             (binary_expression) (unary_expression) (ternary_expression)
+             (true) (false) (number) (string) (template_string) (null)
+             (object) (array) (arrow_function) (function_expression)
+             (new_expression) (await_expression) (parenthesized_expression)])] @rebinder
+  (#eq? @rebind "@variable_name")
+)""", """(
+  (variable_declarator name: (identifier) @rebind
+    value: (call_expression
+      function: [(member_expression property: (property_identifier) @callee)
+                 (identifier) @callee])) @rebinding_call
+  (#eq? @rebind "@variable_name")
+  (#not-eq? @callee "boolVariation")
+  (#not-eq? @callee "useFeatureFlag")
+)""", """(
+  (variable_declarator name: (identifier) @rebind
+    value: (call_expression
+      arguments: (arguments . (string (string_fragment) @callee_first_arg)))) @rebinding_flag_read
+  (#eq? @rebind "@variable_name")
+  (#not-eq? @callee_first_arg "@stale_flag_name")
+)""", """(
+  (shorthand_property_identifier_pattern) @destructured
+  (#eq? @destructured "@variable_name")
+)""", """(
+  (type_query (identifier) @typeref) @tq
+  (#eq? @typeref "@variable_name")
+)"""]
+
+
+
+
+# ===========================================================================
+# KEY-const propagation — a SECOND, INDEPENDENT mechanism in this file (#2671)
+# ===========================================================================
+#
+# Everything above propagates a const bound to the flag READ's RESULT
+# (`const on = boolVariation('k')`); the value it moves is a boolean. The rules
+# below resolve a const bound to the flag's KEY:
+#
+#     const OLD_CHECKOUT = 'old-checkout';
+#     ...
+#     if (client.boolVariation(OLD_CHECKOUT, ctx, false)) { ... }
+#
+# The value they move is the key string, and they move it at MATCH time rather
+# than by rewriting anything — the declaration is matched as a FILTER, so the
+# key never has to be substituted into the source at all. Conflating the two
+# wastes a session; see the table in this tool's CLAUDE.md.
+#
+# **Both questions gate this one file.** `syntax.const_path_is_safe` asks the
+# read-const question (`ts_syntax`) AND the key-const question (`key_const`),
+# and a refusal from either withholds the whole file, because the runner
+# partitions on a single boolean and prepends one file. That costs nothing:
+# in a file whose key is hoisted, `ts.toml`'s literal-anchored seed rules
+# cannot match that flag's reads at all, so a file newly withheld by the key
+# question was already producing no diff for this flag.
+#
+# The `accessor-guard` note at the top of this file still applies and is
+# unaffected — these rules bind no name a call could be re-bound to, so they
+# have no `(#not-eq? @callee ...)` guard of their own and add nothing for
+# `rule_synthesis.with_accessor_guards` to extend.
+#
+# THE OTHER ACCESSOR QUESTION IS ANSWERED DIFFERENTLY SINCE #2730, and the two
+# were conflated before it. These rules ARE cloned per accessor, by
+# `rule_synthesis.with_accessor_const_rules`, exactly as `ts.toml`'s
+# literal-key seeds are — without that, `useFlag(OLD_CHECKOUT, …)` matched
+# nothing and a project that both wraps the SDK and hoists its keys got a green
+# run and no pull request. `key_const._TS_FLAG_READ_CALLEES` is widened with
+# the same accessors in the same breath: the clone is what makes a wrapper's
+# read removable, and Gate 2 has to agree or it withholds the whole file and
+# the clone never runs. Note this is the KEY-const half only — the read-const
+# rules above are reached by the guard, not by a clone.
+#
+# `const` is matched as an anonymous child because `lexical_declaration` also
+# covers `let`, which may be reassigned; `var` is a different node type and is
+# excluded structurally. `key_const._ts_key_consts` requires the same.
+
+# --- fold the read: `boolVariation(OLD_CHECKOUT, …)` -> @treated ------------
+[[rules]]
+name = "replace_boolvariation_const_key_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# Same optional-call exclusion as the literal rules in `ts.toml`, for the same
+# reason and in the same shape: `boolVariation?.(K, …)` is `undefined` when the
+# callee is nullish. `key_const._ts_is_removable_read` refuses to count such a
+# read as removable, so the two halves agree and the delete rule cannot strand
+# a reference the engine deliberately left standing.
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(program
+     [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string (string_fragment) @flag_name)) .)
+      (export_statement declaration: (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string (string_fragment) @flag_name)) .))])
+   (statement_block
+     (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: (string (string_fragment) @flag_name)) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- the React SDK hook, same shape, different callee -----------------------
+# A copy rather than an alternation for the reason given in `ts.toml`: a query
+# holds one top-level pattern, and `#any-of?` is banned here.
+[[rules]]
+name = "replace_usefeatureflag_const_key_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "useFeatureFlag")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(program
+     [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string (string_fragment) @flag_name)) .)
+      (export_statement declaration: (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string (string_fragment) @flag_name)) .))])
+   (statement_block
+     (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: (string (string_fragment) @flag_name)) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- the OpenFeature read, which must be AWAITED ----------------------------
+# The `await` is matched for the same reason `ts.toml` matches it: the bare call
+# is a `Promise<boolean>`, so replacing only the invocation would fold a promise
+# to a boolean. Replacing the whole `await_expression` keeps the type right.
+[[rules]]
+name = "replace_getbooleanvalue_const_key_read_with_boolean_literal"
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments . (identifier) @key_const))
+  ) @await
+  (#eq? @sdk_fn "getBooleanValue")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(program
+     [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string (string_fragment) @flag_name)) .)
+      (export_statement declaration: (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string (string_fragment) @flag_name)) .))])
+   (statement_block
+     (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: (string (string_fragment) @flag_name)) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- delete the now-unused KEY declaration ----------------------------------
+# Distinct from `delete_flag_const_declaration` above, which deletes a const
+# bound to the READ. This one is keyed on the flag's KEY STRING, so it carries
+# no usage census of its own — Gate 2 has already proved every surviving
+# reference is a read these rules remove. The `not_contains` filter is a
+# SEQUENCING guard: while any call still takes this const as its first
+# argument, the declaration stays.
+#
+# The `export_statement` alternative deletes the WHOLE export, not the
+# declaration inside it — leaving a bare `export ;` behind would not parse.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(program
+     [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @variable_name
+            value: (string (string_fragment) @flag_name)) .) @declaration
+      (export_statement declaration: (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @variable_name
+            value: (string (string_fragment) @flag_name)) .)) @declaration])
+   (statement_block
+     (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @variable_name
+           value: (string (string_fragment) @flag_name)) .) @declaration)] @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(program) (statement_block) (function_declaration)] @container)"""
+not_contains = ["""(
+  (call_expression arguments: (arguments . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

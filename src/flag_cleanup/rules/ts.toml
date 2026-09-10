@@ -1,0 +1,827 @@
+# Piranha flag-cleanup rules for TypeScript / TSX (js, node, browser, react SDKs).
+#
+# Piranha ships NO built-in feature-flag cleanup rules for TS/JS (only
+# go/java/kt/ruby/scala/swift), so we carry the whole cascade ourselves:
+#   1. seed rules replace the flag read with a boolean literal (@treated), then
+#   2. cleanup rules simplify the enclosing boolean expression, fold the
+#      enclosing `if`, and drop dead statements.
+# The seed -> cleanup wiring lives in ts_edges.toml (Piranha reads [[edges]] from
+# edges.toml, never from this file).
+#
+# Holes filled per invocation via substitutions:
+#   @stale_flag_name -> the flag key (matched against the first string-literal arg)
+#   @treated         -> "true" | "false"
+#
+# THE BINDING CONSTRAINT: when a reference cannot be rewritten with confidence,
+# emit NO diff for it. Every filter below exists to turn a would-be wrong
+# rewrite into "leave it alone". The failure mode that matters most is output
+# that COMPILES and is WRONG, because nothing downstream will catch it.
+#
+# ---------------------------------------------------------------------------
+# Piranha (0.4.8) behaviours these rules are built around — verified empirically,
+# because they are undocumented and several are counter-intuitive:
+#
+#  * EVERY query must put a capture on its ROOT node. A query whose root node is
+#    uncaptured silently never matches, even when the pattern is correct.
+#  * `scope = "Parent"` matches the next rule against the ANCESTOR NODES of the
+#    node just edited — the ancestor must match the query's root. Siblings and
+#    descendants of an ancestor are NOT reachable. (A rule may still edit a
+#    descendant: `replace_node` can name any capture in the query.)
+#  * `scope = "Global"` re-applies the rule to EVERY file in the codebase. It is
+#    unusable for identifier propagation (it happily rewrites same-named
+#    variables in unrelated files) and is not used here.
+#  * Named scopes ("Function"/"Class"/"File") do not exist for TS/TSX — Piranha's
+#    scope generators are language-specific and there is no TypeScript
+#    scope_config. Using one panics the process.
+#  * FILTERS. `contains` NEVER matches, so `at_least`/`at_most` are unusable
+#    too. `enclosing_node`, `outermost_enclosing_node`, `not_enclosing_node` and
+#    `not_contains` all work. Two scoping rules matter:
+#      - `enclosing_node` matches an ANCESTOR of the rule's match, and its query
+#        may constrain that ancestor's own CHILDREN. That is how a positive
+#        "this scope declares X" requirement is expressed without `contains`.
+#      - a `not_contains` WITH `enclosing_node` searches inside the enclosing
+#        node; a `not_contains` with NO `enclosing_node` searches inside the
+#        rule's own matched node. The second form is the only way to constrain a
+#        filter to the match itself.
+#    Multiple `[[rules.filters]]` blocks are ANDed. `contains` and
+#    `not_contains` may not appear in the same filter.
+#  * Predicates: `#eq?`, `#not-eq?` and `#any-of?` are exact text comparisons
+#    and are stable. UPDATE (0.5.0): `#any-of?` is now HONOURED by the engine
+#    — under the pre-0.5.0 engine it was accepted but silently IGNORED (see
+#    the `ONE RULE PER METHOD NAME` note below, near
+#    `replace_boolvariation_read_with_boolean_literal`, for the full history
+#    and why this file still doesn't use it even though it now safely could).
+#    `#match?` / `#not-match?` (regex) are NOT — DO NOT USE THEM. Reproduction
+#    preserved at
+#    `tests/test_piranha_predicate_nondeterminism.py` (deselected by default,
+#    run with `pytest -m nondeterministic`): a `not_contains` entry using
+#    `#not-match?` to decide whether a guard fires returns a mix of answers
+#    over 10 runs on byte-identical input, with both an escaped and a plain
+#    pattern. Narrow claim: this is what was observed for THIS filter shape.
+#    Simpler `#match?` uses may well be stable — but a flag key is a literal, so
+#    an exact comparison is the right tool anyway and the ban costs nothing.
+#    Multiple predicates in one pattern are ANDed. A query may contain only ONE
+#    top-level pattern — extra patterns are ignored, so alternation must use
+#    `[...]`.
+#  * Piranha bundles its OWN tree-sitter-typescript, older than the
+#    `tree-sitter-typescript` wheel `flag_cleanup.ts_syntax` parses with. Node
+#    names differ: a class expression is `class` here and `class_expression`
+#    there. Verify a node type against Piranha before using it — an unknown one
+#    fails loudly with `Could not parse the query … kind: NodeType`. This
+#    divergence is one more reason the safety argument lives in Python.
+#  * Anchors (`.`) and negated fields (`!field`) work, and are load-bearing
+#    below for single-declarator statements and optional chaining respectively.
+#  * Seed rules run in the order they are declared in this file, each to a
+#    fixpoint (with its edge cascade) before the next one starts. The const
+#    rules below MUST stay ahead of the generic call-replacement rule, which
+#    would otherwise rewrite the const initialiser out from under them.
+#  * A malformed rules.toml does not raise a parse error — it deserialises to
+#    zero rules and Piranha reports "NO RULES PROVIDED".
+#  * Piranha's "Produced syntactically incorrect source code" self-check is NOT
+#    a safety net. It caught `true = recompute();` but NOT
+#    `for (const false of xs)` or `catch (false)`. Do not rely on it to stop a
+#    bad rule. The real guards are the fixture suite and Gate 1 — the
+#    post-transform re-parse in `flag_cleanup.ts_syntax`, which runs on every
+#    rewrite and refuses the whole flag rather than proposing a broken one. A
+#    `node --check` sweep is NOT one of them: it was tried and rejected,
+#    because it rejects 286 of 431 real `.ts` files (TypeScript syntax it
+#    cannot parse at all), which is why Gate 1 compares the rewrite against the
+#    ORIGINAL parse instead of judging it in isolation.
+#  * On panic Piranha writes NOTHING — output is buffered until every file has
+#    been processed (checked with the failing file both first and last).
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# The const-propagation rules are NOT in this file — they live in
+# `ts_const.toml`, which `piranha_runner` prepends to this one only for files
+# that pass the Gate 2 shadow check. Order matters: they must run before the
+# generic rule below, which would otherwise rewrite the const initialiser out
+# from under them.
+# ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 2. Generic flag reads in expression position
+# ===========================================================================
+
+# --- <obj>.boolVariation("KEY", ...) / useFeatureFlag("KEY", ...) -> @treated
+# Matches a call whose callee is named `boolVariation` (js/node/browser SDK
+# method) or `useFeatureFlag` (the React SDK hook)
+# and whose FIRST argument is the string literal `@stale_flag_name`. Either name
+# is accepted in either callee shape (member or bare) so an SDK re-export or a
+# destructured import is covered too.
+#
+# Arity is unconstrained — the query only anchors the first argument — so the
+# 2-arg browser form and the 3-arg js/node form both match from one rule. A
+# non-string-literal key never binds `string_fragment`, so a dynamic key is left
+# untouched (safety).
+#
+# Optional chaining is excluded in BOTH of its positions, because either makes
+# the expression `undefined` when the left-hand side is nullish — replacing that
+# with a boolean literal is a behaviour change, not a simplification:
+#   * `client?.boolVariation("KEY", …)` — `!optional_chain` on the
+#     member_expression, where `?.` is a proper field.
+#   * `client.boolVariation?.("KEY", …)` — the `not_enclosing_node` filter
+#     below. Piranha's grammar does not expose the call's `?.` as a field (it is
+#     invisible in the s-expression), so a negated field cannot reach it. It CAN
+#     be matched as an anonymous token, and `not_enclosing_node` tests the
+#     matched node itself as well as its ancestors — both verified — which is
+#     what makes the exclusion expressible at all.
+# ONE RULE PER METHOD NAME, and every predicate is `#eq?`. This used to be a
+# single rule using `(#any-of? @sdk_fn "boolVariation" "useFeatureFlag")` —
+# which, under the pre-0.5.0 engine, Piranha's bundled tree-sitter SILENTLY
+# IGNORED. An ignored predicate does not fail the query, it just stops
+# constraining it, so `@sdk_fn` was unbound and the rule matched ANY call
+# whose first argument was the flag-key string. On real code that meant
+# `trackEvent("KEY")` -> `true`, `api.deleteFlag("KEY")` -> `await true`,
+# `if (isEnabledInDb("KEY"))` folded away — output that parses and
+# type-checks, so neither Piranha's self-check nor Gate 1 sees it. Found by
+# running against a real repository; no fixture had a non-SDK call carrying a
+# flag key, because nobody writes one on purpose.
+#
+# Verified before and after (against the 0.4.8 engine, at the time): with
+# `#any-of?` all four of {member,bare} x {SDK,non-SDK} matched; with `#eq?`
+# only the SDK ones do, in BOTH branches of the `[...]` alternation.
+#
+# UPDATE (0.5.0): re-measured — the engine now HONOURS `#any-of?` (see
+# `test_an_ignored_predicate_does_not_constrain` in `tests/test_piranha_rules.py`,
+# which now fails if a future Piranha ever goes back to ignoring it). The
+# hazard above is HISTORY, not the current behaviour, and using `#any-of?`
+# here would not reintroduce it. This file still doesn't, on purpose: `#eq?`
+# is no worse now that it is safe, collapsing back to one rule buys nothing,
+# and the per-name shape is what every other SDK-name rule already uses. Do
+# not re-merge these two rules, and do not introduce `#any-of?` anywhere —
+# `test_rules_use_no_ignored_predicates` still fails the build if it appears,
+# as a "we choose not to" ban rather than a "this would be dangerous" one.
+# The single exception is rules/*_entries.toml, where the alternatives are
+# runtime data — see that file's header.
+[[rules]]
+name = "replace_boolvariation_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (string (string_fragment) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# `not_contains`, NOT `not_enclosing_node`. Both express "this must not be an
+# optional call", but `not_enclosing_node` tests the matched node AND every
+# ancestor, so it also skipped an ORDINARY read nested anywhere inside an
+# unrelated optional call: `maybe?.(client.boolVariation("KEY", …))` was left
+# alone. That is not a safe conservatism — when another read of the same key in
+# the same file DID get rewritten, the run opened a pull request claiming the
+# flag was removed while a live read survived, and nothing warned, because the
+# unprocessed-reference scan only covers extensions the configured languages do
+# not process. `not_contains` carries no `enclosing_node`, which scopes it to
+# the rule's own match. Verified all three shapes: `boolVariation?.("KEY")`
+# skipped, `client?.boolVariation("KEY")` skipped (that one is `!optional_chain`
+# on the member_expression), nested-ordinary rewritten.
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+
+# The React SDK hook. Identical to the rule above but for the callee name —
+# see the comment there for why this is a copy rather than an alternation.
+[[rules]]
+name = "replace_usefeatureflag_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (string (string_fragment) @flag_name))
+  ) @call
+  (#eq? @sdk_fn "useFeatureFlag")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# `not_contains`, NOT `not_enclosing_node`. Both express "this must not be an
+# optional call", but `not_enclosing_node` tests the matched node AND every
+# ancestor, so it also skipped an ORDINARY read nested anywhere inside an
+# unrelated optional call: `maybe?.(client.boolVariation("KEY", …))` was left
+# alone. That is not a safe conservatism — when another read of the same key in
+# the same file DID get rewritten, the run opened a pull request claiming the
+# flag was removed while a live read survived, and nothing warned, because the
+# unprocessed-reference scan only covers extensions the configured languages do
+# not process. `not_contains` carries no `enclosing_node`, which scopes it to
+# the rule's own match. Verified all three shapes: `boolVariation?.("KEY")`
+# skipped, `client?.boolVariation("KEY")` skipped (that one is `!optional_chain`
+# on the member_expression), nested-ordinary rewritten.
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+
+# --- await <obj>.getBooleanValue("KEY", default, ctx) -> @treated
+# The OpenFeature JS provider (`@featureflip/openfeature-node`). The read a customer
+# writes comes from `@openfeature/server-sdk`, NOT from our provider —
+# `resolveBooleanEvaluation` is the provider's own side of the contract and is
+# never a call site — so nothing above matches it.
+#
+# Two things differ from every other seed rule in this file.
+#
+# 1. THE MATCHED NODE IS THE `await_expression`, not the call inside it. The
+#    call alone would leave `await true`, which is where the whole cascade
+#    stalls: `await true` is not a `(true)` node, so NOTHING downstream folds
+#    it. Measured against the shipped rules before this was added:
+#    `if (await c.boolVariation("k", ctx, false))` came out as
+#    `if (await false) { … } else { … }` with both branches standing, and
+#    `const on = await c.boolVariation(…)` blocked const propagation so the
+#    guard below it survived too. That is a correct-looking, HALF-FINISHED
+#    cleanup shipped under a PR that says the flag was removed — the exact
+#    failure this tool exists to prevent. (The `simplify_await_*` rules in
+#    section 3 fix that residue for the sync SDK reads; matching the whole
+#    `await_expression` here is what keeps THIS rule from depending on them.)
+#
+# 2. THE UN-AWAITED CALL IS DELIBERATELY NOT MATCHED, and that is a safety
+#    requirement rather than an omission. `getBooleanValue` returns
+#    `Promise<boolean>`, so a bare call is not a boolean: rewriting
+#    `c.getBooleanValue("KEY", false, ctx).then(on => …)` to `true.then(…)`
+#    breaks at runtime, and a bare read in a condition is ALREADY
+#    always-truthy in the customer's own code — a bug we must not silently
+#    "fix" into the opposite branch. Requiring the `await` means the shape we
+#    rewrite is the shape that genuinely evaluates to a boolean.
+#
+# The consequence used to be that OpenFeature's SYNC client
+# (`@openfeature/web-sdk`, whose `getBooleanValue` returns a plain boolean) was
+# not matched by anything: it spells its read identically, so the `await`
+# requirement excluded it too. That is now reached by a SECOND seed rule
+# immediately below, which proves the file holds a synchronous client from its
+# imports before matching the bare call. This rule is unchanged by that, and
+# must stay so — the `await` here is what makes the shape it rewrites the shape
+# that genuinely evaluates to a boolean, whatever the file imports.
+[[rules]]
+name = "replace_getbooleanvalue_read_with_boolean_literal"
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments
+        . (string (string_fragment) @flag_name)))
+  ) @await
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# Same optional-call exclusion as the rules above, for the same reason:
+# `client.getBooleanValue?.("KEY", …)` is `undefined` when the callee is
+# nullish, so a boolean literal is a behaviour change rather than a
+# simplification. `not_contains` with no `enclosing_node` scopes the check to
+# this rule's own match.
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+
+# --- <obj>.getBooleanValue("KEY", default) -> @treated, in a browser-SDK file
+# The SAME method name as the rule above, matched at the CALL instead of at the
+# `await`, and safe only because a file-scoped filter has first proved the file
+# holds a synchronous client. `@openfeature/web-sdk`'s `getBooleanValue`
+# returns a plain `boolean`, not a `Promise<boolean>`.
+#
+# WHY THE RULE ABOVE COULD NOT SIMPLY DROP ITS `await` REQUIREMENT. The two
+# clients are indistinguishable at the call site: `@openfeature/server-sdk` and
+# `@openfeature/web-sdk` spell the read with the same method name and the same
+# argument positions. So relaxing the `await` does not "also match the sync
+# client" — it matches the async one too, and there a bare call is a promise:
+# `c.getBooleanValue("KEY", false, ctx).then(on => …)` would become
+# `true.then(…)` and break at runtime, while a bare read used as a condition is
+# ALREADY always-truthy in the customer's own code, so rewriting it converts
+# their bug into the opposite branch silently. Requiring the `await` there
+# stays a safety property; this rule reaches the sync client by proving the
+# discriminator instead of discarding it.
+#
+# THE DISCRIMINATOR IS THE IMPORT, so the filter is file-scoped
+# (`enclosing_node` at `(program)`) rather than node-scoped. Two halves, and
+# the second is the one doing the safety work:
+#
+# 1. The file must import `@openfeature/web-sdk`.
+# 2. The file must mention NO OTHER `@openfeature/…` module. Not "must not
+#    import `@openfeature/server-sdk`" — anything else `@openfeature/…` blocks
+#    the rewrite, so a server-flavoured wrapper (`@openfeature/nestjs-sdk`) and
+#    every package that does not exist yet fail SAFE rather than needing this
+#    list maintained. `@openfeature/core` is the one exception: it ships types,
+#    never a client, and is routinely imported for `EvaluationContext`.
+#
+# Half 2 is matched on a bare `(string_fragment)` rather than on an
+# `import_statement`, deliberately: that also catches
+# `require("@openfeature/server-sdk")`, `await import(…)` and
+# `export … from …`, none of which is an `import_statement`. Being broad costs
+# nothing on a REFUSAL — it only ever withholds a rewrite.
+#
+# WHY A SHARED-MODULE FILE IS NOT THE HOLE IT LOOKS LIKE. The worry a
+# file-scoped predicate invites is a module holding a server read and a browser
+# read, where the gate cannot tell them apart and the failure mode is rewriting
+# the promise. Half 2 refuses that file outright — verified, not assumed, by
+# `openfeature_sync_untouched_shapes`. And the two packages target different
+# runtimes (browser bundle vs Node), so a file that imports the web SDK and
+# nothing else `@openfeature/…` is not somewhere a server client plausibly
+# arrives by another route.
+#
+# WHAT THIS STILL DOES NOT REACH, recorded in README "Known gaps": a client
+# passed in as a parameter, read off a context object, or re-exported through a
+# local module leaves no import in the file at all, so the gate never fires and
+# the read survives silently — same as before. This closes the common shape,
+# not the shape class. `accessors` remains the escape hatch there.
+[[rules]]
+name = "replace_sync_getbooleanvalue_read_with_boolean_literal"
+# accessor-template: none
+#
+# Not cloned for the `accessors` input. The gate below names
+# `@openfeature/web-sdk`, which says nothing about a customer's own wrapper, and
+# the call-shaped seed at the top of this section already clones into a rule
+# matching that wrapper's bare call with no import condition — so a clone here
+# would be a strictly narrower duplicate carrying a gate that reads as
+# meaningful and is not.
+#
+# The marker sits INSIDE the block, below `name`, and has to: blocks are split
+# on `[[rules]]`, so a comment written ABOVE that line belongs to the PREVIOUS
+# rule and would opt the wrong one out.
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (string (string_fragment) @flag_name))) @call
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# Half 1 — the file imports the synchronous client.
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+contains = """(
+  (import_statement source: (string (string_fragment) @module)) @import
+  (#eq? @module "@openfeature/web-sdk")
+)"""
+
+# Half 2 — and mentions no other OpenFeature package, in any string form.
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+not_contains = ["""(
+  (string_fragment) @module
+  (#match? @module "^@openfeature/")
+  (#not-eq? @module "@openfeature/web-sdk")
+  (#not-eq? @module "@openfeature/core")
+)"""]
+
+# Same optional-call exclusion as every rule above, for the same reason:
+# `client.getBooleanValue?.("KEY", …)` is `undefined` when the callee is
+# nullish, so a boolean literal is a behaviour change rather than a
+# simplification.
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+
+# ===========================================================================
+# 3. boolean_expression_simplify: fold the literal into its enclosing expression
+# ===========================================================================
+
+# `await true` -> `true`, `await false` -> `false`.
+#
+# Only ever reached on the residue of one of THIS tool's own rewrites: edges are
+# scoped to the ancestors of the node just edited, so an `await true` a customer
+# wrote themselves elsewhere in the file is not touched.
+#
+# Awaiting a non-thenable yields the value itself, so dropping the `await` keeps
+# the value identical; it resolves one microtask sooner, which no correct
+# program can observe here because the operand is a literal with no side
+# effects. The enclosing function stays `async`, so its signature is unchanged.
+#
+# Needed because our own `boolVariation` is SYNC (`@featureflip/node`'s
+# `boolVariation(...): boolean`) and a redundant `await` in front of it is legal
+# TS that people do write defensively. Before these two rules the seed replaced
+# that read and then stalled: `if (await false)` folds no further, so the dead
+# branch survived under a PR claiming the flag was gone. The OpenFeature seed
+# rule in section 2 does not depend on these — it consumes its own
+# `await_expression` — but a Promise-returning read reached through any shape
+# these rules do not cover still lands here.
+[[rules]]
+name = "simplify_await_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (await_expression (true)) @await
+)"""
+replace_node = "await"
+replace = "true"
+
+[[rules]]
+name = "simplify_await_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (await_expression (false)) @await
+)"""
+replace_node = "await"
+replace = "false"
+
+# `!true` -> false, `!false` -> true.
+[[rules]]
+name = "simplify_not_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (unary_expression operator: "!" argument: (true)) @not
+)"""
+replace_node = "not"
+replace = "false"
+
+[[rules]]
+name = "simplify_not_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (unary_expression operator: "!" argument: (false)) @not
+)"""
+replace_node = "not"
+replace = "true"
+
+# `true ? a : b` -> a, `false ? a : b` -> b.
+[[rules]]
+name = "simplify_ternary_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (ternary_expression
+    condition: (true)
+    consequence: (_) @consequence) @ternary
+)"""
+replace_node = "ternary"
+replace = "@consequence"
+
+[[rules]]
+name = "simplify_ternary_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (ternary_expression
+    condition: (false)
+    alternative: (_) @alternative) @ternary
+)"""
+replace_node = "ternary"
+replace = "@alternative"
+
+# Short-circuit operators, LITERAL ON THE LEFT ONLY. These four rewrites are
+# exactly semantics-preserving in JS: the dropped operand is the one the runtime
+# would not have evaluated, and the kept operand is returned verbatim.
+#
+# The mirrored right-hand forms are deliberately NOT implemented. `x && true`
+# -> `x` and `x || false` -> `x` change the produced VALUE whenever `x` is
+# falsy-but-not-`false` (`0`, `""`, `null`), and `x && false` -> `false` /
+# `x || true` -> `true` discard `x`'s side effects entirely. Leaving `x && true`
+# in place is ugly but correct, which is the trade this tool always makes.
+[[rules]]
+name = "simplify_and_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (true) operator: "&&" right: (_) @right) @expr
+)"""
+replace_node = "expr"
+replace = "@right"
+
+[[rules]]
+name = "simplify_and_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (false) operator: "&&" right: (_)) @expr
+)"""
+replace_node = "expr"
+replace = "false"
+
+[[rules]]
+name = "simplify_or_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (true) operator: "||" right: (_)) @expr
+)"""
+replace_node = "expr"
+replace = "true"
+
+[[rules]]
+name = "simplify_or_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (false) operator: "||" right: (_) @right) @expr
+)"""
+replace_node = "expr"
+replace = "@right"
+
+# Equality against a boolean literal, BOTH SIDES LITERAL ONLY. `flagRead === true`
+# becomes `true === true` once the read is folded, and without these it stops
+# there: correct, but the `if` never disappears and the customer is left to
+# finish the removal by hand.
+#
+# The single-literal forms are deliberately NOT implemented, and the reason is
+# the same one that rules out `x && true`. `true === x` is NOT equivalent to
+# `x`: `===` always produces a boolean, while `x` produces whatever `x` is, so
+# folding it changes the value of every expression where `x` is not already a
+# boolean — and in TS, `if (someString === true)` is a real (if wrong) thing to
+# write. With both sides literal the comparison has exactly one answer and no
+# operand can carry a side effect, so the rewrite is total.
+#
+# `==` rides along with `===`: between two boolean literals the two operators
+# agree, and a repository that writes `flagRead == true` deserves the same
+# cleanup as one that writes `===`.
+[[rules]]
+name = "simplify_equality_true_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (true) operator: ["===" "=="] right: (true)) @expr
+)"""
+replace_node = "expr"
+replace = "true"
+
+[[rules]]
+name = "simplify_equality_true_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (true) operator: ["===" "=="] right: (false)) @expr
+)"""
+replace_node = "expr"
+replace = "false"
+
+[[rules]]
+name = "simplify_equality_false_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (false) operator: ["===" "=="] right: (true)) @expr
+)"""
+replace_node = "expr"
+replace = "false"
+
+[[rules]]
+name = "simplify_equality_false_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (false) operator: ["===" "=="] right: (false)) @expr
+)"""
+replace_node = "expr"
+replace = "true"
+
+[[rules]]
+name = "simplify_inequality_true_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (true) operator: ["!==" "!="] right: (true)) @expr
+)"""
+replace_node = "expr"
+replace = "false"
+
+[[rules]]
+name = "simplify_inequality_true_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (true) operator: ["!==" "!="] right: (false)) @expr
+)"""
+replace_node = "expr"
+replace = "true"
+
+[[rules]]
+name = "simplify_inequality_false_true"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (false) operator: ["!==" "!="] right: (true)) @expr
+)"""
+replace_node = "expr"
+replace = "true"
+
+[[rules]]
+name = "simplify_inequality_false_false"
+groups = ["boolean_expression_simplify"]
+is_seed_rule = false
+query = """(
+  (binary_expression left: (false) operator: ["!==" "!="] right: (false)) @expr
+)"""
+replace_node = "expr"
+replace = "false"
+
+# NOTE: there is deliberately no "unwrap `(true)` -> `true`" rule. In TS a
+# parenthesized_expression is also how `if`, `while`, `do`, and `switch` carry
+# their condition, and tree-sitter queries cannot say "unless my parent is one
+# of those" — stripping the parentheses there produces `switch true`, which does
+# not parse. Leaving redundant parentheses is always valid code.
+
+
+# ===========================================================================
+# 4. if_cleanup: fold `if (true/false) { ... } else { ... }`
+# ===========================================================================
+# After the seed rewrite the condition is `(true)` / `(false)` (a
+# parenthesized_expression). Replace the whole if_statement with the branch that
+# survives.
+#
+# Each direction has TWO rules, declared splice-first:
+#   *_splice     — replaces the if with the surviving BLOCK'S STATEMENTS, so no
+#                  braces are left behind. Only applies when the if_statement
+#                  contains no declaration anywhere: hoisting a `const`/`let`/
+#                  `class`/`function` out of the braces it was scoped to can
+#                  collide with an outer binding of the same name
+#                  (`SyntaxError: Identifier 'y' has already been declared`).
+#   *_keep_block — the fallback: replaces the if with the branch verbatim,
+#                  braces included. A bare `{ … }` block statement is valid JS
+#                  and preserves the declarations' scope. It also handles a
+#                  braceless branch (`if (true) foo();`).
+#
+# The `not_contains` filter carries no `enclosing_node`, which scopes it to the
+# rule's own matched node (the if_statement) — verified; that is the only way to
+# constrain a filter to the match rather than to an ancestor.
+#
+# This replaced an earlier `remove_unnecessary_nested_block` rule that unwrapped
+# ANY block nested in a block. It could splice an unrelated, deliberate bare
+# block into its parent scope and produce a duplicate-declaration SyntaxError.
+[[rules]]
+name = "simplify_if_true_splice"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  [(statement_block
+     (if_statement
+       condition: (parenthesized_expression (true))
+       consequence: (statement_block (_)* @body)) @if_statement)
+   (program
+     (if_statement
+       condition: (parenthesized_expression (true))
+       consequence: (statement_block (_)* @body)) @if_statement)
+   (switch_case
+     (if_statement
+       condition: (parenthesized_expression (true))
+       consequence: (statement_block (_)* @body)) @if_statement)
+   (switch_default
+     (if_statement
+       condition: (parenthesized_expression (true))
+       consequence: (statement_block (_)* @body)) @if_statement)] @container
+)"""
+replace_node = "if_statement"
+replace = "@body"
+
+[[rules.filters]]
+not_contains = ["""((lexical_declaration) @decl)""",
+                """((variable_declaration) @decl)""",
+                """((class_declaration) @decl)""",
+                """((abstract_class_declaration) @decl)""",
+                """((function_declaration) @decl)""",
+                """((generator_function_declaration) @decl)""",
+                """((enum_declaration) @decl)""",
+                """((interface_declaration) @decl)""",
+                """((type_alias_declaration) @decl)"""]
+
+[[rules]]
+name = "simplify_if_true_keep_block"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    condition: (parenthesized_expression (true))
+    consequence: (_) @consequence) @if_statement
+)"""
+replace_node = "if_statement"
+replace = "@consequence"
+
+[[rules]]
+name = "simplify_if_false_splice"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  [(statement_block
+     (if_statement
+       condition: (parenthesized_expression (false))
+       alternative: (else_clause (statement_block (_)* @body))) @if_statement)
+   (program
+     (if_statement
+       condition: (parenthesized_expression (false))
+       alternative: (else_clause (statement_block (_)* @body))) @if_statement)
+   (switch_case
+     (if_statement
+       condition: (parenthesized_expression (false))
+       alternative: (else_clause (statement_block (_)* @body))) @if_statement)
+   (switch_default
+     (if_statement
+       condition: (parenthesized_expression (false))
+       alternative: (else_clause (statement_block (_)* @body))) @if_statement)] @container
+)"""
+replace_node = "if_statement"
+replace = "@body"
+
+[[rules.filters]]
+not_contains = ["""((lexical_declaration) @decl)""",
+                """((variable_declaration) @decl)""",
+                """((class_declaration) @decl)""",
+                """((abstract_class_declaration) @decl)""",
+                """((function_declaration) @decl)""",
+                """((generator_function_declaration) @decl)""",
+                """((enum_declaration) @decl)""",
+                """((interface_declaration) @decl)""",
+                """((type_alias_declaration) @decl)"""]
+
+[[rules]]
+name = "simplify_if_false_keep_block"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    condition: (parenthesized_expression (false))
+    alternative: (else_clause (_) @alternative)) @if_statement
+)"""
+replace_node = "if_statement"
+replace = "@alternative"
+
+# `if (false) { … }` with no else, sitting in an ELSE position. Deleting just
+# the if_statement (what `delete_if_false` below would do) leaves a dangling
+# `else`, which does not parse — so the whole else_clause goes with it. This is
+# the same parent-position question the splice rules answer, with a harsher
+# answer available: there, a bad splice still parses; here it does not, so
+# Piranha's self-check rejected the transform and abandoned the flag. Safe, but
+# it meant a repository using `else if (<flag read>)` could never have that flag
+# cleaned while it served false.
+#
+# Declared BEFORE `delete_if_false` so it is the one that fires.
+#
+# Rooted at the else_clause because Piranha cannot express the alternative.
+# Measured: a query rooted at the OUTER if_statement, constraining its
+# `alternative:` to an `(else_clause (if_statement condition: … !alternative))`,
+# never matches — while the identical pattern matches under tree-sitter
+# directly, and while `(else_clause (_) @inner)` (a WILDCARD in that position)
+# does match. So the constrained grandchild is what Piranha drops. That is why
+# this cannot instead rewrite the outer `if` as `if @condition @consequence`,
+# which is the formulation that would leave no whitespace behind.
+#
+# The cost of rooting here: the else_clause does not start its line — the text
+# before it is `} ` — so removing it leaves ONE trailing space on that line.
+# Every other deletion in these rules removes a node that begins a line, which
+# is why this is the only rule that leaves an artefact. Cosmetic, and much
+# smaller than what it replaces (the flag could not be cleaned at all), but it
+# is real: a repository linting `no-trailing-spaces` will flag that line in the
+# pull request. See README "Known gaps".
+[[rules]]
+name = "delete_else_if_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (else_clause
+    (if_statement
+      condition: (parenthesized_expression (false))
+      !alternative)) @else_clause
+)"""
+replace_node = "else_clause"
+replace = ""
+
+# `if (false) { … }` with no else: the statement goes entirely. Its own group,
+# so it is never wired to anything that expects a surviving branch.
+[[rules]]
+name = "delete_if_false"
+groups = ["if_cleanup"]
+is_seed_rule = false
+query = """(
+  (if_statement
+    condition: (parenthesized_expression (false))
+    !alternative) @if_statement
+)"""
+replace_node = "if_statement"
+replace = ""
+
+
+# ===========================================================================
+# 5. statement_cleanup: drop statements the fold made dead
+# ===========================================================================
+# `true;` / `false;` on its own has no effect — it is what `flagRead && doIt();`
+# collapses to when the flag serves the branch that skips `doIt()`.
+[[rules]]
+name = "delete_boolean_literal_statement"
+groups = ["statement_cleanup"]
+is_seed_rule = false
+query = """(
+  (expression_statement [(true) (false)]) @statement
+)"""
+replace_node = "statement"
+replace = ""

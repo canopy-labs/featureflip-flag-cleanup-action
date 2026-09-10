@@ -1,0 +1,29 @@
+# Wires the TS flag-cleanup cascade (see ts.toml). Piranha reads [[edges]] only
+# from this file, never from rules.toml.
+#
+# Every edge uses scope = "Parent", which matches the target rule against the
+# ANCESTOR NODES of the node just edited (the ancestor must match the target
+# query's root). That is the only scope available to TS/TSX: named scopes need a
+# language scope_config Piranha does not ship for TypeScript, and "Global"
+# re-applies a rule to every file in the codebase.
+
+# A flag read became a boolean literal: fold it into the expression around it,
+# into the enclosing `if`, or drop the statement it left behind.
+[[edges]]
+scope = "Parent"
+from = "replace_expression_with_boolean_literal"
+to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
+
+# Simplifying an expression can expose another simplification (`!(a && true)`),
+# a foldable `if`, or a dead statement. Self-edge = cascade to a fixpoint.
+[[edges]]
+scope = "Parent"
+from = "boolean_expression_simplify"
+to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
+
+# Folding an if can expose a statement that is now dead (`false;`) or another
+# foldable `if` (an `else if` chain collapses one level at a time).
+[[edges]]
+scope = "Parent"
+from = "if_cleanup"
+to = ["if_cleanup", "statement_cleanup"]

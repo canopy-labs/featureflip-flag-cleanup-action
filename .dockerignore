@@ -1,0 +1,25 @@
+# Keep host build artefacts out of the image. `COPY src ./src` is otherwise
+# happy to bake in whatever `__pycache__` the developer's interpreter left
+# behind — including bytecode compiled by a Python version this image does not
+# even have (the repo is developed on 3.12 *and* 3.14; the image is 3.12).
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Not copied by the Dockerfile today, but listed so that stays true by
+# accident-proofing rather than by nobody having changed the COPY lines yet.
+tests/
+CLAUDE.md
+
+# Release tooling: generates the PUBLIC wrapper repository's action.yml. It runs
+# on a runner with a checkout, never inside the image, and importing it would
+# be the only reason this package needed a YAML parser.
+scripts/
+
+# wheels/ (the fork's polyglot-piranha, fetched by scripts/fetch_piranha_wheels.py)
+# is deliberately NOT listed here: the Dockerfile bind-mounts it out of the
+# build context. Ignoring it would make the mount source vanish and the build
+# fail before pip ever runs.

@@ -1,0 +1,360 @@
+# KEY-const propagation for Java — the flag key hoisted to a constant, as in
+#
+#     private static final String FLAG_KEY = "old-checkout";
+#     ...
+#     if (client.boolVariation(FLAG_KEY, context, false)) { ... }
+#
+# `piranha_runner` prepends this file to `java.toml` for files that pass the
+# Gate 2 shadow check (see `flag_cleanup.key_const`).
+#
+# accessor-guard: none — see `rule_synthesis.with_accessor_guards`. This file
+# resolves a flag KEY, not a flag READ, so it binds no name that a non-flag call
+# could be re-bound to and there is no `(#not-eq? @callee ...)` guard to extend.
+#
+# It does NOT mean this file needs nothing from `rule_synthesis`. The fold rules
+# below are pinned to an SDK callee by `(#eq? @sdk_fn "…")` exactly as the seed
+# rules in the language file are, so they are CLONED per accessor too — see
+# `rule_synthesis.with_accessor_const_rules`. Reading the marker as "no accessor
+# handling here" is what left a wrapper unable to reach a hoisted key for the
+# life of this file (#2730), and `key_const` has to be widened in the same
+# breath or the gate withholds the file the clones would have cleaned.
+#
+# --- WHAT THIS FIXES ---------------------------------------------------------
+#
+# `java.toml`'s seed rule anchors a string LITERAL first argument, so an
+# identifier there is not a weak match — it is structurally unmatchable. Before
+# this file, a Java codebase that hoisted its keys to a `static final` (which is
+# the conventional thing to do, and what our own C# gates do) reported
+# `no-changes` for every flag with nothing anywhere saying why. Same silent
+# no-op class as #2525 closed for C#.
+#
+# --- `final` IS REQUIRED, AND IT IS A PREDICATE RATHER THAN A NODE -----------
+#
+# C# gets to write `(modifier) @m (#eq? @m "const")` because its grammar emits
+# ONE `modifier` node per modifier. Java emits a single `modifiers` node holding
+# all of them (`@Deprecated private static final`), so an `#eq?` on its text
+# cannot work and the requirement is expressed as a `#match?` instead.
+#
+# `#match?` IS honoured by the bundled tree-sitter — verified positively AND
+# negatively against the installed wheel, which matters because a SILENTLY
+# IGNORED predicate does not fail, it stops constraining, and this one is the
+# only thing standing between these rules and a mutable field. (That is exactly
+# what `#any-of?` used to do here; see this tool's CLAUDE.md.)
+#
+# The pattern is spelled with explicit character classes rather than `\b`
+# because this is a TOML basic string, where `\b` is a real escape (backspace)
+# and would corrupt the query rather than reach the regex engine. `@FinalThing`
+# and `@finalizer` are both correctly refused by the boundary form; the naive
+# substring form refuses only the first.
+#
+# **Why the rules and not just Gate 2.** Gate 2 returns "trivially safe" for a
+# file it finds no resolvable constant in — so if these queries matched a
+# declaration Gate 2 does not recognise, that declaration would be rewritten
+# with NO gate at all. The two must agree on what counts as a constant, and
+# `key_const._JAVA_FINAL` is the same boundary pattern in Python.
+#
+# An `interface_body` constant is matched WITHOUT the modifier requirement
+# because an interface field is implicitly `public static final` — there is
+# nothing to assert.
+#
+# --- THE SAFETY ARGUMENT IS GATE 2, NOT THE QUERIES --------------------------
+#
+# `key_const.path_is_safe` withholds this whole file from any source where the
+# const's name is bound more than once, or is referenced by anything other than
+# a flag read this file's rules will themselves remove. Two concrete losses if
+# that check is weakened:
+#
+#   1. WRONG BRANCH. `enclosing_node` finds the class-level constant from
+#      anywhere inside the class, INCLUDING a method that shadows the name with
+#      a local bound to a different key. Without the bound-exactly-once check
+#      the other flag's read folds to THIS flag's value — it compiles, it looks
+#      right, and it is wrong. `tests/fixtures/java/const_key_shadowed`.
+#   2. DANGLING REFERENCE. The delete rule below removes the declaration. If
+#      anything else in the file still reads it, the result does not compile.
+#      `tests/fixtures/java/const_key_other_usage`.
+#
+# Gate 1 catches NEITHER: the first produces valid Java with no ERROR nodes, and
+# the second is a name-resolution error one layer below a re-parse.
+#
+# --- grammar facts -----------------------------------------------------------
+#
+# `string_fragment` is the node holding a literal's text without its quotes —
+# the same node `java.toml` relies on, and the reason Java is constrainable at
+# all where Kotlin is not.
+#
+# The `type: (_) . (variable_declarator …) .` anchors mean EXACTLY ONE
+# declarator: it must immediately follow the type and also be last. So
+# `static final String A = "k", B = "j";` matches nothing here, and the delete
+# rule can never take a statement that also declares something else.
+#
+# Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
+
+# --- boolVariation(FLAG_KEY, …); AS A WHOLE STATEMENT -> deleted -------------
+#
+# The statement-position read, with the key behind a constant. `java.toml`'s
+# `delete_discarded_boolvariation_statement` is anchored to a string LITERAL
+# like every seed rule in this tool, so a hoisted key does not reach it: the
+# read folded to a bare `true;`, which is not a statement in Java (JLS 14.8),
+# and the whole flag was refused (#2716). Hoisting a key read more than once is
+# the conventional shape — the README says so — so this is not a rare
+# arrangement, and it is the position the const path did not carry.
+#
+# THESE RULES MUST STAY ABOVE the two `replace_*` rules below, for the reason
+# `java.toml` gives at length: seed rules fire in declaration order and those
+# rewrite the CALL, the child of the statement these want, so declared second
+# they never fire and the refusal silently comes back. `_execute` PREPENDS this
+# whole file, so being above the literal rules is already true; being above
+# this file's OWN read rules is what the position buys, and
+# `test_a_discarded_read_rule_declared_second_stops_firing` pins both.
+#
+# THE FILTERS ARE THE LITERAL RULE'S, UNCHANGED, plus this file's declaration
+# resolution. The safety argument does not depend on how the key is spelled:
+# the statement may hold exactly ONE argument list, which is the read's own, so
+# `verify(client).boolVariation(FLAG_KEY, …)` and `boolVariation(FLAG_KEY,
+# buildCtx(), false)` are refused here exactly as they are there — and Gate 2
+# withholds this whole file long before that for anything that reads the
+# constant outside a flag read. Over-refusing costs one uncleaned statement.
+#
+# Split in two for the same reason the read rules below are: an interface field
+# is implicitly `public static final` and carries no `modifiers` node, and a
+# filter's alternatives all share the one `#match?`.
+[[rules]]
+name = "delete_discarded_boolvariation_const_key_statement"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @sdk_fn
+      arguments: (argument_list . (identifier) @key_const))) @statement
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+# File-scoped, for the subclass reason spelled out on the read rule below.
+[[rules.filters]]
+enclosing_node = """((program) @scope)"""
+contains = """(
+  [(field_declaration
+     (modifiers) @mods
+     type: (_) . (variable_declarator
+       name: (identifier) @decl_name
+       value: (string_literal (string_fragment) @flag_name)) .)
+   (local_variable_declaration
+     (modifiers) @mods
+     type: (_) . (variable_declarator
+       name: (identifier) @decl_name
+       value: (string_literal (string_fragment) @flag_name)) .)] @declaration
+  (#match? @mods "(^|[^A-Za-z])final([^A-Za-z]|$)")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((update_expression) @mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+[[rules]]
+name = "delete_discarded_boolvariation_interface_const_key_statement"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @sdk_fn
+      arguments: (argument_list . (identifier) @key_const))) @statement
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((program) @scope)"""
+contains = """(
+  (constant_declaration
+    type: (_) . (variable_declarator
+      name: (identifier) @decl_name
+      value: (string_literal (string_fragment) @flag_name)) .) @declaration
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((update_expression) @mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+# --- fold the read: `boolVariation(FLAG_KEY, …)` -> @treated ----------------
+# Declared BEFORE the delete rule. Seed rules fire in declaration order, and the
+# delete rule's filter additionally refuses while any such call survives, so the
+# declaration cannot be removed out from under a read that still needs it.
+[[rules]]
+name = "replace_boolvariation_const_key_read_with_boolean_literal"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+# File-scoped for the same reason as the interface rule below, and against the
+# same defect measured one class over: a constant on a BASE class, read from a
+# subclass that inherits it, is a live reference the delete rule's guard could
+# not see either.
+#
+#     class Base  { protected static final String FLAG_KEY = "old-checkout"; }
+#     class Child extends Base { … boolVariation(FLAG_KEY, …) … }
+#
+# `class_body` finds the field from anywhere INSIDE `Base` and `Child` is not
+# inside it, so the fold declined and the delete — nearest `class_declaration`
+# being `Base`, which does not contain `Child` — fired anyway. Not in #2701's
+# report; found by asking whether the interface shape's mechanism had a twin.
+enclosing_node = """((program) @scope)"""
+contains = """(
+  [(field_declaration
+     (modifiers) @mods
+     type: (_) . (variable_declarator
+       name: (identifier) @decl_name
+       value: (string_literal (string_fragment) @flag_name)) .)
+   (local_variable_declaration
+     (modifiers) @mods
+     type: (_) . (variable_declarator
+       name: (identifier) @decl_name
+       value: (string_literal (string_fragment) @flag_name)) .)] @declaration
+  (#match? @mods "(^|[^A-Za-z])final([^A-Za-z]|$)")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# An interface field is implicitly `public static final`, so it carries no
+# `modifiers` node to assert on and needs none. Kept as its own rule rather than
+# a third alternative above, because a filter's alternatives all share the one
+# `#match?` and this branch must not be subject to it.
+[[rules]]
+name = "replace_boolvariation_interface_const_key_read_with_boolean_literal"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+# Scoped to the FILE, not to the `interface_body`, and that is the fix for
+# #2701's third shape. `enclosing_node` walks ANCESTORS, and the conventional
+# way to use an interface of keys is to implement it:
+#
+#     interface Keys { String FLAG_KEY = "old-checkout"; }
+#     class A implements Keys { … boolVariation(FLAG_KEY, …) … }
+#
+# A read in `class A` has no `interface_body` ancestor, so this fold declined
+# while `delete_flag_key_interface_const_declaration` — whose guard was scoped
+# to the nearest `interface_declaration`, which does not contain `A` — fired.
+# The declaration went and the read stayed: `cannot find symbol`. The two
+# halves of one path have to agree about which declarations they cover, and
+# `key_const.path_is_safe` already reads the whole file, so the file is the
+# scope they agree on. The delete rule's guard moved here too.
+enclosing_node = """((program) @scope)"""
+contains = """(
+  (constant_declaration
+    type: (_) . (variable_declarator
+      name: (identifier) @decl_name
+      value: (string_literal (string_fragment) @flag_name)) .) @declaration
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- delete the now-unused declaration ---------------------------------------
+# Flag-key-scoped: the initialiser must be THIS flag's key, so there is no blast
+# radius on unrelated constants.
+#
+# ROOTED AT THE PARENT and deleting the declaration as a child of it, for the
+# reason `ts_const.toml`'s and `csharp_const.toml`'s delete rules are: matching
+# the declaration on its own ignores what encloses it, and a wrapper we did not
+# anticipate would have its insides removed and its shell left behind.
+#
+# The filter is a SEQUENCING guard, not the safety argument (Gate 2 is — see the
+# header): while any call still takes this constant as its first argument, the
+# declaration stays.
+#
+# ITS SCOPE IS THE FILE, and narrowing it is what shipped #2701's third shape.
+# `enclosing_node` takes the NEAREST matching ancestor, so listing
+# `class_declaration` here scoped the search to the class holding the
+# declaration — and a surviving read in a SIBLING class or a SUBCLASS is
+# outside it. The guard then saw no surviving read, deleted the declaration,
+# and left the reference behind. The fold rules above now resolve a constant
+# file-wide, so the two halves cover the same declarations; this is the belt to
+# that braces, and it must stay the wider of the two. Over-refusing here costs
+# one uncleaned declaration, which is the direction this whole file fails in.
+[[rules]]
+name = "delete_flag_key_const_declaration"
+query = """(
+  [(class_body
+     (field_declaration
+       (modifiers) @mods
+       type: (_) . (variable_declarator
+         name: (identifier) @variable_name
+         value: (string_literal (string_fragment) @flag_name)) .) @declaration)
+   (block
+     (local_variable_declaration
+       (modifiers) @mods
+       type: (_) . (variable_declarator
+         name: (identifier) @variable_name
+         value: (string_literal (string_fragment) @flag_name)) .) @declaration)] @scope
+  (#match? @mods "(^|[^A-Za-z])final([^A-Za-z]|$)")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((program) @container)"""
+not_contains = ["""(
+  (method_invocation
+    arguments: (argument_list . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]
+
+[[rules]]
+name = "delete_flag_key_interface_const_declaration"
+query = """(
+  (interface_body
+    (constant_declaration
+      type: (_) . (variable_declarator
+        name: (identifier) @variable_name
+        value: (string_literal (string_fragment) @flag_name)) .) @declaration) @scope
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((program) @container)"""
+not_contains = ["""(
+  (method_invocation
+    arguments: (argument_list . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]
