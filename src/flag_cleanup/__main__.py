@@ -27,6 +27,35 @@ is ``0`` — those are the ordinary outcomes of a workflow that fires on every
 closed pull request, not failures. A trigger that cannot work at all is ``2``;
 an API that refuses the archive is ``1``.
 
+``mode: pr-command`` answers ONE command a human left as a comment, so almost
+every outcome is ``0`` — including a comment from someone without write
+access, a branch this Action never opened, a re-run that comes back empty
+because nothing reads the flag any more, or a **dry run**, which regenerates
+and reports exactly what it would have done but pushes nothing and leaves the
+pull request untouched: each of those is an answer, not a failure. ``1`` is
+for the four outcomes where the command genuinely could not do what it was
+asked (the branch carries commits this Action did not make, the pull request
+already merged, the flag is no longer a removal candidate, or the flag is in
+this workflow's ``ignore`` list — the same "silence it, don't resurrect it"
+rule the ``flags`` allowlist is held to), for a transform that raised
+outright, and for ``BaseRefError`` — which in THIS mode
+means the one pull request the command is acting on targets a base the
+checkout never saw, not that the workflow itself is broken, so it is
+deliberately excluded from the exit-2 set below even though the identical type
+means exactly that for ``remove``. ``issue_comment`` triggers attach no check
+run to the pull request itself, so a raised failure also gets a reply posted
+on the pull request before the non-zero exit — otherwise the one person
+waiting on an answer, the one who typed the command, is the one person who
+never gets one. ``2`` is the workflow wired to the wrong trigger, exactly as
+for ``archive-on-merge``, and — reached through the same preflight ``remove``
+mode opens with — a checkout this tool cannot safely operate in: a configured
+directory that is not a git working tree, that belongs to a different
+repository than the first one, or that carries uncommitted changes to tracked
+files, which this mode would otherwise commit onto the customer's branch and
+then destroy. Nothing has been transformed, committed or pushed when that
+fires, so exit 2's "the run could not start" reading holds, and the reply is
+still posted.
+
 Nothing reaches the customer as a bare traceback: a misconfigured workflow is
 by far the most common failure and deserves a one-liner, and an abort mid-run
 still has real results to report. The exceptions are the two things that are
@@ -40,18 +69,31 @@ import logging
 import sys
 from collections import Counter
 
+from flag_cleanup import github_ops
 from flag_cleanup.archive import run_archive
 from flag_cleanup.client import FeatureflipApiError
-from flag_cleanup.config import MODE_ARCHIVE_ON_MERGE, Config, ConfigError
-from flag_cleanup.git_ops import GitCommandError, PreflightError
-from flag_cleanup.github_ops import BaseRefError, GitHubApiError, GitHubConfigError
+from flag_cleanup.config import MODE_ARCHIVE_ON_MERGE, MODE_PR_COMMAND, Config, ConfigError
+from flag_cleanup.git_ops import ForceWithLeaseRejected, GitCommandError, PreflightError
+from flag_cleanup.github_ops import (
+    BaseRefError,
+    GitHubApi,
+    GitHubApiError,
+    GitHubConfigError,
+    GitHubEnv,
+)
 from flag_cleanup.orchestrate import (
     PARTIAL_RESULTS_ATTR,
     RUN_STARTED_ATTR,
     FlagResult,
     run,
 )
-from flag_cleanup.pr_event import PullRequestEventError
+from flag_cleanup.pr_command import (
+    PrCommandResult,
+    branch_was_force_pushed,
+    pull_request_was_updated,
+    run_pr_command,
+)
+from flag_cleanup.pr_event import PullRequestEventError, commented_pull_request
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     del argv  # no CLI flags yet — everything comes from the environment
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     # httpx logs every request at INFO as a full URL — including any userinfo
-    # in `api-url`. That is the exact value `orchestrate._without_userinfo`
+    # in `api-url`. That is the exact value `pr_content._without_userinfo`
     # strips before a self-hosted URL can reach a PR body, and a workflow log
     # is just as readable, so silencing it here closes the same leak on the
     # other side. (The API token itself never appears: it rides in a header.)
@@ -80,6 +122,11 @@ def main(argv: list[str] | None = None) -> int:
             # two failure types: a misconfigured trigger to exit 2 (nothing was
             # archived), an API refusal to exit 1.
             return _archive(config)
+        if config.mode == MODE_PR_COMMAND:
+            # Same reasoning: a misconfigured trigger (`PullRequestEventError`)
+            # falls through to exit 2 below, and a raised transform failure
+            # falls through to exit 1 — `_pr_command` only adds the reply.
+            return _pr_command(config)
         results = run(config)
     except BaseException as exc:  # noqa: BLE001 - an abort still has results to report
         # A clean one-liner beats a traceback for the most common failures: a
@@ -94,16 +141,37 @@ def main(argv: list[str] | None = None) -> int:
         # run — by which point earlier flags may already have pull requests.
         # Reporting that as exit 2 told the customer nothing had been modified
         # AND skipped the report naming the PRs they had just been given.
-        if isinstance(
-            exc,
-            (
-                ConfigError,
-                GitHubConfigError,
-                PreflightError,
-                BaseRefError,
-                PullRequestEventError,
-            ),
-        ) and not getattr(exc, RUN_STARTED_ATTR, False):
+        #
+        # `BaseRefError` is the one type in this tuple whose MEANING depends on
+        # the mode, not just on whether the run had started. In `remove` mode
+        # it names a misconfigured `base-branch` input or trigger — the
+        # workflow itself cannot work as written, so exit 2 is right. In
+        # `pr-command` mode the identical type means something else entirely:
+        # `ensure_head_on_base` raised it for THIS ONE pull request, whose
+        # base the checkout never saw — the workflow is fine, and every other
+        # comment on every other pull request would work. Exit 2 would send
+        # the customer to fix a workflow file that has nothing wrong with it,
+        # so it is excluded here and falls through to the ordinary exit-1
+        # path below instead — `config` is always bound by this point, since
+        # the type can only be raised from `run`/`_pr_command`, both reached
+        # only after `Config.from_env()` already succeeded.
+        pr_command_base_ref_failure = (
+            isinstance(exc, BaseRefError) and config.mode == MODE_PR_COMMAND
+        )
+        if (
+            isinstance(
+                exc,
+                (
+                    ConfigError,
+                    GitHubConfigError,
+                    PreflightError,
+                    BaseRefError,
+                    PullRequestEventError,
+                ),
+            )
+            and not getattr(exc, RUN_STARTED_ATTR, False)
+            and not pr_command_base_ref_failure
+        ):
             print(f"flag-cleanup: {exc}", file=sys.stderr)
             return 2
 
@@ -186,6 +254,163 @@ def _archive(config: Config) -> int:
     key = f" {result.key}" if result.key else ""
     print(f"[{result.action_taken}]{key} {result.detail}", flush=True)
     return 0
+
+
+#: pr-command outcomes that must turn the build red. Each is a command a human
+#: typed and is waiting on, which did not happen — the reply says why, and the
+#: red check is what a reader scanning the pull request sees without opening
+#: comments. `rerun-empty` and `rerun-dry-run` are deliberately NOT here:
+#: "the code no longer reads this flag" and "here is what would have happened"
+#: are both answers, not failures.
+PR_COMMAND_FAILURES = (
+    "rerun-refused",
+    "rerun-merged",
+    "rerun-not-a-candidate",
+    "rerun-ignored",
+)
+
+
+def _pr_command(config: Config) -> int:
+    """Run pr-command mode and print the single line that says what happened.
+
+    Printed rather than logged, matching `_archive` and `_report`: stdout is
+    what a workflow log and job summary capture.
+
+    `run_pr_command` RAISES rather than returning an outcome for a transform
+    refusal (see its module docstring) — every ordinary outcome, including
+    every member of `PR_COMMAND_FAILURES`, already replies for itself via
+    `pr_command._reply` before returning here. A raised failure gets no such
+    reply, and `issue_comment` triggers attach no check run to the pull
+    request, so without one the human who typed the command — the one person
+    actually waiting on this run — is the one person who never sees an answer.
+    `_reply_to_pr_command_failure` closes that gap; the exit code itself is
+    still decided by `main`'s existing handler, exactly as the module
+    docstring's exit table says.
+    """
+    try:
+        result: PrCommandResult = run_pr_command(config)
+    except PullRequestEventError:
+        # Raised before any comment is even identified (wrong trigger, unusable
+        # payload) — there is structurally no pull request to reply to, and
+        # `main`'s handler already renders this as exit 2. Nothing to add here.
+        raise
+    except Exception as exc:
+        # Best-effort and never allowed to mask `exc`: whatever happens inside
+        # the reply, the bare `raise` below re-raises the ORIGINAL exception
+        # untouched, so the exit code and the "run aborted" message on stderr
+        # are always about the real failure, never about a broken reply.
+        _reply_to_pr_command_failure(exc)
+        raise
+    key = f" {result.key}" if result.key else ""
+    print(f"[{result.action_taken}]{key} {result.detail}", flush=True)
+    if result.action_taken in PR_COMMAND_FAILURES:
+        print(f"flag-cleanup: {result.detail}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _reply_to_pr_command_failure(exc: Exception) -> None:
+    """Tell the human who typed the command that the re-run failed.
+
+    Re-reads the triggering event rather than threading anything out of
+    `run_pr_command`: that function closes its OWN GitHub client in a
+    `finally` before an exception it raised can reach here, so this needs its
+    own comment lookup and its own client regardless.
+
+    Every step is best-effort and wrapped in one broad `except`, deliberately:
+    a workflow broken enough to have raised in the first place (a missing
+    `GITHUB_TOKEN`, a non-comment trigger) fails the SAME way here, and that
+    must be swallowed — logged, not raised — rather than replacing the
+    failure this function exists to report.
+    """
+    try:
+        comment = commented_pull_request()
+        if comment is None:
+            return
+        github = GitHubEnv.from_env()
+        gh = GitHubApi(github.token, api_url=github.api_url)
+        try:
+            github_ops.comment_on_pull_request(
+                gh,
+                github.repository,
+                comment.number,
+                _pr_command_failure_body(exc),
+            )
+        finally:
+            gh.close()
+    except Exception as reply_exc:  # noqa: BLE001 - best-effort only
+        logger.warning(
+            "could not reply on the pull request about a failed pr-command "
+            "run: %s",
+            reply_exc,
+        )
+
+
+def _pr_command_failure_body(exc: Exception) -> str:
+    """A short, readable comment body naming what failed.
+
+    `exc`'s own message can be multi-line engine output (a Piranha abort, a
+    Gate 1 refusal listing several files) — reduced to its first line so the
+    reply stays a sentence a non-expert can act on, rather than pasting raw
+    engine output into a pull request comment. The full message is still one
+    `gh run view` away in the workflow log.
+
+    A REJECTED LEASE gets its own branch rather than that truncation, because
+    truncating it drops the only informative line: `GitCommandError`'s first
+    line is the command plus `To <url>`, and git puts the
+    `! [rejected] ... (stale info)` reason on the second. Widening the
+    truncation for everything would paste engine output into a comment, which
+    is what it exists to prevent — so the fix is a branch for the one failure
+    whose remedy is a sentence. `git_ops` classifies it; this only phrases it.
+
+    How far the run GOT is read off the exception rather than assumed, and it
+    has three states rather than two. The force-push is not the last step: the
+    `PATCH` that rewrites the title and body follows it, and the reply, the ref
+    restore and the worktree verification follow that.
+
+    * Nothing pushed — the ordinary case, and worth saying plainly.
+    * Pushed, not updated (a token without `pull-requests: write`, a 422, a
+      locked pull request): the branch is new and the body still narrates the
+      old diff, which is the one thing that person has to know.
+    * Pushed AND updated, then something later failed (a refused undo, a
+      cancelled job, a failed reply): both halves of the change are correct and
+      the RUN is what did not finish.
+
+    Collapsing the last two — which a single "was it pushed" flag forces — sent
+    the reader to a pull-request description that was already right, and away
+    from the checkout a refused `snapshot.verify()` may have left holding this
+    flag's edits. That failure deliberately keeps its traceback (see the note
+    on `expected` in `main`), so the reply's job is to stop misdirecting rather
+    than to describe the working tree, which it cannot honestly do from here.
+    """
+    if isinstance(exc, ForceWithLeaseRejected):
+        return (
+            "**flag-cleanup — command failed**\n\n"
+            f"`{exc.branch}` moved on the remote after this run read it, so the "
+            "force-push was refused rather than overwriting whatever landed "
+            "there.\n\n"
+            "Nothing was pushed. Comment the command again to regenerate "
+            "against the branch as it now stands."
+        )
+    message = str(exc).strip()
+    first_line = message.splitlines()[0] if message else exc.__class__.__name__
+    if not branch_was_force_pushed(exc):
+        outcome = "Nothing was pushed."
+    elif not pull_request_was_updated(exc):
+        outcome = (
+            "The branch WAS force-pushed, but this pull request could not be "
+            "updated, so its description still describes the previous diff."
+        )
+    else:
+        outcome = (
+            "The branch was force-pushed and this pull request was updated, "
+            "but the run did not finish."
+        )
+    return (
+        "**flag-cleanup — command failed**\n\n"
+        f"{first_line}\n\n"
+        f"{outcome} See this workflow run's log for the full output."
+    )
 
 
 def _report(results: list[FlagResult], *, dry_run: bool) -> None:

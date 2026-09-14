@@ -120,6 +120,157 @@ It can legitimately fail, and the message says which case you are in:
 | `403` | The token cannot archive. Check this workflow is not reusing the read-only cleanup secret. |
 | `404` | The flag no longer exists, or `org`/`project` do not name the project it lives in. |
 
+### Re-run a removal from a comment
+
+A removal pull request can go stale — the base branch moved on, or somebody
+pushed a fix by hand and wants the tool to try again from scratch. `mode:
+pr-command` lets a human ask for that directly, by commenting on the pull
+request this Action already opened, rather than waiting for the next
+scheduled sweep. Like `archive-on-merge` it is **opt-in and separate**, in its
+own workflow on its own trigger:
+
+```yaml
+name: Featureflip flag cleanup — pull request commands
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  pr-command:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          mode: pr-command
+          api-token: ${{ secrets.FEATUREFLIP_API_TOKEN }}
+          org: my-org
+          project: my-project
+          # Must match the scheduled workflow's values — see below.
+          directories: src
+          languages: ts
+```
+
+Two commands, both left as a comment on the pull request itself. The mention
+must be followed by whitespace or the end of the line — `@featureflip-cleanuprerun`,
+with no space, is not a command, and neither is `@featureflip-cleanup rerun`
+buried in a longer sentence; it must stand alone on its own line.
+
+- **`@featureflip-cleanup rerun`** regenerates the removal from the pull
+  request's own base branch and force-pushes it over the pull request's
+  branch. It refuses if anyone other than this Action has committed to that
+  branch since it was opened, so a fix-up commit you pushed by hand is never
+  silently thrown away.
+- **`@featureflip-cleanup recreate`** does the same regeneration, but
+  proceeds even when the branch carries commits this Action did not make —
+  **and discards them.** Only comment this once you are sure those commits
+  should not survive.
+
+Both commands push under a lease keyed to the branch's current commit, so a
+write that lands on the branch between this run reading it and pushing is
+**rejected**, never silently overwritten.
+
+Six things to know.
+
+**The flag is identified by the pull request's own branch**, the same
+reversible encoding `archive-on-merge` reads — there is nothing to type in the
+comment besides the command itself, and no way to aim a re-run at a different
+flag than the one the pull request is already about.
+
+**Only someone with write access to the repository can run either command.**
+A comment from anyone else is silently ignored — no reply, exit `0` — for the
+same reason `archive-on-merge`'s own no-ops stay quiet: `issue_comment` fires
+for anyone who can comment at all, and replying would turn this Action into an
+amplifier for whoever types the mention.
+
+**`GITHUB_TOKEN` must be passed through explicitly**, exactly as for the
+scheduled workflow above — GitHub does not expose it to a container by
+default.
+
+**This mode reads a narrower set of inputs than `remove` does, and getting the
+list right matters.** `api-token`, `org`, `project`, `api-url`, `directories`,
+`languages`, `accessors` and `ignore` all feed the same transform a scheduled
+run uses, so a re-run configured differently regenerates a *different* pull
+request under the same title — keep this workflow's values in step with the
+one that opened the pull request. `staleness` does NOT belong on that list:
+this command looks the flag up by the key encoded in its branch name and
+checks both tiers regardless of which one is configured, trying the
+configured tier first and falling back to the other — a flag genuinely moving
+from `stale` to `dead` while its pull request sits open must still be
+findable. So the diff, the draft-vs-ready state and the pull request body are
+unaffected by this input either way; the only thing it can change is which
+tier name this command's own reply quotes, in the rare case a flag qualifies
+under both. Three inputs `remove` reads do nothing here, deliberately: `flags`
+scopes an ordinary sweep and is not how you re-run one flag, since the pull
+request's own branch already identifies it unambiguously; `max-prs` bounds how
+many *new* pull requests a sweep opens, and this mode opens none; and
+`pr-labels` only ever applies the moment a pull request is first opened.
+`base-branch` is a fourth exception, in the other
+direction: this mode always regenerates from the pull request's **own** base
+branch, never from a configured one, so a pull request targeting some other
+branch than usual is still handled correctly — or refused, if this checkout
+never saw that branch at all.
+
+**`dry-run` is honoured here too, but not identically to `remove` mode.** Set
+it on this workflow and a comment still runs the whole regeneration — the
+guards, the transform, everything — but stops before creating a branch,
+force-pushing, or updating the pull request; it replies naming what it would
+have done (including how many existing commits the push would have replaced)
+and exits `0` as `rerun-dry-run`. Unlike a `remove`-mode dry run, which never
+touches the GitHub API at all, this one still checks your write access, reads
+the pull request, and posts that reply — only the push and the `PATCH` are
+skipped. Carrying `dry-run: true` over from the scheduled workflow, out of
+habit or caution, previews safely here rather than doing nothing silently,
+which is the whole reason this exists: the alternative was a real force-push
+with no warning. An empty regeneration wins over a dry run: if nothing in the
+configured directories reads the flag any more, the outcome is `rerun-empty`,
+not `rerun-dry-run` — there is nothing left for dry-run's own preview to
+show once the diff is empty.
+
+**A closed pull request is reopened by the same update that regenerates
+it**, and a **merged** pull request is refused outright: the code is already
+on the base branch, so there is nothing left to remove.
+
+The command always answers on the pull request itself, and the run closes
+with an exit code:
+
+- `0` — the command was answered. This covers a comment this Action ignores
+  entirely (not left on a pull request, no recognized command, or from
+  someone without write access — all three silently, with no reply), a
+  branch this Action never opened (replied to, so you know why nothing
+  happened), and every successful regeneration — including one whose diff
+  came back **empty** (nothing in the configured directories reads the flag
+  any more; nothing is pushed and the pull request is left alone, so it can be
+  closed) and including a **dry run** (regenerates and reports, but pushes
+  nothing and leaves the pull request untouched).
+- `1` — the command was refused, or the regeneration itself failed. Refused
+  covers `rerun` finding foreign commits on the branch (comment `recreate` to
+  proceed and discard them), the pull request having already merged, the flag
+  no longer being a removal candidate in either tier (archived, deleted, or
+  brought back into use), and the flag key being in this workflow's `ignore`
+  list (`rerun-ignored`) — the same "silence it, do not resurrect it" rule the
+  `flags` allowlist is held to. Every one of these replies on the pull request
+  saying which; a failed regeneration replies too, with a short summary and a
+  pointer to this run's log for the rest. This is also where a pull request
+  targeting a base your checkout never saw lands — one pull request's problem,
+  not a broken workflow, so it is exit `1` here even though the identical
+  refusal is exit `2` for the scheduled `remove` mode.
+- `2` — the run could not start. Either the workflow itself is wired wrong —
+  for example triggered by something other than `issue_comment` — or the
+  checkout is one this Action cannot work in safely: a `directories` entry that
+  is not inside a git working tree, entries belonging to two different
+  repositories, or **uncommitted changes to tracked files**, which a re-run
+  would otherwise commit onto the pull request's branch and then discard when
+  it restores your working tree. All of those are checked before anything is
+  transformed, committed or pushed, so nothing has been modified when this
+  happens, and the reply on the pull request names the offending path.
+
 ### Inputs
 
 Every input is bridged into the container as the environment variable named
@@ -133,17 +284,18 @@ entries dropped.
 | `api-token` | `FEATUREFLIP_API_TOKEN` | *(required)* | Your Featureflip API token. |
 | `org` | `FEATUREFLIP_ORG` | *(required)* | Featureflip organization slug. |
 | `project` | `FEATUREFLIP_PROJECT` | *(required)* | Featureflip project slug. |
-| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-on-merge` archives the flag whose removal PR just merged and ignores every input below except `api-url` — see [Archive the flag when the cleanup PR merges](#archive-the-flag-when-the-cleanup-pr-merges). |
+| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-on-merge` archives the flag whose removal PR just merged and ignores every input below except `api-url` — see [Archive the flag when the cleanup PR merges](#archive-the-flag-when-the-cleanup-pr-merges). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
 | `api-url` | `FEATUREFLIP_API_URL` | `https://api.featureflip.io` | Override only for a staging/self-hosted instance. |
 | `staleness` | `FEATUREFLIP_STALENESS` | `dead` | `dead` (ready-for-review PRs) or `stale` (draft PRs). |
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
+| `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. |
 | `pr-labels` | `FEATUREFLIP_PR_LABELS` | *(none)* | Comma-separated. A label that fails to apply is logged as a warning and does not fail the PR. **May create labels** — see below. |
 | `max-prs` | `FEATUREFLIP_MAX_PRS` | `10` | Most pull requests one run may propose (`0` = no limit). See "How much one run can do" below. |
-| `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below. |
+| `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below for `remove` mode; `pr-command` honours it too, differently — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
 
 `GITHUB_TOKEN` is **not** a declared input — GitHub does not expose it to a
 container as a default environment variable, so it must be passed through the
@@ -195,6 +347,10 @@ actually happen rather than of one that never will. Set `max-prs: 0` for no
 limit once you have seen a few rounds of diffs and trust them.
 
 ### Dry run
+
+This section is about `mode: remove`. `pr-command` also honours `dry-run`,
+but not identically — see [Re-run a removal from a
+comment](#re-run-a-removal-from-a-comment) for what it does there.
 
 `dry-run` defaults to `false` — if you omit it, the Action opens real
 branches, commits, and pull requests on its first run. There is no friendlier
@@ -575,6 +731,16 @@ scopes a variable to its one enclosing function needs a name to match the code
 from before the fold against the code after — so a local declared inside one is
 always left standing rather than guessed at. In a codebase built out of
 arrow-function components, that is most functions.
+
+A binding at the **top level of a module** is cleaned too — the usual
+`const client = OpenFeature.getClient();` above the functions that read the
+flag. It needs no name to match against, because a file has exactly one top
+level and nothing to confuse it with. What makes this safe is that the file is
+a module: it has an `import`, an `export` or a `require`, so a top-level `const`
+in it is reachable from nowhere else and this tool can see its whole scope. A
+file with none of those is a plain script whose top-level `const` is shared
+with every other script on the page, and its bindings are left alone. Exported
+bindings are left alone in either case.
 
 ## Supported Python flag-read shapes
 
@@ -1326,12 +1492,23 @@ means no PR.
   other language leaves the parameter too; JavaScript and TypeScript are where
   a standard gate has something to say about it.
 
-  Two narrower cases of the same shape are not cleaned either, and these ones
-  are simply not reached yet: a binding declared at the **top level of a
-  module** rather than inside a function (`const client =
-  OpenFeature.getClient();`, once every read through it is gone), and
-  TypeScript's `import x = require("…")` form in a `.cts` file. Both are
-  reported by `no-unused-vars`; delete them by hand.
+  One narrower case of the same shape is also left standing, for the same
+  reason: a binding at the top level of a file that is **not a module** — no
+  `import`, no `export`, no `require` anywhere in it. A top-level `const` there
+  is shared with every other script on the page, so its readers can live
+  outside this file exactly as a parameter's callers do, and one file is not
+  enough to prove it unused. The same binding in a module IS cleaned up (see
+  [above](#supported-jsts-flag-read-shapes)); so is
+  TypeScript's `import x = require("…")`.
+
+  A top-level binding whose initializer is a **call** is rewritten to just that
+  call — `OpenFeature.getClient();` where `const client = OpenFeature.getClient();`
+  stood — rather than removed. This is not a gap so much as a deliberate half
+  measure: the call may do work the rest of the file still depends on, and this
+  tool will not decide for you that it does not. It satisfies `no-unused-vars`,
+  and it is the same treatment the equivalent local inside a function has always
+  had. Delete the leftover line yourself if the call was only ever there to
+  produce the binding.
 * Empty blocks left by a fold are not cleaned up. A fold can
   also leave a blank line where the guard's own line was, in Go and Ruby. Fold
   output **is** re-indented, in every language: a spliced branch comes back at

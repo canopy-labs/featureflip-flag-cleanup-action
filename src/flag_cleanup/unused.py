@@ -50,6 +50,14 @@ ambiguous rather than wrong), and `_references_in_scope` counts references
 whose nearest enclosing function is anonymous (a lambda, an arrow function, a
 Go func literal) can never be matched this way and is always left alone.
 
+One scope has no name and is matched anyway: the FILE. A TS/JS module's
+top-level `const` is reachable from nowhere else, and pairing two programs
+needs no name because each parse has exactly one — the ambiguity a name
+resolves cannot arise. `_module_scopes` is that case, gated on the file
+proving it is a module (`_top_level_bindings_are_private`), since a top-level
+`const` in a plain script is shared with every other script and this pass can
+only see one file.
+
 A third correction is needed for the one case where blanking a variable's own
 declaration span blanks a REAL reference along with it:
 `_bound_name_occurs_once_in_own_span` refuses a candidate whose own
@@ -319,6 +327,18 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
     there is no name to have gone unused, and the module's load-time effect is
     the only reason it is written.
 
+    ``import ff = require('./ff')`` has no ``import_clause`` either, and used
+    to be passed over by that same test — which read as the side-effect rule
+    working and was a different thing wearing its shape (#2825). It carries an
+    ``import_require_clause`` instead, and that clause DOES bind a name, so the
+    two are told apart by which clause type is present rather than by the
+    absence of one. Every other spelling of an unused import is already
+    removed here; this one landed a `no-unused-vars` error in the customer's
+    repository for no reason but a node type nobody had looked at. Note the
+    OTHER import-equals form, ``import ff = A.B.C``, is a wholly separate node
+    type (``import_alias``, not ``import_statement``) and does not reach this
+    loop at all — it is out of scope here rather than silently included.
+
     A named specifier spans only itself, so ``import { a, b }`` can lose ``a``
     and keep ``b``. Removing the LAST specifier in a group is different,
     because it empties the group, and the candidate then grows to whatever
@@ -359,9 +379,33 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
         if node.type != "import_statement":
             continue
         clause = next(
-            (c for c in node.children if c.type == "import_clause"), None
+            (
+                c
+                for c in node.children
+                if c.type in {"import_clause", "import_require_clause"}
+            ),
+            None,
         )
         if clause is None:
+            continue
+        if clause.type == "import_require_clause":
+            # `import ff = require("./ff")`. The clause binds exactly one
+            # name and the statement has no other reason to exist, so the
+            # candidate spans the whole statement — the same "solo" outcome
+            # a lone default import gets, reached without a count because
+            # this clause shape admits no sibling to share with.
+            local = next(
+                (c for c in clause.children if c.type == "identifier"), None
+            )
+            if local is not None:
+                candidates.append(
+                    _candidate(
+                        local.text.decode("utf-8", "replace"),
+                        node,
+                        source_bytes,
+                        "import",
+                    )
+                )
             continue
         bindings = [
             c for c in clause.children
@@ -624,22 +668,103 @@ _VARIABLE_DECLARATIONS = {
 
 #: Node types that make a declaration LOCAL. A declaration not inside one of
 #: these is a field, a parameter or a package-level binding, all of which are
-#: referenced from files this pass never parses.
+#: referenced from files this pass never parses — with the one exception
+#: ``_variable_candidates`` describes, a TS/JS module's top level, which is
+#: reachable from no other file at all.
 _FUNCTION_BODIES = frozenset({
     "block", "function_body", "statement_block", "function_declaration",
     "method_declaration", "function_definition",
 })
 
+#: The languages where a top-level declaration can be FILE-PRIVATE, plus the
+#: node that is the file. Deliberately only the TS family: Go's package-level
+#: `var` is visible to every other file in the package, and java/csharp have
+#: no top-level variable declaration at all, so the widening below has nothing
+#: to say about any of them.
+#:
+#: Today this is the statement of intent rather than the mechanism, and that
+#: is worth knowing before relying on it. Two accidents already refuse each
+#: non-TS language on their own — none of the three spells its root node
+#: `program` except java, and none spells an import `import_statement` — so
+#: removing this line would change no current answer. It stays because
+#: `_top_level_bindings_are_private` should be right when READ, not right
+#: because of two facts about other grammars that a bump could take away.
+_TS_MODULE_LANGUAGES = frozenset({"ts", "tsx", "js"})
+_TS_PROGRAM = "program"
+
+#: What proves a TS/JS file is a module — i.e. that its top-level bindings are
+#: private to it. `import`/`export` is TypeScript's own test and Node's: a file
+#: carrying either is an ES module and its top-level `const` is reachable from
+#: nowhere else. A `require(...)` call proves the other half, CommonJS, whose
+#: module wrapper gives the same guarantee.
+_MODULE_EVIDENCE = frozenset({"import_statement", "export_statement"})
+
+
+def _top_level_bindings_are_private(root: Node, language: str) -> bool:
+    """Whether a declaration sitting directly in ``root`` is file-private.
+
+    This is the one thing that makes a module-level candidate decidable, and
+    it is not a formality. A top-level ``const`` in a CLASSIC script is not
+    module-scoped at all — it lands in the shared script-scope every other
+    ``<script>`` on the page reads, so a differential over this one file
+    proves nothing about it and neutralising it breaks a caller this pass
+    never saw. A module's top-level ``const`` is unreachable from outside by
+    construction, so the same differential is complete.
+
+    Asked of the file rather than of its extension, because this pass is
+    handed source and a language, never a path — and it is the same question
+    TypeScript and Node each answer from the file's own contents.
+
+    Exporting is NOT tested here, and needs no test: an exported declaration
+    is a child of an ``export_statement`` rather than of the program, so it
+    never reaches the widened gate, and a separate ``export { client }``
+    re-export is a leaf spelling the name, which the reference count already
+    sees as the read it is.
+    """
+    if language not in _TS_MODULE_LANGUAGES:
+        return False
+    for node in _walk(root):
+        if node.type in _MODULE_EVIDENCE:
+            return True
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            if callee is not None and callee.type == "identifier":
+                if callee.text == b"require":
+                    return True
+    return False
+
 
 def _variable_candidates(source: str, language: str) -> list[Candidate]:
-    """Every single-name local declaration, with its initializer span."""
+    """Every single-name local declaration, with its initializer span.
+
+    "Local" means inside a function body — with one widening, and the reason
+    it is safe is not the reason the guard was written. ``_FUNCTION_BODIES``
+    stands in for "not reachable from another file", and for a field, a
+    parameter or a Go package-level binding that is exactly right. It is
+    wrong for a TS/JS MODULE's top-level ``const``, which is reachable from
+    nowhere else at all, and the cost of getting it wrong there was a
+    `no-unused-vars` error shipped to the customer in eight of the ten
+    findings #2825 enumerates. So a declaration sitting directly in the
+    program of a file whose top-level bindings are private (see
+    ``_top_level_bindings_are_private``) is a candidate too.
+
+    Directly in the PROGRAM, not merely outside a function: a declaration in
+    a top-level ``if`` block is scoped to that block, and claiming the file
+    for it would be describing a wider scope than it has. It stays out.
+    """
     declaration_type, name_field, value_field = _VARIABLE_DECLARATIONS[language]
     source_bytes = source.encode("utf-8")
+    root = _parse(source, language)
+    top_level_is_private = _top_level_bindings_are_private(root, language)
     candidates = []
-    for node in _walk(_parse(source, language)):
+    for node in _walk(root):
         if node.type != declaration_type:
             continue
-        if not _has_ancestor(node, _FUNCTION_BODIES):
+        if not _has_ancestor(node, _FUNCTION_BODIES) and not (
+            top_level_is_private
+            and node.parent is not None
+            and node.parent.type == _TS_PROGRAM
+        ):
             continue
         pair = _declared_name_and_value(node, name_field, value_field)
         if pair is None:
@@ -738,6 +863,16 @@ def _declared_name_and_value(
     name_node = declarator.child_by_field_name("name")
     if name_node is None:
         return None
+    # Two distinct nodes from here on, and conflating them is a live trap.
+    # `_sole_bound_name` can descend INTO the bound position — for
+    # `const { client } = …` the name is a child of the pattern, not a child
+    # of the declarator — so the C# fallback below, which identifies the
+    # initializer as "the named child that is not the name", has to keep
+    # comparing against the declarator's own child. Reassigning over
+    # `name_node` would leave the pattern itself looking like an initializer.
+    bound_name = _sole_bound_name(name_node)
+    if bound_name is None:
+        return None
     value_node = declarator.child_by_field_name("value")
     if value_node is None:
         # C# leaves the initializer with no field name at all. Fall back to
@@ -747,7 +882,42 @@ def _declared_name_and_value(
         rest = [child for child in declarator.named_children if child is not name_node]
         if rest:
             value_node = rest[-1]
-    return name_node, value_node
+    return bound_name, value_node
+
+
+#: The TS destructuring patterns whose bound position is a whole pattern
+#: rather than a name. Both are containers, and their punctuation is
+#: anonymous, so "how many names does this bind" is a count of named children.
+_DESTRUCTURING_PATTERNS = frozenset({"object_pattern", "array_pattern"})
+
+
+def _sole_bound_name(name_node: Node) -> Node | None:
+    """``name_node`` itself, or the ONE name a destructuring pattern binds.
+
+    ``const { client } = require('./ff')`` binds exactly one name, and the
+    declaration's own span is the whole statement — so the "referenced
+    before, referenced nowhere after" differential answers for it exactly as
+    it does for ``const client = ...``. That was not true of a pattern in
+    general, which is why the caller declines one: taking ``{ a, b }``'s
+    source text as the binding name runs the differential against a string
+    nothing can reference, and the declaration goes with both names still in
+    use below it.
+
+    So the restriction is a COUNT, and it is the same "solo or shared" count
+    ``_ts_import_candidates`` makes over an ``import_clause``: a span may
+    only be removed for a binding when that binding is the span's only
+    reason to exist. More than one name, and there is a sibling to strand.
+
+    Only the count is decided here. The caller's existing "a token, and it
+    spells like a name" guard is what rejects the shapes that bind one name
+    through a node that is not one — ``{ a: b }``'s ``pair_pattern`` and
+    ``{ ...r }``'s ``rest_pattern`` both have children, so both fall out
+    there rather than needing a list of their own.
+    """
+    if name_node.type not in _DESTRUCTURING_PATTERNS:
+        return name_node
+    bound = name_node.named_children
+    return bound[0] if len(bound) == 1 else None
 
 
 #: How each language spells "evaluate this and throw the value away".
@@ -1089,7 +1259,7 @@ def _matching_scope(
         return None
     current_scope = _enclosing_scope(candidate_node, language)
     if current_scope is None:
-        return None
+        return _module_scopes(before, current, candidate_node, language)
     name = _scope_name(current_scope)
     if name is None:
         return None
@@ -1104,6 +1274,46 @@ def _matching_scope(
         current_scope.start_byte,
         current_scope.end_byte,
     )
+
+
+def _module_scopes(
+    before: str, current: str, candidate_node: Node, language: str
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """The whole-file spans, when the candidate's scope IS the file.
+
+    ``_matching_scope`` pairs two scopes by NAME, and a module has none — the
+    reason the module-level bindings in #2825 were unreachable even once
+    ``_variable_candidates`` was willing to produce them. But a name is only
+    needed to tell two candidate scopes apart, and there are never two: each
+    parse has exactly one program, so the pairing that is ambiguous for two
+    same-named functions is forced here. The span is the file.
+
+    Counting file-wide cannot delete a live binding, which is the property
+    that matters, and it holds for the same reason the function-scoped count
+    does. ``_references_in_scope`` hides only BINDER TOKENS, so widening the
+    span can only hide more binders and count more leaves; reaching zero
+    still means no leaf anywhere in the file spells the name outside a
+    binding position. A nested function's own same-named local therefore
+    makes the module binding read as REFERENCED — a missed tidy, never a
+    wrong deletion, which is the direction this pass errs in everywhere else.
+
+    Both sides are re-tested for module-ness rather than assumed from one.
+    They cannot in practice disagree — a fold only removes code, so it cannot
+    turn a module into a script — but the invariant that makes a module-level
+    ``before`` count honest is that ``_variable_candidates(before, …)``
+    blanked the same binder, and that is a property of ``before``, not of
+    this fold.
+    """
+    if language not in _TS_MODULE_LANGUAGES:
+        return None
+    program = candidate_node.parent
+    if program is None or program.type != _TS_PROGRAM:
+        return None
+    if not _top_level_bindings_are_private(program, language):
+        return None
+    if not _top_level_bindings_are_private(_parse(before, language), language):
+        return None
+    return (0, len(before.encode("utf-8"))), (0, len(current.encode("utf-8")))
 
 
 def _references_in_scope(
@@ -1301,6 +1511,22 @@ def remove_stranded_bindings(
     so the pull request did not build, and the pass returned as though it had
     finished.
 
+    VARIABLES ARE OFFERED BEFORE IMPORTS, and that order is load-bearing in
+    one direction only. It is the cheaper order anyway — the feeding runs
+    one way, since deleting a variable can strand the import it read while
+    deleting an import can strand no variable (``_references_in_scope``
+    already ignores every leaf inside an import). What makes it necessary is
+    that a TS/JS file's top-level bindings are private BECAUSE it is a
+    module, and the thing that proves it is a module can be an import THIS
+    PASS DELETES. Imports-first, a file whose only `import` and whose only
+    top-level `const` were both stranded lost the import in the first round
+    and then read as a plain script — so the `const` stopped being a
+    candidate at all and shipped as the `no-unused-vars` error this pass
+    exists to prevent. Variables-first cannot reach that state: no import is
+    touched in a round where any variable is still actionable, and an
+    import-only round changes no variable's reference count, so by the time
+    the last import goes there is nothing left for it to strand.
+
     The bound cannot be reached. One edit deletes or neutralises exactly one
     binding and creates none, so the candidate set strictly shrinks and the
     pass converges in at most as many rounds as it had candidates to begin
@@ -1320,9 +1546,9 @@ def remove_stranded_bindings(
     )
     for _ in range(budget):
         acted = False
-        for candidate in _import_candidates(current, language) + _variable_candidates(
+        for candidate in _variable_candidates(
             current, language
-        ):
+        ) + _import_candidates(current, language):
             if candidate.kind == "import":
                 before_count = _references_excluding_own_declaration(
                     before, candidate.name, language

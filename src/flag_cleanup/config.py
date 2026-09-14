@@ -37,7 +37,11 @@ DEFAULT_STALENESS = "dead"
 DEFAULT_MODE = "remove"
 MODE_REMOVE = "remove"
 MODE_ARCHIVE_ON_MERGE = "archive-on-merge"
-MODES = (MODE_REMOVE, MODE_ARCHIVE_ON_MERGE)
+#: Re-run the transform for the flag whose removal pull request this comment
+#: was left on. Human-initiated and pull-request-scoped: the branch names the
+#: flag, so there is no key to pass and no way to aim it at another one.
+MODE_PR_COMMAND = "pr-command"
+MODES = (MODE_REMOVE, MODE_ARCHIVE_ON_MERGE, MODE_PR_COMMAND)
 
 #: The endpoint's ``?staleness=`` enum, verbatim. Validated here rather than
 #: sent blind: a typo would otherwise reach the API, come back 4xx, and surface
@@ -99,6 +103,19 @@ class Config:
     #: flag keys are.
     accessors: tuple[str, ...] = ()
     ignore: frozenset[str] = frozenset()
+    #: Flag keys this run may propose, as an ALLOWlist. Empty — the default —
+    #: means no filtering, so an existing workflow is unaffected.
+    #:
+    #: Not a way around `already_handled`: a flag named here is still skipped
+    #: if it has already been proposed. This scopes a sweep (and, with
+    #: `dry_run`, previews exactly one flag without touching GitHub at all);
+    #: re-proposing a flag whose pull request was closed is `mode:
+    #: pr-command`'s job, where a human asks for it on the pull request itself.
+    #:
+    #: `ignore` WINS when a key is in both. Deny beating allow is the safe
+    #: direction, and `ignore` is documented as the way to silence a flag this
+    #: tool refuses to process — an allowlist must not resurrect it.
+    flags: frozenset[str] = frozenset()
     #: Empty means "resolve the repository's default branch at run time".
     base_branch: str = DEFAULT_BASE_BRANCH
     pr_labels: tuple[str, ...] = ()
@@ -184,6 +201,7 @@ class Config:
             languages=languages,
             accessors=accessors,
             ignore=frozenset(_split_csv(_get(env, "FEATUREFLIP_IGNORE", ""), default=())),
+            flags=frozenset(_split_csv(_get(env, "FEATUREFLIP_FLAGS", ""), default=())),
             base_branch=_get(env, "FEATUREFLIP_BASE_BRANCH", DEFAULT_BASE_BRANCH),
             pr_labels=_split_csv(_get(env, "FEATUREFLIP_PR_LABELS", ""), default=()),
             dry_run=_parse_bool(

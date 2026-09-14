@@ -68,16 +68,14 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Protocol
-from urllib.parse import quote
 
 import httpx
 
 from flag_cleanup import git_ops, github_ops
 from flag_cleanup.client import Candidate, FeatureflipApiError, FeatureflipClient
 from flag_cleanup.config import Config
-from flag_cleanup.urls import without_userinfo
 from flag_cleanup.github_ops import (
     GitHubApi,
     GitHubEnv,
@@ -93,51 +91,25 @@ from flag_cleanup.piranha_runner import (
     transform_flag,
     source_files,
 )
+from flag_cleanup.pr_content import (
+    _GENERATED_DIRS,
+    commit_message,
+    is_dead,
+    note_removed_entries,
+    note_rewritten_build_output,
+    pr_body,
+    pr_title,
+)
 
 logger = logging.getLogger(__name__)
 
 #: The two ways the transform can REFUSE rather than find nothing. Both are
 #: caught in one place and both abandon the whole flag — see
-#: :func:`_piranha_transform`.
+#: :func:`piranha_transform`.
 TransformRefusal = PiranhaTransformError | UnsafeRewriteError
 
 # Mirrors piranha_runner._SKIP_DIRS: never scan a vendored dependency tree.
 _SKIP_DIRS = frozenset({".git", "node_modules"})
-
-#: Directory names a build usually writes into. Used in exactly two places,
-#: both chosen so that being WRONG about one is cheap:
-#:
-#: 1. Skipped when scanning for references the transform could not process.
-#:    That scan's answer is rendered in the PR body as "N file(s) still
-#:    reference this flag and were not processed", so its cost is a wrong,
-#:    scary caveat on a complete removal. A repository that commits its
-#:    compiled output (a published library: ``dist/index.js``,
-#:    ``dist/index.mjs``) got that caveat on every PR, naming build artefacts
-#:    the reviewer cannot act on and that the next build regenerates anyway.
-#: 2. :func:`_rewritten_build_output`, which annotates the PR body with the
-#:    generated files this run DID rewrite.
-#:
-#: NOT applied to the transform, and #2634 is the record of why that stayed
-#: true once the js language made these directories reachable. These names are
-#: conventions, not guarantees: a repository that keeps hand-written source in
-#: one of them must still be cleaned correctly, and a `.ts` file here is
-#: processed exactly as before. The asymmetry is the whole design — the worst
-#: case of a wrong skip is a missing warning, or a mislabelled note, about a
-#: generated file; the worst case of a wrong TRANSFORM skip is a flag left
-#: half-removed, in a pull request claiming it was removed.
-#:
-#: That asymmetry USED TO BE UNREACHABLE on this side, and the history is worth
-#: keeping: ``_unprocessed_references`` scanned only the extensions no
-#: configured language covered, so with `js` configured a `.js` file was never
-#: examined and this constant was dead code for it — #2634's "move both halves
-#: or neither" could not be honoured by editing this set, because emptying it
-#: entirely still yielded no caveat. The scan now covers every known extension,
-#: so the skip below is live again and is the only thing keeping committed build
-#: output out of the caveat. Pinned by
-#: ``test_emptying_the_generated_dirs_skip_now_restores_the_caveat``.
-_GENERATED_DIRS = frozenset(
-    {"dist", "build", "out", "coverage", ".next", ".nuxt", ".output", ".svelte-kit", ".turbo"}
-)
 
 _RECOGNIZED_STATUSES = frozenset({"dead", "stale"})
 
@@ -159,7 +131,7 @@ ABORTING_RESULT_ATTR = "aborting_result"
 #:
 #: It exists because the same exception TYPE means opposite things on either
 #: side of that line. :class:`~flag_cleanup.git_ops.PreflightError` raised by
-#: :func:`_preflight` means "the run never started"; raised mid-run by
+#: :func:`preflight` means "the run never started"; raised mid-run by
 #: ``git_ops.work_dir`` (a configured directory that vanished under us) it means
 #: "some flags already have pull requests". Keying the exit code off the type
 #: alone reported the second case as exit 2 — documented as *nothing was
@@ -190,6 +162,8 @@ class FlagResult:
     ``action_taken`` is one of:
 
     * ``"ignored"`` — the key was in ``config.ignore``; Piranha never ran.
+    * ``"not-selected"`` — ``config.flags`` names an allowlist and this key
+      was not on it; Piranha never ran.
     * ``"piranha-error"`` — the engine aborted (its own syntax self-check);
       ``diff`` is empty, but this is a REFUSAL, not a no-match.
     * ``"unsafe-rewrite"`` — Gate 1 refused the rewrite of at least one file
@@ -271,18 +245,7 @@ def run(
     safe place to cut removal branches from. Both fire before any candidate is
     processed, so nothing has been modified when they do.
     """
-    try:
-        _preflight(config)
-    except BaseException:
-        # A refused preflight can still have written to `.git`: `ensure_clean`
-        # runs `git status`, which opportunistically rewrites a stale index.
-        # That particular file is harmless left as root's (see
-        # `restore_repository_ownership` on why), so this is here to keep the
-        # property unconditional — "this tool never leaves paths the customer
-        # cannot write" — rather than true only for the preflights that happen
-        # not to write today.
-        git_ops.restore_repository_ownership(config.directories)
-        raise
+    preflight(config)
 
     owns_client = client is None
     resolved_client: _Client = (
@@ -322,7 +285,7 @@ def run(
     # `git_ops.OwnershipLedger`.
     ledger = git_ops.OwnershipLedger()
     try:
-        known_flag_keys = _fetch_known_flag_keys(resolved_client, config)
+        known_flag_keys = fetch_known_flag_keys(resolved_client, config)
         if config.dry_run:
             process = partial(
                 _process_candidate,
@@ -418,8 +381,15 @@ def _is_proposal(result: FlagResult) -> bool:
     return result.action_taken == "dry-run" and bool(result.diff)
 
 
-def _fetch_known_flag_keys(client: _Client, config: Config) -> frozenset[str]:
+def fetch_known_flag_keys(client: _Client, config: Config) -> frozenset[str]:
     """The project's flag list, for the entry rules' sibling evidence.
+
+    Public (no leading underscore): ``pr_command`` regenerates a flag's
+    removal through :func:`piranha_transform` and has to hand it the SAME
+    evidence set the run that opened the pull request handed it, or the
+    regenerated removal quietly under-removes. Calling ``client.flag_keys``
+    from there instead would duplicate the degradation policy below, and a
+    second copy is free to drift into aborting a command on an API hiccup.
 
     Once per run, never per candidate. A failure DEGRADES rather than aborts,
     because this is a tidiness improvement layered on the primary job and a run
@@ -446,18 +416,37 @@ def _fetch_known_flag_keys(client: _Client, config: Config) -> frozenset[str]:
     return keys
 
 
-def _preflight(config: Config) -> None:
+def preflight(config: Config) -> None:
     """Validate every configured directory BEFORE anything can be written.
 
-    Ordered first in :func:`run` on purpose. Both checks describe conditions
-    under which this tool cannot safely operate, and both are cheap; finding
-    out mid-run instead means Piranha has already rewritten source files that
-    the failing reset then cannot restore.
+    Ordered first in :func:`run` on purpose. Every check describes a condition
+    under which this tool cannot safely operate, and all of them are cheap;
+    finding out mid-run instead means Piranha has already rewritten source
+    files that the failing reset then cannot restore.
+
+    Public, and called from :mod:`flag_cleanup.pr_command` as well, because
+    ``pr-command`` mode transforms, commits and FORCE-PUSHES the same working
+    tree from a second entry point — one shared function is what stops the two
+    entry points disagreeing about what "safe to operate in" means, and means a
+    check added here covers both the day it is added.
     """
-    for directory in config.directories:
-        git_ops.ensure_work_tree(directory)
-        git_ops.ensure_clean(directory)
-    git_ops.ensure_one_repository(config.directories)
+    try:
+        for directory in config.directories:
+            git_ops.ensure_work_tree(directory)
+            git_ops.ensure_clean(directory)
+        git_ops.ensure_one_repository(config.directories)
+    except BaseException:
+        # A refused preflight can still have written to `.git`: `ensure_clean`
+        # runs `git status`, which opportunistically rewrites a stale index.
+        # That particular file is harmless left as root's (see
+        # `restore_repository_ownership` on why), so this is here to keep the
+        # property unconditional — "this tool never leaves paths the customer
+        # cannot write" — rather than true only for the preflights that happen
+        # not to write today. Inside the function rather than around its call
+        # site so both callers get it; `pr_command` reaches this before its own
+        # `finally` exists.
+        git_ops.restore_repository_ownership(config.directories)
+        raise
 
 
 def _resolve_base(config: Config, gh: GitHubApi, github: GitHubEnv) -> str:
@@ -522,6 +511,18 @@ def _process_candidate(
         logger.info("skipping %s: listed in the ignore config", candidate.key)
         return FlagResult(candidate.key, candidate.treatment, candidate.status, "", "ignored")
 
+    if config.flags and candidate.key not in config.flags:
+        # After `ignore`, so a key in both lists is reported as ignored: deny
+        # beats allow. Free against `max_prs` — `_is_proposal` does not count
+        # it — so an allowlisted sweep is not silently truncated by the flags
+        # it skipped on the way.
+        logger.info(
+            "skipping %s: the flags allowlist does not name it", candidate.key
+        )
+        return FlagResult(
+            candidate.key, candidate.treatment, candidate.status, "", "not-selected"
+        )
+
     _warn_on_unrecognized_status(candidate)
 
     # Asked here too, in the same order as the PR path, even though a dry run
@@ -540,7 +541,7 @@ def _process_candidate(
         return unsupported
 
     unprocessed: tuple[str, ...] = ()
-    with _piranha_transform(candidate, config, ledger, known_flag_keys) as (
+    with piranha_transform(candidate, config, ledger, known_flag_keys) as (
         diff,
         transform_error,
         _snapshot,
@@ -556,14 +557,14 @@ def _process_candidate(
         # this run had just cleaned — a dry run whose whole promise is to
         # preview a real run would have contradicted the real run's own body.
         if transform_error is None:
-            unprocessed = _all_unprocessed(config, candidate.key, unprocessable)
+            unprocessed = all_unprocessed(config, candidate.key, unprocessable)
 
     if transform_error is not None:
         return _refusal_result(candidate, transform_error)
 
     _warn_on_unprocessed_references(config, candidate.key, unprocessed)
-    _note_rewritten_build_output(diff)
-    _note_removed_entries(entries)
+    note_rewritten_build_output(diff)
+    note_removed_entries(entries)
 
     return FlagResult(
         candidate.key,
@@ -589,6 +590,18 @@ def _process_candidate_for_pr(
     if candidate.key in config.ignore:
         logger.info("skipping %s: listed in the ignore config", candidate.key)
         return FlagResult(candidate.key, candidate.treatment, candidate.status, "", "ignored")
+
+    if config.flags and candidate.key not in config.flags:
+        # After `ignore`, so a key in both lists is reported as ignored: deny
+        # beats allow. Free against `max_prs` — `_is_proposal` does not count
+        # it — so an allowlisted sweep is not silently truncated by the flags
+        # it skipped on the way.
+        logger.info(
+            "skipping %s: the flags allowlist does not name it", candidate.key
+        )
+        return FlagResult(
+            candidate.key, candidate.treatment, candidate.status, "", "not-selected"
+        )
 
     _warn_on_unrecognized_status(candidate)
 
@@ -631,7 +644,7 @@ def _process_candidate_for_pr(
             )
 
         original_ref = git_ops.current_ref(repo_dir)
-        with _piranha_transform(candidate, config, ledger, known_flag_keys) as (
+        with piranha_transform(candidate, config, ledger, known_flag_keys) as (
             diff,
             transform_error,
             snapshot,
@@ -649,16 +662,16 @@ def _process_candidate_for_pr(
             elif not diff:
                 logger.info("no changes for %s: opening no PR", candidate.key)
                 action = "no-changes"
-                unprocessed = _all_unprocessed(config, candidate.key, unprocessable)
+                unprocessed = all_unprocessed(config, candidate.key, unprocessable)
             else:
                 # Computed BEFORE the PR is opened so the body can carry the
                 # caveat. A PR titled "remove flag X" whose repo still reads X
                 # from a .js file must say so where the reviewer will see it.
-                unprocessed = _all_unprocessed(config, candidate.key, unprocessable)
+                unprocessed = all_unprocessed(config, candidate.key, unprocessable)
                 git_ops.create_branch(repo_dir, branch)
                 created_branch = True
                 git_ops.commit_changes(
-                    repo_dir, config.directories, _commit_message(candidate)
+                    repo_dir, config.directories, commit_message(candidate)
                 )
                 git_ops.push_branch(repo_dir, branch, github.push_url, github.token)
                 pushed = True
@@ -667,18 +680,18 @@ def _process_candidate_for_pr(
                     github.repository,
                     branch=branch,
                     base=base,
-                    title=_pr_title(candidate),
-                    body=_pr_body(
+                    title=pr_title(candidate),
+                    body=pr_body(
                         candidate,
                         config,
                         unprocessed,
                         stranded,
                         bindings,
-                        _note_rewritten_build_output(diff),
+                        note_rewritten_build_output(diff),
                         entries=entries,
                     ),
                     labels=config.pr_labels,
-                    draft=not _is_dead(candidate.status),
+                    draft=not is_dead(candidate.status),
                 )
                 # Tracked separately from `pr_url`: `open_pr` raises only when
                 # no PR was created, but it can legitimately return an empty
@@ -1005,7 +1018,7 @@ def _discard_pushed_branch(repo_dir: str, branch: str, github: GitHubEnv) -> Non
 
 
 @contextmanager
-def _piranha_transform(
+def piranha_transform(
     candidate: Candidate,
     config: Config,
     ledger: git_ops.OwnershipLedger,
@@ -1022,6 +1035,11 @@ def _piranha_transform(
     ]
 ]:
     """Run Piranha for one candidate; yield the outcome; always undo.
+
+    Public (no leading underscore): ``pr_command`` regenerates a flag's
+    removal through this exact context manager, so a re-run produces the same
+    diff the original run did rather than a second implementation that could
+    drift from it.
 
     Yields ``(diff, error, snapshot, unprocessable, stranded, bindings,
     entries)`` — ``unprocessable`` names files the ENGINE could not process,
@@ -1254,381 +1272,12 @@ def _undo_transform(
         raise undo_error from pending
 
 
-def _is_dead(status: str) -> bool:
-    """Is this candidate ``Dead`` (ready PR) rather than ``Stale`` (draft)?
-
-    ``status`` arrives PascalCase on the wire (``"Dead"``/``"Stale"``), so the
-    comparison is case-insensitive — a literal ``== "dead"`` would quietly
-    make EVERY pull request a draft. Anything unrecognized is treated as the
-    safer draft case, matching what ``_warn_on_unrecognized_status`` promises.
-    """
-    return status.strip().lower() == "dead"
-
-
-def _pr_title(candidate: Candidate) -> str:
-    # A PR title is plain text, not markdown — no code fences here.
-    word = "dead" if _is_dead(candidate.status) else "stale"
-    return f"Remove {word} feature flag: {_one_line(candidate.key)}"
-
-
-def _commit_message(candidate: Candidate) -> str:
-    served = "true" if candidate.treatment else "false"
-    return (
-        f"chore: remove feature flag {_one_line(candidate.key)}\n"
-        "\n"
-        f"Status: {_one_line(candidate.status)}. The flag serves {served}, so the "
-        f"code behind the {'on' if candidate.treatment else 'off'} branch was kept.\n"
-        "\n"
-        "Generated by the Featureflip flag-cleanup Action (deterministic Piranha "
-        "rewrite, no LLM).\n"
-    )
-
-
-def _and_list(items: list[str]) -> str:
-    """Join for prose: ``a``; ``a and b``; ``a, b and c``."""
-    if len(items) <= 1:
-        return "".join(items)
-    return f"{', '.join(items[:-1])} and {items[-1]}"
-
-
-def _rewritten_build_output(diff: str) -> tuple[str, ...]:
-    """Paths in ``diff`` that sit under a conventionally-generated directory.
-
-    Since #2607 the js language covers `.js`/`.mjs`/`.jsx`/`.cjs`, so a
-    repository that commits its bundles has them REWRITTEN rather than merely
-    reported (#2634). That is the correct behaviour and this tool keeps it: a
-    generated-dir file is transformed like any other, so no live read can
-    survive one and the "flag removed" claim stays true. Measured, the rewrite
-    lands even on minified output — bundlers mangle local names but preserve
-    property access and string literals, so `t.client.boolVariation("k",!1)`
-    matches the rules exactly as the source it came from does.
-
-    What it costs is review: a minified hunk is unreviewable in practice, and a
-    reviewer who finds one in a PR titled "Remove dead feature flag" has no way
-    to tell why it is there. So the body names them, the way ``stranded``
-    names the statements it deleted — the fix for #2634 is information, not a
-    behaviour change.
-
-    Reading the DIFF rather than the candidate list is deliberate: the diff is
-    the authoritative record of what this pull request actually contains, so
-    the note cannot name a file the PR does not touch. And it is the safe place
-    to be approximate — a header-shaped content line mislabels a note, which a
-    reviewer can ignore, where the same slip in a transform-side prune would
-    half-remove a flag. Every edge case named below is pinned by
-    ``test_rewritten_build_output_reads_only_real_diff_headers``, including
-    that spoof, which is asserted to produce the stray name rather than
-    pretended not to exist.
-    """
-    paths: list[str] = []
-    lines = diff.splitlines()
-    for index, line in enumerate(lines[:-1]):
-        if not line.startswith("--- a/") or not lines[index + 1].startswith("+++ b/"):
-            continue
-        before, after = line[len("--- a/") :], lines[index + 1][len("+++ b/") :]
-        # `_summaries_to_diff` never renames, so the two halves of a real
-        # header always agree. A content line that merely LOOKS like one
-        # (`++ b/x` added renders as `+++ b/x`) is unlikely to be preceded by
-        # a matching `--- a/x`, and costs only a stray name if it is.
-        if before != after:
-            continue
-        # `parts[:-1]` — directory components only, so a FILE named `dist`
-        # is not mistaken for the directory.
-        if not _GENERATED_DIRS.isdisjoint(PurePosixPath(before).parts[:-1]):
-            paths.append(before)
-    return tuple(dict.fromkeys(paths))
-
-
-def _pr_body(
-    candidate: Candidate,
-    config: Config,
-    unprocessed: tuple[str, ...] = (),
-    stranded: tuple[tuple[str, str], ...] = (),
-    bindings: tuple[tuple[str, str, str], ...] = (),
-    generated: tuple[str, ...] = (),
-    entries: tuple[tuple[str, str], ...] = (),
-) -> str:
-    """The PR description: what was removed, why, and which branch survived.
-
-    States ``treatment`` in plain English so a reviewer can sanity-check the
-    deletion without reading the Piranha rules — the single most likely way
-    for this tool to be wrong is keeping the branch the flag was NOT serving.
-
-    ``unprocessed`` (files that still mention the key after the rewrite) is
-    called out prominently when non-empty: merging a PR titled "remove flag X"
-    while the repo still declares or reads X is the failure mode this tool most
-    needs to avoid causing silently.
-
-    ``generated`` is the opposite case and must not be confused with it: those
-    files WERE rewritten and the removal really is complete. They are named
-    only because a reviewer cannot be expected to make sense of a minified
-    hunk. See :func:`_rewritten_build_output`.
-
-    ``bindings`` is a THIRD case, distinct from both: an import or local
-    variable the fold left with no remaining use, named for the same reason
-    ``stranded`` is — sound by construction, but the code was the customer's.
-    It is a separate field, and gets a separate sentence, because
-    ``stranded``'s sentence is specifically about statements the language's own
-    toolchain proves unreachable, and printing that for an import would be
-    false. See :func:`~flag_cleanup.unused.remove_stranded_bindings`.
-
-    ``entries`` is a FOURTH case: a flag-keyed entry — a registry line, an
-    override property, an object-type member — deleted under one of the two
-    evidence prongs the `*_entries.toml` rules carry (a sibling key that is
-    another flag of this project, or a boolean value). Not a read, and named
-    for the same reason
-    ``bindings`` is: the code was the customer's, and the evidence rule that
-    justified deleting it is the thing a reviewer needs to see.
-    """
-    served = "true" if candidate.treatment else "false"
-    kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
-    flag_url = (
-        f"{_without_userinfo(config.api_url)}/api/v1/orgs/{quote(config.org, safe='')}"
-        f"/projects/{quote(config.project, safe='')}"
-        f"/flags/{quote(candidate.key, safe='')}"
-    )
-    lines = [
-        f"Removes the {_md_code(candidate.key)} feature flag from this repository.",
-        "",
-        "| | |",
-        "| --- | --- |",
-        f"| **Flag** | {_md_cell(_md_code(candidate.key))} |",
-        f"| **Status** | {_md_cell(_md_code(candidate.status))} |",
-        # Code-spanned like every other server-supplied value: `reason` is API
-        # text, and left bare it renders as live markdown in the customer's PR.
-        f"| **Reason** | {_md_cell(_md_code(candidate.reason))} |",
-        f"| **Treatment** | `{served}` — the flag serves `{served}`, so the "
-        f"**{kept}** branch of each check was kept and the **{deleted}** branch "
-        "deleted. |",
-        # Deliberately NOT a link: this is the API resource (a dashboard deep
-        # link cannot be built — that route is keyed by internal ids, and a
-        # removal candidate carries only the key), and it needs a bearer token,
-        # so auto-linking it would send a reviewer to a 401. In a code span it
-        # reads as what it is: the identity of the flag this PR came from.
-        f"| **Flag (API resource)** | {_md_cell(_md_code(flag_url))} |",
-        "",
-    ]
-    if not _is_dead(candidate.status):
-        lines += [
-            f"Opened as a **draft** because this flag is {_md_code(candidate.status)}, "
-            "not `Dead` — confirm it really is settled, then mark the PR ready.",
-            "",
-        ]
-    if unprocessed:
-        shown = unprocessed[:20]
-        lines += [
-            f"> **⚠️ {len(unprocessed)} file(s) still reference this flag**, so "
-            "this PR does **not** remove every mention of it. The reference may "
-            "not be a flag read the transform can rewrite (a registry entry, a "
-            "test stub, a comment), its extension may be outside the configured "
-            f"languages ({_md_cell(', '.join(config.languages))}), or the "
-            "engine may not have been able to parse the file — check them by "
-            "hand:",
-            ">",
-            *[f"> - {_md_code(path)}" for path in shown],
-            *(
-                [f"> - ...and {len(unprocessed) - len(shown)} more"]
-                if len(unprocessed) > len(shown)
-                else []
-            ),
-            "",
-        ]
-    if generated:
-        shown = generated[:20]
-        # Only the directories actually present — naming all nine reads as
-        # boilerplate and tells the reviewer nothing about THIS diff.
-        roots = sorted(
-            {
-                part
-                for path in generated
-                for part in PurePosixPath(path).parts[:-1]
-                if part in _GENERATED_DIRS
-            }
-        )
-        # No `_md_cell`: these are our own literals from `_GENERATED_DIRS`,
-        # not API-supplied values, so there is no `|` to escape and escaping
-        # would imply otherwise.
-        named = _and_list([f"`{root}/`" for root in roots])
-        noun = "a directory" if len(roots) == 1 else "directories"
-        lines += [
-            f"> **ℹ️ This diff includes {len(generated)} build-output file(s).** "
-            f"They sit under {named} — {noun} a build normally writes — so if "
-            "that is what they are, your next build regenerates them from the "
-            "sources this PR just cleaned, and their hunks need no review. "
-            "They were rewritten rather than skipped so no read of the flag "
-            "survives anywhere in the tree: a minified bundle still reads the "
-            "flag, and leaving one alone would make this PR claim more than "
-            "it did.",
-            ">",
-            *[f"> - {_md_code(path)}" for path in shown],
-            *(
-                [f"> - ...and {len(generated) - len(shown)} more"]
-                if len(generated) > len(shown)
-                else []
-            ),
-            "",
-        ]
-    if stranded:
-        # Named rather than left to the diff. The deletion is behaviour-neutral
-        # by construction — the language's own toolchain proves these can never
-        # run, and the alternative was a branch that cannot go green — but it
-        # removes code the customer wrote, and that is not something a reviewer
-        # should have to discover.
-        #
-        # The sentence names every language this can fire for rather than one,
-        # because `stranded` is accumulated across the languages of a single
-        # run: `_transform_all` extends one list per language, so a PR can
-        # carry strands from more than one and there is no single language to
-        # name. It said "which Java rejects at compile time" while the repair
-        # was Java-only, and kept saying it for the TS family that #2807 added
-        # — a false sentence in a customer's pull request.
-        lines += [
-            f"> **{len(stranded)} statement(s) became unreachable and were "
-            "removed.** Folding the flag out left every path above them "
-            "returning, which your toolchain rejects rather than warns about: "
-            "a compile error in Java (JLS 14.21), a non-zero `dart analyze`, "
-            "and a `no-unreachable` error under `eslint:recommended` in "
-            "JavaScript and TypeScript. They cannot have run, so nothing "
-            "changes behaviour — but they were yours, so here they are:",
-            ">",
-            *[
-                f"> - {_md_code(path)} — {_md_code(statement)}"
-                for path, statement in stranded[:20]
-            ],
-            *(
-                [f"> - ...and {len(stranded) - 20} more"]
-                if len(stranded) > 20
-                else []
-            ),
-            "",
-        ]
-    if bindings:
-        # A THIRD case alongside `stranded`, sharing its reasoning — sound by
-        # construction, but the code was the customer's — without sharing its
-        # sentence: that one is specifically about Java statements javac
-        # proves unreachable, and an import is not that.
-        #
-        # The sentences below are deliberately conditional on the counts, and
-        # the variable sentence is deliberately PHRASED AS POLICY rather than
-        # as an assertion about this run: `Candidate.kind` in `unused.py` is
-        # decided before `_apply()` chooses discard-vs-delete, so nothing here
-        # knows which one happened to any given variable in this tuple. Saying
-        # "were rewritten" when every listed variable was actually an inert
-        # deletion would tell the customer something false about their own PR.
-        import_count = sum(1 for _, kind, _ in bindings if kind == "import")
-        variable_count = len(bindings) - import_count
-
-        def _plural(n: int, noun: str) -> str:
-            return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
-
-        counted = []
-        if import_count:
-            counted.append(_plural(import_count, "import"))
-        if variable_count:
-            counted.append(_plural(variable_count, "local variable"))
-
-        sentences = [
-            # Go is the only unconditionally-true claim here: javac has no
-            # built-in lint for either shape and never warns; an unused C#
-            # local is a real compiler warning (CS0219) but an unused `using`
-            # is an analyzer/IDE concern (IDE0005), not the base compiler; and
-            # TypeScript's noUnusedLocals/noUnusedParameters are off by
-            # default. So the weaker, defensible claim: a compile error in
-            # Go, at most a linter/analyzer/opt-in setting elsewhere.
-            "Leaving these in place is a compile error in Go; in Java, C# "
-            "and TypeScript it usually is not — at most a linter, "
-            "analyzer, or opt-in compiler setting flags it — so in those "
-            "three this cleanup is tidiness rather than a fix."
-        ]
-        if import_count:
-            sentences.append(
-                "Every import is deleted outright, which cannot change "
-                "behaviour."
-            )
-        if variable_count:
-            sentences.append(
-                "A variable whose initializer could have a side effect is "
-                "rewritten to discard its value rather than deleted, so "
-                "nothing stops running; one whose initializer cannot have a "
-                "side effect is deleted along with its declaration."
-            )
-
-        lines += [
-            f"> **{len(bindings)} unused binding(s) were removed.** Folding "
-            "the flag out left these with no remaining use — "
-            f"{_and_list(counted)}. " + " ".join(sentences),
-            ">",
-            *[
-                f"> - {_md_code(path)} — {kind}: {_md_code(text)}"
-                for path, kind, text in bindings[:20]
-            ],
-            *(
-                [f"> - ...and {len(bindings) - 20} more"]
-                if len(bindings) > 20
-                else []
-            ),
-            "",
-        ]
-    if entries:
-        count = len(entries)
-        noun = "entry was" if count == 1 else "entries were"
-        lines += [
-            f"> **{count} flag-keyed {noun} removed.** Each was an entry keyed by "
-            "this flag inside a literal that is provably about flags: either "
-            "another key in the same literal is a different flag of this project, "
-            "or the entry's value is a boolean. None is a flag read — these are "
-            "the registry and override lines a reviewer used to delete by hand.",
-            ">",
-            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in entries[:20]],
-            *([f"> - ...and {count - 20} more"] if count > 20 else []),
-            "",
-        ]
-    lines += [
-        "The rewrite is deterministic (AST transforms), with no LLM involved. "
-        "References the tool could not rewrite with confidence were left "
-        "untouched, so review the diff before merging.",
-        "",
-        "_Generated by the Featureflip flag-cleanup Action._",
-    ]
-    return "\n".join(lines)
-
-
-def _without_userinfo(url: str) -> str:
-    """Strip credentials before this URL is written into a pull-request body.
-
-    Thin alias over :func:`flag_cleanup.urls.without_userinfo`, which is shared
-    with the API client — see that module for why one home rather than three.
-    """
-    return without_userinfo(url)
-
-
-def _one_line(value: str) -> str:
-    return " ".join(value.split())
-
-
-def _md_code(value: str) -> str:
-    """Wrap ``value`` in a code span that its own backticks cannot break out of."""
-    text = _one_line(value)
-    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
-    fence = "`" * (longest + 1)
-    pad = " " if text.startswith("`") or text.endswith("`") else ""
-    return f"{fence}{pad}{text}{pad}{fence}"
-
-
-def _md_cell(value: str) -> str:
-    """Escape a value for a markdown table cell.
-
-    Flag keys come from the API, so a stray ``|`` is a plausible way for a PR
-    body to come out mangled. GFM honours ``\\|`` inside code spans too.
-    """
-    return _one_line(value).replace("|", r"\|")
-
-
 def _warn_on_unrecognized_status(candidate: Candidate) -> None:
     """Log (not raise) when ``status`` is neither ``Dead`` nor ``Stale``.
 
     The contract says the API only ever returns those two, but a future
     backend change could add a third value. Nothing downstream crashes on it:
-    :func:`_is_dead` returns ``False`` for anything unrecognized, so the flag
+    :func:`is_dead` returns ``False`` for anything unrecognized, so the flag
     gets the safer treatment (a **draft** PR, like ``Stale``) — which is what
     the warning below promises, and is covered by
     ``test_run_treats_an_unrecognized_status_as_the_safer_draft_case``.
@@ -1672,7 +1321,7 @@ def _unprocessed_references(config: Config, flag_key: str) -> tuple[str, ...]:
     **Read AFTER the transform, never before.** The question is about the
     rewritten tree, so a file the engine really did clean does not appear here
     and no rewritten call site is reported back at the customer. Both callers
-    run it inside the ``_piranha_transform`` window for that reason; running it
+    run it inside the ``piranha_transform`` window for that reason; running it
     once the context has rolled the edits back would name every file the run
     just fixed. A file the engine cleaned only PARTIALLY still mentions the key
     and is still reported, which is the case no before-and-subtract scheme
@@ -1700,10 +1349,13 @@ def _unprocessed_references(config: Config, flag_key: str) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-def _all_unprocessed(
+def all_unprocessed(
     config: Config, flag_key: str, engine_skipped: Iterable[str]
 ) -> tuple[str, ...]:
     """Every file still reading ``flag_key`` that this run did not process.
+
+    Public (no leading underscore): ``pr_command`` regenerates through the
+    same path and needs the identical caveat, computed the identical way.
 
     Two sources, one caveat. :func:`_unprocessed_references` finds files that
     still mention the key once the rewrite is on disk, whatever the reason;
@@ -1723,46 +1375,6 @@ def _all_unprocessed(
     for path in (*_unprocessed_references(config, flag_key), *engine_skipped):
         seen.setdefault(os.path.abspath(path), path)
     return tuple(seen.values())
-
-
-def _note_rewritten_build_output(diff: str) -> tuple[str, ...]:
-    """Log the build-output files this run rewrote, and return them.
-
-    The PR body carries the same list, but `--dry-run` opens no PR and prints
-    the diff instead — so without this the one mode whose entire purpose is
-    previewing what a real run would do is the mode that explains a minified
-    hunk least. Mirrors :func:`_warn_on_unprocessed_references`, at INFO
-    rather than WARNING: nothing here is wrong, the removal is complete, and
-    these files regenerate.
-    """
-    generated = _rewritten_build_output(diff)
-    if generated:
-        logger.info(
-            "%d rewritten file(s) are build output and your next build "
-            "regenerates them from the sources just cleaned: %s",
-            len(generated),
-            ", ".join(generated),
-        )
-    return generated
-
-
-def _note_removed_entries(entries: tuple[tuple[str, str], ...]) -> None:
-    """Log the flag-keyed entries this run deleted; the dry run's only outlet.
-
-    Each entry's text is flattened through :func:`_one_line`, as
-    :func:`_pr_body` already does for the same values: a deleted entry is
-    routinely multi-line (`'k': {\n  default: false,\n},`), and a newline
-    inside one item of a `; `-joined list turns a single log record into what
-    reads as several unattributed ones in the workflow log.
-    """
-    if entries:
-        logger.info(
-            "%d flag-keyed entr%s removed (registry lines, override properties, "
-            "type members): %s",
-            len(entries),
-            "y" if len(entries) == 1 else "ies",
-            "; ".join(f"{path}: {_one_line(text)}" for path, text in entries),
-        )
 
 
 def _warn_on_unprocessed_references(

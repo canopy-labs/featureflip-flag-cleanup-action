@@ -59,7 +59,7 @@ import base64
 import logging
 import os
 import subprocess
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -72,9 +72,46 @@ BOT_EMAIL = "featureflip-flag-cleanup[bot]@users.noreply.github.com"
 
 _REDACTED = "***"
 
+#: What git prints when a ``--force-with-lease`` expectation is not met:
+#: ``! [rejected]  <branch> -> <branch> (stale info)``. Matched rather than
+#: parsed, and matched on this phrase alone rather than on ``[rejected]``,
+#: because ``[rejected]`` also covers a non-fast-forward and a hook refusal —
+#: neither of which is fixed by re-running the command, which is the whole
+#: point of telling the two apart. Compared against a lowercased message.
+_STALE_LEASE = "stale info"
+
 
 class GitCommandError(RuntimeError):
     """A git subprocess failed. Its message is redacted before construction."""
+
+
+class ForceWithLeaseRejected(GitCommandError):
+    """A leased force-push was refused because the remote branch had moved.
+
+    A subclass, so nothing that already handles :class:`GitCommandError`
+    changes behaviour — but a distinct type, so the one caller that can do
+    something useful with it (the reply :mod:`flag_cleanup.__main__` posts on
+    the pull request) can branch on the TYPE rather than grepping git's stderr
+    a second time.
+
+    The distinction is worth making because this is the single most likely
+    concurrency failure in ``pr-command`` mode, and its cause and its remedy
+    are both simple to state: somebody else wrote to the branch between this
+    run reading the pull request and this run pushing, and running the command
+    again regenerates against the branch as it now is. Left as a bare
+    :class:`GitCommandError`, the reply said none of that — the first line of
+    git's own message is the command plus ``To <url>``, and the
+    ``! [rejected] ... (stale info)`` line that carries the reason is the
+    second.
+
+    The message deliberately carries NO git output. There is nothing in it a
+    non-expert can act on that this sentence does not say, and keeping the
+    push URL out of a pull-request comment is free.
+    """
+
+    def __init__(self, message: str, *, branch: str) -> None:
+        super().__init__(message)
+        self.branch = branch
 
 
 class WorktreeResetError(RuntimeError):
@@ -918,6 +955,75 @@ def push_branch(directory: str, branch: str, push_url: str, token: str) -> None:
     )
 
 
+def force_push_branch(
+    directory: str, branch: str, push_url: str, token: str, expect_sha: str
+) -> None:
+    """Replace ``branch`` on the remote, leased against ``expect_sha``.
+
+    Deliberately a SEPARATE function rather than a flag on
+    :func:`push_branch`. That function's "not a force push" property is what
+    stops the scheduled sweep overwriting somebody's work, and a property that
+    holds only when a parameter is left at its default is not a property worth
+    documenting. Nothing in `remove` mode may reach this.
+
+    ``--force-with-lease=<refname>:<expect>`` with an EXPLICIT expected value
+    is REQUIRED here, not the bare ``--force-with-lease``: the bare form
+    resolves what it expected to overwrite from a remote-tracking ref, and a
+    shallow CI checkout has none for this push URL, so the bare form cannot
+    establish an expectation at all and is unusable in this environment.
+    (Observed locally, with no remote-tracking ref present: git actually
+    refuses the push outright rather than accepting it — the local failure
+    mode we saw, not a claim about every environment.) The expectation is
+    therefore passed explicitly: it is the head SHA read from the pull
+    request moments earlier, so a write that landed on the branch in between
+    is rejected instead of lost.
+
+    Credentials are handled exactly as :func:`push_branch` handles them: the
+    URL carries none, and the token rides in a per-call ``http.extraHeader``.
+
+    A REFUSED lease is raised as :class:`ForceWithLeaseRejected` rather than as
+    a bare :class:`GitCommandError`, so the reply a human sees can name the
+    cause. It is classified here, at the only place that knows the push was
+    leased at all — and it is deliberately the ONLY failure reclassified: git
+    declines a push for plenty of other reasons (no permission, a hook, a dead
+    remote) and none of them is fixed by running the command again.
+    """
+    logger.info(
+        "force-pushing %s to %s (expecting the remote at %s)",
+        branch,
+        push_url,
+        expect_sha[:12],
+    )
+    def _classify(detail: str) -> None:
+        """Raise :class:`ForceWithLeaseRejected` when git refused the lease.
+
+        Reads git's raw stderr (see :func:`_git`) and builds its message from
+        ``branch`` and ``expect_sha`` alone — nothing git printed reaches the
+        pull-request comment this ends up in.
+        """
+        if _STALE_LEASE in detail.lower():
+            raise ForceWithLeaseRejected(
+                f"the remote branch {branch!r} moved after this run read it "
+                f"(the push was leased against {expect_sha[:12]}), so git "
+                "refused it rather than overwriting whatever landed there",
+                branch=branch,
+            )
+
+    _git(
+        [
+            "push",
+            "--quiet",
+            f"--force-with-lease=refs/heads/{branch}:{expect_sha}",
+            push_url,
+            f"refs/heads/{branch}:refs/heads/{branch}",
+        ],
+        cwd=directory,
+        env=_authenticated_env(token),
+        secret=token,
+        on_failure=_classify,
+    )
+
+
 def _nothing_staged_message(directory: str, pathspecs: Sequence[str]) -> str:
     """Explain an empty index after a non-empty Piranha diff.
 
@@ -1068,11 +1174,26 @@ def _git(
     cwd: str,
     env: Mapping[str, str] | None = None,
     secret: str | None = None,
+    on_failure: Callable[[str], None] | None = None,
 ) -> str:
     """Run git, returning stdout; raise :class:`GitCommandError` on failure.
 
     Output is captured (never inherited) and redacted so nothing a git
     subprocess prints can carry a credential into the workflow log.
+
+    ``on_failure`` is handed git's **raw** stderr, before redaction, and may
+    raise something more specific than :class:`GitCommandError`. The raw text
+    is what it must see: redaction rewrites every occurrence of the secret, so
+    a caller classifying on the redacted message is reading a string a short
+    enough secret can corrupt — a token of ``t`` turns ``(stale info)`` into
+    ``(s***ale info)`` and the classification silently stops happening. Real
+    GitHub tokens are far too long to overlap git's own vocabulary, so this is
+    a coupling worth removing rather than a live defect; it was found by a
+    test whose fake token was one character.
+
+    A classifier must build its message from what the CALLER knows (a branch
+    name, a ref) and never from the raw text it is shown, or this parameter
+    becomes the credential leak the redaction exists to stop.
     """
     result = subprocess.run(
         ["git", *args],
@@ -1083,6 +1204,8 @@ def _git(
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
+        if on_failure is not None:
+            on_failure(detail)
         raise GitCommandError(
             f"git {_redact(' '.join(args), secret)} failed with exit code "
             f"{result.returncode}: {_redact(detail, secret)}"

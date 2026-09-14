@@ -34,16 +34,68 @@ inputs:
       the flag whose removal pull request just merged, and does nothing else:
       no checkout, no source is read, no pull request is opened.
 
-      The two are separate workflows on separate triggers, never two steps of
-      one job. `remove` runs on a schedule; `archive-on-merge` runs on
-      `pull_request` with `types: [closed]`.
+      `pr-command` re-runs the removal for the flag whose pull request a
+      comment was left on. It is triggered by `issue_comment` and reads its
+      command from the comment body: `@featureflip-cleanup rerun` regenerates
+      the diff from the base branch and force-pushes it over the pull
+      request's branch, refusing if anyone other than this Action has
+      committed to that branch; `@featureflip-cleanup recreate` does the same
+      and proceeds over those commits. Only commenters with write access can
+      run either. The flag is identified by the pull request's own branch, so
+      there is nothing to configure per flag.
+
+      Exit codes in `pr-command` differ from the other two modes, because
+      almost every outcome is an ANSWER rather than a failure: `0` covers a
+      comment this Action ignores (no command, not a pull request, not
+      enough permission, not a branch this Action opened) as well as a
+      successful re-run, including one whose diff came back empty
+      (`rerun-empty`) and including a dry run (`rerun-dry-run`; see the
+      `dry-run` input below for what that mode actually does here). An empty
+      diff wins if both apply — a dry run that would have produced nothing
+      reports `rerun-empty`, not `rerun-dry-run`. `1` is a refusal (foreign
+      commits on the branch, an already-merged pull request, a flag no longer
+      a removal candidate, or the flag being in this workflow's `ignore` list
+      — `rerun-ignored`) or a raised failure. `2` is the run failing to start
+      at all: the workflow wired to something other than `issue_comment`, or a
+      checkout this Action cannot work in safely — a `directories` entry that
+      is not a git working tree, entries from two repositories, or uncommitted
+      changes to tracked files, which a re-run would otherwise commit onto the
+      pull request's branch. Nothing is transformed, committed or pushed when
+      that fires. See "Re-run a removal from a comment" in the README.
+
+      The three modes are separate workflows on separate triggers, never
+      steps of one job. `remove` runs on a schedule; `archive-on-merge` runs
+      on `pull_request` with `types: [closed]`; `pr-command` runs on
+      `issue_comment` with `types: [created]`.
 
       IMPORTANT — `archive-on-merge` needs a DIFFERENT token. Archiving
       requires the Member role, while fetching removal candidates needs only
       read access. Give this workflow its own secret rather than reusing the
       read-only one, or a leaked token stops meaning "flag names disclosed" and
       starts meaning "flag state changed". In `archive-on-merge` every input
-      below except `api-url` is ignored.
+      below except `api-url` is ignored. `pr-command` reads a NARROWER set of
+      `remove`'s inputs — the complete list is in the README's "Re-run a
+      removal from a comment" section, and the short version is: `api-token`,
+      `org`, `project`, `api-url`, `directories`, `languages`, `accessors` and
+      `ignore` all apply and must match the workflow that opened the pull
+      request, or a re-run regenerates a different diff than the one already
+      proposed. `staleness` is NOT on that list: this command looks the flag
+      up by the key its branch already encodes and checks both tiers
+      regardless of which is configured (the configured one first, then the
+      other, so a flag that has moved tiers since the pull request opened is
+      still found) — so it never changes the diff, and its only visible
+      effect is which tier name this command's own reply happens to quote.
+      `dry-run` applies here too — see its own description below for what
+      that actually means in this mode, which is
+      NOT the same as in `remove` — but it has no bearing on the diff itself,
+      only on whether the regenerated result is pushed, so it is deliberately
+      not in the "must match" list above. `flags`, `max-prs` and `pr-labels`
+      are read but do nothing here — `flags` scopes an ordinary sweep, not a
+      re-run of one flag the branch already names; `max-prs` bounds how many
+      pull requests a sweep opens, and this mode opens none; `pr-labels` only
+      applies when a pull request is first opened. `base-branch` is likewise
+      unused, in the other direction: this mode always regenerates from the
+      pull request's OWN base branch, never a configured one.
     required: false
     default: 'remove'
   api-url:
@@ -99,6 +151,21 @@ inputs:
       future invocation (by design; see "Exit codes" in the README).
     required: false
     default: ''
+  flags:
+    description: >-
+      Comma-separated flag keys this run may propose, as an ALLOWlist. Leave
+      unset (the default) to consider every removal candidate. Useful for
+      scoping a sweep to one flag, and — with `dry-run: true` — for previewing
+      exactly one flag's diff without touching the GitHub API at all.
+
+      This does NOT re-propose a flag that already has a pull request: a flag
+      named here is still skipped if one was ever opened for it. To re-run
+      against a flag whose pull request is already open or closed, comment
+      `@featureflip-cleanup rerun` on that pull request (see `mode`).
+
+      `ignore` wins when a key appears in both lists.
+    required: false
+    default: ''
   base-branch:
     description: >-
       Base branch each removal pull request targets. Leave unset to use the
@@ -108,7 +175,10 @@ inputs:
       carries commits the base branch does not, since a removal branch is cut
       from the checkout and would otherwise drag them into every PR: run this
       Action from a checkout of the base branch (`on: schedule` or `on: push`),
-      not from a `pull_request` merge commit.
+      not from a `pull_request` merge commit. Read only by `remove` mode —
+      `pr-command` regenerates against the pull request's OWN base and makes
+      the same containment check against that, but reports it as exit 1, since
+      there it is one pull request's problem rather than a broken workflow.
     required: false
     default: ''
   pr-labels:
@@ -135,11 +205,19 @@ inputs:
     default: '10'
   dry-run:
     description: >-
-      When `true`, compute and print the diff for every removal candidate but
-      open no branch, commit, or pull request — nothing touches the GitHub
-      API at all. When this input is omitted, the underlying tool's own
-      default is `false` (it opens real PRs), so a first-time run should set
-      this explicitly. See README's "Dry run" section.
+      When `true` in `remove` mode, compute and print the diff for every
+      removal candidate but open no branch, commit, or pull request — nothing
+      touches the GitHub API at all. When this input is omitted, the
+      underlying tool's own default is `false` (it opens real PRs), so a
+      first-time run should set this explicitly. See README's "Dry run"
+      section.
+
+      In `pr-command` mode it still checks permissions, reads the pull
+      request and posts a reply (so it DOES touch the GitHub API, unlike
+      `remove`), but stops before force-pushing the branch or updating the
+      pull request — reporting `rerun-dry-run` instead. Ignored in
+      `archive-on-merge`, which never opens a branch or a pull request either
+      way.
     required: false
     default: 'false'
 
@@ -169,6 +247,7 @@ runs:
     FEATUREFLIP_ACCESSORS: ${{ inputs.accessors }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
+    FEATUREFLIP_FLAGS: ${{ inputs.flags }}
     FEATUREFLIP_BASE_BRANCH: ${{ inputs.base-branch }}
     FEATUREFLIP_PR_LABELS: ${{ inputs.pr-labels }}
     FEATUREFLIP_MAX_PRS: ${{ inputs.max-prs }}

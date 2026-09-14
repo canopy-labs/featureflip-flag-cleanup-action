@@ -248,7 +248,7 @@ class FeatureflipClient:
                 # portal or an HTML error page answered instead of the API.
                 # `json.JSONDecodeError` is a `ValueError` and would otherwise
                 # leave this generator as a type no caller recognises —
-                # `orchestrate._fetch_known_flag_keys` catches
+                # `orchestrate.fetch_known_flag_keys` catches
                 # `FeatureflipApiError`/`httpx.HTTPError` and degrades, and
                 # `__main__` renders `FeatureflipApiError` as one sentence, so
                 # anything else aborts the whole run with a traceback.
@@ -304,7 +304,7 @@ class FeatureflipClient:
         collected so far are still returned (removing fewer flags is safe;
         looping is not).
         """
-        # Percent-encoded with `safe=''`, matching how `orchestrate._pr_body`
+        # Percent-encoded with `safe=''`, matching how `pr_content.pr_body`
         # builds the same two segments. Nothing in `Config.from_env` rejects a
         # `/`, `#` or `?` in either value, and interpolating one raw silently
         # rewrites the request's path or query rather than 404-ing on the
@@ -336,7 +336,7 @@ class FeatureflipClient:
         turns the registry prong off for every flag with no warning.
 
         EVERY malformed page shape is refused as :class:`FeatureflipApiError`,
-        and that type is the whole point. ``orchestrate._fetch_known_flag_keys``
+        and that type is the whole point. ``orchestrate.fetch_known_flag_keys``
         catches ``FeatureflipApiError``/``httpx.HTTPError`` and degrades to an
         empty sibling list — the run continues, the registry prong switches
         itself off, the caveat says so. Anything else escapes and ABORTS the

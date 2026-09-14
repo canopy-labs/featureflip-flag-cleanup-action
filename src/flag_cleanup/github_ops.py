@@ -79,6 +79,15 @@ _API_VERSION = "2022-11-28"
 # base branch does not already contain. See :func:`ensure_head_on_base`.
 _HEAD_CONTAINED_IN_BASE = frozenset({"identical", "behind"})
 
+# GitHub's compare endpoint returns at most this many commits in `commits`,
+# with the true count in `total_commits`. See :func:`branch_commits`.
+_MAX_COMPARE_COMMITS = 250
+
+#: Collaborator permissions that may run a pull-request command. GitHub's
+#: legacy permission field answers `admin`/`write`/`read`/`none`; `maintain`
+#: is accepted too rather than relying on it always collapsing to `write`.
+WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+
 
 class GitHubConfigError(ValueError):
     """A runner-provided GitHub variable is missing or malformed."""
@@ -177,7 +186,7 @@ class GitHubEnv:
 
 
 class GitHubApi:
-    """Minimal authenticated transport for the three endpoints this tool uses.
+    """Minimal authenticated transport for the endpoints this tool uses.
 
     Pass ``transport`` (e.g. ``httpx.MockTransport``) in tests — no request
     here is ever made against a hardcoded real client.
@@ -212,6 +221,9 @@ class GitHubApi:
 
     def post(self, path: str, json: dict) -> httpx.Response:
         return self._client.post(path, json=json)
+
+    def patch(self, path: str, json: dict) -> httpx.Response:
+        return self._client.patch(path, json=json)
 
 
 def removal_branch(key: str) -> str:
@@ -489,6 +501,117 @@ def open_pr(
     return url
 
 
+@dataclass(frozen=True, slots=True)
+class PullRequest:
+    """One pull request, as much of it as this tool acts on.
+
+    Read in a single ``GET``: the head branch names the flag (through the
+    :func:`removal_branch` bijection), ``head_sha`` is the value the
+    force-push leases against, and ``state``/``merged``/``draft`` decide what
+    a re-run may do to it.
+    """
+
+    number: int
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    state: str
+    merged: bool
+    draft: bool
+    html_url: str
+
+
+def pull_request(gh: GitHubApi, repo: str, number: int) -> PullRequest:
+    """Read one pull request. Raises rather than defaulting any field.
+
+    Every field here is load-bearing, and ``head_sha`` most of all: it is the
+    expected value of the ``--force-with-lease`` that overwrites the branch, so
+    a default would silently turn a guarded push into an unguarded one.
+    """
+    response = gh.get(f"/repos/{repo}/pulls/{number}")
+    if response.status_code != 200:
+        _raise_api_error(response, f"could not read pull request #{number} in {repo}")
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise GitHubApiError(
+            f"pull request #{number} in {repo} did not come back as an object"
+        )
+
+    head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
+    base = payload.get("base") if isinstance(payload.get("base"), dict) else {}
+    head_ref, head_sha, base_ref = head.get("ref"), head.get("sha"), base.get("ref")
+    absent = [
+        name
+        for name, value in (
+            ("head.ref", head_ref),
+            ("head.sha", head_sha),
+            ("base.ref", base_ref),
+        )
+        if not isinstance(value, str) or not value
+    ]
+    if absent:
+        raise GitHubApiError(
+            f"pull request #{number} in {repo} carries no {', '.join(absent)}, "
+            "so it cannot be safely updated"
+        )
+
+    return PullRequest(
+        number=number,
+        head_ref=head_ref,
+        head_sha=head_sha,
+        base_ref=base_ref,
+        # Strictly `is True`, like `pr_event`'s merged check: this decides
+        # whether a re-run refuses, and `bool("false")` is True.
+        state=str(payload.get("state") or ""),
+        merged=payload.get("merged") is True,
+        draft=payload.get("draft") is True,
+        html_url=str(payload.get("html_url") or ""),
+    )
+
+
+def update_pull_request(
+    gh: GitHubApi,
+    repo: str,
+    number: int,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    state: str | None = None,
+) -> None:
+    """PATCH the fields given, leaving every other field alone.
+
+    ``state="open"`` reopens a closed pull request — the same call, because
+    GitHub treats it as an ordinary field.
+
+    NOT capable of flipping ``draft``: that needs GraphQL
+    (``markPullRequestReadyForReview``). A re-run therefore leaves the draft
+    state exactly as it found it and says so in the body when the flag's tier
+    no longer matches it.
+
+    Raises on refusal. By the time this is called the force-push has already
+    landed, so a swallowed failure would leave the branch carrying a new diff
+    and the pull request describing the old one.
+    """
+    changes = {
+        name: value
+        for name, value in (("title", title), ("body", body), ("state", state))
+        if value is not None
+    }
+    if not changes:
+        return
+    response = gh.patch(f"/repos/{repo}/pulls/{number}", json=changes)
+    if response.status_code != 200:
+        _raise_api_error(
+            response,
+            f"could not update pull request #{number} in {repo} "
+            f"({', '.join(sorted(changes))})",
+        )
+
+
 def default_branch(gh: GitHubApi, repo: str) -> str:
     """The repository's own default branch.
 
@@ -514,7 +637,14 @@ def default_branch(gh: GitHubApi, repo: str) -> str:
     return branch
 
 
-def ensure_head_on_base(gh: GitHubApi, repo: str, base: str, head_sha: str) -> None:
+def ensure_head_on_base(
+    gh: GitHubApi,
+    repo: str,
+    base: str,
+    head_sha: str,
+    *,
+    base_is_configured_input: bool = True,
+) -> None:
     """Raise unless ``head_sha`` introduces nothing ``base`` does not have.
 
     Removal branches are cut from the CURRENT HEAD, because that is what the
@@ -530,6 +660,19 @@ def ensure_head_on_base(gh: GitHubApi, repo: str, base: str, head_sha: str) -> N
 
     Asked of the API rather than of local refs because a shallow CI checkout
     frequently has no local copy of the base branch to compare against.
+
+    Raised before any candidate is processed, so nothing has been modified —
+    true of both callers below.
+
+    ``base_is_configured_input`` decides which remedy the message offers, and
+    it MUST match what ``base`` actually is for the caller. ``remove`` mode
+    passes the configured (or looked-up) ``base-branch`` input, so "set
+    `base-branch`" is real advice there. ``pr-command`` mode passes ONE pull
+    request's own ``base_ref`` — a fact about that pull request, not about
+    this workflow's configuration — so the default wording would send a
+    customer to edit a workflow input that has nothing to do with the failure.
+    Pass ``base_is_configured_input=False`` for that caller; see
+    ``pr_command._regenerate``.
     """
     response = gh.get(f"/repos/{repo}/compare/{base}...{head_sha}")
     if response.status_code in (401, 403):
@@ -538,24 +681,186 @@ def ensure_head_on_base(gh: GitHubApi, repo: str, base: str, head_sha: str) -> N
         # looking in the wrong place entirely.
         _raise_api_error(response, f"could not compare {head_sha[:12]} against {base}")
     if response.status_code != 200:
+        if base_is_configured_input:
+            remedy = (
+                "Check that `base-branch` names a branch that exists and "
+                "that this commit has been pushed"
+            )
+        else:
+            remedy = (
+                f"Check that `{base}` — this pull request's own base branch "
+                "— still exists and that this commit has been pushed"
+            )
         raise BaseRefError(
             f"could not compare the checkout ({head_sha[:12]}) against base "
             f"branch {base!r} in {repo} (HTTP {response.status_code}): "
-            f"{_api_message(response)}. Check that `base-branch` names a "
-            "branch that exists and that this commit has been pushed"
+            f"{_api_message(response)}. {remedy}"
         )
 
     status = response.json().get("status")
     if status in _HEAD_CONTAINED_IN_BASE:
         return
+    if base_is_configured_input:
+        # `remove` mode: this is the FIRST creation of a removal pull request,
+        # not a regeneration of an existing one — "cut from it" describes that
+        # correctly, where "regenerating" would not.
+        consequence = "every removal pull request cut from it would also contain them"
+        remedy = (
+            "Run this Action from a checkout of the base branch (e.g. "
+            "`on: schedule` or `on: push` to that branch), not from a "
+            "`pull_request` merge commit, or set `base-branch` to the branch "
+            "this checkout is on"
+        )
+    else:
+        consequence = "regenerating this removal from it would drag them along"
+        remedy = (
+            f"This pull request targets `{base}`, and this command can only "
+            "regenerate a removal when the workflow's own checkout already "
+            f"contains `{base}` — typically only true when a pull request "
+            "targets this repository's default branch. Nothing was pushed"
+        )
     raise BaseRefError(
-        f"the checkout ({head_sha[:12]}) is {status!r} relative to base branch "
-        f"{base!r}: it carries commits {base!r} does not, so every removal "
-        "pull request cut from it would also contain them. Run this Action "
-        "from a checkout of the base branch (e.g. `on: schedule` or `on: push` "
-        "to that branch), not from a `pull_request` merge commit, or set "
-        "`base-branch` to the branch this checkout is on"
+        f"the checkout ({head_sha[:12]}) is {status!r} relative to base "
+        f"branch {base!r}: it carries commits {base!r} does not, so "
+        f"{consequence}. {remedy}"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class Commit:
+    """One commit on a branch, reduced to what the ownership guard reads."""
+
+    sha: str
+    author_email: str
+    committer_email: str
+
+
+def branch_commits(
+    gh: GitHubApi, repo: str, base: str, branch: str
+) -> tuple[Commit, ...]:
+    """The commits ``branch`` carries that ``base`` does not.
+
+    Refuses a TRUNCATED answer. The endpoint returns at most
+    ``_MAX_COMPARE_COMMITS`` commits while reporting the true count in
+    ``total_commits``, and reading a truncated list as the whole branch would
+    let a human commit slip past the ownership guard unseen. A removal branch
+    with more commits than that is not a pagination problem to solve — it is a
+    branch nothing here should be force-pushing over.
+    """
+    response = gh.get(f"/repos/{repo}/compare/{base}...{branch}")
+    if response.status_code != 200:
+        _raise_api_error(
+            response,
+            f"could not list the commits on {branch} in {repo}; refusing to "
+            "assume it carries none of its own",
+        )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    commits = payload.get("commits") if isinstance(payload, dict) else None
+    if not isinstance(commits, list):
+        raise GitHubApiError(
+            f"the comparison of {branch} against {base} in {repo} carried no "
+            "commit list"
+        )
+
+    total = payload.get("total_commits")
+    if not isinstance(total, int):
+        # The real endpoint always returns `total_commits`; this only fires on
+        # a malformed or mocked response, where the array length is the best
+        # available answer rather than a value to refuse outright over.
+        total = len(commits)
+    if total > len(commits) or total > _MAX_COMPARE_COMMITS:
+        raise GitHubApiError(
+            f"{branch} carries too many commits ({total}) to check safely — "
+            f"the comparison endpoint reports at most {_MAX_COMPARE_COMMITS}. "
+            "A removal branch should carry one; check what is on it by hand"
+        )
+
+    resolved: list[Commit] = []
+    for entry in commits:
+        detail = entry.get("commit") if isinstance(entry, dict) else None
+        detail = detail if isinstance(detail, dict) else {}
+        author = detail.get("author") if isinstance(detail.get("author"), dict) else {}
+        committer = (
+            detail.get("committer") if isinstance(detail.get("committer"), dict) else {}
+        )
+        resolved.append(
+            Commit(
+                sha=str(entry.get("sha") or "") if isinstance(entry, dict) else "",
+                # An absent email reads as foreign, never as the bot: an
+                # unattributable commit is exactly what the guard is for.
+                author_email=str(author.get("email") or ""),
+                committer_email=str(committer.get("email") or ""),
+            )
+        )
+    return tuple(resolved)
+
+
+def foreign_commits(commits: Sequence[Commit], bot_email: str) -> tuple[str, ...]:
+    """SHAs of commits not both authored AND committed by ``bot_email``.
+
+    Both fields, because a rebase or an accepted suggestion preserves the
+    author and replaces the committer — checking only the author would wave
+    through precisely the edit a human is most likely to have made.
+
+    Compared case-insensitively: git preserves the case a commit was made
+    with, and an address that differs only in case is the same mailbox.
+    """
+    expected = bot_email.strip().lower()
+    return tuple(
+        commit.sha
+        for commit in commits
+        if commit.author_email.strip().lower() != expected
+        or commit.committer_email.strip().lower() != expected
+    )
+
+
+def actor_permission(gh: GitHubApi, repo: str, login: str) -> str:
+    """``login``'s permission on ``repo``: ``admin``/``write``/``read``/``none``.
+
+    A 404 is ``none``, not a failure: ``issue_comment`` fires for anyone who
+    can comment, so on a public repository a comment from somebody with no
+    access at all is the ordinary case.
+
+    A refusal (401/403) raises instead. "The token may not ask" is not the same
+    answer as "this person may not do it", and collapsing the two would make
+    every command a silent no-op on a workflow whose permissions are wrong.
+    """
+    response = gh.get(f"/repos/{repo}/collaborators/{login}/permission")
+    if response.status_code == 404:
+        return "none"
+    if response.status_code != 200:
+        _raise_api_error(
+            response, f"could not read {login}'s permission on {repo}"
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    permission = payload.get("permission") if isinstance(payload, dict) else None
+    return str(permission or "none").strip().lower()
+
+
+def comment_on_pull_request(gh: GitHubApi, repo: str, number: int, body: str) -> None:
+    """Reply on the pull request. Logged rather than raised on failure.
+
+    The reply is this mode's report, so it matters — but by the time it is
+    posted the work it describes has already landed and is visible on the pull
+    request itself. Failing the run over a missing receipt would be the same
+    trade ``open_pr`` declines to make for labels.
+    """
+    response = gh.post(f"/repos/{repo}/issues/{number}/comments", json={"body": body})
+    if response.status_code != 201:
+        logger.warning(
+            "could not comment on pull request #%s in %s (HTTP %d): %s",
+            number,
+            repo,
+            response.status_code,
+            _api_message(response),
+        )
 
 
 def _body_names_ref(response: httpx.Response, ref: str) -> bool:
