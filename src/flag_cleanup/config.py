@@ -27,21 +27,47 @@ DEFAULT_STALENESS = "dead"
 #: archive-on-merge existed, and stays the default so an existing workflow that
 #: never sets ``mode`` keeps behaving identically.
 #:
-#: The two are separate invocations on separate triggers, never two phases of
-#: one run: ``remove`` runs on a schedule against a checkout, ``archive-on-merge``
-#: runs on a merged pull request and touches no source at all. Splitting them on
-#: an explicit input rather than sniffing ``GITHUB_EVENT_NAME`` is deliberate —
-#: archive mode needs a token that can WRITE to the customer's flags, and a
+#: Each is a separate invocation on its own trigger, never two phases of one
+#: run: ``remove`` runs on a schedule against a checkout, ``archive-on-merge``
+#: runs on a merged pull request and touches no source at all, ``archive-sweep``
+#: runs on a schedule and touches no source either. Splitting them on an
+#: explicit input rather than sniffing ``GITHUB_EVENT_NAME`` is deliberate —
+#: both archive modes need a token that can WRITE to the customer's flags, and a
 #: behaviour that turns itself on because somebody added a trigger for an
 #: unrelated reason is the wrong way to reach for that.
 DEFAULT_MODE = "remove"
 MODE_REMOVE = "remove"
 MODE_ARCHIVE_ON_MERGE = "archive-on-merge"
+#: Re-attempt every archive that deferred. Scheduled and project-wide rather
+#: than pull-request-scoped. Needs ``GITHUB_TOKEN`` with ``pull-requests:
+#: read`` — as does ``archive-on-deploy`` below, which shares its lookup;
+#: ``archive-on-merge`` is the one archive mode that needs nothing from it. See
+#: :mod:`flag_cleanup.backlog`.
+MODE_ARCHIVE_SWEEP = "archive-sweep"
+#: Archive the outstanding flags a successful deployment actually shipped.
+#: Deployment-scoped rather than pull-request-scoped: it fires on the deploy
+#: rather than on the merge, so it can tell whether the removal is running —
+#: see :mod:`flag_cleanup.deploy`, and note it narrows the sweep's backlog
+#: rather than replacing the sweep. Needs ``GITHUB_TOKEN`` for the same reason
+#: the sweep does, plus ``contents: read`` to compare commits.
+MODE_ARCHIVE_ON_DEPLOY = "archive-on-deploy"
 #: Re-run the transform for the flag whose removal pull request this comment
 #: was left on. Human-initiated and pull-request-scoped: the branch names the
 #: flag, so there is no key to pass and no way to aim it at another one.
 MODE_PR_COMMAND = "pr-command"
-MODES = (MODE_REMOVE, MODE_ARCHIVE_ON_MERGE, MODE_PR_COMMAND)
+MODES = (
+    MODE_REMOVE,
+    MODE_ARCHIVE_ON_MERGE,
+    MODE_ARCHIVE_SWEEP,
+    MODE_ARCHIVE_ON_DEPLOY,
+    MODE_PR_COMMAND,
+)
+
+#: Which GitHub deployment environment ``archive-on-deploy`` acts on. A
+#: deployment to anything else is reported and archives nothing, so the default
+#: is the environment whose name almost every pipeline already uses — and a
+#: wrong one is visible on the very first run rather than silently inert.
+DEFAULT_DEPLOYMENT_ENVIRONMENT = "production"
 
 #: The endpoint's ``?staleness=`` enum, verbatim. Validated here rather than
 #: sent blind: a typo would otherwise reach the API, come back 4xx, and surface
@@ -90,10 +116,14 @@ class Config:
     org: str
     project: str
     api_url: str = DEFAULT_API_URL
-    #: See :data:`MODES`. Everything below this line except ``api_url`` is
-    #: ``remove``-only; archive mode reads a merged pull request and makes one
-    #: API call, so it needs no checkout and none of the transform inputs.
+    #: See :data:`MODES`. Everything below this line is ``remove``-only EXCEPT
+    #: ``api_url``, ``dry_run`` and ``deployment_environment``, each of which
+    #: names the modes that read it; no archive mode touches a checkout, so
+    #: none of them reads a transform input.
     mode: str = DEFAULT_MODE
+    #: ``archive-on-deploy`` only: the deployment environment whose successful
+    #: deployments authorize an archive. Ignored by every other mode.
+    deployment_environment: str = DEFAULT_DEPLOYMENT_ENVIRONMENT
     staleness: str = DEFAULT_STALENESS
     directories: tuple[str, ...] = (".",)
     languages: tuple[str, ...] = supported_languages()
@@ -196,6 +226,16 @@ class Config:
             project=_get(env, "FEATUREFLIP_PROJECT", ""),
             api_url=api_url,
             mode=mode,
+            # NOT lower-cased, unlike `mode` and `staleness`: those are this
+            # tool's own enums, while this names an environment the customer
+            # created in GitHub and may legitimately have capitalised. The
+            # comparison in `deploy._skip_reason` is case-insensitive instead,
+            # so the value is carried through as written and still matches.
+            deployment_environment=_get(
+                env,
+                "FEATUREFLIP_DEPLOYMENT_ENVIRONMENT",
+                DEFAULT_DEPLOYMENT_ENVIRONMENT,
+            ),
             staleness=staleness,
             directories=_split_csv(_get(env, "FEATUREFLIP_DIRECTORIES", "."), default=(".",)),
             languages=languages,

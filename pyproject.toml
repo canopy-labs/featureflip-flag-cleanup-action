@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.1.0"
+version = "1.2.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -115,7 +115,43 @@ dependencies = [
     # Under `--on-parse-error abort` (the default) one such file failed the whole
     # invocation, so this is a file the tool could not touch at all rather than a
     # residue it left behind. Both sides are now `dbac36b`.
-    "polyglot-piranha==0.12.0",
+    #
+    # 0.13.0 (piranha#92) upstreams the three TypeScript cleanup deltas this
+    # tool had been carrying downstream: `simplify_await_true` /
+    # `simplify_await_false`, and eight widened queries that now match a
+    # boolean literal OR that literal wrapped in parentheses. The manifest
+    # diff against 0.12.0 is the workspace version and nothing else -- no
+    # grammar rev moved -- so the tree-sitter-typescript pin below stays at
+    # `+canopy.3`, by the same check described for 0.11.0 above.
+    #
+    # This bump on its own changes NOTHING observable, and landing it alone is
+    # the point: `rules/ts.toml` still declares its own copies of those rules,
+    # and a user rule WINS a name collision against a built-in, so every
+    # rewrite still runs downstream code. A green suite here says the engine
+    # swap is clean; deleting the shadowing copies is then the only thing
+    # under test in the commit that follows.
+    #
+    # 0.14.0 (piranha#94) is the php/ruby half of the same parenthesis defect,
+    # and it lands here as a PURE ENGINE FIX -- neither `php.toml` nor
+    # `ruby.toml` declares a rule the engine also declares (checked by name:
+    # 4 ours vs 34 engine, 3 vs 54, zero collisions), so these two delegate
+    # their whole cascade to the built-ins and a pin move is the entire
+    # downstream change. The manifest diff against 0.13.0 is the workspace
+    # version and nothing else -- no grammar rev moved -- so the
+    # tree-sitter-typescript pin below stays at `+canopy.3`.
+    #
+    # What it fixes: a fold replaces the flag READ, so the literal lands inside
+    # whatever parentheses the source already had for precedence, and
+    # `($f || $other) && $other` stalled at `(true) && $other` -- a dead guard
+    # that still reads as live, which is worse than a refusal because nothing
+    # says so. The issue (#3021) named two shapes; probing every literal
+    # position found FOUR stalling in php and THREE in ruby. Both operand
+    # positions needed widening, not just the left: `&&` binds tighter than
+    # `||`, so a disjunction demands parentheses on either side of a
+    # conjunction. Ruby's own `!` and ternary rules already alternated over
+    # `parenthesized_statements`, which is exactly why `!(...)` folded
+    # correctly there while `&&` did not.
+    "polyglot-piranha==0.14.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

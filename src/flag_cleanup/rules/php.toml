@@ -246,3 +246,41 @@ query = """(
 )"""
 replace_node = "clause"
 replace = ""
+
+# --- <client>->getBooleanValue("KEY", ...) -> @treated   (OpenFeature PHP client)
+#
+# The read a customer of `packages/openfeature-php` writes. The call site
+# belongs to the OpenFeature SDK, not to ours, so nothing else in this file
+# sees it — `resolveBooleanValue` is the provider's own side of the contract
+# and is never a call site.
+#
+# Arity is unconstrained: only the first argument is anchored, so the 2-, 3-
+# and 4-argument forms all match from one rule. `#eq?` is exact, so this cannot
+# match `getBooleanDetails`, which returns an EvaluationDetails object that
+# would be a type error folded to a literal. A non-literal key never binds
+# `string_content`, so a dynamic key is left alone.
+#
+# Only `member_call_expression` — an OpenFeature read always comes off a client
+# object. `boolVariation`'s rule above also accepts `function_call_expression`
+# because our own SDK exposes bare helpers; matching one here would catch any
+# unrelated global function a project happened to name `getBooleanValue`.
+#
+# NO accompanying `delete_discarded_..._statement` rule, deliberately: `true;`
+# is a legal PHP expression statement, so the #2691 hazard — a fold producing
+# unparseable code, which refuses the flag permanently — does not arise. The
+# same reasoning is why `boolVariation` has none.
+[[rules]]
+name = "replace_openfeature_boolean_read_with_boolean_literal"
+query = """(
+  (member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments
+        . (argument [(string (string_content) @flag_name)
+                     (encapsed_string (string_content) @flag_name)]))) @call
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]

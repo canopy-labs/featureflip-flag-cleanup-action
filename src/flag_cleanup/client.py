@@ -14,8 +14,11 @@ returning ``{"items": [{"key", "reason", "treatment", "status"}], "next_cursor":
 on the wire — both verbatim, not a guess.
 
 ``GET {api_url}/api/v1/orgs/{org}/projects/{project}/flags`` (``&cursor=`` to
-page, NO ``archived`` filter), same ``{"items": [{"key", …}], "next_cursor"}``
-envelope — read off ``public-v1-openapi.json``'s ``PublicFlagListItemPagedResult``.
+page; ``?archived=false`` narrows to live flags, and omitting it returns both),
+same ``{"items": [{"key", "isArchived", …}], "next_cursor"}`` envelope — read
+off ``public-v1-openapi.json``'s ``PublicFlagListItemPagedResult``. Note
+``isArchived`` is camelCase while ``next_cursor`` is snake_case; both are
+verbatim off the shipped contract, not a guess.
 """
 
 from __future__ import annotations
@@ -39,6 +42,55 @@ class FeatureflipApiError(RuntimeError):
     any ``api-url`` basic-auth credentials into the workflow log, three times
     over: the log line, the traceback, and stderr.
     """
+
+
+class ArchivePermissionError(FeatureflipApiError):
+    """A 401/403 from the archive endpoint: the token cannot archive.
+
+    A subclass rather than the base type because this refusal is provably NOT
+    about the flag it was raised for. Archiving requires the Member role while
+    fetching removal candidates needs only read, so a workflow that reuses its
+    read-only secret gets this for *every* flag it tries. ``archive-on-merge``
+    archives exactly one and so cannot tell the difference; the sweep would
+    otherwise print the same sentence once per outstanding flag and spend a
+    request on each, so it stops at the first.
+
+    Deliberately NOT extended to the 404 case, which looks similar and is not:
+    a wrong ``org``/``project`` is run-wide, but a flag that was deleted
+    between its pull request merging and this run genuinely is one flag's
+    problem, and the two are indistinguishable from the response.
+    """
+
+
+#: The one archive refusal that resolves with nobody doing anything: the code
+#: merged, the deploy has not landed yet, and traffic drains on its own. Every
+#: other 400 — ``FLAG_HAS_DEPENDENTS``, ``FLAG_HAS_PENDING_SCHEDULES`` — needs
+#: a human to go and change something, which is why only this one is soft.
+RECENTLY_EVALUATED_CODE = "FLAG_RECENTLY_EVALUATED"
+
+
+class FlagRecentlyEvaluatedError(FeatureflipApiError):
+    """Archive refused because live traffic is still evaluating the flag.
+
+    The platform refuses because archiving is not a soft state: it evicts the
+    flag from every cache and SDK within seconds, and every caller then falls
+    back to the default hardcoded in its own source. Merging a removal pull
+    request is not deploying it.
+
+    Its own type because it is the ONE refusal this tool is allowed to treat as
+    a non-failure, and that exception has to be narrow enough to be safe. It
+    carries the environments the response named so a caller can say which ones
+    are still reading the flag rather than only that something is.
+    """
+
+    def __init__(self, message: str, *, key: str, environments: tuple[str, ...]) -> None:
+        super().__init__(message)
+        #: The flag the archive was refused for.
+        self.key = key
+        #: Environment keys still evaluating it. May be EMPTY — see
+        #: :func:`_recently_evaluated_environments` — so callers must phrase the
+        #: report for both, never index into it.
+        self.environments = environments
 
 
 def _raise_for_status_without_credentials(response: httpx.Response) -> None:
@@ -112,6 +164,54 @@ def _envelope_detail(response: httpx.Response) -> str:
             if rendered:
                 parts.append(f"{name}: {rendered}")
     return " ".join(parts)
+
+
+def _recently_evaluated_environments(response: httpx.Response) -> tuple[str, ...] | None:
+    """The environments still evaluating this flag, or ``None`` if that is not
+    what this 400 says.
+
+    ``None`` and ``()`` mean different things and must not be conflated — the
+    same distinction :func:`~flag_cleanup.github_ops.existing_pull_request`
+    makes between ``None`` and ``""``. ``None`` is *this is some other refusal*
+    and keeps the build red; ``()`` is *deferred, but the response did not name
+    the environments* and is still soft. Test it with ``is not None``, never
+    for truthiness.
+
+    Matched per FIELD ENTRY rather than against :func:`_envelope_detail`'s
+    joined string, and that is the whole care in this function. The backend
+    writes one entry per refusal, code first —
+    ``FLAG_RECENTLY_EVALUATED: dev,prod``, the same shape
+    ``FLAG_HAS_DEPENDENTS`` uses for flag keys — so the code can only ever be
+    at the START of an entry. A substring scan of the joined detail would also
+    match a flag KEY that happened to spell the code inside a
+    ``FLAG_HAS_DEPENDENTS`` list, and those two refusals are treated
+    oppositely: one exits 0, the other must stay a red build.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    fields = payload.get("fields")
+    if not isinstance(fields, dict):
+        return None
+
+    prefix = f"{RECENTLY_EVALUATED_CODE}:"
+    for problems in fields.values():
+        entries = problems if isinstance(problems, (list, tuple)) else [problems]
+        for problem in entries:
+            if not isinstance(problem, str):
+                continue
+            if problem.strip() == RECENTLY_EVALUATED_CODE:
+                return ()
+            if problem.startswith(prefix):
+                return tuple(
+                    name.strip()
+                    for name in problem[len(prefix) :].split(",")
+                    if name.strip()
+                )
+    return None
 
 
 def _require_bool(value: object, key: object) -> bool:
@@ -321,19 +421,15 @@ class FeatureflipClient:
                     status=_require_str(item, "status"),
                 )
 
-    def flag_keys(self, org: str, project: str) -> frozenset[str]:
-        """Every flag key in the project, live AND archived.
-
-        Consumed by the ``*_entries.toml`` registry prong as sibling evidence
-        ("another key in this map is a flag of this project"). No ``archived``
-        parameter on purpose: the backend's list handler applies that filter
-        only when the value is present, so leaving it out returns both, and a
-        registry legitimately lists a recently archived key — counting it
-        makes the evidence stronger, never weaker.
+    def _flag_items(self, org: str, project: str, params: dict[str, str]) -> Iterator[dict]:
+        """Yield each item from the flags list endpoint, page shapes validated.
 
         A page without ``items`` is refused rather than read as empty: the
         silent alternative is a project that appears to have no flags, which
-        turns the registry prong off for every flag with no warning.
+        for :meth:`flag_keys` turns the registry prong off for every flag with
+        no warning, and for :meth:`unarchived_flag_keys` reads as "the backlog
+        is empty" — the exact false clean bill of health that mode exists to
+        stop giving.
 
         EVERY malformed page shape is refused as :class:`FeatureflipApiError`,
         and that type is the whole point. ``orchestrate.fetch_known_flag_keys``
@@ -347,8 +443,7 @@ class FeatureflipClient:
         ``AttributeError`` from ``_require_str``'s ``item.get``.
         """
         path = _FLAGS_PATH.format(org=quote(org, safe=""), project=quote(project, safe=""))
-        keys: set[str] = set()
-        for payload in self._pages(path, {}, "flags"):
+        for payload in self._pages(path, params, "flags"):
             if not isinstance(payload, dict) or "items" not in payload:
                 raise FeatureflipApiError(
                     "flags returned a page without `items`. The endpoint contract "
@@ -373,8 +468,62 @@ class FeatureflipClient:
                         "against is frozen, so a response that does not match it "
                         "is refused rather than guessed at"
                     )
-                keys.add(_require_str(item, "key", endpoint="flags"))
-        return frozenset(keys)
+                yield item
+
+    def flag_keys(self, org: str, project: str) -> frozenset[str]:
+        """Every flag key in the project, live AND archived.
+
+        Consumed by the ``*_entries.toml`` registry prong as sibling evidence
+        ("another key in this map is a flag of this project"). No ``archived``
+        parameter on purpose: the backend's list handler applies that filter
+        only when the value is present, so leaving it out returns both, and a
+        registry legitimately lists a recently archived key — counting it
+        makes the evidence stronger, never weaker.
+        """
+        return frozenset(
+            _require_str(item, "key", endpoint="flags")
+            for item in self._flag_items(org, project, {})
+        )
+
+    def unarchived_flag_keys(self, org: str, project: str) -> tuple[str, ...]:
+        """Every LIVE flag key in the project, in the order the API returned.
+
+        The pending marker for the archive sweep, and it needs no new state to
+        be one: a flag whose removal pull request merged but whose archive never
+        landed is, by definition, still unarchived. Nothing is written anywhere
+        to record a deferral.
+
+        Ordered (and de-duplicated in place) rather than a ``frozenset`` like
+        :meth:`flag_keys`, because this one drives a per-flag report and an
+        unstable order makes two runs pointlessly un-diffable.
+
+        ``?archived=false`` narrows the response, and ``isArchived`` is then
+        checked per item anyway — the filter is a payload saving, not the
+        guarantee. A missing or non-boolean ``isArchived`` is refused for the
+        whole walk, in :func:`_require_bool`'s spirit: read wrongly in the
+        *safe-looking* direction it silently empties the backlog, and a sweep
+        that reports "nothing outstanding" forever is indistinguishable from
+        one that is working.
+        """
+        keys: list[str] = []
+        seen: set[str] = set()
+        for item in self._flag_items(org, project, {"archived": "false"}):
+            key = _require_str(item, "key", endpoint="flags")
+            archived = item.get("isArchived")
+            if not isinstance(archived, bool):
+                missing = "isArchived" not in item
+                found = "no" if missing else f"a non-boolean ({archived!r})"
+                raise FeatureflipApiError(
+                    f"flags returned {found} `isArchived` for flag {key!r}. That "
+                    "field is how this mode tells a flag whose archive is still "
+                    "outstanding from one already done, so it is refused rather "
+                    "than guessed at"
+                )
+            if archived or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return tuple(keys)
 
     def archive_flag(self, org: str, project: str, key: str) -> None:
         """Archive one flag. Returns on success, raises on anything else.
@@ -395,12 +544,19 @@ class FeatureflipClient:
         * **403** — almost always the token. Archiving needs the Member role
           while fetching candidates needs only read, so a workflow that reuses
           its read-only cleanup token lands exactly here, and the message says
-          so instead of leaving someone to infer it.
-        * **400** — a real refusal by the domain: another live flag lists this
-          one as a prerequisite (``FLAG_HAS_DEPENDENTS``), or a scheduled
-          change still targets it (``FLAG_HAS_PENDING_SCHEDULES``). The code
-          has already merged; the flag simply cannot be archived until that is
-          resolved. Surfaced verbatim from ``fields`` — see
+          so instead of leaving someone to infer it. Raised as
+          :class:`ArchivePermissionError`, which is the base type to every
+          caller that does not care and a "stop, it is not this flag" signal to
+          the one that does.
+        * **400** — a real refusal by the domain, and the ONE place these are
+          not interchangeable with each other. ``FLAG_HAS_DEPENDENTS`` (another
+          live flag lists this one as a prerequisite) and
+          ``FLAG_HAS_PENDING_SCHEDULES`` (a scheduled change still targets it)
+          both need a HUMAN to go and change something, and stay loud.
+          ``FLAG_RECENTLY_EVALUATED`` does not: the code merged, the deploy has
+          not landed, and the refusal lifts by itself once traffic drains — so
+          it gets :class:`FlagRecentlyEvaluatedError` and the caller decides.
+          All three are surfaced verbatim from ``fields`` — see
           :func:`_envelope_detail`.
         """
         path = _ARCHIVE_PATH.format(
@@ -428,7 +584,7 @@ class FeatureflipClient:
                 f"do not name the project it lives in.{suffix}"
             )
         if response.status_code in (401, 403):
-            raise FeatureflipApiError(
+            raise ArchivePermissionError(
                 f"Featureflip API returned {response.status_code} archiving flag "
                 f"{key!r}. Archiving requires a token with the Member role — a "
                 f"read-only token can fetch removal candidates but cannot archive, "
@@ -436,6 +592,18 @@ class FeatureflipClient:
                 f"cleanup workflow uses.{suffix}"
             )
         if response.status_code == 400:
+            environments = _recently_evaluated_environments(response)
+            if environments is not None:
+                where = f" in {', '.join(environments)}" if environments else ""
+                raise FlagRecentlyEvaluatedError(
+                    f"Featureflip refused to archive flag {key!r}: live traffic is "
+                    f"still evaluating it{where}. Archiving now would evict the flag "
+                    f"from every SDK within seconds and every caller would fall back "
+                    f"to its own hardcoded default, so the refusal stands until the "
+                    f"removal is deployed and traffic drains.{suffix}",
+                    key=key,
+                    environments=environments,
+                )
             raise FeatureflipApiError(
                 f"Featureflip refused to archive flag {key!r}: the code was merged "
                 f"but the flag cannot be archived yet.{suffix}"

@@ -1,12 +1,20 @@
 # Piranha flag-cleanup rules for TypeScript / TSX (js, node, browser, react SDKs).
 #
-# Piranha ships NO built-in feature-flag cleanup rules for TS/JS (only
-# go/java/kt/ruby/scala/swift), so we carry the whole cascade ourselves:
-#   1. seed rules replace the flag read with a boolean literal (@treated), then
-#   2. cleanup rules simplify the enclosing boolean expression, fold the
-#      enclosing `if`, and drop dead statements.
-# The seed -> cleanup wiring lives in ts_edges.toml (Piranha reads [[edges]] from
-# edges.toml, never from this file).
+# Like java.toml and go.toml, this file carries ONLY the seed rules: they
+# replace the flag read with a boolean literal (@treated). The boolean
+# simplification, the `if` fold and the statement cleanup all come from the
+# engine's own `cleanup_rules/ts`, reached over the edges in ts_edges.toml —
+# which name GROUPS, not rules, so the engine's rules answer them. (Piranha
+# reads [[edges]] from edges.toml, never from this file.) The JSX cleanup in
+# ts_jsx.toml is the exception: it has no engine counterpart and stays here.
+#
+# It did carry the whole cascade, because upstream Piranha ships none for TS/JS
+# (only go/java/kt/ruby/scala/swift). That stopped being true at piranha#35,
+# which gave the fork a built-in TS/TSX cascade, and for a while both copies
+# existed. A user rule wins a name collision, so ours shadowed the engine's and
+# the engine's 25 rules were dead weight — which is how the parenthesis defect
+# survived in the engine while the fix sat downstream, the same way it did for
+# Python. The shadowing half is gone; see the note at the end of this file.
 #
 # Holes filled per invocation via substitutions:
 #   @stale_flag_name -> the flag key (matched against the first string-literal arg)
@@ -69,8 +77,10 @@
 #    there. Verify a node type against Piranha before using it — an unknown one
 #    fails loudly with `Could not parse the query … kind: NodeType`. This
 #    divergence is one more reason the safety argument lives in Python.
-#  * Anchors (`.`) and negated fields (`!field`) work, and are load-bearing
-#    below for single-declarator statements and optional chaining respectively.
+#  * Anchors (`.`) and negated fields (`!field`) work, and both are
+#    load-bearing: the anchor pins the flag key to the FIRST argument in every
+#    seed rule below (and single-declarator statements in ts_const.toml), and
+#    `!optional_chain` is what excludes `client?.boolVariation(…)`.
 #  * Seed rules run in the order they are declared in this file, each to a
 #    fixpoint (with its edge cascade) before the next one starts. The const
 #    rules below MUST stay ahead of the generic call-replacement rule, which
@@ -241,9 +251,10 @@ not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call
 #    `const on = await c.boolVariation(…)` blocked const propagation so the
 #    guard below it survived too. That is a correct-looking, HALF-FINISHED
 #    cleanup shipped under a PR that says the flag was removed — the exact
-#    failure this tool exists to prevent. (The `simplify_await_*` rules in
-#    section 3 fix that residue for the sync SDK reads; matching the whole
-#    `await_expression` here is what keeps THIS rule from depending on them.)
+#    failure this tool exists to prevent. (The engine's `simplify_await_*`
+#    rules — ours until piranha#92 took them — fix that residue for the sync
+#    SDK reads; matching the whole `await_expression` here is what keeps THIS
+#    rule from depending on them, and on an engine version that has them.)
 #
 # 2. THE UN-AWAITED CALL IS DELIBERATELY NOT MATCHED, and that is a safety
 #    requirement rather than an omission. `getBooleanValue` returns
@@ -394,434 +405,42 @@ not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call
 
 
 # ===========================================================================
-# 3. boolean_expression_simplify: fold the literal into its enclosing expression
+# 3. Everything after the read belongs to the engine
 # ===========================================================================
-
-# `await true` -> `true`, `await false` -> `false`.
 #
-# Only ever reached on the residue of one of THIS tool's own rewrites: edges are
-# scoped to the ancestors of the node just edited, so an `await true` a customer
-# wrote themselves elsewhere in the file is not touched.
+# `boolean_expression_simplify`, `if_cleanup` and `statement_cleanup` used to be
+# declared here, 25 rules of them. They are gone because the engine ships the
+# same 25 — same names, same queries, same filters, same replacements, and the
+# same three edges — so every one of them was shadowed and unreachable. Checked
+# by parsing both files rather than by eye, against the pinned engine version.
 #
-# Awaiting a non-thenable yields the value itself, so dropping the `await` keeps
-# the value identical; it resolves one microtask sooner, which no correct
-# program can observe here because the operand is a literal with no side
-# effects. The enclosing function stays `async`, so its signature is unchanged.
+# Three deltas kept the two copies apart until now, and each was a real
+# behaviour difference rather than a formatting one: `simplify_await_true` and
+# `simplify_await_false` existed only here, and eight queries here matched a
+# boolean literal OR THAT LITERAL IN PARENTHESES where the engine's matched
+# only the bare literal — which stalls the cascade one rewrite short and
+# leaves a dead `{(true) && (` standing. All three went up in piranha#92 and
+# ship in 0.13.0, the version pinned in pyproject.toml.
 #
-# Needed because our own `boolVariation` is SYNC (`@featureflip/node`'s
-# `boolVariation(...): boolean`) and a redundant `await` in front of it is legal
-# TS that people do write defensively. Before these two rules the seed replaced
-# that read and then stalled: `if (await false)` folds no further, so the dead
-# branch survived under a PR claiming the flag was gone. The OpenFeature seed
-# rule in section 2 does not depend on these — it consumes its own
-# `await_expression` — but a Promise-returning read reached through any shape
-# these rules do not cover still lands here.
-[[rules]]
-name = "simplify_await_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (await_expression (true)) @await
-)"""
-replace_node = "await"
-replace = "true"
-
-[[rules]]
-name = "simplify_await_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (await_expression (false)) @await
-)"""
-replace_node = "await"
-replace = "false"
-
-# `!true` -> false, `!false` -> true.
-[[rules]]
-name = "simplify_not_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (unary_expression operator: "!" argument: (true)) @not
-)"""
-replace_node = "not"
-replace = "false"
-
-[[rules]]
-name = "simplify_not_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (unary_expression operator: "!" argument: (false)) @not
-)"""
-replace_node = "not"
-replace = "true"
-
-# `true ? a : b` -> a, `false ? a : b` -> b.
-[[rules]]
-name = "simplify_ternary_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (ternary_expression
-    condition: (true)
-    consequence: (_) @consequence) @ternary
-)"""
-replace_node = "ternary"
-replace = "@consequence"
-
-[[rules]]
-name = "simplify_ternary_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (ternary_expression
-    condition: (false)
-    alternative: (_) @alternative) @ternary
-)"""
-replace_node = "ternary"
-replace = "@alternative"
-
-# Short-circuit operators, LITERAL ON THE LEFT ONLY. These four rewrites are
-# exactly semantics-preserving in JS: the dropped operand is the one the runtime
-# would not have evaluated, and the kept operand is returned verbatim.
+# What that means when something here misbehaves: the rule you are looking for
+# is in the engine, not in this directory. `ts_edges.toml` is deliberately kept
+# even though the engine declares identical edges — edges MERGE rather than
+# collide, so a local copy adds a guarantee instead of hiding one, and it keeps
+# the contract the seed rules above depend on visible at the point of use.
+# `ts_jsx_edges.toml` is not a copy of anything: it wires `jsx_cleanup`, which
+# the engine does not have.
 #
-# The mirrored right-hand forms are deliberately NOT implemented. `x && true`
-# -> `x` and `x || false` -> `x` change the produced VALUE whenever `x` is
-# falsy-but-not-`false` (`0`, `""`, `null`), and `x && false` -> `false` /
-# `x || true` -> `true` discard `x`'s side effects entirely. Leaving `x && true`
-# in place is ugly but correct, which is the trade this tool always makes.
-[[rules]]
-name = "simplify_and_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (true) operator: "&&" right: (_) @right) @expr
-)"""
-replace_node = "expr"
-replace = "@right"
-
-[[rules]]
-name = "simplify_and_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (false) operator: "&&" right: (_)) @expr
-)"""
-replace_node = "expr"
-replace = "false"
-
-[[rules]]
-name = "simplify_or_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (true) operator: "||" right: (_)) @expr
-)"""
-replace_node = "expr"
-replace = "true"
-
-[[rules]]
-name = "simplify_or_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (false) operator: "||" right: (_) @right) @expr
-)"""
-replace_node = "expr"
-replace = "@right"
-
-# Equality against a boolean literal, BOTH SIDES LITERAL ONLY. `flagRead === true`
-# becomes `true === true` once the read is folded, and without these it stops
-# there: correct, but the `if` never disappears and the customer is left to
-# finish the removal by hand.
+# The ts/tsx/js fixture cases in `tests/test_piranha_rules.py` are what holds
+# this together. They exercise the whole cascade end to end, so an engine bump
+# that changed or dropped any of those 25 rules turns them red here rather than
+# in a customer's repository. `test_declares_no_cleanup_rules` stops the
+# duplicate being reintroduced by hand.
 #
-# The single-literal forms are deliberately NOT implemented, and the reason is
-# the same one that rules out `x && true`. `true === x` is NOT equivalent to
-# `x`: `===` always produces a boolean, while `x` produces whatever `x` is, so
-# folding it changes the value of every expression where `x` is not already a
-# boolean — and in TS, `if (someString === true)` is a real (if wrong) thing to
-# write. With both sides literal the comparison has exactly one answer and no
-# operand can carry a side effect, so the rewrite is total.
-#
-# `==` rides along with `===`: between two boolean literals the two operators
-# agree, and a repository that writes `flagRead == true` deserves the same
-# cleanup as one that writes `===`.
-[[rules]]
-name = "simplify_equality_true_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (true) operator: ["===" "=="] right: (true)) @expr
-)"""
-replace_node = "expr"
-replace = "true"
-
-[[rules]]
-name = "simplify_equality_true_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (true) operator: ["===" "=="] right: (false)) @expr
-)"""
-replace_node = "expr"
-replace = "false"
-
-[[rules]]
-name = "simplify_equality_false_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (false) operator: ["===" "=="] right: (true)) @expr
-)"""
-replace_node = "expr"
-replace = "false"
-
-[[rules]]
-name = "simplify_equality_false_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (false) operator: ["===" "=="] right: (false)) @expr
-)"""
-replace_node = "expr"
-replace = "true"
-
-[[rules]]
-name = "simplify_inequality_true_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (true) operator: ["!==" "!="] right: (true)) @expr
-)"""
-replace_node = "expr"
-replace = "false"
-
-[[rules]]
-name = "simplify_inequality_true_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (true) operator: ["!==" "!="] right: (false)) @expr
-)"""
-replace_node = "expr"
-replace = "true"
-
-[[rules]]
-name = "simplify_inequality_false_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (false) operator: ["!==" "!="] right: (true)) @expr
-)"""
-replace_node = "expr"
-replace = "true"
-
-[[rules]]
-name = "simplify_inequality_false_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (binary_expression left: (false) operator: ["!==" "!="] right: (false)) @expr
-)"""
-replace_node = "expr"
-replace = "false"
-
-# NOTE: there is deliberately no "unwrap `(true)` -> `true`" rule. In TS a
-# parenthesized_expression is also how `if`, `while`, `do`, and `switch` carry
-# their condition, and tree-sitter queries cannot say "unless my parent is one
-# of those" — stripping the parentheses there produces `switch true`, which does
-# not parse. Leaving redundant parentheses is always valid code.
-
-
-# ===========================================================================
-# 4. if_cleanup: fold `if (true/false) { ... } else { ... }`
-# ===========================================================================
-# After the seed rewrite the condition is `(true)` / `(false)` (a
-# parenthesized_expression). Replace the whole if_statement with the branch that
-# survives.
-#
-# Each direction has TWO rules, declared splice-first:
-#   *_splice     — replaces the if with the surviving BLOCK'S STATEMENTS, so no
-#                  braces are left behind. Only applies when the if_statement
-#                  contains no declaration anywhere: hoisting a `const`/`let`/
-#                  `class`/`function` out of the braces it was scoped to can
-#                  collide with an outer binding of the same name
-#                  (`SyntaxError: Identifier 'y' has already been declared`).
-#   *_keep_block — the fallback: replaces the if with the branch verbatim,
-#                  braces included. A bare `{ … }` block statement is valid JS
-#                  and preserves the declarations' scope. It also handles a
-#                  braceless branch (`if (true) foo();`).
-#
-# The `not_contains` filter carries no `enclosing_node`, which scopes it to the
-# rule's own matched node (the if_statement) — verified; that is the only way to
-# constrain a filter to the match rather than to an ancestor.
-#
-# This replaced an earlier `remove_unnecessary_nested_block` rule that unwrapped
-# ANY block nested in a block. It could splice an unrelated, deliberate bare
-# block into its parent scope and produce a duplicate-declaration SyntaxError.
-[[rules]]
-name = "simplify_if_true_splice"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  [(statement_block
-     (if_statement
-       condition: (parenthesized_expression (true))
-       consequence: (statement_block (_)* @body)) @if_statement)
-   (program
-     (if_statement
-       condition: (parenthesized_expression (true))
-       consequence: (statement_block (_)* @body)) @if_statement)
-   (switch_case
-     (if_statement
-       condition: (parenthesized_expression (true))
-       consequence: (statement_block (_)* @body)) @if_statement)
-   (switch_default
-     (if_statement
-       condition: (parenthesized_expression (true))
-       consequence: (statement_block (_)* @body)) @if_statement)] @container
-)"""
-replace_node = "if_statement"
-replace = "@body"
-
-[[rules.filters]]
-not_contains = ["""((lexical_declaration) @decl)""",
-                """((variable_declaration) @decl)""",
-                """((class_declaration) @decl)""",
-                """((abstract_class_declaration) @decl)""",
-                """((function_declaration) @decl)""",
-                """((generator_function_declaration) @decl)""",
-                """((enum_declaration) @decl)""",
-                """((interface_declaration) @decl)""",
-                """((type_alias_declaration) @decl)"""]
-
-[[rules]]
-name = "simplify_if_true_keep_block"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (if_statement
-    condition: (parenthesized_expression (true))
-    consequence: (_) @consequence) @if_statement
-)"""
-replace_node = "if_statement"
-replace = "@consequence"
-
-[[rules]]
-name = "simplify_if_false_splice"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  [(statement_block
-     (if_statement
-       condition: (parenthesized_expression (false))
-       alternative: (else_clause (statement_block (_)* @body))) @if_statement)
-   (program
-     (if_statement
-       condition: (parenthesized_expression (false))
-       alternative: (else_clause (statement_block (_)* @body))) @if_statement)
-   (switch_case
-     (if_statement
-       condition: (parenthesized_expression (false))
-       alternative: (else_clause (statement_block (_)* @body))) @if_statement)
-   (switch_default
-     (if_statement
-       condition: (parenthesized_expression (false))
-       alternative: (else_clause (statement_block (_)* @body))) @if_statement)] @container
-)"""
-replace_node = "if_statement"
-replace = "@body"
-
-[[rules.filters]]
-not_contains = ["""((lexical_declaration) @decl)""",
-                """((variable_declaration) @decl)""",
-                """((class_declaration) @decl)""",
-                """((abstract_class_declaration) @decl)""",
-                """((function_declaration) @decl)""",
-                """((generator_function_declaration) @decl)""",
-                """((enum_declaration) @decl)""",
-                """((interface_declaration) @decl)""",
-                """((type_alias_declaration) @decl)"""]
-
-[[rules]]
-name = "simplify_if_false_keep_block"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (if_statement
-    condition: (parenthesized_expression (false))
-    alternative: (else_clause (_) @alternative)) @if_statement
-)"""
-replace_node = "if_statement"
-replace = "@alternative"
-
-# `if (false) { … }` with no else, sitting in an ELSE position. Deleting just
-# the if_statement (what `delete_if_false` below would do) leaves a dangling
-# `else`, which does not parse — so the whole else_clause goes with it. This is
-# the same parent-position question the splice rules answer, with a harsher
-# answer available: there, a bad splice still parses; here it does not, so
-# Piranha's self-check rejected the transform and abandoned the flag. Safe, but
-# it meant a repository using `else if (<flag read>)` could never have that flag
-# cleaned while it served false.
-#
-# Declared BEFORE `delete_if_false` so it is the one that fires.
-#
-# Rooted at the else_clause because Piranha cannot express the alternative.
-# Measured: a query rooted at the OUTER if_statement, constraining its
-# `alternative:` to an `(else_clause (if_statement condition: … !alternative))`,
-# never matches — while the identical pattern matches under tree-sitter
-# directly, and while `(else_clause (_) @inner)` (a WILDCARD in that position)
-# does match. So the constrained grandchild is what Piranha drops. That is why
-# this cannot instead rewrite the outer `if` as `if @condition @consequence`,
-# which is the formulation that would leave no whitespace behind.
-#
-# The cost of rooting here: the else_clause does not start its line — the text
-# before it is `} ` — so removing it leaves ONE trailing space on that line.
-# Every other deletion in these rules removes a node that begins a line, which
-# is why this is the only rule that leaves an artefact. Cosmetic, and much
-# smaller than what it replaces (the flag could not be cleaned at all), but it
-# is real: a repository linting `no-trailing-spaces` will flag that line in the
-# pull request. See README "Known gaps".
-[[rules]]
-name = "delete_else_if_false"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (else_clause
-    (if_statement
-      condition: (parenthesized_expression (false))
-      !alternative)) @else_clause
-)"""
-replace_node = "else_clause"
-replace = ""
-
-# `if (false) { … }` with no else: the statement goes entirely. Its own group,
-# so it is never wired to anything that expects a surviving branch.
-[[rules]]
-name = "delete_if_false"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (if_statement
-    condition: (parenthesized_expression (false))
-    !alternative) @if_statement
-)"""
-replace_node = "if_statement"
-replace = ""
-
-
-# ===========================================================================
-# 5. statement_cleanup: drop statements the fold made dead
-# ===========================================================================
-# `true;` / `false;` on its own has no effect — it is what `flagRead && doIt();`
-# collapses to when the flag serves the branch that skips `doIt()`.
-[[rules]]
-name = "delete_boolean_literal_statement"
-groups = ["statement_cleanup"]
-is_seed_rule = false
-query = """(
-  (expression_statement [(true) (false)]) @statement
-)"""
-replace_node = "statement"
-replace = ""
+# Four things stay downstream and are NOT candidates to follow the rules up:
+# the seed rules above (they encode these SDKs' call shapes and their
+# boolean-literal type evidence), the JSX cleanup in `ts_jsx.toml`, the
+# const-propagation rules in `ts_const.toml` and their Gate 2 shadow check (the
+# TS/Python families have no `scope_config.toml` in the engine), and the safety
+# gates in `flag_cleanup.ts_syntax` — the engine re-parses its own output, but
+# against a DIFFERENT and older bundled grammar than the one Gate 1 judges the
+# rewrite with, and it never compares the rewrite to the original parse.

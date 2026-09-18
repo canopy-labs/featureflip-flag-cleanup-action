@@ -93,12 +93,23 @@ not_enclosing_node = """(
 # `{false}` / `{true}` in child position -> nothing. React renders neither, so
 # the container is pure residue: it is what `{flag && <Panel />}` collapses to
 # when the flag serves the branch that drops the panel.
+#
+# `{(true)}` counts too, for the reason `rules/ts.toml` sets out above its
+# boolean simplifications: a fold lands inside whatever parentheses the source
+# already had, and `{(social || github)}` leaves the literal wrapped. Matching
+# only the bare form left the container standing. Note this is the opposite
+# decision from `unwrap_parenthesized_jsx_child` two rules up, which refuses
+# `(_)` on purpose — unwrapping `{(true)}` to a bare `true` would put the
+# four-character string "true" on the page, whereas DELETING the container is
+# what the flag serving that branch actually means. Attribute position is
+# still excluded by the filter, so `disabled={(true)}` keeps its live value.
 [[rules]]
 name = "delete_boolean_jsx_child"
 groups = ["jsx_cleanup"]
 is_seed_rule = false
 query = """(
-  (jsx_expression [(true) (false)]) @container
+  (jsx_expression
+    [(true) (false) (parenthesized_expression [(true) (false)])]) @container
 )"""
 replace_node = "container"
 replace = ""

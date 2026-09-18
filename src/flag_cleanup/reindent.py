@@ -85,9 +85,24 @@ languages or node names.
 
 Python is not excluded and needs no exclusion: ``python.toml`` folds only what
 needs no re-indenting and :mod:`flag_cleanup.python_fold` re-indents the rest
-itself, so by the time this runs there is no shift left to find and it is a
-no-op. That is measured — ``test_reindent.py`` asserts it — rather than
-arranged with a language check, which is one less list to rot.
+itself, so by the time this runs there is almost nothing left to find. Arrived
+at by measurement rather than by a language check, which is one less list to
+rot.
+
+**"Almost" is the honest word, and the reason matters more than the
+exception.** What makes this safe is not that the pass declines to run on
+Python but that ``python_fold`` has already applied the SAME prefix
+substitution to every statement in the body, so the shift computed here equals
+the column the line is already at and the write changes nothing. The lines
+where the two disagree are bracketed continuations — where Python's
+indentation is not significant, so a wrong answer is untidy rather than
+unparseable. That is a property of how ``python_fold`` re-indents, not
+something enforced here: were it ever to indent by column arithmetic instead of
+by prefix substitution, this would start moving Python blocks with no gate able
+to see it, because :func:`_verified` cannot judge Python at all (zero-width
+``INDENT``/``DEDENT``). ``test_python_folds_arrive_already_indented`` walks the
+Python fixtures and ``test_a_python_bracketed_continuation_comes_back_aligned``
+pins the one shape that does move.
 """
 
 from __future__ import annotations
@@ -127,16 +142,11 @@ def reindent_spliced_lines(before: str, after: str, language: str) -> str:
     folds = _folds(before, after, language, opcodes)
     if not folds:
         return after
-    survivors = {
-        i1 + step: j1 + step
-        for tag, i1, i2, j1, _ in opcodes
-        if tag == "equal"
-        for step in range(i2 - i1)
-    }
+    paired = _paired(opcodes, folds)
     starts = _line_starts(after)
     leaves = _leaf_spans(after, language)
     out = list(new)
-    for source, target in survivors.items():
+    for source, target in paired.items():
         line = old[source]
         if not line.strip():
             continue
@@ -148,6 +158,97 @@ def reindent_spliced_lines(before: str, after: str, language: str) -> str:
             out[target] = wanted + new[target].lstrip()
     _shift_rewritten_body(out, new, starts, leaves, folds, after, language)
     return _verified("".join(out), after, language)
+
+
+def _paired(
+    opcodes: list[tuple[str, int, int, int, int]],
+    folds: list[tuple[int, int, str, str, tuple[int, int]]],
+) -> dict[int, int]:
+    """Each input line mapped to the output line it became, where that is KNOWN.
+
+    Two kinds of hunk answer it, and the second was missing until #3030:
+
+    * **``equal`` — the line survived.** Matched on stripped content, so a line
+      the splice only re-indented still reads as the same line; that is the
+      whole point of diffing stripped lines rather than whole ones.
+    * **``replace`` of N lines by N lines — the lines were rewritten in place.**
+      A second read of the same flag inside its own branch, and still body
+      lines: ``{social && <GoogleButton />}`` becomes ``<GoogleButton />`` and
+      has to come up a level with everything around it.
+      :func:`_shift_rewritten_body` covers only the rewrite sharing the FOLD's
+      own hunk, so a nested gate whose whole body is ONE line was moved by
+      nothing and kept the column it had while nested deeper — two columns off
+      its siblings in JSX, and at column ZERO for a statement, which is where
+      the C family's flattening leaves it (#3030).
+
+    **Equal counts, and the restriction is the point rather than caution.** A
+    ``replace`` of N by M has no correspondence to read at all, while equal
+    counts means the k-th rewritten line answers the k-th original: the engine
+    rewrites in place and never reorders, so a differing count is the only way
+    a line can go missing from the middle of the run. Nothing needs the wider
+    guess anyway — a multi-line rewrite keeps its inner lines verbatim
+    (``{social && (`` … ``)}`` around an untouched element), so ``difflib`` puts
+    those in ``equal`` hunks and the first kind above already carries them. That
+    is exactly why no fixture caught this: ``tsx/jsx_gate_disjunction`` has
+    single-line inner gates but its outer gate does not dedent them, and every
+    other nested gate in the corpus is multi-line.
+
+    **Take the run whole rather than a line at a time.** Two rewritten body
+    lines that happen to be adjacent are ONE ``replace`` hunk, not two — the
+    reported shape and the ternary beside it merge the moment they are written
+    next to each other — so a rule admitting only the one-for-one case fixes the
+    bug as reported and leaves it standing in the fixture written to lock it.
+
+    A pair is a candidate, never a decision: :func:`_reindented` still has to
+    find a fold whose body contains the input line and whose base its
+    indentation extends, and a line failing either is left exactly as the
+    engine wrote it.
+
+    **What keeps the pairing honest is ``difflib``'s anchoring, NOT
+    :func:`_reindented`'s ``placed`` check, and it is worth being clear about
+    that because the reverse is the tempting thing to write.** ``placed``
+    admits a line sitting at its own old column, at column zero, or at the
+    fold's target — and between them those are very nearly every column a
+    spliced line can legally occupy, since column zero is exactly where the C
+    family flattens a body and the target is exactly where the first spliced
+    line lands. So it is a good test of "did the engine put SOMETHING here" and
+    a poor one of "is this THAT line". What actually holds is upstream: the
+    engine rewrites in place and never reorders, so equal counts really do mean
+    the k-th answers the k-th.
+
+    The residue is the hazard :func:`_reindented` already names for closing
+    delimiters — stripped content that repeats inside one fold body AT
+    DIFFERING DEPTHS, where ``difflib`` can anchor a line against a namesake
+    several lines away. Three `alpha(true);` at two depths mis-columns all
+    three. That shape mis-columns identically WITHOUT this change (measured:
+    the ``equal`` path carries the same exposure, and the pre-#3030 code gets
+    the same file equally wrong), so this widens a door that was already open
+    rather than opening one. Narrowing ``placed`` enough to separate two body
+    lines of the same fold is a change to the ``equal`` path first and belongs
+    with that defect, not here.
+
+    ``consumed`` is what keeps this off :func:`_shift_rewritten_body`'s ground.
+    A fold's own hunk is usually a different opcode, whose output range is
+    disjoint from these by construction — but "usually" is not an invariant once
+    a ``replace`` can be matched here, so its lines are dropped outright. That
+    makes "a fold's own hunk belongs to :func:`_shift_rewritten_body` alone" a
+    property of this function rather than something resting on
+    :func:`_still_stands` happening to refuse every equal-count shape.
+    """
+    consumed = {
+        index for _, _, _, _, (j1, j2) in folds for index in range(j1, j2)
+    }
+    paired = {}
+    for tag, i1, i2, j1, j2 in opcodes:
+        # One test for both kinds: an `equal` hunk is equal-length by
+        # definition, so what is being asked of a `replace` is only that it be
+        # the same shape — as many lines out as in, mapped in order.
+        if tag not in ("equal", "replace") or i2 - i1 != j2 - j1:
+            continue
+        for step in range(i2 - i1):
+            if j1 + step not in consumed:
+                paired[i1 + step] = j1 + step
+    return paired
 
 
 def _folds(
@@ -190,6 +291,61 @@ def _folds(
     does with the first spliced line, on every language that moves it — the
     nine that do agree, and Ruby, which moves nothing, is why reading the
     header is what this does rather than reading the output.
+
+    **A hunk holds as many headers as it holds header lines, and asking only
+    about the first got three ordinary shapes wrong (#3037).** ``difflib``
+    merges adjacent deletions into ONE opcode, so "which line is this hunk's
+    header?" has no single answer:
+
+    * **A binding directly above the header it feeds** — the way this code is
+      most often written. The ``const`` and the ``if`` are adjacent deletions,
+      ``old[i1]`` is the binding, and a binding opens nothing, so the hunk was
+      skipped and no fold was found AT ALL. Not a fold placed badly: the pass
+      returned the engine's output untouched and the C family's column-zero
+      flattening shipped as written, which in Go is the ``gofmt -l`` failure
+      this module exists to prevent.
+    * **Two ``if``s on one flag nested directly inside each other** — both
+      headers deleted, one opcode, only the outer one read. :func:`_reindented`
+      composes nested folds correctly and always did; there was simply one fold
+      where there should have been two, so a body owing two levels came up one.
+    * **Allman brace style**, where the ``{`` is on its own line. Here
+      ``old[i1]`` DOES open something, so this looked nothing like the other
+      two and failed one step later: the ``if`` line's body scan meets the
+      ``{`` at the SAME column, so it finds no body and records no fold, and
+      the ``{`` — which does have one — was never reached. It is the default
+      brace style of every style guide C# ships with.
+
+    In all three the tell is that ADJACENCY is the only ingredient: put one
+    unrelated statement between the two lines, the deletions land in separate
+    opcodes, and the same file comes back correct. Same flag, same rules, same
+    language, one line either side of a ``difflib`` boundary.
+
+    So every line the hunk DELETED is asked, and each header that did not
+    survive contributes its own fold. The three guards below make that safe
+    rather than merely more generous — a blank line is not a header, a line
+    that opens nothing is not a header, a header still standing is refused —
+    each now asked per LINE where they were asked once per hunk.
+
+    **Which lines the hunk deleted is the load-bearing half, and the corpus is
+    what settled it.** :func:`_still_stands` reads the hunk's after-side as a
+    WHOLE, so it cannot say which input line a given output line was made from
+    — and asking it about a line that was rewritten rather than removed
+    produces a fold that dedents a block still standing. Two fixtures found
+    exactly that: C#'s ``else if (<read>)`` + ``{`` becomes ``else {``, where
+    the brace survives by moving onto the line above and the type test cannot
+    see it; and Ruby's ``elsif premium?`` promoted to ``if premium?``, where
+    the type changes outright. Both dedented a live branch's body.
+
+    The rule that separates them takes the same premise :func:`_paired` rests
+    on — the engine rewrites in place and never reorders — so the ``kept``
+    non-blank lines a hunk produced answer its LAST ``kept`` input lines, and
+    those are not asked. ``old[i1]`` is asked always, so a one-for-one hunk
+    still reaches :func:`_still_stands`' first clause rather than being skipped
+    by arithmetic that happens to agree with it. That clause counts lines in
+    the hunk, so it fires only when the hunk IS one line, and then the header
+    is ``old[i1]`` by construction — it never sees a header found part-way in,
+    which is correct, since its reasoning is that a one-line hunk covers the
+    header and nothing else.
     """
     old = before.splitlines(keepends=True)
     new = after.splitlines(keepends=True)
@@ -197,46 +353,69 @@ def _folds(
     for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal" or i2 == i1:
             continue
-        header = old[i1]
-        # A blank line is not a header. The engine drops blank lines from a
-        # spliced body, which arrives here as its own deletion — and its empty
-        # indentation would otherwise name column zero as every following
-        # line's target.
-        if not header.strip():
-            continue
-        opened = _opens(before, language, i1)
-        # A line that opens nothing is not a header, whatever the diff did to
-        # it. A closing delimiter is the case that matters: `        }` begins
-        # no node — the block it ends began pages earlier — so reading it as a
-        # header invents a fold whose "body" is whatever happens to be indented
-        # more deeply BELOW the real one, and dedents it. The old guard hid this
-        # by refusing every non-blank hunk; nothing else would catch it, because
-        # such a line has a perfectly good indentation to be a target.
-        if opened is None:
-            continue
-        if _still_stands(after, language, opened, i1, i2, j1, j2):
-            continue
-        target = _indent(header)
-        end, base = i1 + 1, None
-        while end < len(old):
-            if not old[end].strip():
-                end += 1  # a blank line neither ends the body nor sets its base
+        kept = sum(1 for index in range(j1, min(j2, len(new))) if new[index].strip())
+        # Every input line the hunk DELETED, not just the first: `difflib`
+        # merges adjacent deletions into one opcode, so such a hunk holds as
+        # many headers as it holds header lines. The `kept` lines it produced
+        # answer its LAST `kept` input lines, which is the same premise
+        # :func:`_paired` rests on — the engine rewrites in place and never
+        # reorders — so those are the lines whose survival cannot be read off
+        # the after-side and they are not asked. `old[i1]` is always asked, so
+        # a one-for-one hunk still reaches :func:`_still_stands`' first clause
+        # rather than being skipped by arithmetic that happens to agree with
+        # it. See the docstring (#3037).
+        for index in range(i1, max(i1 + 1, i2 - kept)):
+            header = old[index]
+            # A blank line is not a header. The engine drops blank lines from a
+            # spliced body, which arrives here as its own deletion — and its
+            # empty indentation would otherwise name column zero as every
+            # following line's target.
+            if not header.strip():
                 continue
-            indent = _indent(old[end])
-            if len(indent) <= len(target) or not indent.startswith(target):
-                break
+            target = _indent(header)
+            end, base = index + 1, None
+            while end < len(old):
+                if not old[end].strip():
+                    end += 1  # a blank line neither ends the body nor sets its base
+                    continue
+                line_indent = _indent(old[end])
+                if len(line_indent) <= len(target) or not line_indent.startswith(target):
+                    break
+                if base is None:
+                    base = line_indent
+                end += 1
+            # Nothing indented below the line means nothing to fold, and that
+            # settles it without parsing — so the two questions below, which do
+            # parse, are asked only of a line that could be a header. The order
+            # matters because `_opens` is now asked once per DELETED LINE
+            # rather than once per hunk: a `treated=false` removal, where the
+            # whole guarded block is one contiguous deletion, would otherwise
+            # pay a tree descent per statement in it — 0.146s against 0.013s on
+            # a 4,800-line file with an 800-line block, where the whole of
+            # `_folds` used to cost 0.011s.
             if base is None:
-                base = indent
-            end += 1
-        if base is not None:
-            found.append((i1 + 1, end, base, target, (j1, j2)))
+                continue
+            opened = _opens(before, language, index)
+            # A line that opens nothing is not a header, whatever the diff did
+            # to it. A closing delimiter is the case that matters: `        }`
+            # begins no node — the block it ends began pages earlier — so
+            # reading it as a header invents a fold whose "body" is whatever
+            # happens to be indented more deeply BELOW the real one, and dedents
+            # it. The old guard hid this by refusing every non-blank hunk;
+            # nothing else would catch it, because such a line has a perfectly
+            # good indentation to be a target.
+            if opened is None:
+                continue
+            if _still_stands(after, language, opened, i1, i2, j1, j2):
+                continue
+            found.append((index + 1, end, base, target, (j1, j2)))
     return found
 
 
 def _shift_rewritten_body(
     out: list[str],
     new: list[str],
-    starts: list[int],
+    starts: tuple[int, ...],
     leaves: list[tuple[int, int]] | None,
     folds: list[tuple[int, int, str, str, tuple[int, int]]],
     source: str,
@@ -244,16 +423,18 @@ def _shift_rewritten_body(
 ) -> None:
     """Shift the body lines the rewrite CONSUMED, which have no survivor to follow.
 
-    The loop above can only move a line the diff paired, and a line the
-    transform rewrote is inside the ``replace`` hunk rather than matched across
-    it. In ten languages that costs nothing, because the line the rewrite
-    consumed is the FIRST spliced line and the engine has already placed that
-    one at the header's column. Ruby is the exception it always is: it moves
-    nothing at all, so that line is still at the body's own depth and stays
-    there — leaving `alpha(true)` at the old column while the survivor below it
-    came back at the header's, a body split across two columns. Consistent and
-    misplaced beats inconsistent, so leaving this out would have made Ruby worse
-    than the engine had, which is the one outcome this module refuses.
+    The loop above can only move a line :func:`_paired` matched, and a line
+    inside a fold's OWN hunk is never one: that hunk's output range is exactly
+    what :func:`_paired` drops, so whatever the rewrite consumed there is this
+    function's alone to move. In ten languages it still costs nothing, because
+    the line the rewrite consumed is the FIRST spliced line and the engine has
+    already placed that one at the header's column. Ruby is the exception it
+    always is: it moves nothing at all, so that line is still at the body's own
+    depth and stays there — leaving `alpha(true)` at the old column while the
+    line below it came back at the header's, a body split across two columns.
+    Consistent and misplaced beats inconsistent, so leaving this out would have
+    made Ruby worse than the engine had, which is the one outcome this module
+    refuses.
 
     ``indent.startswith(base)`` is what makes reading the column off the OUTPUT
     sound here, and it is not the same read the module's docstring rules out. A
@@ -264,22 +445,39 @@ def _shift_rewritten_body(
     lines cannot be shifted twice, whichever language produced them.
 
     Every after-line in one of these regions is body content, which is what the
-    survival guard buys: the header is gone, so nothing else is left to be. The
-    regions come from distinct opcodes and so are disjoint in ``new``, and none
-    of them can overlap a survivor's target, so no line is written twice.
+    survival guard buys: the header is gone, so nothing else is left to be. No
+    line is written twice: none of these regions can overlap a target
+    :func:`_paired` produced, because ``consumed`` drops exactly these output
+    ranges, and a line matched by more than one fold is COMPOSED rather than
+    overwritten.
+
+    **INNERMOST FIRST, and the composition is not decoration** (#3037). Two
+    folds can now share one output region — two ``if``s on the same flag nested
+    directly inside one another are adjacent deletions, so ``difflib`` merges
+    them into a single opcode and both headers yield a fold against the same
+    ``(j1, j2)``. A line inside both owes BOTH shifts. Applied independently
+    against the engine's own indentation each one computes a single level, the
+    second silently replacing the first, and the result is the split body this
+    function exists to prevent: Ruby's ``alpha(true)`` came back one level above
+    the ``beta`` beside it, which :func:`_reindented` had composed correctly.
+    Running the shifts in the same order, each over the previous one's result,
+    makes the two paths agree by construction.
     """
-    for _, _, base, target, (j1, j2) in folds:
+    shifted: dict[int, str] = {}
+    for _, _, base, target, (j1, j2) in sorted(folds, key=lambda fold: -len(fold[2])):
         for index in range(j1, min(j2, len(new))):
             line = new[index]
-            indent = _indent(line)
-            if not line.strip() or not indent.startswith(base):
+            if not line.strip():
                 continue
-            code = _code_start(line, starts[index])
-            if code is None or _immovable(
-                starts[index], code, leaves, source, language
-            ):
+            indent = shifted.get(index, _indent(line))
+            if not indent.startswith(base):
                 continue
-            out[index] = target + indent[len(base) :] + line.lstrip()
+            shifted[index] = target + indent[len(base) :]
+    for index, indent in shifted.items():
+        code = _code_start(new[index], starts[index])
+        if code is None or _immovable(starts[index], code, leaves, source, language):
+            continue
+        out[index] = indent + new[index].lstrip()
 
 
 def _opens(source: str, language: str, line: int) -> str | None:
@@ -290,8 +488,8 @@ def _opens(source: str, language: str, line: int) -> str | None:
     line ends. That is what makes something a header, and asking it of the input
     costs one parse and names no node type.
     """
-    lines, starts = source.splitlines(keepends=True), _line_starts(source)
-    opening = _code_start(lines[line], starts[line])
+    starts = _line_starts(source)
+    opening = _code_start(_lines(source)[line], starts[line])
     if opening is None:
         return None
     return _construct_at(source, language, opening, _line_end(source, starts, line + 1))
@@ -347,9 +545,14 @@ def _still_stands(
     Three details of that second clause:
 
     * **Beyond the region, not merely past the header.** The lines at risk are
-      the survivors BELOW the hunk. A construct that opens and closes inside the
-      region owns nothing this pass will touch — and the lines inside a
-      ``replace`` hunk are never survivors, so they are never moved either.
+      the paired lines BELOW the hunk, and a construct that opens and closes
+      inside the region owns none of them. It used to own nothing at all, since
+      no line inside a ``replace`` hunk was paired; since #3030 one can be, but
+      only ever by an ENCLOSING fold whose body genuinely contains it — a
+      rewritten header sitting inside an ``if`` that folded belongs one level up
+      along with everything around it. That is the right answer, not the one
+      this clause exists to refuse, which is a header dragging its OWN block up
+      a level.
     * **At a line's first code character.** A construct that starts mid-line is
       part of an expression, not a header. The same rule in :func:`_opens` means
       `} else if (…) {` never reaches here at all — its line begins with the
@@ -399,7 +602,7 @@ def _code_start(line: str, start: int) -> int | None:
     return start + len(_indent(line).encode("utf-8"))
 
 
-def _line_end(source: str, starts: list[int], index: int) -> int:
+def _line_end(source: str, starts: tuple[int, ...], index: int) -> int:
     """Byte offset where line ``index`` begins, or the file's end past the last."""
     return starts[index] if index < len(starts) else len(source.encode("utf-8"))
 
@@ -677,8 +880,29 @@ def _indent(line: str) -> str:
     return body[: len(body) - len(body.lstrip())]
 
 
-def _line_starts(source: str) -> list[int]:
+@lru_cache(maxsize=4)
+def _lines(source: str) -> tuple[str, ...]:
+    """``source`` split keeping line endings, held across the calls one file makes.
+
+    :func:`_opens` wants ONE line and used to re-split the whole file to get
+    it. Cached for the reason :func:`_line_starts` beside it is, and bounded
+    the same way.
+    """
+    return tuple(source.splitlines(keepends=True))
+
+
+@lru_cache(maxsize=4)
+def _line_starts(source: str) -> tuple[int, ...]:
     """Byte offset at which each line of ``source`` begins.
+
+    Cached, and a TUPLE so the cached value cannot be edited by one caller
+    under another's feet. Four entries for the reason :func:`_encoded` holds
+    four: one pass has a ``before`` and an ``after`` in play at once. Without
+    the cache this is O(file) on every call, and since #3037 :func:`_opens` is
+    asked once per DELETED LINE rather than once per hunk — measured at 0.011s
+    to 0.603s on a 4,800-line file whose guarded block is one 800-line
+    deletion, which is an ordinary `treated=false` removal, not a pathological
+    input.
 
     Byte, not character: :func:`~flag_cleanup.syntax._leaf_spans` reports
     tree-sitter's own offsets, and a non-ASCII line above would put every span
@@ -696,7 +920,7 @@ def _line_starts(source: str) -> list[int]:
     for line in source.splitlines(keepends=True):
         offsets.append(position)
         position += len(line.encode("utf-8"))
-    return offsets
+    return tuple(offsets)
 
 
 def _covering_token(

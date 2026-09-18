@@ -75,9 +75,14 @@ _MAX_BRANCH_SEGMENT = 240
 
 _API_VERSION = "2022-11-28"
 
-# Statuses of GitHub's compare endpoint that mean HEAD introduces nothing the
-# base branch does not already contain. See :func:`ensure_head_on_base`.
-_HEAD_CONTAINED_IN_BASE = frozenset({"identical", "behind"})
+# Statuses of `GET /compare/{first}...{second}` that mean the SECOND ref
+# introduces nothing the first does not already contain — i.e. every commit
+# reachable from the second is reachable from the first. Two callers ask that
+# same question of different pairs: :func:`ensure_head_on_base` (is the
+# checkout contained in the base branch?) and :func:`commit_is_contained` (is
+# a merge commit contained in the commit that was deployed?). `ahead` and
+# `diverged` both mean the second ref carries commits of its own.
+_SECOND_REF_CONTAINED = frozenset({"identical", "behind"})
 
 # GitHub's compare endpoint returns at most this many commits in `commits`,
 # with the true count in `total_commits`. See :func:`branch_commits`.
@@ -406,6 +411,145 @@ def existing_pull_request(gh: GitHubApi, repo: str, branch: str) -> str | None:
     return str(first.get("html_url") or "")
 
 
+@dataclass(frozen=True, slots=True)
+class MergedRemoval:
+    """The merged pull request a removal branch produced.
+
+    ``number`` is ``None`` when the response did not carry one — the pull
+    request still merged, and that is the fact the caller acts on, so the
+    missing number degrades to an unnamed reference rather than discarding the
+    evidence (same reasoning as ``pr_event.MergedPullRequest``'s ``number=0``).
+
+    ``merge_commit_sha`` degrades to ``""`` for the same reason, and the
+    consequence is stated here because it is not obvious from the field: it is
+    what ``mode: archive-on-deploy`` compares against the deployed commit, so
+    an empty one means that mode cannot establish the removal is live and
+    leaves the flag outstanding. ``archive-on-merge`` and ``archive-sweep``
+    never read it, so they are unaffected.
+    """
+
+    number: int | None
+    html_url: str
+    merge_commit_sha: str = ""
+
+
+def merged_removal(gh: GitHubApi, repo: str, branch: str) -> MergedRemoval | None:
+    """The merged pull request opened from ``branch``, or ``None``.
+
+    ``None`` covers two situations the caller must treat identically: no pull
+    request was ever opened from this branch, and one was opened and CLOSED
+    WITHOUT MERGING. The second is a customer declining the removal, and
+    archiving a flag whose removal was rejected is the single worst thing
+    archive mode can do (``pr_event``). Evidence of a merge is what authorizes
+    the archive, so its absence can only ever mean "leave the flag alone".
+
+    Distinct from :func:`existing_pull_request`, which asks the neighbouring
+    question — *has this flag been proposed at all* — and therefore counts a
+    closed one and stops at the first hit. This one reads the whole page: a
+    branch that was force-pushed and reopened, or reused after a close, carries
+    more than one pull request and only one of them merged, so taking the first
+    would report a merge that never happened or miss one that did.
+
+    Raises rather than guessing when the API will not answer, matching
+    :func:`existing_pull_request`: "I could not tell" must never be recorded as
+    "it did not merge", which would silently drop a flag from the sweep's
+    backlog on every future run.
+    """
+    owner = repo.split("/", 1)[0]
+    response = gh.get(
+        f"/repos/{repo}/pulls",
+        params={
+            "state": "all",
+            "head": f"{owner}:{branch}",
+            "per_page": "100",
+            # Pinned rather than left to the endpoint's default, because since
+            # `archive-on-deploy` this function decides WHICH merge commit is
+            # compared against the deployed one, not merely whether a merge
+            # happened. Newest first means a branch that was reopened and
+            # merged a second time answers with the merge that is actually in
+            # the history a deploy could contain; the older one names a commit
+            # a later force-push may have replaced. These are the endpoint's
+            # current defaults, so this changes no behaviour today — it stops a
+            # default changing underneath a question that now has a wrong
+            # answer as well as a right one.
+            "sort": "created",
+            "direction": "desc",
+        },
+    )
+    if response.status_code != 200:
+        _raise_api_error(
+            response,
+            f"could not list pull requests for {branch}; refusing to assume its "
+            "removal never merged",
+        )
+
+    try:
+        pulls = response.json()
+    except ValueError:
+        pulls = None
+    if not isinstance(pulls, list):
+        return None
+
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            continue
+        # `merged_at` rather than `merged`: the LIST representation of a pull
+        # request carries the timestamp and omits the boolean, which only the
+        # single-pull-request endpoint returns. Reading `merged` here would be
+        # `None` for every entry and the sweep would find nothing, forever.
+        if not pull.get("merged_at"):
+            continue
+        number = pull.get("number")
+        # `merge_commit_sha` is the commit the merge produced ON THE BASE
+        # BRANCH, whichever merge strategy was used — for a squash merge it is
+        # the squashed commit, not anything on the (now usually deleted)
+        # removal branch. That is exactly the commit a deploy has to contain
+        # for the removal to be live, which is why it is read here rather than
+        # the head sha.
+        merge_commit_sha = pull.get("merge_commit_sha")
+        return MergedRemoval(
+            number=number if isinstance(number, int) else None,
+            html_url=str(pull.get("html_url") or ""),
+            merge_commit_sha=merge_commit_sha if isinstance(merge_commit_sha, str) else "",
+        )
+    return None
+
+
+def commit_is_contained(gh: GitHubApi, repo: str, commit: str, *, within: str) -> bool:
+    """Is every commit reachable from ``commit`` also reachable from ``within``?
+
+    The question ``mode: archive-on-deploy`` turns on: *has the commit that
+    merged this removal actually shipped in the build that was just deployed?*
+    Asked of GitHub rather than of local refs because that mode runs with no
+    checkout at all, and even with one a shallow CI clone would not hold the
+    history to answer it.
+
+    Raises rather than guessing when the API will not answer, matching
+    :func:`merged_removal`. "I could not tell" must never be recorded as "it is
+    deployed": that is the one error in this mode that turns a feature off in
+    production. A 404 is included in that — it means one of the two commits is
+    not reachable in this repository, which is a fact worth a red build rather
+    than a silently skipped flag.
+
+    An unrecognised ``status`` returns ``False``, which leaves the flag
+    outstanding for the next deploy. Erring toward *not yet deployed* is free;
+    erring the other way is the incident this mode exists to prevent.
+    """
+    response = gh.get(f"/repos/{repo}/compare/{within}...{commit}")
+    if response.status_code != 200:
+        _raise_api_error(
+            response,
+            f"could not tell whether {commit[:12]} is contained in the deployed "
+            f"commit {within[:12]}; refusing to assume it is",
+        )
+
+    try:
+        status = response.json().get("status")
+    except ValueError:
+        status = None
+    return status in _SECOND_REF_CONTAINED
+
+
 def open_pr(
     gh: GitHubApi,
     repo: str,
@@ -657,6 +801,7 @@ def ensure_head_on_base(
     ``behind`` means every commit reachable from HEAD is already in ``base``
     (``behind`` simply means the base moved on since the checkout, which is
     harmless). ``ahead``/``diverged`` means HEAD carries commits of its own.
+    See :data:`_SECOND_REF_CONTAINED`.
 
     Asked of the API rather than of local refs because a shallow CI checkout
     frequently has no local copy of the base branch to compare against.
@@ -698,7 +843,7 @@ def ensure_head_on_base(
         )
 
     status = response.json().get("status")
-    if status in _HEAD_CONTAINED_IN_BASE:
+    if status in _SECOND_REF_CONTAINED:
         return
     if base_is_configured_input:
         # `remove` mode: this is the FIRST creation of a removal pull request,

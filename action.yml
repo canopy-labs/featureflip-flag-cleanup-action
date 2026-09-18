@@ -32,7 +32,56 @@ inputs:
       candidates and opens one pull request per dead flag — everything this
       Action did before archive-on-merge existed. `archive-on-merge` archives
       the flag whose removal pull request just merged, and does nothing else:
-      no checkout, no source is read, no pull request is opened.
+      no checkout, no source is read, no pull request is opened. Merging is not
+      deploying, though, and that distinction decides whether this mode is safe
+      for you: archiving a flag a deployed build still reads makes every caller
+      fall back to the default written at its own call site, which for a
+      fully-rolled-out flag turns the feature off. Featureflip refuses such an
+      archive while it can still see the flag being evaluated, and this run
+      reports `deferred` and exits `0` rather than failing — so where your
+      deploys lag your merges, pair this with `archive-sweep` below, which is
+      what actually archives the flag once traffic drains. See "Archive the
+      flag once the removal is deployed" in the README, including the one case
+      neither mode can close: clients you cannot update (mobile, desktop,
+      embedded), where evaluations never stop arriving.
+
+      `archive-sweep` re-attempts the archives `archive-on-merge` could not
+      finish. Merging a removal pull request is not deploying it, and
+      Featureflip refuses to archive a flag live traffic is still evaluating —
+      so an `archive-on-merge` run reports `deferred` and exits `0` rather than
+      failing. This mode is what comes back for those: on a schedule, it finds
+      every flag in the project whose removal pull request merged but which is
+      still live, and tries again. Nothing is written anywhere to record a
+      deferral — the flag being unarchived IS the record — so re-running is
+      harmless and there is no state to reset.
+
+      `archive-on-deploy` archives on the event the removal was actually
+      waiting for. Where `archive-on-merge` fires on the merge and usually has
+      to defer, this fires on `deployment_status` and archives the outstanding
+      flags whose removal the DEPLOYED COMMIT contains — asked of GitHub's
+      compare endpoint, not assumed. A deployment to any environment other
+      than `deployment-environment` (below) archives nothing and says so, as
+      does any status that is not `success`, and a merged removal this deploy
+      does not contain is reported `pending-deploy` and left for the deploy
+      that ships it. It is an ADDITIONAL pattern, not a replacement: it helps
+      only repositories that create GitHub Deployments, and nothing at all for
+      clients you cannot update (mobile, desktop, embedded), where old versions
+      keep evaluating the flag whatever you deploy. It reads `api-token`,
+      `org`, `project`, `api-url`, `deployment-environment` and `dry-run`, and
+      ignores every other input below.
+
+      IMPORTANT — `archive-sweep` and `archive-on-deploy` are the archive modes
+      that need `GITHUB_TOKEN`. The sweep asks GitHub, once per live flag,
+      whether that flag's removal branch ever produced a merged pull request
+      (`pull-requests: read`); `archive-on-deploy` asks that too and then
+      compares each merge commit against the deployed one (`contents: read` as
+      well). Pass the token through in the workflow's `env:` and give the job
+      those permissions. Needing a token at all is the cost those two modes pay
+      for not firing on the merge event: `archive-on-merge` reads its pull
+      request straight out of the event payload, so it needs nothing from
+      GitHub, and reads only `api-token`, `org`, `project` and `api-url` —
+      `dry-run` included in what it ignores, since it archives exactly the one
+      flag its trigger names.
 
       `pr-command` re-runs the removal for the flag whose pull request a
       comment was left on. It is triggered by `issue_comment` and reads its
@@ -63,16 +112,17 @@ inputs:
       pull request's branch. Nothing is transformed, committed or pushed when
       that fires. See "Re-run a removal from a comment" in the README.
 
-      The three modes are separate workflows on separate triggers, never
+      The five modes are separate workflows on separate triggers, never
       steps of one job. `remove` runs on a schedule; `archive-on-merge` runs
-      on `pull_request` with `types: [closed]`; `pr-command` runs on
-      `issue_comment` with `types: [created]`.
+      on `pull_request` with `types: [closed]`; `archive-sweep` runs on a
+      schedule; `archive-on-deploy` runs on `deployment_status`; `pr-command`
+      runs on `issue_comment` with `types: [created]`.
 
-      IMPORTANT — `archive-on-merge` needs a DIFFERENT token. Archiving
+      IMPORTANT — every archive mode needs a DIFFERENT token. Archiving
       requires the Member role, while fetching removal candidates needs only
-      read access. Give this workflow its own secret rather than reusing the
-      read-only one, or a leaked token stops meaning "flag names disclosed" and
-      starts meaning "flag state changed". In `archive-on-merge` every input
+      read access. Give those workflows their own secret rather than reusing
+      the read-only one, or a leaked token stops meaning "flag names disclosed"
+      and starts meaning "flag state changed". In `archive-on-merge` every input
       below except `api-url` is ignored. `pr-command` reads a NARROWER set of
       `remove`'s inputs — the complete list is in the README's "Re-run a
       removal from a comment" section, and the short version is: `api-token`,
@@ -98,6 +148,19 @@ inputs:
       pull request's OWN base branch, never a configured one.
     required: false
     default: 'remove'
+  deployment-environment:
+    description: >-
+      `archive-on-deploy` only: the GitHub deployment environment whose
+      successful deployments authorize an archive. A `deployment_status` for
+      any other environment is reported and archives nothing, which is what
+      keeps a staging or preview deploy from retiring a flag production is
+      still reading. Matched case-insensitively against the payload's
+      `deployment.environment`, so `Production` and `production` are the same
+      environment here — a mismatch would otherwise make the workflow silently
+      inert, which reads exactly like having nothing to archive. Ignored by
+      every other mode.
+    required: false
+    default: 'production'
   api-url:
     description: >-
       Featureflip public API origin. Override only for a staging or
@@ -215,9 +278,15 @@ inputs:
       In `pr-command` mode it still checks permissions, reads the pull
       request and posts a reply (so it DOES touch the GitHub API, unlike
       `remove`), but stops before force-pushing the branch or updating the
-      pull request — reporting `rerun-dry-run` instead. Ignored in
-      `archive-on-merge`, which never opens a branch or a pull request either
-      way.
+      pull request — reporting `rerun-dry-run` instead.
+
+      In `archive-sweep` mode it works out exactly which flags the real run
+      would attempt and prints one `[would-archive]` line each, sending no
+      archive request. It does NOT claim each one would succeed: whether an
+      attempt lands or defers is a fact only the attempt has.
+
+      Ignored in `archive-on-merge`, which never opens a branch or a pull
+      request either way.
     required: false
     default: 'false'
 
@@ -242,6 +311,7 @@ runs:
     FEATUREFLIP_PROJECT: ${{ inputs.project }}
     FEATUREFLIP_API_URL: ${{ inputs.api-url }}
     FEATUREFLIP_MODE: ${{ inputs.mode }}
+    FEATUREFLIP_DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment-environment }}
     FEATUREFLIP_STALENESS: ${{ inputs.staleness }}
     FEATUREFLIP_LANGUAGES: ${{ inputs.languages }}
     FEATUREFLIP_ACCESSORS: ${{ inputs.accessors }}

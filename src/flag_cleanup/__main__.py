@@ -24,8 +24,28 @@ A genuine ``no-changes`` is NOT in that set: nothing to do is success.
 it archives one flag or it does not, so there is no partial result. A pull
 request that did not merge, or did not come from a branch this Action created,
 is ``0`` — those are the ordinary outcomes of a workflow that fires on every
-closed pull request, not failures. A trigger that cannot work at all is ``2``;
-an API that refuses the archive is ``1``.
+closed pull request, not failures. So is ``deferred``: live traffic still
+evaluating the flag is a refusal that lifts by itself once the removal deploys,
+with nothing for anyone to do, and it is the ordinary case wherever merge and
+deploy are separate events. A trigger that cannot work at all is ``2``; every
+OTHER API refusal is ``1``.
+
+``mode: archive-sweep`` reports a list rather than one line and follows
+``remove``'s partial-failure rule rather than ``archive-on-merge``'s: ``0`` when
+every outstanding archive either landed or deferred (including when there were
+none, and including a dry run), ``1`` when any flag could not be archived —
+which names the flags, because the remedies differ per flag. ``2`` is the run
+failing to start: no ``GITHUB_TOKEN``, which the two GitHub-reading archive
+modes genuinely need.
+
+``mode: archive-on-deploy`` reports the same way and reads the same codes, with
+two outcomes of its own that are both ``0``. A delivery this mode does not act
+on — a status that is not ``success``, or a deployment to an environment other
+than the configured one — is ONE line and no summary, because there was no
+backlog to summarise. A merged removal the deployed commit does not contain is
+``pending-deploy``: named, left outstanding, and picked up by the next deploy
+that ships it (or by the sweep). ``2`` is again the run failing to start — the
+wrong trigger, or no ``GITHUB_TOKEN``.
 
 ``mode: pr-command`` answers ONE command a human left as a comment, so almost
 every outcome is ``0`` — including a comment from someone without write
@@ -70,9 +90,18 @@ import sys
 from collections import Counter
 
 from flag_cleanup import github_ops
-from flag_cleanup.archive import run_archive
+from flag_cleanup.archive import ArchiveResult, run_archive
+from flag_cleanup.backlog import run_archive_sweep
 from flag_cleanup.client import FeatureflipApiError
-from flag_cleanup.config import MODE_ARCHIVE_ON_MERGE, MODE_PR_COMMAND, Config, ConfigError
+from flag_cleanup.config import (
+    MODE_ARCHIVE_ON_DEPLOY,
+    MODE_ARCHIVE_ON_MERGE,
+    MODE_ARCHIVE_SWEEP,
+    MODE_PR_COMMAND,
+    Config,
+    ConfigError,
+)
+from flag_cleanup.deploy import SKIPPED_ACTIONS, run_archive_on_deploy
 from flag_cleanup.git_ops import ForceWithLeaseRejected, GitCommandError, PreflightError
 from flag_cleanup.github_ops import (
     BaseRefError,
@@ -122,6 +151,17 @@ def main(argv: list[str] | None = None) -> int:
             # two failure types: a misconfigured trigger to exit 2 (nothing was
             # archived), an API refusal to exit 1.
             return _archive(config)
+        if config.mode == MODE_ARCHIVE_SWEEP:
+            # Same reasoning again: a workflow that did not pass GITHUB_TOKEN
+            # through raises `GitHubConfigError`, which the handler below
+            # renders as exit 2 — nothing was archived.
+            return _archive_sweep(config)
+        if config.mode == MODE_ARCHIVE_ON_DEPLOY:
+            # Same again, with two ways to reach exit 2: a trigger that is not
+            # `deployment_status` (`PullRequestEventError`) and a workflow that
+            # did not pass GITHUB_TOKEN through (`GitHubConfigError`). Both are
+            # raised before the environment gate, so nothing was archived.
+            return _archive_on_deploy(config)
         if config.mode == MODE_PR_COMMAND:
             # Same reasoning: a misconfigured trigger (`PullRequestEventError`)
             # falls through to exit 2 below, and a raised transform failure
@@ -251,9 +291,105 @@ def _archive(config: Config) -> int:
     a workflow log and job summary capture.
     """
     result = run_archive(config)
+    _print_archive_result(result)
+    return 0
+
+
+def _print_archive_result(result: ArchiveResult) -> None:
     key = f" {result.key}" if result.key else ""
     print(f"[{result.action_taken}]{key} {result.detail}", flush=True)
+
+
+def _archive_sweep(config: Config) -> int:
+    """Run archive-sweep and print one line per outstanding flag, then a total.
+
+    Follows `remove`'s partial-failure shape rather than `_archive`'s all-or-
+    nothing one, because this mode HAS partial results: `deferred` and
+    `archived` are both fine, one flag the domain refuses does not invalidate
+    the others, and the flags that failed are named because their remedies
+    differ from each other.
+
+    Printed rather than logged, matching every other reporter here: stdout is
+    what a workflow log and job summary capture.
+    """
+    results = run_archive_sweep(config)
+    for result in results:
+        _print_archive_result(result)
+    _summarize_sweep(results, dry_run=config.dry_run)
+    return _archive_exit_code(results)
+
+
+def _archive_on_deploy(config: Config) -> int:
+    """Run archive-on-deploy: one line per outstanding flag, then a total.
+
+    Shares `_archive_sweep`'s reporting because it shares its candidate set —
+    same outcome vocabulary, same partial-failure rule, same summary sentence
+    for an empty backlog.
+
+    The one addition is the delivery-level no-op. A status that is not
+    `success`, or a deployment to another environment, comes back as a single
+    result and is printed WITHOUT the summary: "0 outstanding flags" would
+    claim this run looked at the backlog, and it did not — that is the whole
+    point of the gate it stopped at.
+    """
+    results = run_archive_on_deploy(config)
+    for result in results:
+        _print_archive_result(result)
+
+    if len(results) == 1 and results[0].action_taken in SKIPPED_ACTIONS:
+        return 0
+
+    _summarize_sweep(results, dry_run=config.dry_run)
+    return _archive_exit_code(results)
+
+
+def _archive_exit_code(results: list[ArchiveResult]) -> int:
+    """`0`, or `1` naming every flag that could not be archived.
+
+    Named per flag because the remedies differ per flag — a dependent
+    prerequisite, a pending schedule and a deleted flag each need something
+    different, and a bare count sends the reader back to the log to find out
+    which.
+    """
+    failed = [result.key or "?" for result in results if result.action_taken == "failed"]
+    if failed:
+        print(
+            f"flag-cleanup: {len(failed)} outstanding archive(s) failed: "
+            f"{', '.join(failed)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
+
+
+def _summarize_sweep(results: list[ArchiveResult], *, dry_run: bool) -> None:
+    """Close the sweep with one line saying what it did.
+
+    An empty backlog is the HEALTHY steady state of this mode and prints its
+    own sentence, for `_summarize`'s reason one mode over: without it a clean
+    sweep emits nothing at all, and "everything is archived" is byte-for-byte
+    identical in the job log to a sweep that was pointed at the wrong project
+    and found nothing because nothing was there to find.
+    """
+    if not results:
+        print(
+            "flag-cleanup: no outstanding archives — every merged removal in "
+            "this project is already archived",
+            flush=True,
+        )
+        return
+
+    counts = Counter(result.action_taken for result in results)
+    breakdown = ", ".join(
+        f"{count} {action}"
+        for action, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    noun = "flag" if len(results) == 1 else "flags"
+    suffix = " (dry run — nothing was archived)" if dry_run else ""
+    print(
+        f"flag-cleanup: {len(results)} outstanding {noun}: {breakdown}{suffix}",
+        flush=True,
+    )
 
 
 #: pr-command outcomes that must turn the build red. Each is a command a human

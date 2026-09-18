@@ -1,10 +1,18 @@
 # Piranha flag-cleanup rules for Python (python SDK).
 #
-# Like ts.toml and unlike java.toml/go.toml, this file carries the WHOLE
-# cascade: Piranha ships built-in feature-flag cleanup rules for
-# go/java/kt/ruby/scala/swift, and none at all for TypeScript or Python. So the
-# seed rules, the boolean simplification, the `if` fold and the statement
-# cleanup are all authored here.
+# Like java.toml and go.toml, this file carries ONLY the seed rules. The
+# boolean simplification, the `if` fold and the statement cleanup all come from
+# the engine's own `cleanup_rules/python`, reached over the edges in
+# python_edges.toml — which name GROUPS, not rules, so the engine's rules answer
+# them.
+#
+# It did carry the whole cascade, because the engine shipped none for Python.
+# That stopped being true at engine 0.6.0, which upstreamed this file's cleanup
+# half verbatim, and for a while both copies existed. A user rule wins a name
+# collision, so ours shadowed the engine's and the engine's 21 rules were dead
+# weight — until one of them was fixed and ours was not, which is exactly how
+# the TypeScript parenthesis defect survived in the engine while the fix sat
+# downstream. The shadowing half is gone; see the note at the end of this file.
 #
 # Holes filled per invocation via substitutions:
 #   @stale_flag_name -> the flag key (matched against the first string-literal arg)
@@ -17,8 +25,10 @@
 #    `if_statement` with the statements of its block pastes the first line at
 #    the `if`'s column and leaves every later line at its ORIGINAL column, and
 #    capturing the whole `(block)` instead leaves every line over-indented.
-#    Both produce source CPython rejects. So there is no `*_splice` rule here:
-#    a branch is folded only when it is a SINGLE SIMPLE STATEMENT, which needs
+#    Both produce source CPython rejects. So the cascade has no `*_splice`
+#    rule at all — not here and not in the engine's copy, which inherited this
+#    constraint with the rules. A branch is folded only when it is a SINGLE
+#    SIMPLE STATEMENT, which needs
 #    no re-indentation because only its first line moves. A multi-statement
 #    branch is left alone, and the residual-condition gate in `syntax.py` then
 #    refuses the file rather than shipping `if True:` as a "removal".
@@ -37,7 +47,7 @@
 
 
 # ===========================================================================
-# 1. The flag read
+# 1. The flag read — the only rules this file still declares
 # ===========================================================================
 
 # --- <obj>.variation("KEY", ctx, <bool literal>) -> @treated
@@ -158,352 +168,31 @@ holes = ["treated", "stale_flag_name"]
 
 
 # ===========================================================================
-# 2. boolean_expression_simplify: fold the literal into its enclosing expression
+# 2. Everything after the read belongs to the engine
 # ===========================================================================
-
-# `not True` -> False, `not False` -> True.
-[[rules]]
-name = "simplify_not_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (not_operator argument: (true)) @not
-)"""
-replace_node = "not"
-replace = "False"
-
-[[rules]]
-name = "simplify_not_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (not_operator argument: (false)) @not
-)"""
-replace_node = "not"
-replace = "True"
-
-# `a if True else b` -> a, `a if False else b` -> b.
 #
-# `conditional_expression` carries NO field names in this grammar — its
-# children are positional (consequence, condition, alternative) — so the
-# anchors are what identify them. Without the anchors a nested conditional
-# could bind the wrong child.
-[[rules]]
-name = "simplify_ternary_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (conditional_expression . (_) @consequence . (true) . (_)) @ternary
-)"""
-replace_node = "ternary"
-replace = "@consequence"
-
-[[rules]]
-name = "simplify_ternary_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (conditional_expression . (_) . (false) . (_) @alternative) @ternary
-)"""
-replace_node = "ternary"
-replace = "@alternative"
-
-# Short-circuit operators, LITERAL ON THE LEFT ONLY. These four rewrites are
-# exactly semantics-preserving in Python: `and`/`or` return one of their
-# OPERANDS (not a bool), the dropped operand is the one the runtime would not
-# have evaluated, and the kept operand is returned verbatim.
+# `boolean_expression_simplify`, `if_cleanup` and `statement_cleanup` used to be
+# declared here, 21 rules of them. They are gone because the engine ships the
+# same 21 — same names, same queries, same filters, same replacements, and the
+# same three edges — so every one of them was shadowed and unreachable. Checked
+# by parsing both files rather than by eye, against the pinned engine version.
 #
-# The mirrored right-hand forms are deliberately NOT implemented, for the same
-# reason as in ts.toml: `x and True` -> `x` changes the produced VALUE whenever
-# `x` is falsy-but-not-`False` (`0`, `""`, `[]`, `None`), and `x and False` ->
-# `False` discards `x`'s side effects entirely. Leaving `x and True` in place
-# is ugly but correct, which is the trade this tool always makes.
-[[rules]]
-name = "simplify_and_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (boolean_operator left: (true) operator: "and" right: (_) @right) @expr
-)"""
-replace_node = "expr"
-replace = "@right"
-
-[[rules]]
-name = "simplify_and_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (boolean_operator left: (false) operator: "and" right: (_)) @expr
-)"""
-replace_node = "expr"
-replace = "False"
-
-[[rules]]
-name = "simplify_or_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (boolean_operator left: (true) operator: "or" right: (_)) @expr
-)"""
-replace_node = "expr"
-replace = "True"
-
-[[rules]]
-name = "simplify_or_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (boolean_operator left: (false) operator: "or" right: (_) @right) @expr
-)"""
-replace_node = "expr"
-replace = "@right"
-
-# Comparison against a boolean literal, BOTH SIDES LITERAL ONLY.
-# `client.variation("k", ctx, False) == True` becomes `True == True` once the
-# read is folded, and without these it stops there: correct, but the `if` never
-# disappears.
+# What that means when something here misbehaves: the rule you are looking for
+# is in the engine, not in this directory. `python_edges.toml` is deliberately
+# kept even though the engine declares identical edges — edges MERGE rather than
+# collide, so a local copy adds a guarantee instead of hiding one, and it keeps
+# the contract the seed rules above depend on visible at the point of use.
 #
-# The single-literal forms are deliberately NOT implemented, for the same reason
-# as `x and True`. `True == x` is not `x` — `==` yields a bool while `x` yields
-# whatever `x` is, and Python is full of objects with a custom `__eq__` whose
-# result is neither. With both sides literal the comparison has one answer and
-# neither operand can carry a side effect.
+# The 15 python fixture cases in `tests/test_piranha_rules.py` are what holds
+# this together. They exercise the whole cascade end to end, so an engine bump
+# that changed or dropped any of those 21 rules turns them red here rather than
+# in a customer's repository. `test_declares_no_cleanup_rules` stops the
+# duplicate being reintroduced by hand.
 #
-# `is` rides along with `==`: `True is True` and `True == True` agree for the
-# two singletons, and `if flag is True:` is a shape real code uses.
-# `comparison_operator`'s operands are POSITIONAL — only the operator carries a
-# field name — so the literals are matched by position, exactly as
-# `conditional_expression` above.
-[[rules]]
-name = "simplify_comparison_true_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (true) operators: ["==" "is"] (true)) @expr
-)"""
-replace_node = "expr"
-replace = "True"
-
-[[rules]]
-name = "simplify_comparison_true_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (true) operators: ["==" "is"] (false)) @expr
-)"""
-replace_node = "expr"
-replace = "False"
-
-[[rules]]
-name = "simplify_comparison_false_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (false) operators: ["==" "is"] (true)) @expr
-)"""
-replace_node = "expr"
-replace = "False"
-
-[[rules]]
-name = "simplify_comparison_false_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (false) operators: ["==" "is"] (false)) @expr
-)"""
-replace_node = "expr"
-replace = "True"
-
-[[rules]]
-name = "simplify_negated_comparison_true_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (true) operators: ["!=" "is not"] (true)) @expr
-)"""
-replace_node = "expr"
-replace = "False"
-
-[[rules]]
-name = "simplify_negated_comparison_true_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (true) operators: ["!=" "is not"] (false)) @expr
-)"""
-replace_node = "expr"
-replace = "True"
-
-[[rules]]
-name = "simplify_negated_comparison_false_true"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (false) operators: ["!=" "is not"] (true)) @expr
-)"""
-replace_node = "expr"
-replace = "True"
-
-[[rules]]
-name = "simplify_negated_comparison_false_false"
-groups = ["boolean_expression_simplify"]
-is_seed_rule = false
-query = """(
-  (comparison_operator (false) operators: ["!=" "is not"] (false)) @expr
-)"""
-replace_node = "expr"
-replace = "False"
-
-
-# ===========================================================================
-# 3. if_cleanup: fold `if True:` / `if False:`
-# ===========================================================================
-# Python's `elif` chain is FLAT — one `if_statement` carries a list of
-# `alternative:` children (`elif_clause`s then an optional `else_clause`)
-# rather than nesting another `if` inside an else. That makes the dangling-else
-# disaster the C-family languages all share (see java.toml section 2) simply
-# not exist here: a dead `elif` is one node to delete, and the `else` that
-# follows it is its SIBLING, not its child.
-#
-# What Python has instead is the re-indentation wall. Every rule below either
-# deletes a node that starts its own line, or replaces a node with a single
-# simple statement whose first line is the only one that moves. Nothing here
-# changes the indentation of a line it did not already own.
-
-# `if True: <one simple statement>` -> that statement, with any `elif`/`else`
-# branches dropped with it (they are unreachable once the condition is `True`).
-#
-# The consequence must be a block holding EXACTLY ONE statement (`. … .`) drawn
-# from an allow-list of SIMPLE statements. Both halves matter:
-#
-#   * one statement, because two would need the second and later lines
-#     re-indented and the engine cannot do that;
-#   * simple, because a COMPOUND statement (`for`, `with`, a nested `if`)
-#     carries its own indented block, and moving its header to a shallower
-#     column while its body stays put is exactly the breakage above.
-#
-# A simple statement may still span lines — via brackets or a backslash — but
-# in both cases the continuation lines' indentation is insignificant to Python,
-# and a triple-quoted string's content is untouched because only the FIRST line
-# of the statement moves.
-#
-# The allow-list is the safe direction to be wrong in: omitting a statement
-# type costs a missed cleanup (the file is then refused, loudly, by the
-# residual-condition gate), whereas admitting a compound statement produces
-# source that does not run.
-[[rules]]
-name = "simplify_if_true_single_statement"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (if_statement
-    condition: (true)
-    consequence: (block . [(expression_statement)
-                           (return_statement)
-                           (pass_statement)
-                           (raise_statement)
-                           (break_statement)
-                           (continue_statement)
-                           (assert_statement)
-                           (delete_statement)
-                           (global_statement)
-                           (nonlocal_statement)
-                           (import_statement)
-                           (import_from_statement)] @only .)) @if_statement
-)"""
-replace_node = "if_statement"
-replace = "@only"
-
-# `if False: … else: <one simple statement>` -> that statement.
-#
-# The `else_clause` is anchored as the child IMMEDIATELY AFTER the consequence
-# and the LAST child, which is how "there are no `elif` branches in between" is
-# expressed. Without those anchors this would match
-# `if False: a elif c: b else: d` and collapse the whole chain to `d`,
-# discarding a live `elif` branch — the sharpest available way to produce code
-# that runs and is wrong.
-[[rules]]
-name = "simplify_if_false_else_single_statement"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (if_statement
-    condition: (false)
-    consequence: (_)
-    . (else_clause
-        body: (block . [(expression_statement)
-                        (return_statement)
-                        (pass_statement)
-                        (raise_statement)
-                        (break_statement)
-                        (continue_statement)
-                        (assert_statement)
-                        (delete_statement)
-                        (global_statement)
-                        (nonlocal_statement)
-                        (import_statement)
-                        (import_from_statement)] @only .)) .) @if_statement
-)"""
-replace_node = "if_statement"
-replace = "@only"
-
-# `elif False:` -> gone. Flat `elif` chains make this the whole fix: the clause
-# begins its own line, so deleting it re-indents nothing, and any `else` after
-# it is a sibling that simply stays. This is the case that needs a bespoke
-# rule and a documented artefact in every C-family language here.
-[[rules]]
-name = "delete_elif_false"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (elif_clause condition: (false)) @clause
-)"""
-replace_node = "clause"
-replace = ""
-
-# `if False: …` with no `elif`/`else` -> gone.
-#
-# Rooted at the PARENT, and only when the parent holds another statement.
-# Deleting the sole statement of a block leaves `def f():` with no body, which
-# CPython rejects (`IndentationError: expected an indented block`) — and which
-# tree-sitter-python accepts without an ERROR node, so the tree-sitter half of
-# Gate 1 would not have caught it. The two `block` alternatives cover "a
-# sibling before" and "a sibling after"; `module` needs no guard because an
-# empty file is valid Python.
-#
-# This is the same parent-position question ts.toml's splice rules answer, with
-# Python's answer driven by indentation rather than by scope.
-[[rules]]
-name = "delete_if_false"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  [(block (_) (if_statement condition: (false) !alternative) @if_statement)
-   (block (if_statement condition: (false) !alternative) @if_statement (_))
-   (module (if_statement condition: (false) !alternative) @if_statement)] @container
-)"""
-replace_node = "if_statement"
-replace = ""
-
-
-# ===========================================================================
-# 4. statement_cleanup: drop statements the fold made dead
-# ===========================================================================
-# A bare `True` / `False` on its own line has no effect — it is what
-# `flag_read and do_it()` collapses to when the flag serves the branch that
-# skips `do_it()`.
-#
-# Rooted at the parent for the same reason as `delete_if_false`: a lone `True`
-# can be the entire body of a function, and deleting it would leave that
-# function bodiless.
-[[rules]]
-name = "delete_boolean_literal_statement"
-groups = ["statement_cleanup"]
-is_seed_rule = false
-query = """(
-  [(block (_) (expression_statement [(true) (false)]) @statement)
-   (block (expression_statement [(true) (false)]) @statement (_))
-   (module (expression_statement [(true) (false)]) @statement)] @container
-)"""
-replace_node = "statement"
-replace = ""
+# Three things stay downstream and are NOT candidates to follow the rules up:
+# the seed rules above (they encode this SDK's call shapes and its
+# boolean-literal type evidence), the const-propagation rules and their
+# bound-exactly-once pre-flight (the TS/Python families have no
+# `scope_config.toml` in the engine), and the post-passes in `python_fold.py` /
+# `reindent.py` / `syntax.py` — the engine re-parses its output but never
+# type-checks it, and cannot re-indent at all.

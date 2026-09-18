@@ -58,12 +58,72 @@ and is what these instructions are verified against. Nothing here archives,
 toggles or deletes a flag — removing the code is proposed as a pull request for
 you to merge, and what happens to the flag afterwards stays your decision.
 
-### Archive the flag when the cleanup PR merges
+### Archive the flag once the removal is deployed
 
 Merging a removal pull request deletes the code, but the flag itself stays live
-in Featureflip until somebody archives it by hand. `mode: archive-on-merge`
-closes that loop. It is **opt-in and separate**, in its own workflow on its own
-trigger:
+in Featureflip until somebody archives it. `mode: archive-on-merge` closes that
+loop from the `pull_request` closed event. It is **opt-in and separate**, in its
+own workflow on its own trigger — and it is the one part of this Action that can
+change what your users see, so read this section before wiring it up.
+
+**The loop closes on the deploy, not on the merge**, and those are the same
+moment in some pipelines and nowhere near it in others. Archiving is not a soft
+state: the flag leaves the evaluation payload within seconds, every connected
+SDK drops it, and each read falls back to the default value written beside it at
+the call site. If a build that still reads the flag is running anywhere in
+production at that moment, that fallback is what production serves from then on.
+
+**Which way the feature moves is not a coin flip.** This Action only proposes
+flags whose telemetry says they have served one variation and nothing else for
+months. For a flag that is fully rolled out, that variation is the on one, while
+the default beside the read — the value its author wrote for the case where the
+flag cannot be reached at all — is almost always the off one. So archiving a
+rolled-out flag ahead of its deploy does not disturb the feature at random. It
+turns the feature **off**, for everyone, until the deploy lands.
+
+**Featureflip refuses the archive while it can still see the flag being
+evaluated**, which is what stops that being a silent outcome. The refusal is
+`FLAG_RECENTLY_EVALUATED`, and this Action reports it as `[deferred]` and exits
+`0` — nothing failed, nothing is for you to do, and the archive happens later
+(see [Drain the archives that deferred](#drain-the-archives-that-deferred)).
+It is a backstop reading telemetry that has already been reported, though, not
+permission to treat a merge as a deploy: it can only rule on environments it has
+seen traffic from, and a flag no environment has ever evaluated is allowed
+through because nothing can break.
+
+So this mode fits comfortably when merging *is* deploying — the merge triggers
+the pipeline, the pipeline finishes on its own, the old build is gone minutes
+later — and it is now also workable when they are hours or days apart, because
+the deferral is what covers that gap:
+
+* **Promotion to production is manual, staged or gated** — a release train, a
+  canary, an approval step. Each removal merge will usually report `[deferred]`
+  rather than archiving, so **wire up `archive-sweep` as well**, or the flag
+  defers forever and the loop is left half-closed. If your pipeline creates
+  GitHub Deployments, [`archive-on-deploy`](#archive-when-the-deploy-actually-lands)
+  adds a second, deterministic check on top of that — it will not even propose a
+  flag whose removal is not in the commit you are running. It does **not**
+  replace the sweep, and does not avoid the deferral.
+* **Long-lived browser sessions are normal for your users** — a tab opened
+  before the deploy is still running the old bundle and still reading the flag.
+  Its evaluations keep the refusal in place until those sessions drain, which is
+  exactly what you want; the sweep archives afterwards.
+
+**One case is genuinely not covered, and no amount of retrying fixes it:**
+
+* **You ship to clients you cannot update** — mobile apps, desktop apps,
+  embedded devices, anything installed rather than served. Old versions keep
+  evaluating the flag for as long as people keep running them, which can be
+  months, so the refusal never clears on its own and the sweep defers
+  indefinitely. That is the correct behaviour — the flag really is still being
+  read — but it means archiving is a decision rather than a schedule. Archive
+  those by hand once the old versions are genuinely gone, or deliberately with
+  `?force=true` on the archive endpoint, accepting that whatever is still
+  running falls back to its own default.
+
+Nothing about `mode: remove` depends on either of these workflows: the removal
+pull requests keep arriving regardless, and what happens to the flag afterwards
+stays your decision.
 
 ```yaml
 name: Featureflip archive on merge
@@ -111,7 +171,23 @@ removal never archives anything.
 
 Archiving is idempotent, so a redelivered event or a re-run is harmless.
 
-It can legitimately fail, and the message says which case you are in:
+**The flag not being deployed yet is an outcome, not a failure.** When
+Featureflip refuses because live traffic is still evaluating the flag — the
+hazard described above, caught — the run prints:
+
+```
+[deferred] old-checkout not archived yet: live traffic is still evaluating this
+flag in production. The removal merged but has not finished deploying — nothing
+to do, and `mode: archive-sweep` re-attempts it once traffic drains
+```
+
+and **exits 0**. It is deliberately not a red build: wherever deploys lag
+merges this is the ordinary result of a removal merge, and a failing job nobody
+can act on is one people learn to ignore. What closes the loop is the sweep in
+the next section — without it a deferred flag stays live indefinitely.
+
+It can also legitimately fail, and the message says which case you are in. All
+of these exit 1, and each needs a person:
 
 | What happened | What to do |
 | --- | --- |
@@ -119,6 +195,193 @@ It can legitimately fail, and the message says which case you are in:
 | A scheduled change still targets the flag (`FLAG_HAS_PENDING_SCHEDULES`) | Cancel the pending schedule, then archive. |
 | `403` | The token cannot archive. Check this workflow is not reusing the read-only cleanup secret. |
 | `404` | The flag no longer exists, or `org`/`project` do not name the project it lives in. |
+
+### Drain the archives that deferred
+
+`mode: archive-sweep` is what comes back for the flags above. On a schedule, it
+finds every flag in the project whose removal pull request merged but which is
+still live, and tries to archive each one again:
+
+```yaml
+name: Featureflip archive sweep
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  pull-requests: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          mode: archive-sweep
+          api-token: ${{ secrets.FEATUREFLIP_ARCHIVE_TOKEN }}
+          org: my-org
+          project: my-project
+```
+
+Four things to note.
+
+**It needs `GITHUB_TOKEN`, and `archive-on-merge` does not.** This is the one
+real cost of the mode. Not firing on the merge event means it has no pull
+request handed to it, so it asks GitHub — once per live flag — whether that
+flag's removal branch ever produced a *merged* pull request. Read access to pull
+requests is all it wants, and it never writes anything to your repository.
+
+**Evidence of a merge is what authorises each archive.** A removal pull request
+you closed *without* merging is a removal you declined, and reads to this mode
+exactly like a flag that was never proposed: it is left alone. Nothing is
+archived that this Action did not open a pull request for.
+
+**It needs the same Member-role token `archive-on-merge` uses**, for the same
+reason, and keeps the same quiet/loud split: `archived` and `deferred` are both
+fine and exit 0, and a flag the API refuses for any other reason is named on its
+own line and exits 1 without stopping the rest of the backlog draining.
+
+**There is no state to manage.** Nothing is written when an archive defers — a
+flag still being live *is* the record — so running this more often, less often,
+or twice at once is harmless, and there is nothing to reset if you turn it off.
+`dry-run: true` prints the flags it would attempt and sends nothing.
+
+A run with nothing to do says so:
+
+```
+flag-cleanup: no outstanding archives — every merged removal in this project is
+already archived
+```
+
+### Archive when the deploy actually lands
+
+`archive-on-merge` fires on the merge, which is the wrong event: it proposes an
+archive against a commit nobody is running yet. If your pipeline creates
+**GitHub Deployments**, `mode: archive-on-deploy` fires on the deploy instead,
+and archives only the outstanding flags whose removal that deployment actually
+contains:
+
+```yaml
+name: Featureflip archive on deploy
+on:
+  deployment_status
+
+permissions:
+  contents: read         # is the removal's merge commit in the deployed one?
+  pull-requests: read    # which merged removals exist?
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          mode: archive-on-deploy
+          api-token: ${{ secrets.FEATUREFLIP_ARCHIVE_TOKEN }}
+          org: my-org
+          project: my-project
+          deployment-environment: production
+```
+
+**It does not replace the sweep, and does not avoid the deferral.** Featureflip
+refuses an archive while it can still see the flag being evaluated, and a
+deployment finishes seconds after the build it replaced was serving that flag —
+so for any flag with live traffic this mode's ordinary outcome is `[deferred]`
+too, and the archive lands later once the old traffic has drained. **Run
+`archive-sweep` on a schedule alongside it**; without one, a repository that
+deploys weekly defers every removal and never drains.
+
+What this mode adds is the half that refusal cannot do. The refusal reads
+traffic your environments have already reported, so it can only rule on
+environments it has seen traffic from and lets through a flag nothing has
+evaluated — right when the flag really is dead, wrong when the code reading it
+is deployed but rarely reached. This mode asks git instead, and git cannot be
+vague about a commit: either your deployment contains the removal or it does
+not. The two checks fail in opposite directions, which is the whole reason to
+run both.
+
+**Then read the two limits**, because they decide whether this mode is worth
+wiring up at all:
+
+* **It only helps if something creates GitHub Deployments.** Plenty of pipelines
+  do — Vercel, Netlify, `actions/deploy-pages`, Argo and friends via webhooks,
+  and any workflow that uses a GitHub `environment:`. Plenty do not, and there
+  is no event for this mode to hang on in those. Nothing is lost by not using
+  it: `archive-on-merge` plus `archive-sweep` behave exactly as they did.
+* **It does nothing for clients you cannot update.** Mobile, desktop and
+  embedded builds keep evaluating the flag long after your servers stop, and no
+  git event corresponds to "the last old version stopped calling us". Deploying
+  is simply not the completion event there, which is why those flags stay
+  covered by Featureflip's own refusal and the `[deferred]` outcome, exactly as
+  described two sections up.
+
+**It asks whether the deployed commit contains the removal, rather than
+assuming.** For each flag whose removal pull request merged but which is still
+live — the same set `archive-sweep` computes, by the same route — it compares
+that pull request's merge commit against the commit the deployment shipped. A
+flag whose removal is not in that commit yet is reported and left alone:
+
+```
+[pending-deploy] old-checkout the removal merged as 4f2c8ab19e01, which this
+deployment (91ee0a7c33d4) does not contain — so the code that reads this flag is
+still running. Left outstanding for the deploy that ships it
+```
+
+Nothing is written to record that, so nothing has to be cleaned up: the flag
+still being unarchived *is* the record, and the next deployment that contains
+the merge picks it up — as does the scheduled `archive-sweep` you are running
+alongside this.
+
+**A flag GitHub will not answer for is named and turns the run red**, rather
+than being folded in with the ones that are merely not deployed yet. A merge
+commit orphaned by a history rewrite, two commits with no common ancestor, or a
+comparison too large for the API to compute all mean *I could not tell* — which
+is not the same as *not yet* and will not clear by itself:
+
+```
+[failed] old-checkout could not tell whether this deployment contains the
+removal: could not tell whether 4f2c8ab19e01 is contained in the deployed commit
+91ee0a7c33d4; refusing to assume it is (HTTP 422): No common ancestor. The flag
+is left outstanding; `mode: archive-sweep` archives it on the merge alone
+```
+
+The rest of the backlog is archived anyway. One flag the API cannot place does
+not stop the flags this deployment provably shipped from being archived, and
+does not cost you their report lines.
+
+**A deployment to another environment archives nothing**, and says so rather
+than passing silently — a workflow that quietly never fires is indistinguishable
+from a repository with nothing to clean up:
+
+```
+[other-environment] this deployment was to 'staging', not 'production' —
+nothing is archived. Set the `deployment-environment` input if that is the
+wrong environment to archive on
+```
+
+The environment name is matched case-insensitively against the payload's
+`deployment.environment`. Any status that is not `success` is likewise reported
+and archives nothing — a deployment that failed left the old build running, so
+the flag is still being read.
+
+**It needs `GITHUB_TOKEN` and two read permissions**, which is the real cost
+against `archive-on-merge`. That mode reads its pull request out of the event
+payload and touches neither your source nor the GitHub API; this one asks GitHub
+which removals merged (`pull-requests: read`) and whether the deployed commit
+contains each of them (`contents: read`). It writes nothing to your repository.
+It needs the same Member-role Featureflip token the other archive modes use, for
+the same reason.
+
+**The same quiet/loud split applies.** `archived`, `deferred`, `pending-deploy`
+and both no-ops above exit `0`; a flag the API refuses for any other reason is
+named on its own line and exits `1` without stopping the rest of the backlog.
+`dry-run: true` computes the same set — including the containment check — and
+sends nothing.
 
 ### Re-run a removal from a comment
 
@@ -284,7 +547,8 @@ entries dropped.
 | `api-token` | `FEATUREFLIP_API_TOKEN` | *(required)* | Your Featureflip API token. |
 | `org` | `FEATUREFLIP_ORG` | *(required)* | Featureflip organization slug. |
 | `project` | `FEATUREFLIP_PROJECT` | *(required)* | Featureflip project slug. |
-| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-on-merge` archives the flag whose removal PR just merged and ignores every input below except `api-url` — see [Archive the flag when the cleanup PR merges](#archive-the-flag-when-the-cleanup-pr-merges). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
+| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-on-merge` archives the flag whose removal PR just merged and ignores every input below except `api-url` — read [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed) before using it, because merging is not deploying. `archive-sweep` re-attempts the archives that deferred, and reads only `api-url` and `dry-run` from the inputs below — see [Drain the archives that deferred](#drain-the-archives-that-deferred). `archive-on-deploy` archives the outstanding flags a successful deployment shipped, and reads only `deployment-environment`, `api-url` and `dry-run` from the inputs below — see [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
+| `deployment-environment` | `FEATUREFLIP_DEPLOYMENT_ENVIRONMENT` | `production` | `archive-on-deploy` only. Matched case-insensitively against the payload's `deployment.environment`; a deployment to anything else archives nothing and says so. |
 | `api-url` | `FEATUREFLIP_API_URL` | `https://api.featureflip.io` | Override only for a staging/self-hosted instance. |
 | `staleness` | `FEATUREFLIP_STALENESS` | `dead` | `dead` (ready-for-review PRs) or `stale` (draft PRs). |
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
@@ -295,7 +559,7 @@ entries dropped.
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. |
 | `pr-labels` | `FEATUREFLIP_PR_LABELS` | *(none)* | Comma-separated. A label that fails to apply is logged as a warning and does not fail the PR. **May create labels** — see below. |
 | `max-prs` | `FEATUREFLIP_MAX_PRS` | `10` | Most pull requests one run may propose (`0` = no limit). See "How much one run can do" below. |
-| `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below for `remove` mode; `pr-command` honours it too, differently — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
+| `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below for `remove` mode; `archive-sweep`, `archive-on-deploy` and `pr-command` honour it too, each differently — see [Drain the archives that deferred](#drain-the-archives-that-deferred), [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands) and [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
 
 `GITHUB_TOKEN` is **not** a declared input — GitHub does not expose it to a
 container as a default environment variable, so it must be passed through the
@@ -391,6 +655,19 @@ The summary is also the marker of a finished run. A run that aborted part-way
 reports the candidates it got through and then explains itself on stderr, so no
 tally means the run did not reach the end.
 
+`archive-sweep` prints the same shape one flag at a time — `[archived]`,
+`[deferred]`, `[would-archive]`, `[failed]` — and closes with its own tally:
+
+```
+flag-cleanup: 2 outstanding flags: 1 archived, 1 deferred
+```
+
+`archive-on-deploy` prints and tallies identically, adding `[pending-deploy]`
+for a flag this deployment does not contain yet. The two deliveries it declines
+to act on print one line and **no** tally, deliberately: a run that stopped at
+the environment gate never looked at the backlog, and "0 outstanding flags"
+would claim it had.
+
 ### Exit codes
 
 - `0` — every candidate the run attempted succeeded (this includes
@@ -455,6 +732,19 @@ tally means the run did not reach the end.
     (build output shouldn't block a run). In CI the checkout is clean and this
     never fires; it exists for local invocations.
 
+The archive modes read the same three codes, with far fewer ways to reach them.
+`archive-on-merge` archives one flag or it does not, so there is no partial
+result: `0` for `archived`, `deferred`, and both quiet no-ops
+(`not-merged`, `not-a-removal-branch`); `1` for any other API refusal; `2` for a
+workflow wired to the wrong trigger. `archive-sweep` reports a list and follows
+`remove`'s partial-failure rule instead: `0` when every outstanding archive
+either landed or deferred — including when there were none, and including a dry
+run — `1` naming each flag that could not be archived, and `2` when
+`GITHUB_TOKEN` was not passed through. `archive-on-deploy` reads exactly like
+the sweep, plus `0` for the two deliveries it declines to act on (a status that
+is not `success`, a deployment to another environment) and `0` for each
+`[pending-deploy]` flag the deployed commit does not contain yet.
+
 ### Flag keys
 
 Keys are processed verbatim when they consist of `A-Z`, `a-z`, `0-9`, `-` and
@@ -469,13 +759,41 @@ option that can't quietly rewrite the wrong code.
 
 ### Required permissions
 
+For `remove` and `pr-command`:
+
 ```yaml
 permissions:
   contents: write        # push the removal branch
   pull-requests: write   # open the PR
 ```
 
-Without both, the Action stops at the first flag with one clear message rather
+`archive-on-merge` needs **none of this** — it reads the pull request out of the
+event payload and makes one API call, so it needs nothing from `GITHUB_TOKEN`
+and no `permissions:` block at all.
+
+`archive-sweep` sits between the two:
+
+```yaml
+permissions:
+  pull-requests: read    # find each flag's merged removal PR
+```
+
+and needs `GITHUB_TOKEN` passed through the step's `env:`. It writes nothing to
+your repository.
+
+`archive-on-deploy` needs that plus one more, because it also has to ask whether
+the deployed commit contains each merged removal:
+
+```yaml
+permissions:
+  contents: read         # compare the merge commit against the deployed one
+  pull-requests: read    # find each flag's merged removal PR
+```
+
+It too needs `GITHUB_TOKEN` in the step's `env:`, and writes nothing.
+
+Without both of the write permissions above, `remove` stops at the first flag
+with one clear message rather
 than repeating the same refusal per candidate, and exits `1`. The same applies
 to a repository with **"Allow GitHub Actions to create and approve pull
 requests"** disabled (Settings → Actions → General), which 403s on PR creation
