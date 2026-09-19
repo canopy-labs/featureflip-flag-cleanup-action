@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.2.0"
+version = "1.2.1"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -151,7 +151,40 @@ dependencies = [
     # conjunction. Ruby's own `!` and ternary rules already alternated over
     # `parenthesized_statements`, which is exactly why `!(...)` folded
     # correctly there while `&&` did not.
-    "polyglot-piranha==0.14.0",
+    #
+    # 0.15.0 (piranha#97) is the PYTHON half of the same parenthesis defect,
+    # and unlike the php/ruby half it is NOT a pin move on its own -- see
+    # `python_fold._literal_condition`, which had the identical blind spot one
+    # layer down and is fixed in the same commit. The engine covers the
+    # expression positions and the `if`/`elif` it can already reach; the
+    # post-pass covers the three rewrites the engine calls impossible (a
+    # multi-statement branch, a sole-statement `if`, and `elif True:` ->
+    # `else:`). Each half was verified load-bearing by reverting it alone and
+    # watching `tests/fixtures/python/paren_group_fold` go red. The manifest
+    # diff against 0.14.0 is the workspace version and nothing else -- no
+    # grammar rev moved -- so the tree-sitter-typescript pin below stays at
+    # `+canopy.3`.
+    #
+    # It reaches FURTHER than php and ruby did, and the reason is grammatical
+    # rather than a longer list: parentheses are OPTIONAL around a python
+    # condition rather than part of the syntax, so `if (flag):` and
+    # `elif (flag):` are shapes real code writes and there is a STATEMENT
+    # position to widen that neither prior language had. The issue (#3028)
+    # named four shapes; probing every literal position found TWELVE.
+    #
+    # The oracle is PARITY WITH THE BARE FORM in both directions, not "folds as
+    # far as possible" -- which is where the issue's own expectations were
+    # wrong. `other and (True)` stays exactly as `other and True` stays: the
+    # engine deliberately refuses `x and True` -> `x`, because that changes the
+    # produced VALUE whenever `x` is falsy-but-not-False. A parenthesis does not
+    # suspend a non-goal, and the fixture pins both directions.
+    #
+    # Known boundary, shared with php and ruby since 0.14.0 and confirmed
+    # against that wheel rather than assumed: one alternation arm sees ONE level
+    # of parentheses, so `((True)) and other` still stalls. A doubly-
+    # parenthesised flag read is not a shape real source contains, and the
+    # `if`/`elif` half is covered anyway because the post-pass unwraps in a loop.
+    "polyglot-piranha==0.15.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

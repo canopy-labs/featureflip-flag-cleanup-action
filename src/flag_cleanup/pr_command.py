@@ -496,6 +496,7 @@ def _regenerate(
             stranded,
             bindings,
             entries,
+            declined,
         ):
             if transform_error is not None:
                 # Not turned into a reply: a refused transform is the one
@@ -544,7 +545,9 @@ def _regenerate(
                 # reasonable habit, must not get a real force-push for it.
                 commits = github_ops.branch_commits(gh, repo, pull.base_ref, pull.head_ref)
                 draft_note = _draft_note(pull, candidate)
-                caveats = _dry_run_caveats(unprocessed, stranded, bindings, entries)
+                caveats = _dry_run_caveats(
+                    unprocessed, stranded, bindings, entries, declined
+                )
                 return _reply(
                     gh,
                     repo,
@@ -593,6 +596,7 @@ def _regenerate(
                 bindings,
                 pr_content.note_rewritten_build_output(diff),
                 entries=entries,
+                declined=declined,
             )
             draft_note = _draft_note(pull, candidate)
             github_ops.update_pull_request(
@@ -683,14 +687,17 @@ def _dry_run_caveats(
     stranded: tuple[tuple[str, str], ...],
     bindings: tuple[tuple[str, str, str], ...],
     entries: tuple[tuple[str, str], ...],
+    declined: tuple[tuple[str, str], ...],
 ) -> str:
     """A short summary of what a real run's pull-request body would call out.
 
-    A real run folds all four of these into `pr_content.pr_body` — the
+    A real run folds all five of these into `pr_content.pr_body` — the
     still-referenced-flag warning, the unreachable statements a language's own
     toolchain proves dead, the stranded imports/locals a fold left with no
     remaining use, and the flag-keyed registry/override/type-member entries a
-    removal strands. A dry run computes every one of them (they come from the
+    removal strands, plus the entries whose value is the branch being removed
+    and which the rules therefore left alone (#3050). A dry run computes every
+    one of them (they come from the
     same `piranha_transform` call the real run uses) and, without this,
     reported NONE of them — a preview quieter than the run it is supposed to
     preview, which is backwards for a preview. Counts only, not the full
@@ -708,6 +715,12 @@ def _dry_run_caveats(
     if entries:
         noun = "entry" if len(entries) == 1 else "entries"
         notes.append(f"{len(entries)} flag-keyed {noun} would be removed")
+    if declined:
+        noun = "entry" if len(declined) == 1 else "entries"
+        notes.append(
+            f"{len(declined)} flag-keyed {noun} would be LEFT IN PLACE, pinning "
+            "the flag to the branch being removed"
+        )
     if not notes:
         return ""
     return " " + "; ".join(notes) + "."

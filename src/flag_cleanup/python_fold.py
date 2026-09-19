@@ -56,6 +56,7 @@ rolled back, exactly as an engine-produced one would be.
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import symtable
 import tokenize
@@ -69,6 +70,13 @@ _PARSER = Parser(_LANGUAGE)
 #: Bound purely as a runaway guard. Each rewrite strictly removes a literal
 #: condition, and there are finitely many, so this terminates on its own.
 _MAX_ROUNDS = 200
+
+#: Shared verbatim with :data:`flag_cleanup.kotlin_sentinel._SENTINEL_PREFIX`,
+#: and deliberately not imported from it: the two mark different things at
+#: different times (that one rewrites a CALLEE before the engine runs, this one
+#: stands in for a NAME after it) and only the "no real codebase contains this"
+#: property is common. They can never meet — one language each.
+_MARKER_PREFIX = "__ff_cleanup_"
 
 
 def fold_literal_conditions(before: str, after: str) -> str:
@@ -137,8 +145,31 @@ def _iter(node: Node):
 
 
 def _literal_condition(node: Node, field: str) -> bool | None:
-    """``True``/``False`` if this node's condition is that literal, else ``None``."""
+    """``True``/``False`` if this node's condition is that literal, else ``None``.
+
+    ``parenthesized_expression`` is unwrapped first, the same way
+    ``php_fold._literal`` unwraps PHP's. A fold replaces the flag READ, so the
+    literal lands inside whatever parentheses the source already had:
+    ``if (client.variation("k", ctx, False)):`` becomes ``if (True):``, which is
+    the same dead guard as ``if True:`` and has to read as one here
+    (featureflip#3028). Without this the engine's widened rules fold the
+    *expression* positions while ``if``/``elif`` stay standing, which is the
+    worse half — a guard a reviewer reads as live logic.
+
+    Unwrapping is a loop rather than one step because ``((True))`` nests, and
+    it costs nothing to be complete on this side even though the engine's
+    queries can only see one level. Only a sole named child is unwrapped: a
+    parenthesised node holding anything else is not a bare literal, whatever it
+    contains.
+
+    Nothing is ever RE-EMITTED through this helper — the callers rewrite the
+    header line or splice a block, so the customer's parentheses are read
+    through, never rewritten.
+    """
     condition = node.child_by_field_name(field)
+    while condition is not None and condition.type == "parenthesized_expression":
+        named = condition.named_children
+        condition = named[0] if len(named) == 1 else None
     if condition is None:
         return None
     if condition.type == "true":
@@ -373,7 +404,21 @@ def _indent_of(data: bytes, line_start: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def inline_literal_bindings(before: str, after: str) -> str:
+def marker_for(flag_key: str) -> str:
+    """The call this pass stands in for an inlined read of ``flag_key``.
+
+    A valid Python identifier whatever the key looks like (hex only), and
+    derived from the key rather than random so a run is reproducible and a
+    failure can be reasoned about from the flag alone — both for
+    :func:`~flag_cleanup.kotlin_sentinel.sentinel_for`'s reasons.
+    """
+    digest = hashlib.sha256(flag_key.encode("utf-8")).hexdigest()[:16]
+    return f"{_MARKER_PREFIX}{digest}"
+
+
+def inline_literal_bindings(
+    before: str, after: str, marker: str | None = None
+) -> str:
     """Inline a local the transform bound to a boolean literal, and drop it.
 
     ``use_legacy = client.variation(…)`` becomes ``use_legacy = True`` and
@@ -419,14 +464,34 @@ def inline_literal_bindings(before: str, after: str) -> str:
     many modules — bailing there would mean this pass almost never fires. A
     name already bound to a literal BEFORE the transform is the customer's and
     is left alone; only a name the transform newly bound to one is inlined.
+
+    ``marker``, when given, is substituted as ``marker(True)`` in place of the
+    bare literal so the caller can run the engine over the result and have the
+    literal created INSIDE its cascade — see
+    ``rules/python.toml``'s marker rule and
+    :func:`flag_cleanup.piranha_runner._inline_bound_reads` for why a literal
+    written here reaches no edge and stops where it lands (#3029). Passing
+    ``None`` substitutes the literal directly, which is what the later,
+    engine-less call still does as the fallback for a file the marker pass
+    declined.
     """
     if after == before:
+        return after
+    if marker is not None and marker in after:
+        # Astronomically unlikely — a SHA-256 prefix behind a reserved-looking
+        # name — and refused rather than worked around, exactly as
+        # `kotlin_sentinel` refuses its own: once the name is already in the
+        # file, "did a marker survive the engine?" cannot tell ours from
+        # theirs, and that question is the only thing standing between a
+        # broken identifier and a pull request. Returning `after` unchanged
+        # leaves the binding standing, which the residue gate then refuses
+        # loudly.
         return after
     preexisting = _literal_binding_names(before)
     if preexisting is None:  # pragma: no cover - Gate 1 owns unparseable input
         return after
     for _ in range(_MAX_ROUNDS):
-        rewritten = _inline_once(after, preexisting)
+        rewritten = _inline_once(after, preexisting, marker)
         if rewritten is None:
             return after
         after = rewritten
@@ -472,7 +537,9 @@ def _literal_binding(node: ast.AST) -> tuple[str, bool] | None:
     return target.id, value.value
 
 
-def _inline_once(source: str, preexisting: set[str]) -> str | None:
+def _inline_once(
+    source: str, preexisting: set[str], marker: str | None = None
+) -> str | None:
     """Inline the first eligible binding; ``None`` if there is none.
 
     One edit per call with a re-parse between, for the reason
@@ -499,7 +566,7 @@ def _inline_once(source: str, preexisting: set[str]) -> str | None:
     candidates.sort(key=lambda item: (item[0].lineno, item[0].col_offset))
     for node, (name, value) in candidates:
         edited = _inline_binding(
-            name, value, node, tree, table, occurrences, data, lines
+            name, value, node, tree, table, occurrences, data, lines, marker
         )
         if edited is not None:
             return edited
@@ -515,6 +582,7 @@ def _inline_binding(
     occurrences: dict[str, int],
     data: bytes,
     lines: list[int],
+    marker: str | None = None,
 ) -> str | None:
     """The two-part safety check, then the edit. ``None`` if it does not hold."""
     if not _confined_to_one_function(name, table):
@@ -547,8 +615,15 @@ def _inline_binding(
         # and its replacement spliced into text that no longer exists. Removing
         # both is what `test_a_binding_sharing_its_line_is_left_alone` measures.
         return None  # pragma: no cover
-    literal = b"True" if value else b"False"
-    edits = [(begin, finish, literal) for begin, finish in replacements]
+    literal = "True" if value else "False"
+    # A CALL rather than a bare literal when the caller is going to re-run the
+    # engine. Substituting a call for a name can never change precedence — a
+    # call binds tightest — and a call is legal in every position a load of the
+    # name was.
+    substitute = (
+        f"{marker}({literal})" if marker is not None else literal
+    ).encode("utf-8")
+    edits = [(begin, finish, substitute) for begin, finish in replacements]
     edits.append((start, end, _binding_filler(tree, node, data, start)))
     text = data
     for begin, finish, replacement in sorted(edits, reverse=True):

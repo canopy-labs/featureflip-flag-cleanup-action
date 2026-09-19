@@ -671,6 +671,30 @@ def supported(language: str) -> bool:
     return language in _TS_LANGUAGES or language in _PROFILES
 
 
+def host_code_view(source: str, language: str) -> tuple[str, str] | None:
+    """``(host source, host language token)`` for a TEMPLATE language, else None.
+
+    The public door onto :func:`_code_view` and the ``code_view`` profile
+    field, for callers outside this module that need to ask a question about
+    the code inside a template's tags rather than about the template. ERB is
+    the only language this answers for today.
+
+    Returning the host TOKEN alongside the string is what keeps the caller
+    honest: the derived source is Ruby, and reading it under the ``erb``
+    profile — or under whatever the caller happened to be iterating on — would
+    parse a Ruby program with a template grammar and find nothing, silently.
+
+    The offsets caveat on :func:`_code_view` applies in full: this string is
+    not the file, so nothing that EDITS the file may be pointed at it. A caller
+    that only wants the text of a construct, to name it in a report, is inside
+    that limit; a caller that wants to rewrite one is not.
+    """
+    profile = _PROFILES.get(language)
+    if profile is None or profile.code_view is None:
+        return None
+    return _code_view(source, language), profile.code_view
+
+
 @lru_cache(maxsize=None)
 def _parser(language: str) -> Parser:
     try:
@@ -794,7 +818,10 @@ def _construct_at(source: str, language: str, start: int, beyond: int) -> str | 
 
     ``None`` when the line opens nothing that outlives it: a ``} else {`` line
     begins with the brace closing the block above it, and a line holding a
-    complete statement is over before ``beyond``.
+    complete statement is over before ``beyond``. Also ``None`` when the only
+    thing beginning here is the CONTAINER the line is the first element of —
+    see :func:`_begins_a_sequence`, which is the same four containers the
+    paragraph above names, asked about the line BELOW the header instead.
     """
     node, found = _root_node(source, language), None
     while True:
@@ -805,7 +832,82 @@ def _construct_at(source: str, language: str, start: int, beyond: int) -> str | 
                 node = child
                 break
         else:
-            return found.type if found is not None else None
+            break
+    if found is None or _begins_a_sequence(found, beyond):
+        return None
+    return found.type
+
+
+def _begins_a_sequence(node: Node, beyond: int) -> bool:
+    """Whether the line ending at ``beyond`` merely BEGINS ``node``, rather than opens it.
+
+    The descent above is careful to look past a body container that starts at
+    the header's own byte. It cannot look past one when the line IS that
+    container's first statement rather than a header — the statement ends
+    within the line, so nothing deeper qualifies and the container is what
+    comes back. ``_folds`` then reads the line as a header and invents a fold
+    whose "body" is whatever happens to be indented more deeply below it
+    (#3079). Reproduced end to end in Go and Swift; Python misreports too and
+    is saved only by a more-indented sibling being a syntax error there.
+
+    THREE conditions, and each one alone refuses a family the other two
+    admit. None names a node type or a language, which is the constraint this
+    module is held to everywhere.
+
+    * **Exactly ONE child of the construct begins on this line.** A sequence's
+      first element is the whole of the container's presence there; a real
+      header has several of its own parts on the line — Go's ``if`` keyword,
+      its condition and its ``{``; Python's ``if``, its condition and its
+      ``:``; Java's modifiers, type, name, parameters and brace.
+    * **That child is NAMED.** An anonymous child is a literal token of the
+      grammar — a delimiter, not a construct — so a line holding only one is
+      opening something rather than being something. This is what keeps the
+      Allman ``{`` on its own line a header (#3037's third shape).
+    * **No child of the construct carries a FIELD NAME.** A field names a
+      child's ROLE, so a construct that gives its children roles is not a
+      sequence. Without it ``jsx_element`` reads as a container — its lone
+      child on the line is the named ``jsx_opening_element``, field
+      ``open_tag`` — and so does a C# ``method_declaration`` whose attribute
+      sits alone above the signature.
+
+    Measured by dropping each in turn across the 816-file fixture tree, and
+    every one of them is load-bearing: without the count, 12 real headers stop
+    opening anything (a C# ``field_declaration`` with a multi-line
+    initialiser, a Dart ``named_argument``, a Swift trailing-closure
+    ``call_expression``); without the named test, 392 sites, Allman's
+    ``block`` 117 of them; without the field test, 36, of which 30 are JSX.
+    With all three the answer changes for exactly four node types and nothing
+    else — Go's ``statement_list``, Swift's ``statements``, Python's ``block``
+    and Ruby's ``body_statement``.
+
+    Ruby is in that list and is NOT in the issue's table, which measured only
+    an ``if`` body — where Ruby answers ``None`` because its ``if`` owns its
+    arm through a ``then``. A ``def`` body's first statement answered
+    ``body_statement`` all along.
+
+    **Ordered so the expensive question is asked last, because a sequence
+    container is exactly the node with the most children.** Children are in
+    source order, so the count stops at the first one past the line — two
+    lookups for a real header. The field scan is O(children) and cannot be
+    bounded, but it is only ever reached by a construct whose sole presence on
+    the line is one named child, which a header with a delimiter (an Allman
+    ``block``, a keyword-led ``if``) is not. Asking it first would walk every
+    statement of every block a ``treated=false`` deletion passes through — the
+    shape #3037 already had to make ``_folds`` cheap for.
+    """
+    lead = None
+    for index in range(node.child_count):
+        child = node.child(index)
+        if child is None or child.start_byte >= beyond:
+            break
+        if lead is not None:
+            return False  # more than one part of the construct is on this line
+        lead = child
+    if lead is None or not lead.is_named:
+        return False
+    return all(
+        node.field_name_for_child(index) is None for index in range(node.child_count)
+    )
 
 
 def _construct_spans(source: str, language: str, kind: str) -> list[tuple[int, int]]:

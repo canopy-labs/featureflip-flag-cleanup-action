@@ -95,6 +95,7 @@ from flag_cleanup.pr_content import (
     _GENERATED_DIRS,
     commit_message,
     is_dead,
+    note_declined_entries,
     note_removed_entries,
     note_rewritten_build_output,
     pr_body,
@@ -549,6 +550,7 @@ def _process_candidate(
         _stranded,
         _bindings,
         entries,
+        declined,
     ):
         # Inside the `with`, and for the same reason the PR path computes it
         # there: `_unprocessed_references` reads the REWRITTEN tree, and the
@@ -565,6 +567,7 @@ def _process_candidate(
     _warn_on_unprocessed_references(config, candidate.key, unprocessed)
     note_rewritten_build_output(diff)
     note_removed_entries(entries)
+    note_declined_entries(declined)
 
     return FlagResult(
         candidate.key,
@@ -633,6 +636,10 @@ def _process_candidate_for_pr(
     pushed = False
     pr_created = False
     unprocessed: tuple[str, ...] = ()
+    # Pre-bound beside `unprocessed` and for its reason: both are read after
+    # the `with` below, and a path that never enters it must not turn a
+    # reportable failure into a NameError on the way out.
+    declined: tuple[tuple[str, str], ...] = ()
     refused: tuple[str, ...] = ()
     snapshot: git_ops.WorktreeSnapshot | None = None
     try:
@@ -652,6 +659,7 @@ def _process_candidate_for_pr(
             stranded,
             bindings,
             entries,
+            declined,
         ):
             # Inside the `with`, this flag's edits — and only this flag's —
             # are on disk. That is the only window in which the commit can be
@@ -689,6 +697,7 @@ def _process_candidate_for_pr(
                         bindings,
                         note_rewritten_build_output(diff),
                         entries=entries,
+                        declined=declined,
                     ),
                     labels=config.pr_labels,
                     draft=not is_dead(candidate.status),
@@ -845,6 +854,14 @@ def _process_candidate_for_pr(
 
     if action in {"pr-opened", "no-changes"}:
         _warn_on_unprocessed_references(config, candidate.key, unprocessed)
+        # Logged on BOTH outcomes, not only alongside a pull request, because
+        # `no-changes` is the one where the body cannot say it: a repository
+        # whose only mention of the flag is an override pinning it to the
+        # branch being removed produces an empty diff, opens nothing, and would
+        # otherwise report a bare "no changes" about a decision the tool made
+        # deliberately. Duplicating the body's paragraph on `pr-opened` is the
+        # cheaper half of that trade, and matches `unprocessed` above.
+        note_declined_entries(declined)
     else:
         # `unprocessed` is computed BEFORE the branch/commit/push (the PR body
         # needs it), so a flag that fails after that point still holds a list
@@ -1048,8 +1065,9 @@ def piranha_transform(
     family — see :func:`~flag_cleanup.syntax._unreachable_dialect`),
     ``bindings`` the imports/local variables the fold left stranded, and
     ``entries`` the flag-keyed registry/override/type-member entries deleted
-    under the ``rules/<base>_entries.toml`` prong — see
-    :class:`~flag_cleanup.piranha_runner.TransformOutcome`.
+    under the ``rules/<base>_entries.toml`` prong, and ``declined`` the ones
+    those same prongs LEFT because their value is the branch being removed
+    (#3050) — see :class:`~flag_cleanup.piranha_runner.TransformOutcome`.
 
     The body of the ``with`` runs while the edits are still on disk — that is
     what lets the PR path commit them. On exit the tree is restored no matter
@@ -1075,6 +1093,7 @@ def piranha_transform(
     stranded: list[tuple[str, str]] = []
     bindings: list[tuple[str, str, str]] = []
     entries: list[tuple[str, str]] = []
+    declined: list[tuple[str, str]] = []
     transform_error: TransformRefusal | None = None
     try:
         try:
@@ -1099,6 +1118,7 @@ def piranha_transform(
                 stranded.extend(outcome.stranded)
                 bindings.extend(outcome.bindings)
                 entries.extend(outcome.entries)
+                declined.extend(outcome.declined)
         except (PiranhaTransformError, UnsafeRewriteError) as exc:
             # Both are refusals, and both abandon the flag ENTIRELY — note the
             # try wraps the whole directory x language loop, so a refusal in
@@ -1136,6 +1156,12 @@ def piranha_transform(
             # Dropped with the rest on refusal: nothing was deleted, so there
             # is nothing to disclose.
             () if transform_error is not None else tuple(entries),
+            # And dropped for the OPPOSITE reason, which is worth keeping
+            # straight: this list is what the rules DECLINED to delete. On a
+            # refusal the whole removal is abandoned and the file is untouched
+            # either way, so naming a preserved entry would explain a decision
+            # inside a pull request that was never opened.
+            () if transform_error is not None else tuple(declined),
         )
     except BaseException as body_error:
         # try/except/else rather than `finally`: the undo needs to know whether

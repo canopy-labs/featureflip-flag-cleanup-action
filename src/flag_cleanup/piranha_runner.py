@@ -80,7 +80,7 @@ else:  # pragma: no cover - project requires >=3.11
 
 from polyglot_piranha import PiranhaArguments, execute_piranha
 
-from flag_cleanup import kotlin_sentinel
+from flag_cleanup import contradicting, kotlin_sentinel
 from flag_cleanup.kotlin_sentinel import Rewrite
 from flag_cleanup.go_fold import fold_literal_cases as fold_go_literal_cases
 from flag_cleanup.ruby_fold import fold_literal_whens as fold_ruby_literal_whens
@@ -91,6 +91,7 @@ from flag_cleanup.php_fold import (
 from flag_cleanup.python_fold import (
     fold_literal_conditions,
     inline_literal_bindings,
+    marker_for,
 )
 from flag_cleanup.reindent import reindent_spliced_lines
 from flag_cleanup.syntax import (
@@ -243,6 +244,13 @@ class _Language:
     silent and severe — the engine happily emitted ``if true:``, which is a
     ``NameError`` at run time rather than a syntax error, so it survives a parse
     check.
+
+    They spell ``@untreated`` too, which is the same two values swapped. That
+    one is compared against a SOURCE literal rather than emitted into one, so a
+    wrong spelling there fails the other way round: the comparison never
+    matches, every entry prong keeps deleting, and #3050 comes back silently.
+    ``contradicting.py`` reads the same two fields for its detector, so the two
+    halves cannot disagree about how a language spells ``false``.
     """
 
     piranha_id: str
@@ -798,6 +806,15 @@ class TransformOutcome:
     #: which evidence rule, rather than finding it in the diff. Read off the
     #: engine's own summaries by rule-name prefix; see :func:`_flag_keyed_entries`.
     entries: tuple[tuple[str, str], ...] = ()
+    #: ``(path, text)`` for every flag-keyed entry whose value is the boolean
+    #: literal this run is REMOVING, which both `*_entries.toml` prongs decline
+    #: to delete (#3050). The mirror image of ``entries``, and reported for the
+    #: opposite reason: a rule that does not fire leaves no summary behind, so
+    #: without this the file lands in the generic "still references this flag"
+    #: caveat with none of what the tool actually knows about it. Found by
+    #: :func:`~flag_cleanup.contradicting.find_contradicting_entries`, not by
+    #: the engine.
+    declined: tuple[tuple[str, str], ...] = ()
 
 
 def run_piranha(
@@ -912,12 +929,29 @@ def transform_flag(
     # point is that neither of them can see the hazard, so a check that ran
     # afterwards would be reading a file the engine had already corrupted.
     paths, skipped = _partition_by_readability(paths, language)
+
+    # Computed here, off the CUSTOMER's bytes, before anything rewrites them.
+    # It is the only reading of the tree that has to happen first: every prong
+    # in `<base>_entries.toml` declines this shape, so it is still on disk
+    # afterwards — but the fold has rewritten the code around it by then, and a
+    # file the engine quarantines never reaches the post state at all. Cheap,
+    # and bounded by the same candidate list the engine gets.
+    declined = contradicting.find_contradicting_entries(
+        paths,
+        language,
+        flag_key,
+        spec.false_literal if treatment else spec.true_literal,
+        repo_dir,
+    )
+
     if not paths:
         # Every candidate was unreadable, so there is nothing to transform —
         # but this is emphatically NOT a no-match, and returning a bare empty
         # diff would report it as one. The files ride out on `unprocessable`,
         # which is what puts them in front of a human.
-        return TransformOutcome("", unprocessable=tuple(skipped))
+        return TransformOutcome(
+            "", unprocessable=tuple(skipped), declined=declined
+        )
 
     rules_file = RULES_DIR / f"{base}.toml"
     const_rules_file = RULES_DIR / f"{base}_const.toml"
@@ -954,10 +988,24 @@ def transform_flag(
             Path(generated_rules.name), rules_file, const_rules_file, accessors
         )
 
+    # `untreated` is `treated`'s complement — the literal spelling of the branch
+    # this run is DELETING — and it exists for the `*_entries.toml` rules alone.
+    # A flag-keyed entry whose value is that literal is the customer saying
+    # "exercise the branch we are about to remove", which is evidence the
+    # enclosing code is about to become dead rather than evidence the entry is
+    # safe to strip; both entry prongs decline it and
+    # `contradicting.find_contradicting_entries` reports it. See #3050 and the
+    # header of any `rules/*_entries.toml`.
     substitutions = {
         "stale_flag_name": flag_key,
         "treated": spec.true_literal if treatment else spec.false_literal,
+        "untreated": spec.false_literal if treatment else spec.true_literal,
         "known_flag_keys": render_known_flag_keys(known_flag_keys, flag_key, language),
+        # Python only in practice — `python.toml`'s marker rule is the one
+        # consumer — but supplied unconditionally, because a substitution no
+        # rule names costs nothing and a rule whose hole is absent aborts the
+        # engine. See `_inline_bound_reads`.
+        "marker": marker_for(flag_key),
     }
     argument_flags = _load_argument_flags(base)
 
@@ -1026,61 +1074,80 @@ def transform_flag(
     unprocessable: list[str] = list(skipped)
     summaries: list = []
     try:
-        run_groups(
-            with_const=with_const, without_const=without_const, collected=summaries
-        )
-    except PiranhaTransformError as abort:
-        # Gate 2 made this run the engine TWICE, which quietly falsified the
-        # "nothing was written" contract this function and PiranhaTransformError
-        # both advertise: the first group's rewrites are already on disk when the
-        # second group panics, and the Gate 1 rollback below is never reached.
-        # `orchestrate` happens to survive that (its snapshot undo is
-        # unconditional), but a caller that believes the documented contract — the
-        # M4 archive-on-merge mode, a direct CLI use — would carry one flag's
-        # half-applied deletions into the next flag's pull request.
-        #
-        # Restoring the ENGINE's writes only, deliberately: that puts the files
-        # back into the state the retry below needs (sentinel-ified, if this
-        # language has a pre-pass), and the pre-pass owns its own undo either way.
-        _restore(summaries)
         try:
-            summaries, quarantined = _quarantine_and_retry(
-                paths, language, flag_key, run_groups, accessors
+            run_groups(
+                with_const=with_const, without_const=without_const, collected=summaries
             )
-            # Extend, never rebind: the pre-flight skips above are already in
-            # here, and `_quarantine_and_retry` only ever knows about the files
-            # it was given.
-            unprocessable.extend(quarantined)
-        except BaseException:
-            if prepass is not None:
-                prepass.restore_all()
-            raise
-        if len(quarantined) == len(paths):
-            # Nothing survived, so there is no partial removal to offer and no
-            # reason to soften the failure: report it exactly as before.
-            if prepass is not None:
-                prepass.restore_all()
-            raise abort
-        logger.warning(
-            "the transform engine could not process %d file(s) while removing "
-            "%r, and they were left untouched: %s. The remaining file(s) were "
-            "still cleaned, and the pull request says so — this is usually a "
-            "source file newer than the engine's bundled grammar",
-            len(unprocessable),
-            flag_key,
-            ", ".join(unprocessable),
-        )
+        except PiranhaTransformError as abort:
+            # Gate 2 made this run the engine TWICE, which quietly falsified the
+            # "nothing was written" contract this function and PiranhaTransformError
+            # both advertise: the first group's rewrites are already on disk when the
+            # second group panics, and the Gate 1 rollback below is never reached.
+            # `orchestrate` happens to survive that (its snapshot undo is
+            # unconditional), but a caller that believes the documented contract — the
+            # M4 archive-on-merge mode, a direct CLI use — would carry one flag's
+            # half-applied deletions into the next flag's pull request.
+            #
+            # Restoring the ENGINE's writes only, deliberately: that puts the files
+            # back into the state the retry below needs (sentinel-ified, if this
+            # language has a pre-pass), and the pre-pass owns its own undo either way.
+            _restore(summaries)
+            try:
+                summaries, quarantined = _quarantine_and_retry(
+                    paths, language, flag_key, run_groups, accessors
+                )
+                # Extend, never rebind: the pre-flight skips above are already in
+                # here, and `_quarantine_and_retry` only ever knows about the files
+                # it was given.
+                unprocessable.extend(quarantined)
+            except BaseException:
+                if prepass is not None:
+                    prepass.restore_all()
+                raise
+            if len(quarantined) == len(paths):
+                # Nothing survived, so there is no partial removal to offer and no
+                # reason to soften the failure: report it exactly as before.
+                if prepass is not None:
+                    prepass.restore_all()
+                raise abort
+            logger.warning(
+                "the transform engine could not process %d file(s) while removing "
+                "%r, and they were left untouched: %s. The remaining file(s) were "
+                "still cleaned, and the pull request says so — this is usually a "
+                "source file newer than the engine's bundled grammar",
+                len(unprocessable),
+                flag_key,
+                ", ".join(unprocessable),
+            )
+
+        # Read BEFORE any text pass or the pre-pass rebase: both replace a
+        # changed summary with a `Rewrite`, and only the engine's summary
+        # carries the rule name each edit came from. Inside this statement
+        # rather than after it because the Python pass below replaces
+        # summaries with `Rewrite`s of its own, and the entries its rounds
+        # report have to be accumulated as they are produced.
+        entries, entry_paths = _flag_keyed_entries(summaries, repo_dir)
+
+        # Python only. Resolve a read the customer bound to a local and hand
+        # the result back to the engine, so the literal is created inside the
+        # cascade where the edges apply. See `_inline_bound_reads` (#3029).
+        if language == "python":
+            summaries, entries, entry_paths = _inline_bound_reads(
+                summaries,
+                run_groups=run_groups,
+                with_const=with_const,
+                marker=substitutions["marker"],
+                repo_dir=repo_dir,
+                entries=entries,
+                entry_paths=entry_paths,
+            )
     finally:
-        # Every engine invocation — the first pass and the quarantine retry —
-        # happens inside this statement, and nothing after it reads a rule
-        # file. `raise abort` above runs this on its way out.
+        # Every engine invocation — the first pass, the quarantine retry, and
+        # each round of the Python marker pass — happens inside this
+        # statement, and nothing after it reads a rule file. `raise abort`
+        # above runs this on its way out.
         if generated_rules is not None:
             generated_rules.cleanup()
-
-    # Read BEFORE any text pass or the pre-pass rebase: both replace a changed
-    # summary with a `Rewrite`, and only the engine's summary carries the
-    # rule name each edit came from.
-    entries, entry_paths = _flag_keyed_entries(summaries, repo_dir)
 
     # Swap the engine's sentinel-ified "before" for what the customer actually
     # had, and pull in any file the pre-pass marked that the engine returned no
@@ -1185,6 +1252,12 @@ def transform_flag(
             # and it would ship an identifier that does not compile and that no
             # customer can interpret. Refuse — never diff.
             or (prepass is not None and prepass.survived(s.content))
+            # The same hazard from the other end of the run: a marker
+            # `_inline_bound_reads` wrote and the engine did not consume. That
+            # pass already unwinds such a file to its previous content, so
+            # this is the belt to its braces — and it is the one outcome where
+            # a quiet pass-through would ship a NameError.
+            or (language == "python" and substitutions["marker"] in s.content)
         }
     )
     if refused:
@@ -1215,6 +1288,7 @@ def transform_flag(
         stranded,
         bindings,
         entries,
+        declined,
     )
 
 
@@ -1572,6 +1646,145 @@ def _fold_ruby_literals(summaries) -> list:
         Path(summary.path).write_text(result, encoding="utf-8")
         folded.append(Rewrite(summary.path, summary.original_content, result))
     return folded
+
+
+#: Rounds of (inline → re-run the engine) before the Python marker pass gives
+#: up. A runaway guard only: every round deletes at least one binding and a
+#: file holds finitely many, so it converges on its own. Chaining needs more
+#: than one — `b = a or other` becomes a literal binding only once `a` has been
+#: inlined and the engine has folded what that produced — but a second round
+#: firing at all is already rare, and a file needing five is not a file this
+#: tool should keep paying engine invocations for.
+_MAX_MARKER_ROUNDS = 5
+
+
+def _inline_bound_reads(
+    summaries,
+    *,
+    run_groups,
+    with_const: list[str],
+    marker: str,
+    repo_dir: str,
+    entries: tuple[tuple[str, str], ...],
+    entry_paths: set[str],
+):
+    """Resolve Python reads bound to a local, through the engine (#3029).
+
+    `python_fold.inline_literal_bindings` is the only way a read bound to a
+    name is resolved at all — no rule of ours can do it, because the useful
+    edit deletes the binding AND rewrites its references, two edits in
+    different places — and it runs after the engine because it needs the whole
+    file in hand. That placement is what broke: **Piranha's cascade is driven
+    by edges from the rule that created a literal**, so a literal written by
+    Python code once the engine has exited reaches no edge and stops where it
+    lands. `use_legacy or other` became `True or other` while the identical
+    read written INLINE folded to `True`.
+
+    So the inliner substitutes a call to a marker instead of the literal, and
+    this hands the result back to the engine, where `python.toml`'s marker rule
+    creates the literal inside the cascade. A bound read then folds exactly
+    like a direct one — which is the property to assert, and the reason there
+    is no Python re-implementation of `boolean_expression_simplify` here: a
+    second copy of the engine's cascade is what kept the TypeScript parenthesis
+    defect alive in the engine for a full release, because the downstream copy
+    was the one running.
+
+    Five things are load-bearing:
+
+    * **It runs inside the rule-file window**, before the engine's first pass
+      is torn down, and BEFORE every text pass. Later would mean re-rendering
+      the accessor clones, and it would also mean the whitespace tidy, the
+      stranded-statement pass and the re-indent all judging content the engine
+      was about to rewrite again.
+    * **The per-round path list is narrowed to the files the inline changed.**
+      The cost of this pass is one engine invocation per round, and a
+      repository whose Python never binds a read pays nothing: nothing is
+      staged, so nothing runs.
+    * **A round that aborts puts its own files back and stops.** The engine's
+      panic is per invocation, so the previous round's output is still the
+      best answer available; leaving the marker text on disk instead would
+      ship an identifier that does not exist.
+    * **A marker that survives its round costs that FILE, not the run.** It
+      means the engine did not consume something this pass wrote, which is the
+      one outcome that must never reach a diff — and unwinding to the
+      pre-inline content leaves the binding standing, which the residue gate
+      then refuses loudly rather than quietly.
+    * **Entries are accumulated per round rather than read once at the end.**
+      `_flag_keyed_entries` needs the engine's summaries, and everything this
+      returns for a changed file is a plain `Rewrite`, which carries no rule
+      names. In practice a later round finds none — the first pass has already
+      taken the registry lines — but reading them here costs nothing and does
+      not depend on that staying true.
+    """
+    const_group = set(with_const)
+    originals = {s.path: s.original_content for s in summaries}
+    current = {s.path: s for s in summaries}
+    # A file whose marker the engine did not consume is unwound and then NOT
+    # offered again. Without this it is staged, re-run and unwound once per
+    # remaining round — the inline is deterministic, so every round reproduces
+    # the round that just failed — which turns one bad file into
+    # `_MAX_MARKER_ROUNDS` engine invocations that cannot succeed.
+    declined: set[str] = set()
+
+    for _ in range(_MAX_MARKER_ROUNDS):
+        staged: dict[str, tuple[str, str]] = {}
+        for path, summary in current.items():
+            if summary.original_content == summary.content or path in declined:
+                continue
+            inlined = inline_literal_bindings(
+                summary.original_content, summary.content, marker
+            )
+            if inlined != summary.content:
+                staged[path] = (summary.content, inlined)
+        if not staged:
+            break
+
+        for path, (_, inlined) in staged.items():
+            Path(path).write_text(inlined, encoding="utf-8")
+
+        produced: list = []
+        try:
+            run_groups(
+                with_const=[p for p in staged if p in const_group],
+                without_const=[p for p in staged if p not in const_group],
+                collected=produced,
+            )
+        except PiranhaTransformError:
+            logger.warning(
+                "the transform engine aborted while resolving %d Python "
+                "read(s) bound to a local; those file(s) keep the result of "
+                "the previous pass: %s",
+                len(staged),
+                ", ".join(sorted(staged)),
+            )
+            for path, (previous, _) in staged.items():
+                Path(path).write_text(previous, encoding="utf-8")
+            break
+
+        round_entries, round_paths = _flag_keyed_entries(produced, repo_dir)
+        entries += round_entries
+        entry_paths |= round_paths
+
+        results = {s.path: s for s in produced}
+        for path, (previous, inlined) in staged.items():
+            summary = results.get(path)
+            content = summary.content if summary is not None else inlined
+            if marker in content:
+                # Never a diff. The engine left behind something this pass
+                # wrote, so the file would ship a call to an identifier that
+                # does not exist — and unlike a bad fold it parses, so Gate 1
+                # could not see it from the syntax alone.
+                logger.warning(
+                    "a bound-read marker survived the engine in %s; that file "
+                    "keeps the result of the previous pass",
+                    path,
+                )
+                Path(path).write_text(previous, encoding="utf-8")
+                declined.add(path)
+                continue
+            current[path] = Rewrite(path, originals[path], content)
+
+    return list(current.values()), entries, entry_paths
 
 
 def _fold_python_literals(summaries) -> list:

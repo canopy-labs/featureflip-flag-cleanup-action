@@ -901,11 +901,60 @@ entries were removed". An `interface` body is **not** covered yet: the members
 look identical, but they are a different node to the rules, so an
 `interface Overrides { 'old-checkout'?: boolean }` member is left for you and
 listed under "still reference this flag".
-One TypeScript shape is only half covered for now: in a `;`-separated object
-type the rules delete the flag's member when it is the first one (or when the
-type uses commas); a middle or last `;`-terminated member is left for you and
-listed under "still reference this flag", because the engine cannot yet delete
-the member and its `;` in one edit.
+
+Every member position in a `;`-separated object type is covered — first,
+middle and last, with or without a trailing `;` — with one exception, below.
+
+**A type's last surviving member is never deleted.** `{}` does not mean "an
+empty object" in a type position; it means *any non-nullish value*, so
+narrowing
+
+```ts
+const render = (flags: { 'old-checkout'?: boolean } = {}) => { ... }
+```
+
+to `(flags: {})` would quietly widen the parameter to accept `0`, `""` and
+`true`, and most TypeScript lint configurations reject it outright
+(`@typescript-eslint/no-empty-object-type`). A cleanup that loosens your types
+is worse than one that leaves you a line to delete, so the member stays and
+the file is listed under "still reference this flag". In a *value* position
+the same run does empty the object — `{ 'old-checkout': true }` becomes `{}`,
+which is an ordinary empty object and the right shape for an override that no
+longer overrides anything.
+
+**An entry set to the branch being removed is deliberately left in place.**
+If the flag serves `true` and an entry reads `{ 'old-checkout': false }`, that
+entry pins the flag to the branch this removal deletes — which is evidence the
+code around it is about to become dead, not evidence the entry is leftover
+residue. The commonest case is a test written for the off path:
+
+```ts
+it('hides the panel when the flag is off', () => {
+  render({ 'old-checkout': false });          // <- kept
+  expect(screen.queryByText(/panel/i)).not.toBeInTheDocument();
+});
+```
+
+Stripping that override would not make the test pass, it would make it assert
+behaviour your code can no longer produce — so the run keeps the entry, lists
+it in the pull-request body under "deliberately left in place", and leaves you
+to delete the entry or the test around it. Entries whose value *agrees* with
+the treatment are removed as before.
+
+The signal is not perfect and is not meant to be: a test can carry an off
+override and still be about something else entirely, in which case the entry
+really is residue and deleting it is one line of review. That trade is
+deliberate — a leftover entry is visible in the pull request, and a test
+rewritten into a false assertion is not.
+
+The same rule applies outside tests, because the tool cannot tell the two
+apart and the evidence is the same either way. A boolean-valued *registry*
+(`{ 'old-checkout': false, 'legacy-banner': true }`) therefore keeps its entry
+too, and is reported. A registry whose value is not a boolean —
+`{ 'old-checkout': { default: false } }` — is removed exactly as before: the
+discriminator is the value position the entry occupies, not the literal
+underneath it.
+
 What it does **not** do is rewrite a test whose *assertion* was the gate:
 `it('hides the link when the flag is off')` mentions no key, fails because the
 gate is gone, and is yours to delete. Nor does it touch statements that write a
@@ -923,9 +972,11 @@ export type Overrides = {
 };
 ```
 
-becomes `export type Overrides = {// gone soon` with the surviving member
-below it. Nothing is lost, but the comment now annotates the wrong thing;
-delete or move it in review.
+becomes `export type Overrides = { // gone soon` with the surviving member
+below it — and the same entry one line further down would leave the comment
+on the end of `'legacy-banner'?: boolean;`, where it now reads as a note about
+a flag that is staying. Nothing is lost, but the comment annotates the wrong
+thing; delete or move it in review.
 
 ## The key hoisted to a constant
 
@@ -1705,10 +1756,14 @@ means no PR.
      entries keyed by the flag in a literal that is provably about flags (see
      "Wrapping the SDK"). What is left: a test whose assertion was the gate, a
      comment, a string passed to something other than an accessor, a map
-     entry whose siblings are not flags and whose value is not a boolean, a
-     middle or last member of a `;`-separated TypeScript object type, a Java
-     `Map.of` or Swift dictionary entry (not yet). Each is a line you have to
-     delete yourself.
+     entry whose siblings are not flags and whose value is not a boolean, the
+     last surviving member of a TypeScript object type (see "Wrapping the
+     SDK"), a Java `Map.of` or Swift dictionary entry (not yet). Each is a
+     line you have to delete yourself;
+  4. **the mention is a flag-keyed entry the run deliberately kept**, because
+     its value is the branch being removed (see "Wrapping the SDK"). This is
+     the one cause the body explains on its own, in its own paragraph, naming
+     each entry — the others it can only guess between.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift
@@ -1884,7 +1939,10 @@ means no PR.
   many places the flag is actually read, not the size of your repository.
 * **A Python read bound to a name is inlined only where it is provably a
   local.** `use_legacy = client.variation(…)` has its binding removed and every
-  reference replaced with the literal — but only when the name belongs to
+  reference replaced with the literal, and the expression around it is then
+  folded exactly as it would have been had the read been written inline —
+  `use_legacy or other` becomes what `client.variation(…) or other` becomes,
+  in every position. But only when the name belongs to
   exactly one *function* scope and every mention of it in the file is one the
   safety analysis accounts for. Four shapes are left standing instead, and the
   run then **refuses** the file: a binding at module or class level (public

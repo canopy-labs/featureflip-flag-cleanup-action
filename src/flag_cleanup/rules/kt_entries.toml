@@ -18,6 +18,31 @@
 # cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
 # `piranha_runner._flag_keyed_entries` reports them.
 #
+# NEITHER PRONG DELETES AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED
+# (#3050). `@treated` is the literal this run keeps; `@untreated` is its
+# complement, and an entry spelled `k -> @untreated` is the customer pinning
+# the flag to the branch the fold is deleting — evidence that the code around
+# it is about to become dead, not evidence the entry is stale. Stripping one
+# turned a test that asserted the removed branch into a test asserting
+# behaviour the code can no longer produce. That is strictly worse than
+# leaving it alone: a residual reference is visible in the pull-request body,
+# a silently falsified test is not (measured on featureflip#3041, where
+# `renderProfile({ 'web-two-factor-auth': false })` became `renderProfile({})`
+# and the suite went red).
+#
+# So the STUB prong requires `(#eq? @value "@treated")` and the REGISTRY prong
+# carries `(#not-eq? @value "@untreated")`. The second is phrased negatively on
+# purpose: the registry prong must keep deleting a value that is not a boolean
+# at all, because `k -> { default: false }` is a registry DEFAULT rather than
+# an override. The discriminator is the literal's ROLE — a value position the
+# entry occupies directly — not the value itself, which is why a nested
+# `false` is untouched by this guard.
+#
+# The decline is reported rather than silent: `contradicting.py` finds the same
+# shape with tree-sitter and the pull-request body names it with its reason.
+# `test_the_detector_reports_exactly_what_the_rules_declined` is what keeps the
+# two from drifting apart.
+#
 # The engine swallows the entry's comma itself (measured in every position);
 # `syntax.collapse_introduced_double_spaces` tidies the space a single-line
 # middle deletion leaves.
@@ -69,11 +94,20 @@
 # Map-builder arguments: `mapOf("k" to …)`
 # ===========================================================================
 
-# STUB PRONG — the value is `true`: a test override, or a plain flag -> value
-# map. May empty its call (`mutableMapOf("k" to true)` -> `mutableMapOf()`),
-# which is the right shape for an override.
+# STUB PRONG — the value is the boolean literal this run KEEPS: a test
+# override, or a plain flag -> value map. May empty its call
+# (`mutableMapOf("k" to true)` -> `mutableMapOf()`), which is the right shape
+# for an override.
+#
+# ONE rule where there used to be two. This grammar parses `true`/`false` in
+# this position as a plain `(identifier)` rather than as their own node types,
+# so the alternation `[(true) (false)]` every other language uses is not
+# available here and the value had to be named by TEXT — which `#eq?` can only
+# do one spelling at a time, hence a `_true` rule and a `_false` one. The
+# #3050 guard collapses that: there is exactly one spelling to accept now, and
+# it is whichever `@treated` holds.
 [[rules]]
-name = "delete_flag_keyed_boolean_argument_true"
+name = "delete_flag_keyed_boolean_argument"
 query = """(
   (value_argument
     (infix_expression
@@ -82,31 +116,12 @@ query = """(
       . (identifier) @value)) @entry
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @operator "to")
-  (#eq? @value "true")
+  (#eq? @value "@treated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name"]
-
-# The same rule for a `false` value. See the header on why the two spellings
-# cannot be one query in this grammar.
-[[rules]]
-name = "delete_flag_keyed_boolean_argument_false"
-query = """(
-  (value_argument
-    (infix_expression
-      . (string_literal . (string_content) @flag_name .)
-      . (identifier) @operator
-      . (identifier) @value)) @entry
-  (#eq? @flag_name "@stale_flag_name")
-  (#eq? @operator "to")
-  (#eq? @value "false")
-)"""
-replace_node = "entry"
-replace = ""
-groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name"]
+holes = ["stale_flag_name", "treated"]
 
 # REGISTRY PRONG — another argument in the SAME call is keyed by a different
 # flag of this project, so the call builds a flag-keyed map. The evidence
@@ -121,14 +136,16 @@ query = """(
   (value_argument
     (infix_expression
       . (string_literal . (string_content) @flag_name .)
-      . (identifier) @operator)) @entry
+      . (identifier) @operator
+      . (_) @value)) @entry
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name", "known_flag_keys"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 
 # `@sibling_operator` rather than `@operator`, which is NOT cosmetic: a rule's
 # own captures are in scope as substitutions inside its filters, so `@operator`

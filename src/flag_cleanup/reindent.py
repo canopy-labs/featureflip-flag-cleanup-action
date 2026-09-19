@@ -142,7 +142,7 @@ def reindent_spliced_lines(before: str, after: str, language: str) -> str:
     folds = _folds(before, after, language, opcodes)
     if not folds:
         return after
-    paired = _paired(opcodes, folds)
+    paired = _reanchored(_paired(opcodes, folds), folds, old, new)
     starts = _line_starts(after)
     leaves = _leaf_spans(after, language)
     out = list(new)
@@ -248,6 +248,107 @@ def _paired(
         for step in range(i2 - i1):
             if j1 + step not in consumed:
                 paired[i1 + step] = j1 + step
+    return paired
+
+
+def _reanchored(
+    paired: dict[int, int],
+    folds: list[tuple[int, int, str, str, tuple[int, int]]],
+    old: list[str],
+    new: list[str],
+) -> dict[int, int]:
+    """``paired``, with any fold body ``difflib`` anchored off by one re-laid.
+
+    The hazard :func:`_paired` names and :func:`_reindented` was asked to catch:
+    stripped content that repeats inside ONE fold body at differing depths.
+    Three ``alpha(true);`` a level apart give ``difflib`` three namesakes to
+    anchor the survivor against, it takes the first, and every pair after that
+    anchor is off by one — so the body's second line is re-indented against the
+    third's base, and the FIRST line, which the engine had already placed
+    correctly at the header's own column, is moved a level deeper (#3040).
+
+    **This cannot be fixed where it was first looked for.** ``placed`` admits a
+    line at its own old column, at column zero and at the fold's target, and
+    those are not three of the columns a spliced line can occupy — between them
+    they are very nearly all of them, since column zero is exactly where the C
+    family flattens a body and the target is exactly where its first line
+    lands. A mis-paired body line therefore sits at a perfectly legal column
+    and no tightening of that check can say otherwise. Neither can the content:
+    the whole point of diffing stripped lines is that the namesakes are equal,
+    and the line ``difflib`` skipped was skipped because the transform REWROTE
+    it, so it does not match its own output either.
+
+    What does settle it is the same premise :func:`_paired` and :func:`_folds`
+    already rest on — **the engine rewrites in place and never reorders** — plus
+    one fact about a fold that is read off the INPUT: its body is a contiguous
+    run of lines, and it stays one. So where the body's own arithmetic is
+    FORCED, the k-th surviving body line answers the k-th output line and the
+    diff's opinion is not needed. Forced means all of:
+
+    * the fold's hunk produced nothing (``j1 == j2``), so the body's output
+      begins at ``j1`` — everything before the fold maps before it, and every
+      line of the hunk at or before the header was deleted. A hunk that DID
+      produce something is :func:`_shift_rewritten_body`'s ground and is left
+      to it, which is why ``consumed`` is re-derived here rather than assumed;
+    * no other fold lies inside this one. A nested fold deletes a header and a
+      closing delimiter from the middle of this body, so the counts stop
+      matching and positions stop answering positions;
+    * the run ``new[j1 : j1 + len(body)]`` exists and is all non-blank — a
+      blank line inside the run means the engine kept one where the body has
+      none, and the counts have already diverged;
+    * every output line in that run is currently claimed by a line of this fold
+      or by its closing delimiter, and by nothing else. That is the guard that
+      keeps a body which COLLAPSED — a multi-line rewrite coming back as one
+      line — from claiming the statement after the fold: the run would reach a
+      line already answering a source below ``end``, and the repair declines;
+    * and at least one of those claims belongs to the BODY rather than to the
+      closing delimiter. A fold's body does not always survive the fold, and
+      nothing above notices: the arm a ``treated`` removal DELETES is a header
+      with a body of its own, so :func:`_folds` records it like any other and
+      its ``j1`` is wherever the deletion landed — which is the line AFTER the
+      whole construct. Without this the C family re-indented an enclosing
+      class's closing brace to the dead arm's column, on eight fixture cases
+      across four languages. A body
+      the transform rewrote in full leaves no paired line either and is
+      declined the same way — conservative, and no loss: there is nothing there
+      to re-anchor against.
+
+    And it only fires at all when ``difflib`` disagrees, i.e. when the body's
+    first line did not come back at ``j1``. Every fixture in the corpus pairs
+    that line the ordinary way, so this is inert for all of them — which is the
+    point: the shape it exists for is one the corpus had nowhere, and a repair
+    that re-laid every fold would be a rewrite of the pass rather than a fix to
+    it.
+
+    A re-laid pair is still only a candidate. :func:`_reindented` applies the
+    same ``placed`` test to it as to any other, so a body this misjudges is
+    left exactly where the engine wrote it rather than moved somewhere new.
+    """
+    consumed = {
+        index for _, _, _, _, (j1, j2) in folds for index in range(j1, j2)
+    }
+    for start, end, _, _, (j1, j2) in folds:
+        if j1 != j2:
+            continue
+        if any(other[0] > start and other[1] <= end for other in folds):
+            continue
+        body = [index for index in range(start, end) if old[index].strip()]
+        if not body or paired.get(body[0]) == j1:
+            continue
+        run = range(j1, j1 + len(body))
+        if run.stop > len(new) or any(
+            index in consumed or not new[index].strip() for index in run
+        ):
+            continue
+        claimed = {source for source, target in paired.items() if target in run}
+        if any(not start <= source <= end for source in claimed):
+            continue
+        if claimed.isdisjoint(body):
+            continue
+        for source in claimed:
+            del paired[source]
+        for offset, source in enumerate(body):
+            paired[source] = j1 + offset
     return paired
 
 

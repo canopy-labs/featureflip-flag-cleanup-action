@@ -167,6 +167,69 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
 
+# --- <marker>(True|False) -> that literal
+#
+# Not an SDK shape, and the only rule in this directory that matches something
+# THIS TOOL wrote. `python_fold.inline_literal_bindings` resolves a read bound
+# to a local (`use_legacy = client.variation(...)` plus `if use_legacy:`), which
+# no rule can do — the useful edit DELETES the binding and rewrites its
+# references, two edits in different places — so it runs after the engine, with
+# the whole file in hand.
+#
+# That placement is exactly what broke (#3029). Piranha's cascade is driven by
+# EDGES FROM THE RULE THAT CREATED A LITERAL, so a literal written by Python
+# code after the engine has exited has no edge to travel: `use_legacy or other`
+# became `True or other` and stopped there, while the identical read written
+# inline folded all the way to `True`. Five operand positions diverged —
+# `x or _`, `x and _`, `not x`, a ternary condition, and a three-term chain —
+# and the fold left a dead guard reading as live code under a pull request
+# saying the flag was removed.
+#
+# So the inliner substitutes a CALL TO THIS MARKER rather than the literal, and
+# the engine is run again. This rule then creates the literal INSIDE the
+# cascade, where the edges apply, and a bound read becomes indistinguishable
+# from a direct one — which is the property
+# `test_a_bound_read_folds_exactly_like_a_direct_one` asserts as a relation
+# rather than against expected bytes. The alternative was re-implementing
+# `boolean_expression_simplify` in Python, i.e. a second copy of the engine's
+# cascade: the arrangement that kept the TypeScript parenthesis defect alive in
+# the engine for a full release because the downstream copy was the one
+# actually running.
+#
+# The marker CARRIES its value as its only argument instead of folding to
+# `@treated`, and that is load-bearing rather than tidy: the value is not
+# always the treatment. `x = not <read>` folds to `x = False` under
+# `treated=true`, so a marker hard-wired to `@treated` would put `True` back
+# and invert the flag.
+#
+# `@marker` is `__ff_cleanup_<sha256(key)[:16]>` — the same reserved-looking
+# shape `kotlin_sentinel` uses, and unreachable from real source by the same
+# argument. Be precise about what that buys, because this rule is live on
+# EVERY pass and not only the second: a file that genuinely contained
+# `__ff_cleanup_<the right digest>(True)` would have it rewritten to `True`,
+# an unrequested edit. That is the exposure Kotlin's sentinel already carries,
+# accepted here for the same reason (a SHA-256 prefix keyed on the flag).
+# What the guards cover is the other direction, which is the one that ships
+# broken code: the inliner declines a file that already contains the marker,
+# because "did a marker survive the engine?" cannot then tell ours from
+# theirs; `_inline_bound_reads` unwinds a file where one survives anyway; and
+# Gate 1 refuses one that reaches it regardless. A surviving marker parses, so
+# nothing downstream of the syntax check could see it.
+[[rules]]
+name = "replace_inlined_binding_marker_with_boolean_literal"
+query = """(
+  (call
+    function: (identifier) @sdk_fn
+    arguments: (argument_list . [(true) (false)] @value .)
+  ) @call
+  (#eq? @sdk_fn "@marker")
+)"""
+replace_node = "call"
+replace = "@value"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["marker"]
+
+
 # ===========================================================================
 # 2. Everything after the read belongs to the engine
 # ===========================================================================

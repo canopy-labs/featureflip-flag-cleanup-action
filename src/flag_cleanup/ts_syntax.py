@@ -173,21 +173,27 @@ def strip_dangling_type_separators(source: str, language: str) -> str:
     """Remove a ``;`` a member deletion left leading or doubled in an object type.
 
     The engine's separator handling knows ``,`` and not ``;``. Deleting the
-    first member of ``{ 'k'?: boolean; 'a'?: boolean }`` leaves
+    first member of ``{ 'k'?: boolean; 'a'?: boolean }`` used to leave
     ``{ ; 'a'?: boolean }``, which tree-sitter parses clean — invisible to
-    Gate 1 and TS1131 to ``tsc`` — so it has to be removed here. Deleting a
-    middle or last member would leave ``; ;``, an ERROR node, but the
-    engine's own per-edit syntax check panics on that before it reaches this
-    pass, so in practice the leading ``;`` is the only shape this sees; the
-    algorithm is written for any run of stray ``;`` tokens anyway, because
-    that is no harder and a later engine may hand it one. A trailing ``;``
-    is valid and is left alone.
+    Gate 1 and TS1131 to ``tsc`` — so it had to be removed here. A trailing
+    ``;`` is valid and is left alone.
 
-    A ``(comment)`` ahead of the first member (``rules/ts_entries.toml``'s
-    ``_after_comment`` rules match it) is transparent here: it does not count
-    as "something real" for deciding whether a ``;`` behind it is leading, so
-    ``{ // note\n ; 'a'?: boolean }`` is cleaned exactly like the
-    comment-free shape.
+    **Nothing produces that shape any more**, and this pass is kept as
+    insurance rather than as a step anything depends on. Since #3049
+    ``rules/ts_entries.toml`` rewrites the ``;`` after the doomed member to a
+    ``,`` in a separate edit FIRST, so the engine deletes a comma-separated
+    member and swallows its own separator; measured, this function changes
+    nothing on the entry fixtures under the current rules and changes
+    ``{ ; 'a'?: boolean }`` under the previous ones. The algorithm is written
+    for any run of stray ``;`` tokens because that is no harder than the one
+    shape, and a later engine or rule may hand it one.
+
+    A ``(comment)`` ahead of the first member is transparent here: it does not
+    count as "something real" for deciding whether a ``;`` behind it is
+    leading, so ``{ // note\n ; 'a'?: boolean }`` is cleaned exactly like the
+    comment-free shape. (``rules/ts_entries.toml`` used to carry
+    ``_after_comment`` rule variants for that shape; they went with the
+    first-member anchor they existed to work around.)
 
     Not differential on purpose: neither shape can exist in code that
     compiled before this transform ran, so anything found here is ours.

@@ -19,6 +19,31 @@
 # cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
 # `piranha_runner._flag_keyed_entries` reports them.
 #
+# NEITHER PRONG DELETES AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED
+# (#3050). `@treated` is the literal this run keeps; `@untreated` is its
+# complement, and an entry spelled `k -> @untreated` is the customer pinning
+# the flag to the branch the fold is deleting — evidence that the code around
+# it is about to become dead, not evidence the entry is stale. Stripping one
+# turned a test that asserted the removed branch into a test asserting
+# behaviour the code can no longer produce. That is strictly worse than
+# leaving it alone: a residual reference is visible in the pull-request body,
+# a silently falsified test is not (measured on featureflip#3041, where
+# `renderProfile({ 'web-two-factor-auth': false })` became `renderProfile({})`
+# and the suite went red).
+#
+# So the STUB prong requires `(#eq? @value "@treated")` and the REGISTRY prong
+# carries `(#not-eq? @value "@untreated")`. The second is phrased negatively on
+# purpose: the registry prong must keep deleting a value that is not a boolean
+# at all, because `k -> { default: false }` is a registry DEFAULT rather than
+# an override. The discriminator is the literal's ROLE — a value position the
+# entry occupies directly — not the value itself, which is why a nested
+# `false` is untouched by this guard.
+#
+# The decline is reported rather than silent: `contradicting.py` finds the same
+# shape with tree-sitter and the pull-request body names it with its reason.
+# `test_the_detector_reports_exactly_what_the_rules_declined` is what keeps the
+# two from drifting apart.
+#
 # The engine swallows the entry's comma itself (measured in every position);
 # `syntax.collapse_introduced_double_spaces` tidies the space a single-line
 # middle deletion leaves. Emptying the sole entry of a one-line initializer
@@ -102,13 +127,14 @@ query = """(
   (initializer_expression
     (initializer_expression
       . (string_literal . (string_literal_content) @flag_name .)
-      . (boolean_literal)) @entry) @container
+      . (boolean_literal) @value) @entry) @container
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name"]
+holes = ["stale_flag_name", "treated"]
 
 # REGISTRY PRONG — another element in the SAME initializer is keyed by a
 # different flag of this project, so the initializer is a flag-keyed map. The
@@ -123,13 +149,14 @@ query = """(
   (initializer_expression
     (initializer_expression
       . (string_literal . (string_literal_content) @flag_name .)
-      . (_)) @entry) @container
+      . (_) @value) @entry) @container
   (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name", "known_flag_keys"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 
 # One filter, one concern: the sibling evidence. Its `enclosing_node` is the
 # scope `contains` searches and nothing more — the container requirement lives
@@ -154,13 +181,14 @@ name = "delete_flag_keyed_boolean_index_element"
 query = """(
   (assignment_expression
     left: (element_binding_expression (argument (string_literal . (string_literal_content) @flag_name .)))
-    right: (boolean_literal)) @entry
+    right: (boolean_literal) @value) @entry
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name"]
+holes = ["stale_flag_name", "treated"]
 
 # REGISTRY PRONG — as above, for the indexed spelling. The `left:`/`right:`
 # fields make the anchors unnecessary here.
@@ -168,13 +196,15 @@ holes = ["stale_flag_name"]
 name = "delete_flag_keyed_registry_index_element"
 query = """(
   (assignment_expression
-    left: (element_binding_expression (argument (string_literal . (string_literal_content) @flag_name .)))) @entry
+    left: (element_binding_expression (argument (string_literal . (string_literal_content) @flag_name .)))
+    right: (_) @value) @entry
   (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name", "known_flag_keys"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 
 [[rules.filters]]
 enclosing_node = "(initializer_expression) @registry"

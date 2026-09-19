@@ -21,6 +21,31 @@
 # cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
 # `piranha_runner._flag_keyed_entries` reports them.
 #
+# NEITHER PRONG DELETES AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED
+# (#3050). `@treated` is the literal this run keeps; `@untreated` is its
+# complement, and an entry spelled `k -> @untreated` is the customer pinning
+# the flag to the branch the fold is deleting — evidence that the code around
+# it is about to become dead, not evidence the entry is stale. Stripping one
+# turned a test that asserted the removed branch into a test asserting
+# behaviour the code can no longer produce. That is strictly worse than
+# leaving it alone: a residual reference is visible in the pull-request body,
+# a silently falsified test is not (measured on featureflip#3041, where
+# `renderProfile({ 'web-two-factor-auth': false })` became `renderProfile({})`
+# and the suite went red).
+#
+# So the STUB prong requires `(#eq? @value "@treated")` and the REGISTRY prong
+# carries `(#not-eq? @value "@untreated")`. The second is phrased negatively on
+# purpose: the registry prong must keep deleting a value that is not a boolean
+# at all, because `k -> { default: false }` is a registry DEFAULT rather than
+# an override. The discriminator is the literal's ROLE — a value position the
+# entry occupies directly — not the value itself, which is why a nested
+# `false` is untouched by this guard.
+#
+# The decline is reported rather than silent: `contradicting.py` finds the same
+# shape with tree-sitter and the pull-request body names it with its reason.
+# `test_the_detector_reports_exactly_what_the_rules_declined` is what keeps the
+# two from drifting apart.
+#
 # EVERY KEY IS DOUBLE-ANCHORED — `(string . (string_fragment) @flag_name .)` —
 # and that is what makes the comparison a WHOLE-KEY comparison rather than a
 # prefix one. A `string` may carry more than one named child: an escape splits
@@ -33,8 +58,12 @@
 # prefix case. A template literal is a different node and never matched.
 #
 # The engine swallows the entry's comma itself (measured in every position);
-# `syntax.collapse_introduced_double_spaces` tidies the space it leaves, and
-# `ts_syntax.strip_dangling_type_separators` the `;` it does not know.
+# `syntax.collapse_introduced_double_spaces` tidies the space it leaves. It
+# does NOT know `;`, which is why the object-type rules below rewrite one to a
+# `,` before deleting anything. `ts_syntax.strip_dangling_type_separators`
+# used to clean the `{ ;` that a first-member deletion left; since #3049 no
+# rule here produces that shape any more (measured: it fires on the old rules
+# and not on these), so it is now belt-and-braces rather than load-bearing.
 
 # ===========================================================================
 # Value objects: `{ 'k': … }`
@@ -48,13 +77,14 @@ name = "delete_flag_keyed_boolean_pair"
 query = """(
   (pair
     key: (string . (string_fragment) @flag_name .)
-    value: [(true) (false)]) @entry
+    value: [(true) (false)] @value) @entry
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name"]
+holes = ["stale_flag_name", "treated"]
 
 # REGISTRY PRONG — another pair in the SAME object is keyed by a different
 # flag of this project, so the object is a flag-keyed map. The evidence cannot
@@ -66,13 +96,14 @@ holes = ["stale_flag_name"]
 [[rules]]
 name = "delete_flag_keyed_registry_pair"
 query = """(
-  (pair key: (string . (string_fragment) @flag_name .)) @entry
+  (pair key: (string . (string_fragment) @flag_name .) value: (_) @value) @entry
   (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name", "known_flag_keys"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 
 [[rules.filters]]
 enclosing_node = "(object) @registry"
@@ -86,87 +117,130 @@ at_least = 1
 # Object types: `{ 'k'?: boolean; … }`
 # ===========================================================================
 #
-# The engine's separator logic knows `,` and not `;`, and its own per-edit
-# syntax check panics on the `;;` that deleting a middle or last member of a
-# `;`-separated type would leave (measured against the engine, not inferred).
-# So the
-# rules below match only the shapes that cannot produce `;;`: the FIRST
-# member of a type that has a following member (`{ ;` parses clean and
-# `ts_syntax.strip_dangling_type_separators` removes it), and any member of a
-# type containing no `;` at all (the engine swallows a comma; a bare newline-
-# separated member is a clean line deletion). Middle and last members of a
-# `;` type are reported as residual until `replace_node_end` lands.
+# TWO RULES PER PRONG, IN TWO ORDERED STAGES — a `;` is rewritten to a `,`
+# first, and only then is the member deleted. That is the whole design, and
+# both halves were measured against the engine rather than reasoned about.
 #
-# Tree-sitter anchors ignore ANONYMOUS nodes only — a COMMENT is a NAMED node
-# (the `rules/dart.toml` finding, re-measured here and found to hold for this
-# grammar too), so it counts as a sibling on both ends of a `.` anchor. That
-# bites twice, in opposite directions:
+# WHAT THE ENGINE CAN AND CANNOT DELETE. Its separator logic knows `,` and not
+# `;`, and its own per-edit syntax check panics on anything the grammar reads
+# as an ERROR. Deleting a member therefore aborts the run when — and only
+# when — the member is IMMEDIATELY FOLLOWED BY a `;` (measured across every
+# position; `{ a; k; b }` -> `{ a; ; b }`, `{ a; k; }` -> `{ a;; }`,
+# `{ k; }` -> `{ ; }`, all ERROR). Note what is NOT in that set: the LAST
+# member of a `;` type carrying no trailing `;` deletes perfectly cleanly
+# (`{ a; k }` -> `{ a; }`), and so does the first member of a multi-member one
+# (`{ k; a }` -> `{ ; a }`, which parses). The rules used to exclude every
+# member of a `;`-bearing host with `not_contains = [";"]`, which was a far
+# blunter instrument than the engine actually needs, and it is what left
+# #3041's `LoginPage.test.tsx` member standing.
 #
-# * On the LEADING side, a comment directly above a multi-line member defeats
-#   the `.` that pins the key to the object type's first child, exactly as it
-#   does for Dart's argument list. No single pattern expresses "the first
-#   non-comment named child" — the same four forms fail the same way (see
-#   `rules/dart.toml`'s header) — so, as there, the ONE-leading-comment shape
-#   is written out as a second rule rather than folded into the first with a
-#   quantifier. Two or more leading comments fall through to no match: a
-#   residue, not a wrong rewrite.
-# * On the TRAILING side, `@entry . (_)` used to read "a following NAMED
-#   sibling" as proof a second member exists — and a comment satisfies that
-#   just as well as a real member does. A SOLE member with a trailing comment
-#   (`{ 'k'?: boolean; // note\n }`) has no second member at all, but the
-#   comment made the rule fire anyway, deleting the only member and leaving
-#   `{;` — which the engine's own per-edit syntax check panics on (measured:
-#   `PanicException: Produced syntactically incorrect source code`). So the
-#   rules below require a LATER sibling of a REAL member kind
-#   (`property_signature`/`method_signature`/`index_signature`/
-#   `call_signature`/`construct_signature`) rather than any following
-#   sibling, with no `.` adjacency — a comment sitting between @entry and
-#   that later member no longer matters, and a sole member never matches
-#   whatever comments surround it. Multiple later members can each satisfy
-#   the pattern, producing multiple matches of the same @entry; the engine
-#   applies one and re-parses, the same way a `contains` filter's multiple
-#   matches are handled.
+# SO THE `;` IS REWRITTEN TO A `,` FIRST. `{ a; k; b }` -> `{ a; k, b }`
+# parses clean (TypeScript lets an object type mix its separators, and this
+# state never reaches the customer: the very next edit takes the member and
+# the engine swallows the `,` it now owns, leaving `{ a; b }`). That converts
+# every shape into one the engine already handles, so no member position needs
+# excluding any more and `replace_node_end` is not required after all.
+#
+# THE TWO STAGES ARE ORDERED BY THEIR POSITION IN THIS FILE, AND THAT IS
+# LOAD-BEARING. Measured: the engine runs the rules in the order they are
+# declared and does not revisit an earlier one after a later one edits, so a
+# deletion rule placed above its normaliser is refused (correctly, by the
+# filter below) and then never reconsidered — leaving the customer a `,` where
+# they wrote a `;` and the member still standing. Every `rewrite_` rule must
+# stay above the `delete_` rule it feeds, and
+# `test_entry_separator_rules_precede_the_deletions` is what keeps it there.
+#
+# THE DELETION RULES CARRY THE GUARD ANYWAY, because an ordering invariant
+# enforced only by a test fails open. `not_contains` on the member-followed-
+# by-`;` shape turns a mis-ordered file into a no-op rather than an engine
+# panic that abandons the whole removal.
+#
+# NEITHER STAGE MAY EMPTY ITS HOST (#3049). `{}` in a TYPE position is not the
+# harmless empty object it is in a value position: it is TypeScript's
+# "any non-nullish value", so `(flags: { 'k'?: boolean })` narrowed to
+# `(flags: {})` starts accepting `0`, `""` and `true`, and `apps/web`'s own
+# eslint rejects it outright (`@typescript-eslint/no-empty-object-type`). That
+# is a type-safety REGRESSION shipped inside a cleanup, which is strictly
+# worse than a residual reference — the residual reference is named in the
+# pull-request body, the widened parameter is only in whatever it later lets
+# through. So every rule here requires a surviving sibling of a REAL member
+# kind, and a sole member is declined and reported instead. The value-object
+# prongs above deliberately keep the opposite trade: `{}` there is an ordinary
+# empty object literal and the right shape for an emptied override.
+#
+# "A REAL member kind" is `property_signature`/`method_signature`/
+# `index_signature`/`call_signature`/`construct_signature`, never `(_)`.
+# Tree-sitter anchors ignore ANONYMOUS nodes only (the `rules/dart.toml`
+# finding, re-measured for this grammar), so a COMMENT is a named sibling and
+# `(_)` took `{ 'k'?: boolean; // note\n }` for a two-member type — deleting
+# the only member and panicking on the `{ ;` it left.
+#
+# THE SURVIVOR IS REQUIRED IN BOTH DIRECTIONS, which is why each prong is two
+# rules rather than one query carrying two patterns. A tree-sitter query may
+# hold several patterns, but Piranha ANDs them: given both an earlier-sibling
+# and a later-sibling pattern in one query, only a MIDDLE member matched, and
+# first and last members silently stopped being deleted at all (measured).
+#
+# No first-member rules and no `_after_comment` variants any more: both
+# existed only to pin a member to the object type's first child with a `.`
+# anchor, which a leading comment defeats. Nothing here anchors to the host's
+# start, so a leading comment is simply not an issue — and the shapes two or
+# more leading comments used to fall through on are now covered.
 
-# STUB PRONG, first member.
+# --- Stage 1: `;` -> `,` ---------------------------------------------------
+# Must stay above every `delete_` rule. These do NOT carry the
+# `delete_flag_keyed_` reporting prefix: they delete no entry, and a report
+# built from them would show the reviewer a `;` where an entry should be.
+
+# STUB PRONG, a later surviving member.
 [[rules]]
-name = "delete_flag_keyed_boolean_first_type_member"
+name = "rewrite_flag_keyed_boolean_type_member_separator_with_later_member"
 query = """(
-  (object_type . (property_signature
-    (string . (string_fragment) @flag_name .)
-    type: (type_annotation (predefined_type) @member_type)) @entry [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
+  (object_type
+    (property_signature
+      (string . (string_fragment) @flag_name .)
+      type: (type_annotation (predefined_type) @member_type)) @entry
+    . (";") @separator
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @member_type "boolean")
 )"""
-replace_node = "entry"
-replace = ""
-groups = ["delete_flag_keyed_entry"]
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
 holes = ["stale_flag_name"]
 
-# STUB PRONG, first member, with ONE leading comment. See the header note.
+# STUB PRONG, an earlier surviving member.
 [[rules]]
-name = "delete_flag_keyed_boolean_first_type_member_after_comment"
+name = "rewrite_flag_keyed_boolean_type_member_separator_with_earlier_member"
 query = """(
-  (object_type . (comment) . (property_signature
-    (string . (string_fragment) @flag_name .)
-    type: (type_annotation (predefined_type) @member_type)) @entry [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
+  (object_type
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
+    (property_signature
+      (string . (string_fragment) @flag_name .)
+      type: (type_annotation (predefined_type) @member_type)) @entry
+    . (";") @separator)
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @member_type "boolean")
 )"""
-replace_node = "entry"
-replace = ""
-groups = ["delete_flag_keyed_entry"]
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
 holes = ["stale_flag_name"]
 
-# REGISTRY PRONG, first member: a sibling member is keyed by another flag.
+# REGISTRY PRONG, a later surviving member.
 [[rules]]
-name = "delete_flag_keyed_registry_first_type_member"
+name = "rewrite_flag_keyed_registry_type_member_separator_with_later_member"
 query = """(
-  (object_type . (property_signature (string . (string_fragment) @flag_name .)) @entry [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
+  (object_type
+    (property_signature (string . (string_fragment) @flag_name .)) @entry
+    . (";") @separator
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
 )"""
-replace_node = "entry"
-replace = ""
-groups = ["delete_flag_keyed_entry"]
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
 holes = ["stale_flag_name", "known_flag_keys"]
 
 [[rules.filters]]
@@ -177,16 +251,19 @@ contains = """(
 )"""
 at_least = 1
 
-# REGISTRY PRONG, first member, with ONE leading comment. See the header note.
+# REGISTRY PRONG, an earlier surviving member.
 [[rules]]
-name = "delete_flag_keyed_registry_first_type_member_after_comment"
+name = "rewrite_flag_keyed_registry_type_member_separator_with_earlier_member"
 query = """(
-  (object_type . (comment) . (property_signature (string . (string_fragment) @flag_name .)) @entry [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
+  (object_type
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
+    (property_signature (string . (string_fragment) @flag_name .)) @entry
+    . (";") @separator)
   (#eq? @flag_name "@stale_flag_name")
 )"""
-replace_node = "entry"
-replace = ""
-groups = ["delete_flag_keyed_entry"]
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
 holes = ["stale_flag_name", "known_flag_keys"]
 
 [[rules.filters]]
@@ -197,13 +274,21 @@ contains = """(
 )"""
 at_least = 1
 
-# STUB PRONG, any member of a type with no `;` in it.
+# --- Stage 2: delete the member --------------------------------------------
+# The `not_contains` filter is the belt to stage 1's braces: it declines a
+# member still followed by a `;`, so a mis-ordered file is a no-op instead of
+# an engine panic. Its capture names are prefixed because Piranha substitutes
+# a rule's OWN captures into its filter queries (see `rules/kt.toml`).
+
+# STUB PRONG, a later surviving member.
 [[rules]]
-name = "delete_flag_keyed_boolean_type_member"
+name = "delete_flag_keyed_boolean_type_member_with_later_member"
 query = """(
-  (property_signature
-    (string . (string_fragment) @flag_name .)
-    type: (type_annotation (predefined_type) @member_type)) @entry
+  (object_type
+    (property_signature
+      (string . (string_fragment) @flag_name .)
+      type: (type_annotation (predefined_type) @member_type)) @entry
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @member_type "boolean")
 )"""
@@ -214,14 +299,44 @@ holes = ["stale_flag_name"]
 
 [[rules.filters]]
 enclosing_node = "(object_type) @host"
-not_contains = ["""(";") @semi"""]
+not_contains = ["""(
+  (property_signature (string . (string_fragment) @unseparated_name .))
+  . (";")
+  (#eq? @unseparated_name "@stale_flag_name")
+)"""]
 
-# REGISTRY PRONG, any member of a type with no `;` in it. Two filters: Piranha
-# refuses `contains` and `not_contains` on the same one.
+# STUB PRONG, an earlier surviving member.
 [[rules]]
-name = "delete_flag_keyed_registry_type_member"
+name = "delete_flag_keyed_boolean_type_member_with_earlier_member"
 query = """(
-  (property_signature (string . (string_fragment) @flag_name .)) @entry
+  (object_type
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
+    (property_signature
+      (string . (string_fragment) @flag_name .)
+      type: (type_annotation (predefined_type) @member_type)) @entry)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @member_type "boolean")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = "(object_type) @host"
+not_contains = ["""(
+  (property_signature (string . (string_fragment) @unseparated_name .))
+  . (";")
+  (#eq? @unseparated_name "@stale_flag_name")
+)"""]
+
+# REGISTRY PRONG, a later surviving member.
+[[rules]]
+name = "delete_flag_keyed_registry_type_member_with_later_member"
+query = """(
+  (object_type
+    (property_signature (string . (string_fragment) @flag_name .)) @entry
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "entry"
@@ -239,4 +354,38 @@ at_least = 1
 
 [[rules.filters]]
 enclosing_node = "(object_type) @host"
-not_contains = ["""(";") @semi"""]
+not_contains = ["""(
+  (property_signature (string . (string_fragment) @unseparated_name .))
+  . (";")
+  (#eq? @unseparated_name "@stale_flag_name")
+)"""]
+
+# REGISTRY PRONG, an earlier surviving member.
+[[rules]]
+name = "delete_flag_keyed_registry_type_member_with_earlier_member"
+query = """(
+  (object_type
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
+    (property_signature (string . (string_fragment) @flag_name .)) @entry)
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys"]
+
+[[rules.filters]]
+enclosing_node = "(object_type) @registry"
+contains = """(
+  (property_signature (string . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)"""
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(object_type) @host"
+not_contains = ["""(
+  (property_signature (string . (string_fragment) @unseparated_name .))
+  . (";")
+  (#eq? @unseparated_name "@stale_flag_name")
+)"""]

@@ -150,6 +150,7 @@ def pr_body(
     bindings: tuple[tuple[str, str, str], ...] = (),
     generated: tuple[str, ...] = (),
     entries: tuple[tuple[str, str], ...] = (),
+    declined: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """The PR description: what was removed, why, and which branch survived.
 
@@ -182,6 +183,14 @@ def pr_body(
     for the same reason
     ``bindings`` is: the code was the customer's, and the evidence rule that
     justified deleting it is the thing a reviewer needs to see.
+
+    ``declined`` is the FIFTH, and the only one that is about something this
+    tool did NOT do. Those entries set the flag to the branch this removal
+    deletes, so both entry prongs left them alone (#3050) and they surface in
+    ``unprocessed`` as residual references — where the generic caveat can only
+    guess at what they are. This field is what lets the body say which of those
+    files the tool understood and why it stopped, so a reviewer reads one
+    paragraph instead of bisecting a red build.
     """
     served = "true" if candidate.treatment else "false"
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
@@ -386,6 +395,27 @@ def pr_body(
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+    if declined:
+        count = len(declined)
+        noun = "entry was" if count == 1 else "entries were"
+        it = "this entry" if count == 1 else "each of these"
+        lines += [
+            f"> **⚠️ {count} flag-keyed {noun} deliberately left in "
+            f"place.** {it.capitalize()} pins the flag to its **{deleted}** "
+            "branch — the one this pull request just deleted — so the code "
+            "around it may be exercising behaviour that no longer exists. "
+            "Stripping the entry would not fix that, it would hide it: a test "
+            "whose subject is the removed branch would keep running and start "
+            "asserting something the code can no longer do. Delete the entry, "
+            "or the code it belongs to, by hand:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in declined[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
     lines += [
         "The rewrite is deterministic (AST transforms), with no LLM involved. "
         "References the tool could not rewrite with confidence were left "
@@ -464,4 +494,32 @@ def note_removed_entries(entries: tuple[tuple[str, str], ...]) -> None:
             len(entries),
             "y" if len(entries) == 1 else "ies",
             "; ".join(f"{path}: {_one_line(text)}" for path, text in entries),
+        )
+
+
+def note_declined_entries(declined: tuple[tuple[str, str], ...]) -> None:
+    """Log the flag-keyed entries this run DECLINED to delete.
+
+    The mirror of :func:`note_removed_entries`, and needed for a reason that
+    one does not have: an entry the rules deleted is in the diff, so the dry
+    run would show it even with no log line, while an entry they declined is
+    in neither the diff nor the engine's summaries. Without this, a `--dry-run`
+    preview of a file the tool deliberately left alone is indistinguishable
+    from one it never looked at.
+
+    WARNING rather than INFO, unlike its counterpart. This is the one outcome
+    here that asks the reviewer to do something — read the enclosing test and
+    decide whether it is still about anything — where a removed entry is a
+    thing already done.
+    """
+    if declined:
+        logger.warning(
+            "%d flag-keyed entr%s left in place because %s value is the branch "
+            "this removal deletes — the enclosing code may be exercising "
+            "behaviour that no longer exists, so check %s by hand: %s",
+            len(declined),
+            "y was" if len(declined) == 1 else "ies were",
+            "its" if len(declined) == 1 else "their",
+            "it" if len(declined) == 1 else "them",
+            "; ".join(f"{path}: {_one_line(text)}" for path, text in declined),
         )
