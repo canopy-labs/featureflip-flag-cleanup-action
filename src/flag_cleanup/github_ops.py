@@ -19,7 +19,9 @@ Two things in here are load-bearing for not being a spammer or a vandal:
   checkout knows nothing about branches pushed by last week's run) about BOTH
   the branch and any prior PR for it, in **any** state. A closed PR is a
   customer saying no; re-opening it every week is worse than not shipping the
-  feature at all.
+  feature at all. :func:`already_handled_pull_request` asks the identical
+  question and additionally names a still-OPEN pull request's URL, so a run
+  that finds a flag already handled can still hand it to the reporter.
 
 Neither an HTTP error nor a missing permission is ever read as "not handled" —
 that would silently duplicate PRs. Failures raise :class:`GitHubApiError` so
@@ -190,6 +192,18 @@ class GitHubEnv:
         return f"{self.server_url.rstrip('/')}/{self.repository}.git"
 
 
+def graphql_url(api_url: str) -> str:
+    """The GraphQL endpoint beside a REST base URL.
+
+    ``https://api.github.com`` serves it at ``/graphql``; GitHub Enterprise
+    Server serves REST at ``/api/v3`` and GraphQL at ``/api/graphql``.
+    """
+    base = api_url.rstrip("/")
+    if base.endswith("/api/v3"):
+        return base[: -len("/v3")] + "/graphql"
+    return base + "/graphql"
+
+
 class GitHubApi:
     """Minimal authenticated transport for the endpoints this tool uses.
 
@@ -217,6 +231,7 @@ class GitHubApi:
                 "X-GitHub-Api-Version": _API_VERSION,
             },
         )
+        self._graphql_url = graphql_url(api_url)
 
     def close(self) -> None:
         self._client.close()
@@ -229,6 +244,11 @@ class GitHubApi:
 
     def patch(self, path: str, json: dict) -> httpx.Response:
         return self._client.patch(path, json=json)
+
+    def graphql(self, query: str, variables: dict) -> httpx.Response:
+        # An absolute URL: httpx uses it as-is rather than joining it to the
+        # REST base, which on GitHub Enterprise Server is a different path.
+        return self._client.post(self._graphql_url, json={"query": query, "variables": variables})
 
 
 def removal_branch(key: str) -> str:
@@ -348,12 +368,148 @@ def already_handled(gh: GitHubApi, repo: str, branch: str) -> bool:
     Asked of the API rather than of local refs, because a scheduled run works
     from a fresh shallow checkout that has never seen last week's branch.
     """
+    if _branch_exists(gh, repo, branch):
+        logger.info(
+            "branch %s already exists on %s — nothing to propose", branch, repo
+        )
+        return True
+
+    return existing_pull_request(gh, repo, branch) is not None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenPullRequest:
+    """An open removal pull request, as much of it as holding it needs.
+
+    ``node_id`` is what GraphQL addresses it by (REST cannot toggle draft), and
+    ``author`` is whose comments are trusted to say whether it is on hold.
+    """
+
+    number: int
+    node_id: str
+    draft: bool
+    author: str
+    html_url: str
+
+
+def _open_pull(pr: dict) -> OpenPullRequest | None:
+    try:
+        user = pr["user"]
+        return OpenPullRequest(
+            number=int(pr["number"]),
+            node_id=str(pr["node_id"]),
+            draft=bool(pr["draft"]),
+            author=str(user["login"]),
+            html_url=str(pr["html_url"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class HandledPullRequest:
+    """The idempotency answer :func:`already_handled_pull_request` gives — with
+    a link, when there is a safe one to give.
+
+    ``open_pr_url`` names a still-OPEN pull request from this branch, so the
+    caller can report it to Featureflip again. It is deliberately empty in the
+    other two ways ``handled`` can be true: a CLOSED pull request (the
+    customer's "no thanks" — reporting it would look like a live PR) and a
+    branch that exists with no pull request ever opened from it (nothing to
+    link). ``handled`` is false only when neither the branch nor any pull
+    request exists.
+
+    ``open_pull`` carries what holding or releasing the pull request needs;
+    ``None`` whenever ``open_pr_url`` is empty, or GitHub's answer lacked one
+    of those fields.
+
+    ``state`` says which of those it was: ``"open"``, ``"merged"``, ``"closed"``
+    (closed without merging), ``"branch"`` (a branch with no pull request), or
+    empty when ``handled`` is false. A merged removal and a declined one are
+    both ``state: closed`` to the REST API and opposite facts to the customer:
+    one is waiting to be archived, the other was turned down.
+
+    ``closed_pr_url`` names a merged or closed pull request, for the run's
+    report only. It is a separate field from ``open_pr_url`` so that nothing
+    that links pull requests in Featureflip can pick it up by mistake.
+    """
+
+    handled: bool
+    open_pr_url: str = ""
+    open_pull: OpenPullRequest | None = None
+    state: str = ""
+    closed_pr_url: str = ""
+
+
+def already_handled_pull_request(gh: GitHubApi, repo: str, branch: str) -> HandledPullRequest:
+    """Like :func:`already_handled`, but also names an OPEN pull request's URL.
+
+    Exists for the run that finds a flag already handled by an EARLIER run —
+    one that reported nothing at the time (a transient 5xx/429, a token that
+    could not yet write, an Action version that predates reporting at all) —
+    so this run's up-front idempotency check can hand that link to the
+    reporter instead of the flag going unlinked forever.
+
+    Queries the pull-request endpoint FIRST, the reverse of
+    :func:`already_handled`, because that response already carries ``state``
+    and ``html_url`` for the exact lookup :func:`already_handled` throws away.
+    For the case this function exists to serve — a branch (and its pull
+    request) a PRIOR run already pushed — that is the SAME single request
+    :func:`already_handled` would have made for it, so answering the URL costs
+    no additional request over what idempotency already pays. Only a branch
+    with no pull request ever opened from it (rare — see
+    ``orchestrate._discard_pushed_branch``) falls through to a second, ref-only
+    request, to answer ``handled`` the way :func:`already_handled` would.
+    """
+    pr = _pull_request_lookup(gh, repo, branch)
+    if pr is not None:
+        if pr.get("state") == "open":
+            logger.info(
+                "pull request #%s from %s is still open — not proposing it again",
+                pr.get("number"),
+                branch,
+            )
+            return HandledPullRequest(
+                handled=True,
+                open_pr_url=str(pr.get("html_url") or ""),
+                open_pull=_open_pull(pr),
+                state="open",
+            )
+        merged = bool(pr.get("merged_at"))
+        logger.info(
+            "pull request #%s from %s was %s — not proposing it again, and not "
+            "reporting it as a live pull request",
+            pr.get("number"),
+            branch,
+            "merged" if merged else "closed without merging",
+        )
+        return HandledPullRequest(
+            handled=True,
+            state="merged" if merged else "closed",
+            closed_pr_url=str(pr.get("html_url") or ""),
+        )
+
+    if _branch_exists(gh, repo, branch):
+        logger.info(
+            "branch %s already exists on %s with no pull request — nothing to "
+            "propose or report",
+            branch,
+            repo,
+        )
+        return HandledPullRequest(handled=True, state="branch")
+
+    return HandledPullRequest(handled=False)
+
+
+def _branch_exists(gh: GitHubApi, repo: str, branch: str) -> bool:
+    """Does ``branch`` exist on the remote, per the ref endpoint?
+
+    Shared by :func:`already_handled` and :func:`already_handled_pull_request`
+    so the two never drift on what "exists" means.
+    """
     ref_response = gh.get(f"/repos/{repo}/git/ref/heads/{branch}")
     if ref_response.status_code == 200:
         if _body_names_ref(ref_response, f"refs/heads/{branch}"):
-            logger.info(
-                "branch %s already exists on %s — nothing to propose", branch, repo
-            )
             return True
         # A 200 that does NOT name this exact ref is a prefix match on other
         # branches (GitHub's ref endpoints have historically answered that
@@ -364,27 +520,24 @@ def already_handled(gh: GitHubApi, repo: str, branch: str) -> bool:
             "the branch as absent",
             branch,
         )
-    elif ref_response.status_code != 404:
+        return False
+    if ref_response.status_code != 404:
         _raise_api_error(
             ref_response,
             f"could not check whether branch {branch} exists; refusing to "
             "assume it does not",
         )
+    return False
 
-    return existing_pull_request(gh, repo, branch) is not None
 
+def _pull_request_lookup(gh: GitHubApi, repo: str, branch: str) -> dict | None:
+    """The first pull request (any state) for ``branch``, as raw JSON, or ``None``.
 
-def existing_pull_request(gh: GitHubApi, repo: str, branch: str) -> str | None:
-    """The URL of a pull request already opened from ``branch``, or ``None``.
-
-    ``state=all``, so a PR the customer closed counts: re-proposing a removal
-    they turned down is worse than proposing nothing.
-
-    ``None`` means *provably none exists*. An empty string means one exists but
-    the response did not name its URL — the two must not be conflated, because
-    the caller in ``orchestrate`` uses this to decide whether a pushed branch
-    can be deleted, and deleting the head branch of a pull request CLOSES that
-    pull request. Raises rather than guessing when the API will not answer.
+    Shared by :func:`existing_pull_request` and
+    :func:`already_handled_pull_request` so both ask GitHub the identical
+    question — ``state=all``, so a PR the customer closed counts — and never
+    drift on how the body is read. Raises rather than guessing when the API
+    will not answer.
     """
     owner = repo.split("/", 1)[0]
     response = gh.get(
@@ -401,14 +554,31 @@ def existing_pull_request(gh: GitHubApi, repo: str, branch: str) -> str | None:
     pulls = response.json()
     if not isinstance(pulls, list) or not pulls:
         return None
-    first = pulls[0] if isinstance(pulls[0], dict) else {}
+    return pulls[0] if isinstance(pulls[0], dict) else {}
+
+
+def existing_pull_request(gh: GitHubApi, repo: str, branch: str) -> str | None:
+    """The URL of a pull request already opened from ``branch``, or ``None``.
+
+    ``state=all``, so a PR the customer closed counts: re-proposing a removal
+    they turned down is worse than proposing nothing.
+
+    ``None`` means *provably none exists*. An empty string means one exists but
+    the response did not name its URL — the two must not be conflated, because
+    the caller in ``orchestrate`` uses this to decide whether a pushed branch
+    can be deleted, and deleting the head branch of a pull request CLOSES that
+    pull request. Raises rather than guessing when the API will not answer.
+    """
+    pr = _pull_request_lookup(gh, repo, branch)
+    if pr is None:
+        return None
     logger.info(
         "pull request #%s was already opened from %s (state=%s) — not proposing it again",
-        first.get("number"),
+        pr.get("number"),
         branch,
-        first.get("state"),
+        pr.get("state"),
     )
-    return str(first.get("html_url") or "")
+    return str(pr.get("html_url") or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -728,17 +898,19 @@ def update_pull_request(
 ) -> None:
     """PATCH the fields given, leaving every other field alone.
 
-    ``state="open"`` reopens a closed pull request — the same call, because
-    GitHub treats it as an ordinary field.
+    ``state="open"`` reopens a closed pull request. Send it ALONE and before
+    any force-push to the head branch: GitHub refuses to reopen a pull request
+    whose head was force-pushed while it was closed, so a reopen bundled with
+    the post-push title and body fails every time.
 
     NOT capable of flipping ``draft``: that needs GraphQL
     (``markPullRequestReadyForReview``). A re-run therefore leaves the draft
     state exactly as it found it and says so in the body when the flag's tier
     no longer matches it.
 
-    Raises on refusal. By the time this is called the force-push has already
-    landed, so a swallowed failure would leave the branch carrying a new diff
-    and the pull request describing the old one.
+    Raises on refusal. The title-and-body update runs after the force-push has
+    already landed, so a swallowed failure there would leave the branch
+    carrying a new diff and the pull request describing the old one.
     """
     changes = {
         name: value
@@ -989,13 +1161,16 @@ def actor_permission(gh: GitHubApi, repo: str, login: str) -> str:
     return str(permission or "none").strip().lower()
 
 
-def comment_on_pull_request(gh: GitHubApi, repo: str, number: int, body: str) -> None:
+def comment_on_pull_request(gh: GitHubApi, repo: str, number: int, body: str) -> bool:
     """Reply on the pull request. Logged rather than raised on failure.
 
     The reply is this mode's report, so it matters — but by the time it is
     posted the work it describes has already landed and is visible on the pull
     request itself. Failing the run over a missing receipt would be the same
     trade ``open_pr`` declines to make for labels.
+
+    Returns whether the comment was posted, for the one caller that must not
+    act on an unrecorded decision.
     """
     response = gh.post(f"/repos/{repo}/issues/{number}/comments", json={"body": body})
     if response.status_code != 201:
@@ -1006,6 +1181,82 @@ def comment_on_pull_request(gh: GitHubApi, repo: str, number: int, body: str) ->
             response.status_code,
             _api_message(response),
         )
+        return False
+    return True
+
+
+_TO_DRAFT = (
+    "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) "
+    "{ pullRequest { isDraft } } }"
+)
+_TO_READY = (
+    "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) "
+    "{ pullRequest { isDraft } } }"
+)
+
+
+def set_draft(gh: GitHubApi, pull: OpenPullRequest, *, draft: bool) -> bool:
+    """Convert ``pull`` to a draft, or mark it ready. True when GitHub did it.
+
+    GraphQL, because REST's ``PATCH /pulls/{n}`` ignores ``draft``. GraphQL
+    reports most failures as HTTP 200 with an ``errors`` list, so both are
+    checked. Never raises: the caller is best effort by design.
+    """
+    response = gh.graphql(_TO_DRAFT if draft else _TO_READY, {"id": pull.node_id})
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.status_code == 200 and isinstance(payload, dict) and not payload.get("errors"):
+        return True
+    detail = payload.get("errors") or payload.get("message") if isinstance(payload, dict) else response.text[:200]
+    logger.warning(
+        "could not %s pull request #%s (HTTP %d): %s",
+        "convert to a draft" if draft else "mark ready for review",
+        pull.number,
+        response.status_code,
+        detail,
+    )
+    return False
+
+
+_COMMENT_PAGE_SIZE = 100
+_MAX_COMMENT_PAGES = 20
+
+
+def issue_comments(gh: GitHubApi, repo: str, number: int) -> list[dict] | None:
+    """Every comment on pull request ``number``, oldest first, or ``None``.
+
+    ``None`` means "could not tell" (an API error, or more pages than the cap),
+    which a caller deciding whether a pull request is on hold must treat as
+    unknown rather than as "no comments".
+    """
+    comments: list[dict] = []
+    for page in range(1, _MAX_COMMENT_PAGES + 1):
+        response = gh.get(
+            f"/repos/{repo}/issues/{number}/comments",
+            params={"per_page": str(_COMMENT_PAGE_SIZE), "page": str(page)},
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "could not read the comments on pull request #%s in %s (HTTP %d)",
+                number, repo, response.status_code,
+            )
+            return None
+        try:
+            batch = response.json()
+        except ValueError:
+            return None
+        if not isinstance(batch, list):
+            return None
+        comments.extend(c for c in batch if isinstance(c, dict))
+        if len(batch) < _COMMENT_PAGE_SIZE:
+            return comments
+    logger.warning(
+        "pull request #%s in %s has more than %d comments; not reading further",
+        number, repo, _COMMENT_PAGE_SIZE * _MAX_COMMENT_PAGES,
+    )
+    return None
 
 
 def _body_names_ref(response: httpx.Response, ref: str) -> bool:

@@ -1,0 +1,41 @@
+# Wires two self-edges onto C#'s built-in cascade (see csharp.toml). Piranha
+# reads [[edges]] only from this file, never from rules.toml.
+#
+# Like php_edges.toml, this file does NOT define a cascade. C# is a built-in
+# engine language, so `get_rule_graph` MERGES what is here with the engine's
+# own C# edges rather than replacing them — every built-in edge is still in
+# force and must not be restated.
+#
+# The gap: a folded early return strands everything after it,
+#
+#     if (<read>) { return 1; }  A();  B();  return 2;
+#     ->  return 1;  A();  B();  return 2;
+#
+# and the built-in `delete_all_statements_after_return` removes ONE statement
+# per firing. Its `(_)+ @post` capture matches the whole tail, but the engine
+# resolves `replace_node = "post"` to the first node bearing that capture, and
+# the rule is reached only from `if_cleanup`, so nothing fires it again on what
+# is left. The run above came out as `return 1; B(); return 2;` — dead code
+# the pull request claimed to have removed, and CS0162, which fails a
+# `TreatWarningsAsErrors` build.
+#
+# Java and Dart never showed it because `remove_unreachable_statements` in
+# syntax.py clears their tails after the engine runs. C# is deliberately
+# outside that pass (unreachable code is a warning here, not an error), so the
+# engine is the only thing that cleans it, and the engine has to finish.
+#
+# A self-edge makes each deletion re-fire the rule on its parent block until no
+# statement follows the return. Parent scope is what the `if_cleanup` edge
+# already uses, so this reaches nothing the first firing could not: it only
+# finishes the job. `delete_all_statements_after_returning_block` has the
+# identical capture and the identical gap (a kept `{ …; return x; }` block
+# followed by two statements), so it gets the same edge.
+[[edges]]
+scope = "Parent"
+from = "delete_all_statements_after_return"
+to = ["delete_all_statements_after_return"]
+
+[[edges]]
+scope = "Parent"
+from = "delete_all_statements_after_returning_block"
+to = ["delete_all_statements_after_returning_block"]

@@ -149,6 +149,50 @@ enclosing_node = """(
   (#eq? @decl_name "@key_const")
 )"""
 
+# --- fold a read through `self::`/`static::`/`parent::`, file-scoped ---------
+# A constant declared on a BASE class and read from a subclass in the same file
+# shares no ancestor with the read but the file, so the class-scoped rule above
+# declines it -- and, while the delete guard below was class-scoped too, the
+# declaration was deleted out from under the read. `java_const.toml` resolves a
+# constant file-wide for the same reason.
+#
+# Only the RELATIVE scopes are widened. They resolve through the inheritance
+# chain of the class the read sits in, which is the reading the file-wide
+# bound-exactly-once check in Gate 2 is sound for. A read through a NAMED class
+# (`Keys::FLAG_KEY`) can name a class declared in another file entirely, where a
+# file-wide match would fold the wrong constant, so that form stays with the
+# class-scoped rule above, and the file-scoped delete guard keeps its
+# declaration standing when it declines.
+[[rules]]
+name = "replace_boolvariation_relative_const_key_read_with_boolean_literal"
+query = """(
+  [(member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments
+        . (argument (class_constant_access_expression (relative_scope) (name) @key_const .))))
+   (function_call_expression
+      function: (name) @sdk_fn
+      arguments: (arguments
+        . (argument (class_constant_access_expression (relative_scope) (name) @key_const .))))] @call
+  (#eq? @sdk_fn "boolVariation")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((program) @scope)"""
+contains = """(
+  (const_declaration
+    ["const" type: (_)] . (const_element
+        (name) @decl_name
+        [(string (string_content) @flag_name)
+         (encapsed_string (string_content) @flag_name)]) .)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
 # --- delete the now-unused declaration ---------------------------------------
 # Flag-key-scoped, so there is no blast radius on unrelated constants. Rooted
 # at the PARENT and deleting the declaration as a child of it, for the reason
@@ -181,7 +225,14 @@ replace = ""
 holes = ["stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """([(class_declaration) (program)] @container)"""
+# ITS SCOPE IS THE FILE. `enclosing_node` takes the NEAREST matching ancestor,
+# so a class-scoped guard looked only inside the class holding the declaration,
+# and a surviving read in a SUBCLASS or a SIBLING class -- which inherits or
+# names the constant -- was invisible to it: the declaration was deleted and the
+# read stayed, a reference to nothing. java_const.toml's guard is file-scoped for
+# the same reason. Over-refusing here costs one uncleaned declaration, which is
+# the direction this file fails in.
+enclosing_node = """((program) @container)"""
 not_contains = ["""(
   [(member_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))
    (function_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))] @surviving_read

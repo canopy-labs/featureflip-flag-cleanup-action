@@ -404,6 +404,51 @@ not_contains = ["""(
 not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
 
 
+# --- <marker>(true|false) -> that literal
+#
+# Not an SDK shape: the one rule in this file that matches something THIS TOOL
+# wrote. It is the TypeScript half of the Python rule of the same name, and
+# exists for the same reason.
+#
+# The fold can leave a local bound to a bare literal that no const rule could
+# have seen coming: `const show = on || user.enrolled` becomes
+# `const show = true` only once `on` has been inlined and the `||` folded, and
+# `ts_const.toml` matches a const bound to the READ, not to whatever an
+# expression around the read later folds into. `ts_fold.inline_literal_bindings`
+# resolves that binding after the engine, with the whole file in hand, and
+# writes a call to this marker at each reference instead of the literal itself.
+# The engine then runs again and this rule creates the literal INSIDE the
+# cascade, where the edges reach `if_cleanup` and `jsx_cleanup` — a literal
+# written by Python after the engine exits reaches no edge at all, which is
+# the defect the Python twin of this rule was written to close.
+#
+# The marker carries its value as its argument rather than folding to
+# `@treated`: `const hide = !on` binds the OPPOSITE literal, and a marker
+# hard-wired to the treatment would invert it.
+#
+# `@marker` is the same reserved-looking `__ff_cleanup_<digest>` the Python
+# pass uses, and the same guards apply: the inliner declines a file that
+# already contains it, a file where one survives the engine is unwound, and
+# Gate 1 refuses one that reaches it regardless. The callee is captured as
+# `@inlined_callee`, not `@sdk_fn`: it is not an SDK name, so accessor
+# synthesis and the SDK-name consistency test must not count it as one. Nor
+# may the capture START with a hole's name — holes are substituted as text, so
+# `@marker_fn` became `__ff_cleanup_…_fn` and the query no longer parsed.
+[[rules]]
+name = "replace_inlined_binding_marker_with_boolean_literal"
+query = """(
+  (call_expression
+    function: (identifier) @inlined_callee
+    arguments: (arguments . [(true) (false)] @value .)
+  ) @call
+  (#eq? @inlined_callee "@marker")
+)"""
+replace_node = "call"
+replace = "@value"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["marker"]
+
+
 # ===========================================================================
 # 3. Everything after the read belongs to the engine
 # ===========================================================================

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.2.1"
+version = "1.3.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -184,7 +184,57 @@ dependencies = [
     # of parentheses, so `((True)) and other` still stalls. A doubly-
     # parenthesised flag read is not a shape real source contains, and the
     # `if`/`elif` half is covered anyway because the post-pass unwraps in a loop.
-    "polyglot-piranha==0.15.0",
+    #
+    # 0.16.0 (piranha#99) ports fixes that had landed in one language to the
+    # siblings that had the same defect: Swift `!( … )`, condition lists,
+    # free-function inline and a refusal to inline a name bound twice;
+    # literal-vs-literal comparisons for go, php and cs; pattern guards for cs,
+    # java and python; splice-or-keep-block for java, cs, dart and go. One
+    # change needs a downstream half: in kt and swift a surviving branch that
+    # declares a name is left as a literal `if` (neither has a bare block to
+    # keep its scope in), and `syntax.py`'s residue gate now refuses that rather
+    # than shipping it with the flag key gone. No grammar rev moved, so the
+    # tree-sitter-typescript pin below stays at `+canopy.3`.
+    #
+    # 0.16.1 (piranha#101), not 0.16.0: 0.16.0 anchored Swift's
+    # `guard_always_true` in a shape that cost ~18s per run, so every Swift
+    # removal took ~20s instead of ~2s. Measured on every Swift fixture here;
+    # 0.16.1 is back to 0.15.0's times.
+    #
+    # 0.16.2 (piranha#103, #104). Swift: an `if` whose then-block is EMPTY
+    # used to have its branches swapped in both treatments, and the output
+    # parsed, so no gate here saw it. It now folds correctly, and the shapes
+    # the engine declines (a comment-only then-block, an empty `else`) are
+    # left as a literal `if`, which the residue gate refuses.
+    # Java/Kotlin: a boolean-initialised field is deleted only when it is
+    # private. No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.16.3 (piranha#106). Java: a private field is deleted only when its
+    # class is top-level. A private member of a nested, local or anonymous
+    # class is visible to the enclosing class (`settings.on`), which the
+    # class-scoped rewrite never reaches, so the field is kept as the literal.
+    # No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.17.0 (piranha#108). Two engine aborts that refused the whole file:
+    # Dart `while (read)` / `do … while (read)` lost the parentheses the
+    # statement requires, and a Go package-level `var x = <read>` panicked
+    # looking for an enclosing function (it is now folded and kept, since the
+    # binding is package-visible). Swift: a trailing `else if <read>` keeps
+    # its branch's braces on true and takes its `else` with it on false, using
+    # the release's new span capture.
+    # Python and Dart fold `await <literal>`. No grammar rev moved, so
+    # `+canopy.3` stays.
+    #
+    # 0.17.1 (piranha#111). The engine's tree-sitter-dart is now the
+    # canopy-labs fork `v0.2.0-canopy.1`. An arrow function's body extends past
+    # its postfix selectors, so a read at the end of a lambda is the lambda's
+    # body. Under stock 0.2.0, `(i) => client.boolVariation(...)` parsed as
+    # `((i) => client).boolVariation(...)` and the seed rule replaced the whole
+    # lambda. That was worked around by a pre-pass that parenthesised those
+    # reads before the engine ran. The pre-pass is gone, and the reads reach
+    # the engine as written. Only the Dart rev moved, and Dart's Gate 1 grammar
+    # comes from PyPI, so `+canopy.3` stays.
+    "polyglot-piranha==0.17.1",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

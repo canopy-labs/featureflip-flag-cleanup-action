@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "SynthesisError",
+    "cross_file_key_rules",
     "generated_rule_names",
     "with_accessors",
     "with_accessor_const_rules",
@@ -112,6 +113,15 @@ def _strip_comments(text: str) -> str:
         line
         for line in text.splitlines()
         if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def _strip_comments_keep_markers(text: str) -> str:
+    """Drop comment lines except the `# xconst:` markers the cloner selects on."""
+    return "\n".join(
+        line
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#") or line.lstrip().startswith("# xconst:")
     )
 
 
@@ -409,3 +419,148 @@ def with_accessor_guards(const_rules_text: str, accessors: tuple[str, ...]) -> s
         return block + additions
 
     return pattern.sub(extend, const_rules_text)
+
+
+_HOLES_LINE = re.compile(r"^holes = \[(.*)\]$", re.MULTILINE)
+#: Holes whose value a keyless reader never holds. The engine skips a file
+#: that holds none of its seeds' query-hole values, so one such hole left on
+#: any base seed skips every reader: the key, which a reader names only
+#: through the constant, and the bound-read marker, which is only ever written
+#: into a file after a first pass (and a marker round re-runs the file under
+#: the base rules, not these). `ts.toml`'s marker rule alone made the engine
+#: skip every TypeScript reader.
+_READER_ABSENT_HOLES = frozenset({"stale_flag_name", "marker"})
+
+
+def _without_comment_lines(text: str) -> str:
+    """Drop whole-line comments, leaving every multi-line string untouched.
+
+    The base file's commentary describes rules running on files that hold the
+    key, which a reader does not; the generated file carries rules only.
+    """
+    kept: list[str] = []
+    in_string = False
+    for line in text.splitlines():
+        if not in_string and line.lstrip().startswith("#"):
+            continue
+        kept.append(line)
+        if line.count('"""') % 2 == 1:
+            in_string = not in_string
+    return "\n".join(kept) + "\n"
+
+
+def _without_key_hole(match: re.Match[str]) -> str:
+    holes = [h.strip() for h in match.group(1).split(",") if h.strip()]
+    kept = [h for h in holes if h.strip("\"'") not in _READER_ABSENT_HOLES]
+    return f"holes = [{', '.join(kept)}]"
+
+
+def cross_file_key_rules(
+    base_rules_text: str,
+    template_text: str,
+    references,
+    *,
+    accessors: tuple[str, ...] = (),
+    strip_key_hole: bool = True,
+) -> str:
+    """Rules for the reader invocation: one clone per proven reference.
+
+    A reader names a key constant declared in another file and never the key
+    itself, so no shipped seed can reach it. Each template block is cloned for
+    every distinct ``(owner, member)`` the resolution proved, and again for
+    every configured accessor: an accessor read is proven like an SDK read, and
+    a proven read with no rule to remove it would be left pointing at a
+    declaration the same run deletes. An enum entry's read is cloned from the
+    `# xconst: enum-*` block of its shape, once per `(owner, member, accessor)`;
+    a TypeScript entry read as ``ns.Flags.X`` (an owner spelled ``ns.Flags``)
+    from the `# xconst: enum-nested` blocks, where the template has them.
+
+    The clones go FIRST (seeds fire in declaration order). The base rules
+    follow so their cleanup cascade and edges resolve, with ``stale_flag_name``
+    and ``marker`` removed from every ``holes`` line: the engine skips a file
+    that holds none of its seeds' hole values, which would skip every reader.
+    A base seed left holding the literal text ``@stale_flag_name`` or
+    ``@marker`` can never match, which is the intent -- in a reader only the
+    clones may fire.
+
+    ``strip_key_hole=False`` keeps the base rules as shipped, for a reader whose
+    text holds the key too: there the engine does not skip the file, and the
+    stripped seeds would leave that reader's direct reads standing.
+    """
+    blocks = [
+        b for b in _split_blocks(_strip_comments_keep_markers(template_text))[1:]
+    ]
+    qualified = [b for b in blocks if "# xconst: qualified" in b]
+    bare = [b for b in blocks if "# xconst: bare" in b]
+    if not qualified or not bare:
+        raise SynthesisError(
+            "a cross-file reader template needs a `# xconst: qualified` and a "
+            "`# xconst: bare` block"
+        )
+
+    distinct: list[tuple[str | None, str, str]] = []
+    for ref in references:
+        key = (ref.owner, ref.member, getattr(ref, "accessor", ""))
+        if key not in distinct:
+            distinct.append(key)
+
+    enum_blocks: dict[str, list[str]] = {}
+    for block in blocks:
+        marker = re.search(r"# xconst: (enum-[a-z-]+)", block)
+        if marker is not None:
+            enum_blocks.setdefault(marker.group(1), []).append(block)
+
+    clones: list[str] = []
+    for index, (owner, member, accessor) in enumerate(distinct):
+        # `ns.Flags.X`: an entry read through a namespace of its file.
+        nested = (
+            enum_blocks.get("enum-nested")
+            if owner is not None and "." in owner and not accessor
+            else None
+        )
+        namespace, owner_text = owner.rsplit(".", 1) if nested else ("", owner or "")
+        if accessor:
+            shape = (
+                f"enum-{'qualified' if owner is not None else 'bare'}"
+                f"-{'call' if accessor.endswith('()') else 'field'}"
+            )
+            chosen = enum_blocks.get(shape)
+            if not chosen:
+                raise SynthesisError(
+                    f"a read through an enum accessor needs a `# xconst: {shape}` block"
+                )
+        elif nested:
+            chosen = nested
+        else:
+            chosen = qualified if owner is not None else bare
+        for block in chosen:
+            block = block.replace("__XCONST_NAMESPACE__", namespace)
+            block = block.replace("__XCONST_OWNER__", owner_text)
+            block = block.replace("__XCONST_MEMBER__", member)
+            block = block.replace("__XCONST_ACCESSOR__", accessor.removesuffix("()"))
+            variants = [("", block)]
+            if _SDK_FN_PREDICATE.search(block) is not None:
+                variants += [
+                    (
+                        f"__accessor_{accessor}",
+                        _SDK_FN_PREDICATE.sub(
+                            f'(#eq? @sdk_fn "{accessor}")', block, count=1
+                        ),
+                    )
+                    for accessor in accessors
+                ]
+            for suffix, variant in variants:
+                clone = re.sub(
+                    r'^name = "(.*)"$',
+                    lambda m: f'name = "{m.group(1)}__{index}{suffix}"',
+                    variant,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                clones.append(
+                    _RULE_HEADER + "\n" + clone.removeprefix(_RULE_HEADER).strip() + "\n"
+                )
+    stripped_base = _without_comment_lines(base_rules_text)
+    if strip_key_hole:
+        stripped_base = _HOLES_LINE.sub(_without_key_hole, stripped_base)
+    return "\n".join(clones) + "\n" + stripped_base

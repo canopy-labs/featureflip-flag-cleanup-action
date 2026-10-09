@@ -112,7 +112,13 @@ def _literal(arm: Node) -> bool | None:
     patterns = _patterns(arm)
     if len(patterns) != 1 or not patterns[0].named_children:
         return None
-    kind = patterns[0].named_children[0].type
+    # The flag read is replaced in place, so a literal lands inside whatever
+    # parentheses the source already had: `when (read)` becomes `when (true)`.
+    # Unwrapped in a loop, as `php_fold._literal` does, so nesting is free.
+    inner = patterns[0].named_children[0]
+    while inner.type == "parenthesized_statements" and len(inner.named_children) == 1:
+        inner = inner.named_children[0]
+    kind = inner.type
     return True if kind == "true" else False if kind == "false" else None
 
 

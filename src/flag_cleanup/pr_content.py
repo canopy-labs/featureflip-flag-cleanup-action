@@ -12,13 +12,27 @@ a config it returns strings.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
+from flag_cleanup.cross_file_keys import (
+    ENUM_DYNAMIC,
+    ENUM_UNPROVEN,
+    KEPT,
+    LEFT,
+    LEFT_COMPETING,
+    NAME_NOT_UNIQUE,
+)
+from flag_cleanup.residue import Residue
 from flag_cleanup.urls import without_userinfo
+
+if TYPE_CHECKING:
+    from flag_cleanup.constant_wrappers import ConstantWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +156,72 @@ def _rewritten_build_output(diff: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def _bare_import_lines(bare_imports: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each import cut down to a bare one, or nothing.
+
+    A TypeScript or JavaScript import whose names the fold left unused is not
+    deleted when the original file loaded its module, because loading a module
+    can do work and nothing here can tell whether this one does: the import
+    becomes a bare ``import "…"`` that keeps the load. Most modules do nothing
+    on load, so most of these lines are junk to the reviewer, and a generic
+    sentence left them to be found in the diff. Each is named instead, with
+    the exact line to delete.
+
+    A CommonJS ``const { client } = require("…")`` is the same case in the
+    other module system: it is cut down to ``require("…");``, which keeps the
+    load and binds nothing, so it is listed here too and the heading names
+    whichever spellings the list holds.
+    """
+    if not bare_imports:
+        return []
+    count = len(bare_imports)
+    noun = "import was" if count == 1 else "imports were"
+    spellings = " or ".join(
+        f"`{spelling}`"
+        for spelling in ("import", "require")
+        if any(text.startswith(spelling) for _, text in bare_imports)
+    )
+    return [
+        f"> **{count} {noun} kept as a bare {spellings} so the module still "
+        "loads.** Nothing in the file uses what it imported any more, but the "
+        "original file loaded the module, and loading it may do work such as "
+        "creating a client or registering a handler. This tool cannot tell "
+        "whether it does. If it does nothing, delete the line:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in bare_imports[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _marked_import_lines(marked: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Python import kept whole and marked, or nothing.
+
+    The Python counterpart of :func:`_bare_import_lines`, and a note of its
+    own because the line is a different one: Python has no import that loads
+    a module without binding a name, so the statement keeps every byte and
+    gains ``# noqa: F401``. Even the name is not safe to drop, because the
+    name imported from a package can be a submodule only this line loads.
+    """
+    if not marked:
+        return []
+    count = len(marked)
+    noun = "import was" if count == 1 else "imports were"
+    return [
+        f"> **{count} {noun} kept and marked `# noqa: F401` so the module "
+        "still loads.** Nothing in the file uses what it imported any more, "
+        "but loading a Python module runs it, which may do work such as "
+        "creating a client or registering a handler, and a name imported "
+        "from a package may be a submodule that only this line loads. This "
+        "tool cannot tell whether either is true. If neither is, delete the "
+        "line:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in marked[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def pr_body(
     candidate: Candidate,
     config: Config,
@@ -151,6 +231,13 @@ def pr_body(
     generated: tuple[str, ...] = (),
     entries: tuple[tuple[str, str], ...] = (),
     declined: tuple[tuple[str, str], ...] = (),
+    test_doubles: tuple[tuple[str, str, str], ...] = (),
+    residue: Residue = Residue(),
+    deleted_tests: tuple[tuple[str, str], ...] = (),
+    wrappers: tuple[ConstantWrapper, ...] = (),
+    left_in_place: tuple[tuple[str, str], ...] = (),
+    unresolved: tuple[tuple[str, int, str, str], ...] = (),
+    enum_findings: tuple[tuple[str, int, str, str], ...] = (),
 ) -> str:
     """The PR description: what was removed, why, and which branch survived.
 
@@ -174,7 +261,10 @@ def pr_body(
     It is a separate field, and gets a separate sentence, because
     ``stranded``'s sentence is specifically about statements the language's own
     toolchain proves unreachable, and printing that for an import would be
-    false. See :func:`~flag_cleanup.unused.remove_stranded_bindings`.
+    false. See :func:`~flag_cleanup.unused.remove_stranded_bindings`. Its
+    ``"bare import"`` entries are pulled out into a callout of their own:
+    those statements were kept, not removed, and each is a line the reviewer
+    is asked to judge (see :func:`_bare_import_lines`).
 
     ``entries`` is a FOURTH case: a flag-keyed entry — a registry line, an
     override property, an object-type member — deleted under one of the two
@@ -191,6 +281,34 @@ def pr_body(
     guess at what they are. This field is what lets the body say which of those
     files the tool understood and why it stopped, so a reviewer reads one
     paragraph instead of bisecting a red build.
+
+    ``test_doubles`` is a SIXTH: what the test-double pre-pass deleted (see
+    :mod:`~flag_cleanup.mock_stubs`). Tests whose mock returned the removed
+    value get their own warning, because a whole test went; the stub and
+    verification lines that went from tests which stayed are listed beneath
+    it. Named because each was the customer's test code.
+
+    ``residue`` sorts ``unprocessed`` rather than adding to it. A test that
+    still stubs the removed read and a file naming the flag only in comments
+    each get their own paragraph, and only what is left keeps the generic
+    caveat — one undifferentiated list used to put a test about to fail beside
+    a doc comment, with nothing to say which mattered.
+
+    ``deleted_tests`` is the SEVENTH, and the TypeScript family's answer to the
+    same shape: there the entry rules strip every pin, and a test whose title
+    says it exercises the removed branch is deleted whole (see
+    :mod:`~flag_cleanup.ts_tests`). That choice reads a title, which makes it a
+    heuristic, so each one is named with the title it was chosen by.
+
+    ``wrappers`` is the EIGHTH, and like ``declined`` it is about work left
+    undone: members the fold reduced to a constant whose callers still branch
+    on them. The callers name no flag key, so nothing above catches them —
+    not even ``unprocessed``. See :mod:`flag_cleanup.constant_wrappers`.
+
+    ``left_in_place`` is the NINTH: things a rule would have removed and the transform
+    deliberately put back, each with its reason — a test still handing the key
+    to the code under test, and a registry entry kept because something still
+    names the key. Those files also appear in ``unprocessed``; this says why.
     """
     served = "true" if candidate.treatment else "false"
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
@@ -226,6 +344,31 @@ def pr_body(
             "not `Dead` — confirm it really is settled, then mark the PR ready.",
             "",
         ]
+    stubbed_paths = list(dict.fromkeys(path for path, _ in residue.stubbed))
+    held_paths = [path for path, _ in residue.enum_held]
+    sorted_out = set(stubbed_paths) | set(residue.comment_only) | set(held_paths)
+    generic = tuple(path for path in unprocessed if path not in sorted_out)
+    if residue.stubbed:
+        lines += [
+            f"> **⚠️ {len(stubbed_paths)} test file(s) still stub the read this "
+            "pull request removed.** Each line below describes the flag read to "
+            "a mock, and nothing performs that read any more: the setup is dead, "
+            "and an assertion beside it about what the flag returned may now "
+            "fail. Whether the test should now expect the kept branch or go "
+            "entirely is your call, so they were left for you:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in residue.stubbed[:20]
+            ],
+            *(
+                [f"> - ...and {len(residue.stubbed) - 20} more"]
+                if len(residue.stubbed) > 20
+                else []
+            ),
+            "",
+        ]
+    unprocessed = generic
     if unprocessed:
         shown = unprocessed[:20]
         lines += [
@@ -241,6 +384,21 @@ def pr_body(
             *(
                 [f"> - ...and {len(unprocessed) - len(shown)} more"]
                 if len(unprocessed) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.comment_only:
+        shown = residue.comment_only[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.comment_only)} file(s) mention this flag only "
+            "in comments.** Nothing there can break, but prose describing the "
+            "flag may now describe behaviour that is gone:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.comment_only) - len(shown)} more"]
+                if len(residue.comment_only) > len(shown)
                 else []
             ),
             "",
@@ -295,13 +453,14 @@ def pr_body(
         # was Java-only, and kept saying it for the TS family that #2807 added
         # — a false sentence in a customer's pull request.
         lines += [
-            f"> **{len(stranded)} statement(s) became unreachable and were "
-            "removed.** Folding the flag out left every path above them "
-            "returning, which your toolchain rejects rather than warns about: "
-            "a compile error in Java (JLS 14.21), a non-zero `dart analyze`, "
+            f"> **{len(stranded)} statement(s) could never run and were "
+            "removed.** Folding the flag out either left every path above them "
+            "returning, which your toolchain rejects rather than warns about "
+            "(a compile error in Java (JLS 14.21), a non-zero `dart analyze`, "
             "and a `no-unreachable` error under `eslint:recommended` in "
-            "JavaScript and TypeScript. They cannot have run, so nothing "
-            "changes behaviour — but they were yours, so here they are:",
+            "JavaScript and TypeScript), or turned a loop's condition into "
+            "`false`, so the loop never runs. Nothing changes behaviour — but "
+            "they were yours, so here they are:",
             ">",
             *[
                 f"> - {_md_code(path)} — {_md_code(statement)}"
@@ -314,6 +473,15 @@ def pr_body(
             ),
             "",
         ]
+    bare_imports = [(path, text) for path, kind, text in bindings if kind == "bare import"]
+    marked_imports = [
+        (path, text) for path, kind, text in bindings if kind == "marked import"
+    ]
+    bindings = tuple(
+        b for b in bindings if b[1] not in {"bare import", "marked import"}
+    )
+    lines += _bare_import_lines(bare_imports)
+    lines += _marked_import_lines(marked_imports)
     if bindings:
         # A THIRD case alongside `stranded`, sharing its reasoning — sound by
         # construction, but the code was the customer's — without sharing its
@@ -328,7 +496,8 @@ def pr_body(
         # "were rewritten" when every listed variable was actually an inert
         # deletion would tell the customer something false about their own PR.
         import_count = sum(1 for _, kind, _ in bindings if kind == "import")
-        variable_count = len(bindings) - import_count
+        method_count = sum(1 for _, kind, _ in bindings if kind == "private method")
+        variable_count = len(bindings) - import_count - method_count
 
         def _plural(n: int, noun: str) -> str:
             return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
@@ -338,6 +507,8 @@ def pr_body(
             counted.append(_plural(import_count, "import"))
         if variable_count:
             counted.append(_plural(variable_count, "local variable"))
+        if method_count:
+            counted.append(_plural(method_count, "private method"))
 
         sentences = [
             # Go is the only unconditionally-true claim here: javac has no
@@ -354,8 +525,8 @@ def pr_body(
         ]
         if import_count:
             sentences.append(
-                "Every import is deleted outright, which cannot change "
-                "behaviour."
+                "Every import listed here is deleted outright; one kept for "
+                "its module load is named in its own note."
             )
         if variable_count:
             sentences.append(
@@ -363,6 +534,13 @@ def pr_body(
                 "rewritten to discard its value rather than deleted, so "
                 "nothing stops running; one whose initializer cannot have a "
                 "side effect is deleted along with its declaration."
+            )
+        if method_count:
+            sentences.append(
+                "A private method is deleted, with the doc comment directly "
+                "above it, only when nothing else in its file still names it; "
+                "a method in a `partial` type, an overloaded one, or one "
+                "carrying an attribute or annotation is never touched."
             )
 
         lines += [
@@ -379,6 +557,43 @@ def pr_body(
                 if len(bindings) > 20
                 else []
             ),
+            "",
+        ]
+    mocked_tests = [(path, text) for path, kind, text in test_doubles if kind == "test"]
+    mock_lines = [(path, text) for path, kind, text in test_doubles if kind != "test"]
+    if mocked_tests:
+        count = len(mocked_tests)
+        noun = "test was" if count == 1 else "tests were"
+        lines += [
+            f"> **⚠️ {count} {noun} deleted.** Each mocked the flag read to "
+            f"return `{'false' if candidate.treatment else 'true'}` — the "
+            f"**{deleted}** branch, which this pull request deletes — so its "
+            "assertions describe behaviour the code can no longer produce. The "
+            "choice was made from the mock's own return value, not the test's "
+            "name; a test whose mock returned the kept value stayed, without "
+            "the mock:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in mocked_tests[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if mock_lines:
+        count = len(mock_lines)
+        noun = "line was" if count == 1 else "lines were"
+        lines += [
+            f"> **{count} mock {noun} deleted.** Each stubbed or verified the "
+            "flag read this pull request replaced with a literal: a stub of it "
+            "is dead, and a verification that it happens could only fail now. "
+            "The tests around them still run, against the kept branch:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in mock_lines[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
     if entries:
@@ -406,13 +621,89 @@ def pr_body(
             "around it may be exercising behaviour that no longer exists. "
             "Stripping the entry would not fix that, it would hide it: a test "
             "whose subject is the removed branch would keep running and start "
-            "asserting something the code can no longer do. Delete the entry, "
-            "or the code it belongs to, by hand:",
+            "asserting something the code can no longer do. A type member "
+            "declaring the flag in the same file is kept too, so the entry "
+            "still type-checks. Delete the entry, or the code it belongs to, "
+            "by hand:",
             ">",
             *[
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in declined[:20]
             ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    competing, unproven = split_competing(unresolved)
+    if unproven:
+        count = len(unproven)
+        noun = "reference" if count == 1 else "references"
+        lines += [
+            f"> **⚠️ {count} {noun} to this flag's key constant could not be "
+            "resolved**, so the constant's declaration is kept. Each line below "
+            "names a place that reads the constant, or might, and the reason. "
+            "Once none of them names it any more (rewritten by hand, or renamed "
+            "where it is really another constant), a later run deletes the "
+            "declaration:",
+            ">",
+            *[
+                f"> - {_md_code(f'{path}:{line}')} — `{reason}`"
+                + (f" — {_md_code(text)}" if text else "")
+                for path, line, reason, text in unproven[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if competing:
+        count = len(competing)
+        noun = "declaration" if count == 1 else "declarations"
+        lines += [
+            f"> **ℹ️ This flag's key constant has {count} competing {noun}**, "
+            "so none of them, and none of their reads, was touched. The same "
+            "qualified name is declared more than once (in another source set, "
+            "build variant or module, or in the other JVM language), and which "
+            "one a reader gets is decided by the build, not by anything in the "
+            "source. That is usually deliberate. Check every variant before "
+            "removing the constant:",
+            ">",
+            *[
+                f"> - {_md_code(f'{path}:{line}')}"
+                + (f" — {_md_code(text)}" if text else "")
+                for path, line, _reason, text in competing[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    lines += _enum_lines(enum_findings, residue.enum_held)
+    if deleted_tests:
+        count = len(deleted_tests)
+        noun = "test was" if count == 1 else "tests were"
+        lines += [
+            f"> **⚠️ {count} {noun} deleted.** Each pinned the flag to its "
+            f"**{deleted}** branch — the one this pull request just deleted — "
+            "and its title says that branch is what it tests, so its assertions "
+            "describe behaviour the code can no longer produce. The choice was "
+            "made from the title, so check each one. Other overrides pinning "
+            "that branch were stripped like any other entry: their tests are "
+            "about something that holds either way.",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(title)}"
+                for path, title in deleted_tests[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if wrappers:
+        lines += _constant_wrapper_lines(wrappers)
+    if left_in_place:
+        count = len(left_in_place)
+        lines += [
+            f"> **ℹ️ {count} thing{'' if count == 1 else 's'} deliberately left "
+            "in place.** A rule would have removed "
+            f"{'it' if count == 1 else 'each'}, but the rest of this removal "
+            "would not have built without it:",
+            ">",
+            *[f"> - {_md_code(path)} — {_one_line(reason)}" for path, reason in left_in_place[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -424,6 +715,60 @@ def pr_body(
         "_Generated by the Featureflip flag-cleanup Action._",
     ]
     return "\n".join(lines)
+
+
+def _constant_wrapper_lines(wrappers: tuple[ConstantWrapper, ...]) -> list[str]:
+    """The body section for members the fold reduced to a constant.
+
+    Siblings are named with an explicit warning because they are the trap: a
+    reviewer who inlines the constant at every caller also overrides whatever
+    the sibling returns, and the sibling is usually the local-development or
+    test path, where nobody looks until it misbehaves.
+    """
+    count = len(wrappers)
+    noun = "member now returns" if count == 1 else "members now return"
+    lines = [
+        f"> **⚠️ {count} {noun} a constant, but callers still branch on "
+        f"{'it' if count == 1 else 'them'}.** The flag read inside was folded "
+        "away, and the calls name no flag key, so the transform cannot follow "
+        "them: every check on the result still runs. Remove the checks, and the "
+        "member once nothing calls it, by hand:",
+        ">",
+    ]
+    for wrapper in wrappers[:20]:
+        value = "true" if wrapper.value else "false"
+        lines.append(
+            f"> - {_md_code(wrapper.member)} in {_md_code(wrapper.path)} always "
+            f"returns `{value}`."
+        )
+        if wrapper.types:
+            lines.append(
+                ">   Declared against "
+                f"{_and_list([_md_code(t) for t in wrapper.types])}."
+            )
+        if wrapper.siblings:
+            shown = wrapper.siblings[:20]
+            lines.append(
+                ">   Other implementations, untouched by this PR. Inlining the "
+                "constant at a call through the shared type overrides what "
+                "these return: "
+                + ", ".join(f"{_md_code(name)} in {_md_code(path)}" for name, path in shown)
+                + (f", and {len(wrapper.siblings) - len(shown)} more" if len(wrapper.siblings) > len(shown) else "")
+                + "."
+            )
+        if wrapper.callers:
+            shown_callers = wrapper.callers[:20]
+            lines.append(
+                ">   Files that name one of these types and call "
+                f"{_md_code('.' + wrapper.member.rsplit('.', 1)[-1])}: "
+                + ", ".join(_md_code(path) for path in shown_callers)
+                + (f", and {len(wrapper.callers) - len(shown_callers)} more" if len(wrapper.callers) > len(shown_callers) else "")
+                + "."
+            )
+    if count > 20:
+        lines.append(f"> - ...and {count - 20} more")
+    lines.append("")
+    return lines
 
 
 def _without_userinfo(url: str) -> str:
@@ -494,6 +839,252 @@ def note_removed_entries(entries: tuple[tuple[str, str], ...]) -> None:
             len(entries),
             "y" if len(entries) == 1 else "ies",
             "; ".join(f"{path}: {_one_line(text)}" for path, text in entries),
+        )
+
+
+def note_deleted_tests(deleted_tests: tuple[tuple[str, str], ...]) -> None:
+    """Log the tests this run deleted because they test the removed branch.
+
+    WARNING, like :func:`note_declined_entries`: the deletion was chosen from a
+    test's title, and a reviewer should confirm each one.
+    """
+    if deleted_tests:
+        logger.warning(
+            "%d test%s deleted because %s title says %s the branch this "
+            "removal deletes — check %s: %s",
+            len(deleted_tests),
+            " was" if len(deleted_tests) == 1 else "s were",
+            "its" if len(deleted_tests) == 1 else "their",
+            "it tests" if len(deleted_tests) == 1 else "they test",
+            "it" if len(deleted_tests) == 1 else "them",
+            "; ".join(f"{path}: {_one_line(title)}" for path, title in deleted_tests),
+        )
+
+
+def note_kept(kept: tuple[tuple[str, str], ...]) -> None:
+    """Log what the transform deliberately left in place, and why."""
+    if kept:
+        logger.warning(
+            "%d thing%s deliberately left in place, because the removal would not "
+            "build without %s: %s",
+            len(kept),
+            " was" if len(kept) == 1 else "s were",
+            "it" if len(kept) == 1 else "them",
+            "; ".join(f"{path}: {_one_line(reason)}" for path, reason in kept),
+        )
+
+
+#: Findings made at an enum entry's own declaration: a profile judged the
+#: file, so the residue scan's generic enum paragraph would say it twice.
+_DECLARATION_SITE = (KEPT, LEFT, LEFT_COMPETING, ENUM_UNPROVEN)
+
+#: Why an entry was left in place, as one clause after its name.
+_LEFT_BECAUSE = {
+    LEFT: "some reads through it could not be resolved and are listed above.",
+    LEFT_COMPETING: (
+        "another declaration with the same name exists, so no read through it "
+        "was resolved. Those reads still evaluate the flag and are not listed: "
+        "find them by hand."
+    ),
+}
+
+
+def unjudged_enum_held(
+    enum_findings: tuple[tuple[str, int, str, str], ...],
+    enum_held: tuple[tuple[str, str], ...],
+) -> list[tuple[str, str]]:
+    """The ``enum_held`` files no declaration-site finding already explains.
+
+    Compared as whole paths: both are spelled under their configured directory
+    (see ``orchestrate._run_plan``), and a suffix match would let a kept
+    ``src/flags.ts`` in one directory hide another directory's.
+    """
+    judged = {os.path.abspath(f[0]) for f in enum_findings if f[2] in _DECLARATION_SITE}
+    return [(path, text) for path, text in enum_held if os.path.abspath(path) not in judged]
+
+
+def _enum_lines(
+    enum_findings: tuple[tuple[str, int, str, str], ...],
+    enum_held: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """The pull request's paragraphs about enum entries holding the key."""
+    kept = [f for f in enum_findings if f[2] == KEPT]
+    left = [f for f in enum_findings if f[2] in _LEFT_BECAUSE]
+    dynamic = [f for f in enum_findings if f[2] == ENUM_DYNAMIC]
+    competing = [f for f in enum_findings if f[2] == NAME_NOT_UNIQUE]
+    refused = [
+        f for f in enum_findings if f[2] not in (KEPT, ENUM_DYNAMIC, NAME_NOT_UNIQUE, *_LEFT_BECAUSE)
+    ]
+    held = unjudged_enum_held(enum_findings, enum_held)
+    lines: list[str] = []
+
+    def listed(rows):
+        rows = list(rows)
+        return [
+            *rows[:20],
+            *([f"> - ...and {len(rows) - 20} more"] if len(rows) > 20 else []),
+            "",
+        ]
+
+    if refused:
+        lines += [
+            f"> **⚠️ {len(refused)} reference(s) to this flag through an enum entry "
+            "could not be resolved**, so those places were left as they are and "
+            "still evaluate the flag. Each line names the place and the reason. "
+            "Rewrite them by hand before archiving the flag:",
+            ">",
+            *listed(
+                f"> - {_md_code(f'{path}:{line}')} — `{reason}`"
+                + (f" — {_md_code(text)}" if text else "")
+                for path, line, reason, text in refused
+            ),
+        ]
+    if competing:
+        noun = "declaration" if len(competing) == 1 else "declarations"
+        lines += [
+            f"> **ℹ️ The enum entry holding this flag's key has {len(competing)} "
+            f"competing {noun}**, so no read through it was touched. The same name "
+            "is declared more than once (in another source set, build variant or "
+            "module, or in the other JVM language), or another declaration can "
+            "stand in for its enum, and which one a reader gets is decided by the "
+            "build, not by anything in the source. That is usually deliberate. "
+            "Check every variant before removing the entry:",
+            ">",
+            *listed(
+                f"> - {_md_code(f'{path}:{line}')}" + (f" — {_md_code(text)}" if text else "")
+                for path, line, _reason, text in competing
+            ),
+        ]
+    if left:
+        lines += [
+            f"> **ℹ️ {len(left)} enum entr{'y' if len(left) == 1 else 'ies'} holding "
+            "this flag's key "
+            f"{'was' if len(left) == 1 else 'were'} left in place:**",
+            ">",
+            *listed(
+                f"> - {_md_code(text)} ({_md_code(f'{path}:{line}')}) was left in "
+                f"place; {_LEFT_BECAUSE[reason]}"
+                for path, line, reason, text in left
+            ),
+        ]
+    if dynamic:
+        lines += [
+            f"> **⚠️ The enum holding this flag's key is used dynamically in "
+            f"{len(dynamic)} place(s)** (`values()`, `entries`, `valueOf`, a class "
+            "literal, or the enum object itself). A use like this can reach the "
+            "entry without naming it, so the flag may still be evaluated there. "
+            "Check each one before archiving the flag:",
+            ">",
+            *listed(
+                f"> - {_md_code(f'{path}:{line}')} — {_md_code(text)}"
+                for path, line, _reason, text in dynamic
+            ),
+        ]
+    if kept:
+        lines += [
+            f"> **ℹ️ {len(kept)} enum entr{'y' if len(kept) == 1 else 'ies'} holding "
+            f"this flag's key {'was' if len(kept) == 1 else 'were'} left in place, "
+            f"and no read through {'it' if len(kept) == 1 else 'them'} that this "
+            "run could find remains.** Removing an enum entry can change stored "
+            "ordinals, `valueOf` lookups and iteration over the enum, none of "
+            "which a build catches. Delete each one once nothing depends on it:",
+            ">",
+            *listed(
+                f"> - {_md_code(f'{path}:{line}')} — {_md_code(text)}"
+                for path, line, _reason, text in kept
+            ),
+        ]
+    if held:
+        lines += [
+            f"> **ℹ️ {len(held)} file(s) still hold this flag's key in an enum "
+            "entry, and this run resolved no read through it.** Enum-held keys "
+            "are resolved only in Java, Kotlin and TypeScript, and only through "
+            "the forms the README lists. For each one, resolve the reads through "
+            "it by hand; delete the entry only once nothing depends on it, since "
+            "removing an enum entry can change stored ordinals, `valueOf` "
+            "lookups and iteration over the enum:",
+            ">",
+            *listed(f"> - {_md_code(path)} — {_md_code(text)}" for path, text in held),
+        ]
+    return lines
+
+
+def split_competing(
+    unresolved: tuple[tuple[str, int, str, str], ...],
+) -> tuple[
+    tuple[tuple[str, int, str, str], ...], tuple[tuple[str, int, str, str], ...]
+]:
+    """``unresolved`` as (competing declarations, every other refusal).
+
+    A competing declaration is a build variant or a second module, not a
+    reference anyone has to rewrite, so it is reported apart.
+    """
+    competing = tuple(u for u in unresolved if u[2] == NAME_NOT_UNIQUE)
+    return competing, tuple(u for u in unresolved if u[2] != NAME_NOT_UNIQUE)
+
+
+def note_enum_findings(
+    enum_findings: tuple[tuple[str, int, str, str], ...],
+    enum_held: tuple[tuple[str, str], ...] = (),
+) -> None:
+    """Log what the run found about enum entries, so a dry run shows it too."""
+    issues = [f for f in enum_findings if f[2] != KEPT and f[2] not in _LEFT_BECAUSE]
+    if issues:
+        logger.warning(
+            "%d finding%s about enum entries holding the flag's key: %s",
+            len(issues),
+            "" if len(issues) == 1 else "s",
+            "; ".join(
+                f"{path}:{line} ({reason})" + (f" {_one_line(text)}" if text else "")
+                for path, line, reason, text in issues
+            ),
+        )
+    left = [f for f in enum_findings if f[2] in _LEFT_BECAUSE]
+    if left:
+        logger.warning(
+            "%s",
+            "; ".join(
+                f"{text} ({path}:{line}) was left in place; {_LEFT_BECAUSE[reason].rstrip('.')}"
+                for path, line, reason, text in left
+            ),
+        )
+    kept = [f for f in enum_findings if f[2] == KEPT]
+    if kept:
+        logger.warning(
+            "%d enum entr%s left in place, and no read through %s that this run "
+            "could find remains: %s",
+            len(kept),
+            "y was" if len(kept) == 1 else "ies were",
+            "it" if len(kept) == 1 else "them",
+            "; ".join(f"{text} ({path}:{line})" for path, line, _reason, text in kept),
+        )
+    held = unjudged_enum_held(enum_findings, enum_held)
+    if held:
+        logger.warning(
+            "%d file(s) still hold the flag's key in an enum entry, and this run "
+            "resolved no read through it; resolve the reads by hand, and delete "
+            "the entry only once nothing depends on it: %s",
+            len(held),
+            "; ".join(f"{path} ({_one_line(text)})" for path, text in held),
+        )
+
+
+def note_unresolved_references(unresolved: tuple[tuple[str, int, str, str], ...]) -> None:
+    """Log the key-constant references this run could not prove.
+
+    WARNING, like :func:`note_declined_entries`: a kept declaration is not in
+    the diff, so without this a dry run could not show why it stayed.
+    """
+    if unresolved:
+        logger.warning(
+            "%d reference%s to the flag's key constant could not be resolved, so "
+            "its declaration is kept: %s",
+            len(unresolved),
+            "" if len(unresolved) == 1 else "s",
+            "; ".join(
+                f"{path}:{line} ({reason})" + (f" {_one_line(text)}" if text else "")
+                for path, line, reason, text in unresolved
+            ),
         )
 
 

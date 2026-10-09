@@ -39,11 +39,20 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from flag_cleanup import git_ops, github_ops, orchestrate, pr_content
+from flag_cleanup import (
+    constant_wrappers,
+    cross_file_keys,
+    git_ops,
+    github_ops,
+    orchestrate,
+    pr_content,
+    source_index,
+)
 from flag_cleanup.client import Candidate, FeatureflipClient
 from flag_cleanup.config import Config, STALENESS_VALUES
 from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
+from flag_cleanup.residue import Residue, classify as classify_residue
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +99,16 @@ FORCE_PUSHED_ATTR = "flag_cleanup_force_pushed"
 #: than summarising it.
 PULL_REQUEST_UPDATED_ATTR = "flag_cleanup_pull_request_updated"
 
+#: Attribute stamped onto any exception that escapes a run which had REOPENED
+#: a closed pull request.
+#:
+#: The reopen is its own write, made before the push (see `_regenerate` for
+#: why it cannot ride on the `PATCH` after it), so a push that then fails
+#: leaves the pull request open at its previous head. That is deliberate — it
+#: is not closed again — and the reply is the only place the person who typed
+#: the command learns it.
+PULL_REQUEST_REOPENED_ATTR = "flag_cleanup_pull_request_reopened"
+
 
 def branch_was_force_pushed(exc: BaseException) -> bool:
     """Whether ``exc`` escaped a run that had already replaced the branch.
@@ -112,6 +131,15 @@ def pull_request_was_updated(exc: BaseException) -> bool:
     return getattr(exc, PULL_REQUEST_UPDATED_ATTR, False) is True
 
 
+def pull_request_was_reopened(exc: BaseException) -> bool:
+    """Whether ``exc`` escaped a run that had reopened a closed pull request.
+
+    Independent of the other two markers: the reopen comes BEFORE the push, so
+    it can be the only write that landed.
+    """
+    return getattr(exc, PULL_REQUEST_REOPENED_ATTR, False) is True
+
+
 @dataclass(slots=True)
 class _RemoteWrites:
     """How far the run got through the two writes it makes to the customer's
@@ -129,6 +157,7 @@ class _RemoteWrites:
     exists to stop telling.
     """
 
+    reopened: bool = False
     pushed: bool = False
     patched: bool = False
 
@@ -377,6 +406,25 @@ def _run(
         )
 
     candidate, tier = found
+    if candidate.blocked_by:
+        # The scheduled run holds this pull request for the same reason; a
+        # command must not regenerate or re-ready it out of order.
+        return _reply(
+            gh,
+            repo,
+            comment.number,
+            PrCommandResult(
+                action_taken="rerun-blocked",
+                detail=(
+                    f"`{key}` is still a prerequisite of "
+                    f"{', '.join(f'`{k}`' for k in candidate.blocked_by)}. Remove and "
+                    "archive those flags first, then run this command again. "
+                    "Nothing was pushed"
+                ),
+                key=key,
+                pull_request=comment.number,
+            ),
+        )
     written = _RemoteWrites()
     try:
         return _regenerate(
@@ -409,6 +457,12 @@ def _run(
             setattr(exc, orchestrate.RUN_STARTED_ATTR, True)
         if written.patched:
             setattr(exc, PULL_REQUEST_UPDATED_ATTR, True)
+        if written.reopened:
+            setattr(exc, PULL_REQUEST_REOPENED_ATTR, True)
+            # A reopen alone already falsifies exit 2's "nothing was
+            # modified": the pull request changed state even when the push
+            # behind it then failed.
+            setattr(exc, orchestrate.RUN_STARTED_ATTR, True)
         raise
 
 
@@ -486,7 +540,7 @@ def _regenerate(
     created_branch = False
     snapshot: git_ops.WorktreeSnapshot | None = None
     try:
-        with orchestrate.piranha_transform(
+        with source_index.run_scope(), orchestrate.piranha_transform(
             candidate, config, ledger, known_flag_keys
         ) as (
             diff,
@@ -497,6 +551,11 @@ def _regenerate(
             bindings,
             entries,
             declined,
+            test_doubles,
+            deleted_tests,
+            kept,
+            unresolved,
+            enum_findings,
         ):
             if transform_error is not None:
                 # Not turned into a reply: a refused transform is the one
@@ -508,6 +567,8 @@ def _regenerate(
                 # complete.
                 raise transform_error
             unprocessed = orchestrate.all_unprocessed(config, key, unprocessable)
+            residue = classify_residue(unprocessed, key, config.accessors)
+            wrappers = constant_wrappers.find_constant_wrappers(diff, config.directories)
             if not diff:
                 # Loud, not silent: an open pull request is proposing a removal
                 # the code no longer needs. Nothing is pushed and the pull
@@ -546,7 +607,9 @@ def _regenerate(
                 commits = github_ops.branch_commits(gh, repo, pull.base_ref, pull.head_ref)
                 draft_note = _draft_note(pull, candidate)
                 caveats = _dry_run_caveats(
-                    unprocessed, stranded, bindings, entries, declined
+                    unprocessed, stranded, bindings, entries, declined,
+                    test_doubles, residue, deleted_tests, wrappers, kept, unresolved,
+                    enum_findings,
                 )
                 return _reply(
                     gh,
@@ -574,6 +637,24 @@ def _regenerate(
             git_ops.commit_changes(
                 repo_dir, config.directories, pr_content.commit_message(candidate)
             )
+            if pull.state == "closed":
+                # BEFORE the push, as its own write. GitHub refuses to reopen a
+                # closed pull request once its head branch has been
+                # force-pushed, so a reopen sent with the title and body after
+                # the push was rejected every time — leaving the branch on the
+                # new diff and the pull request closed at the old one, with no
+                # way left to reopen it. Here the head still matches
+                # `pull.head_sha`, which is what GitHub checks.
+                #
+                # Placed after the local commit so nothing that can fail
+                # locally sits between it and the push. If the push then
+                # fails, the pull request is left OPEN at its previous head
+                # rather than closed again: closing is only safe if the push
+                # provably landed nothing, and closing over a push that DID
+                # land recreates exactly the wedge this ordering removes. The
+                # marker below is what lets the failure reply say so.
+                github_ops.update_pull_request(gh, repo, pull.number, state="open")
+                written.reopened = True
             # Leased against the head sha this run READ from the pull request,
             # for both commands: `recreate` waives the ownership guard above,
             # never the lease. A write that landed on the branch between that
@@ -597,6 +678,13 @@ def _regenerate(
                 pr_content.note_rewritten_build_output(diff),
                 entries=entries,
                 declined=declined,
+                test_doubles=test_doubles,
+                residue=residue,
+                deleted_tests=deleted_tests,
+                wrappers=wrappers,
+                left_in_place=kept,
+                unresolved=unresolved,
+                enum_findings=enum_findings,
             )
             draft_note = _draft_note(pull, candidate)
             github_ops.update_pull_request(
@@ -605,9 +693,6 @@ def _regenerate(
                 pull.number,
                 title=pr_content.pr_title(candidate),
                 body=body + draft_note,
-                # The same call reopens a closed pull request; `None` leaves an
-                # open one alone rather than sending a redundant field.
-                state="open" if pull.state == "closed" else None,
             )
             # AFTER the `PATCH` returns, for the reason the record's docstring
             # gives: the reply, the ref restore, `snapshot.verify()` and
@@ -688,15 +773,27 @@ def _dry_run_caveats(
     bindings: tuple[tuple[str, str, str], ...],
     entries: tuple[tuple[str, str], ...],
     declined: tuple[tuple[str, str], ...],
+    test_doubles: tuple[tuple[str, str, str], ...] = (),
+    residue: Residue = Residue(),
+    deleted_tests: tuple[tuple[str, str], ...] = (),
+    wrappers: tuple[constant_wrappers.ConstantWrapper, ...] = (),
+    kept: tuple[tuple[str, str], ...] = (),
+    unresolved: tuple[tuple[str, int, str, str], ...] = (),
+    enum_findings: tuple[tuple[str, int, str, str], ...] = (),
 ) -> str:
     """A short summary of what a real run's pull-request body would call out.
 
-    A real run folds all five of these into `pr_content.pr_body` — the
+    A real run folds every one of these into `pr_content.pr_body` — the
     still-referenced-flag warning, the unreachable statements a language's own
     toolchain proves dead, the stranded imports/locals a fold left with no
-    remaining use, and the flag-keyed registry/override/type-member entries a
-    removal strands, plus the entries whose value is the branch being removed
-    and which the rules therefore left alone (#3050). A dry run computes every
+    remaining use, the flag-keyed registry/override/type-member entries a
+    removal strands, the entries whose value is the branch being removed and
+    which the rules therefore left alone, the mocked tests and stub lines
+    resolved with the read, the test files still stubbing it, the tests
+    deleted because they test that branch (TypeScript family), the members
+    left returning a constant, the files deliberately kept so the removal
+    builds, and the key-constant references it could not resolve and the
+    competing declarations it left alone. A dry run computes every
     one of them (they come from the
     same `piranha_transform` call the real run uses) and, without this,
     reported NONE of them — a preview quieter than the run it is supposed to
@@ -721,6 +818,55 @@ def _dry_run_caveats(
             f"{len(declined)} flag-keyed {noun} would be LEFT IN PLACE, pinning "
             "the flag to the branch being removed"
         )
+    removed_tests = sum(1 for _, kind, _ in test_doubles if kind == "test")
+    if removed_tests:
+        notes.append(
+            f"{removed_tests} test(s) whose mock returns the removed value "
+            "would be deleted"
+        )
+    if len(test_doubles) > removed_tests:
+        notes.append(
+            f"{len(test_doubles) - removed_tests} mock stub/verification line(s) "
+            "of the removed read would be deleted"
+        )
+    if residue.stubbed:
+        files = len({path for path, _ in residue.stubbed})
+        notes.append(
+            f"{files} test file(s) would still stub the removed read"
+        )
+    if deleted_tests:
+        notes.append(
+            f"{len(deleted_tests)} test(s) testing the branch being removed "
+            "would be deleted"
+        )
+    if wrappers:
+        notes.append(
+            f"{len(wrappers)} member(s) would be left returning a constant that "
+            "callers still branch on"
+        )
+    if kept:
+        notes.append(
+            f"{len(kept)} file(s)/entr(ies) would be deliberately left in place "
+            "so the removal still builds"
+        )
+    competing, unproven = pr_content.split_competing(unresolved)
+    if unproven:
+        noun = "reference" if len(unproven) == 1 else "references"
+        notes.append(
+            f"{len(unproven)} {noun} to the flag's key constant could not be "
+            "resolved, so its declaration would be kept"
+        )
+    if competing:
+        noun = "declaration" if len(competing) == 1 else "declarations"
+        notes.append(
+            f"{len(competing)} competing {noun} of the flag's key constant "
+            "(a build variant or another module) would be left untouched"
+        )
+    # A kept or left entry is the declaration a finding is about, not one more.
+    declared = (cross_file_keys.KEPT, cross_file_keys.LEFT, cross_file_keys.LEFT_COMPETING)
+    enum_issues = [f for f in enum_findings if f[2] not in declared]
+    if enum_issues:
+        notes.append(f"{len(enum_issues)} enum-entry finding(s) would be reported")
     if not notes:
         return ""
     return " " + "; ".join(notes) + "."

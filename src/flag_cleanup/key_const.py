@@ -1410,9 +1410,14 @@ def _swift_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[Ke
         )
         if binding is None or _text(binding, source_bytes) != "let":
             continue
-        pattern = next((c for c in node.named_children if c.type == "pattern"), None)
-        if pattern is None:
+        # EXACTLY ONE binding. `let a = "x", b = "y"` is one declaration holding
+        # several name/value pairs, and the delete rule removes the declaration
+        # whole, so a key in one pair would take its siblings with it. The rules
+        # anchor each pattern to its own literal for the same reason.
+        patterns = [c for c in node.named_children if c.type == "pattern"]
+        if len(patterns) != 1:
             continue
+        pattern = patterns[0]
         name_node = next(
             (c for c in pattern.named_children if c.type == "simple_identifier"), None
         )

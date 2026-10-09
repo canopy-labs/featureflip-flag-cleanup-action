@@ -133,21 +133,26 @@ replace = ""
 holes = ["stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """(
-  [(declaration_list
-     (field_declaration
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))
-   (block
-     (local_declaration_statement
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+# File-scoped, as java_const.toml's is: a const on a BASE class, read from a
+# subclass in the same file (or from another part of a `partial` class), has
+# no ancestor in common with the read but the file. Scoped to the class, the
+# fold declined while the delete fired, and the read was left naming a const
+# that no longer existed. Gate 2's bound-exactly-once check runs over the whole
+# file, so the file is the scope the two halves agree on.
+enclosing_node = """((compilation_unit) @scope)"""
+contains = """(
+  [(field_declaration
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))
+   (local_declaration_statement
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -186,21 +191,26 @@ replace = ""
 holes = ["stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """(
-  [(declaration_list
-     (field_declaration
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))
-   (block
-     (local_declaration_statement
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+# File-scoped, as java_const.toml's is: a const on a BASE class, read from a
+# subclass in the same file (or from another part of a `partial` class), has
+# no ancestor in common with the read but the file. Scoped to the class, the
+# fold declined while the delete fired, and the read was left naming a const
+# that no longer existed. Gate 2's bound-exactly-once check runs over the whole
+# file, so the file is the scope the two halves agree on.
+enclosing_node = """((compilation_unit) @scope)"""
+contains = """(
+  [(field_declaration
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))
+   (local_declaration_statement
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -238,21 +248,26 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """(
-  [(declaration_list
-     (field_declaration
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))
-   (block
-     (local_declaration_statement
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+# File-scoped, as java_const.toml's is: a const on a BASE class, read from a
+# subclass in the same file (or from another part of a `partial` class), has
+# no ancestor in common with the read but the file. Scoped to the class, the
+# fold declined while the delete fired, and the read was left naming a const
+# that no longer existed. Gate 2's bound-exactly-once check runs over the whole
+# file, so the file is the scope the two halves agree on.
+enclosing_node = """((compilation_unit) @scope)"""
+contains = """(
+  [(field_declaration
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))
+   (local_declaration_statement
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -301,21 +316,26 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """(
-  [(declaration_list
-     (field_declaration
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))
-   (block
-     (local_declaration_statement
-       (modifier) @const_modifier
-       (variable_declaration
-         type: (_) . (variable_declarator
-           name: (identifier) @decl_name
-           (string_literal (string_literal_content) @flag_name)) .)))] @scope
+# File-scoped, as java_const.toml's is: a const on a BASE class, read from a
+# subclass in the same file (or from another part of a `partial` class), has
+# no ancestor in common with the read but the file. Scoped to the class, the
+# fold declined while the delete fired, and the read was left naming a const
+# that no longer existed. Gate 2's bound-exactly-once check runs over the whole
+# file, so the file is the scope the two halves agree on.
+enclosing_node = """((compilation_unit) @scope)"""
+contains = """(
+  [(field_declaration
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))
+   (local_declaration_statement
+     (modifier) @const_modifier
+     (variable_declaration
+       type: (_) . (variable_declarator
+         name: (identifier) @decl_name
+         (string_literal (string_literal_content) @flag_name)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -361,7 +381,14 @@ replace = ""
 holes = ["stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """([(class_declaration) (struct_declaration) (record_declaration) (method_declaration) (compilation_unit)] @container)"""
+# ITS SCOPE IS THE FILE. `enclosing_node` takes the NEAREST matching ancestor,
+# so a class-scoped guard looked only inside the class holding the declaration,
+# and a surviving read in a SUBCLASS or a SIBLING class -- which inherits or
+# names the constant -- was invisible to it: the declaration was deleted and the
+# read stayed, a reference to nothing. java_const.toml's guard is file-scoped for
+# the same reason. Over-refusing here costs one uncleaned declaration, which is
+# the direction this file fails in.
+enclosing_node = """((compilation_unit) @container)"""
 not_contains = ["""(
   (invocation_expression
     arguments: (argument_list . (argument (identifier) @first_arg))) @surviving_read

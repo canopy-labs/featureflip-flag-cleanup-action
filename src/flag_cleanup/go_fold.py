@@ -154,7 +154,13 @@ def _literal(arm: Node) -> bool | None:
         return None
     if len(value.named_children) != 1:
         return None
-    kind = value.named_children[0].type
+    # The flag read is replaced in place, so a literal lands inside whatever
+    # parentheses the source already had: `case (read):` becomes `case (true):`.
+    # Unwrapped in a loop, as `php_fold._literal` does, so nesting is free.
+    inner = value.named_children[0]
+    while inner.type == "parenthesized_expression" and len(inner.named_children) == 1:
+        inner = inner.named_children[0]
+    kind = inner.type
     return True if kind == "true" else False if kind == "false" else None
 
 

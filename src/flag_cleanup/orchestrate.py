@@ -39,13 +39,19 @@ are surfaced explicitly instead of swallowed:
   that the engine had anything to say about a given occurrence of the key.
 
 With ``config.dry_run`` set, that is all that happens: diffs are computed and
-returned, and GitHub is never contacted. Otherwise each flag with a non-empty
+returned, and nothing is written to GitHub. A dry run that has a token still
+READS — the same idempotency lookup a real run makes — so a flag a real run
+would report as already handled is not previewed as a pull request it would
+never open. Otherwise each flag with a non-empty
 diff also gets a branch, a commit and a pull request — **draft** when the flag
 is merely ``Stale``, ready for review when it is ``Dead``. Three properties
 that path is built around:
 
-* **Idempotent.** ``github_ops.already_handled`` runs BEFORE Piranha, so a
-  flag already proposed costs nothing and can never get a second PR.
+* **Idempotent.** ``github_ops.already_handled_pull_request`` runs BEFORE
+  Piranha, so a flag already proposed costs nothing and can never get a
+  second PR — and, when what it finds is still an OPEN pull request, that
+  flag's ``FlagResult`` still carries its URL, so the reporter below can link
+  it again even though this run did not open it.
 * **One flag per PR.** Branch/commit/push happen while that flag's edits (and
   only that flag's) are on disk, inside the same window that the unconditional
   reset closes.
@@ -66,24 +72,37 @@ import re
 import subprocess
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops
-from flag_cleanup.client import Candidate, FeatureflipApiError, FeatureflipClient
+from flag_cleanup import git_ops, github_ops, prerequisite_hold, source_index
+from flag_cleanup.constant_wrappers import (
+    ConstantWrapper,
+    find_constant_wrappers,
+    note_constant_wrappers,
+)
+from flag_cleanup.client import (
+    Candidate,
+    FeatureflipApiError,
+    FeatureflipClient,
+    RemovalPrPermissionError,
+)
 from flag_cleanup.config import Config
 from flag_cleanup.github_ops import (
     GitHubApi,
+    GitHubConfigError,
     GitHubEnv,
+    HandledPullRequest,
     UnsafeFlagKeyError,
 )
 from flag_cleanup.piranha_runner import (
     KNOWN_EXTENSIONS,
     PiranhaTransformError,
+    TransformOutcome,
     UnsafeRewriteError,
     UnsupportedFlagKeyError,
     candidate_files,
@@ -96,11 +115,16 @@ from flag_cleanup.pr_content import (
     commit_message,
     is_dead,
     note_declined_entries,
+    note_enum_findings,
+    note_unresolved_references,
+    note_deleted_tests,
+    note_kept,
     note_removed_entries,
     note_rewritten_build_output,
     pr_body,
     pr_title,
 )
+from flag_cleanup.residue import classify as classify_residue, live_references
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +179,8 @@ class _Client(Protocol):
 
     def flag_keys(self, org: str, project: str) -> Iterable[str]: ...
 
+    def set_removal_pr(self, org: str, project: str, key: str, url: str) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class FlagResult:
@@ -165,6 +191,13 @@ class FlagResult:
     * ``"ignored"`` — the key was in ``config.ignore``; Piranha never ran.
     * ``"not-selected"`` — ``config.flags`` names an allowlist and this key
       was not on it; Piranha never ran.
+    * ``"blocked"`` — live flags still list this one as a prerequisite
+      (``blocked_by`` names them), so removing it now is out of order; the
+      engine never ran. When a removal pull request for it is already open,
+      it was put on hold and ``pr_url`` names it. When one was already merged
+      or closed, ``prior_removal`` says which: such a flag is never proposed
+      again, so the report must not promise that it will be. Reachable in a
+      dry run too, which looks the pull request up but never holds it.
     * ``"piranha-error"`` — the engine aborted (its own syntax self-check);
       ``diff`` is empty, but this is a REFUSAL, not a no-match.
     * ``"unsafe-rewrite"`` — Gate 1 refused the rewrite of at least one file
@@ -175,6 +208,13 @@ class FlagResult:
       if nothing matched.
     * ``"already-handled"`` — the branch or a prior PR (open **or** closed)
       already exists on the remote; nothing was run, nothing was opened.
+      ``prior_removal`` says which, when it was not an open pull request.
+      ``pr_url`` names that pull request when it is still OPEN — found up
+      front by this run's own idempotency check, not opened by this run —
+      so the reporter below can (re-)link it in Featureflip. A CLOSED pull
+      request, or a branch with no pull request at all, leaves ``pr_url``
+      empty: the former is the customer's "no thanks" and must never be
+      reported as if it were ready.
     * ``"duplicate"`` — the same key appeared earlier in THIS run and was
       already dealt with; nothing was run, nothing was opened.
     * ``"unsafe-key"`` — the key cannot be represented as a git branch name,
@@ -184,11 +224,14 @@ class FlagResult:
     * ``"failed"`` — this flag errored (push rejected, API refused, ...); the
       run continued with the next candidate.
 
-    A dry run produces only ``dry-run``, ``ignored``, ``unsafe-key``,
-    ``piranha-error`` and ``unsafe-rewrite`` — everything that needs GitHub is
-    unreachable, but every refusal is reachable and is reported identically in
-    both modes. That symmetry is the point of dry-run: a flag a real run would
-    refuse must be visible in the dry run that preceded it.
+    A dry run produces only ``dry-run``, ``ignored``, ``not-selected``,
+    ``unsafe-key``, ``blocked``, ``already-handled``, ``piranha-error`` and
+    ``unsafe-rewrite`` — everything that WRITES to GitHub is unreachable, but
+    every refusal is reachable and is reported identically in both modes, and
+    so is ``already-handled`` whenever the dry run has a token to ask with.
+    That symmetry is the point of dry-run: a flag a real run would refuse, or
+    would skip, must be visible in the dry run that preceded it. Without a
+    token a dry run cannot know, and logs that it did not ask.
 
     ``diff`` is what the transform COMPUTED, not a claim that it survived:
     ``failed`` carries the diff it would have proposed, because the failure
@@ -221,6 +264,68 @@ class FlagResult:
     #: ``unprocessed_files`` is: it is the one thing the customer can act on,
     #: and it decides whether this flag will ever be proposable.
     refused_files: tuple[str, ...] = ()
+    #: ``(file, reason)`` for each refused file: which Gate 1 check stopped it,
+    #: worded for the reader. Most are not syntax errors at all, and a refusal
+    #: that named no cause sent people looking for one in a file that parsed.
+    refusal_reasons: tuple[tuple[str, str], ...] = ()
+    #: Live flags that still list this one as a prerequisite (``blocked``
+    #: only). On the result so the run's report can say what it waits on.
+    blocked_by: tuple[str, ...] = ()
+    #: What an earlier run left for this flag when it was not an OPEN pull
+    #: request: ``"merged"``, ``"closed"`` (without merging) or ``"branch"``
+    #: (a branch with no pull request). ``blocked`` and ``already-handled``
+    #: only. ``prior_removal_url`` names the pull request; it is for the report
+    #: and is never linked in Featureflip — that is ``pr_url``'s job, and only
+    #: for an open one.
+    prior_removal: str = ""
+    prior_removal_url: str = ""
+
+
+#: Actions whose ``pr_url`` names a pull request that is open for this flag right
+#: now: one this run opened, one an overlapping run opened seconds earlier, or one
+#: the up-front already-handled check found still open (#3201 F4) — a PR an
+#: earlier run or Action version opened and never reported, for instance. A
+#: closed ("no thanks") pull request, or a branch with no pull request at all,
+#: leaves ``pr_url`` empty and is never reported. A held pull request is still the
+#: removal pull request for its flag, so it stays linked.
+_REPORTABLE_ACTIONS = frozenset({"pr-opened", "already-handled", "blocked"})
+
+
+class _RemovalPrReporter:
+    """Tells Featureflip which pull request removes each flag. Best effort.
+
+    The pull request already exists by the time this runs, so nothing here may
+    fail the flag, the run, or the branch: every error becomes a warning. A
+    permission refusal is about the token rather than the flag, so it switches
+    reporting off for the rest of the run instead of repeating once per flag.
+    """
+
+    def __init__(self, client: _Client, org: str, project: str) -> None:
+        self._client = client
+        self._org = org
+        self._project = project
+        self._enabled = True
+
+    def report(self, result: FlagResult) -> None:
+        if (
+            not self._enabled
+            or not result.pr_url
+            or result.action_taken not in _REPORTABLE_ACTIONS
+        ):
+            return
+        try:
+            self._client.set_removal_pr(self._org, self._project, result.key, result.pr_url)
+        except RemovalPrPermissionError as exc:
+            self._enabled = False
+            logger.warning(
+                "not linking removal pull requests in Featureflip for the rest "
+                "of this run: %s", exc
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must never fail a flag
+            logger.warning(
+                "could not link %s to flag %s in Featureflip: %s",
+                result.pr_url, result.key, exc,
+            )
 
 
 def run(
@@ -236,8 +341,10 @@ def run(
     environment and an authenticated :class:`GitHubApi`. All three are
     injectable so tests never touch the network.
 
-    With ``config.dry_run`` set, ``github``/``gh`` are ignored entirely — not
-    one request is made — and every result is a ``"dry-run"``.
+    With ``config.dry_run`` set, nothing is written to GitHub. ``github``/``gh``
+    (or a ``GITHUB_TOKEN`` in the environment) are used only for the read-only
+    idempotency lookup, so a dry run reports ``already-handled`` where a real
+    run would; with no token at all, not one request is made.
 
     Raises :class:`~flag_cleanup.git_ops.PreflightError` before touching the
     network or the filesystem if any configured directory is missing, is not
@@ -260,6 +367,21 @@ def run(
         # Resolved before the first API call so a missing GITHUB_TOKEN fails
         # immediately rather than after a page of candidates has been fetched.
         resolved_github = github if github is not None else GitHubEnv.from_env()
+    else:
+        # Optional here: a dry run with no token still previews every diff, it
+        # just cannot tell which flags a real run would skip as already handled.
+        resolved_github = github
+        if resolved_github is None:
+            try:
+                resolved_github = GitHubEnv.from_env()
+            except GitHubConfigError as exc:
+                logger.info(
+                    "dry run: %s — not checking for existing removal pull "
+                    "requests, so a flag that already has one is previewed as "
+                    "if it had none",
+                    exc,
+                )
+    if resolved_github is not None:
         owns_gh = gh is None
         resolved_gh = (
             gh
@@ -293,7 +415,15 @@ def run(
                 config=config,
                 ledger=ledger,
                 known_flag_keys=known_flag_keys,
+                lookup=(
+                    _ReadOnlyLookup(resolved_gh, resolved_github.repository)
+                    if resolved_gh is not None and resolved_github is not None
+                    else None
+                ),
             )
+            # Never in dry-run: no pull request has actually been opened, so
+            # there is nothing yet for Featureflip to link.
+            reporter = None
         else:
             # One flag key can legitimately appear twice in one paginated fetch
             # (a cursor re-read, a backend listing it under two reasons).
@@ -310,29 +440,36 @@ def run(
                 ledger=ledger,
                 known_flag_keys=known_flag_keys,
             )
+            reporter = _RemovalPrReporter(resolved_client, config.org, config.project)
         started = True
-        proposed = 0
-        for candidate in resolved_client.removal_candidates(
-            config.org, config.project, config.staleness
-        ):
-            result = process(candidate)
-            results.append(result)
-            proposed += 1 if _is_proposal(result) else 0
-            if config.max_prs and proposed >= config.max_prs:
-                # Stop cleanly rather than propose the rest. This is a
-                # blast-radius limit, not an error: correctness arguments bound
-                # what a bug can do to ONE pull request, and nothing bounded how
-                # many of them a single run could open against a customer's
-                # repository. Counted on proposals, so ignored/no-changes/
-                # already-handled candidates cost nothing against it.
-                logger.warning(
-                    "stopping after %d proposal(s): the max-prs limit. Remaining "
-                    "candidates were not attempted and will be proposed on the "
-                    "next run — raise `max-prs` (or set it to 0 for no limit) to "
-                    "do more in one go",
-                    proposed,
-                )
-                break
+        # One listing of the checkout's source files for the whole run: every
+        # flag's changes are undone before the next starts, so no candidate
+        # adds or removes a file another one would see. See `source_index`.
+        with source_index.run_scope():
+            proposed = 0
+            for candidate in resolved_client.removal_candidates(
+                config.org, config.project, config.staleness
+            ):
+                result = process(candidate)
+                results.append(result)
+                if reporter is not None:
+                    reporter.report(result)
+                proposed += 1 if _is_proposal(result) else 0
+                if config.max_prs and proposed >= config.max_prs:
+                    # Stop cleanly rather than propose the rest. This is a
+                    # blast-radius limit, not an error: correctness arguments bound
+                    # what a bug can do to ONE pull request, and nothing bounded how
+                    # many of them a single run could open against a customer's
+                    # repository. Counted on proposals, so ignored/no-changes/
+                    # already-handled candidates cost nothing against it.
+                    logger.warning(
+                        "stopping after %d proposal(s): the max-prs limit. Remaining "
+                        "candidates were not attempted and will be proposed on the "
+                        "next run — raise `max-prs` (or set it to 0 for no limit) to "
+                        "do more in one go",
+                        proposed,
+                    )
+                    break
     except BaseException as exc:
         # Stamped BEFORE the results check inside `_attach_partial_results`:
         # "candidate processing began" is true even when no candidate completed,
@@ -506,8 +643,13 @@ def _process_candidate(
     config: Config,
     ledger: git_ops.OwnershipLedger,
     known_flag_keys: frozenset[str] = frozenset(),
+    lookup: _ReadOnlyLookup | None = None,
 ) -> FlagResult:
-    """Dry run: compute the diff, touch nothing else."""
+    """Dry run: compute the diff, touch nothing else.
+
+    ``lookup`` asks GitHub the PR path's idempotency question, read-only, when
+    the run has a token to ask with.
+    """
     if candidate.key in config.ignore:
         logger.info("skipping %s: listed in the ignore config", candidate.key)
         return FlagResult(candidate.key, candidate.treatment, candidate.status, "", "ignored")
@@ -527,13 +669,12 @@ def _process_candidate(
     _warn_on_unrecognized_status(candidate)
 
     # Asked here too, in the same order as the PR path, even though a dry run
-    # never uses the branch name: `removal_branch` is the ONLY check that
-    # refuses a key for being unrepresentable as a git ref (blank once
-    # stripped, or over 240 characters escaped), and skipping it let a dry run
-    # print a clean `[dry-run]` plus the diff it would propose for a flag the
-    # very next real run refuses outright. Pure string work — no request is
-    # made, so `run`'s "not one request in dry-run mode" still holds.
-    _branch, unsafe_key = _branch_or_refusal(candidate)
+    # creates no branch: `removal_branch` is the ONLY check that refuses a key
+    # for being unrepresentable as a git ref (blank once stripped, or over 240
+    # characters escaped), and skipping it let a dry run print a clean
+    # `[dry-run]` plus the diff it would propose for a flag the very next real
+    # run refuses outright. The name is also what the lookup below asks about.
+    branch, unsafe_key = _branch_or_refusal(candidate)
     if unsafe_key is not None:
         return unsafe_key
 
@@ -541,7 +682,20 @@ def _process_candidate(
     if unsupported is not None:
         return unsupported
 
+    # Asked once, before either check that needs it, and in the PR path's
+    # order: blocked first, then already handled. Never holds or releases —
+    # those are writes.
+    handled = lookup.find(branch) if lookup is not None else None
+
+    if candidate.blocked_by:
+        return _blocked_result(candidate, handled)
+
+    if handled is not None and handled.handled:
+        return _already_handled_result(candidate, handled)
+
     unprocessed: tuple[str, ...] = ()
+    wrappers: tuple[ConstantWrapper, ...] = ()
+    enum_held: tuple[tuple[str, str], ...] = ()
     with piranha_transform(candidate, config, ledger, known_flag_keys) as (
         diff,
         transform_error,
@@ -551,6 +705,11 @@ def _process_candidate(
         _bindings,
         entries,
         declined,
+        _test_doubles,
+        deleted_tests,
+        kept,
+        unresolved,
+        enum_findings,
     ):
         # Inside the `with`, and for the same reason the PR path computes it
         # there: `_unprocessed_references` reads the REWRITTEN tree, and the
@@ -560,14 +719,23 @@ def _process_candidate(
         # preview a real run would have contradicted the real run's own body.
         if transform_error is None:
             unprocessed = all_unprocessed(config, candidate.key, unprocessable)
+            enum_held = classify_residue(
+                unprocessed, candidate.key, config.accessors
+            ).enum_held
+            wrappers = find_constant_wrappers(diff, config.directories)
 
     if transform_error is not None:
         return _refusal_result(candidate, transform_error)
 
     _warn_on_unprocessed_references(config, candidate.key, unprocessed)
+    note_constant_wrappers(wrappers)
     note_rewritten_build_output(diff)
     note_removed_entries(entries)
     note_declined_entries(declined)
+    note_unresolved_references(unresolved)
+    note_enum_findings(enum_findings, enum_held)
+    note_deleted_tests(deleted_tests)
+    note_kept(kept)
 
     return FlagResult(
         candidate.key,
@@ -625,6 +793,11 @@ def _process_candidate_for_pr(
         )
     seen_branches.add(branch)
 
+    if candidate.blocked_by:
+        return _blocked_result(
+            candidate, _hold_open_removal(candidate, gh, github.repository, branch)
+        )
+
     # Not `config.directories[0]` raw: a configured entry may name a single
     # file, and a file cannot be a subprocess cwd.
     repo_dir = git_ops.work_dir(config.directories[0])
@@ -640,15 +813,29 @@ def _process_candidate_for_pr(
     # the `with` below, and a path that never enters it must not turn a
     # reportable failure into a NameError on the way out.
     declined: tuple[tuple[str, str], ...] = ()
+    deleted_tests: tuple[tuple[str, str], ...] = ()
+    kept: tuple[tuple[str, str], ...] = ()
+    unresolved: tuple[tuple[str, int, str, str], ...] = ()
+    enum_findings: tuple[tuple[str, int, str, str], ...] = ()
+    enum_held: tuple[tuple[str, str], ...] = ()
     refused: tuple[str, ...] = ()
+    reasons: tuple[tuple[str, str], ...] = ()
     snapshot: git_ops.WorktreeSnapshot | None = None
     try:
         # Asked first: an already-proposed flag must cost nothing and must
-        # never reach the point where a second PR could be opened.
-        if github_ops.already_handled(gh, github.repository, branch):
-            return FlagResult(
-                candidate.key, candidate.treatment, candidate.status, "", "already-handled"
-            )
+        # never reach the point where a second PR could be opened. Also names
+        # a still-OPEN pull request's URL when that is why this flag is
+        # handled — a transient reporting failure, a permission upgrade, or a
+        # PR an earlier Action version opened all leave exactly this shape
+        # (#3201 F4), and the result's `pr_url` is what lets the reporter
+        # below link it again.
+        handled = github_ops.already_handled_pull_request(gh, github.repository, branch)
+        if handled.handled:
+            if handled.open_pull is not None:
+                # Not blocked any more (that check ran above): undo a hold an
+                # earlier run placed. A no-op when the PR is not on hold.
+                _release_hold(gh, github.repository, handled.open_pull, candidate.key)
+            return _already_handled_result(candidate, handled)
 
         original_ref = git_ops.current_ref(repo_dir)
         with piranha_transform(candidate, config, ledger, known_flag_keys) as (
@@ -660,6 +847,11 @@ def _process_candidate_for_pr(
             bindings,
             entries,
             declined,
+            test_doubles,
+            deleted_tests,
+            kept,
+            unresolved,
+            enum_findings,
         ):
             # Inside the `with`, this flag's edits — and only this flag's —
             # are on disk. That is the only window in which the commit can be
@@ -667,15 +859,26 @@ def _process_candidate_for_pr(
             if transform_error is not None:
                 action = _refusal_action(transform_error)
                 refused = _refused_files(transform_error)
+                reasons = _refusal_reasons(transform_error)
             elif not diff:
                 logger.info("no changes for %s: opening no PR", candidate.key)
                 action = "no-changes"
                 unprocessed = all_unprocessed(config, candidate.key, unprocessable)
+                enum_held = classify_residue(
+                    unprocessed, candidate.key, config.accessors
+                ).enum_held
             else:
                 # Computed BEFORE the PR is opened so the body can carry the
                 # caveat. A PR titled "remove flag X" whose repo still reads X
                 # from a .js file must say so where the reviewer will see it.
                 unprocessed = all_unprocessed(config, candidate.key, unprocessable)
+                # Sorted while the rewrite is still on disk, for the same
+                # reason `unprocessed` is computed here.
+                residue = classify_residue(unprocessed, candidate.key, config.accessors)
+                enum_held = residue.enum_held
+                # Same window, same reason: the members it reads are only
+                # constants while the rewrite is on disk.
+                wrappers = find_constant_wrappers(diff, config.directories)
                 git_ops.create_branch(repo_dir, branch)
                 created_branch = True
                 git_ops.commit_changes(
@@ -698,6 +901,13 @@ def _process_candidate_for_pr(
                         note_rewritten_build_output(diff),
                         entries=entries,
                         declined=declined,
+                        test_doubles=test_doubles,
+                        residue=residue,
+                        deleted_tests=deleted_tests,
+                        unresolved=unresolved,
+                        enum_findings=enum_findings,
+                        wrappers=wrappers,
+                        left_in_place=kept,
                     ),
                     labels=config.pr_labels,
                     draft=not is_dead(candidate.status),
@@ -862,6 +1072,10 @@ def _process_candidate_for_pr(
         # deliberately. Duplicating the body's paragraph on `pr-opened` is the
         # cheaper half of that trade, and matches `unprocessed` above.
         note_declined_entries(declined)
+        note_unresolved_references(unresolved)
+        note_enum_findings(enum_findings, enum_held)
+        note_deleted_tests(deleted_tests)
+        note_kept(kept)
     else:
         # `unprocessed` is computed BEFORE the branch/commit/push (the PR body
         # needs it), so a flag that fails after that point still holds a list
@@ -882,6 +1096,7 @@ def _process_candidate_for_pr(
         pr_url,
         unprocessed_files=unprocessed,
         refused_files=refused,
+        refusal_reasons=reasons,
     )
 
 
@@ -939,6 +1154,173 @@ def _refused_files(error: TransformRefusal) -> tuple[str, ...]:
     return error.refused if isinstance(error, UnsafeRewriteError) else ()
 
 
+def _refusal_reasons(error: TransformRefusal) -> tuple[tuple[str, str], ...]:
+    if not isinstance(error, UnsafeRewriteError):
+        return ()
+    return tuple((path, error.reasons[path]) for path in error.refused if path in error.reasons)
+
+
+#: The ``HandledPullRequest.state`` values that ``FlagResult.prior_removal``
+#: carries. An OPEN pull request is not among them: that one is ``pr_url``.
+_PRIOR_REMOVAL_STATES = frozenset({"merged", "closed", "branch"})
+
+
+def _prior_removal(handled: HandledPullRequest | None) -> tuple[str, str]:
+    """``(prior_removal, prior_removal_url)`` for a result, from the lookup."""
+    if handled is None or handled.state not in _PRIOR_REMOVAL_STATES:
+        return "", ""
+    return handled.state, handled.closed_pr_url
+
+
+def _note_blocked(candidate: Candidate, prior: str, prior_url: str) -> None:
+    """Say why ``candidate`` was not proposed, and what happens to it next.
+
+    "Proposed on the first run after that" is true only when nothing was ever
+    proposed. A merged removal is waiting on an ARCHIVE, and a declined one,
+    or a branch left without a pull request, is never proposed again: the
+    idempotency check that runs once the flag is unblocked says so.
+    """
+    dependents = ", ".join(candidate.blocked_by)
+    named = f" in {prior_url}" if prior_url else ""
+    if prior == "merged":
+        logger.warning(
+            "not proposing %s: its removal was already merged%s. It can be "
+            "archived once %s, which still use it as a prerequisite, are archived",
+            candidate.key, named, dependents,
+        )
+    elif prior == "closed":
+        logger.warning(
+            "not proposing %s: its removal pull request%s was closed without "
+            "merging, so it is not proposed again. It is also still a "
+            "prerequisite of %s",
+            candidate.key, named, dependents,
+        )
+    elif prior == "branch":
+        logger.warning(
+            "not proposing %s: its removal branch already exists with no pull "
+            "request, so it is not proposed again. It is also still a "
+            "prerequisite of %s",
+            candidate.key, dependents,
+        )
+    else:
+        logger.warning(
+            "not proposing %s: it is still a prerequisite of %s. Remove and "
+            "archive those flags first; %s is proposed on the first run after that",
+            candidate.key, dependents, candidate.key,
+        )
+
+
+def _hold_open_removal(
+    candidate: Candidate, gh: GitHubApi, repo: str, branch: str
+) -> HandledPullRequest | None:
+    """Look up ``branch``'s removal pull request and put an open one on hold.
+
+    The hold is best effort: a GitHub refusal is a warning, and the outcome is
+    ``blocked`` either way, because nothing was proposed. The archive endpoint
+    refuses this flag while its dependents are live, whatever happens here.
+    ``None`` when the lookup itself failed.
+    """
+    handled: HandledPullRequest | None = None
+    try:
+        handled = github_ops.already_handled_pull_request(gh, repo, branch)
+        if handled.open_pull is not None:
+            prerequisite_hold.hold(gh, repo, handled.open_pull, candidate.key, candidate.blocked_by)
+    except Exception as exc:  # noqa: BLE001 - a hold must never end the run
+        # Broad on purpose, and that includes an auth error the PR path would
+        # stop on: nothing is being proposed here, so there is nothing to stop.
+        logger.warning(
+            "could not check %s for an open pull request to hold: %s", branch, exc, exc_info=True
+        )
+    return handled
+
+
+def _blocked_result(candidate: Candidate, handled: HandledPullRequest | None) -> FlagResult:
+    """``blocked``, naming whatever removal pull request the lookup found.
+
+    Shared by both modes so a dry run and a real run describe a blocked flag
+    identically; only the real run has put an open one on hold.
+    """
+    prior, prior_url = _prior_removal(handled)
+    _note_blocked(candidate, prior, prior_url)
+    open_pull = handled.open_pull if handled is not None else None
+    return FlagResult(
+        candidate.key,
+        candidate.treatment,
+        candidate.status,
+        "",
+        "blocked",
+        pr_url=open_pull.html_url if open_pull is not None else "",
+        blocked_by=candidate.blocked_by,
+        prior_removal=prior,
+        prior_removal_url=prior_url,
+    )
+
+
+def _already_handled_result(candidate: Candidate, handled: HandledPullRequest) -> FlagResult:
+    prior, prior_url = _prior_removal(handled)
+    return FlagResult(
+        candidate.key,
+        candidate.treatment,
+        candidate.status,
+        "",
+        "already-handled",
+        pr_url=handled.open_pr_url,
+        prior_removal=prior,
+        prior_removal_url=prior_url,
+    )
+
+
+class _ReadOnlyLookup:
+    """A dry run's idempotency lookup: the PR path's question, never its writes.
+
+    The lookup refines the preview, it is not what the preview is for, so a
+    failure falls back to previewing the diff. A token that cannot read pull
+    requests at all stops the asking for the rest of the run, once, rather
+    than warning per flag.
+    """
+
+    def __init__(self, gh: GitHubApi, repo: str) -> None:
+        self._gh = gh
+        self._repo = repo
+        self._enabled = True
+
+    def find(self, branch: str) -> HandledPullRequest | None:
+        if not self._enabled:
+            return None
+        try:
+            return github_ops.already_handled_pull_request(self._gh, self._repo, branch)
+        except github_ops.GitHubAuthError as exc:
+            self._enabled = False
+            logger.warning(
+                "dry run: not checking for existing removal pull requests for "
+                "the rest of this run (%s). A flag a real run would report as "
+                "already handled is previewed as if it had none",
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - a read must never end a dry run
+            logger.warning(
+                "dry run: could not check %s for an existing removal pull "
+                "request (%s); previewing its diff anyway",
+                branch,
+                exc,
+            )
+        return None
+
+
+def _release_hold(gh: GitHubApi, repo: str, pull: github_ops.OpenPullRequest, key: str) -> None:
+    """:func:`prerequisite_hold.release`, as a warning rather than a failed flag.
+
+    The flag is already handled whatever happens here; a hold left in place
+    is retried on the next run.
+    """
+    try:
+        prerequisite_hold.release(gh, repo, pull, key)
+    except Exception as exc:  # noqa: BLE001 - a release must never fail the flag
+        logger.warning(
+            "could not release the hold on pull request #%s: %s", pull.number, exc, exc_info=True
+        )
+
+
 def _refusal_result(candidate: Candidate, error: TransformRefusal) -> FlagResult:
     return FlagResult(
         candidate.key,
@@ -947,6 +1329,7 @@ def _refusal_result(candidate: Candidate, error: TransformRefusal) -> FlagResult
         "",
         _refusal_action(error),
         refused_files=_refused_files(error),
+        refusal_reasons=_refusal_reasons(error),
     )
 
 
@@ -1049,6 +1432,8 @@ def piranha_transform(
         tuple[tuple[str, str], ...],
         tuple[tuple[str, str, str], ...],
         tuple[tuple[str, str], ...],
+        tuple[tuple[str, str], ...],
+        tuple[tuple[str, int, str, str], ...],
     ]
 ]:
     """Run Piranha for one candidate; yield the outcome; always undo.
@@ -1068,6 +1453,15 @@ def piranha_transform(
     under the ``rules/<base>_entries.toml`` prong, and ``declined`` the ones
     those same prongs LEFT because their value is the branch being removed
     (#3050) — see :class:`~flag_cleanup.piranha_runner.TransformOutcome`.
+    The next-to-last element, ``kept``, is ``(path, reason)`` for what the
+    transform deliberately left in place although a rule would have removed
+    it: a test file that still uses the key as data, and a registry entry kept
+    because something still names the key (see :func:`_live_references`).
+    The last, ``unresolved``, is ``(path, line, reason, text)`` for each
+    reference to a cross-file key constant the run could not prove is a read
+    of this flag, and so why its declaration was kept. A 13th element,
+    ``enum_findings``, is ``(path, line, reason, text)`` for what the run found
+    about enum entries holding the key.
 
     The body of the ``with`` runs while the edits are still on disk — that is
     what lets the PR path commit them. On exit the tree is restored no matter
@@ -1094,21 +1488,51 @@ def piranha_transform(
     bindings: list[tuple[str, str, str]] = []
     entries: list[tuple[str, str]] = []
     declined: list[tuple[str, str]] = []
+    test_doubles: list[tuple[str, str, str]] = []
+    deleted_tests: list[tuple[str, str]] = []
+    kept: list[tuple[str, str]] = []
+    unresolved: list[tuple[str, int, str, str]] = []
+    enum_findings: list[tuple[str, int, str, str]] = []
     transform_error: TransformRefusal | None = None
     try:
         try:
-            for directory, language, files in plan:
-                if not files:
-                    continue
-                outcome = transform_flag(
-                    directory,
-                    language,
+            outcomes = _run_plan(plan, candidate, config, known_flag_keys)
+            kept_entries: list[tuple[str, str]] = []
+            # A registry entry deleted while something still names the key
+            # turns that mention into a compile error or a crash: the registry
+            # is usually what the key's TYPE is derived from, and what a lookup
+            # by key reads its default out of. So when anything but a comment
+            # still names the key once the removal is on disk, the whole
+            # removal is undone and run again without the registry prong, and
+            # the entries it would have deleted are reported as kept. Nothing
+            # else changes between the two runs; see `_live_references`.
+            if known_flag_keys and any(o.entries for o in outcomes):
+                live = _live_references(
+                    config,
                     candidate.key,
-                    candidate.treatment,
-                    paths=files,
-                    accessors=config.accessors,
-                    known_flag_keys=known_flag_keys,
+                    [path for o in outcomes for path in o.unprocessable],
                 )
+                if live:
+                    first = [entry for o in outcomes for entry in o.entries]
+                    _undo_transform(config, snapshot, pending=None)
+                    outcomes = _run_plan(plan, candidate, config, frozenset())
+                    for entry in (entry for o in outcomes for entry in o.entries):
+                        if entry in first:
+                            first.remove(entry)
+                    named = ", ".join((os.path.relpath(p) for p in live[:5])) + (
+                        f" and {len(live) - 5} more" if len(live) > 5 else ""
+                    )
+                    kept_entries = [
+                        (
+                            path,
+                            f"registry entry {text} kept: {len(live)} file(s) still "
+                            f"name the key outside a comment ({named}), and "
+                            "deleting the entry they are typed against would "
+                            "break them",
+                        )
+                        for path, text in first
+                    ]
+            for outcome in outcomes:
                 if outcome.diff:
                     diff_parts.append(outcome.diff)
                 # Files the engine could not process at all. They still hold a
@@ -1119,6 +1543,12 @@ def piranha_transform(
                 bindings.extend(outcome.bindings)
                 entries.extend(outcome.entries)
                 declined.extend(outcome.declined)
+                test_doubles.extend(outcome.test_doubles)
+                deleted_tests.extend(outcome.deleted_tests)
+                kept.extend(outcome.kept)
+                unresolved.extend(outcome.unresolved)
+                enum_findings.extend(outcome.enum_findings)
+            kept.extend(kept_entries)
         except (PiranhaTransformError, UnsafeRewriteError) as exc:
             # Both are refusals, and both abandon the flag ENTIRELY — note the
             # try wraps the whole directory x language loop, so a refusal in
@@ -1162,6 +1592,18 @@ def piranha_transform(
             # either way, so naming a preserved entry would explain a decision
             # inside a pull request that was never opened.
             () if transform_error is not None else tuple(declined),
+            # Dropped on refusal like the other deletions: none happened.
+            () if transform_error is not None else tuple(test_doubles),
+            # Dropped with the diff it describes: on a refusal no test was
+            # deleted.
+            () if transform_error is not None else tuple(deleted_tests),
+            # Dropped too: on a refusal everything was left in place, and
+            # singling some of it out would explain a pull request never opened.
+            () if transform_error is not None else tuple(kept),
+            # Dropped on refusal: the declaration it explains was never judged.
+            () if transform_error is not None else tuple(unresolved),
+            # Dropped on refusal like `unresolved`: nothing was judged.
+            () if transform_error is not None else tuple(enum_findings),
         )
     except BaseException as body_error:
         # try/except/else rather than `finally`: the undo needs to know whether
@@ -1172,6 +1614,69 @@ def piranha_transform(
         raise
     else:
         _undo_transform(config, snapshot, pending=None)
+
+
+def _run_plan(
+    plan: list[tuple[str, str, list[str]]],
+    candidate: Candidate,
+    config: Config,
+    known_flag_keys: frozenset[str],
+) -> list[TransformOutcome]:
+    """One transform per ``(directory, language)`` pass in ``plan``, in order.
+
+    A refusal propagates out of the first pass that raises it, so a later pass
+    never runs after an earlier one was refused; see :func:`piranha_transform`.
+
+    Each pass reports its enum findings and unresolved key-constant references
+    relative to its own directory. They are re-spelled here under that
+    directory, the way the residue scan spells the files it finds, so a
+    finding is compared with the residue by path and ``src/flags.ts`` in one
+    directory is never taken for another's.
+    """
+
+    def qualify(
+        findings: tuple[tuple[str, int, str, str], ...], directory: str
+    ) -> tuple[tuple[str, int, str, str], ...]:
+        return tuple(
+            (os.path.normpath(os.path.join(directory, path)), line, reason, text)
+            for path, line, reason, text in findings
+        )
+
+    outcomes: list[TransformOutcome] = []
+    for directory, language, files in plan:
+        if not files:
+            continue
+        outcome = transform_flag(
+            directory,
+            language,
+            candidate.key,
+            candidate.treatment,
+            paths=files,
+            accessors=config.accessors,
+            known_flag_keys=known_flag_keys,
+            gates=config.gates,
+        )
+        outcomes.append(
+            replace(
+                outcome,
+                unresolved=qualify(outcome.unresolved, directory),
+                enum_findings=qualify(outcome.enum_findings, directory),
+            )
+        )
+    return outcomes
+
+
+def _live_references(
+    config: Config, flag_key: str, engine_skipped: Iterable[str]
+) -> tuple[str, ...]:
+    """The files that still name ``flag_key`` other than in a comment.
+
+    Asked with the removal on disk, like :func:`all_unprocessed`, whose list
+    this narrows. A file this cannot parse counts as live: keeping a registry
+    entry it did not need costs the reviewer one line, deleting one it did
+    costs a broken build.
+    """
+    return live_references(all_unprocessed(config, flag_key, engine_skipped), flag_key)
 
 
 def _transform_plan(
@@ -1195,7 +1700,12 @@ def _transform_plan(
         (
             directory,
             language,
-            _committable(directory, candidate_files(directory, language, candidate.key)),
+            _committable(
+                directory,
+                candidate_files(
+                    directory, language, candidate.key, languages=config.languages
+                ),
+            ),
         )
         for directory in config.directories
         for language in config.languages

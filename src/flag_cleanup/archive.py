@@ -35,7 +35,12 @@ the same way as nothing having matched:
 * ``FLAG_HAS_DEPENDENTS`` and ``FLAG_HAS_PENDING_SCHEDULES`` stay LOUD. Nothing
   changes until a person removes a prerequisite or cancels a schedule, so a run
   that exits 0 is telling them the loop closed when it did not, and nobody will
-  ever look again.
+  ever look again. The one carve-out is a dependents refusal where EVERY
+  dependent named has a merged removal of its own: then this flag waits on the
+  same deploy its dependents do, nobody has anything to do, and it is
+  ``deferred`` like the refusal below. Showing that takes a GitHub lookup per
+  dependent, so this mode makes it only when ``GITHUB_TOKEN`` is passed
+  through, and otherwise stays loud.
 * ``FLAG_RECENTLY_EVALUATED`` is ``deferred`` and exits 0. Nobody has anything
   to do: the code merged, the deploy has not landed yet, and the refusal lifts
   by itself once traffic drains. ``archive-on-merge`` fires on the MERGE, so on
@@ -55,11 +60,26 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+
+import httpx
 from dataclasses import dataclass
 
-from flag_cleanup.client import FeatureflipClient, FlagRecentlyEvaluatedError
+from flag_cleanup.client import (
+    FeatureflipClient,
+    FlagHasDependentsError,
+    FlagRecentlyEvaluatedError,
+)
 from flag_cleanup.config import Config
-from flag_cleanup.github_ops import flag_key_from_branch
+from flag_cleanup.github_ops import (
+    GitHubApi,
+    GitHubApiError,
+    GitHubConfigError,
+    GitHubEnv,
+    UnsafeFlagKeyError,
+    flag_key_from_branch,
+    merged_removal,
+    removal_branch,
+)
 from flag_cleanup.pr_event import MergedPullRequest, merged_pull_request
 
 logger = logging.getLogger(__name__)
@@ -97,16 +117,35 @@ def deferred_detail(exc: FlagRecentlyEvaluatedError) -> str:
     )
 
 
+def dependents_deferred_detail(exc: FlagHasDependentsError) -> str:
+    """The one-line report for an archive deferred behind its own dependents.
+
+    Only ever printed once the caller has shown that EVERY dependent the
+    refusal names has a merged removal of its own — see
+    :func:`flag_cleanup.backlog.archive_outstanding`. The flag is then waiting
+    on the same deploy its dependents are, and nobody has anything to do.
+    """
+    names = ", ".join(exc.dependents)
+    noun = "flag" if len(exc.dependents) == 1 else "flags"
+    return (
+        f"not archived yet: dependent {noun} {names} still list it as a "
+        "prerequisite, and their removal has merged too but they are not "
+        "archived yet — nothing to do, and `mode: archive-sweep` archives this "
+        "flag once they are"
+    )
+
+
 def run_archive(
     config: Config,
     env: Mapping[str, str] | None = None,
     *,
     client: FeatureflipClient | None = None,
+    gh: GitHubApi | None = None,
 ) -> ArchiveResult:
     """Archive the flag whose removal pull request just merged.
 
-    ``client`` is injectable so tests never open a socket; when omitted, one is
-    built from ``config`` and closed before returning.
+    ``client`` and ``gh`` are injectable so tests never open a socket; when
+    omitted, each is built when needed and closed before returning.
 
     Raises :class:`~flag_cleanup.pr_event.PullRequestEventError` when the
     workflow is wired wrongly, and
@@ -115,9 +154,11 @@ def run_archive(
     a partial result is not a thing this mode has — it archives one flag or it
     does not.
 
-    The lone exception is :class:`~flag_cleanup.client.FlagRecentlyEvaluatedError`,
+    The exceptions are :class:`~flag_cleanup.client.FlagRecentlyEvaluatedError`,
     which is returned as ``deferred`` rather than raised — see the module
-    docstring for why that one refusal, and only that one, is soft.
+    docstring — and a :class:`~flag_cleanup.client.FlagHasDependentsError` whose
+    every dependent has a merged removal of its own, which can only be shown
+    when ``GITHUB_TOKEN`` is available (:func:`_dependents_all_removed`).
     """
     pull_request = merged_pull_request(env)
     if pull_request is None:
@@ -126,7 +167,7 @@ def run_archive(
             detail="the pull request closed without merging, so nothing is archived",
         )
 
-    return _archive_for(config, pull_request, client=client)
+    return _archive_for(config, pull_request, client=client, env=env, gh=gh)
 
 
 def _archive_for(
@@ -134,6 +175,8 @@ def _archive_for(
     pull_request: MergedPullRequest,
     *,
     client: FeatureflipClient | None,
+    env: Mapping[str, str] | None = None,
+    gh: GitHubApi | None = None,
 ) -> ArchiveResult:
     key = flag_key_from_branch(pull_request.head_ref)
     if key is None:
@@ -165,6 +208,20 @@ def _archive_for(
             key=key,
             pull_request=pull_request.number or None,
         )
+    except FlagHasDependentsError as exc:
+        if not _dependents_all_removed(exc.dependents, env=env, gh=gh):
+            raise
+        logger.info(
+            "archive of flag %s deferred: dependents %s have merged removals",
+            key,
+            ", ".join(exc.dependents),
+        )
+        return ArchiveResult(
+            action_taken="deferred",
+            detail=dependents_deferred_detail(exc),
+            key=key,
+            pull_request=pull_request.number or None,
+        )
     finally:
         if owned:
             active.close()
@@ -176,3 +233,40 @@ def _archive_for(
         key=key,
         pull_request=pull_request.number or None,
     )
+
+
+def _dependents_all_removed(
+    dependents: tuple[str, ...],
+    *,
+    env: Mapping[str, str] | None,
+    gh: GitHubApi | None,
+) -> bool:
+    """Whether every dependent has a merged removal pull request of its own.
+
+    This mode needs nothing from ``GITHUB_TOKEN`` and does not start needing
+    it: when the workflow does not pass one through, the answer is ``False``
+    and the refusal stays the loud failure it always was. A workflow that DOES
+    pass one (with ``pull-requests: read``) gets the sweep's judgement — the
+    same :func:`~flag_cleanup.github_ops.merged_removal` evidence, one lookup
+    per dependent.
+
+    Any lookup that cannot answer is ``False`` too. "I could not tell" must
+    never quiet a refusal a person may need to act on.
+    """
+    try:
+        github = GitHubEnv.from_env(env)
+    except GitHubConfigError:
+        return False
+    active = gh if gh is not None else GitHubApi(github.token, api_url=github.api_url)
+    try:
+        for dependent in dependents:
+            branch = removal_branch(dependent)
+            if merged_removal(active, github.repository, branch) is None:
+                return False
+        return True
+    except (UnsafeFlagKeyError, GitHubApiError, httpx.HTTPError) as exc:
+        logger.warning("could not check the removals of %s: %s", ", ".join(dependents), exc)
+        return False
+    finally:
+        if gh is None:
+            active.close()

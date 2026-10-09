@@ -9,9 +9,11 @@ inferred from the docs):
 
 ``GET {api_url}/api/v1/orgs/{org}/projects/{project}/flags/removal-candidates``
 ``?staleness=dead|stale`` (``&cursor=`` to page), ``Authorization: Bearer <token>``,
-returning ``{"items": [{"key", "reason", "treatment", "status"}], "next_cursor": str | None}``.
+returning ``{"items": [{"key", "reason", "treatment", "status", "blockedBy"}], "next_cursor": str | None}``.
 ``next_cursor`` is snake_case and ``status`` is PascalCase (``"Dead"``/``"Stale"``)
 on the wire — both verbatim, not a guess.
+``blockedBy`` (camelCase) lists the live flags that still use the candidate as a
+prerequisite; a server that predates it omits it, which reads as ``()``.
 
 ``GET {api_url}/api/v1/orgs/{org}/projects/{project}/flags`` (``&cursor=`` to
 page; ``?archived=false`` narrows to live flags, and omitting it returns both),
@@ -62,6 +64,14 @@ class ArchivePermissionError(FeatureflipApiError):
     """
 
 
+class RemovalPrPermissionError(FeatureflipApiError):
+    """A 401/403 recording a pull request link: the token cannot write.
+
+    Its own type because the remedy is the token, not the flag, so the caller
+    stops trying for the rest of the run instead of warning once per flag.
+    """
+
+
 #: The one archive refusal that resolves with nobody doing anything: the code
 #: merged, the deploy has not landed yet, and traffic drains on its own. Every
 #: other 400 — ``FLAG_HAS_DEPENDENTS``, ``FLAG_HAS_PENDING_SCHEDULES`` — needs
@@ -93,6 +103,34 @@ class FlagRecentlyEvaluatedError(FeatureflipApiError):
         self.environments = environments
 
 
+#: The prerequisite refusal: another live flag still lists this one as a
+#: prerequisite. Loud by default, like every other 400 — but a caller that can
+#: show every dependent it names has a merged removal of its own knows nobody
+#: has to act, and :class:`FlagHasDependentsError` carries the keys so it can.
+HAS_DEPENDENTS_CODE = "FLAG_HAS_DEPENDENTS"
+
+
+class FlagHasDependentsError(FeatureflipApiError):
+    """Archive refused because other live flags list this one as a prerequisite.
+
+    Its own type so that a caller can tell WHO those dependents are, not
+    because this refusal is soft. It is soft only when every dependent is
+    itself on its way out — its removal merged, its own archive pending — and
+    only a caller holding that evidence can say so. ``archive_flag`` has none,
+    so to any caller that does not look this is the same loud failure it
+    always was.
+    """
+
+    def __init__(self, message: str, *, key: str, dependents: tuple[str, ...]) -> None:
+        super().__init__(message)
+        #: The flag the archive was refused for.
+        self.key = key
+        #: The dependent flag keys the response named. Never empty: a refusal
+        #: that names none is raised as the base type, because "every dependent
+        #: has a merged removal" is vacuously true of an empty list.
+        self.dependents = dependents
+
+
 def _raise_for_status_without_credentials(response: httpx.Response) -> None:
     """``raise_for_status`` with the URL's userinfo stripped from the message.
 
@@ -122,6 +160,7 @@ logger = logging.getLogger(__name__)
 _REMOVAL_CANDIDATES_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/removal-candidates"
 _FLAGS_PATH = "/api/v1/orgs/{org}/projects/{project}/flags"
 _ARCHIVE_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/{flag}/archive"
+_REMOVAL_PR_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/{flag}/removal-pr"
 
 
 def _envelope_detail(response: httpx.Response) -> str:
@@ -214,6 +253,41 @@ def _recently_evaluated_environments(response: httpx.Response) -> tuple[str, ...
     return None
 
 
+def _dependent_flag_keys(response: httpx.Response) -> tuple[str, ...] | None:
+    """The dependent flag keys a ``FLAG_HAS_DEPENDENTS`` refusal names, or
+    ``None`` when the response is not exactly that refusal.
+
+    Stricter than :func:`_recently_evaluated_environments` in two ways, both
+    because a wrong answer here turns a loud refusal quiet. Every field entry
+    must be a ``FLAG_HAS_DEPENDENTS`` entry — any other code alongside it is a
+    refusal a person has to deal with, and wins. And the entry must name at
+    least one key, since a caller asks whether ALL of them are being removed,
+    and that is vacuously true of none.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    fields = payload.get("fields")
+    if not isinstance(fields, dict):
+        return None
+
+    prefix = f"{HAS_DEPENDENTS_CODE}:"
+    dependents: list[str] = []
+    for problems in fields.values():
+        entries = problems if isinstance(problems, (list, tuple)) else [problems]
+        for problem in entries:
+            if not isinstance(problem, str) or not problem.startswith(prefix):
+                return None
+            for name in problem[len(prefix) :].split(","):
+                name = name.strip()
+                if name and name not in dependents:
+                    dependents.append(name)
+    return tuple(dependents) or None
+
+
 def _require_bool(value: object, key: object) -> bool:
     """``value`` as a real ``bool``, or refuse the whole walk.
 
@@ -270,6 +344,21 @@ def _require_str(item: dict, field: str, endpoint: str = "removal-candidates") -
         "rather than guessed at"
     )
 
+
+def _require_str_list(item: dict, field: str, endpoint: str = "removal-candidates") -> tuple[str, ...]:
+    """An optional list-of-strings field: absent is ``()``, anything else malformed is refused."""
+    if field not in item:
+        return ()
+    value = item[field]
+    if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
+        raise FeatureflipApiError(
+            f"{endpoint} returned a `{field}` that is not a list of strings "
+            f"({value!r}) for {item.get('key')!r}. The endpoint contract this "
+            "Action is built against is frozen, so a response that does not "
+            "match it is refused rather than guessed at"
+        )
+    return tuple(value)
+
 #: Hard cap on pages fetched for ONE ``_pages`` walk — so it bounds
 #: :meth:`FeatureflipClient.flag_keys` exactly as it bounds
 #: :meth:`FeatureflipClient.removal_candidates`. Neither endpoint returns more
@@ -295,6 +384,10 @@ class Candidate:
     reason: str
     treatment: bool
     status: str
+    #: Live flags that still list this one as a prerequisite. Non-empty means
+    #: removing it now is out of order: those flags have to be removed and
+    #: archived first. Empty when the server predates the field.
+    blocked_by: tuple[str, ...] = ()
 
 
 class FeatureflipClient:
@@ -419,6 +512,7 @@ class FeatureflipClient:
                     reason=_require_str(item, "reason"),
                     treatment=_require_bool(item.get("treatment"), item.get("key")),
                     status=_require_str(item, "status"),
+                    blocked_by=_require_str_list(item, "blockedBy"),
                 )
 
     def _flag_items(self, org: str, project: str, params: dict[str, str]) -> Iterator[dict]:
@@ -556,6 +650,9 @@ class FeatureflipClient:
           ``FLAG_RECENTLY_EVALUATED`` does not: the code merged, the deploy has
           not landed, and the refusal lifts by itself once traffic drains — so
           it gets :class:`FlagRecentlyEvaluatedError` and the caller decides.
+          ``FLAG_HAS_DEPENDENTS`` is raised as :class:`FlagHasDependentsError`
+          — the same message, plus the dependent keys — so a caller that can
+          show every dependent is itself being removed may defer instead.
           All three are surfaced verbatim from ``fields`` — see
           :func:`_envelope_detail`.
         """
@@ -604,10 +701,50 @@ class FeatureflipClient:
                     key=key,
                     environments=environments,
                 )
-            raise FeatureflipApiError(
+            message = (
                 f"Featureflip refused to archive flag {key!r}: the code was merged "
                 f"but the flag cannot be archived yet.{suffix}"
             )
+            dependents = _dependent_flag_keys(response)
+            if dependents is not None:
+                raise FlagHasDependentsError(message, key=key, dependents=dependents)
+            raise FeatureflipApiError(message)
+        raise FeatureflipApiError(
+            f"Featureflip API returned {response.status_code} for {safe_url}.{suffix}"
+        )
+
+    def set_removal_pr(self, org: str, project: str, key: str, url: str) -> None:
+        """Record ``url`` as the pull request that removes flag ``key``.
+
+        Lets Featureflip link the pull request in the notice it sends the
+        flag's owner. Idempotent: reporting the same URL again changes nothing.
+        Writing needs a token with the Member role, so a 401/403 raises
+        :class:`RemovalPrPermissionError`; anything else that is not a ``204``
+        raises :class:`FeatureflipApiError`.
+        """
+        path = _REMOVAL_PR_PATH.format(
+            org=quote(org, safe=""),
+            project=quote(project, safe=""),
+            flag=quote(key, safe=""),
+        )
+        response = self._client.put(
+            path,
+            headers={"Authorization": f"Bearer {self._api_token}"},
+            json={"url": url},
+        )
+        if response.status_code == 204:
+            return
+
+        detail = _envelope_detail(response)
+        suffix = f" {detail}" if detail else ""
+        if response.status_code in (401, 403):
+            raise RemovalPrPermissionError(
+                f"Featureflip API returned {response.status_code} recording the pull "
+                f"request for flag {key!r}. Recording it needs a token with the Member "
+                f"role; with a read-only token the pull request is still opened, but "
+                f"owner notifications will not link to it.{suffix}"
+            )
+        safe_url = without_userinfo(str(response.request.url))
         raise FeatureflipApiError(
             f"Featureflip API returned {response.status_code} for {safe_url}.{suffix}"
         )

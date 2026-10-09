@@ -438,9 +438,13 @@ def _folds(
     the type changes outright. Both dedented a live branch's body.
 
     The rule that separates them takes the same premise :func:`_paired` rests
-    on — the engine rewrites in place and never reorders — so the ``kept``
-    non-blank lines a hunk produced answer its LAST ``kept`` input lines, and
-    those are not asked. ``old[i1]`` is asked always, so a one-for-one hunk
+    on — the engine rewrites in place and never reorders — so each non-blank
+    line a hunk produced answers one of its input lines, and those are not
+    asked. Both of those fixtures have the survivor made from the hunk's LAST
+    lines, which is the default; a survivor whose text sits verbatim in one
+    input line names its own source instead, and a rewritten gate directly
+    above a fold is the shape where the two disagree (:func:`_deleted`).
+    ``old[i1]`` is asked always, so a one-for-one hunk
     still reaches :func:`_still_stands`' first clause rather than being skipped
     by arithmetic that happens to agree with it. That clause counts lines in
     the hunk, so it fires only when the hunk IS one line, and then the header
@@ -454,18 +458,11 @@ def _folds(
     for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal" or i2 == i1:
             continue
-        kept = sum(1 for index in range(j1, min(j2, len(new))) if new[index].strip())
         # Every input line the hunk DELETED, not just the first: `difflib`
         # merges adjacent deletions into one opcode, so such a hunk holds as
-        # many headers as it holds header lines. The `kept` lines it produced
-        # answer its LAST `kept` input lines, which is the same premise
-        # :func:`_paired` rests on — the engine rewrites in place and never
-        # reorders — so those are the lines whose survival cannot be read off
-        # the after-side and they are not asked. `old[i1]` is always asked, so
-        # a one-for-one hunk still reaches :func:`_still_stands`' first clause
-        # rather than being skipped by arithmetic that happens to agree with
-        # it. See the docstring (#3037).
-        for index in range(i1, max(i1 + 1, i2 - kept)):
+        # many headers as it holds header lines. See the docstring (#3037) and
+        # :func:`_deleted` for which lines those are.
+        for index in _deleted(old, new, i1, i2, j1, j2):
             header = old[index]
             # A blank line is not a header. The engine drops blank lines from a
             # spliced body, which arrives here as its own deletion — and its
@@ -511,6 +508,57 @@ def _folds(
                 continue
             found.append((index + 1, end, base, target, (j1, j2)))
     return found
+
+
+def _deleted(
+    old: list[str], new: list[str], i1: int, i2: int, j1: int, j2: int
+) -> list[int]:
+    """The input lines of one hunk that :func:`_folds` may ask about.
+
+    A hunk's non-blank output lines were each MADE FROM one of its input lines,
+    and those input lines are not asked: :func:`_still_stands` reads the
+    after-side as a whole, so it cannot tell a header rewritten in place from
+    one that was removed. Which input lines they are has two answers, tried in
+    order:
+
+    * **Where each output line's text survives inside exactly one input line,
+      that line is its source.** A rewrite that drops the read around what it
+      guards leaves the guarded text verbatim — ``{on && <Banner />}`` becomes
+      ``<Banner />``, ``if (on) banner();`` becomes ``banner();``, Ruby's
+      ``elsif premium?`` becomes ``if premium?`` — so the source is read off the
+      input rather than guessed from position. The sources must also come in
+      input order, the premise :func:`_paired` rests on: the engine rewrites in
+      place and never reorders.
+    * **Otherwise the ``kept`` output lines answer the hunk's LAST ``kept``
+      input lines.** This is the shape every rewritten header in the corpus
+      has, because it is rewritten from the hunk's END: C#'s ``else if
+      (<read>)`` + ``{`` merged into ``else {``, whose text is in neither input
+      line, and Ruby's promoted ``elsif``.
+
+    The first answer exists because the second is only a default. A one-line
+    gate rewritten directly ABOVE a multi-line gate that folds puts both in one
+    hunk the other way round: the survivor comes from the FIRST line and the
+    deleted header is the LAST, so the positional rule skipped the one line
+    that should have been asked, no fold was found, and the body shipped where
+    the engine left it — at column zero for the C family's statements.
+
+    ``old[i1]`` is asked either way, so a one-for-one hunk still reaches
+    :func:`_still_stands`' first clause rather than being skipped by arithmetic
+    that happens to agree with it.
+    """
+    survivors = [
+        new[index].strip() for index in range(j1, min(j2, len(new))) if new[index].strip()
+    ]
+    sources: list[int] = []
+    for text in survivors:
+        holders = [index for index in range(i1, i2) if text in old[index]]
+        if len(holders) != 1 or (sources and holders[0] <= sources[-1]):
+            sources = []
+            break
+        sources.append(holders[0])
+    if sources:
+        return [index for index in range(i1, i2) if index == i1 or index not in sources]
+    return list(range(i1, max(i1 + 1, i2 - len(survivors))))
 
 
 def _shift_rewritten_body(

@@ -414,13 +414,27 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     Gate 2 and check 4 each close one specific parses-but-wrong case; a new one
     needs its own check.
     """
-    return (
-        introduced_syntax_errors(before, after, language)
-        or _reserved_bindings(after, language) > _reserved_bindings(before, language)
-        or _reserved_word_identifiers(after, language)
-        > _reserved_word_identifiers(before, language)
-        or _asi_merged_statements(before, after, language)
-    )
+    return refusal_reason(before, after, language) is not None
+
+
+def refusal_reason(before: str, after: str, language: str) -> str | None:
+    """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
+
+    The same four checks in the same order, each worded for the person reading
+    the run's output — a refusal that names no cause sends them looking for a
+    syntax error in a file that may parse perfectly well.
+    """
+    if introduced_syntax_errors(before, after, language):
+        return "the result has a syntax error the original did not"
+    if _reserved_bindings(after, language) > _reserved_bindings(before, language):
+        return "a boolean literal landed where a name is declared"
+    if _reserved_word_identifiers(after, language) > _reserved_word_identifiers(
+        before, language
+    ):
+        return "a keyword was left stranded where an expression is read"
+    if _asi_merged_statements(before, after, language):
+        return "two statements would run together without a semicolon"
+    return None
 
 
 def binding_nodes(root: Node) -> list[Node]:

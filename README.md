@@ -1,9 +1,11 @@
 # Featureflip Flag Cleanup Action
 
-Deterministic dead/stale feature-flag removal, powered by the
+Deterministic dead/stale feature-flag removal for
+[Featureflip](https://featureflip.io/), powered by the
 `polyglot-piranha` AST transform engine. Runs inside the
 customer's CI, fetches removal candidates from the Featureflip public API, and
-opens one PR per flag.
+opens one PR per flag. The setup guide lives at
+[featureflip.io/docs/integrations/flag-cleanup-action](https://featureflip.io/docs/integrations/flag-cleanup-action/).
 
 Supported languages: **TypeScript** (`.ts`, `.mts`, `.cts`), **TSX** (`.tsx`),
 **JavaScript** (`.js`, `.jsx`, `.mjs`, `.cjs`), **PHP** (`.php`, `.phtml`,
@@ -52,19 +54,27 @@ jobs:
 repository or organization secret) — never a Featureflip-internal one, and
 this Action never reads or contacts anything Featureflip-internal.
 
-In this mode the Action only ever **reads** from that API, so give it the least
-privilege that works: a `Viewer` token restricted to the one project is enough,
-and is what these instructions are verified against. Nothing here archives,
-toggles or deletes a flag — removing the code is proposed as a pull request for
-you to merge, and what happens to the flag afterwards stays your decision.
+In this mode the Action reads removal candidates from that API and makes one
+small write: it records a removal pull request's link on the flag, so the
+notice Featureflip sends the flag's owner can link straight to it. That
+happens after opening a pull request, and again on any later run that finds
+the same pull request still open — so a link a prior run couldn't record (a
+transient error, a token still on `Viewer`, or a pull request opened before
+this existed) still reaches Featureflip once the run succeeds. Recording the
+link needs a token with the `Member` role. A `Viewer` token
+restricted to the one project still works, and is the least privilege that
+does: pull requests are opened exactly the same way, the run logs one warning,
+and owner notices simply don't link them. Nothing here archives, toggles or
+deletes a flag — removing the code is proposed as a pull request for you to
+merge, and what happens to the flag afterwards stays your decision.
 
 ### Archive the flag once the removal is deployed
 
 Merging a removal pull request deletes the code, but the flag itself stays live
-in Featureflip until somebody archives it. `mode: archive-on-merge` closes that
-loop from the `pull_request` closed event. It is **opt-in and separate**, in its
-own workflow on its own trigger — and it is the one part of this Action that can
-change what your users see, so read this section before wiring it up.
+in Featureflip until somebody archives it. `mode: archive-sweep` closes that
+loop on a schedule. It is **opt-in and separate**, in its own workflow on its
+own trigger — and it is the one part of this Action that can change what your
+users see, so read this section before wiring it up.
 
 **The loop closes on the deploy, not on the merge**, and those are the same
 moment in some pipelines and nowhere near it in others. Archiving is not a soft
@@ -84,26 +94,29 @@ turns the feature **off**, for everyone, until the deploy lands.
 **Featureflip refuses the archive while it can still see the flag being
 evaluated**, which is what stops that being a silent outcome. The refusal is
 `FLAG_RECENTLY_EVALUATED`, and this Action reports it as `[deferred]` and exits
-`0` — nothing failed, nothing is for you to do, and the archive happens later
-(see [Drain the archives that deferred](#drain-the-archives-that-deferred)).
+`0` — nothing failed, nothing is for you to do, and the next sweep tries again.
 It is a backstop reading telemetry that has already been reported, though, not
 permission to treat a merge as a deploy: it can only rule on environments it has
-seen traffic from, and a flag no environment has ever evaluated is allowed
-through because nothing can break.
+seen traffic from, and a flag nothing has evaluated recently is allowed through.
+That is right for a flag that is truly dead and wrong for code that is still
+deployed but rarely reached — a monthly job, an admin-only page, an error path.
+If your deploys can trail your merges by more than a day and you have code like
+that, add [`archive-on-deploy`](#archive-when-the-deploy-actually-lands), which
+asks git whether the removal is in the commit you are running.
 
-So this mode fits comfortably when merging *is* deploying — the merge triggers
-the pipeline, the pipeline finishes on its own, the old build is gone minutes
-later — and it is now also workable when they are hours or days apart, because
-the deferral is what covers that gap:
+The sweep fits comfortably when merging *is* deploying — the merge triggers the
+pipeline, the pipeline finishes on its own, the old build is gone minutes later
+— and it is also workable when they are hours or days apart, because the
+deferral covers that gap:
 
 * **Promotion to production is manual, staged or gated** — a release train, a
-  canary, an approval step. Each removal merge will usually report `[deferred]`
-  rather than archiving, so **wire up `archive-sweep` as well**, or the flag
-  defers forever and the loop is left half-closed. If your pipeline creates
-  GitHub Deployments, [`archive-on-deploy`](#archive-when-the-deploy-actually-lands)
-  adds a second, deterministic check on top of that — it will not even propose a
-  flag whose removal is not in the commit you are running. It does **not**
-  replace the sweep, and does not avoid the deferral.
+  canary, an approval step. A removal will usually report `[deferred]` on the
+  first runs after it merges, and the sweep archives it once traffic drains. If
+  your pipeline creates GitHub Deployments,
+  [`archive-on-deploy`](#archive-when-the-deploy-actually-lands) adds a second,
+  deterministic check on top — it will not even attempt a flag whose removal is
+  not in the commit you are running. It does **not** replace the sweep, and
+  does not avoid the deferral.
 * **Long-lived browser sessions are normal for your users** — a tab opened
   before the deploy is still running the old bundle and still reading the flag.
   Its evaluations keep the refusal in place until those sessions drain, which is
@@ -121,86 +134,9 @@ the deferral is what covers that gap:
   `?force=true` on the archive endpoint, accepting that whatever is still
   running falls back to its own default.
 
-Nothing about `mode: remove` depends on either of these workflows: the removal
-pull requests keep arriving regardless, and what happens to the flag afterwards
-stays your decision.
-
-```yaml
-name: Featureflip archive on merge
-on:
-  pull_request:
-    types: [closed]
-
-jobs:
-  archive:
-    if: github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
-        with:
-          mode: archive-on-merge
-          api-token: ${{ secrets.FEATUREFLIP_ARCHIVE_TOKEN }}
-          org: my-org
-          project: my-project
-```
-
-Three things to note.
-
-**It needs a different token, and this is the whole reason the mode is
-separate.** Archiving requires a token with the **Member** role, while fetching
-removal candidates needs only read access. Give this workflow its own secret
-rather than reusing the read-only one from the cleanup workflow. The difference
-matters if a token ever leaks: a read token discloses flag names, a Member token
-can change flag state.
-
-**It needs no `actions/checkout` and no `permissions:` block.** The run reads
-the pull request that triggered it and makes one API call. It touches no source,
-opens no branch, and never calls the GitHub API, so it needs nothing from
-`GITHUB_TOKEN`.
-
-**It identifies the flag from the branch name**, which this Action encodes
-reversibly when it opens the pull request. Nothing is parsed out of the pull
-request title or body, so editing those is safe, and the mode works on removal
-pull requests opened before you added this workflow.
-
-The workflow above fires on every closed pull request in the repository. That is
-expected: anything not opened by this Action is skipped with a one-line
-`[not-a-removal-branch]` and exits 0. A pull request you closed **without**
-merging is likewise `[not-merged]` and leaves the flag alone — declining a
-removal never archives anything.
-
-Archiving is idempotent, so a redelivered event or a re-run is harmless.
-
-**The flag not being deployed yet is an outcome, not a failure.** When
-Featureflip refuses because live traffic is still evaluating the flag — the
-hazard described above, caught — the run prints:
-
-```
-[deferred] old-checkout not archived yet: live traffic is still evaluating this
-flag in production. The removal merged but has not finished deploying — nothing
-to do, and `mode: archive-sweep` re-attempts it once traffic drains
-```
-
-and **exits 0**. It is deliberately not a red build: wherever deploys lag
-merges this is the ordinary result of a removal merge, and a failing job nobody
-can act on is one people learn to ignore. What closes the loop is the sweep in
-the next section — without it a deferred flag stays live indefinitely.
-
-It can also legitimately fail, and the message says which case you are in. All
-of these exit 1, and each needs a person:
-
-| What happened | What to do |
-| --- | --- |
-| Another live flag lists this one as a prerequisite (`FLAG_HAS_DEPENDENTS`) | Remove that prerequisite, then archive the flag yourself. The code is already merged. |
-| A scheduled change still targets the flag (`FLAG_HAS_PENDING_SCHEDULES`) | Cancel the pending schedule, then archive. |
-| `403` | The token cannot archive. Check this workflow is not reusing the read-only cleanup secret. |
-| `404` | The flag no longer exists, or `org`/`project` do not name the project it lives in. |
-
-### Drain the archives that deferred
-
-`mode: archive-sweep` is what comes back for the flags above. On a schedule, it
-finds every flag in the project whose removal pull request merged but which is
-still live, and tries to archive each one again:
+Nothing about `mode: remove` depends on these workflows: the removal pull
+requests keep arriving regardless, and what happens to the flag afterwards stays
+your decision.
 
 ```yaml
 name: Featureflip archive sweep
@@ -226,28 +162,67 @@ jobs:
           project: my-project
 ```
 
-Four things to note.
+Each run finds every flag in the project whose removal pull request merged but
+which is still live, and tries to archive it. Five things to note.
 
-**It needs `GITHUB_TOKEN`, and `archive-on-merge` does not.** This is the one
-real cost of the mode. Not firing on the merge event means it has no pull
-request handed to it, so it asks GitHub — once per live flag — whether that
-flag's removal branch ever produced a *merged* pull request. Read access to pull
-requests is all it wants, and it never writes anything to your repository.
+**It needs a different token, and this is the whole reason the mode is
+separate.** Archiving requires a token with the **Member** role. Fetching
+removal candidates needs only read access — the cleanup workflow's one small
+write, recording a pull request's link (see above), wants `Member` too but
+degrades cleanly to `Viewer`. Give this workflow its own secret rather than
+reusing the cleanup workflow's. The difference matters if a token ever leaks:
+the cleanup token discloses flag names at worst, while a Member token here can
+change flag state for real users.
+
+**It needs `GITHUB_TOKEN`, with `pull-requests: read`.** It runs on a schedule,
+so no pull request is handed to it; it asks GitHub — once per live flag —
+whether that flag's removal branch ever produced a *merged* pull request. It
+never writes anything to your repository, and needs no `actions/checkout`.
 
 **Evidence of a merge is what authorises each archive.** A removal pull request
 you closed *without* merging is a removal you declined, and reads to this mode
 exactly like a flag that was never proposed: it is left alone. Nothing is
 archived that this Action did not open a pull request for.
 
-**It needs the same Member-role token `archive-on-merge` uses**, for the same
-reason, and keeps the same quiet/loud split: `archived` and `deferred` are both
-fine and exit 0, and a flag the API refuses for any other reason is named on its
-own line and exits 1 without stopping the rest of the backlog draining.
-
 **There is no state to manage.** Nothing is written when an archive defers — a
 flag still being live *is* the record — so running this more often, less often,
 or twice at once is harmless, and there is nothing to reset if you turn it off.
-`dry-run: true` prints the flags it would attempt and sends nothing.
+Archiving is idempotent, so a flag archived between two runs is simply not
+outstanding on the second. `dry-run: true` prints the flags it would attempt and
+sends nothing.
+
+**A flag that is not deployed yet is an outcome, not a failure.** When
+Featureflip refuses because live traffic is still evaluating the flag — the
+hazard described above, caught — the run prints:
+
+```
+[deferred] old-checkout not archived yet: live traffic is still evaluating this
+flag in production. The removal merged but has not finished deploying — nothing
+to do, and `mode: archive-sweep` re-attempts it once traffic drains
+```
+
+and moves on to the next flag. It is deliberately not a red build: wherever
+deploys lag merges this is the ordinary result for a few runs after each
+removal, and a failing job nobody can act on is one people learn to ignore.
+
+A flag can also legitimately fail, and the message says which case you are in.
+Each is named on its own line, the rest of the backlog is still attempted, and
+the run exits 1, because each needs a person:
+
+| What happened | What to do |
+| --- | --- |
+| Another live flag lists this one as a prerequisite (`FLAG_HAS_DEPENDENTS`), and that flag's removal has not merged | Remove that prerequisite. The next sweep archives the flag. |
+| A scheduled change still targets the flag (`FLAG_HAS_PENDING_SCHEDULES`) | Cancel the pending schedule. The next sweep archives the flag. |
+| `403` | The token cannot archive. Check this workflow is not reusing the cleanup workflow's secret. A `403` stops the run, since every other flag would fail the same way. |
+| `404` | `org`/`project` do not name the project the flags live in, or the flag was deleted while the run was in progress. |
+
+**A flag whose dependents are being removed too is deferred, not failed.**
+Removing a client-side flag and then the server flag it lists as a prerequisite
+is the usual order, and until the client flag is archived Featureflip refuses
+the server flag with `FLAG_HAS_DEPENDENTS`. When every dependent it names has a
+merged removal pull request of its own, nothing is wrong: both flags are waiting
+on the same deploy, so the run reports `[deferred]`. The sweep also archives the
+dependents first, so once traffic has drained one run archives the whole chain.
 
 A run with nothing to do says so:
 
@@ -258,10 +233,10 @@ already archived
 
 ### Archive when the deploy actually lands
 
-`archive-on-merge` fires on the merge, which is the wrong event: it proposes an
-archive against a commit nobody is running yet. If your pipeline creates
-**GitHub Deployments**, `mode: archive-on-deploy` fires on the deploy instead,
-and archives only the outstanding flags whose removal that deployment actually
+`archive-sweep` acts on the evidence of a merge, with Featureflip's refusal
+standing between that and an archive. If your pipeline creates **GitHub
+Deployments**, `mode: archive-on-deploy` fires on the deploy instead, and
+archives only the outstanding flags whose removal that deployment actually
 contains:
 
 ```yaml
@@ -312,13 +287,13 @@ wiring up at all:
   do — Vercel, Netlify, `actions/deploy-pages`, Argo and friends via webhooks,
   and any workflow that uses a GitHub `environment:`. Plenty do not, and there
   is no event for this mode to hang on in those. Nothing is lost by not using
-  it: `archive-on-merge` plus `archive-sweep` behave exactly as they did.
+  it: `archive-sweep` behaves exactly as it does on its own.
 * **It does nothing for clients you cannot update.** Mobile, desktop and
   embedded builds keep evaluating the flag long after your servers stop, and no
   git event corresponds to "the last old version stopped calling us". Deploying
   is simply not the completion event there, which is why those flags stay
   covered by Featureflip's own refusal and the `[deferred]` outcome, exactly as
-  described two sections up.
+  described above.
 
 **It asks whether the deployed commit contains the removal, rather than
 assuming.** For each flag whose removal pull request merged but which is still
@@ -369,11 +344,10 @@ The environment name is matched case-insensitively against the payload's
 and archives nothing — a deployment that failed left the old build running, so
 the flag is still being read.
 
-**It needs `GITHUB_TOKEN` and two read permissions**, which is the real cost
-against `archive-on-merge`. That mode reads its pull request out of the event
-payload and touches neither your source nor the GitHub API; this one asks GitHub
-which removals merged (`pull-requests: read`) and whether the deployed commit
-contains each of them (`contents: read`). It writes nothing to your repository.
+**It needs `GITHUB_TOKEN` and two read permissions**, one more than the sweep.
+Like the sweep it asks GitHub which removals merged (`pull-requests: read`), and
+it also asks whether the deployed commit contains each of them
+(`contents: read`). It writes nothing to your repository.
 It needs the same Member-role Featureflip token the other archive modes use, for
 the same reason.
 
@@ -383,13 +357,50 @@ named on its own line and exits `1` without stopping the rest of the backlog.
 `dry-run: true` computes the same set — including the containment check — and
 sends nothing.
 
+### Deprecated: archive on merge
+
+`mode: archive-on-merge` is **deprecated and will be removed in the next major
+version**. Every run prints a warning saying so; until it is removed it behaves
+exactly as before.
+
+It archives the flag on the `pull_request` closed event, the moment its removal
+merges, which is the wrong moment. The code is merged, not deployed. Since
+Featureflip started refusing to archive a flag it can still see being evaluated,
+nearly every run of this mode reports `[deferred]` and leaves the actual archive
+to `archive-sweep`. The only flags it still archives on the spot are the ones
+nothing has evaluated recently — and those include code that is deployed but
+rarely reached, which it archives at the earliest possible moment, before any
+deploy has had a chance to land.
+
+**To migrate**, delete the workflow that runs `mode: archive-on-merge` and run
+[`archive-sweep`](#archive-the-flag-once-the-removal-is-deployed) on a schedule
+instead, adding [`archive-on-deploy`](#archive-when-the-deploy-actually-lands)
+if your pipeline creates GitHub Deployments. Keep the same Member-role secret.
+The sweep finds every merged removal whose flag is still live, including those
+merged while the old workflow was running, so nothing is lost in the switch.
+
+For reference while you migrate, the mode:
+
+* identifies its flag from the pull request's **branch name**, which this Action
+  encodes reversibly when it opens the pull request — nothing is parsed out of
+  the title or body;
+* reports `[not-a-removal-branch]` for a pull request this Action did not open
+  and `[not-merged]` for one closed without merging, both exit `0` — declining
+  a removal never archives anything;
+* needs no `actions/checkout` and no `permissions:` block. Passing
+  `GITHUB_TOKEN` with `pull-requests: read` is optional, and only lets a
+  `FLAG_HAS_DEPENDENTS` refusal be reported as `[deferred]` when every
+  dependent's removal has merged too;
+* reads only `api-token`, `org`, `project` and `api-url`, and ignores
+  `dry-run`.
+
 ### Re-run a removal from a comment
 
 A removal pull request can go stale — the base branch moved on, or somebody
 pushed a fix by hand and wants the tool to try again from scratch. `mode:
 pr-command` lets a human ask for that directly, by commenting on the pull
 request this Action already opened, rather than waiting for the next
-scheduled sweep. Like `archive-on-merge` it is **opt-in and separate**, in its
+scheduled sweep. Like the archive modes it is **opt-in and separate**, in its
 own workflow on its own trigger:
 
 ```yaml
@@ -442,13 +453,13 @@ write that lands on the branch between this run reading it and pushing is
 Six things to know.
 
 **The flag is identified by the pull request's own branch**, the same
-reversible encoding `archive-on-merge` reads — there is nothing to type in the
+reversible encoding the archive modes read — there is nothing to type in the
 comment besides the command itself, and no way to aim a re-run at a different
 flag than the one the pull request is already about.
 
 **Only someone with write access to the repository can run either command.**
 A comment from anyone else is silently ignored — no reply, exit `0` — for the
-same reason `archive-on-merge`'s own no-ops stay quiet: `issue_comment` fires
+same reason the archive modes' no-ops stay quiet: `issue_comment` fires
 for anyone who can comment at all, and replying would turn this Action into an
 amplifier for whoever types the mention.
 
@@ -486,7 +497,7 @@ guards, the transform, everything — but stops before creating a branch,
 force-pushing, or updating the pull request; it replies naming what it would
 have done (including how many existing commits the push would have replaced)
 and exits `0` as `rerun-dry-run`. Unlike a `remove`-mode dry run, which never
-touches the GitHub API at all, this one still checks your write access, reads
+writes to GitHub at all, this one still checks your write access, reads
 the pull request, and posts that reply — only the push and the `PATCH` are
 skipped. Carrying `dry-run: true` over from the scheduled workflow, out of
 habit or caution, previews safely here rather than doing nothing silently,
@@ -496,9 +507,12 @@ configured directories reads the flag any more, the outcome is `rerun-empty`,
 not `rerun-dry-run` — there is nothing left for dry-run's own preview to
 show once the diff is empty.
 
-**A closed pull request is reopened by the same update that regenerates
-it**, and a **merged** pull request is refused outright: the code is already
-on the base branch, so there is nothing left to remove.
+**A closed pull request is reopened, then regenerated.** The reopen happens
+before the push, because GitHub will not reopen a pull request whose branch
+was force-pushed while it was closed. If the push then fails, the pull request
+stays open at its previous commit and the reply says so; close it again if you
+do not want it. A **merged** pull request is refused outright: the code is
+already on the base branch, so there is nothing left to remove.
 
 The command always answers on the pull request itself, and the run closes
 with an exit code:
@@ -547,19 +561,19 @@ entries dropped.
 | `api-token` | `FEATUREFLIP_API_TOKEN` | *(required)* | Your Featureflip API token. |
 | `org` | `FEATUREFLIP_ORG` | *(required)* | Featureflip organization slug. |
 | `project` | `FEATUREFLIP_PROJECT` | *(required)* | Featureflip project slug. |
-| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-on-merge` archives the flag whose removal PR just merged and ignores every input below except `api-url` — read [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed) before using it, because merging is not deploying. `archive-sweep` re-attempts the archives that deferred, and reads only `api-url` and `dry-run` from the inputs below — see [Drain the archives that deferred](#drain-the-archives-that-deferred). `archive-on-deploy` archives the outstanding flags a successful deployment shipped, and reads only `deployment-environment`, `api-url` and `dry-run` from the inputs below — see [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
+| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-sweep` archives the flags whose removal has merged, on a schedule, and reads only `api-url` and `dry-run` from the inputs below — read [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed) before using it, because merging is not deploying. `archive-on-deploy` archives the outstanding flags a successful deployment shipped, and reads only `deployment-environment`, `api-url` and `dry-run` from the inputs below — see [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `archive-on-merge` is deprecated — see [Deprecated: archive on merge](#deprecated-archive-on-merge). |
 | `deployment-environment` | `FEATUREFLIP_DEPLOYMENT_ENVIRONMENT` | `production` | `archive-on-deploy` only. Matched case-insensitively against the payload's `deployment.environment`; a deployment to anything else archives nothing and says so. |
 | `api-url` | `FEATUREFLIP_API_URL` | `https://api.featureflip.io` | Override only for a staging/self-hosted instance. |
 | `staleness` | `FEATUREFLIP_STALENESS` | `dead` | `dead` (ready-for-review PRs) or `stale` (draft PRs). |
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
-| `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's. See [Wrapping the SDK](#wrapping-the-sdk). |
+| `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`). See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. |
 | `pr-labels` | `FEATUREFLIP_PR_LABELS` | *(none)* | Comma-separated. A label that fails to apply is logged as a warning and does not fail the PR. **May create labels** — see below. |
 | `max-prs` | `FEATUREFLIP_MAX_PRS` | `10` | Most pull requests one run may propose (`0` = no limit). See "How much one run can do" below. |
-| `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below for `remove` mode; `archive-sweep`, `archive-on-deploy` and `pr-command` honour it too, each differently — see [Drain the archives that deferred](#drain-the-archives-that-deferred), [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands) and [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
+| `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below for `remove` mode; `archive-sweep`, `archive-on-deploy` and `pr-command` honour it too, each differently — see [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed), [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands) and [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
 
 `GITHUB_TOKEN` is **not** a declared input — GitHub does not expose it to a
 container as a default environment variable, so it must be passed through the
@@ -592,6 +606,40 @@ exist in your repository may be **created** by that call (with a default
 colour) rather than rejected. If you want to control label colours and
 descriptions, create them before setting this input.
 
+### Flags that other flags depend on
+
+A flag that another live flag lists as a **prerequisite** is not proposed for
+removal until that flag is gone. Archiving it earlier would make every flag
+that depends on it fail its prerequisite check and serve its off variation, so
+the order is always: remove and archive the dependents, then the prerequisite.
+
+Such a flag is reported as `[blocked]`, with the flags it is waiting on:
+
+```
+[blocked] checkout-v2 (status=Dead, treatment=True)
+    waiting on: web-checkout-v2 (still use this flag as a prerequisite; ...)
+```
+
+It costs nothing against `max-prs`, is reported the same way in a dry run, and
+is proposed automatically on the first run after its last dependent is
+archived. If its removal pull request is already open, the run converts it to a
+draft and comments to say what it is waiting on; once nothing depends on the
+flag any more, a later run restores it (a pull request that was already a draft
+stays one) and says so. That needs no permission beyond the
+`pull-requests: write` the Action already uses. `rerun` and `recreate` comments
+on such a pull request are refused for the same reason.
+
+A flag whose removal pull request was already **merged** is not waiting for a
+proposal, so the line says so instead:
+
+```
+[blocked] checkout-v2 (status=Dead, treatment=True)
+    waiting on: web-checkout-v2 (still use this flag as a prerequisite). Its removal was already merged in https://github.com/acme/web/pull/41, so it can be archived once they are
+```
+
+One that was closed without merging is not proposed again either, and its line
+names that pull request instead.
+
 ### How much one run can do
 
 `max-prs` caps how many pull requests a single run proposes (default `10`).
@@ -619,16 +667,30 @@ comment](#re-run-a-removal-from-a-comment) for what it does there.
 `dry-run` defaults to `false` — if you omit it, the Action opens real
 branches, commits, and pull requests on its first run. There is no friendlier
 default hiding in the code. Set `dry-run: true` explicitly (as the quick-start
-above does) to only compute and print each candidate's diff; in that mode
-GitHub is never contacted at all, not even to check whether a PR already
-exists for a flag.
+above does) to only compute and print each candidate's diff. A dry run never
+writes to GitHub: no branch, no push, no pull request, no comment, no label.
+
+It does still **read**, when the workflow passes `GITHUB_TOKEN` through. Each
+flag gets the same lookup a real run makes before anything else, so a flag
+whose removal pull request is already open, merged or closed prints
+`[already-handled]` with that pull request named, not a diff for a pull
+request the next real run would never open. In a repository that has used the
+Action for a while this is the most common outcome, so a dry run that could not
+see it would mostly be previewing work that will not happen. Without a token the
+dry run asks nothing, says so in its log, and previews every diff as if no pull
+request existed.
 
 Every refusal a real run can produce is reachable in a dry run and is reported
 identically — `[unsafe-key]`, `[piranha-error]` and `[unsafe-rewrite]` all
 appear with the same label and the same exit code. That is what makes the dry
 run worth reading: it cannot approve a flag that the next real run turns down.
-Only the outcomes that need GitHub (`[pr-opened]`, `[already-handled]`) are
-unreachable.
+`[blocked]` is too, though a dry run never puts an open pull request on hold.
+Only `[pr-opened]` is unreachable.
+
+A `[dry-run]` line with no diff under it says why: either no file in the
+configured directories mentions the flag any more, or the files that do (listed
+above it) hold nothing the rules can rewrite. Either way a real run opens no
+pull request for that flag.
 
 ### What a run prints
 
@@ -697,12 +759,15 @@ would claim it had.
   - `[piranha-error]` — the transform engine aborted on its own syntax
     self-check. Nothing was written. Please report it.
   - `[unsafe-rewrite]` — the rewrite of one or more files did not survive the
-    post-transform syntax check, so it was rolled back **along with every other
+    post-transform checks, so it was rolled back **along with every other
     file for that flag** (a half-removed flag is worse than an unremoved one).
-    The output names the refused files. Until they are changed by hand — or the
-    key is added to `ignore` — this flag produces nothing on every run. It is
-    reported rather than passed off as "no changes" precisely so it does not
-    look like a repository with nothing to clean up.
+    The output names the refused files and which check stopped each one. Most
+    are not syntax errors: a common one is a removal that would stop part-way,
+    leaving the flag's value bound to a name or still tested. Until they are
+    changed by hand — or the key is added to `ignore` — this flag produces
+    nothing on every run. It is reported rather than passed off as "no
+    changes" precisely so it does not look like a repository with nothing to
+    clean up.
 
   Exit `1` also covers a run that aborted part-way, including one that could not
   read the repository's default branch when no `base-branch` was given: that
@@ -733,17 +798,18 @@ would claim it had.
     never fires; it exists for local invocations.
 
 The archive modes read the same three codes, with far fewer ways to reach them.
-`archive-on-merge` archives one flag or it does not, so there is no partial
-result: `0` for `archived`, `deferred`, and both quiet no-ops
-(`not-merged`, `not-a-removal-branch`); `1` for any other API refusal; `2` for a
-workflow wired to the wrong trigger. `archive-sweep` reports a list and follows
-`remove`'s partial-failure rule instead: `0` when every outstanding archive
+`archive-sweep` reports a list and follows `remove`'s partial-failure rule:
+`0` when every outstanding archive
 either landed or deferred — including when there were none, and including a dry
 run — `1` naming each flag that could not be archived, and `2` when
 `GITHUB_TOKEN` was not passed through. `archive-on-deploy` reads exactly like
 the sweep, plus `0` for the two deliveries it declines to act on (a status that
 is not `success`, a deployment to another environment) and `0` for each
-`[pending-deploy]` flag the deployed commit does not contain yet.
+`[pending-deploy]` flag the deployed commit does not contain yet. The
+deprecated `archive-on-merge` archives one flag or it does not, so there is no
+partial result: `0` for `archived`, `deferred`, and both quiet no-ops
+(`not-merged`, `not-a-removal-branch`); `1` for any other API refusal; `2` for a
+workflow wired to the wrong trigger.
 
 ### Flag keys
 
@@ -767,9 +833,12 @@ permissions:
   pull-requests: write   # open the PR
 ```
 
-`archive-on-merge` needs **none of this** — it reads the pull request out of the
-event payload and makes one API call, so it needs nothing from `GITHUB_TOKEN`
-and no `permissions:` block at all.
+The deprecated `archive-on-merge` needs **none of this** — it reads the pull
+request out of the event payload and makes one API call, so it needs nothing
+from `GITHUB_TOKEN` and no `permissions:` block at all. Granting it
+`pull-requests: read` and passing `GITHUB_TOKEN` through is optional, and only
+lets a prerequisite refusal be reported as `[deferred]` when every dependent's
+removal has merged.
 
 `archive-sweep` sits between the two:
 
@@ -881,6 +950,66 @@ wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
 key is not at the call site and no name will make it matchable. Those reads are
 reported as unremoved rather than guessed at.
 
+**A gate that takes no key at all is reported, not rewritten.** In C# and Java
+a flag is often read once, inside a gate class, and checked everywhere else
+through the gate's interface:
+
+```csharp
+public class FeatureflipCheckoutGate : ICheckoutGate
+{
+    public bool IsEnabled() => _client.BoolVariation("old-checkout", ctx, false);
+}
+
+// elsewhere
+if (gate.IsEnabled()) { … }
+```
+
+The read inside the gate is rewritten, so `IsEnabled()` becomes `=> true`, but
+`gate.IsEnabled()` names no key and is left as it is. The run does not inline
+the constant into those calls. Every gate in a codebase like this tends to
+expose the same `IsEnabled`, so matching on the name would fold the wrong
+gates, and a second implementation of the same interface (a config-backed gate
+for local development, say) would have its own answer overridden. Instead, the
+pull request lists each member the rewrite reduced to a constant under "now
+returns a constant": the value it returns, the types it was declared against,
+any other implementations of those types, and the files that name one of those
+types and call the member. Remove the checks and the gate by hand.
+
+**A JSX gate component is unwrapped, if you name it.** React code often gates
+a whole route or panel with a component instead of a hook:
+
+```tsx
+<FlagGate flag="old-checkout" redirectTo="/cart">
+  <CheckoutPage />
+</FlagGate>
+```
+
+The key is a prop here, not a call argument, so no function name reaches it.
+Name the component and its key prop in the same input:
+
+```yaml
+with:
+  accessors: useFlag, FlagGate[flag]
+```
+
+When the flag is removed serving `true`, the gate is replaced by what it
+rendered: the single child element (`<CheckoutPage />`), moved out to the
+gate's indentation, or a fragment (`<>…</>`) around the children when there is
+more than one. The gate's import goes too once nothing else in the file uses
+it. The key must be a string literal (`flag="old-checkout"` or
+`flag={'old-checkout'}`), as for a function.
+
+Served `false`, the flag is **refused**, with the file and line named. What a
+gate renders when its flag is off is up to the component (a redirect, a
+fallback, nothing at all), and the call site doesn't say which, so the run
+won't guess. The same goes for a gate with no children and a gate with a
+spread attribute (`{...props}`) after the key prop, which could override it.
+
+A gate inside a **test file** is left alone. A test that renders
+`<FlagGate flag="old-checkout">` is nearly always a test of the gate itself,
+with the key as fixture data, and unwrapping it would delete what the test is
+testing. See below for what happens to the rest of that file.
+
 **The wrapper's own registry is cleaned up too.** A typed wrapper usually
 comes with a registry (`FLAGS` above), and tests that stub flags by name.
 Neither is a flag read, so no read rule touches them — instead a separate set
@@ -892,6 +1021,16 @@ true:
   and archived, to decide this; or
 * the entry's value is a boolean (`{ 'old-checkout': true }` in a test
   override).
+
+**A registry entry is kept while anything still names the key.** The
+registry is usually what the key's *type* comes from (`keyof typeof FLAGS`),
+and what a lookup by key reads its default out of. If the rewrite leaves any
+file naming the key outside a comment (a gate nobody declared, a test that
+uses the key as data, a string passed to something that is not a flag read),
+deleting the entry would turn that mention into a compile error or a crash.
+So the run keeps the entry and lists it under "deliberately left in place",
+naming the files that still mention the key. Clean those up and the next run
+removes the entry. A comment never keeps an entry.
 
 That covers the registry line, a test's override property, and a type alias or
 inline object type beside it (`type Overrides = { 'old-checkout'?: boolean }`)
@@ -917,29 +1056,76 @@ to `(flags: {})` would quietly widen the parameter to accept `0`, `""` and
 `true`, and most TypeScript lint configurations reject it outright
 (`@typescript-eslint/no-empty-object-type`). A cleanup that loosens your types
 is worse than one that leaves you a line to delete, so the member stays and
-the file is listed under "still reference this flag". In a *value* position
+the file is listed under "still reference this flag" — with one exception.
+When the type is the **whole annotation of a function parameter**, as above,
+it becomes `Record<string, never>`: the type an object with no properties
+actually has, and the replacement that lint rule itself suggests. It still
+accepts `{}` and the default, and it can still be passed on to a `flags`
+prop of any record type. Anywhere else — inside an intersection
+(`{ 'old-checkout'?: boolean } & Base`), on a variable, behind a comment —
+the member stays, because there the same rewrite would change other types
+too. In a *value* position
 the same run does empty the object — `{ 'old-checkout': true }` becomes `{}`,
 which is an ordinary empty object and the right shape for an override that no
 longer overrides anything.
 
-**An entry set to the branch being removed is deliberately left in place.**
-If the flag serves `true` and an entry reads `{ 'old-checkout': false }`, that
-entry pins the flag to the branch this removal deletes — which is evidence the
-code around it is about to become dead, not evidence the entry is leftover
-residue. The commonest case is a test written for the off path:
+**An entry set to the branch being removed is evidence about the code around
+it**, not just leftover residue. If the flag serves `true` and an entry reads
+`{ 'old-checkout': false }`, it pins the flag to the branch this removal
+deletes. What the run does with that depends on the language.
+
+*TypeScript and JavaScript* tests have titles, and the title says whether the
+test is *about* the removed branch. When the nearest enclosing `it`, `test` or
+`describe` (or `.only`/`.skip`, `xit`/`fit`, …) has a title naming the flag in
+the removed state, the whole test is deleted:
 
 ```ts
-it('hides the panel when the flag is off', () => {
-  render({ 'old-checkout': false });          // <- kept
+it('hides the panel when the flag is off', () => {   // <- deleted, with its body
+  render({ 'old-checkout': false });
   expect(screen.queryByText(/panel/i)).not.toBeInTheDocument();
+});
+
+it('shows the footer even if the flag is off', () => {
+  render({ 'old-checkout': false });          // <- override stripped, test kept
+  expect(screen.getByRole('contentinfo')).toBeInTheDocument();
 });
 ```
 
-Stripping that override would not make the test pass, it would make it assert
-behaviour your code can no longer produce — so the run keeps the entry, lists
-it in the pull-request body under "deliberately left in place", and leaves you
-to delete the entry or the test around it. Entries whose value *agrees* with
-the treatment are removed as before.
+That test asserts behaviour the code can no longer produce, so it would fail
+whatever happened to the override. "The flag is off", "with the feature
+disabled", "when old-checkout is off" all count. A title that hedges with
+*even*, *regardless* or *whether* describes behaviour that holds in both
+states, so that test is kept and its override stripped, and so is any test
+whose title does not mention the flag at all. Choosing from a title is a
+heuristic, so the pull request lists every test it deleted, with its title,
+under "tests were deleted". A test it should have deleted and did not fails in
+your CI, and one it deleted wrongly is in the diff.
+
+A test with **no override at all** can still be about the removed branch, if
+it relies on the flag's default:
+`it('hides the tokens link when old-checkout is off (default)', …)`. With no
+override to go on, the title has to carry the whole decision, so the bar is
+higher. The title must name the flag by its **key**, since "the flag" alone
+could mean any flag, and the test must not override the key to the branch
+being kept. When both hold, it's deleted and listed like the others.
+
+**A test file that still hands the key to the code under test is left exactly
+as it was.** Stripping a test's overrides, and deleting its tests about the
+removed branch, is only right when nothing in the file reads the flag any
+more. A test of a generic component that takes the key as data
+(`<FlagGate flag="old-checkout">`, `isEnabled('old-checkout')` on a helper you
+didn't name in `accessors`) still drives a real read through those overrides.
+So when a test file still names the key anywhere other than an override, its
+type, a test title or a comment once the rewrite is done, the whole file goes
+back as it was. The pull request lists it under "deliberately left in place",
+with the line that kept it. Point that test at another flag, and the next run
+cleans up the rest.
+
+*Every other language* keeps the entry instead, because its tests carry no
+title to read. The pull request lists it under "deliberately left in place",
+and you delete the entry or the test around it by hand. A type member
+declaring the flag (`'old-checkout'?: boolean`) is kept in any such file too,
+so the kept override still type-checks.
 
 The signal is not perfect and is not meant to be: a test can carry an off
 override and still be about something else entirely, in which case the entry
@@ -1032,6 +1218,315 @@ doing all the work. A rebinding elsewhere in the same file is seen and refuses
 the file; one in *another* file is not visible to this tool. If you hoist keys
 in either language, prefer a module that only declares them.
 
+### Declared in another file
+
+A key constant declared in one file and read from another is resolved for
+Java, Kotlin, TypeScript, TSX and JavaScript. Other languages keep the
+behaviour above: the declaration is left in place and nothing is deleted.
+
+| Language | Read forms resolved |
+| --- | --- |
+| Java | `Owner.NAME`, with `Owner` in the same package or imported (`import pkg.Owner;`, `import pkg.*;`); bare `NAME` under `import static pkg.Owner.NAME;` or `import static pkg.Owner.*;`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named |
+| Kotlin | `Owner.NAME` for a `const val` in a top-level `object`, or in the `companion object` of a top-level class (`Owner` is the class; `Owner.Companion.NAME`, or `Owner.Keys.NAME` for a companion named `Keys`, works too), with `Owner` imported or in the same package; bare `NAME` (or its `as` alias) under `import pkg.Owner.NAME`, `import pkg.Owner.Companion.NAME` or `import pkg.NAME`, or in the same package for a top-level `const val`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named. A subclass of the class can read a companion's constant without naming it, so a constant read that way is kept |
+| TypeScript / TSX / JavaScript | an `export const` read through `import { NAME }` (or `as`), `import * as ns` (`ns.NAME`), `const ns = require(...)`, or `const { NAME } = require(...)`. Relative specifiers, and `baseUrl` and `paths` from the nearest `tsconfig.json` or `jsconfig.json`, are followed. The read is the first argument of a non-optional `boolVariation(...)` or `useFeatureFlag(...)`, an awaited `getBooleanValue(...)`, or an accessor you named |
+
+`.ts` (with `.mts` and `.cts`), `.tsx` and JavaScript (`.js`, `.jsx`, `.mjs`,
+`.cjs`) are separate languages, but a file of one can read a constant declared
+in another, as a `.tsx` component reading a key from a `.ts` module does. The
+run that handles the declaration rewrites those readers too, each with its own
+grammar, so the declaration and every read of it go in the same pull request.
+Two readers are left alone, reported as `other-language`, and keep the
+declaration: one whose language is not in `languages`, and one that another of
+these runs would rewrite as well, because it names the flag key itself or also
+reads a key constant declared in a file of another type. A Kotlin file reading
+a Java constant, or the reverse, is refused as `other-language` in the same
+way.
+
+Groovy (`.groovy`, `.gvy`, `.gy`, `.gsh`, `.gradle`, and `.gsp` views) and
+Scala (`.scala`, `.sc`, and `.scala.html`, `.scala.txt` and `.scala.xml`
+templates) files can read a Java or Kotlin constant too, and this tool neither
+rewrites nor parses them, so a mention there is refused as `other-language`
+whenever it might be a read: the file names the owner, a subclass of it or an
+alias, reads the name bare (a static import or an inherited constant), or
+qualifies it with anything other than a class the repository declares, the
+file imports or shares a package with, and never uses as a variable. A Spock spec reading `CheckoutGate.FLAG_KEY`
+keeps `CheckoutGate`'s constant; one reading `SearchGate.FLAG_KEY` from an
+unrelated class does not.
+
+A reader is resolved only when its file can mean nothing else by the name. The
+name must not be bound a second time in the reader (a local, a parameter, a
+second import, a member of a type the repository declares as its supertype), and
+an owner or namespace must not be reachable by another route.
+
+Every file in the git checkout that spells the constant's name is checked,
+whether or not it sits under the directory the run transforms, a submodule's
+included. The exception is a file git ignores and nobody committed, such as
+`dist/` or `build/generated/` output. The next build rewrites it and the pull
+request can never contain it, so its mention keeps nothing. It is still read
+for what it declares: a supertype or a second declaration of the constant
+that only generated code holds still counts against the files that are
+checked. A generator that writes the constant's name from input this Action
+does not read, such as a template or a schema, brings that read back on the
+next build. Commit its output, or add the flag to `ignore` until the
+generator's input no longer names the constant.
+
+#### Enum entries
+
+A key held in an enum entry is resolved too, in Java, Kotlin and TypeScript:
+
+```java
+public enum Flags {
+  NEW_CHECKOUT("new-checkout");
+  private final String key;
+  Flags(String key) { this.key = key; }
+  public String key() { return key; }
+}
+
+client.boolVariation(Flags.NEW_CHECKOUT.key(), ctx, false);
+```
+
+| Language | Entry | Read forms resolved |
+| --- | --- | --- |
+| Java | a top-level `enum` with exactly one constructor that assigns the parameter holding the key to a `final` field, and never writes that parameter (`key = key.trim();` makes the entry `enum-unproven`); the entry has no body | `Flags.X.key()` through a non-private method whose whole body is `return key;` (any name), or `Flags.X.key` when the field is not private; bare `X.key()` / `X.key` under `import static pkg.Flags.X;` or `.*` |
+| Kotlin | a top-level `enum class Flags(val key: String)` with no secondary constructor; the entry passes the key positionally and has no body | `Flags.X.key`; bare `X.key` under `import pkg.Flags.X`, or `Y.key` under `import pkg.Flags.X as Y`. Only an alias of the entry's own import counts: `F.X.key` under `import pkg.Flags as F` is not resolved (`unsupported-form`) |
+| TypeScript / TSX / JavaScript | an `export enum` (or `export const enum`) declared once in its file, with `X = "key"`; or an `export const Flags = { X: "key" } as const` object (see below) | `Flags.X` (or the alias's text) through `import { Flags }`, `const { Flags } = require(...)` or `const { Flags: F } = require(...)` (read as `F.X`); `ns.Flags.X` through `import * as ns` or `const ns = require(...)` |
+
+An entry holds the key when its arguments (or a TypeScript member's
+initialiser) spell the key as a whole token: `"new-checkout-v2"` is another
+flag's key, while `PREFIX + "new-checkout"` still holds this one and makes the
+entry `enum-unproven`.
+
+In TypeScript, a property of an `as const` object is treated as an enum entry
+throughout, so everything this section says about an enum applies to the object
+too, and the pull request reports the property as an enum entry:
+
+```ts
+export const Flags = {
+  NewCheckout: "new-checkout",
+} as const;
+
+client.boolVariation(Flags.NewCheckout, ctx, false);
+```
+
+The object must be an `export const` at the top of its file, written
+`{ ... } as const` (`as const satisfies T` is fine), and contain only plain
+`Name: value` properties. The property holding the key must have an unquoted
+name that appears once in the object, and its value must be the key as a plain
+string. A spread (`...Base`), a computed key (`[k]: ...`), a shorthand
+property, a method, a getter, a `__proto__` property or a name written with an
+escape (`EnableX`) can add, replace or hand out a property the run cannot
+see, so any of them makes every entry of the object `enum-unproven`, and so
+does a `let`, an object that is not exported, or a type annotation on the
+constant (`Flags: Record<string, string>`), which lets other files write the
+property. A property whose name appears twice is `enum-unproven` as well, and
+so is an enum member whose name appears twice. An
+object without `as const` (including `Object.freeze({ ... })`), and one declared
+inside a function, is not resolved at all.
+
+The reads are folded and **the entry is left in place**. Removing an enum
+entry can renumber stored ordinals and break `valueOf` lookups or iteration
+over the enum, and no build catches any of that. So the pull request lists
+each entry whose reads were all folded as safe to delete once nothing depends
+on it, and each entry with a read it could not resolve as left in place, with
+those reads listed beside it. An entry with a competing declaration
+(`name-not-unique`) is listed as left in place too, with the competing
+declarations beside it. Which one a reader gets is the build's choice, so no
+read through it was resolved, and those reads are not listed: find them by
+hand.
+
+An entry passed around as a value (`isEnabled(Flags.X)`) is how most code
+wraps an enum flag, and the read inside that wrapper never names the entry. So
+any mention of the entry that is not one of the reads above keeps that file's
+reads in place and is listed, exactly as for a constant. That includes a bare
+entry used as a Java `case` label (`case X:` / `case X ->`) or as a Kotlin
+`when` branch condition. In TypeScript any other spelling of the entry
+(`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`,
+a nested `require` destructure, or another member of the enum initialised
+from it, `Legacy = X`) is listed as `unsupported-form`. In Java and Kotlin a
+use of the whole enum can reach the entry too: `values()`, `entries`,
+`valueOf(...)`, a method or function reference to one of them
+(`Flags::valueOf`), a class literal, `enumValues<Flags>()` or
+`enumValueOf<Flags>(...)`, whether the owner is spelled bare, qualified
+(`app.Flags.values()`) or through an import alias, and, in Java only, a bare
+`values()` or `valueOf(...)` inside the enum itself. It does not stop the
+removal, but it is listed under `enum-dynamic` so you can check it before
+archiving the flag.
+
+A TypeScript or JavaScript enum is a value that any code holding it can read
+every entry of, so its reads are cleaned up only when every import of its file
+in the repository reads members directly (`Flags.X`, `ns.Flags.X`) or uses it
+as a type. Re-exporting it, for example through a barrel file
+(`export { Flags } from "./flags"`), passing it on as a value
+(`Object.values(Flags)`, `use(ns.Flags)`), looking it up by a computed name,
+loading its file any other way (`module.require("./flags")`,
+`jest.requireActual("./flags")`), a test mock whose factory is handed the real
+module (`vi.mock("./flags", async (importOriginal) => ...)`), a direct `eval`
+or a `with` statement in a file that imports it, or any other use leaves every
+entry of the enum in place, and the file responsible is named. A mock with no
+such factory (`jest.mock("./flags", () => ({}))`, Vitest's typed
+`vi.mock(import("./flags"))`) is not a use. A string or glob that could load the enum's
+file (`import.meta.glob("./*.ts")`, Astro's `Astro.glob("./*.ts")`,
+`require.context("./")`) is treated as a
+use of it. A pattern starting with `/` is read from the bundler's root, which
+could be any directory above the enum's file, or one holding a symlink into
+it. A `base` option moves where a `./` pattern starts, and a pattern starting
+with `**` can match any file. A specifier computed at run time is a use too,
+read as the glob a bundler makes of it: `` import(`./pages/${p}`) `` or `require("./pages/" + p)` counts
+only when the enum's file is under `./pages`, the directory its literal text
+names. A computed specifier with no literal text in front (`require(path)`), or
+`require` used as anything but a call (`const r = require`,
+`(0, require)(...)`, `const c = require.context`), can load any file and
+counts everywhere. A specifier computed for `module.require`,
+`jest.requireActual` or `vi.importActual` is read the same way, and any use of
+`createRequire`, whose result loads files under whatever name it is given,
+counts everywhere too. The scripts of a Vue, Svelte or Astro file, and an
+Astro file's frontmatter, are judged the same way, except that such a file is
+never rewritten, so a read of the flag's entry there (`Flags.X`) leaves the
+entries in place as well, and so does the enum's name anywhere in its script
+outside an import of the enum's file that can be followed, such as through an
+import that cannot be resolved or an auto-import with none written. Its markup
+is not parsed: a name its script binds to the enum or its file leaves them in
+place wherever the markup spells it, hyphenated too (`:feature-flags` for
+`featureFlags`), as do Svelte's `$Flags` and a Vue `<template src>`. So does markup that imports a
+module (`{#await import("./flags")}`) or holds a specifier that could name the
+file (`from "./flags"`). Other text in the markup does not count. A file whose
+scripts cannot be told apart from its markup leaves the entries in place
+wherever it mentions the enum or its file.
+The reads that could be resolved are still folded.
+
+A key held in an enum in any other language, or in a form outside the table,
+is not resolved. The pull request names the file and the entry rather than
+reporting a bare "still references this flag", and asks you to resolve the
+reads through it by hand before deleting the entry.
+
+Only a mention that can reach the declaration counts. Anything else is
+another constant that happens to share the name, such as a sibling class's
+own `FLAG_KEY`, and is ignored:
+
+* a file in a language that cannot name the constant at all is ignored: a
+  TypeScript or Python file beside a Java one, say. Java and Kotlin can name
+  each other's constants, so each judges the other's files;
+* in Java and Kotlin, a bare name counts only when something in its file can
+  tie it to the declaration. That can be an import of it, a star or static
+  import from the owner or from a repository class that may extend it (a
+  library class such as `java.util.Objects` cannot), the same package for a
+  Kotlin top-level constant, a Kotlin lambda or extension receiver around it,
+  or a supertype path from a type in the file to the owner;
+* in TypeScript and JavaScript, a name the file binds itself (a local, a
+  parameter, its own `export const`) is ignored, and so is a named import from
+  a module that declares that name itself. A destructuring, a name bound
+  nowhere, or an import from a module that might re-export the constant
+  still counts;
+* `Other.NAME` is ignored when `Other` can only be a repository type that is
+  neither the owner nor extends it: no variable, field or static import of
+  that name in the file, and no Kotlin top-level property or typealias of that
+  name anywhere. A qualifier the repository does not declare still counts.
+
+Supertype paths are followed through the repository's Java and Kotlin types.
+A file the Action could not read, or a Java file it could not parse, counts as
+a possible path. A Kotlin file it could not fully parse (newer syntax its
+grammar lacks, such as context parameters) counts only where it can matter: as
+a step on a path when it names one of that path's types, and as a receiver's
+member when it spells the name being looked up. Every
+mention that counts has to be a read this run removes. Any other keeps the
+declaration, and the declaring file's own reads of the constant stay with it.
+It also drops that reader's reads and is listed in the pull request with its
+reason:
+
+| Reason | What triggers it |
+| --- | --- |
+| `name-not-unique` | the same qualified constant is declared more than once, or another file declares a competing one: the same name or owner in another source set, build variant or module, or in the other JVM language (a Java `Owner` beside a Kotlin `Owner`). A Kotlin top-level property named like the owner (`val Owner = ...`) or a `@file:JvmName("Owner")` facade counts too. Which declaration a reader gets is then decided by the build, so none is touched. The pull request lists these apart from the other reasons, since a build variant is usually deliberate |
+| `import-unresolved` | nothing in the reading file ties the name to the declaring file: no import or same-package route, an import that resolves to another file or to none, a TypeScript default import, a re-export through a barrel (`export ... from`), a TypeScript import alias of the constant off a name that is not a namespace import of its file (`import K = m.NAME` under `import m = require(...)`), or a TypeScript enum taken off a name that is not a namespace import of its file (`use(m.Flags)`, `const F = m.Flags`, `import F = m.Flags`) or used as a value through an import that does not resolve (`use(Flags)`), or, in a file that names that enum, a computed lookup (`m[k]`) off a namespace or default import of a script that does not resolve, such as a package (`Icons[name]`; a `.css` or `.json` import is not a script) |
+| `not-a-read` | the name is used for something other than a flag read: a log line, a map entry, a callable reference (`Owner::NAME`), a TypeScript type-only import, an import left with no read to remove, or a TypeScript enum taken as a value off a namespace import of its file (`use(ns.Flags)`) |
+| `rebound` | the reading file binds the same name itself, or an in-repository supertype supplies a member of that name |
+| `other-language` | the constant is mentioned, in a way that can reach it, from a file in another JVM language (Java reading a Kotlin constant, Kotlin reading a Java one, or a Groovy or Scala file reading either), or a read of it that would be resolved sits in another file type of the family than the declaration (a `.tsx` or `.js` file reading a `.ts` constant) and is not rewritten with it: its language is not configured, or another run rewrites the file |
+| `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries) |
+| `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name |
+| `enum-dynamic` | not a refusal: a Java or Kotlin use of the whole enum that can reach the entry without naming it. Listed so it can be checked before the flag is archived |
+| `kept`, `left`, `left-competing` | not refusals: what happened to an enum entry, reported at its own declaration. `kept`: every read through it found was folded. `left`: a refusal above names it, and those reads stay. `left-competing`: only a competing declaration (`name-not-unique`) names it, so no read through it was resolved, and those reads are not listed |
+
+One refusal in a file drops every read in that file, so a file is either
+rewritten whole or left alone. After the rewrite the Action checks each reader
+again. If a proven read, or an import naming the constant, survived the rewrite,
+the whole flag is refused: every file it rewrote is restored, so that flag
+produces no diff at all until the file is changed by hand or the key is added to
+`ignore`, and a warning says which file.
+
+Two things are not inspected, and a mention that only they could affect is
+still treated as proven:
+
+* a supertype or receiver declared outside the repository (a library base class,
+  the receiver of a library lambda), whose members could shadow an imported name;
+* bundler aliases and build configs other than `tsconfig.json` and
+  `jsconfig.json` (a webpack or Vite `resolve.alias`, say). A config that
+  `extends` another, or two files a specifier could mean, is not resolved at all
+  and the mention is refused.
+
+## Tests that mock the flag read
+
+A test that mocks the SDK says, in its stub, which branch it exercises. Once
+the read is folded those lines describe a call that no longer happens, so a run
+that folds a read of the flag also resolves the mocks of it, and the pull
+request lists every line and every test it deleted:
+
+| In a test | What happens |
+| --- | --- |
+| A stub returning the **kept** value — `when(<read>).thenReturn(true)` when the flag serves `true` | the stub is deleted. The test stays, and runs against the branch that stays |
+| A stub returning the **removed** value | **the whole test is deleted**, with any comment directly above it. Its assertions describe the branch this pull request deletes, so they can no longer pass. The pull request names each one, under a warning |
+| A verification of the read — `verify(client).boolVariation("KEY", …)`, `client.Verify(c => c.BoolVariation("KEY", …), …)`, `Received().BoolVariation("KEY", …)` | deleted, whatever the test is about: it asserts a call that no longer exists |
+
+Recognised spellings, each with the key as a literal, a constant declared in the
+same file, or inside an equality matcher (`eq("KEY")`, `gomock.Eq("KEY")`), and
+with any name in `accessors` counting as a read:
+
+* **Java** — Mockito `when(…).thenReturn(…)`, `doReturn(…).when(mock).<read>(…)`
+  and `verify(mock[, times(n)]).<read>(…)`; BDDMockito `given(…).willReturn(…)`.
+  A test is a method annotated `@Test`.
+* **Kotlin** — MockK `every { … } returns …` / `coEvery`, `verify { … }` /
+  `coVerify`; mockito-kotlin `whenever(…).thenReturn(…)`. A test is a function
+  annotated `@Test`.
+* **Dart** — `package:mockito` `when(…).thenReturn(…)`, `verify(…)` and
+  `verifyNever(…)`, and the same three in `package:mocktail`'s lambda form,
+  `when(() => …)`. Either library's stub may answer with
+  `thenAnswer((_) => true)` (or `async =>`) instead of `thenReturn`. A test is
+  a `test(…)` or `testWidgets(…)` call.
+* **TypeScript / JavaScript** — ts-mockito `when(…).thenReturn(…)` /
+  `thenResolve(…)` and `verify(…).once()` and its siblings. A test is an `it(…)`
+  or `test(…)` call (and their `.only`/`.skip`/`x`/`f` spellings), never a
+  `describe`.
+* **Go** — gomock `m.EXPECT().BoolVariation(…).Return(…)`, with or without
+  `Times`/`AnyTimes`. A test is a `func TestX(t *testing.T)` or one `t.Run`
+  subtest.
+* **C#** — Moq `Setup(c => c.<read>(…)).Returns(…)` / `ReturnsAsync(…)` and
+  `Verify(c => c.<read>(…), …)`; NSubstitute `sub.<read>(…).Returns(…)`,
+  `Received()` and `DidNotReceive()`. A test is a method carrying `[Fact]`,
+  `[Test]` or `[TestMethod]`.
+
+The decision is taken only from the stub's own literal, so these are left
+exactly as they are:
+
+* a stub returning anything but `true` or `false` — a variable, a parameter;
+* a parameterised test (`[Theory]`, `[TestCase]`, `@ParameterizedTest`, a
+  TestNG `dataProvider`, …), whose stub may be one row of a table;
+* a test that stubs both values;
+* a stub of the removed value outside any single test — a setup method, a
+  constructor, a `beforeEach` — since there is no one test to delete (a stub of
+  the kept value there is still deleted);
+* every line of a test that also holds a mock of the read in a spelling not
+  listed above.
+
+**Nothing in a test is touched unless the same run folds a real read** of the
+flag. If no read could be rewritten — the key held in a field, say — the mocks
+are still true and stay. That makes the configuration matter: a `directories`
+entry is transformed on its own, so tests listed as a separate entry from the
+code they test never see that code's read fold, and their mocks are not
+resolved. Keep the two in one entry.
+
+What is left over is handled as it always was. In C# a Moq stub survives the
+removal and is listed in the pull request. In Java, Kotlin, Dart, TypeScript and
+Go the fold would rewrite a leftover stub into `when(true)` or `true.Return(…)`,
+so **the whole flag is refused** — see "What is deliberately NOT rewritten".
+
 ## Supported JS/TS flag-read shapes
 
 `ts` and `tsx` share one rule set, which removes:
@@ -1076,10 +1571,21 @@ than a client, excepted). A file importing both clients is left alone entirely:
 there the imports no longer say which client any one read belongs to. See
 [Known gaps](#known-gaps) for the reads this cannot reach.
 
-A `const` bound to either read has its read replaced but is not inlined
-(`const enabled = true;` with the guard below it left standing); that is the
-same conservative outcome as any other binding this tool declines to inline, and
-it is correct, just not fully folded.
+A `const` bound to an awaited read is inlined like any other binding the fold
+leaves holding a literal: `const enabled = await client.getBooleanValue(…)`
+and the `if (enabled)` under it fold away together.
+
+**A local the fold turns into a literal is inlined too, not only one bound to
+the read itself.** `const show = on || user.enrolled` becomes
+`const show = true` once `on` is folded, and the run then inlines `show` into
+its uses and folds those in turn, so `{show && <Panel />}` becomes
+`<Panel />`. It does this only for a `const` declared inside a function or
+block, holding a single binding on its own line, with its name bound nowhere
+else in the file and every use an ordinary expression after it. Anything else
+— `{ show }` shorthand, `typeof show`, a top-level `const`, a second binding
+of the name — keeps `const show = true;` for you to inline by hand. A `const`
+you had already set to a literal yourself (`const DEBUG = false`) is never
+touched.
 
 When a fold makes a following statement unreachable — collapsing an `else if`
 into an `else`, turning `if (<read>) { return a; }` into a bare `return a;`, or
@@ -1088,9 +1594,10 @@ listed in the pull request body. `no-unreachable` is part of
 `eslint:recommended` and is an error, so leaving it would open a pull request
 that cannot go green. A `break` that exits the loop keeps what follows
 reachable, and nothing after it is touched. A loop the fold makes *dead* rather
-than infinite (`while (false) { … }`, from a flag serving false) is left
-standing: ESLint's recommended set says nothing about it, so removing it would
-be an edit you did not ask for.
+than infinite (`while (false) { … }`, from a flag serving false) is removed
+and listed too — ESLint's recommended set does not require it, but the loop
+can never run, and the same rule holds in every language. See
+[Known gaps](#known-gaps).
 
 A local variable left with no remaining use after a fold is cleaned up the same
 way an import is — except one level inside a `const Component = () => { ... }`
@@ -1110,6 +1617,25 @@ in it is reachable from nowhere else and this tool can see its whole scope. A
 file with none of those is a plain script whose top-level `const` is shared
 with every other script on the page, and its bindings are left alone. Exported
 bindings are left alone in either case.
+
+Deleting a whole import statement can also stop its module from loading in
+this file. That matters when loading the module does work, such as creating a
+client or registering a handler. So a statement whose last binding the fold
+stranded is cut down to `import "./ff";`, which keeps the load and binds
+nothing, rather than deleted. TypeScript's import elision does not make
+deleting it safe: once the read is folded the name is unused, so an eliding
+compiler would drop the whole statement, while the code before the change read
+the name and so loaded the module. A `const { client } = require("./ff")`
+becomes `require("./ff");` for the same reason. The pull request body names
+each `import` and `require` kept this way, with the exact line, so a reviewer
+can delete the ones whose module does nothing when it loads.
+
+The statement is deleted outright in three cases, because none of them loaded
+anything to begin with: an `import type`, an import whose names the file only
+ever used as types, and an import of a module that another import in the same
+file still loads. A value `import client = require("./ff")` whose last use was
+folded is left as it is, because no single spelling keeps its load under every
+compiler setting. ESLint's `no-unused-vars` will report it.
 
 ## Supported Python flag-read shapes
 
@@ -1134,10 +1660,63 @@ work — because naming it is itself the statement that it reads a boolean.
 `elif <read>:` is handled in both directions: serving `false` deletes the dead
 clause, serving `true` promotes it to `else:` and drops every clause after it.
 
+An awaited read — `if await client.variation(…)`, the shape an async wrapper
+produces — is folded together with its `await`, since `await True` would raise
+`TypeError` the first time it ran. A read bound to a name that is later
+re-assigned (`on = <read>` and then `on = on and eligible(ctx)`) is refused
+rather than half-removed: the name cannot be inlined, and leaving `on = True`
+behind would delete the flag key while the guard stays. The run output says
+so for that file.
+
 A branch of any size is folded, re-indented to the `if`'s own column — as in
 every other language here, though in Python it is the difference between a file
 that runs and one that does not. The indentation of a multi-line string is
 never changed — those lines are data.
+
+A local or an import that only the removed branch used is cleaned up too.
+Ruff's default rules include F401 (unused import) and F841 (unused local
+variable), and `ruff check` exits non-zero on either, so leaving them would
+open a pull request that a project linting with ruff cannot merge.
+
+A local in a function whose value cannot have a side effect (a literal, a
+name, an attribute, or a tuple, list, set or dict of those) is deleted, along
+with a comment on the same line. One that calls or awaits something keeps the
+call as a statement: `legacy = LegacyFlow(ctx)` becomes `LegacyFlow(ctx)`.
+Some locals are left alone:
+
+* assignments in a class body or at module level, which other code can read
+  as attributes;
+* targets that are not a single name (`a, b = …`, `self.x = …`);
+* values that can run code without being a call, such as an index
+  (`items[0]`), an f-string, an operator (`a + b`, `-x`) or a chained
+  assignment;
+* every local of a function that calls `locals()`, `vars()`, `dir()`, `eval`
+  or `exec`, which read locals without naming them
+  (`render(request, "home.html", locals())`);
+* the only statement in a block (`if ready:` needs a body);
+* a statement that shares its line with another (`n = 3; go()`), or that the
+  line above continues into with `\`;
+* a function's first statement when a bare string follows it, since that
+  string would become the docstring.
+
+**An import is never deleted.** It is kept as it was and marked
+`# noqa: F401`, which is what ruff and flake8 read to accept it. Importing a
+module runs it, which can register a handler or configure a client. Even
+dropping just the unused name is not safe: `from app import legacy` is the
+only thing that loads `app.legacy` when `legacy` is a submodule, and nothing
+in one file can tell a submodule from an attribute. The mark goes at the end
+of the statement's first line, after any comment already there, because both
+linters read an import's noqa from that line. A parenthesised import is marked
+after its `(`. An import whose first line runs on, through a `\` continuation
+or a string that opens on that line, is left as it is, because a comment
+there would break the code or land inside the string. So are an import that
+already carries a noqa, a star import and `from __future__`. The pull request body lists every
+import marked this way, so you can delete the ones whose module does nothing
+when it loads.
+
+A name inside a string still counts as a use. This covers a forward-reference
+annotation (`flows: "list[Ledger]"`) and an `__all__` entry, as well as a
+name a comment mentions.
 
 ## Supported C# flag-read shapes
 
@@ -1198,6 +1777,24 @@ so there is no name for this tool to check references against. Only
 `using Alias = Foo.Bar;`, which does bind a name, can be judged this way, and
 is removed like an import everywhere else.
 
+A `private` method the fold leaves with no caller is deleted too, along with a
+doc comment directly above it — typically the helper a gate class used to build
+the evaluation context for its reads. Java gets the same treatment. Only a
+method nothing outside its file can reach qualifies, and only when the fold is
+what stranded it: an explicit `private` (never `private protected`, nor a
+member whose privacy is implied), in a type that is not `partial`, carrying no
+attribute or annotation, with no other method of the same name in the file,
+and named nowhere else in the file — a string counts, since reflection names a
+method by string. A private method the file already had no use for is left
+alone. Fields and constructors are never touched, so a client field the gate
+no longer reads stays, along with the constructor that sets it.
+
+Tests that mock the read — a Moq `Setup` or `Verify`, an NSubstitute stub —
+are resolved along with it: see "Tests that mock the flag read". A `Setup`
+that cannot be resolved is left in place, and the pull request lists those
+test files in their own paragraph, naming each line that still describes the
+read to a mock.
+
 ## Supported Dart/Flutter flag-read shapes
 
 `client.boolVariation('KEY', defaultValue: false)` and
@@ -1230,12 +1827,52 @@ Two shapes are deliberately left alone: **null-aware access**
 and an **interpolated key** (`'KEY$suffix'`, whose runtime value is not the
 key).
 
+A read that is the body of an **arrow function** folds inside it, so
+`items.where((item) => client.boolVariation('KEY', defaultValue: false))`
+becomes `items.where((item) => true)`. That includes a lambda passed as a
+named argument, one bound to a local, an `async` one, and a read behind `!` or
+`&&` at the end of the body. Earlier versions replaced the whole lambda with
+the literal (`items.where(true)`), which does not compile. One nesting is
+refused instead of rewritten: a read ending a lambda that is itself the body of
+another lambda (`(a) => (b) => <read>`). No grammar available to this Action
+parses that shape reliably, so the run exits 1 naming the file.
+
 When folding an `if`/`else` makes a following statement unreachable, that
 statement is **deleted** and listed in the pull request body. Dart is one of
 the languages where this happens (the others are Java, JavaScript and
 TypeScript): `dart analyze` reports dead code as a warning but **exits
 non-zero** on it, so leaving it would open a pull request that cannot go
 green.
+
+A local or an import that only the removed branch used is cleaned up too, for
+the same reason: `dart analyze` reports `unused_local_variable` and
+`unused_import` as warnings and exits non-zero on them. A local whose
+initializer cannot have a side effect is deleted; one that calls, constructs or
+awaits something is rewritten to keep that as a statement
+(`final legacy = LegacyFlow();` becomes `LegacyFlow();`). Left alone: locals
+inside an anonymous closure, declarations binding more than one name, `late`
+locals (their initializer only runs when read), and a local with a declared
+type whose initializer is not a literal (`final int id = json['id'];` is a
+cast that can throw, and removing it would lose the throw).
+
+An import goes when nothing it binds is spelled any more. What it binds is read
+from the imported library, so this works for relative imports and for your own
+package's `package:` imports, and never for `dart:` libraries or another
+package, which are always left in place:
+
+* `import '…' as legacy;` binds its prefix;
+* `import '…' show A, B;` binds each shown name, so `show A, B` can lose `A`
+  and keep `B`;
+* a plain `import '…';` (or one with `hide`) binds every public name the
+  library declares or exports.
+
+Every form also binds the members of every extension the library brings in,
+because Dart applies an extension through any import of it and a call such as
+`context.l10n` spells only the member. A library with an extension operator or
+a `call` member is left in place, since using those spells no name at all.
+Imports in a library that has `part` files are never removed: a part shares its
+library's imports, and nothing here reads the part to see what it uses. Every
+removal is listed in the pull request body.
 
 A local whose name is one of Dart's **built-in identifiers** — `on`, `show`,
 `hide`, `late`, `required`, `covariant`, `get`, `set`, `factory`, `operator`,
@@ -1339,7 +1976,9 @@ still standing and the flag key already gone. Fix it by hand, or add the key to
 
 `client.boolVariation("KEY", default)` (android SDK), in `if`/`else if`/`else`,
 `!` negation, an `if`/`else` used as an expression, and via a `val` bound to
-the read — which is inlined and its declaration removed.
+the read — which is inlined and its declaration removed. A class property is
+inlined and removed only when it is `private`; any other property keeps its
+declaration as the literal (see "What is deliberately NOT rewritten").
 
 Two shapes are deliberately left alone: a **safe call**
 (`client?.boolVariation(…)`, whose type is `Boolean?` rather than `Boolean`, so
@@ -1356,6 +1995,34 @@ same trade Gate 2 makes for TypeScript and C#.
 
 An override map emptied by this cleanup becomes `mutableMapOf()`; add the type
 arguments if inference needed the entry.
+
+A local or an import that only the removed branch used is cleaned up too, the
+same way as in Java and TypeScript. Current `kotlinc` and ktlint's standard
+rules don't fail a build on either, but detekt and the IDE flag both, and a
+removal that leaves them behind isn't finished. A local whose initializer
+cannot have a side effect is deleted. One that calls
+or constructs something is rewritten to keep the call as a statement:
+`val legacy = LegacyFlow(context)` becomes `LegacyFlow(context)`. Some locals
+are left alone:
+
+* locals inside a lambda, an anonymous function, an object expression, an
+  `init` block or a property accessor;
+* destructuring declarations and delegated locals (`val x by lazy { … }`);
+* a local with a declared type whose initializer is not a literal.
+  `val user: User = javaApi()` checks a Java value for null and throws on it,
+  and removing the declaration would lose that throw.
+* a local whose initializer can run code but is not a plain call
+  (`items[0]`, `x!!`, `-x`, a string template, a cast);
+* a local that is the last statement of an `if`, `when` or `try` block,
+  because that statement is the block's value.
+
+An import goes when the name it binds (`import a.b.C` binds `C`) is spelled
+nowhere in the file any more. A read inside a string template or in
+backticks still counts. Some imports are never removed: star imports, aliased
+imports (`import a.b.C as D` also hides `C` from the star imports, so removing
+it could change what `C` means), and imports of a name Kotlin calls by
+convention without spelling it, such as `getValue` (used by `by`), `plus`
+(used by `+`), `invoke` or `component1`.
 
 ## Supported Java flag-read shapes
 
@@ -1433,6 +2100,11 @@ and listed in the pull request body, because Java rejects those at compile time
 rather than warning about them. See [Known gaps](#known-gaps). Java is one of
 the languages where this happens; the others are Dart, JavaScript and
 TypeScript.
+
+A `private` method the fold leaves with no caller is deleted with its Javadoc,
+under the conditions described for C# in [Supported C# flag-read
+shapes](#supported-c-flag-read-shapes): no annotation, not `native`, no other
+method of that name in the file, and named nowhere else in it.
 
 ## Supported Go flag-read shapes
 
@@ -1597,17 +2269,29 @@ argument and its value is not constrained. Any receiver works — `client`,
 `self.client`, `flagProvider`, or a longer chain such as
 `Featureflip.shared.client`.
 
-Folded away entirely in `if` / `else`, under `!` negation, in a `&&` or `||`
-operand, in a `guard … else` and in a ternary.
+Folded away entirely in `if` / `else` (including an `else if` chain, where the
+surviving branch keeps its own braces and a dead last branch takes its `else`
+with it), under `!` negation, in a `&&` or `||` operand, in a `guard … else`
+and in a ternary.
 
-Two positions fold the read to a literal but leave the surrounding code
-standing. A read bound to a `let` is not inlined, so
-`let useLegacy = client.boolVariation(…)` becomes `let useLegacy = true` and
-the `if useLegacy` reading it stays. A read used as a `while` condition
-likewise becomes `while true` or `while false` rather than having the loop
-resolved. In both the flag key is gone — which is what makes the flag
-removable — but you are left with a line or two to tidy by hand. These are
-limits of the transform engine's Swift cleanup, not safety refusals.
+A read bound to a `let` is inlined, and the `if useLegacy` reading it is folded
+the same way.
+
+When the bound name is bound a second time in the same function (a closure
+parameter, a `for` variable, an `if let`, a nested function), it is not
+inlined, so `let useLegacy = client.boolVariation(…)` becomes
+`let useLegacy = true` and the `if useLegacy` reading it stays. The flag key is
+gone, which is what makes the flag removable, but you are left with a line or
+two to tidy by hand. That is a limit of the transform engine's Swift cleanup,
+not a safety refusal.
+
+A read used as a `while` condition: served false, the loop can never run, so
+it is removed and listed in the pull request body, as in every language (see
+[Known gaps](#known-gaps)). Served true it becomes `while true`, a loop you
+meant to keep running, and it stays. Code after that loop is left alone too:
+Swift's compiler only warns that it will never be executed, and statements are
+deleted for being *unreachable* only where a language's standard build rejects
+them.
 
 A key hoisted to a `let` constant is resolved, and the declaration removed with
 the last read of it — see [The key hoisted to a constant](#the-key-hoisted-to-a-constant),
@@ -1707,10 +2391,11 @@ means no PR.
 | A C# `const string` key that is **also** read by anything other than a flag read | no change at all — not even the read is folded. Deleting the declaration would strand the other reference, and folding without deleting would leave a `const` the next run reports as a live reference forever |
 | A C# `const string` key whose name is **bound again** anywhere in the file | no change at all — a shadowing binding means a reference may resolve to the other one, and the key could be read off the wrong declaration |
 | A key held in a REASSIGNABLE binding (C# `static readonly`, a JS `let`, a Kotlin `var`, a non-`final` Java field) | no change at all — its value cannot be read off the declaration, so the flag it names is not knowable |
-| A key hoisted to a constant in a DIFFERENT file | no change at all — this tool reads one file at a time, so a declaration it cannot see is a non-literal key |
-| A C# read inside an **expression tree** (`mock.Setup(c => c.BoolVariation("KEY", …))`) | no change at all — the lambda *describes* the call instead of performing it, so the text of the read is the payload a mocking library reads at run time. This one is not detected by naming `Setup`/`Verify`: the tell is that the read's receiver is the lambda's own parameter, so any library taking an `Expression<>` is covered, while a genuine `Func<>` lambda (`list.Where(x => flags.BoolVariation("KEY", …))`, reading off a captured client) is still rewritten. If the key is a `const`, the whole const path is withheld for that file — the mock setup is a live reference to the declaration |
-| A read handed to a **mocking DSL** that takes the call itself — `when(<read>).thenReturn(…)` (Mockito, mockito-kotlin, `package:mockito`, ts-mockito), `given(<read>).willReturn(…)` (BDDMockito), or `every { <read> } returns …` (MockK) | **the whole flag is refused**, and the run exits 1 naming the file. These libraries stub by *performing* the call and capturing the invocation it registers, so the text of the read is the payload — the same property that makes the C# row above untouchable. Folding it leaves `when(true).thenReturn(true)`, which **compiles**: the stub silently stops stubbing, and the flag key is gone from the file so no later run looks again. Unlike C#, there is nothing structural to key on — no lambda exists, because the call is real — so the guard is a short list of stubbing entry points by name. Delete or rewrite those lines yourself, scope the run with `directories` to exclude your tests, or add the key to `ignore` |
-| A **Go read inside a gomock expectation** (`m.EXPECT().BoolVariation("KEY", ctx, false).Return(true)`) | **the whole flag is refused**, and the run exits 1 naming the file. Same shape as the row above, caught a different way: the fold leaves `true.Return(true)`, and because Go's `bool` is a builtin with no method set, a selector on a boolean literal is broken Go *by construction* — so this one needs no list of library names. Before this was refused it shipped, and the customer's build was what reported it |
+| A key hoisted to a constant in a DIFFERENT file, in a language other than Java, Kotlin, TypeScript, TSX or JavaScript, or read in a shape outside [Declared in another file](#declared-in-another-file) | no change to the reader, and the declaration is **kept**. The pull request lists each such mention with its reason |
+| A C# read inside an **expression tree** (`mock.Setup(c => c.BoolVariation("KEY", …))`) | no change to the read — the lambda *describes* the call instead of performing it, so the text of the read is the payload a mocking library reads at run time. This one is not detected by naming `Setup`/`Verify`: the tell is that the read's receiver is the lambda's own parameter, so any library taking an `Expression<>` is covered, while a genuine `Func<>` lambda (`list.Where(x => flags.BoolVariation("KEY", …))`, reading off a captured client) is still rewritten. If the key is a `const`, the whole const path is withheld for that file — the mock setup is a live reference to the declaration. Once the run has folded a real read of the key, a `Setup` returning a literal and a `Verify` are resolved first, before this applies (see "Tests that mock the flag read") |
+| A read handed to a **mocking DSL** that takes the call itself — `when(<read>).thenReturn(…)` (Mockito, mockito-kotlin, `package:mockito`, ts-mockito), `given(<read>).willReturn(…)` (BDDMockito), `every { <read> } returns …` (MockK), or `when(() => <read>)` / `verify(() => <read>)` (`package:mocktail`) | when the run folds a real read and the stub returns a literal, **resolved first**: the stub or its whole test is deleted (see "Tests that mock the flag read"). Otherwise **the whole flag is refused**, and the run exits 1 naming the file. These libraries stub by *performing* the call and capturing the invocation it registers, so the text of the read is the payload — the same property that makes the C# row above untouchable. Folding it leaves `when(true).thenReturn(true)`, which **compiles**: the stub silently stops stubbing, and the flag key is gone from the file so no later run looks again. Unlike C#, there is nothing structural to key on — no lambda exists, because the call is real — so the guard is a short list of stubbing entry points by name. mocktail's `() => <read>` form is the exception to the first point: the lambda is there but only wraps the call. Delete or rewrite those lines yourself, scope the run with `directories` to exclude your tests, or add the key to `ignore` |
+| A **Go read inside a gomock expectation** (`m.EXPECT().BoolVariation("KEY", ctx, false).Return(true)`) | resolved first in the same way as the row above, when it can be. Otherwise **the whole flag is refused**, and the run exits 1 naming the file. Same shape as the row above, caught a different way: the fold leaves `true.Return(true)`, and because Go's `bool` is a builtin with no method set, a selector on a boolean literal is broken Go *by construction* — so this one needs no list of library names. Before this was refused it shipped, and the customer's build was what reported it |
+| A **Java field or Kotlin property** bound to the read that is not `private` (`public final boolean enabled = <read>`, a bare `val enabled = <read>`) | read replaced, **declaration kept** → `public final boolean enabled = true;` / `val enabled = true`. Other files read it (`checkout.enabled`), and they do not contain the flag key, so this tool never sees them. Removing the field would break files it never parsed. A `private` one is inlined and removed. In Java that holds only for a top-level class: a `private` field of a nested, local or anonymous class is kept the same way, because the enclosing class can read it (`settings.on`). Delete the field yourself once its readers are gone |
 | `export const on = <read>` | read replaced, **declaration kept** → `export const on = true;`. An exported binding is module public API, and the modules importing it do not contain the flag key, so they are never in the candidate set — this tool cannot see them, let alone update them. Removing the binding would break files it never parsed. Delete it yourself once the importers are gone |
 | An **un-awaited** OpenFeature read (`client.getBooleanValue("KEY", …)`, `client.GetBooleanValueAsync("KEY", …)`) | no change at all — the value is a `Promise<boolean>`/`Task<bool>`, not a boolean. Await it at the read site and it is rewritten |
 | The **two-value** form of an OpenFeature Go read (`enabled, err := client.BooleanValue(ctx, "KEY", …)`) | no change at all — it returns `(bool, error)`, so standing a literal in its place would leave `enabled, err := true`, which does not compile. The single-value `client.Boolean(ctx, "KEY", …)` is rewritten; switch the read to that form if you want it folded |
@@ -1725,12 +2410,12 @@ means no PR.
 | `{ on }` shorthand or `export { on }` | that reference is left; the declaration is kept |
 | Folding an `if` whose branch declares a `const`/`let`/`class`/`function`/`enum`/`interface`/`type` | the branch keeps its `{ … }` so the declaration stays scoped |
 | Folding an `if` that sits in an `else`, or as a braceless `if`/`while`/`for` body | the branch keeps its `{ … }`. Only a position that can hold several statements gets them spliced in flat |
-| A **Java, Go or C# read that is a whole statement** and holds **another call** — `verify(client).boolVariation("KEY", ctx, false);` (Mockito), `client.boolVariation("KEY", buildCtx(), false);`, `new Ctx()`, `contexts[index()]`, Go's `<-ready`, or C#'s `ctxs[i++]` | **the whole flag is refused**, and the run exits 1 naming the file. Deleting the statement would delete that call with it — the mock's assertion, or a context the customer builds — and replacing only the read leaves `true;` standing alone, which none of the three accepts (javac: `not a statement`; `go build`: an unused constant expression; C#: CS0201). Delete or rewrite that line yourself, or add the key to `ignore`. A discarded read holding **no** other call is rewritten: see the row below |
+| A **Java, Go or C# read that is a whole statement** and holds **another call** — `verify(client).boolVariation("KEY", ctx, false);` (Mockito), `client.boolVariation("KEY", buildCtx(), false);`, `new Ctx()`, `contexts[index()]`, Go's `<-ready`, or C#'s `ctxs[i++]` | **the whole flag is refused**, and the run exits 1 naming the file — except a mock verification of the read, which is deleted when the run folds a real read (see "Tests that mock the flag read"). Deleting the statement would delete that call with it — the mock's assertion, or a context the customer builds — and replacing only the read leaves `true;` standing alone, which none of the three accepts (javac: `not a statement`; `go build`: an unused constant expression; C#: CS0201). Delete or rewrite that line yourself, or add the key to `ignore`. A discarded read holding **no** other call is rewritten: see the row below |
 | A **Java, Go or C# read that is a whole statement** and holds no other call — a warm-up call made for the SDK's exposure event, `client.boolVariation("KEY", ctx, false);` | **the whole statement is deleted.** Its value is discarded by definition, so there is nothing to fold it into and nothing to lose. Any receiver works, including a static import with no receiver and a field chain; the argument list may hold names and literals (and, in Go, composite literals, which have no constructors to run). The key may be a literal or hoisted to a constant — see the row below. In C# the awaited OpenFeature read is covered too, while an un-awaited one is left alone; in Go the OpenFeature `client.Boolean(ctx, "KEY", …)` read and in Java the OpenFeature `client.getBooleanValue("KEY", …)` read are covered the same way. A project's own wrapper named in `accessors` is covered the same way, whether the key is a **literal** or hoisted to a constant |
 | A discarded read whose **key is hoisted to a constant** (`client.boolVariation(FLAG_KEY, ctx, false);`) | **the whole statement is deleted**, and the declaration with it, exactly as for a literal key. The constant may be declared at file scope or local to the method, and must meet the same four conditions as any other hoisted key — see [The key hoisted to a constant](#the-key-hoisted-to-a-constant). A statement holding another call is refused here too: the row above applies unchanged, because the safety rule does not depend on how the key is spelled |
 | A **PHP template written in the alternative syntax** (`<?php if (<read>): ?> … <?php else: ?> … <?php endif; ?>`) | **rewritten**, markup and all: the arm that runs stays, the guard and the dead arm go, and a `<?php … ?>` pair left bracketing nothing goes with them. The rendered HTML keeps the same markup; only insignificant whitespace around the removed lines moves, because the whole `<?php … ?>` line is taken rather than an empty tag pair left behind. `elseif` chains are handled in the same way, in any position |
-| A **multi-way guard** — Go's tagless `switch { case <read>: … }`, Ruby's subject-less `case` / `when <read>`, or PHP's `switch (true) { case <read>: … }` | **rewritten.** Each arm is a condition and the first true one wins, so this is an `if`/`else if` chain by another spelling. Where the flag serves **false** the dead arm is removed, in any position. Where it serves **true**, an arm with nothing live above it collapses the whole statement to its body (Go and Ruby), and an arm with a live arm above it becomes the terminal `default:` / `else`, taking the arms below it — they sit behind a guard that now always passes. PHP always takes the `default:` form, because a body ending in `break;` is fatal outside a switch. A switch on a **value** (`switch ($v)`, `case v`) is untouched: there the arms compare values rather than act as guards |
-| A multi-way guard the fold **cannot** finish | **the whole flag is refused**, and the run exits 1 naming the file. In Go: a `fallthrough` anywhere in the switch, a `break` in a body that would be lifted out of it, or a `switch v := f(); {` initializer whose binding the arms use. In Ruby: a `when` listing several patterns (`when <read>, isAdmin(ctx)`), where a literal among alternatives is not the whole condition. In PHP: an arm before the flag's that does not end in `break`/`return`/`continue`/`goto`/`exit`, because PHP falls through **by default** and that arm runs into the flag's with nothing in the source saying so — an arm ending in `throw` or `die()` counts as not terminating, since the grammar cannot tell either from an assignment |
+| A **multi-way guard** — Go's tagless `switch { case <read>: … }`, Ruby's subject-less `case` / `when <read>`, Kotlin's subject-less `when { <read> -> … }`, or `switch (true) { case <read>: … }` in PHP, TypeScript and JavaScript | **rewritten.** Each arm is a condition and the first true one wins, so this is an `if`/`else if` chain by another spelling. Where the flag serves **false** the dead arm is removed, in any position. Where it serves **true**, an arm with nothing live above it collapses the whole statement to its body (Go and Ruby), and an arm with a live arm above it becomes the terminal `default:` / `else`, taking the arms below it — they sit behind a guard that now always passes. Kotlin collapses only where that cannot change meaning — an expression body in a slot that takes any expression, or a braced body in statement position that declares nothing — and otherwise takes the `else` form, which also keeps a `when` used as a value exhaustive. PHP, TypeScript and JavaScript always take the `default:` form, because a body ending in `break;` is a syntax error outside a switch, or silently becomes a loop's `break` inside one. A switch on a **value** (`switch ($v)`, `case v`, `when (v)`, `switch (v)`) is untouched: there the arms compare values rather than act as guards |
+| A multi-way guard the fold **cannot** finish | **the whole flag is refused**, and the run exits 1 naming the file. In Go: a `fallthrough` anywhere in the switch, a `break` in a body that would be lifted out of it, or a `switch v := f(); {` initializer whose binding the arms use. In Ruby: a `when` listing several patterns (`when <read>, isAdmin(ctx)`), where a literal among alternatives is not the whole condition. In PHP: an arm before the flag's that does not end in `break`/`return`/`continue`/`goto`/`exit`, because PHP falls through **by default** and that arm runs into the flag's with nothing in the source saying so — an arm ending in `throw` or `die()` counts as not terminating, since the grammar cannot tell either from an assignment. In TypeScript and JavaScript: the same fall-through rule, except that `throw` does count as terminating (it is its own statement there), as does a braced arm body ending in a jump. In Kotlin: an arm listing several conditions (`isAdmin(ctx), <read> ->`). In Kotlin, TypeScript and JavaScript: a dead arm sharing its line with another arm |
 | A PHP **`elseif` that is not last in its chain**, where the flag serves **true** | **rewritten**: the clause becomes the chain's `else`, and every branch after it is deleted. That is not tidying — those branches sit behind a guard that now always passes, so they are unreachable, and leaving them would keep an `else` in front of them, which does not parse. Both spellings (`elseif` and `else if`) behave the same. Where the flag serves **false** the dead branch is removed, in any position |
 | A **Python read bound to a name outside a function** (`use_legacy = <read>` at module or class level) | **the whole flag is refused**. Inside a function the binding is removed and its references replaced with the literal; at module or class level that name is public API, and the modules importing it do not contain the flag key, so they are never in the candidate set — this tool cannot see them, let alone update them. Leaving `use_legacy = True` standing would be permanent, since the flag key is gone from the file. Move the read inside the function that uses it, fix it by hand, or add the key to `ignore` |
 
@@ -1761,9 +2446,18 @@ means no PR.
      SDK"), a Java `Map.of` or Swift dictionary entry (not yet). Each is a
      line you have to delete yourself;
   4. **the mention is a flag-keyed entry the run deliberately kept**, because
-     its value is the branch being removed (see "Wrapping the SDK"). This is
-     the one cause the body explains on its own, in its own paragraph, naming
-     each entry — the others it can only guess between.
+     its value is the branch being removed (see "Wrapping the SDK"; never in
+     TypeScript or JavaScript, where it is stripped or its test deleted). The
+     body explains this cause in its own paragraph, naming each entry.
+
+  Two kinds of cause 3 are sorted out of the generic list, each into its own
+  paragraph. A **C# test that still stubs the removed read** (a Moq `Setup`
+  that "Tests that mock the flag read" could not resolve) comes first, naming each such line, because it is the one entry that can turn
+  the pull request red: an assertion beside it about what the flag returned may
+  now fail. A file that names the flag **only in comments** comes last, as
+  prose to update rather than code that can break. Both are positive verdicts
+  reached by parsing the file; anything this cannot decide stays in the generic
+  list.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift
@@ -1779,7 +2473,10 @@ means no PR.
   exactly like any other. (`node_modules/`, `.git/` and a Go `vendor/` tree are
   skipped everywhere — see the `vendor/` gap below.)
 * **In C# only, a mock that stubs the flag read WITHOUT a lambda is
-  indistinguishable from a real read, and is rewritten.** The expression-tree
+  indistinguishable from a real read, and is rewritten** — unless it is one
+  "Tests that mock the flag read" resolves first, an NSubstitute
+  `sub.BoolVariation("KEY", …).Returns(true)` returning a literal in a run that
+  folds a real read. The expression-tree
   guard above works because `mock.Setup(c => c.BoolVariation("KEY", …))` puts
   the read inside a lambda whose parameter is its own receiver. A library that
   stubs by calling the member on the substitute directly — NSubstitute's
@@ -1803,7 +2500,7 @@ means no PR.
   vacuous.** `assertTrue(client.boolVariation("KEY", ctx, false))` becomes
   `assertTrue(true)`, and the same goes for `expect(<read>).to eq(true)`,
   `$this->assertTrue(<read>)` and their equivalents. This is deliberate, and it
-  is where the line sits: a stub is refused because the *text* of the call is
+  is where the line sits: a stub is resolved or refused because the *text* of the call is
   the payload and folding it changes what the test does, whereas an assertion
   genuinely was about a flag that no longer exists. Folding a read into an
   ordinary argument is also correct everywhere else — `render(<read>)` must
@@ -1850,8 +2547,26 @@ means no PR.
   alternative is a pull request that cannot go green. Each one is listed
   verbatim in the PR body, since it is still code you wrote. A file that
   *already* contained unreachable code is left alone entirely — there the tool
-  cannot tell its own strands from yours. The remaining languages report
-  nothing on the same output, so nothing is deleted there.
+  cannot tell its own strands from yours. In C#, Go, Kotlin, PHP and Swift
+  the statements after a folded `return` are removed as part of the fold
+  itself (C# and Kotlin would otherwise warn about them, which fails a build
+  that treats warnings as errors). Those removals show in the diff like the
+  rest of the fold, but are not listed separately in the PR body. Python and
+  Ruby leave them in place.
+* **A loop the fold makes dead is deleted in every language, and the PR says
+  which.** A flag read as a loop condition, served false, leaves
+  `while (false) { … }` (Go's `for false { … }`, Ruby's `until true`), a loop
+  that can never run its body. It is removed and listed with the statements
+  above. Left standing, because each runs or matters: a `do … while (false)`,
+  `repeat … while false` or Ruby `begin … end while false` (the body runs
+  once); a labelled loop (in C# and Go a `goto` can target the label); a loop
+  that is not directly in a block, such as an unbraced `if` body or (outside
+  Ruby, where an empty `when` is valid) a `switch` arm; a Python
+  `while False: … else: …` (the `else` runs); and a `for` loop with an
+  initialiser, which still runs (Java refuses that flag instead; see its
+  section). A Python loop that was its block's only statement
+  becomes `pass`. As with unreachable statements, a file that already
+  contained a dead loop is left alone.
 * **A parameter the fold leaves unused is not removed, and
   `eslint:recommended` reports it.** Where the flag read was a function's only
   use of one of its parameters — `function typed(ctx) { const on =

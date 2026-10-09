@@ -88,8 +88,9 @@ class _WheelSource(NamedTuple):
 _WHEEL_SOURCES = (
     #: One python tag on purpose: the image is python:3.12-slim and
     #: requires-python caps at <3.13, so only cp312 wheels are ever installable
-    #: here. The fork release ships cp39-cp314 -- widen this, the base image and
-    #: requires-python TOGETHER if that ever changes.
+    #: here. The fork release ships cp312 only, to match -- moving to another
+    #: Python starts with a fork release carrying that tag, then widen this, the
+    #: base image and requires-python TOGETHER.
     _WheelSource(
         distribution="polyglot-piranha",
         repo="canopy-labs/piranha",

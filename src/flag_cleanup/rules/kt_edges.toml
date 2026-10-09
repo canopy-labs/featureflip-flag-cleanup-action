@@ -1,0 +1,26 @@
+# Wires one self-edge onto Kotlin's built-in cascade (see kt.toml). Piranha
+# reads [[edges]] only from this file, never from rules.toml.
+#
+# Kotlin is a built-in engine language, so `get_rule_graph` MERGES what is here
+# with the engine's own Kotlin edges rather than replacing them — every
+# built-in edge is still in force and must not be restated.
+#
+# A folded early return strands everything after it, and the built-in
+# `delete_all_statements_after_return` removes ONE statement per firing: the
+# engine resolves `replace_node = "post"` to the first node bearing that
+# capture, and the rule is reached only from `if_cleanup`, so nothing fires it
+# again on what is left. Measured:
+#
+#     if (<read>) { return 1 }  a()  b()  return 2
+#     ->  return 1  b()  return 2
+#
+# Kotlin reports the leftover as a warning, not an error, so it is outside
+# syntax.py's unreachable repair and the engine is the only thing that cleans
+# it. The self-edge re-fires the rule on the parent block until no statement
+# follows the return — the same edge the engine's own Ruby graph carries.
+# Parent scope matches the `if_cleanup` edge that reaches the rule in the first
+# place, so this reaches nothing the first firing could not.
+[[edges]]
+scope = "Parent"
+from = "delete_all_statements_after_return"
+to = ["delete_all_statements_after_return"]

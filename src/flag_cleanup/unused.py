@@ -1,4 +1,10 @@
-"""Delete the bindings a flag fold stranded — imports and local variables.
+"""Delete the bindings a flag fold stranded — imports, local variables, and
+(C# and Java only) private methods.
+
+A private method is the third kind, and the simplest to argue: once partial
+types are refused, its reach IS the file, so the differential below needs no
+scope matching — see :func:`_method_candidates`. The transform asks for it in
+a separate, later call; see :func:`remove_stranded_bindings`.
 
 Folding a flag out of an ``if`` splices the surviving branch up a level.
 Anything whose only remaining use was inside the branch that went away is now
@@ -87,44 +93,87 @@ This module owns its own parsers rather than borrowing ``syntax``'s, following
 
 from __future__ import annotations
 
+import codecs
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Iterator
 
 import tree_sitter_c_sharp
+import tree_sitter_dart
 import tree_sitter_go
 import tree_sitter_java
+import tree_sitter_kotlin
+import tree_sitter_python
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
+
+from flag_cleanup import dart_namespace
 
 #: ``js`` maps to the TSX grammar deliberately, for the same reason
 #: ``ts_syntax._parser`` does: the engine rewrote with it, and JSX in a ``.js``
 #: file is ordinary in React codebases.
+#:
+#: ``dart`` is the GATE's grammar (tree-sitter-dart 0.1.0), not the engine's
+#: 0.2.0 — the only one with Python bindings. Its shapes differ from the other
+#: grammars here in two ways every Dart branch below exists for: a postfix
+#: chain is FLATTENED into its parent (``LegacyFlow()`` is an ``identifier``
+#: followed by a ``selector`` sibling, not one call node), and a function's
+#: body is the SIBLING of its signature rather than its child.
+#:
+#: ``kt`` is the gate's wheel grammar too (``tree-sitter-kotlin``). Its one
+#: shape every Kotlin branch below has to know: a ``$name`` template in an
+#: ordinary string is NOT a node. ``"x $name y"`` arrives as the
+#: ``string_content`` leaves ``'x '``, ``'$'`` and ``'name y'``, so no leaf
+#: spells the name it reads (see ``_spelled_in``).
+#:
+#: ``python`` is the gate's grammar too, and the one whose IMPORTS this pass
+#: never deletes: see ``_python_import_candidates``.
 _GRAMMARS = {
+    "dart": tree_sitter_dart.language,
     "go": tree_sitter_go.language,
     "java": tree_sitter_java.language,
+    "kt": tree_sitter_kotlin.language,
+    "python": tree_sitter_python.language,
     "csharp": tree_sitter_c_sharp.language,
     "ts": tree_sitter_typescript.language_typescript,
     "tsx": tree_sitter_typescript.language_tsx,
     "js": tree_sitter_typescript.language_tsx,
 }
 
-#: The languages this pass acts on at all. Python, PHP, Ruby, Kotlin, Dart and
-#: Swift are absent because they are not where the compile errors are, not
-#: because the mechanism forbids them — each would need its own measured
-#: decidability table before being added.
+#: The languages this pass acts on at all. PHP, Ruby and Swift are absent
+#: because they are not where the build failures are, not because the
+#: mechanism forbids them — each would need its own measured decidability
+#: table before being added. Python is here because ruff's DEFAULT rule set
+#: includes F401 (unused import) and F841 (unused local) and exits non-zero on
+#: either, so a project that lints in CI cannot merge a pull request leaving
+#: one. Dart is here because `dart analyze` reports both
+#: an unused local and an unused import as warnings and exits non-zero on a
+#: warning, which is what a Flutter CI runs. Kotlin is here for tidiness, like
+#: Java and TypeScript, not for a build fix: measured, neither `kotlinc` 2.4
+#: nor ktlint 1.8's standard rules report an unused local or import (the 1.x
+#: compiler did warn on the local, which `allWarningsAsErrors` fails). What
+#: ktlint DOES reject is what a careless removal adds, so the Kotlin branches
+#: below avoid both: a `;` (`no-semi`) and two blank lines in a row
+#: (`no-consecutive-blank-lines`).
 SUPPORTED = frozenset(_GRAMMARS)
 
-#: The node that holds an import declaration, per language. A name occurring
-#: INSIDE one of these does not count as a reference to itself.
+#: The nodes that hold an import declaration, per language. A name occurring
+#: INSIDE one of these does not count as a reference to itself. Python has
+#: two statements, and a third for ``from __future__``.
 _IMPORT_ROOTS = {
-    "go": "import_declaration",
-    "java": "import_declaration",
-    "csharp": "using_directive",
-    "ts": "import_statement",
-    "tsx": "import_statement",
-    "js": "import_statement",
+    "dart": frozenset({"import_specification"}),
+    "go": frozenset({"import_declaration"}),
+    "java": frozenset({"import_declaration"}),
+    "kt": frozenset({"import"}),
+    "python": frozenset({
+        "import_statement", "import_from_statement", "future_import_statement",
+    }),
+    "csharp": frozenset({"using_directive"}),
+    "ts": frozenset({"import_statement"}),
+    "tsx": frozenset({"import_statement"}),
+    "js": frozenset({"import_statement"}),
 }
 
 
@@ -150,10 +199,10 @@ def _walk(node: Node) -> Iterator[Node]:
 
 
 def _inside_import(node: Node, language: str) -> bool:
-    root_type = _IMPORT_ROOTS[language]
+    roots = _IMPORT_ROOTS[language]
     current = node.parent
     while current is not None:
-        if current.type == root_type:
+        if current.type in roots:
             return True
         current = current.parent
     return False
@@ -173,14 +222,46 @@ def references(source: str, name: str, language: str) -> int:
     word = re.compile(rf"\b{re.escape(name)}\b")
     total = 0
     for node in _walk(_parse(source, language)):
-        if node.child_count:
+        if node.child_count and not _read_by_words(node, language):
             continue
         text = node.text.decode("utf-8", "replace")
-        if "comment" in node.type:
+        if _read_by_words(node, language):
             total += len(word.findall(text))
-        elif text == name and not _inside_import(node, language):
+        elif _spelling(text, language) == name and not _inside_import(node, language):
             total += 1
     return total
+
+
+def _spelling(text: str, language: str) -> str:
+    """The name a leaf spells. The Kotlin grammar keeps an identifier's
+    backticks in its text, and `` `count` `` reads ``count``."""
+    if language == "kt" and len(text) > 2 and text[0] == text[-1] == "`":
+        return text[1:-1]
+    return text
+
+
+def _read_by_words(leaf: Node, language: str) -> bool:
+    """Whether ``leaf`` is counted by the WORDS in it rather than by being
+    the name: a comment, and a Kotlin or Python string's content.
+
+    Kotlin's is a correctness requirement, not caution. A ``$name`` template
+    in an ordinary string reads ``name``, and the grammar splits it across
+    ``string_content`` leaves (``'$'``, then ``'name y'``) instead of giving
+    it a node, so the only place that read is visible is the text. Counting
+    every word of a string's content also counts a name that is merely
+    prose, which costs a missed tidy and never a deleted binding.
+
+    Python's is the same requirement for a different reason. A string can be
+    a forward-reference annotation (``flows: "list[LegacyFlow]"``) that a type
+    checker resolves, or an ``__all__`` entry that re-exports an import, and
+    neither has a leaf spelling the name alone. A Python ``string_content``
+    holding an escape is NOT a leaf (the ``\\n`` is its child), so the
+    counters ask this before skipping a node with children; its escape
+    children are then visited too, and spell no name.
+    """
+    return "comment" in leaf.type or (
+        language in {"kt", "python"} and leaf.type == "string_content"
+    )
 
 
 #: A trailing `.vN` on a Go module path is a semantic-import-versioning suffix,
@@ -215,15 +296,35 @@ class Candidate:
     #: inside the declaration that is not a read. ``None`` for an import,
     #: which self-excludes structurally via ``_inside_import``.
     binder: tuple[int, int] | None = None
+    #: Every name a Dart import binds, ``name`` among them when the directive
+    #: spells one (a plain import's ``name`` is only its URI, for the record).
+    #: Empty for every other candidate, whose one binding is ``name``. When
+    #: set, the differential runs over these instead: referenced before if
+    #: any one was, stranded only if none is referenced after.
+    names: tuple[str, ...] = ()
+    #: What the span becomes instead of nothing — a TS/JS import statement
+    #: reduced to the bare ``import "./m";`` that still loads its module (see
+    #: ``_ts_import_candidates``). ``None`` means the span is deleted. On a
+    #: record :func:`remove_stranded_bindings` returns it is also set for a
+    #: ``const { client } = require("./m")`` discarded to ``require("./m");``
+    #: (see ``_kept_require``), the same kept load in CommonJS.
+    replacement: str | None = None
 
 
-def _candidate(name: str, node: Node, source_bytes: bytes, kind: str) -> Candidate:
+def _candidate(
+    name: str,
+    node: Node,
+    source_bytes: bytes,
+    kind: str,
+    replacement: str | None = None,
+) -> Candidate:
     return Candidate(
         name=name,
         start=node.start_byte,
         end=node.end_byte,
         kind=kind,
         text=source_bytes[node.start_byte:node.end_byte].decode("utf-8", "replace"),
+        replacement=replacement,
     )
 
 
@@ -318,7 +419,9 @@ def _java_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
     return candidates
 
 
-def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
+def _ts_import_candidates(
+    root: Node, source_bytes: bytes, before: Node | None
+) -> list[Candidate]:
     """Every binding an `import_statement` introduces, at specifier granularity.
 
     A side-effect import (``import './se'``) is excluded structurally: it has no
@@ -370,9 +473,25 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
     binding-bearing node types, not the punctuation between them — never an
     assumption from one example shape.
 
-    ``import type`` needs no special case: it is erased at compile time, so
-    removing an unreferenced one is always safe, and it parses with the same
-    clause shapes as a value import.
+    ``import type`` parses with the same clause shapes as a value import, and
+    is found by the same loop.
+
+    A candidate spanning the WHOLE statement is the one that can change what
+    runs. A value import statement loads its module, and loading a module can
+    do work (initialise a client, register a handler), so deleting the
+    statement can stop that work for this file. TypeScript's import elision
+    does NOT make the deletion harmless, which is easy to get backwards. It
+    makes the deletion invisible next to the FOLDED file, whose binding is
+    already unused and so already elided. Next to the customer's original
+    file, whose binding was read and so kept, the load is gone either way. The
+    one spelling that keeps it under every compiler and every setting is a
+    bare ``import "./m";``, which binds nothing and which no compiler elides.
+    So the candidate carries that as its ``replacement``. It is also the
+    spelling ``const { client } = require("./m")`` already reduces to in
+    CommonJS (``require("./m");``, see ``_apply``), so both module systems
+    keep the load. ``_module_load`` decides which statements need it. A
+    candidate spanning only part of a clause needs no replacement, because
+    the statement survives and still loads the module.
     """
     candidates = []
     for node in _walk(root):
@@ -388,12 +507,22 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
         )
         if clause is None:
             continue
+        load = _module_load(node, source_bytes, before)
         if clause.type == "import_require_clause":
             # `import ff = require("./ff")`. The clause binds exactly one
             # name and the statement has no other reason to exist, so the
             # candidate spans the whole statement — the same "solo" outcome
             # a lone default import gets, reached without a count because
             # this clause shape admits no sibling to share with.
+            #
+            # No spelling keeps its load in every configuration, so a load
+            # that has to be kept leaves the statement alone. `import "./ff"`
+            # is an error in a CommonJS file under `verbatimModuleSyntax`,
+            # the setting that makes this form necessary, and a bare
+            # `require("./ff")` needs a `require` declared for the compiler,
+            # which `import ff = require` does not.
+            if load is not None:
+                continue
             local = next(
                 (c for c in clause.children if c.type == "identifier"), None
             )
@@ -423,6 +552,7 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
                         node if solo else child,
                         source_bytes,
                         "import",
+                        load if solo else None,
                     )
                 )
             elif child.type == "namespace_import":
@@ -433,6 +563,7 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
                         node if solo else child,
                         source_bytes,
                         "import",
+                        load if solo else None,
                     )
                 )
             elif child.type == "named_imports":
@@ -459,9 +590,161 @@ def _ts_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
                             specifier if emptied is None else emptied,
                             source_bytes,
                             "import",
+                            load if emptied is node else None,
                         )
                     )
     return candidates
+
+
+def _specifier(statement: Node) -> str | None:
+    """The module an import statement names, without its quotes."""
+    source = statement.child_by_field_name("source")
+    if source is None:
+        return None
+    return source.text.decode("utf-8", "replace")[1:-1]
+
+
+def _is_type_only(statement: Node) -> bool:
+    """``import type …``: the keyword is a direct child of the statement.
+
+    An inline ``import { type A }`` is NOT this. Whether that statement loads
+    its module depends on the compiler, and ``_loaded_before`` judges it.
+    """
+    return any(child.type == "type" for child in statement.children)
+
+
+#: Nodes whose subtree is a TYPE, erased at compile time. A name read only
+#: under one of these never made its import load anything. Measured against
+#: the TS grammar: a plain type name is already a ``type_identifier`` leaf,
+#: and these are the places a VALUE-shaped ``identifier`` leaf turns up in a
+#: type (``ns.T``, ``typeof client``, ``implements ns.I``).
+_TYPE_CONTEXTS = frozenset({
+    "type_annotation", "type_arguments", "type_parameters", "type_query",
+    "nested_type_identifier", "implements_clause", "extends_type_clause",
+    "type_alias_declaration", "interface_declaration",
+})
+
+#: The leaf types a value read of an imported name takes. A ``type_identifier``
+#: is never one, and neither is a ``property_identifier`` (``obj.client`` is
+#: not the binding).
+_VALUE_LEAVES = frozenset({"identifier", "shorthand_property_identifier"})
+
+
+def _read_as_value(root: Node, name: str) -> bool:
+    """Whether ``root`` reads ``name`` anywhere a compiler would emit it."""
+    for node in _walk(root):
+        if node.child_count or node.type not in _VALUE_LEAVES:
+            continue
+        if node.text.decode("utf-8", "replace") != name:
+            continue
+        if _has_ancestor(node, _TYPE_CONTEXTS | {"import_statement"}):
+            continue
+        return True
+    return False
+
+
+def _bound_names(statement: Node) -> list[str]:
+    """The local names an ``import_clause`` binds, minus inline ``type`` ones."""
+    names = []
+    for clause in statement.children:
+        if clause.type != "import_clause":
+            continue
+        for child in clause.children:
+            if child.type == "identifier":
+                names.append(child)
+            elif child.type == "namespace_import":
+                names.append(child.children[-1])
+            elif child.type == "named_imports":
+                for specifier in child.children:
+                    if specifier.type != "import_specifier" or any(
+                        c.type == "type" for c in specifier.children
+                    ):
+                        continue
+                    alias = specifier.child_by_field_name("alias")
+                    names.append(
+                        alias
+                        if alias is not None
+                        else specifier.child_by_field_name("name")
+                    )
+    return [n.text.decode("utf-8", "replace") for n in names if n is not None]
+
+
+def _loaded_before(before: Node | None, specifier: str) -> bool:
+    """Whether the ORIGINAL file loaded ``specifier`` at runtime.
+
+    It did when some import of it that is not ``import type`` either binds
+    nothing (``import "./m"``) or binds a name the file read as a value. An
+    import whose names were only ever read as types loaded nothing: the
+    default compiler elides it, and ``verbatimModuleSyntax`` refuses to
+    compile it at all. Reducing that one to a bare import would ADD a load
+    the customer never had, which can expose a circular import that type-only
+    use had kept dormant.
+
+    ``None`` (no original to ask) answers yes, the direction that keeps a
+    load. One shape answers no where one configuration loads:
+    ``import { type A } from "./m"`` under ``verbatimModuleSyntax`` emits
+    ``import {} from "./m"``. Its names are types by declaration, so it is
+    judged like the default compiler judges it.
+    """
+    if before is None:
+        return True
+    for statement in _walk(before):
+        if (
+            statement.type != "import_statement"
+            or _is_type_only(statement)
+            or _specifier(statement) != specifier
+        ):
+            continue
+        if not any(c.type == "import_clause" for c in statement.children):
+            return True
+        if any(_read_as_value(before, name) for name in _bound_names(statement)):
+            return True
+    return False
+
+
+def _module_load(
+    statement: Node, source_bytes: bytes, before: Node | None
+) -> str | None:
+    """The bare import that keeps ``statement``'s module load, or ``None``.
+
+    ``None`` means deleting the statement drops no load the original file
+    had, which holds in three cases:
+
+    * the statement is ``import type``, which never loads anything;
+    * the original file never loaded the module (``_loaded_before``): every
+      name imported from it was read only as a type;
+    * a sibling statement that does load (not type-only) imports the same
+      module, so the module still loads without this one. Asked again in every
+      round of the fixpoint, so when two stranded statements import one
+      module, whichever is offered first is deleted, because the other still
+      loads it, and the other then has no sibling left and becomes the bare
+      import. Each edit leaves the module loaded.
+
+    The bare import keeps everything after ``from``: the specifier as written
+    (its quotes included) and any ``with { type: "json" }`` attribute, which a
+    runtime requires on a JSON import whether or not it binds a name.
+    """
+    if _is_type_only(statement):
+        return None
+    specifier = _specifier(statement)
+    source = statement.child_by_field_name("source")
+    if specifier is None or source is None:
+        # `import ff = require(...)` carries its specifier inside the clause,
+        # and the caller leaves that form alone whenever this is not None.
+        return ""
+    if not _loaded_before(before, specifier):
+        return None
+    parent = statement.parent
+    for sibling in parent.children if parent is not None else ():
+        if (
+            sibling.type == "import_statement"
+            and sibling.id != statement.id
+            and not _is_type_only(sibling)
+            and _specifier(sibling) == specifier
+        ):
+            return None
+    tail = source_bytes[source.start_byte:statement.end_byte].decode("utf-8", "replace")
+    return f"import {tail}"
 
 
 def _csharp_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
@@ -494,16 +777,299 @@ def _csharp_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate
     return candidates
 
 
-def _import_candidates(source: str, language: str) -> list[Candidate]:
-    """Every import binding in ``source`` whose usage this pass can decide."""
+def _dart_import_candidates(
+    root: Node,
+    source_bytes: bytes,
+    resolve: Callable[[str], dart_namespace.Namespace | None] | None = None,
+) -> list[Candidate]:
+    """Every Dart import whose bindings this pass can name.
+
+    Every form needs the library itself, which ``resolve`` finds when it is
+    in the checkout (see :mod:`flag_cleanup.dart_namespace`); one it cannot
+    read — a ``dart:`` library, another package's — is never offered. Even
+    a prefix needs it: an extension the library declares applies through
+    ``as legacy`` too, and a call to its member spells neither the prefix nor
+    any shown name, so every candidate's ``names`` carries the library's
+    extension members beside what the directive binds.
+
+    A plain ``import 'package:app/legacy.dart';`` binds every public name that
+    library declares and spells none of them; its candidate carries that
+    whole namespace. ``hide`` is the same import minus the hidden names. The
+    other two forms bind names the directive spells:
+
+    * a PREFIX (``as legacy``, ``deferred as legacy``), which binds exactly
+      one name and is the import's only reason to exist, so the candidate is
+      the whole directive. A ``show`` beside a prefix narrows what ``legacy.``
+      reaches and binds nothing of its own;
+    * a ``show`` list with no prefix, which binds each shown name. One name
+      spans the whole directive; with siblings it spans only itself, and the
+      comma goes with it in ``_apply``. More than one combinator is not
+      offered: what ``show A hide B`` binds is a set difference, not a list.
+
+    A library with a ``part`` directive offers nothing. Its part files share
+    its import namespace, and they are files this pass never sees, so a name
+    no longer spelled HERE can still be what a part file uses. A part file
+    itself cannot carry imports, so it needs no check of its own.
+
+    An import has no side effect in Dart to lose: a library's top-level
+    initialisers run lazily, on first use, never at import time.
+    """
+    if any(child.type == "part_directive" for child in root.children):
+        return []
+    candidates = []
+    for node in _walk(root):
+        if node.type != "import_specification":
+            continue
+        directive = node.parent.parent if node.parent is not None else None
+        if directive is None or directive.type != "import_or_export":
+            continue
+        uri = dart_namespace.uri_of(node)
+        namespace = None if uri is None or resolve is None else resolve(uri)
+        if namespace is None:
+            continue
+        members = tuple(sorted(namespace.members))
+        children = node.children
+        prefix = next(
+            (
+                children[index + 1]
+                for index, child in enumerate(children[:-1])
+                if child.type == "as" and children[index + 1].type == "identifier"
+            ),
+            None,
+        )
+        if prefix is not None:
+            name = prefix.text.decode("utf-8", "replace")
+            candidate = _candidate(name, directive, source_bytes, "import")
+            candidates.append(replace(candidate, names=(name, *members)))
+            continue
+        combinators = [c for c in children if c.type == "combinator"]
+        if all(c.children[0].type == "hide" for c in combinators):
+            names = set(namespace.names)
+            for combinator in combinators:
+                names -= {
+                    c.text.decode("utf-8", "replace")
+                    for c in combinator.children
+                    if c.type == "identifier"
+                }
+            names |= namespace.members
+            if names:
+                candidate = _candidate(uri, directive, source_bytes, "import")
+                candidates.append(replace(candidate, names=tuple(sorted(names))))
+            continue
+        if len(combinators) != 1 or combinators[0].children[0].type != "show":
+            continue
+        shown = [c for c in combinators[0].children if c.type == "identifier"]
+        for name_node in shown:
+            name = name_node.text.decode("utf-8", "replace")
+            candidate = _candidate(
+                name,
+                directive if len(shown) == 1 else name_node,
+                source_bytes,
+                "import",
+            )
+            candidates.append(replace(candidate, names=(name, *members)))
+    return candidates
+
+
+#: The functions Kotlin calls by CONVENTION, from an operator or a language
+#: construct that spells no name: `a + b` calls `plus`, `var x by remember
+#: { … }` calls `getValue`, `val (a, b) = p` calls `component1`, a `for` loop
+#: calls `iterator`. Any of them can be an imported extension, and the import
+#: then has a use this pass cannot count. `toString` is here too, for the
+#: template that calls it.
+_KOTLIN_CONVENTION_NAME = re.compile(
+    r"component\d+|getValue|setValue|provideDelegate|invoke|iterator|next|"
+    r"hasNext|contains|get|set|compareTo|equals|rangeTo|rangeUntil|plus|minus|"
+    r"times|div|rem|mod|plusAssign|minusAssign|timesAssign|divAssign|"
+    r"remAssign|modAssign|unaryPlus|unaryMinus|not|inc|dec|toString"
+)
+
+
+def _kotlin_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
+    """Every Kotlin ``import`` that binds one name this file can spell.
+
+    ``import a.b.C`` binds ``C``, and the candidate is the whole directive.
+    An ALIASED import is never offered: ``import java.util.Date as JDate``
+    also hides ``java.util.Date`` from the file's star imports, so deleting
+    it can change what a bare ``Date`` resolves to, with no ``JDate`` left to
+    show it. A star import binds names it never spells and is excluded
+    structurally, by its ``*`` child. A name in backticks fails the
+    identifier test and is left alone.
+
+    Kotlin spells almost every use of an import, an extension call included
+    (``"s".shout()`` — the import count, unlike a local's, keeps a member
+    position). The exception is a function called by convention, which no
+    use spells: see ``_KOTLIN_CONVENTION_NAME``. An import of one of those
+    is never offered.
+
+    Loading has no effect to lose: a JVM class initialises on first use,
+    never at import.
+    """
+    candidates = []
+    for node in _walk(root):
+        if node.type != "import" or not node.is_named:
+            continue
+        if any(child.type == "*" for child in node.children):
+            continue
+        path = next(
+            (c for c in node.children if c.type == "qualified_identifier"), None
+        )
+        if path is None or not path.named_children:
+            continue
+        original = path.named_children[-1].text.decode("utf-8", "replace")
+        alias = next(
+            (
+                node.children[index + 1]
+                for index, child in enumerate(node.children[:-1])
+                if child.type == "as"
+            ),
+            None,
+        )
+        if alias is not None:
+            continue
+        if not original.isidentifier() or _KOTLIN_CONVENTION_NAME.fullmatch(original):
+            continue
+        candidates.append(_candidate(original, node, source_bytes, "import"))
+    return candidates
+
+
+#: What a stranded Python import is marked with. F401 is the code ruff and
+#: flake8 share for an unused import.
+_PYTHON_NOQA = "  # noqa: F401"
+
+#: A noqa directive already on the line, in any spelling a linter reads.
+_PYTHON_HAS_NOQA = re.compile(r"#\s*noqa", re.IGNORECASE)
+
+
+def _python_line_can_end_in_a_comment(root: Node, line_end: int) -> bool:
+    """Whether a comment appended at ``line_end`` is a comment.
+
+    Not inside a token that runs on past the line. A ``\\`` continuation is
+    one (tree-sitter's ``line_continuation`` spans the backslash AND the
+    newline), and any character after it is a SyntaxError. A triple-quoted
+    string opened later on the same line is another, and would take the mark
+    into its value; the string is asked as a whole, because its content token
+    can START at the newline and so never straddle it.
+    """
+    return not any(
+        node.start_byte < line_end < node.end_byte
+        for node in _walk(root)
+        if not node.child_count or node.type == "string"
+    )
+
+
+def _python_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
+    """Every name a Python import binds, each offered as a MARK on its
+    statement rather than a deletion.
+
+    Python never loses an import here, because no removal keeps what the
+    statement loads. Loading a module runs it, and that can register a
+    handler or configure a client. The name is no safer to drop than the
+    statement: ``from app import legacy`` loads the SUBMODULE ``app.legacy``
+    when ``legacy`` is one, and nothing in one file can tell a submodule from
+    an attribute. ``import app`` would then lose the load, and
+    ``import app.legacy`` raises when ``legacy`` is an attribute. So a
+    stranded import keeps every byte and gains ``# noqa: F401``, which is what
+    the lint failure this pass exists for asks for. It also keeps the name for
+    a module that re-exports it, an ``__init__.py`` above all.
+
+    The mark goes at the end of the statement's FIRST line, after any comment
+    already there, and only where a comment can go (see
+    ``_python_line_can_end_in_a_comment``). Measured, ruff and flake8 both read an import's noqa from
+    that line and accept it after a comment, and neither honours one on a
+    parenthesised import's closing line. The candidate spans from the
+    statement's start to the end of that line, so the record the pull request
+    shows is the whole line as it now reads.
+
+    Not offered:
+
+    * a statement whose first line already carries a noqa, which is the
+      customer's call (and the state a statement this pass marked is left
+      in, so the fixpoint never marks one twice);
+    * a star import, which spells nothing it binds and has no ``name``;
+    * ``from __future__``, a compiler directive and a statement type of its
+      own.
+    """
+    candidates = []
+    for node in _walk(root):
+        if node.type == "import_statement":
+            bound = [
+                child for child in node.children
+                if child.type in {"dotted_name", "aliased_import"}
+            ]
+        elif node.type == "import_from_statement":
+            # A star import has no `name` child, so it offers nothing.
+            bound = [
+                node.child(index)
+                for index in range(node.child_count)
+                if node.field_name_for_child(index) == "name"
+            ]
+        else:
+            continue
+        line_end = source_bytes.find(b"\n", node.start_byte)
+        line_end = len(source_bytes) if line_end == -1 else line_end
+        if source_bytes[line_end - 1 : line_end] == b"\r":
+            line_end -= 1
+        line = source_bytes[node.start_byte:line_end].decode("utf-8", "replace")
+        # A bare `\r` ends a line too, and then "up to the next `\n`" is not
+        # the first line. Old Mac line endings are rare enough to decline.
+        if "\r" in line or _PYTHON_HAS_NOQA.search(line) or not _python_line_can_end_in_a_comment(
+            root, line_end
+        ):
+            continue
+        for binding in bound:
+            if binding.type == "aliased_import":
+                name_node = binding.child_by_field_name("alias")
+            elif node.type == "import_statement":
+                # `import a.b` binds `a`.
+                name_node = binding.named_children[0] if binding.named_children else None
+            else:
+                name_node = binding
+            if name_node is None:
+                continue
+            name = name_node.text.decode("utf-8", "replace")
+            if not name.isidentifier():
+                continue
+            candidates.append(
+                Candidate(
+                    name=name,
+                    start=node.start_byte,
+                    end=line_end,
+                    kind="import",
+                    text=line,
+                    replacement=line + _PYTHON_NOQA,
+                )
+            )
+    return candidates
+
+
+def _import_candidates(
+    source: str,
+    language: str,
+    before: Node | None = None,
+    resolve: Callable[[str], dart_namespace.Namespace | None] | None = None,
+) -> list[Candidate]:
+    """Every import binding in ``source`` whose usage this pass can decide.
+
+    ``before`` is the parsed original file, which the TS family asks whether a
+    stranded statement's module was ever loaded (see ``_loaded_before``).
+    ``resolve`` reads the library a Dart import names (see
+    ``_dart_import_candidates``).
+    """
     source_bytes = source.encode("utf-8")
     root = _parse(source, language)
+    if language == "dart":
+        return _dart_import_candidates(root, source_bytes, resolve)
     if language == "go":
         return _go_import_candidates(root, source_bytes)
     if language == "java":
         return _java_import_candidates(root, source_bytes)
+    if language == "kt":
+        return _kotlin_import_candidates(root, source_bytes)
+    if language == "python":
+        return _python_import_candidates(root, source_bytes)
     if language in {"ts", "tsx", "js"}:
-        return _ts_import_candidates(root, source_bytes)
+        return _ts_import_candidates(root, source_bytes, before)
     if language == "csharp":
         return _csharp_import_candidates(root, source_bytes)
     return []
@@ -563,6 +1129,85 @@ _INERT_WRAPPERS = frozenset({
     "array_type", "array_rank_specifier", "integral_type", "dimensions_expr",
 })
 
+#: Dart's additions to the two sets above, kept per language because several
+#: of these names mean something else, or something effectful, in a grammar
+#: that never had them measured. ``arguments`` is the sharpest: here it is
+#: reached only through a ``const_object_expression`` (a constant, evaluated
+#: at compile time, so it runs nothing), because the call shapes that also
+#: hold one — ``argument_part``, ``new_expression`` — are absent and stop the
+#: walk first.
+#:
+#: A member access (``obj.field``, ``obj?.field``) and an index
+#: (``items[0]``) are inert, as they already are for C# and TypeScript. A
+#: Dart getter can run code, exactly as a C# property can; the pass accepts
+#: the same trade here that it accepts there.
+#:
+#: An interpolated string is NOT inert: ``'$obj'`` calls ``obj.toString()``,
+#: which is user code. ``template_substitution`` is absent for that reason,
+#: so such a literal is judged effectful — and then left standing, since a
+#: string is not a statement this pass will write (see
+#: ``_dart_initializer_is_a_statement``).
+_DART_INERT_NODES = frozenset({
+    "list_literal", "set_or_map_literal", "const_object_expression",
+    "null_literal", "symbol_literal",
+})
+_DART_INERT_WRAPPERS = frozenset({
+    "selector", "unconditional_assignable_selector",
+    "conditional_assignable_selector", "index_selector", "type_arguments",
+    "arguments", "argument", "named_argument", "label",
+})
+
+#: Kotlin's additions, kept per language for the reason Dart's are. A boolean
+#: and ``null`` are plain ``identifier`` leaves in this grammar, so they are
+#: inert already. A member access (``navigation_expression``, which ``?.``
+#: and ``::`` share) is inert as it is for C#, Dart and TypeScript, getters
+#: and all. An index is NOT: ``items[0]`` calls an ``operator get``, which is
+#: as likely to be the customer's as the standard library's.
+#:
+#: A string is inert only when it interpolates nothing, and the grammar's
+#: shapes make that a TEXT test rather than a node test (see
+#: ``_kotlin_string_is_inert``).
+_KOTLIN_INERT_NODES = frozenset({
+    "number_literal", "character_literal", "navigation_expression",
+    "this_expression",
+})
+_KOTLIN_STRINGS = frozenset({"string_literal", "multiline_string_literal"})
+
+#: Node names Kotlin SHARES with a grammar that listed them as inert, for a
+#: shape that is not inert here: Go's ``index_expression`` is a slice read,
+#: Kotlin's is a call to ``operator get``.
+_KOTLIN_EFFECTFUL_NODES = frozenset({"index_expression"})
+
+#: A ``$`` that starts a template: a name (any letter, not only ASCII), a
+#: backticked name, or ``${``. The
+#: ``$`` of ``"cost: $"`` or ``"$5"`` interpolates nothing.
+_KOTLIN_TEMPLATE = re.compile(r"\$(?:[^\W\d]|[`{])")
+
+
+def _kotlin_string_is_inert(node: Node) -> bool:
+    """Whether a Kotlin string literal interpolates nothing.
+
+    Asked of the TEXT, because the grammar gives a template a node in some
+    strings and not in others: a raw string's ``$name`` is an
+    ``interpolation``, an ordinary string's is two ``string_content`` leaves
+    with no node of its own. A template calls ``toString()``, which is user
+    code, so a string holding one is effectful.
+    """
+    return not _KOTLIN_TEMPLATE.search(node.text.decode("utf-8", "replace"))
+
+
+#: Python's additions. A member access (``attribute``) is inert as it is for
+#: C#, Dart, Kotlin and TypeScript, properties and ``__getattr__`` included:
+#: the same trade those languages accept. An index (``subscript``) is NOT,
+#: as in Kotlin: ``__getitem__`` is the customer's as often as not, and a
+#: ``KeyError`` is a result. An f-string's ``interpolation`` calls
+#: ``__format__`` and is absent, so such a string is effectful.
+_PYTHON_INERT_NODES = frozenset({
+    "integer", "float", "none", "ellipsis", "list", "tuple", "set",
+    "dictionary", "concatenated_string", "attribute",
+})
+
+
 #: `unary_expression` (go/java/ts) and `prefix_unary_expression` (csharp) are
 #: shared by a purely computational negation (`-1`, `!b`, `~c`) AND, in Go
 #: only, a channel receive (`<-ch`) and a pointer dereference (`*p`) — both of
@@ -590,15 +1235,40 @@ def is_inert(candidate: Candidate, source: str, language: str) -> bool:
     """
     if candidate.initializer is None:
         return True
+    nodes = _initializer_nodes(source, candidate, language)
+    return bool(nodes) and all(_subtree_is_inert(node, language) for node in nodes)
+
+
+def _initializer_nodes(
+    source: str, candidate: Candidate, language: str
+) -> list[Node]:
+    """The node, or the run of SIBLING nodes, that spans the initializer.
+
+    One node everywhere except Dart, whose grammar flattens a postfix chain
+    into its parent: ``repo.load(id)`` is an ``identifier`` followed by two
+    ``selector`` siblings, each under the declaration's ``value`` field, and
+    no single node spans the three. Asked of the span rather than of a field
+    name, so it answers for both shapes: the outermost nodes lying wholly
+    inside it, in order. Empty when they do not cover the span exactly.
+    """
     start, end = candidate.initializer
-    for node in _walk(_parse(source, language)):
-        if node.start_byte != start or node.end_byte != end:
+    found: list[Node] = []
+    stack = [_parse(source, language)]
+    while stack:
+        node = stack.pop()
+        if node.end_byte <= start or node.start_byte >= end:
             continue
-        return _subtree_is_inert(node)
-    return False
+        if start <= node.start_byte and node.end_byte <= end:
+            found.append(node)
+            continue
+        stack.extend(node.children)
+    found.sort(key=lambda node: node.start_byte)
+    if not found or found[0].start_byte != start or found[-1].end_byte != end:
+        return []
+    return found
 
 
-def _subtree_is_inert(node: Node) -> bool:
+def _subtree_is_inert(node: Node, language: str = "") -> bool:
     # A CHILDLESS node is one token, and a token cannot run anything — the
     # behaviour in every effectful shape lives in the node that COMBINES
     # tokens (a call, an `await`, a channel receive), and that node is judged
@@ -615,18 +1285,56 @@ def _subtree_is_inert(node: Node) -> bool:
     # reviewer of the output could defend.
     if node.child_count == 0:
         return True
-    if node.type in _INERT_WRAPPERS:
+    if language == "python":
+        if node.type == "unary_operator":
+            # `-x` calls `__neg__`; only a number takes the built-in one.
+            operand = node.child_by_field_name("argument")
+            return operand is not None and operand.type in {"integer", "float"}
+        if node.type in _PYTHON_INERT_NODES:
+            return all(
+                _subtree_is_inert(child, language) for child in node.named_children
+            )
+    if language == "kt":
+        if node.type in _KOTLIN_STRINGS:
+            return _kotlin_string_is_inert(node)
+        if node.type in _KOTLIN_INERT_NODES:
+            return all(
+                _subtree_is_inert(child, language) for child in node.named_children
+            )
+        if node.type in _KOTLIN_EFFECTFUL_NODES:
+            return False
+    dart = language == "dart"
+    if node.type in _INERT_WRAPPERS or (dart and node.type in _DART_INERT_WRAPPERS):
         return all(
-            _subtree_is_inert(child) for child in node.named_children
+            _subtree_is_inert(child, language) for child in node.named_children
         )
     if node.type in _UNARY_EXPRESSION_NODES:
-        return _unary_is_inert(node)
-    if node.type not in _INERT_NODES:
+        if language == "kt" and not _kotlin_unary_operand_is_literal(node):
+            return False
+        return _unary_is_inert(node, language)
+    if node.type not in _INERT_NODES and not (
+        dart and node.type in _DART_INERT_NODES
+    ):
         return False
-    return all(_subtree_is_inert(child) for child in node.named_children)
+    return all(_subtree_is_inert(child, language) for child in node.named_children)
 
 
-def _unary_is_inert(node: Node) -> bool:
+def _kotlin_unary_operand_is_literal(node: Node) -> bool:
+    """Whether a Kotlin unary operator applies to a literal.
+
+    ``-x``, ``+x`` and ``!x`` call ``unaryMinus``, ``unaryPlus`` and ``not``,
+    which any type can define as an operator (kotlinx.html's ``+"text"``
+    appends to the document). Only a number or a boolean literal is known to
+    take the built-in one.
+    """
+    operand = node.child_by_field_name("argument")
+    return operand is not None and (
+        operand.type == "number_literal"
+        or (operand.type == "identifier" and operand.text in {b"true", b"false"})
+    )
+
+
+def _unary_is_inert(node: Node, language: str = "") -> bool:
     """A unary expression is inert only when its operator is purely
     computational and its operand is inert.
 
@@ -636,7 +1344,11 @@ def _unary_is_inert(node: Node) -> bool:
     go/java/ts name it with an ``operator`` field (and the operand with
     ``operand`` or, for ts, ``argument``); csharp's `prefix_unary_expression`
     names neither child, so its operator is the node's first child and its
-    operand the second — always exactly two children.
+    operand the second — always exactly two children. Dart's names neither child
+    either, and wraps the operator token one level deeper
+    (``prefix_operator > minus_operator``); the wrapper's text is the
+    operator's, so the same comparison reads it. A Dart ``await`` is a
+    ``unary_expression`` with ONE child and is rejected by the count.
     """
     operator_node = node.child_by_field_name("operator")
     if operator_node is not None:
@@ -652,14 +1364,17 @@ def _unary_is_inert(node: Node) -> bool:
     operator = operator_node.text.decode("utf-8", "replace")
     if operator not in _COMPUTATIONAL_UNARY_OPERATORS:
         return False
-    return _subtree_is_inert(operand)
+    return _subtree_is_inert(operand, language)
 
 
 #: ``(declaration node type, the node type its enclosing statement list uses)``
 #: per language, plus the field names holding the bound name and the value.
 _VARIABLE_DECLARATIONS = {
+    "dart": ("local_variable_declaration", None, None),
     "go": ("short_var_declaration", "left", "right"),
     "java": ("local_variable_declaration", None, None),
+    "kt": ("property_declaration", None, None),
+    "python": ("expression_statement", None, None),
     "csharp": ("local_declaration_statement", None, None),
     "ts": ("lexical_declaration", None, None),
     "tsx": ("lexical_declaration", None, None),
@@ -766,10 +1481,24 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
             and node.parent.type == _TS_PROGRAM
         ):
             continue
-        pair = _declared_name_and_value(node, name_field, value_field)
+        if language == "dart":
+            pair = _dart_declared_name_and_value(node)
+        elif language == "kt":
+            pair = _kotlin_declared_name_and_value(node)
+        elif language == "python":
+            pair = _python_declared_name_and_value(node)
+        else:
+            pair = _declared_name_and_value(node, name_field, value_field)
+            if pair is not None:
+                name_node, value_node = pair
+                pair = name_node, (
+                    (value_node.start_byte, value_node.end_byte)
+                    if value_node is not None
+                    else None
+                )
         if pair is None:
             continue
-        name_node, value_node = pair
+        name_node, initializer = pair
         name = name_node.text.decode("utf-8", "replace")
         # A binding whose declared name is not a NAME is never a candidate.
         # The bound position of a destructuring declarator is a whole pattern
@@ -795,15 +1524,192 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
                 text=source_bytes[node.start_byte:node.end_byte].decode(
                     "utf-8", "replace"
                 ),
-                initializer=(
-                    (value_node.start_byte, value_node.end_byte)
-                    if value_node is not None
-                    else None
-                ),
+                initializer=initializer,
                 binder=(name_node.start_byte, name_node.end_byte),
             )
         )
     return candidates
+
+
+def _dart_declared_name_and_value(
+    node: Node,
+) -> tuple[Node, tuple[int, int] | None] | None:
+    """The single bound name of a Dart ``local_variable_declaration`` and the
+    byte span of its initializer, or ``None`` if it binds more than one name.
+
+    The initializer is a SPAN, not a node, because the grammar flattens a
+    postfix chain: ``LegacyFlow()`` arrives as an ``identifier`` and a
+    ``selector`` that are both children of the declaration under the
+    ``value`` field, and nothing spans the pair. From the first ``value``
+    child to the last is the expression.
+
+    Two shapes bind more than one name and are declined structurally: a
+    second declarator (``final a = 1, b = 2;`` puts ``b`` in an
+    ``initialized_identifier`` beside the first) and a pattern
+    (``final (a, b) = pair();`` is a ``pattern_variable_declaration``, a
+    different node from the ``initialized_variable_definition`` read here).
+    """
+    definitions = [
+        child for child in node.named_children
+        if child.type == "initialized_variable_definition"
+    ]
+    if len(definitions) != 1 or len(node.named_children) != 1:
+        return None
+    definition = definitions[0]
+    if any(child.type == "late" for child in definition.children):
+        # Its initializer runs on first READ, and a stranded one is never
+        # read: deleting the declaration is right but this pass's discard
+        # would make the call unconditional, and an inert initializer is
+        # judged as such anyway. Neither half is worth a third rule here.
+        return None
+    if any(c.type == "initialized_identifier" for c in definition.named_children):
+        return None
+    name_node = definition.child_by_field_name("name")
+    if name_node is None:
+        return None
+    values = [
+        definition.child(index)
+        for index in range(definition.child_count)
+        if definition.field_name_for_child(index) == "value"
+    ]
+    if not values:
+        return name_node, None
+    typed = any(
+        child.end_byte <= name_node.start_byte
+        and child.type not in _DART_UNTYPED_MODIFIERS
+        for child in definition.named_children
+    )
+    if typed and any(
+        node.type == "identifier" for value in values for node in _walk(value)
+    ):
+        # `final int id = json['id'];` casts from `dynamic` and throws on bad
+        # data; deleting the declaration or keeping only its initializer
+        # both lose that. A literal cannot be `dynamic`, so only an
+        # initializer that names something is declined.
+        return None
+    return name_node, (values[0].start_byte, values[-1].end_byte)
+
+
+def _kotlin_declared_name_and_value(
+    node: Node,
+) -> tuple[Node, tuple[int, int] | None] | None:
+    """The single bound name of a Kotlin local ``val``/``var`` and the byte
+    span of its initializer, or ``None`` when it is not one this pass can
+    judge.
+
+    ``property_declaration`` is also a class's PROPERTY, and a local class or
+    an object expression inside a function puts one inside a function body.
+    A member is read as ``local.x``, which the local count deliberately does
+    not see, so only a declaration that is a statement of a ``block`` is a
+    local here.
+
+    Declined outright:
+
+    * a destructuring declaration (``val (a, b) = p``), which binds more
+      than one name and calls ``componentN`` doing it;
+    * a delegated one (``val x by lazy { … }``): ``provideDelegate`` can run
+      code at the declaration, and the initializer is not an expression;
+    * a TYPED local whose initializer names anything. ``val x: Foo =
+      javaApi()`` checks a platform type for null and throws on it, and
+      deleting the line or keeping only the call both lose the throw. A
+      literal has no platform type, so ``val x: Long = 3`` is still judged.
+      A boolean and ``null`` are ``identifier`` leaves in this grammar and
+      are told apart by their text.
+    """
+    if node.parent is None or node.parent.type != "block":
+        return None
+    if any(
+        child.type in {"multi_variable_declaration", "property_delegate"}
+        for child in node.children
+    ):
+        return None
+    declarations = [c for c in node.named_children if c.type == "variable_declaration"]
+    if len(declarations) != 1:
+        return None
+    declaration = declarations[0]
+    name_node = declaration.named_children[0] if declaration.named_children else None
+    if name_node is None or name_node.type != "identifier":
+        return None
+    value = None
+    for index, child in enumerate(node.children[:-1]):
+        if child.type == "=":
+            value = node.children[index + 1]
+            break
+    if value is None:
+        return name_node, None
+    typed = len(declaration.named_children) > 1
+    if typed and any(
+        leaf.type == "identifier" and leaf.text not in _KOTLIN_LITERAL_WORDS
+        for leaf in _walk(value)
+    ):
+        return None
+    return name_node, (value.start_byte, value.end_byte)
+
+
+#: The Kotlin literals this grammar parses as an ``identifier``.
+_KOTLIN_LITERAL_WORDS = frozenset({b"true", b"false", b"null"})
+
+#: Names whose call reads a function's locals without spelling any of them:
+#: ``render(request, "t.html", locals())`` is a Django idiom. A scope that
+#: spells one offers no local at all. ``eval``/``exec`` of a literal string is
+#: already counted by its words; this covers the computed one too.
+_PYTHON_NAMESPACE_READERS = frozenset({
+    b"locals", b"vars", b"dir", b"eval", b"exec", b"_getframe",
+    b"currentframe", b"f_locals",
+})
+
+#: The Python nodes that start a new binding scope, or (a class body) a
+#: namespace whose names are attributes rather than locals.
+_PYTHON_SCOPES = frozenset({"function_definition", "class_definition", "lambda"})
+
+
+def _python_declared_name_and_value(
+    node: Node,
+) -> tuple[Node, tuple[int, int] | None] | None:
+    """The one name a Python assignment statement binds in a function, and
+    the span of the value it assigns, or ``None`` when it is not one this pass
+    can judge.
+
+    Python has no declaration: an ``expression_statement`` holding an
+    ``assignment`` to a bare name is the binding. Only one inside a FUNCTION
+    is local. A class body's assignment is an attribute anyone can read, and
+    a module's is a global other files import, so the nearest enclosing scope
+    must be a ``def``. A ``global``/``nonlocal`` declaration makes the name
+    somebody else's, and needs no check of its own: it spells the name, so
+    the scope's count never reaches zero.
+
+    Declined: any local of a function that spells one of
+    ``_PYTHON_NAMESPACE_READERS``, a target that is not a bare name (``a, b = …``, ``self.x =
+    …``, ``items[0] = …``) and an annotation with no value (``x: int``),
+    which binds nothing at run time. A chain (``a = b = make()``) is offered
+    and then left: its value is the inner assignment, which is neither inert
+    nor a call.
+    """
+    scope = node.parent
+    while scope is not None and scope.type not in _PYTHON_SCOPES:
+        scope = scope.parent
+    if scope is None or scope.type != "function_definition":
+        return None
+    if any(
+        leaf.type == "identifier" and leaf.text in _PYTHON_NAMESPACE_READERS
+        for leaf in _walk(scope)
+    ):
+        return None
+    statements = [c for c in node.named_children if c.type != "comment"]
+    if len(statements) != 1 or statements[0].type != "assignment":
+        return None
+    assignment = statements[0]
+    name_node = assignment.child_by_field_name("left")
+    value = assignment.child_by_field_name("right")
+    if name_node is None or name_node.type != "identifier" or value is None:
+        return None
+    return name_node, (value.start_byte, value.end_byte)
+
+
+#: The words before a Dart local's name that are NOT a type annotation.
+_DART_UNTYPED_MODIFIERS = frozenset({
+    "final_builtin", "const_builtin", "inferred_type", "late",
+})
 
 
 def _has_ancestor(node: Node, types: frozenset[str]) -> bool:
@@ -929,6 +1835,10 @@ def _sole_bound_name(name_node: Node) -> Node | None:
 #: guard below is the honest backstop for the rest.
 _DISCARD_PREFIX = {"go": "_ = "}
 
+#: The languages whose discard needs no ``;``. Kotlin and Python end a
+#: statement at the newline, and ktlint's `no-semi` flags one written anyway.
+_NO_STATEMENT_TERMINATOR = frozenset({"go", "kt", "python"})
+
 #: Node types that ARE a legal expression statement in Java, C# and TS. Java's
 #: list is JLS 14.8; C# and TS admit the same shapes plus ``await``.
 #:
@@ -946,10 +1856,37 @@ _STATEMENT_EXPRESSIONS = frozenset({
     "assignment_expression", "update_expression",
 })
 
+#: The node a Dart initializer may START with and still stand as a statement
+#: once its declaration is gone. Dart admits any expression as a statement,
+#: so what this guards is not legality but how a statement's FIRST TOKEN is
+#: read: one starting with `{` is a block (a map literal's `{'a': f()};`
+#: does not parse), one starting with `const` is a declaration, and a
+#: function literal at statement start is not an expression statement at
+#: all. Starting from a name, `new` or `await` is unambiguous, and those are
+#: also the shapes an effectful initializer overwhelmingly takes: a call, a
+#: constructor, a cascade, an awaited future.
+_DART_STATEMENT_STARTS = frozenset({"identifier", "new_expression", "this"})
+
+#: The languages whose deleted first-line import takes the blank line below it
+#: along. None of their grammars gives a leading blank line any meaning, and
+#: each formatter (`dotnet format`, `dart format`, Prettier) strips one. Go is
+#: absent because its first line is always `package`, never an import.
+_LEADING_BLANK_IS_MEANINGLESS = frozenset({"ts", "tsx", "js", "csharp", "dart", "java", "kt"})
+
+#: The languages whose standard linter fails on two blank lines in a row,
+#: which a deleted import between two blank lines leaves behind: ktlint's
+#: `no-consecutive-blank-lines`, in its default rule set.
+_BLANK_RUN_IS_AN_ERROR = frozenset({"kt"})
+
+
 def _apply(source: str, candidate: Candidate, language: str) -> str | None:
     """Remove or neutralise ``candidate``; ``None`` when neither is possible.
 
-    Imports are deleted outright — deleting one cannot change behaviour.
+    An import is deleted, unless it carries a ``replacement``. That is a TS/JS
+    statement whose module load must survive, and it becomes the bare
+    ``import "./m";`` in place (see ``_ts_import_candidates``). No other
+    import in these languages is kept for its load: Java and C# imports only
+    name things, and Go refuses to compile an unused import, so it has to go.
 
     A variable is three-way: an inert initializer is deleted with its
     declaration, an effectful one is rewritten to a discard so the call
@@ -969,26 +1906,154 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
     avoid — a hole is loud, a non-building branch is silent.
     """
     data = source.encode("utf-8")
+    if (
+        language == "kt"
+        and candidate.kind == "variable"
+        and _kotlin_ends_a_value_block(source, candidate)
+    ):
+        return None
+    if candidate.replacement is not None:
+        return (
+            data[: candidate.start]
+            + candidate.replacement.encode("utf-8")
+            + data[candidate.end :]
+        ).decode("utf-8")
     deletable = candidate.kind == "import" or is_inert(candidate, source, language)
+    lines = (
+        _python_deletable_lines(source, candidate) if language == "python" else None
+    )
+    if language == "python" and lines is None:
+        deletable = False
     if deletable and not _fills_a_parent_slot(source, candidate, language):
         start, end = candidate.start, candidate.end
         if _sits_in_comma_separated_list(source, candidate, language):
             start, end = _expand_over_separator(data, start, end)
-        start, end = _expand_to_whole_lines(data, start, end)
+        start, end = lines or _expand_to_whole_lines(data, start, end)
+        if (
+            start == _bom_length(data)
+            and candidate.kind == "import"
+            and language in _LEADING_BLANK_IS_MEANINGLESS
+        ):
+            # The file's first line went, so the blank line that separated
+            # the imports from the code would now open the file.
+            while data[end:].startswith((b"\n", b"\r\n")):
+                end += 1 if data[end : end + 1] == b"\n" else 2
+        elif (
+            language in _BLANK_RUN_IS_AN_ERROR
+            and (start, end) != (candidate.start, candidate.end)
+            and data[:start].endswith((b"\n\n", b"\n\r\n"))
+        ):
+            # The line above is blank, so a blank line below would make two.
+            while data[end:].startswith((b"\n", b"\r\n")):
+                end += 1 if data[end : end + 1] == b"\n" else 2
         return (data[:start] + data[end:]).decode("utf-8")
     if candidate.initializer is None:
         return None
     init_start, init_end = candidate.initializer
     initializer = data[init_start:init_end].decode("utf-8")
     prefix = _DISCARD_PREFIX.get(language)
-    if prefix is None and not _is_statement_expression(source, candidate, language):
+    if language == "dart":
+        if not _dart_initializer_is_a_statement(source, candidate):
+            return None
+    elif language == "kt":
+        if not _kotlin_initializer_is_a_statement(source, candidate):
+            return None
+    elif language == "python":
+        value = _node_at(source, "python", init_start, init_end)
+        if value is None or value.type not in {"call", "await"}:
+            return None
+    elif prefix is None and not _is_statement_expression(source, candidate, language):
         return None
     replacement = f"{prefix or ''}{initializer}"
-    if language != "go":
+    if language not in _NO_STATEMENT_TERMINATOR:
         replacement += ";"
     return (
         data[: candidate.start] + replacement.encode("utf-8") + data[candidate.end :]
     ).decode("utf-8")
+
+
+def _python_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] | None:
+    """The whole lines a Python statement can be deleted as, or ``None``.
+
+    Two shapes cannot lose the statement, and both would otherwise ship
+    source CPython rejects (Gate 1 would then refuse the whole flag, losing
+    the fold along with the tidy):
+
+    * a statement sharing its line with another (``n = 3; go()`` would
+      leave ``; go()``). A trailing COMMENT is not another statement: it
+      annotates the binding, and goes with it;
+    * the only statement of its block. ``if c:`` with nothing under it is an
+      ``IndentationError`` that tree-sitter does not report;
+    * a statement the line above continues into with ``\\``;
+    * a body's first statement when a bare string follows it, which would
+      become the ``__doc__``.
+
+    A call kept as a statement (the discard) fills either just as well, so
+    ``None`` here only stops the deletion.
+    """
+    data = source.encode("utf-8")
+    line_start = max(data.rfind(b"\n", 0, candidate.start) + 1, _bom_length(data))
+    line_end = data.find(b"\n", candidate.end)
+    line_end = len(data) if line_end == -1 else line_end + 1
+    tail = data[candidate.end:line_end].strip()
+    if data[line_start:candidate.start].strip() or (tail and not tail.startswith(b"#")):
+        return None
+    if data[:line_start].endswith((b"\\\n", b"\\\r\n")):
+        # The line above is continued into this one.
+        return None
+    # The statement itself, by type: a block holding only this statement
+    # spans exactly the same bytes, and ``_node_at`` would answer with it.
+    node = next(
+        (
+            n for n in _walk(_parse(source, "python"))
+            if n.type == "expression_statement"
+            and (n.start_byte, n.end_byte) == (candidate.start, candidate.end)
+        ),
+        None,
+    )
+    if node is None or node.parent is None:
+        return None
+    if node.parent.type == "block" and not any(
+        sibling.id != node.id and sibling.type != "comment"
+        for sibling in node.parent.named_children
+    ):
+        return None
+    statements = [c for c in node.parent.named_children if c.type != "comment"]
+    if statements[0].id == node.id and len(statements) > 1:
+        following = statements[1]
+        if following.type == "expression_statement" and following.named_child_count == 1 and (
+            following.named_children[0].type in {"string", "concatenated_string"}
+        ):
+            # It would become the body's docstring.
+            return None
+    return line_start, line_end
+
+
+def _kept_require(source: str, candidate: Candidate, language: str) -> str | None:
+    """The ``require("./m");`` a CommonJS binding was discarded to, or ``None``.
+
+    ``const { client } = require("./m")`` is a variable, so ``_apply`` never
+    deletes it: a call is not inert, and the declaration becomes the discard
+    ``require("./m");``. That line is the CommonJS spelling of a bare
+    ``import "./m";`` — the binding is gone and only the module load is left —
+    so the pull request names it alongside the bare imports rather than
+    counting it as removed.
+
+    Only a call whose callee IS the identifier ``require``. Any other discard
+    (``compute();``, ``require("./m")();``) keeps a call the customer wrote for
+    what it does, not a load, and stays reported as the binding it removed.
+    """
+    if language not in _TS_MODULE_LANGUAGES or candidate.initializer is None:
+        return None
+    start, end = candidate.initializer
+    node = _node_at(source, language, start, end)
+    if node is None or node.type != "call_expression":
+        return None
+    callee = node.child_by_field_name("function")
+    if callee is None or callee.type != "identifier" or callee.text != b"require":
+        return None
+    # `_apply`'s discard for these languages: the initializer, then `;`.
+    return source.encode("utf-8")[start:end].decode("utf-8") + ";"
 
 
 def _fills_a_parent_slot(
@@ -1050,6 +2115,81 @@ def _is_statement_expression(
     return False
 
 
+def _dart_initializer_is_a_statement(source: str, candidate: Candidate) -> bool:
+    """Whether this Dart initializer still parses as the statement it would
+    become; see ``_DART_STATEMENT_STARTS``. An ``await`` arrives wrapped in a
+    one-child ``unary_expression`` and is admitted through it."""
+    nodes = _initializer_nodes(source, candidate, "dart")
+    if not nodes:
+        return False
+    first = nodes[0]
+    if first.type == "unary_expression" and first.child_count == 1:
+        first = first.children[0]
+        return first.type == "await_expression"
+    return first.type in _DART_STATEMENT_STARTS
+
+
+#: The first token a Kotlin discard may START with. A name, ``this`` or
+#: ``super`` can never be read as the tail of the statement above, which a
+#: line starting with ``(`` or ``{`` can.
+_KOTLIN_STATEMENT_STARTS = frozenset({"identifier", "this", "super"})
+
+#: The parents of a block whose last statement is NOT a value: a function's
+#: or a constructor's body, a loop's body and a `finally`. An `if`, `when`,
+#: `try` or `catch` block, and a lambda, have a value.
+_KOTLIN_STATEMENT_BLOCKS = frozenset({
+    "function_body", "secondary_constructor", "anonymous_initializer",
+    "for_statement", "while_statement", "do_while_statement", "finally_block",
+})
+
+
+def _kotlin_ends_a_value_block(source: str, candidate: Candidate) -> bool:
+    """Whether this Kotlin declaration is the last statement of a block whose
+    last statement is the block's VALUE.
+
+    A declaration there makes the value ``Unit``. Deleting it hands the value
+    to the statement before it, and discarding it hands the value to the
+    call; either can change the type of the ``if``/``when``/``try`` around it
+    (``val r: Unit = if (c) { track(); val n = 3 } else { Unit }`` stops
+    compiling) or silently what it returns. So such a declaration is neither
+    deleted nor discarded.
+    """
+    node = _node_at(source, "kt", candidate.start, candidate.end)
+    if node is None or node.parent is None:
+        return True
+    following = node.next_named_sibling
+    while following is not None and "comment" in following.type:
+        following = following.next_named_sibling
+    block = node.parent
+    return following is None and (
+        block.parent is None or block.parent.type not in _KOTLIN_STATEMENT_BLOCKS
+    )
+
+
+def _kotlin_initializer_is_a_statement(source: str, candidate: Candidate) -> bool:
+    """Whether this Kotlin initializer can stand as the statement it would
+    become.
+
+    Only a CALL. Kotlin admits any expression as a statement, but anything
+    else that can run code (``items[0]``'s ``operator get``, ``x!!``, a
+    template's ``toString``, a cast, an elvis) would stand as an expression
+    whose value nobody reads. ``kotlinc`` warns on some of those (a template
+    is "expression is unused"), and a reviewer reads a bare ``items[0]`` as a
+    mistake. Leaving the declaration standing is the smaller cost.
+
+    A declaration that ends a block with a value never reaches this; see
+    ``_kotlin_ends_a_value_block``.
+    """
+    start, end = candidate.initializer
+    value = _node_at(source, "kt", start, end)
+    if value is None or value.type != "call_expression":
+        return False
+    first = value
+    while first.child_count:
+        first = first.children[0]
+    return first.type in _KOTLIN_STATEMENT_STARTS
+
+
 def _sits_in_comma_separated_list(
     source: str, candidate: Candidate, language: str
 ) -> bool:
@@ -1088,7 +2228,7 @@ def _expand_to_whole_lines(data: bytes, start: int, end: int) -> tuple[int, int]
     :func:`flag_cleanup.syntax._expand_to_whole_lines`, deliberately, since the
     two solve the same problem for different node kinds.
     """
-    line_start = data.rfind(b"\n", 0, start) + 1
+    line_start = max(data.rfind(b"\n", 0, start) + 1, _bom_length(data))
     line_end = data.find(b"\n", end)
     line_end = len(data) if line_end == -1 else line_end + 1
     before_blank = data[line_start:start].strip() == b""
@@ -1096,6 +2236,17 @@ def _expand_to_whole_lines(data: bytes, start: int, end: int) -> tuple[int, int]
     if before_blank and after_blank:
         return line_start, line_end
     return start, end
+
+
+def _bom_length(data: bytes) -> int:
+    """How many bytes a UTF-8 byte-order mark takes at the start of ``data``.
+
+    The first line starts after it. Visual Studio writes one by default, and
+    a mark is not text on that line: counting it as such leaves a first-line
+    deletion with its newline behind, and deleting it would change an
+    encoding marker the customer chose.
+    """
+    return len(codecs.BOM_UTF8) if data.startswith(codecs.BOM_UTF8) else 0
 
 
 def _expand_over_separator(data: bytes, start: int, end: int) -> tuple[int, int]:
@@ -1195,6 +2346,46 @@ _SCOPE_ROOTS = {
 }
 _SCOPE_ROOTS["tsx"] = _SCOPE_ROOTS["ts"]
 _SCOPE_ROOTS["js"] = _SCOPE_ROOTS["ts"]
+#: Dart's body is the SIBLING of its signature (``method_signature`` then
+#: ``function_body`` under a class body), so the scope root is the body and
+#: its name is read off the signature beside it — see ``_dart_scope_key``.
+#: ``function_expression`` is the anonymous closure, whose own body is a
+#: ``function_expression_body`` and so never reaches the first entry.
+_SCOPE_ROOTS["dart"] = frozenset({"function_body", "function_expression"})
+#: Kotlin's named roots are the function and the secondary constructor. The
+#: rest are here so that a local inside one stops at it rather than at the
+#: function around it, and is then declined by ``_kotlin_scope_key``: a lambda,
+#: an anonymous function and an object expression have no name, a class can
+#: hold several ``init`` blocks, and every getter is spelled ``get()``.
+_SCOPE_ROOTS["kt"] = frozenset({
+    "function_declaration", "secondary_constructor", "anonymous_initializer",
+    "getter", "setter", "lambda_literal", "anonymous_function",
+})
+
+#: Python's one named local scope is a ``def``. A class stops the walk so a
+#: method is qualified by it, and a lambda so it is declined: it has no name,
+#: and cannot hold an assignment anyway.
+_SCOPE_ROOTS["python"] = _PYTHON_SCOPES
+
+#: The Kotlin scopes ``_kotlin_scope_key`` cannot name.
+_KOTLIN_ANONYMOUS_SCOPES = frozenset({
+    "anonymous_initializer", "getter", "setter", "lambda_literal",
+    "anonymous_function", "object_literal",
+})
+
+#: The Kotlin declarations whose header qualifies a scope inside them.
+_KOTLIN_TYPE_DECLARATIONS = frozenset({
+    "class_declaration", "object_declaration", "companion_object",
+})
+
+#: The Dart declarations a function body can sit inside whose NAME qualifies
+#: it. Every Flutter widget has a `build`, so a scope named by its method
+#: alone is ambiguous in almost every Flutter file, and an ambiguous scope is
+#: one this pass declines to act in.
+_DART_TYPE_DECLARATIONS = frozenset({
+    "class_definition", "mixin_declaration", "extension_declaration",
+    "enum_declaration", "extension_type_declaration",
+})
 
 
 def _enclosing_scope(node: Node, language: str) -> Node | None:
@@ -1230,6 +2421,131 @@ def _scope_name(scope: Node) -> str | None:
     return name_node.text.decode("utf-8", "replace") if name_node is not None else None
 
 
+def _scope_key(scope: Node, language: str) -> str | None:
+    """What identifies ``scope`` across the fold; ``None`` when nothing does."""
+    if language == "dart":
+        return _dart_scope_key(scope)
+    if language == "kt":
+        return _kotlin_scope_key(scope)
+    if language == "python":
+        return _python_scope_key(scope)
+    return _scope_name(scope)
+
+
+def _normalised(node: Node) -> str:
+    return " ".join(node.text.decode("utf-8", "replace").split())
+
+
+def _dart_signature(body: Node) -> Node | None:
+    """The signature a Dart ``function_body`` belongs to.
+
+    A method's or top-level function's signature is the body's previous
+    sibling (comments between the two skipped); a named local function puts
+    both under a ``lambda_expression``, the signature in its ``parameters``
+    field. Anything else (an anonymous closure's body is never a
+    ``function_body``) has no signature to name it by.
+    """
+    parent = body.parent
+    if parent is not None and parent.type == "lambda_expression":
+        return parent.child_by_field_name("parameters")
+    previous = body.prev_named_sibling
+    while previous is not None and "comment" in previous.type:
+        previous = previous.prev_named_sibling
+    if previous is None or not previous.type.endswith("signature"):
+        return None
+    return previous
+
+
+def _dart_scope_key(scope: Node) -> str | None:
+    """The scope's signature, qualified by every named scope and type it sits
+    in, or ``None`` when any of them is anonymous.
+
+    The signature TEXT rather than its name field: Dart spells a name four
+    ways across signature kinds (a ``name`` field, several ``name`` fields
+    for ``A.named``, none at all for a factory), and a getter and a setter
+    share one name while their signatures differ. A fold never touches a
+    signature, so the text is stable across it; and if it ever were not, the
+    pairing fails, which is a missed tidy. A type contributes its header
+    (everything before its body), which names it whether or not it has a
+    ``name`` field — an unnamed ``extension on String`` included.
+    """
+    parts: list[str] = []
+    node: Node | None = scope
+    while node is not None:
+        if node.type == "function_expression":
+            return None
+        if node.type == "function_body":
+            signature = _dart_signature(node)
+            if signature is None:
+                return None
+            parts.append(_normalised(signature))
+        elif node.type in _DART_TYPE_DECLARATIONS:
+            body = next(
+                (c for c in node.children if c.type.endswith("_body")), None
+            )
+            end = body.start_byte if body is not None else node.end_byte
+            header = node.text[: end - node.start_byte].decode("utf-8", "replace")
+            parts.append(" ".join(header.split()))
+        node = node.parent
+    return " / ".join(reversed(parts))
+
+
+def _kotlin_scope_key(scope: Node) -> str | None:
+    """The scope's header, qualified by every function and type it sits in,
+    or ``None`` when any of them is anonymous.
+
+    The header is the declaration's text up to its body, whitespace
+    normalised: the name alone is not enough, because overloads share one
+    and an ``override`` has the same name in every subclass. A fold never
+    touches a header unless a flag is read in a default argument, and then
+    the pairing fails, which is a missed tidy.
+    """
+    parts: list[str] = []
+    node: Node | None = scope
+    while node is not None:
+        if node.type in _KOTLIN_ANONYMOUS_SCOPES:
+            return None
+        if node.type in {"function_declaration", "secondary_constructor"} | (
+            _KOTLIN_TYPE_DECLARATIONS
+        ):
+            body = next(
+                (
+                    c for c in node.children
+                    if c.type in {"function_body", "block", "class_body", "enum_class_body"}
+                ),
+                None,
+            )
+            end = body.start_byte if body is not None else node.end_byte
+            header = node.text[: end - node.start_byte].decode("utf-8", "replace")
+            parts.append(" ".join(header.split()))
+        node = node.parent
+    return " / ".join(reversed(parts))
+
+
+def _python_scope_key(scope: Node) -> str | None:
+    """The ``def`` line, qualified by every ``def`` and ``class`` it sits in,
+    or ``None`` inside a lambda.
+
+    The header rather than the name, for the reason Kotlin's is: every class
+    in a file can have a ``run``, and a ``@property`` and its setter share
+    one name while their headers differ. Two identical headers in one class
+    (an ``@overload`` stub beside its implementation) pair with nothing, which
+    is a missed tidy.
+    """
+    parts: list[str] = []
+    node: Node | None = scope
+    while node is not None:
+        if node.type == "lambda":
+            return None
+        if node.type in {"function_definition", "class_definition"}:
+            body = node.child_by_field_name("body")
+            end = body.start_byte if body is not None else node.end_byte
+            header = node.text[: end - node.start_byte].decode("utf-8", "replace")
+            parts.append(" ".join(header.split()))
+        node = node.parent
+    return " / ".join(reversed(parts))
+
+
 def _node_at(source: str, language: str, start: int, end: int) -> Node | None:
     for node in _walk(_parse(source, language)):
         if node.start_byte == start and node.end_byte == end:
@@ -1260,13 +2576,13 @@ def _matching_scope(
     current_scope = _enclosing_scope(candidate_node, language)
     if current_scope is None:
         return _module_scopes(before, current, candidate_node, language)
-    name = _scope_name(current_scope)
+    name = _scope_key(current_scope, language)
     if name is None:
         return None
     matches = [
         node
         for node in _walk(_parse(before, language))
-        if node.type == current_scope.type and _scope_name(node) == name
+        if node.type == current_scope.type and _scope_key(node, language) == name
     ]
     if len(matches) != 1:
         return None
@@ -1349,7 +2665,7 @@ def _references_in_scope(
     word = re.compile(rf"\b{re.escape(name)}\b")
     total = 0
     for node in _walk(_parse(source, language)):
-        if node.child_count:
+        if node.child_count and not _read_by_words(node, language):
             continue
         if node.start_byte < start or node.end_byte > end:
             continue
@@ -1369,9 +2685,9 @@ def _references_in_scope(
         if _is_member_access_property(node, language):
             continue
         text = node.text.decode("utf-8", "replace")
-        if "comment" in node.type:
+        if _read_by_words(node, language):
             total += len(word.findall(text))
-        elif text == name and not _inside_import(node, language):
+        elif _spelling(text, language) == name and not _inside_import(node, language):
             total += 1
     return total
 
@@ -1389,11 +2705,28 @@ def _references_in_scope(
 _MEMBER_ACCESS_PROPERTY = {
     "go": ("selector_expression", "field"),
     "java": ("field_access", "field"),
+    "python": ("attribute", "attribute"),
     "csharp": ("member_access_expression", "name"),
     "ts": ("member_expression", "property"),
     "tsx": ("member_expression", "property"),
     "js": ("member_expression", "property"),
 }
+
+
+#: Dart's member access is a ``selector`` chain rather than one node, so the
+#: PARENT of the property token tells it apart: ``.x``, ``?.x`` and ``..x``
+#: each wrap the name in one of these, and nothing else does. An index
+#: (``items[x]``) wraps its ``x`` in an ``index_selector`` first, so its read
+#: is still counted.
+_DART_PROPERTY_PARENTS = frozenset({
+    "unconditional_assignable_selector", "conditional_assignable_selector",
+    "cascade_selector",
+})
+
+
+#: The tokens that make the name after them a MEMBER in a Kotlin
+#: ``navigation_expression``, whose children carry no field names.
+_KOTLIN_MEMBER_OPERATORS = frozenset({".", "?.", "::"})
 
 
 def _is_member_access_property(leaf: Node, language: str) -> bool:
@@ -1407,6 +2740,31 @@ def _is_member_access_property(leaf: Node, language: str) -> bool:
     FRESH ``Node`` per call, so the comparison is by ``.id``, never ``is`` —
     the same lesson ``key_const``'s C# declarator lookup already paid for.
     """
+    if language == "dart":
+        return (
+            leaf.type == "identifier"
+            and leaf.parent is not None
+            and leaf.parent.type in _DART_PROPERTY_PARENTS
+        )
+    if language == "kt":
+        # A CALLED member is not excluded: `"s".t()` is how a local of
+        # extension-function type (`val t: String.() -> String`) is invoked,
+        # and that is a read of the local. Counting every `obj.start()` too
+        # costs only a missed tidy when a local shares a method's name.
+        previous = leaf.prev_sibling
+        access = leaf.parent
+        return (
+            leaf.type == "identifier"
+            and access is not None
+            and access.type == "navigation_expression"
+            and previous is not None
+            and previous.type in _KOTLIN_MEMBER_OPERATORS
+            and not (
+                access.parent is not None
+                and access.parent.type == "call_expression"
+                and access.parent.children[0].id == access.id
+            )
+        )
     member_type, field = _MEMBER_ACCESS_PROPERTY.get(language, (None, None))
     if member_type is None:
         return False
@@ -1465,19 +2823,219 @@ def _bound_name_occurs_once_in_own_span(
         return True
     count = 0
     for leaf in _walk(node):
-        if leaf.child_count:
+        if leaf.child_count and not _read_by_words(leaf, language):
             continue
         if _is_member_access_property(leaf, language):
             continue
-        if leaf.text.decode("utf-8", "replace") == candidate.name:
+        text = leaf.text.decode("utf-8", "replace")
+        if _read_by_words(leaf, language) and "comment" not in leaf.type:
+            count += len(re.findall(rf"\b{re.escape(candidate.name)}\b", text))
+        elif _spelling(text, language) == candidate.name:
             count += 1
-            if count > 1:
-                return False
+        if count > 1:
+            return False
     return True
 
 
+#: The languages where a method can be private to ONE FILE's worth of source.
+#: Go and the TypeScript family are absent on purpose: an unexported Go func is
+#: package-scoped and a package spans files, and a TS `private` member is a
+#: type-check fiction — the method is reachable at run time, by string, from
+#: anywhere. A one-file differential can decide neither.
+_METHOD_LANGUAGES = frozenset({"csharp", "java"})
+
+#: C# modifiers that disqualify a method even beside `private`. `partial` is
+#: the one that matters most: its other half lives in another file. `extern`
+#: is a body supplied from outside. `protected` turns `private protected` into
+#: a member derived types can call.
+_CSHARP_DISQUALIFYING_MODIFIERS = frozenset({"partial", "extern", "protected"})
+
+#: C# type declarations whose `partial` modifier spreads a type across files.
+_CSHARP_TYPE_DECLARATIONS = frozenset({
+    "class_declaration", "struct_declaration", "record_declaration",
+    "interface_declaration",
+})
+
+#: The comment node types, per language, that can document a method.
+_METHOD_COMMENTS = {
+    "csharp": frozenset({"comment"}),
+    "java": frozenset({"line_comment", "block_comment"}),
+}
+
+
+def _csharp_modifiers(node: Node) -> set[str]:
+    return {
+        child.text.decode("utf-8")
+        for child in node.children
+        if child.type == "modifier"
+    }
+
+
+def _is_class_private_method(node: Node, language: str) -> bool:
+    """Whether ``node`` is a method nothing outside this file can call.
+
+    Explicit `private` only. C# makes an unmodified member private too, but
+    an interface member with no modifier is PUBLIC, and telling the two apart
+    is one more question this pass would have to get right for no gain.
+
+    An annotated or attributed method is refused outright: an attribute is how
+    a method becomes an entry point that no source calls — a test, a
+    serialization hook, a native callback, a JSON-RPC handler — and the list of
+    such attributes is open-ended.
+    """
+    if language == "csharp":
+        if any(child.type == "attribute_list" for child in node.children):
+            return False
+        modifiers = _csharp_modifiers(node)
+        if "private" not in modifiers or modifiers & _CSHARP_DISQUALIFYING_MODIFIERS:
+            return False
+        ancestor = node.parent
+        while ancestor is not None:
+            if (
+                ancestor.type in _CSHARP_TYPE_DECLARATIONS
+                and "partial" in _csharp_modifiers(ancestor)
+            ):
+                return False
+            ancestor = ancestor.parent
+        return True
+    modifiers = next((c for c in node.children if c.type == "modifiers"), None)
+    if modifiers is None:
+        return False
+    words = set()
+    for child in modifiers.children:
+        if "annotation" in child.type:
+            return False
+        words.add(child.type)
+    return "private" in words and "native" not in words
+
+
+def _method_candidates(source: str, language: str) -> list[Candidate]:
+    """Every class-private method in ``source`` whose name no other method
+    declaration in the file shares.
+
+    The uniqueness requirement is what lets a NAME stand in for the method:
+    with two declarations of `Context` (overloads, or one in a nested type),
+    a surviving call names one of them and this pass cannot tell which.
+
+    ``start`` reaches back over a comment that touches the declaration — a
+    doc comment left above the next member would describe the wrong method.
+    """
+    if language not in _METHOD_LANGUAGES:
+        return []
+    root = _parse(source, language)
+    source_bytes = source.encode("utf-8")
+    methods = [n for n in _walk(root) if n.type == "method_declaration"]
+    names: dict[str, int] = {}
+    for method in methods:
+        name_node = method.child_by_field_name("name")
+        if name_node is not None:
+            key = name_node.text.decode("utf-8")
+            names[key] = names.get(key, 0) + 1
+    candidates = []
+    for method in methods:
+        name_node = method.child_by_field_name("name")
+        if name_node is None:
+            continue
+        name = name_node.text.decode("utf-8")
+        if names[name] != 1 or not _is_class_private_method(method, language):
+            continue
+        start = method.start_byte
+        previous = method.prev_sibling
+        while (
+            previous is not None
+            and previous.type in _METHOD_COMMENTS[language]
+            and source_bytes[previous.end_byte:start].count(b"\n") == 1
+            and not source_bytes[previous.end_byte:start].strip()
+        ):
+            start = previous.start_byte
+            previous = previous.prev_sibling
+        candidates.append(
+            Candidate(
+                name=name,
+                start=start,
+                end=method.end_byte,
+                kind="private method",
+                text=source_bytes[method.start_byte:method.end_byte].decode(
+                    "utf-8", "replace"
+                ),
+            )
+        )
+    return candidates
+
+
+def _method_references(source: str, name: str, language: str) -> int | None:
+    """``references()`` outside the declaration of ``name`` itself; ``None``
+    when ``source`` holds no single class-private method of that name.
+
+    The WHOLE declaration is blanked, attached doc comment included, not just
+    its name token. A doc comment naming the method it documents is not a use
+    of it, and neither is a recursive call: a method whose only caller is
+    itself is as dead as one with no caller.
+
+    File-wide, which is exactly a private method's reach once partial types
+    are refused. A mention in a string or another comment counts, as it does
+    for every other kind here — reflection names a method by string, and a
+    missed tidy is the cheap direction.
+    """
+    own = [c for c in _method_candidates(source, language) if c.name == name]
+    if len(own) != 1:
+        return None
+    data = source.encode("utf-8")
+    start, end = own[0].start, own[0].end
+    data = data[:start] + re.sub(rb"[^\n]", b" ", data[start:end]) + data[end:]
+    return references(data.decode("utf-8", "replace"), name, language)
+
+
+def _delete_method(source: str, candidate: Candidate) -> str:
+    """Delete a method's whole lines and the blank line that would be left
+    standing beside it.
+
+    Members are conventionally separated by one blank line. Deleting a member
+    between two others must leave exactly one; deleting the LAST member must
+    not leave a blank line before the closing brace, nor the first one a blank
+    line after the opening brace.
+    """
+    data = source.encode("utf-8")
+    start, end = _expand_to_whole_lines(data, candidate.start, candidate.end)
+    if start == candidate.start and end == candidate.end:
+        return (data[:start] + data[end:]).decode("utf-8")
+
+    def line_before(position: int) -> tuple[int, bytes]:
+        line_start = data.rfind(b"\n", 0, max(position - 1, 0)) + 1
+        return line_start, data[line_start:position]
+
+    def line_at(position: int) -> tuple[int, bytes]:
+        line_end = data.find(b"\n", position)
+        line_end = len(data) if line_end == -1 else line_end + 1
+        return line_end, data[position:line_end]
+
+    previous_start, previous = line_before(start)
+    following_end, following = line_at(end)
+    if start > 0 and not previous.strip() and (
+        not following.strip() or following.strip().startswith(b"}")
+    ):
+        start = previous_start
+    elif not following.strip() and following and previous.rstrip().endswith(b"{"):
+        end = following_end
+    return (data[:start] + data[end:]).decode("utf-8")
+
+
+def _import_references(source: str, candidate: Candidate, language: str) -> int:
+    """How often ``source`` spells any binding of the import ``candidate``."""
+    return sum(
+        _references_excluding_own_declaration(source, name, language)
+        for name in (candidate.names or (candidate.name,))
+    )
+
+
 def remove_stranded_bindings(
-    before: str, after: str, language: str
+    before: str,
+    after: str,
+    language: str,
+    *,
+    include_methods: bool = False,
+    path: str | None = None,
+    root: str | None = None,
 ) -> tuple[str, list[Candidate]]:
     """Delete or neutralise the bindings this fold stranded.
 
@@ -1511,6 +3069,20 @@ def remove_stranded_bindings(
     so the pull request did not build, and the pass returned as though it had
     finished.
 
+    ``path`` and ``root`` — the file's own path and the checkout it lives in
+    — let a plain Dart import be judged by the library it names (see
+    :func:`_dart_import_candidates`). Without them such an import is never a
+    candidate, which is the conservative reading.
+
+    PRIVATE METHODS are offered only with ``include_methods``, and the
+    transform asks for them in a SECOND call, after the reindent pass rather
+    than beside the first. A method deletion removes whole lines, so it needs
+    no reindenting itself — but the reindent pass reads the diff between the
+    engine's input and the current text, and a deleted method sitting in the
+    same hunk as a fold beside it threw off the indentation it gave the folded
+    line. Offered after variables and before imports: deleting a method can
+    strand the import of a type only it used.
+
     VARIABLES ARE OFFERED BEFORE IMPORTS, and that order is load-bearing in
     one direction only. It is the cheaper order anyway — the feeding runs
     one way, since deleting a variable can strand the import it read while
@@ -1537,25 +3109,40 @@ def remove_stranded_bindings(
     """
     if language not in SUPPORTED:
         return after, []
+    methods = _method_candidates if include_methods else (lambda _s, _l: [])
+    resolve = (
+        dart_namespace.resolver(path, root)
+        if language == "dart" and path is not None and root is not None
+        else None
+    )
     removed: list[Candidate] = []
     current = after
+    original = _parse(before, language)
     budget = (
-        len(_import_candidates(after, language))
+        len(_import_candidates(after, language, original, resolve))
         + len(_variable_candidates(after, language))
+        + len(methods(after, language))
         + 1
     )
     for _ in range(budget):
         acted = False
-        for candidate in _variable_candidates(
-            current, language
-        ) + _import_candidates(current, language):
+        for candidate in (
+            _variable_candidates(current, language)
+            + methods(current, language)
+            + _import_candidates(current, language, original, resolve)
+        ):
+            if candidate.kind == "private method":
+                before_count = _method_references(before, candidate.name, language)
+                current_count = _method_references(current, candidate.name, language)
+                if not before_count or current_count != 0:
+                    continue
+                current = _delete_method(current, candidate)
+                removed.append(candidate)
+                acted = True
+                break
             if candidate.kind == "import":
-                before_count = _references_excluding_own_declaration(
-                    before, candidate.name, language
-                )
-                current_count = _references_excluding_own_declaration(
-                    current, candidate.name, language
-                )
+                before_count = _import_references(before, candidate, language)
+                current_count = _import_references(current, candidate, language)
             else:
                 if not _bound_name_occurs_once_in_own_span(
                     candidate, current, language
@@ -1578,8 +3165,11 @@ def remove_stranded_bindings(
             updated = _apply(current, candidate, language)
             if updated is None or updated == current:
                 continue
+            kept = _kept_require(current, candidate, language)
             current = updated
-            removed.append(candidate)
+            removed.append(
+                candidate if kept is None else replace(candidate, replacement=kept)
+            )
             acted = True
             break
         if not acted:

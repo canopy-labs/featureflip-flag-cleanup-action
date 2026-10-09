@@ -101,7 +101,8 @@ import tree_sitter_ruby
 import tree_sitter_swift
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import key_const, ts_syntax
+from flag_cleanup import key_const, kotlin_fold, ts_switch_fold, ts_syntax
+from flag_cleanup.key_const_visibility import VisibleKeyConst, visible_key_consts
 
 #: Languages :mod:`flag_cleanup.ts_syntax` owns outright. `js` is here rather
 #: than in `_PROFILES` below because it needs the WHOLE ts_syntax machinery —
@@ -131,9 +132,11 @@ class _Profile:
     keywords: frozenset[str]
     #: ``(node type, field name)`` pairs whose field holding a boolean literal
     #: means the rewrite left something behind that must not ship. Empty for
-    #: Java and Swift, which lean on Piranha's built-in cleanup — it folds the
+    #: Java, which leans on Piranha's built-in cleanup — it folds the
     #: condition AND inlines a local bound to the read, so a count there would
-    #: only ever be zero. Populated for Python, where declining to fold is a
+    #: only ever be zero. Populated for Kotlin and Swift, whose built-ins leave
+    #: a literal `if` standing when its surviving branch declares a name (see
+    #: their profiles). Populated for Python, where declining to fold is a
     #: designed-in outcome rather than a bug (see the module docstring), for
     #: PHP, and for Go — whose two entries are deliberately different kinds and
     #: say so at the profile.
@@ -143,6 +146,12 @@ class _Profile:
     #: both values a single ``boolean`` node type, which is why the residue
     #: check could not see PHP at all before it was made to ask the profile.
     boolean_nodes: frozenset[str] = frozenset()
+    #: Identifier TEXTS that are boolean literals, for the one grammar that
+    #: gives a literal no node type of its own: Kotlin's wheel grammar parses
+    #: `true` as a plain ``identifier``, so a node-type test cannot tell it from
+    #: any name. Safe only because ``true``/``false`` are hard keywords there,
+    #: which cannot name anything.
+    boolean_texts: frozenset[bytes] = frozenset()
     #: Node types :func:`_literal_residues` descends THROUGH when looking for a
     #: literal in a field. Each wraps an expression without changing what it
     #: evaluates to, so a literal underneath one is still a literal in that
@@ -314,6 +323,15 @@ _PROFILES: dict[str, _Profile] = {
         frozenset({"simple_identifier", "type_identifier"}),
         frozenset({"true", "false", "nil", "func", "return", "if", "else", "let",
                    "var", "class", "struct", "guard", "import", "self"}),
+        # A folded `if` whose surviving branch DECLARES a name is left standing
+        # as `if true { … }` by the engine: splicing it would put the name in
+        # the enclosing scope, where it can collide with one declared there,
+        # and Swift has no bare block to keep it in. Correct and compiling, but
+        # the flag key is gone from the file, so nothing could ever revisit it —
+        # refused here instead. `while` is absent for the reason Python gives:
+        # a `while true` loop is shipped as a documented residue.
+        literal_residues=(("if_statement", "condition"), ("guard_statement", "condition")),
+        boolean_nodes=frozenset({"boolean_literal"}),
     ),
     "kt": _Profile(
         tree_sitter_kotlin.language,
@@ -342,6 +360,13 @@ _PROFILES: dict[str, _Profile] = {
         # measured, the stranded-`val` case this grammar rejects outright.
         frozenset({"null", "fun", "return", "if", "else", "val",
                    "var", "class", "object", "import", "package", "this", "when"}),
+        # Swift's residue, for Swift's reason: a folded `if` whose surviving
+        # branch declares a name is left standing as `if (true) { … }`, because
+        # Kotlin has no bare block to keep the declaration's scope in. Matched by
+        # TEXT through `boolean_texts`, since this grammar parses the literal as
+        # an `identifier`.
+        literal_residues=(("if_expression", "condition"),),
+        boolean_texts=frozenset({b"true", b"false"}),
     ),
     "python": _Profile(
         tree_sitter_python.language,
@@ -1250,13 +1275,57 @@ def _literal_residues(source: str, language: str) -> int:
         return 0
     wanted = dict(profile.literal_residues)
     booleans = profile.boolean_nodes or _BOOLEAN_LITERALS
+
+    def is_literal(node: Node) -> bool:
+        node = _through_wrappers(node, profile)
+        if profile.boolean_texts:
+            return node.type == "identifier" and node.text in profile.boolean_texts
+        return node.type in booleans
+
+    # EVERY child in the field, not the first: a Swift condition list is one
+    # `condition` field per clause, and the engine leaves
+    # `if let x = lookup(), false` standing (folding it would drop the call)
+    # with the literal in the SECOND clause.
     return sum(
         1
         for node in _walk(_parse(source, language))
         if node.type in wanted
-        and (condition := node.child_by_field_name(wanted[node.type])) is not None
-        and _through_wrappers(condition, profile).type in booleans
+        for condition in node.children_by_field_name(wanted[node.type])
+        if is_literal(condition)
     )
+
+
+#: The multi-way guards whose literal arms `literal_residues` cannot express,
+#: counted by the fold module that finishes them. Kotlin's subject-less
+#: ``when { true -> … }`` and the TypeScript family's ``switch (true) { case
+#: true: … }`` are the same construct as Go's tagless switch, Ruby's
+#: subject-less ``case`` and PHP's ``switch (true)``, and had the same gap: the
+#: built-ins fold the ``if`` family only, so the read was left as a literal arm
+#: and SHIPPED with the flag key gone from the file — neither language had a
+#: residue entry for it, so nothing could revisit it.
+#:
+#: Not a ``literal_residues`` row, for two reasons that are both measured. The
+#: Kotlin grammar parses a boolean literal as a plain ``identifier``, so a
+#: node-TYPE test cannot tell ``true`` from any name; and in both languages the
+#: residue is a literal arm under a guard with NO SUBJECT, while the same arm
+#: under ``when (x)``/``switch (x)`` is a complete fold comparing a value. A
+#: (node type, field) pair can say neither. Delegating to the fold's own count
+#: also makes "what the fold declines" and "what this refuses" one definition
+#: by construction: the fold handles what it can, and every arm it leaves —
+#: a fall-through it cannot rule out, a ``default``/``else`` above the flag's
+#: arm, an arm sharing its line — is refused here instead of shipped.
+_MULTIWAY_LITERAL_ARMS: dict[str, Callable[[str], int]] = {
+    "kt": kotlin_fold.literal_arms,
+    **{
+        language: (lambda source, language=language: ts_switch_fold.literal_arms(source, language))
+        for language in _TS_LANGUAGES
+    },
+}
+
+
+def _multiway_literal_arms(source: str, language: str) -> int:
+    count = _MULTIWAY_LITERAL_ARMS.get(language)
+    return count(source) if count is not None else 0
 
 
 def _through_wrappers(node: Node, profile: _Profile) -> Node:
@@ -1477,9 +1546,11 @@ _JAVA_DIALECT = _Dialect(
 #: inside a ``case:``. It says NOTHING about ``while (false) { … }`` or
 #: ``for (…; false; …) { … }``, which is what the FALSE treatment emits;
 #: ``no-unreachable-loop`` is the rule that would, and it is not in the
-#: recommended set. So deleting those loops would be an unrequested edit and
-#: refusing them would trade a working pull request for no pull request, which
-#: is the wrong way round.
+#: recommended set. So this pass neither counts nor refuses them — refusing
+#: would trade a working pull request for no pull request. The dead ``while``
+#: is still DELETED, by :func:`remove_dead_loops`, which does the same in every
+#: language this pass does not cover: it is dead code the fold created, whether
+#: or not a toolchain demands its removal.
 _TS_DIALECT = _Dialect(
     parse=ts_syntax._parse,
     blocks=frozenset({"statement_block"}),
@@ -1799,6 +1870,204 @@ def remove_unreachable_statements(
     return data.decode("utf-8"), removed
 
 
+@dataclass(frozen=True)
+class _DeadLoopSpec:
+    """How one grammar spells a pre-test loop, and where deleting one is safe.
+
+    ``loops`` maps a loop node type to the literal that makes it dead —
+    ``while`` dies on ``false``, Ruby's ``until`` on ``true``. Only PRE-test
+    loops are listed: a ``do … while (false)`` / ``repeat … while false`` /
+    ``begin … end while false`` runs its body once and is not dead.
+
+    ``containers`` are the parents a loop may be deleted from — statement lists
+    where one fewer statement is always valid. A loop anywhere else (an
+    unbraced ``if`` body, a labelled statement, a switch arm) is left standing,
+    because deleting it there can break the syntax or, for a label, a ``goto``.
+    """
+
+    loops: dict[str, str]
+    literal_types: frozenset[str]
+    containers: frozenset[str]
+
+
+#: Every language the fold can leave a dead loop in, EXCEPT Java and Dart,
+#: whose dead loops :func:`remove_unreachable_statements` already deletes
+#: (``dead_loop_is_fatal``) — two passes over one loop would race. ERB is
+#: absent: its loops live across template tags, which this cannot see.
+_DEAD_LOOP_SPECS: dict[str, _DeadLoopSpec] = {
+    **{
+        lang: _DeadLoopSpec(
+            loops={"while_statement": "false"},
+            literal_types=frozenset({"false"}),
+            containers=frozenset({"statement_block", "program"}),
+        )
+        for lang in _TS_LANGUAGES
+    },
+    # kotlin-ng parses the literal as an `identifier`; a name cannot be spelled
+    # `false` in Kotlin, so the text decides. A label is a CHILD of the loop.
+    "kt": _DeadLoopSpec(
+        loops={"while_statement": "false"},
+        literal_types=frozenset({"identifier", "boolean_literal"}),
+        containers=frozenset({"block"}),
+    ),
+    "csharp": _DeadLoopSpec(
+        loops={"while_statement": "false"},
+        literal_types=frozenset({"boolean_literal"}),
+        containers=frozenset({"block"}),
+    ),
+    # Go's `for <cond> { }` is its while. The condition has no field name, and
+    # a `for_clause` form is skipped: its initializer runs even when the
+    # condition is false.
+    "go": _DeadLoopSpec(
+        loops={"for_statement": "false"},
+        literal_types=frozenset({"false"}),
+        containers=frozenset({"statement_list"}),
+    ),
+    "php": _DeadLoopSpec(
+        loops={"while_statement": "false"},
+        literal_types=frozenset({"boolean"}),
+        containers=frozenset({"compound_statement", "colon_block", "program"}),
+    ),
+    # The block form only; `x while false` and `begin … end while false` are
+    # `while_modifier`, and the second runs its body once.
+    "ruby": _DeadLoopSpec(
+        loops={"while": "false", "until": "true"},
+        literal_types=frozenset({"false", "true"}),
+        containers=frozenset({"body_statement", "program", "then", "else", "do", "begin"}),
+    ),
+    "python": _DeadLoopSpec(
+        loops={"while_statement": "False"},
+        literal_types=frozenset({"false"}),
+        containers=frozenset({"block", "module"}),
+    ),
+    # A label is a SIBLING statement here, and a `case` whose only statement
+    # was the loop would be left empty, which Swift rejects.
+    "swift": _DeadLoopSpec(
+        loops={"while_statement": "false"},
+        literal_types=frozenset({"boolean_literal"}),
+        containers=frozenset({"statements"}),
+    ),
+}
+
+_PARENTHESES = frozenset({"parenthesized_expression", "parenthesized_statements", "tuple_expression"})
+
+
+def _dead_loop_condition(loop: Node, language: str) -> Node | None:
+    """The loop's condition with parentheses peeled off, or None if it has none we model."""
+    if language == "go":
+        named = [c for c in loop.named_children if c.type != "comment"]
+        # `for false { … }` is exactly [condition, block]. A `for_clause` or
+        # `range_clause` form has a different shape and is not a while.
+        if len(named) != 2 or named[1].type != "block":
+            return None
+        condition = named[0]
+    else:
+        condition = loop.child_by_field_name("condition")
+    while condition is not None and condition.type in _PARENTHESES:
+        inner = [c for c in condition.named_children if c.type != "comment"]
+        condition = inner[0] if len(inner) == 1 else None
+    return condition
+
+
+def _is_dead_loop(node: Node, source: bytes, language: str, spec: _DeadLoopSpec) -> bool:
+    literal = spec.loops.get(node.type)
+    if literal is None:
+        return False
+    condition = _dead_loop_condition(node, language)
+    if condition is None or condition.type not in spec.literal_types or condition.named_child_count:
+        return False
+    text = source[condition.start_byte : condition.end_byte].decode("utf-8")
+    # PHP's literals are case-insensitive; everywhere else the spelling is exact.
+    return (text.lower() == literal.lower()) if language == "php" else text == literal
+
+
+def _dead_loops(source: str, language: str) -> list[Node]:
+    """Pre-test loops in ``source`` whose condition is the dead literal."""
+    spec = _DEAD_LOOP_SPECS.get(language)
+    if spec is None:
+        return []
+    data = source.encode("utf-8")
+    return [
+        node
+        for node in _walk(_root_node(source, language))
+        if _is_dead_loop(node, data, language, spec)
+    ]
+
+
+def _deletable(loop: Node, language: str) -> bool:
+    """Whether deleting ``loop`` keeps the file valid and its meaning intact."""
+    spec = _DEAD_LOOP_SPECS[language]
+    parent = loop.parent
+    if parent is None or parent.type not in spec.containers:
+        return False
+    if language == "go" and (parent.parent is None or parent.parent.type != "block"):
+        return False
+    if language == "kt" and any(c.type == "label" for c in loop.children):
+        return False
+    if language == "swift":
+        previous = loop.prev_named_sibling
+        while previous is not None and previous.type in ("comment", "multiline_comment"):
+            previous = previous.prev_named_sibling
+        if previous is not None and previous.type == "statement_label":
+            return False
+        if parent.parent is not None and parent.parent.type == "switch_entry":
+            return False
+    # `while False: … else: …` runs its `else` — the loop is not dead code.
+    if language == "python" and loop.child_by_field_name("alternative") is not None:
+        return False
+    return True
+
+
+def remove_dead_loops(before: str, after: str, language: str) -> tuple[str, list[str]]:
+    """Delete loops the fold made dead; return the new source and their text.
+
+    A flag read as a loop condition folds to ``while (false)`` on the false
+    treatment, and that loop can never run its body. Java and Dart delete it
+    already, because their toolchains reject it; this deletes it everywhere
+    else, on the plainer ground that it is dead code the flag removal created.
+    Every loop removed is returned so the pull request can name it — the same
+    rule as :func:`remove_unreachable_statements`: behaviour-neutral, but the
+    code was the customer's.
+
+    Conservative in the same two ways as that pass:
+
+    * **Nothing is touched if ``before`` already had a dead loop.** Then this
+      cannot tell the fold's from the customer's own.
+    * **A loop is deleted only where deleting it is plainly valid** — see
+      :func:`_deletable`. Anything else is left standing, which is what every
+      language did before this existed.
+
+    Python is the one language where a block cannot be empty, so a loop that
+    was its block's only statement becomes ``pass`` rather than nothing.
+    """
+    if language not in _DEAD_LOOP_SPECS or after == before:
+        return after, []
+    if _dead_loops(before, language):
+        return after, []
+    loops = [n for n in _dead_loops(after, language) if _deletable(n, language)]
+    if not loops:
+        return after, []
+    data = after.encode("utf-8")
+    removed: list[str] = []
+    spans = _outermost([(n.start_byte, n.end_byte) for n in loops])
+    sole = {
+        (n.start_byte, n.end_byte)
+        for n in loops
+        if language == "python"
+        and n.parent is not None
+        and n.parent.type == "block"
+        and len([c for c in n.parent.named_children if c.type != "comment"]) == 1
+    }
+    for start, end in sorted(spans, reverse=True):
+        removed.append(data[start:end].decode("utf-8"))
+        if (start, end) in sole:
+            data = data[:start] + b"pass" + data[end:]
+            continue
+        wide_start, wide_end = _expand_to_whole_lines(data, start, end)
+        data = data[:wide_start] + data[wide_end:]
+    return data.decode("utf-8"), removed
+
+
 def _outermost(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Drop any span contained in another, so deletions cannot overlap.
 
@@ -1832,6 +2101,14 @@ _MOCK_STUBBING_PAREN_NAMES = ("whenever", "when", "given")
 #: gain.
 _MOCK_STUBBING_BRACE_NAMES = ("coEvery", "every", "coVerify", "verify")
 
+#: The arrow form is mocktail's (Dart), where the read is the body of a
+#: no-argument lambda (`when(() => <read>)`). Folding the read leaves the lambda
+#: standing, so the literal sits behind `() =>` rather than directly in the
+#: parentheses. `verify` and `verifyNever` are listed for this form only:
+#: neither takes a bare call in any library here. `verifyNever` precedes
+#: `verify` for reading order only, as above.
+_MOCK_STUBBING_ARROW_NAMES = ("verifyNever", "verify", "when")
+
 #: Languages whose mocking libraries pass a REAL call to the DSL. Go is absent
 #: because `literal_residues` catches its gomock shape structurally, and C#
 #: because `rules/csharp.toml`'s expression-tree filter stops the fold before
@@ -1844,6 +2121,8 @@ _MOCK_STUBBING_DSL_LANGUAGES = frozenset({"java", "kt", "dart", "ts", "tsx", "js
 _MOCK_STUBBED_LITERAL = re.compile(
     r"\b(?:" + "|".join(_MOCK_STUBBING_PAREN_NAMES) + r")\s*\(\s*(?:true|false)\s*\)"
     r"|\b(?:" + "|".join(_MOCK_STUBBING_BRACE_NAMES) + r")\s*\{\s*(?:true|false)\s*\}"
+    r"|\b(?:" + "|".join(_MOCK_STUBBING_ARROW_NAMES) + r")\s*\(\s*\(\s*\)\s*(?:async\s*)?=>"
+    r"\s*(?:true|false)\s*\)"
 )
 
 
@@ -1889,6 +2168,12 @@ def _mock_stubbed_literals(source: str, language: str) -> int:
     against name-matching on principle. A loud refusal costs the customer this
     flag's diff; the alternative costs them a test that silently stopped
     asserting.
+
+    Most stubs never reach this check any more. :mod:`flag_cleanup.mock_stubs`
+    reads them off the customer's bytes BEFORE the engine and resolves every
+    one whose literal decides it — the stub goes, or its whole test does — so
+    the engine never sees them. What arrives here is what that pass could not
+    decide, and the refusal is still the right answer for it.
     """
     if language not in _MOCK_STUBBING_DSL_LANGUAGES:
         return 0
@@ -1914,13 +2199,29 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     returning ``False`` — a gate that silently passes everything is worse than
     no gate, because the run still reports the rewrite as checked.
     """
+    return refusal_reason(before, after, language) is not None
+
+
+def refusal_reason(before: str, after: str, language: str) -> str | None:
+    """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
+
+    The same checks in the same order, each worded for the person reading the
+    run's output. Most of them are not about syntax at all — a literal left
+    bound to a name parses perfectly well — and a refusal that said only
+    "syntax check" sent the reader looking for a parse error that was never
+    there.
+    """
     # Ahead of the ts delegation, which returns wholesale: these checks cover
     # the TS family too, and putting either after the branch would silently
     # exclude the languages it is keyed for. That is not hypothetical — the
     # unreachable-statement count sat below the branch and so never ran for
     # `ts`/`tsx`/`js`, which is half of what #2807 was.
     if _mock_stubbed_literals(after, language) > _mock_stubbed_literals(before, language):
-        return True
+        return "a test double now stubs a literal where the flag read was"
+    # Same placement argument: the multi-way guard residue is keyed for the TS
+    # family as well as for Kotlin, so it must run ahead of the delegation.
+    if _multiway_literal_arms(after, language) > _multiway_literal_arms(before, language):
+        return "a switch/when/case arm was left testing a literal"
     # The repair in `remove_unreachable_statements` has already run by the time
     # the runner asks this, so what reaches here is what the repair declined:
     # a file that ALREADY had unreachable code, where the fold's strands cannot
@@ -1929,21 +2230,31 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     if _unreachable_statements(after, language) > _unreachable_statements(
         before, language
     ):
-        return True
+        return "the fold left statements unreachable"
     if language in _TS_LANGUAGES:
-        return ts_syntax.transform_broke_syntax(before, after, language)
+        return ts_syntax.refusal_reason(before, after, language)
     if language not in _PROFILES:
         raise ValueError(f"unsupported language {language!r}")
-    return (
-        count_syntax_errors(after, language) > count_syntax_errors(before, language)
-        or _stranded_keywords(after, language) > _stranded_keywords(before, language)
-        or (_native_parse_fails(after, language) and not _native_parse_fails(before, language))
-        or _literal_residues(after, language) > _literal_residues(before, language)
-        or _literal_statements(after, language) > _literal_statements(before, language)
-        or _null_literal_comparisons(after, language)
-        > _null_literal_comparisons(before, language)
-        or _lost_side_effects(after, language) < _lost_side_effects(before, language)
-    )
+    if count_syntax_errors(after, language) > count_syntax_errors(before, language):
+        return "the result has a syntax error the original did not"
+    if _stranded_keywords(after, language) > _stranded_keywords(before, language):
+        return "a keyword was left stranded where an expression is read"
+    if _native_parse_fails(after, language) and not _native_parse_fails(before, language):
+        return "the language's own compiler rejects the result"
+    if _literal_residues(after, language) > _literal_residues(before, language):
+        return (
+            "the removal stopped part-way: the flag read became a literal that is "
+            "still bound to a name or still tested"
+        )
+    if _literal_statements(after, language) > _literal_statements(before, language):
+        return "a boolean literal was left standing as a statement"
+    if _null_literal_comparisons(after, language) > _null_literal_comparisons(
+        before, language
+    ):
+        return "a boolean literal is now compared with null"
+    if _lost_side_effects(after, language) < _lost_side_effects(before, language):
+        return "the fold would drop code that runs whatever the flag says"
+    return None
 
 
 def const_path_is_safe(
@@ -2014,3 +2325,27 @@ def const_path_is_safe(
     return key_const.path_is_safe(
         root, source.encode("utf-8"), language, flag_key, accessors
     )
+
+
+def externally_visible_key_consts(
+    source: str, language: str, flag_key: str
+) -> tuple[VisibleKeyConst, ...]:
+    """The hoisted key constants in ``source`` that another file could read.
+
+    Gate 2's own reading of the file -- the same parse and the same profile
+    `const_path_is_safe` uses, including the template code view -- so these are
+    exactly the declarations the const rules would delete, narrowed to those
+    visible outside the file (see :mod:`flag_cleanup.key_const_visibility`).
+    Empty for a language with no key-const profile.
+    """
+    if language in _TS_LANGUAGES:
+        root = ts_syntax._parse(source, language)
+    elif language in key_const.supported_languages():
+        profile = _PROFILES[language]
+        if profile.code_view is not None:
+            source, language = _code_view(source, language), profile.code_view
+        root = _parse(source, language)
+    else:
+        return ()
+    consts = key_const.key_consts(root, source.encode("utf-8"), language, flag_key)
+    return visible_key_consts(consts, language)

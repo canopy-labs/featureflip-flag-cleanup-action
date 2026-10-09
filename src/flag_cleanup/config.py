@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from flag_cleanup.piranha_runner import supported_languages
+from flag_cleanup.ts_gates import Gate, parse_gate
 from flag_cleanup.urls import redact_userinfo
 
 # The Featureflip public API origin. Overridable (``FEATUREFLIP_API_URL``) so
@@ -132,6 +133,11 @@ class Config:
     #: :data:`_ACCESSOR_RE` for why these are held to a stricter shape than
     #: flag keys are.
     accessors: tuple[str, ...] = ()
+    #: JSX components that render their children only while a flag is on,
+    #: with the prop carrying the key — ``FlagGate[flag]`` entries in the same
+    #: ``accessors`` input, split out here because nothing that reads
+    #: ``accessors`` can use one. See :mod:`flag_cleanup.ts_gates`.
+    gates: tuple[Gate, ...] = ()
     ignore: frozenset[str] = frozenset()
     #: Flag keys this run may propose, as an ALLOWlist. Empty — the default —
     #: means no filtering, so an existing workflow is unaffected.
@@ -193,7 +199,7 @@ class Config:
                 f"expected one or more of {', '.join(supported_languages())}"
             )
 
-        accessors = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
+        accessors, gates = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
 
         # Lower-cased before the check: the wire value is lowercase, but the
         # API's own `status` field is PascalCase, so "Dead" is an easy thing
@@ -240,6 +246,7 @@ class Config:
             directories=_split_csv(_get(env, "FEATUREFLIP_DIRECTORIES", "."), default=(".",)),
             languages=languages,
             accessors=accessors,
+            gates=gates,
             ignore=frozenset(_split_csv(_get(env, "FEATUREFLIP_IGNORE", ""), default=())),
             flags=frozenset(_split_csv(_get(env, "FEATUREFLIP_FLAGS", ""), default=())),
             base_branch=_get(env, "FEATUREFLIP_BASE_BRANCH", DEFAULT_BASE_BRANCH),
@@ -265,27 +272,35 @@ class Config:
 _ACCESSOR_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
-def _parse_accessors(value: str) -> tuple[str, ...]:
+def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
     """Split, validate and de-duplicate ``FEATUREFLIP_ACCESSORS``.
+
+    Returns the function names and, separately, the gate components
+    (``Component[prop]``). A gate never reaches the rules: it is matched in
+    Python, against the parsed tree, so it is held to its own shape rather than
+    to the function-name one.
 
     De-duplication is not tidiness. Each name becomes one generated rule, and
     two rules sharing a name is a hard engine error — so a repeated value would
     turn a harmless typo into a run that cannot start.
     """
     names = _split_csv(value, default=())
+    gates = {gate: None for name in names if (gate := parse_gate(name)) is not None}
+    names = tuple(name for name in names if parse_gate(name) is None)
     invalid = [name for name in names if not _ACCESSOR_RE.match(name)]
     if invalid:
         raise ConfigError(
             f"unsupported FEATUREFLIP_ACCESSORS value(s): "
             f"{', '.join(repr(name) for name in invalid)}; each must be a function "
-            "name in your source, matching [A-Za-z_][A-Za-z0-9_]*. These are "
+            "name in your source, matching [A-Za-z_][A-Za-z0-9_]*, or a gate "
+            "component and its key prop, like FlagGate[flag]. Function names are "
             "substituted into the rewrite rules as text, so anything else either "
             "fails the engine or silently changes which calls are matched"
         )
     seen: dict[str, None] = {}
     for name in names:
         seen[name] = None
-    return tuple(seen)
+    return tuple(seen), tuple(gates)
 
 
 def _get(env: Mapping[str, str], name: str, default: str) -> str:

@@ -30,6 +30,17 @@
 # whose initialiser is exactly the key, at file scope, in a type body, or local
 # to a function — which is what the three scopes below enumerate.
 #
+# EXACTLY ONE binding per declaration. `let k = "old-checkout", other = "x"`
+# is ONE `property_declaration` holding the name/value pairs as flat siblings,
+# and the delete rule removes the declaration whole, so a key in one pair would
+# take `other` with it and strand its readers. Every declaration pattern below
+# therefore anchors the pattern straight after the binding keyword, the literal
+# straight after the pattern (or its type annotation), and the literal as the
+# LAST child — which no multi-binding declaration satisfies. The alternation
+# spells the annotation out rather than using `?`, the quantifier that once
+# deleted a Swift declaration silently (see rules/swift.toml). The same
+# single-binding reading as go_const.toml's one-`const_spec` requirement.
+#
 # `var` is deliberately excluded, matching every other language's treatment of a
 # reassignable binding: its value cannot be read off the declaration, so the key
 # it names is not knowable.
@@ -51,13 +62,14 @@ name = "replace_negated_boolvariation_const_key_read_with_negated_literal"
 query = """(
   (call_expression
     [(navigation_expression
-       (navigation_suffix (simple_identifier) @sdk_fn))
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
      (prefix_expression (simple_identifier) @sdk_fn)]
     (call_suffix
       (value_arguments
         . (value_argument (simple_identifier) @key_const)))
   ) @call
   (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
   (#match? @call "^![^!]")
 )"""
 replace_node = "call"
@@ -68,20 +80,35 @@ holes = ["treated", "stale_flag_name"]
 [[rules.filters]]
 enclosing_node = """(
   [(source_file
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @decl_name)
-       (line_string_literal (_) @flag_name)))
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])
    (class_body
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @decl_name)
-       (line_string_literal (_) @flag_name)))
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])
    (statements
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @decl_name)
-       (line_string_literal (_) @flag_name)))] @scope
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])] @scope
   (#eq? @binding "let")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -97,13 +124,14 @@ name = "replace_boolvariation_const_key_read_with_boolean_literal"
 query = """(
   (call_expression
     [(navigation_expression
-       (navigation_suffix (simple_identifier) @sdk_fn))
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
      (simple_identifier) @sdk_fn]
     (call_suffix
       (value_arguments
         . (value_argument (simple_identifier) @key_const)))
   ) @call
   (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
   (#not-match? @call "^!")
 )"""
 replace_node = "call"
@@ -118,20 +146,35 @@ holes = ["treated", "stale_flag_name"]
 [[rules.filters]]
 enclosing_node = """(
   [(source_file
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @decl_name)
-       (line_string_literal (_) @flag_name)))
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])
    (class_body
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @decl_name)
-       (line_string_literal (_) @flag_name)))
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])
    (statements
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @decl_name)
-       (line_string_literal (_) @flag_name)))] @scope
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])] @scope
   (#eq? @binding "let")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -156,20 +199,35 @@ enclosing_node = """(
 name = "delete_flag_key_const_declaration"
 query = """(
   [(source_file
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @variable_name)
-       (line_string_literal (_) @flag_name)) @declaration)
+       . (pattern (simple_identifier) @variable_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @variable_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)] @declaration)
    (class_body
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @variable_name)
-       (line_string_literal (_) @flag_name)) @declaration)
+       . (pattern (simple_identifier) @variable_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @variable_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)] @declaration)
    (statements
-     (property_declaration
+     [(property_declaration
        (value_binding_pattern) @binding
-       (pattern (simple_identifier) @variable_name)
-       (line_string_literal (_) @flag_name)) @declaration)] @scope
+       . (pattern (simple_identifier) @variable_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @variable_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)] @declaration)] @scope
   (#eq? @binding "let")
   (#eq? @flag_name "@stale_flag_name")
 )"""

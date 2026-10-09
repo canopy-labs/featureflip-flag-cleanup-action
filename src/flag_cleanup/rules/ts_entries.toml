@@ -21,30 +21,25 @@
 # cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
 # `piranha_runner._flag_keyed_entries` reports them.
 #
-# NEITHER PRONG DELETES AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED
-# (#3050). `@treated` is the literal this run keeps; `@untreated` is its
-# complement, and an entry spelled `k -> @untreated` is the customer pinning
-# the flag to the branch the fold is deleting — evidence that the code around
-# it is about to become dead, not evidence the entry is stale. Stripping one
-# turned a test that asserted the removed branch into a test asserting
-# behaviour the code can no longer produce. That is strictly worse than
-# leaving it alone: a residual reference is visible in the pull-request body,
-# a silently falsified test is not (measured on featureflip#3041, where
-# `renderProfile({ 'web-two-factor-auth': false })` became `renderProfile({})`
-# and the suite went red).
+# BOTH PRONGS DELETE AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED, and
+# that is where this family parts company with every other `*_entries.toml`.
+# There (#3050) `k -> @untreated` is declined and reported: the customer is
+# pinning the flag to the branch the fold deletes, and stripping the pin
+# turned a test asserting that branch into a test asserting behaviour the
+# code can no longer produce (measured on featureflip#3041).
 #
-# So the STUB prong requires `(#eq? @value "@treated")` and the REGISTRY prong
-# carries `(#not-eq? @value "@untreated")`. The second is phrased negatively on
-# purpose: the registry prong must keep deleting a value that is not a boolean
-# at all, because `k -> { default: false }` is a registry DEFAULT rather than
-# an override. The discriminator is the literal's ROLE — a value position the
-# entry occupies directly — not the value itself, which is why a nested
-# `false` is untouched by this guard.
-#
-# The decline is reported rather than silent: `contradicting.py` finds the same
-# shape with tree-sitter and the pull-request body names it with its reason.
-# `test_the_detector_reports_exactly_what_the_rules_declined` is what keeps the
-# two from drifting apart.
+# Declining did not make that test pass, though — the code it renders no
+# longer reads the flag, so the test fails with the pin or without it — and
+# most pins are not that test at all. Of #3041's eight, one asserted the
+# removed branch; the other seven sat in tests about something else that
+# happened to set the flag off, and declining them left residue the reviewer
+# had to delete by hand for no gain. JavaScript test files name their cases,
+# so the TS family can tell those apart where the other languages cannot:
+# `ts_tests.py` deletes the whole `it`/`test`/`describe` around a pin whose
+# TITLE says it exercises the removed state ("when the flag is off"), and
+# every other pin is stripped here like any other entry. The pull-request
+# body names both lists. The STUB prong therefore takes either boolean, and
+# the REGISTRY prong takes any value.
 #
 # EVERY KEY IS DOUBLE-ANCHORED — `(string . (string_fragment) @flag_name .)` —
 # and that is what makes the comparison a WHOLE-KEY comparison rather than a
@@ -79,12 +74,11 @@ query = """(
     key: (string . (string_fragment) @flag_name .)
     value: [(true) (false)] @value) @entry
   (#eq? @flag_name "@stale_flag_name")
-  (#eq? @value "@treated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name", "treated"]
+holes = ["stale_flag_name"]
 
 # REGISTRY PRONG — another pair in the SAME object is keyed by a different
 # flag of this project, so the object is a flag-keyed map. The evidence cannot
@@ -98,12 +92,11 @@ name = "delete_flag_keyed_registry_pair"
 query = """(
   (pair key: (string . (string_fragment) @flag_name .) value: (_) @value) @entry
   (#eq? @flag_name "@stale_flag_name")
-  (#not-eq? @value "@untreated")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
-holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+holes = ["stale_flag_name", "known_flag_keys"]
 
 [[rules.filters]]
 enclosing_node = "(object) @registry"
@@ -389,3 +382,51 @@ not_contains = ["""(
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
 )"""]
+
+
+
+# --- A SOLE member of a PARAMETER's type: `{ 'k'?: boolean }` -> `Record<string, never>`
+#
+# Every rule above requires a surviving sibling, because emptying a type to
+# `{}` widens it to "any non-nullish value" (see NEITHER STAGE MAY EMPTY ITS
+# HOST). That left the commonest test-helper shape standing for the reviewer:
+#
+#     const renderPage = (flags: { 'k'?: boolean } = {}) => …
+#
+# once every caller's override has been stripped to `renderPage({})`.
+# `Record<string, never>` is the type that object actually has now — an
+# object with no properties — and it is what `@typescript-eslint/no-empty-
+# object-type` itself recommends in place of `{}`. It still accepts `{}` and
+# the default, and passing it on to a `flags` prop of any record type
+# type-checks, because `never` is assignable to everything.
+#
+# A PARAMETER's own annotation only, matched from the parameter down, and that
+# is the safety argument rather than a narrowing for its own sake: anywhere
+# else the object type can be one operand of an intersection
+# (`{ 'k'?: boolean } & Base`), where `Record<string, never>` would turn every
+# property of `Base` into `never`. Directly under a parameter's
+# `type_annotation` it is the whole type. The `. … .` anchors make it the SOLE
+# member; a comment is a named node, so a commented type is not sole and is
+# left to the reviewer as before.
+[[rules]]
+name = "delete_flag_keyed_sole_parameter_type_member"
+query = """(
+  [(required_parameter
+     type: (type_annotation
+       (object_type
+         . (property_signature
+             (string . (string_fragment) @flag_name .)
+             type: (type_annotation (predefined_type) @member_type)) @entry .) @host))
+   (optional_parameter
+     type: (type_annotation
+       (object_type
+         . (property_signature
+             (string . (string_fragment) @flag_name .)
+             type: (type_annotation (predefined_type) @member_type)) @entry .) @host))]
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @member_type "boolean")
+)"""
+replace_node = "host"
+replace = "Record<string, never>"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name"]

@@ -82,17 +82,20 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """(
-  [(program
-     (assignment
-       left: (constant) @decl_name
-       right: [(string . (string_content) @flag_name .)
-               (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)]))
-   (body_statement
-     (assignment
-       left: (constant) @decl_name
-       right: [(string . (string_content) @flag_name .)
-               (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)]))] @scope
+# File-scoped, as java_const.toml's is: a constant assigned in a SUPERCLASS or
+# an included MODULE is read bare from the class that inherits it, which shares
+# no ancestor with the assignment but the file. Scoped to the nearest class
+# body, the fold declined while the delete fired, and the read was left naming
+# a constant that no longer existed (NameError at the first call). Gate 2's
+# bound-exactly-once check runs over the whole file, so the file is the scope
+# the two halves agree on. A qualified `Keys::FLAG_KEY` is a `scope_resolution`,
+# not a bare `constant`, and is not reached by this rule at all.
+enclosing_node = """((program) @scope)"""
+contains = """(
+  (assignment
+    left: (constant) @decl_name
+    right: [(string . (string_content) @flag_name .)
+            (call receiver: (string . (string_content) @flag_name .) method: (identifier) @freeze)])
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -121,7 +124,14 @@ replace = ""
 holes = ["stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """([(program) (class) (module) (method)] @container)"""
+# ITS SCOPE IS THE FILE. `enclosing_node` takes the NEAREST matching ancestor,
+# so a class-scoped guard looked only inside the class holding the declaration,
+# and a surviving read in a SUBCLASS or a SIBLING class -- which inherits or
+# names the constant -- was invisible to it: the declaration was deleted and the
+# read stayed, a reference to nothing. java_const.toml's guard is file-scoped for
+# the same reason. Over-refusing here costs one uncleaned declaration, which is
+# the direction this file fails in.
+enclosing_node = """((program) @container)"""
 not_contains = ["""(
   (call arguments: (argument_list . (constant) @first_arg)) @surviving_read
   (#eq? @first_arg "@variable_name")

@@ -65,19 +65,30 @@
 # while on a free function the callee is a bare `simple_identifier` and the
 # bang wraps it in a `prefix_expression` directly under the call.
 
+# An OPTIONAL-CHAINED read is declined, as every other language declines it:
+# `client?.boolVariation(…)` is a `Bool?` -- nil when `client` is -- so a literal
+# in its place changes the type and the behaviour. In `if let v = client?…, v`
+# it produced `if let v = true, v`, which does not compile. The grammar keeps
+# `?` as an anonymous token of the `navigation_expression`, so the check is on
+# the receiver chain's TEXT, which spans the receiver and the `?.` but never the
+# arguments: a `?` anywhere in the chain (`a?.b.boolVariation`) makes the
+# whole result optional. A force unwrap (`client!.`) is not optional and still
+# folds.
+
 # --- !<obj>.boolVariation("KEY", default: ...) -> !@treated
 [[rules]]
 name = "replace_negated_boolvariation_read_with_negated_literal"
 query = """(
   (call_expression
     [(navigation_expression
-       (navigation_suffix (simple_identifier) @sdk_fn))
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
      (prefix_expression (simple_identifier) @sdk_fn)]
     (call_suffix
       (value_arguments
         . (value_argument (line_string_literal (_) @flag_name))))
   ) @call
   (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
   (#eq? @flag_name "@stale_flag_name")
   (#match? @call "^![^!]")
 )"""
@@ -108,13 +119,14 @@ name = "replace_boolvariation_read_with_boolean_literal"
 query = """(
   (call_expression
     [(navigation_expression
-       (navigation_suffix (simple_identifier) @sdk_fn))
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
      (simple_identifier) @sdk_fn]
     (call_suffix
       (value_arguments
         . (value_argument (line_string_literal (_) @flag_name))))
   ) @call
   (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
   (#eq? @flag_name "@stale_flag_name")
   (#not-match? @call "^!")
 )"""

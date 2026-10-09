@@ -40,7 +40,8 @@ compared in Python against the captured text.
 
 Java and Swift have no entry rules at all (their map entries cannot be deleted
 with their separator in one edit until the fork ships ``replace_node_end``), so
-they have nothing to decline and no table row here.
+they have nothing to decline and no table row here. The TypeScript family has
+entry rules and declines nothing either: see the note above ``_DETECTORS``.
 """
 
 from __future__ import annotations
@@ -57,7 +58,6 @@ import tree_sitter_kotlin
 import tree_sitter_php
 import tree_sitter_python
 import tree_sitter_ruby
-import tree_sitter_typescript
 from tree_sitter import Language, Parser, Query, QueryCursor
 
 from flag_cleanup import syntax
@@ -102,23 +102,12 @@ class _Detector:
     operator: str | None = None
 
 
-# The key capture is DOUBLE-ANCHORED (`. (content) @k .`) wherever the grammar
-# has a content node, which is what makes the comparison whole-key rather than
-# prefix — and what makes an escape sequence, which splits the literal into two
-# children, decline the match instead of matching a longer key. Same anchoring,
-# same reason, as every `rules/*_entries.toml`.
-_TS_FAMILY_QUERY = """(
-  (pair
-    key: (string . (string_fragment) @flag_name .)
-    value: [(true) (false)] @value) @entry
-)"""
-
+# No row for `ts`, `tsx` or `js`. Their entry rules strip a pin instead of
+# declining it, because a JavaScript test carries a title that says whether it
+# is ABOUT the removed branch — `ts_tests.py` deletes the ones that are, and
+# the rest are ordinary residue. A detector there would report entries the
+# rules had already deleted.
 _DETECTORS: dict[str, _Detector] = {
-    "ts": _Detector(tree_sitter_typescript.language_typescript, (_TS_FAMILY_QUERY,)),
-    # `tsx` and `js` share the TSX grammar, exactly as `ts_syntax._parser` and
-    # the engine's own `javascript` arm do (piranha#25).
-    "tsx": _Detector(tree_sitter_typescript.language_tsx, (_TS_FAMILY_QUERY,)),
-    "js": _Detector(tree_sitter_typescript.language_tsx, (_TS_FAMILY_QUERY,)),
     "python": _Detector(
         tree_sitter_python.language,
         ("""(
@@ -206,11 +195,12 @@ _BOOLEAN_TEXTS = frozenset({"true", "false"})
 def covers(language: str) -> bool:
     """Whether a declined entry in ``language`` would be reported.
 
-    True for every language with a ``rules/<base>_entries.toml``, counting a
-    template language that borrows another's rules. False means the language
-    has no entry rules, so it declines nothing and there is nothing to miss —
-    which is why ``test_every_language_with_entry_rules_has_a_detector`` asks
-    this of the rules on disk rather than trusting the table above.
+    True for every language whose ``rules/<base>_entries.toml`` can decline
+    an entry, counting a template language that borrows another's rules.
+    False means the language declines nothing — it has no entry rules, or (the
+    TypeScript family) its rules strip every pin — so there is nothing to
+    miss. ``test_every_language_with_entry_rules_has_a_detector`` asks this of
+    the rules on disk rather than trusting the table above.
     """
     if language in _DETECTORS:
         return True

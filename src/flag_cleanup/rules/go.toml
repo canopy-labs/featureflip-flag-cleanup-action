@@ -191,50 +191,20 @@ replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
-
 # ===========================================================================
-# 2. The one gap in Piranha's built-in cascade
+# 2. `} else if <read> { … }` with no trailing `else` — the engine's rule
 # ===========================================================================
 
-# `} else if <read> { … }` with NO trailing `else`, on the false treatment.
-# Identical defect to Java's and TypeScript's — see java.toml for the full
-# account. Deleting just the inner `if` leaves a dangling `else`, Piranha's own
-# self-check panics, and the flag is abandoned on every run, forever.
+# This file used to carry its own `delete_trailing_else_if_false`. The engine
+# ships one under the same name, and a rule declared here WINS a name
+# collision, so ours shadowed it. Ours was the narrower of the two: it matched
+# only a bare `false` condition, so a parenthesised `} else if (<read>) {`
+# fell through to the built-in that deletes the inner `if` alone, left a
+# dangling `else`, and the engine aborted the whole file on its own syntax
+# check. It also lacked the guard on the inner `if`'s initializer, which the
+# engine's version declines on (the initializer runs whatever the condition
+# says, so deleting the branch would delete a call).
 #
-# Go's `if_statement` has no wrapper node around the alternative either, so the
-# fix rebuilds the outer statement from its captures. Unlike Java the condition
-# carries no parentheses, which is exactly why it is rebuilt from `@condition`
-# rather than assumed: the same rule text would be wrong in the other language.
-#
-# `!initializer` is the second thing Java does not need, and leaving it out was
-# a real bug. Go's `if` may carry one — `if v, err := load(); err != nil {…}` —
-# and it is a SIBLING FIELD of the condition, not part of it. Rebuilding the
-# statement from `@condition` and `@consequence` alone therefore dropped it:
-#
-#   if v, err := load(); err != nil { handle(v, err) } else if <read> { … }
-#   ->  if err != nil { handle(v, err) }        // v and err now undefined
-#
-# Copying the rule shape across from java.toml is exactly how that got in —
-# Java's grammar has no initializer, so the omission is invisible there.
-# Rather than capture and re-emit the initializer, the rule declines the shape:
-# the built-in then leaves a dangling `else`, the engine's self-check rejects
-# the whole transform, and the flag is skipped. A refusal is the right answer
-# anyway, because there is no rewrite of this shape that both drops the dead
-# branch and keeps the initializer's binding where the rest of the function can
-# see it. `syntax.py`'s `preserved_fields` check is the backstop for every
-# other route to the same damage.
-[[rules]]
-name = "delete_trailing_else_if_false"
-groups = ["if_cleanup"]
-is_seed_rule = false
-query = """(
-  (if_statement
-    !initializer
-    condition: (_) @condition
-    consequence: (_) @consequence
-    alternative: (if_statement
-      condition: (false)
-      !alternative)) @if_statement
-)"""
-replace_node = "if_statement"
-replace = "if @condition @consequence"
+# Do not re-add it. A cleanup rule that needs to change belongs in the engine,
+# where one copy is authoritative; `test_declares_no_cleanup_rules` refuses a
+# re-add by name.

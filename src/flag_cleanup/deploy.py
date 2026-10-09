@@ -153,7 +153,12 @@ def run_archive_on_deploy(
         deployed, pending = _partition_by_containment(
             active_gh, github.repository, candidates, deployment.sha
         )
-        return pending + archive_outstanding(config, deployed, active)
+        return pending + archive_outstanding(
+            config,
+            deployed,
+            active,
+            merged_removals={candidate.key for candidate in candidates},
+        )
     finally:
         if owned_gh:
             active_gh.close()

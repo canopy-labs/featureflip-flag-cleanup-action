@@ -43,14 +43,16 @@ than spending a request per flag to print the same sentence.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
-from flag_cleanup.archive import ArchiveResult, deferred_detail
+from flag_cleanup.archive import ArchiveResult, deferred_detail, dependents_deferred_detail
 from flag_cleanup.client import (
     ArchivePermissionError,
     FeatureflipApiError,
     FeatureflipClient,
+    FlagHasDependentsError,
     FlagRecentlyEvaluatedError,
 )
 from flag_cleanup.config import Config
@@ -174,6 +176,8 @@ def archive_outstanding(
     config: Config,
     candidates: list[OutstandingArchive],
     client: FeatureflipClient,
+    *,
+    merged_removals: Collection[str] | None = None,
 ) -> list[ArchiveResult]:
     """One archive attempt per candidate, isolated from each other.
 
@@ -182,9 +186,33 @@ def archive_outstanding(
     else. Keeping the loop here rather than copying it is what makes the two
     modes report in one vocabulary: same outcome names, same dry-run wording,
     and one place where the per-flag/whole-token distinction below is decided.
+
+    ``merged_removals`` is every flag key known to have a merged removal and no
+    archive yet; it defaults to the candidates' own keys. ``archive-on-deploy``
+    passes the WHOLE outstanding set, because a dependent its deployed commit
+    does not contain is still a dependent on its way out.
+
+    **A prerequisite refusal is ``deferred`` when every dependent it names is in
+    ``merged_removals``.** Removing a client-side flag and then the server
+    flag it depends on is the normal order, and until the dependent archives the
+    platform refuses the prerequisite with ``FLAG_HAS_DEPENDENTS``. Nothing has
+    failed there: both flags wait on the same deploy, and nobody has anything
+    to do. A dependent with NO merged removal stays ``failed`` — that is a
+    removal merged out of order, and a person has to look.
+
+    **Dependents are attempted before their prerequisites**, without knowing
+    the graph up front: a flag refused for a dependent that is still waiting
+    its turn in this run goes to the back of the queue, once. So when traffic
+    has drained, one run archives both rather than taking two days.
     """
+    merged = set(merged_removals) if merged_removals is not None else {
+        candidate.key for candidate in candidates
+    }
+    queue = deque(candidates)
+    requeued: set[str] = set()
     results: list[ArchiveResult] = []
-    for candidate in candidates:
+    while queue:
+        candidate = queue.popleft()
         opened = _merge_reference(candidate)
 
         if config.dry_run:
@@ -215,6 +243,36 @@ def archive_outstanding(
                 )
             )
             continue
+        except FlagHasDependentsError as exc:
+            waiting = {queued.key for queued in queue}
+            if candidate.key not in requeued and any(
+                dependent in waiting for dependent in exc.dependents
+            ):
+                # A dependent has not had its turn yet. Archive it first, then
+                # come back — once, so a cycle the platform should never allow
+                # still cannot loop here.
+                requeued.add(candidate.key)
+                queue.append(candidate)
+                continue
+            if all(dependent in merged for dependent in exc.dependents):
+                results.append(
+                    ArchiveResult(
+                        action_taken="deferred",
+                        detail=dependents_deferred_detail(exc),
+                        key=candidate.key,
+                        pull_request=candidate.pull_request,
+                    )
+                )
+                continue
+            results.append(
+                ArchiveResult(
+                    action_taken="failed",
+                    detail=str(exc),
+                    key=candidate.key,
+                    pull_request=candidate.pull_request,
+                )
+            )
+            continue
         except ArchivePermissionError as exc:
             # Not this flag's problem — the token cannot archive anything, so
             # every remaining candidate would fail identically. Reported as a
@@ -234,8 +292,9 @@ def archive_outstanding(
             )
             break
         except FeatureflipApiError as exc:
-            # Everything else IS one flag's problem — a dependent prerequisite,
-            # a pending schedule, a flag deleted since its pull request merged.
+            # Everything else IS one flag's problem — a pending schedule, a
+            # flag deleted since its pull request merged. (A live dependent with
+            # no merged removal arrives above, and is reported the same way.)
             # Reported and carried on from, so one stuck flag cannot hold the
             # rest of the backlog hostage.
             results.append(

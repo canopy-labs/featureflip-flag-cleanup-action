@@ -1,0 +1,231 @@
+# Reader rules for a flag key hoisted to a constant declared in ANOTHER file,
+# for TypeScript, TSX and JavaScript (the three share the `ts` rule base).
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `ns.NAME` (a namespace import or a
+# required module object), `# xconst: bare` for an imported or destructured
+# `NAME` -- or its local alias, which is the text at the read. A block marked
+# `# xconst: enum-nested` is used for an enum entry read through a namespace
+# of the enum's file, `ns.Flags.X`, with __XCONST_NAMESPACE__ standing for
+# `ns` and __XCONST_OWNER__ for `Flags`.
+#
+# The callee shapes are the seed rules' in `ts.toml`, changing only the key
+# argument: `boolVariation` and `useFeatureFlag` as a method or a bare call,
+# never through `?.`, and `getBooleanValue` only under an `await`, matched at
+# the `await_expression` for the reason given there. The sync OpenFeature seed
+# is not copied: it is gated on the file's imports, which a reader of a
+# constant from another file does not prove, so such a read is refused before
+# the engine runs rather than left for a rule. `cross_file_ts._is_read` accepts
+# exactly these shapes, and a proven read these rules miss refuses the flag
+# after the engine.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules. Which reads are this
+# flag's was proven before the engine ran.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_boolvariation_read"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_usefeatureflag_read"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "useFeatureFlag")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_getbooleanvalue_read"
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments
+        . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member)))
+  ) @await
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_boolvariation_read"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . (identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_usefeatureflag_read"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . (identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "useFeatureFlag")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_getbooleanvalue_read"
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments . (identifier) @key_member))
+  ) @await
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: enum-nested
+name = "xconst_nested_boolvariation_read"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (member_expression !optional_chain
+          object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
+          property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_namespace "__XCONST_NAMESPACE__")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: enum-nested
+name = "xconst_nested_usefeatureflag_read"
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (member_expression !optional_chain
+          object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
+          property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "useFeatureFlag")
+  (#eq? @key_namespace "__XCONST_NAMESPACE__")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+# xconst: enum-nested
+name = "xconst_nested_getbooleanvalue_read"
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments
+        . (member_expression !optional_chain
+          object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
+          property: (property_identifier) @key_member)))
+  ) @await
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @key_namespace "__XCONST_NAMESPACE__")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]

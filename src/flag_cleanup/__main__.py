@@ -20,7 +20,9 @@ pull request, on this run or any future one, until something changes. Exiting
 nothing, which is the failure this tool exists to avoid rather than cause.
 A genuine ``no-changes`` is NOT in that set: nothing to do is success.
 
-``mode: archive-on-merge`` reads the same codes but reaches far fewer of them:
+``mode: archive-on-merge`` is DEPRECATED and prints a warning annotation on
+every run (see ``_archive``); until it is removed it reads the same codes but
+reaches far fewer of them:
 it archives one flag or it does not, so there is no partial result. A pull
 request that did not merge, or did not come from a branch this Action created,
 is ``0`` — those are the ordinary outcomes of a workflow that fires on every
@@ -119,6 +121,7 @@ from flag_cleanup.orchestrate import (
 from flag_cleanup.pr_command import (
     PrCommandResult,
     branch_was_force_pushed,
+    pull_request_was_reopened,
     pull_request_was_updated,
     run_pr_command,
 )
@@ -130,6 +133,20 @@ logger = logging.getLogger(__name__)
 #: something changes". Every one of them turns the build red — see the module
 #: docstring for why ``no-changes`` is not among them.
 UNPROPOSABLE_ACTIONS = ("failed", "unsafe-key", "piranha-error", "unsafe-rewrite")
+
+#: A GitHub workflow command, so the notice becomes an annotation on the run
+#: rather than one line in a green log nobody opens. Must stay on ONE line and
+#: free of ``%`` — the runner treats a newline as the end of the command.
+ARCHIVE_ON_MERGE_DEPRECATION = (
+    "::warning title=archive-on-merge is deprecated::"
+    "mode: archive-on-merge is deprecated and will be removed in the next major "
+    "version. It archives on the merge, before the removal is deployed, and "
+    "Featureflip's refusal to archive a flag still being evaluated cannot see "
+    "code that is deployed but was not reached recently. Run mode: archive-sweep "
+    "on a schedule instead, plus mode: archive-on-deploy if your pipeline creates "
+    "GitHub Deployments. See \"Archive the flag once the removal is deployed\" "
+    "in the README."
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -289,7 +306,15 @@ def _archive(config: Config) -> int:
 
     Printed rather than logged, matching `_report`/`_summarize`: stdout is what
     a workflow log and job summary capture.
+
+    The mode is DEPRECATED, and says so on every run before doing anything — so
+    a run that then fails to start still carries the notice. It fires on the
+    merge, which is not when a flag becomes safe to archive: the platform's
+    refusal reads telemetry, so it cannot protect code that is deployed but was
+    not reached recently, and this mode archives exactly those at the earliest
+    possible moment. Behaviour and exit codes are unchanged until it is removed.
     """
+    print(ARCHIVE_ON_MERGE_DEPRECATION, flush=True)
     result = run_archive(config)
     _print_archive_result(result)
     return 0
@@ -403,6 +428,7 @@ PR_COMMAND_FAILURES = (
     "rerun-merged",
     "rerun-not-a-candidate",
     "rerun-ignored",
+    "rerun-blocked",
 )
 
 
@@ -512,6 +538,11 @@ def _pr_command_failure_body(exc: Exception) -> str:
       cancelled job, a failed reply): both halves of the change are correct and
       the RUN is what did not finish.
 
+    Orthogonal to all three: a closed pull request is reopened BEFORE the
+    push, so any of them can also leave it open. That is added as one more
+    sentence until the `PATCH` lands, at which point an open pull request is
+    simply the outcome the command asked for.
+
     Collapsing the last two — which a single "was it pushed" flag forces — sent
     the reader to a pull-request description that was already right, and away
     from the checkout a refused `snapshot.verify()` may have left holding this
@@ -519,14 +550,26 @@ def _pr_command_failure_body(exc: Exception) -> str:
     on `expected` in `main`), so the reply's job is to stop misdirecting rather
     than to describe the working tree, which it cannot honestly do from here.
     """
+    # A closed pull request is reopened BEFORE the push, so a failure after
+    # that leaves it open even when nothing else landed. Said wherever it can
+    # apply, because the alternative is a reply that reads "nothing was
+    # pushed" about a pull request that has visibly changed state. Not once
+    # the `PATCH` has landed too: the pull request is then open on the new
+    # diff with the new description, which is what the command asked for.
+    reopened = (
+        " This pull request was reopened before the push and is still open; "
+        "close it again if you do not want it."
+        if pull_request_was_reopened(exc) and not pull_request_was_updated(exc)
+        else ""
+    )
     if isinstance(exc, ForceWithLeaseRejected):
         return (
             "**flag-cleanup — command failed**\n\n"
             f"`{exc.branch}` moved on the remote after this run read it, so the "
             "force-push was refused rather than overwriting whatever landed "
             "there.\n\n"
-            "Nothing was pushed. Comment the command again to regenerate "
-            "against the branch as it now stands."
+            f"Nothing was pushed.{reopened} Comment the command again to "
+            "regenerate against the branch as it now stands."
         )
     message = str(exc).strip()
     first_line = message.splitlines()[0] if message else exc.__class__.__name__
@@ -545,7 +588,7 @@ def _pr_command_failure_body(exc: Exception) -> str:
     return (
         "**flag-cleanup — command failed**\n\n"
         f"{first_line}\n\n"
-        f"{outcome} See this workflow run's log for the full output."
+        f"{outcome}{reopened} See this workflow run's log for the full output."
     )
 
 
@@ -567,14 +610,66 @@ def _report(results: list[FlagResult], *, dry_run: bool) -> None:
         if result.refused_files:
             # Same reasoning, one step stronger: this flag produced NOTHING,
             # and these files are the reason. Without the list the customer
-            # sees a refusal they cannot act on.
+            # sees a refusal they cannot act on — and without the reason they
+            # go looking for a syntax error in a file that may parse fine.
+            reasons = dict(result.refusal_reasons)
+            named = ", ".join(
+                f"{path} ({reasons[path]})" if path in reasons else path
+                for path in result.refused_files
+            )
             print(
                 f"    refused: the rewrite of {len(result.refused_files)} file(s) "
-                "did not survive the syntax check, so the whole flag was "
-                f"abandoned: {', '.join(result.refused_files)}"
+                "did not survive the post-transform checks, so the whole flag "
+                f"was abandoned: {named}"
             )
+        if result.blocked_by:
+            dependents = ", ".join(result.blocked_by)
+            if result.prior_removal == "merged":
+                # Waiting on an archive, not a proposal: promising a pull
+                # request here described a removal that had already shipped.
+                print(
+                    f"    waiting on: {dependents} (still use this flag as a "
+                    f"prerequisite). Its removal was already {_prior(result)}, "
+                    "so it can be archived once they are"
+                )
+            elif result.prior_removal:
+                print(
+                    f"    waiting on: {dependents} (still use this flag as a "
+                    f"prerequisite). Its removal {_prior(result)}, so it is not "
+                    "proposed again"
+                )
+            else:
+                print(
+                    f"    waiting on: {dependents} (still use this flag as a "
+                    "prerequisite; remove and archive them first, and this flag "
+                    "is proposed on the first run after that)"
+                )
+        elif result.prior_removal:
+            print(f"    removal {_prior(result)}")
+        if dry_run and result.action_taken == "dry-run" and not result.diff:
+            # A bare tag with no diff read like a preview that failed to print.
+            # Say what it means; the warning above names any files that still
+            # mention the flag when that is why nothing could be rewritten.
+            where = (
+                "the files above mention this flag, but nothing in them can be "
+                "rewritten"
+                if result.unprocessed_files
+                else "no file in the configured directories mentions this flag"
+            )
+            print(f"    no changes: {where}, so a real run opens no pull request")
         if dry_run and result.diff:
             print(result.diff)
+
+
+def _prior(result: FlagResult) -> str:
+    """The earlier removal ``result`` found, as the tail of a sentence."""
+    url = result.prior_removal_url
+    if result.prior_removal == "merged":
+        return f"merged in {url}" if url else "merged"
+    if result.prior_removal == "closed":
+        pull = f"pull request {url}" if url else "pull request"
+        return f"{pull} was closed without merging"
+    return "branch already exists with no pull request"
 
 
 def _summarize(results: list[FlagResult], *, staleness: str) -> None:

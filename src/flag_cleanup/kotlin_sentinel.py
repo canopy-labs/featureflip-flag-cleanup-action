@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -322,11 +323,45 @@ def const_val_declarations(root: Node) -> list[tuple[str, Node, Node, str]]:
     return found
 
 
-def _resolved_key(argument: Node, consts: dict[str, str]) -> str | None:
+def _argument_text(value: Node) -> str | None:
+    """``NAME``, ``Owner.NAME`` or ``Owner.Companion.NAME`` as one canonical text, or ``None``.
+
+    Whitespace, comments and an identifier's backticks are dropped, so the
+    text matches however the customer spelled it and is the text the
+    cross-file resolution proved. Only a plain ``.`` between plain names
+    qualifies: a ``?.``, a call or any other expression is not a name. A
+    longer path still gets a text, which matches only if it was proven.
+    """
+    if value.type == "identifier":
+        text = value.text.decode("utf-8", "replace")
+        return text[1:-1] if len(text) > 2 and text[0] == text[-1] == "`" else text
+    if value.type != "navigation_expression":
+        return None
+    named = [c for c in value.named_children if c.type not in ("line_comment", "block_comment")]
+    operators = [c.type for c in value.children if not c.is_named]
+    if len(named) != 2 or operators != ["."] or named[1].type != "identifier":
+        return None
+    qualifier = _argument_text(named[0])
+    if qualifier is None:
+        return None
+    return qualifier + "." + _argument_text(named[1])
+
+
+def _resolved_key(
+    argument: Node,
+    consts: dict[str, str],
+    external: Mapping[str, str] | None = None,
+) -> str | None:
     """The key an argument holds, resolving a ``const val`` name through ``consts``.
 
     Mirrors `_literal_key`'s handling of the named form (`key = FLAG_KEY`) by
     looking at the argument's LAST named child.
+
+    ``external`` maps an argument's exact text (``RuntimeKeys.OLD_CHECKOUT``,
+    or an imported bare name or alias) to the key it was proven to hold in
+    ANOTHER file. Only the cross-file resolution fills it, only for a file it
+    proved, and only an unlabelled argument can match it -- the proof covers
+    exactly that shape -- so a text match here is never a guess.
     """
     literal = _literal_key(argument)
     if literal is not None:
@@ -334,6 +369,10 @@ def _resolved_key(argument: Node, consts: dict[str, str]) -> str | None:
     if not argument.named_children:
         return None
     value = argument.named_children[-1]
+    if external and len(argument.named_children) == 1:
+        text = _argument_text(value)
+        if text is not None and text in external:
+            return external[text]
     if value.type != "simple_identifier" and value.type != "identifier":
         return None
     return consts.get(value.text.decode("utf-8", "replace"))
@@ -344,6 +383,7 @@ def _callee_spans(
     flag_key: str,
     accessors: tuple[str, ...] = DEFAULT_ACCESSORS,
     resolve_consts: bool = True,
+    external: Mapping[str, str] | None = None,
 ) -> list[tuple[int, int]]:
     """Byte ranges of every callee this tool should replace, last first.
 
@@ -370,7 +410,7 @@ def _callee_spans(
         arguments = [c for c in node.named_children if c.type == "value_arguments"]
         if not arguments or not arguments[0].named_children:
             continue
-        if _resolved_key(arguments[0].named_children[0], consts) != flag_key:
+        if _resolved_key(arguments[0].named_children[0], consts, external) != flag_key:
             continue
         # NOT `callee.start_byte` — see `_callee_start`. That spelling swallowed
         # a leading `!` into the sentinel and inverted every negated read.
@@ -384,6 +424,7 @@ def rewrite(
     sentinel: str,
     accessors: tuple[str, ...] = DEFAULT_ACCESSORS,
     resolve_consts: bool = True,
+    external: Mapping[str, str] | None = None,
 ) -> str | None:
     """``source`` with every matching callee replaced by ``sentinel``.
 
@@ -398,7 +439,7 @@ def rewrite(
             f"{sentinel!r} already appears in this source, so a rewrite could "
             "not be told apart from what was already there"
         )
-    spans = _callee_spans(source, flag_key, accessors, resolve_consts)
+    spans = _callee_spans(source, flag_key, accessors, resolve_consts, external)
     if not spans:
         return None
     raw = source.encode("utf-8")
@@ -438,6 +479,12 @@ class SentinelPrePass:
     #: is left exactly as it was for the const path. See
     #: `key_const` and `rules/kt_const.toml`.
     const_key_paths: frozenset[str] = frozenset()
+    #: path -> the argument texts (``RuntimeKeys.OLD_CHECKOUT``, ``OLD_CHECKOUT``
+    #: or an import alias) that were proven, in that file, to name a constant
+    #: holding this flag's key and declared in ANOTHER file. Filled only by the
+    #: cross-file resolution, for the readers it proved; see
+    #: :mod:`flag_cleanup.cross_file_kotlin`.
+    external_keys: dict[str, frozenset[str]] = field(default_factory=dict)
 
     #: path -> the file's text before this pre-pass touched it.
     originals: dict[str, str] = field(default_factory=dict)
@@ -463,6 +510,10 @@ class SentinelPrePass:
                     self.sentinel,
                     self.accessors,
                     resolve_consts=path in self.const_key_paths,
+                    external={
+                        text: self.flag_key
+                        for text in self.external_keys.get(path, frozenset())
+                    },
                 )
             except SentinelCollisionError:
                 self.failed_path = path
@@ -506,8 +557,11 @@ class SentinelPrePass:
             rebased.append(Rewrite(path, source, current))
         return rebased
 
-    def survived(self, content: str) -> bool:
+    def survived(self, path: str, content: str) -> bool:
         """Whether ``content`` still holds the sentinel.
+
+        ``path`` is unused: the sentinel is unique to this run, so any
+        occurrence is one this pre-pass wrote.
 
         A true answer means the engine did not consume a read this pre-pass
         marked, which is never an acceptable thing to ship: the file would

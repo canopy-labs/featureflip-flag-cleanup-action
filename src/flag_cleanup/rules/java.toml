@@ -54,6 +54,8 @@
 #   client.boolVariation("KEY", buildCtx(), false);   // buildCtx() would be lost
 #   verify(client).boolVariation("KEY", ctx, false);  // Mockito: deleting it
 #                                                     // deletes the assertion
+#                                                     // (unless `mock_stubs`
+#                                                     // resolved it first)
 #   client.boolVariation("KEY", new Ctx(), false);    // a constructor is a call
 #   client.boolVariation("KEY", flags[read()], false);// nested, still counted
 #

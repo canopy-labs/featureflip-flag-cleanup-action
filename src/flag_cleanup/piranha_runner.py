@@ -66,9 +66,11 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import re
+import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -80,10 +82,22 @@ else:  # pragma: no cover - project requires >=3.11
 
 from polyglot_piranha import PiranhaArguments, execute_piranha
 
-from flag_cleanup import contradicting, kotlin_sentinel
+from flag_cleanup import (
+    contradicting,
+    cross_file_keys,
+    cross_file_kotlin,
+    kotlin_sentinel,
+    mock_stubs,
+    source_index,
+    ts_fold,
+    ts_gates,
+    ts_tests,
+)
 from flag_cleanup.kotlin_sentinel import Rewrite
 from flag_cleanup.go_fold import fold_literal_cases as fold_go_literal_cases
 from flag_cleanup.ruby_fold import fold_literal_whens as fold_ruby_literal_whens
+from flag_cleanup.kotlin_fold import fold_literal_whens as fold_kotlin_literal_whens
+from flag_cleanup.ts_switch_fold import fold_switch_true
 from flag_cleanup.php_fold import (
     fold_literal_cases as fold_php_literal_cases,
     fold_literal_conditions as fold_php_literal_conditions,
@@ -93,15 +107,18 @@ from flag_cleanup.python_fold import (
     inline_literal_bindings,
     marker_for,
 )
+from flag_cleanup.key_const_visibility import VisibleKeyConst
 from flag_cleanup.reindent import reindent_spliced_lines
 from flag_cleanup.syntax import (
     collapse_introduced_carriage_returns,
     collapse_introduced_double_spaces,
     const_path_is_safe,
+    externally_visible_key_consts,
+    remove_dead_loops,
     remove_unreachable_statements,
     source_is_unreadable,
     strip_introduced_trailing_whitespace,
-    transform_broke_syntax,
+    refusal_reason,
 )
 from flag_cleanup.ts_syntax import strip_dangling_type_separators
 from flag_cleanup.unused import remove_stranded_bindings
@@ -140,18 +157,27 @@ class UnsafeRewriteError(RuntimeError):
     ``[no-changes]`` on every scheduled run, for that flag, forever — the exact
     outcome the whole gate design was meant to avoid.
 
-    ``refused`` are the files whose own rewrite did not survive the gate;
+    ``refused`` are the files whose own rewrite did not survive the gate, and
+    ``reasons`` says which check stopped each one;
     ``discarded`` are the files that rewrote cleanly but were rolled back with
     them, because the rollback is deliberately all-or-nothing (see
     :func:`run_piranha`).
     """
 
     def __init__(
-        self, message: str, refused: Iterable[str] = (), discarded: Iterable[str] = ()
+        self,
+        message: str,
+        refused: Iterable[str] = (),
+        discarded: Iterable[str] = (),
+        reasons: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.refused = tuple(refused)
         self.discarded = tuple(discarded)
+        # Which check refused each file, worded for the reader. Most are not
+        # about syntax at all, so without this a refusal sent people looking for
+        # a parse error in a file that parsed fine.
+        self.reasons = dict(reasons or {})
 
 
 class UnsupportedFlagKeyError(ValueError):
@@ -418,8 +444,9 @@ _LANGUAGES: dict[str, _Language] = {
     # Dart rides the engine's built-in cascade (piranha#70/#71) like C#, PHP and
     # Ruby, so `rules/dart.toml` is a seed rule and nothing else.
     #
-    # The grammar the RULES query (the engine's bundled tree-sitter-dart 0.2.0)
-    # and the grammar GATE 1 parses with (PyPI's 0.1.0) are different grammars,
+    # The grammar the RULES query (the engine's bundled tree-sitter-dart, 0.2.0
+    # plus one arrow-body fix) and the grammar GATE 1 parses with (PyPI's
+    # 0.1.0) are different grammars,
     # not two versions of one — see rules/dart.toml and CLAUDE.md.
     "dart": _Language("dart", "dart", (".dart",), display_name="Dart"),
     # Swift was parked for three reasons and all three are now resolved
@@ -570,7 +597,12 @@ def unprocessed_extensions(languages: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(KNOWN_EXTENSIONS - processed))
 
 
-def candidate_files(repo_dir: str, language: str, flag_key: str) -> list[str]:
+def candidate_files(
+    repo_dir: str,
+    language: str,
+    flag_key: str,
+    languages: Iterable[str] = (),
+) -> list[str]:
     """Every file :func:`run_piranha` could rewrite for this dir/language/key.
 
     Public because the orchestrator needs the exact same set to snapshot before
@@ -580,10 +612,113 @@ def candidate_files(repo_dir: str, language: str, flag_key: str) -> list[str]:
     ``git checkout`` alone is not (it restores tracked files only — see
     ``git_ops.WorktreeSnapshot``).
 
+    Files that only mention a hoisted key constant declared in another
+    candidate are included too, so the undo snapshot covers the readers the
+    cross-file pass may rewrite.
+
+    ``languages`` is every language of the run. A mention in a file of
+    another of them that shares this one's key-constant family (a ``.tsx``
+    reader of a ``.ts`` constant) is included as well, when no other run of
+    the family can rewrite it: it must not name the key itself, nor a constant
+    declared in a file of another configured member of the family. Either
+    would make it a candidate of that run too, and a file rewritten by two
+    runs comes out depending on which ran first. Left out, it is reported as
+    the reason the declaration stays.
+
     Raises ``ValueError`` for an unsupported ``language``, exactly like
     :func:`run_piranha`.
     """
-    return _candidate_files(Path(repo_dir), _language_spec(language).extensions, flag_key)
+    spec = _language_spec(language)
+    root = Path(repo_dir)
+    found = _candidate_files(root, spec.extensions, flag_key)
+    if not cross_file_keys.supported(language):
+        return found
+    names = _key_const_names(found, language, flag_key)
+    siblings = [
+        sibling
+        for sibling in sorted(cross_file_keys.family(language) & set(languages))
+        if sibling != language
+    ]
+    sibling_extensions = tuple(
+        ext for sibling in siblings for ext in _LANGUAGES[sibling].extensions
+    )
+    # Names declared by the other configured members' key files, read only
+    # once a sibling mention turns up: most runs never need them.
+    claimed: re.Pattern[str] | None = None
+    resolved_root = root.resolve()
+    extra: list[str] = []
+    for mention in cross_file_keys.mention_files(repo_dir, names, exclude=found):
+        sibling = mention.endswith(sibling_extensions)
+        if not (sibling or mention.endswith(spec.extensions)):
+            continue
+        if not cross_file_keys.within(Path(mention), resolved_root):
+            continue  # outside this run; the resolution refuses it instead
+        try:
+            text = Path(mention).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # never a reader; the resolution refuses it on its own
+        if sibling:
+            if flag_key in text:
+                continue  # its own run rewrites it
+            if claimed is None:
+                claimed = cross_file_keys.mention_pattern(
+                    name
+                    for other in siblings
+                    for name in _key_const_names(
+                        _candidate_files(root, _LANGUAGES[other].extensions, flag_key),
+                        other,
+                        flag_key,
+                    )
+                )
+            if claimed.search(text):
+                continue  # a reader in another run of the family as well
+        # Spelled under `repo_dir` like every other candidate, so a summary's
+        # path and the snapshot's agree however `repo_dir` was written.
+        if root.is_dir():
+            mention = str(root / os.path.relpath(mention, resolved_root))
+        extra.append(mention)
+    return found + sorted(set(extra))
+
+
+def _key_const_names(paths: Iterable[str], language: str, flag_key: str) -> set[str]:
+    """The key constants and enum entries ``paths`` declare that another file can read."""
+    names: set[str] = set()
+    for path in paths:
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        names.update(
+            c.name for c in externally_visible_key_consts(source, language, flag_key)
+        )
+        names.update(cross_file_keys.entry_names(path, source, language, flag_key))
+    return names
+
+
+def _grammar_of(path: str, language: str) -> str:
+    """The language whose grammar parses ``path`` in a run for ``language``.
+
+    ``language`` itself, except for a cross-file reader of a sibling file type
+    in its key-constant family: a ``.tsx`` reader handed to the ``ts`` run is
+    parsed, rewritten and checked as TSX. Every pass that parses a file asks
+    this rather than trusting the run's language.
+    """
+    if path.endswith(_language_spec(language).extensions):
+        return language
+    for sibling in sorted(cross_file_keys.family(language)):
+        if path.endswith(_LANGUAGES[sibling].extensions):
+            return sibling
+    return language
+
+
+def _jsx_rule_files(spec: _Language) -> tuple[Path | None, Path | None]:
+    """``(rules, edges)`` of the JSX rules ``spec``'s grammar takes, if any."""
+    if not spec.parses_jsx:
+        return None, None
+    return (
+        RULES_DIR / f"{spec.rule_base}_jsx.toml",
+        RULES_DIR / f"{spec.rule_base}_jsx_edges.toml",
+    )
 
 
 def _language_spec(language: str) -> _Language:
@@ -798,7 +933,13 @@ class TransformOutcome:
     #: separately from ``stranded`` because that field's PR-body sentence is
     #: specifically about unreachable STATEMENTS — reusing it would put a false
     #: sentence in front of the customer. See
-    #: :func:`~flag_cleanup.unused.remove_stranded_bindings`.
+    #: :func:`~flag_cleanup.unused.remove_stranded_bindings`. An import cut down
+    #: to a bare one rather than deleted has kind ``"bare import"`` and the
+    #: line it became as its text, because that line is still in the diff and
+    #: the body asks the reviewer to judge it. So does a CommonJS
+    #: ``const { client } = require("./m")`` discarded to ``require("./m");``.
+    #: A Python import is never cut down: it is kept whole and marked
+    #: ``# noqa: F401``, with kind ``"marked import"`` and that line as text.
     bindings: tuple[tuple[str, str, str], ...] = ()
     #: ``(path, text)`` for every flag-keyed ENTRY the ``*_entries.toml``
     #: rules deleted — a registry line, an override property, an object-type
@@ -815,6 +956,43 @@ class TransformOutcome:
     #: :func:`~flag_cleanup.contradicting.find_contradicting_entries`, not by
     #: the engine.
     declined: tuple[tuple[str, str], ...] = ()
+    #: ``(path, kind, text)`` for every test-double line and test this run
+    #: deleted because it stubbed or verified the read being removed: ``kind``
+    #: is ``stub`` or ``verification`` (``text`` is the line) or ``test``
+    #: (``text`` is the test's name). Only when the run folded a real read; see
+    #: :mod:`flag_cleanup.mock_stubs`. Reported because these were the
+    #: customer's tests, and a reviewer should not find a deleted assertion
+    #: only in the diff.
+    test_doubles: tuple[tuple[str, str, str], ...] = ()
+    #: ``(path, title)`` for every test deleted because its title says it
+    #: exercises the branch the fold removed, and a flag-keyed entry inside it
+    #: pinned the flag to that branch. TypeScript family only — the language
+    #: whose tests carry titles — and the reason ``declined`` is always empty
+    #: there: those rules strip every pin, and this names the tests that would
+    #: otherwise have gone red asserting code that no longer exists. See
+    #: :mod:`flag_cleanup.ts_tests`.
+    deleted_tests: tuple[tuple[str, str], ...] = ()
+    #: ``(path, reason)`` for every file this transform deliberately put back
+    #: exactly as it was, although the rules had rewritten it: a test that
+    #: still names the key as DATA once its rewrite is on disk (a gate's key
+    #: prop, a string handed to the code under test), whose overrides are
+    #: therefore still live. See :func:`~flag_cleanup.ts_tests.data_mention`.
+    #: TypeScript family only. ``orchestrate`` adds the registry entries it
+    #: keeps to the same list.
+    kept: tuple[tuple[str, str], ...] = ()
+    #: References to a cross-file key constant this run could not prove are
+    #: reads of this flag: ``(path, line, reason, text)``, paths relative to the
+    #: repository. Each one is why a declaration was kept, so each one is a
+    #: line in the pull request.
+    unresolved: tuple[tuple[str, int, str, str], ...] = ()
+    #: What the run found about enum entries holding the key:
+    #: ``(path, line, reason, text)``, paths relative to the repository.
+    #: ``reason`` is ``kept`` for an entry whose every read was folded and
+    #: which was left in place, ``enum-dynamic`` for a use of the whole enum
+    #: that can reach the entry unseen, and otherwise a refusal reason for a
+    #: mention that is not a proven read. Kept apart from ``unresolved``,
+    #: whose wording is about a constant's declaration.
+    enum_findings: tuple[tuple[str, int, str, str], ...] = ()
 
 
 def run_piranha(
@@ -825,6 +1003,7 @@ def run_piranha(
     paths: list[str] | None = None,
     accessors: tuple[str, ...] = (),
     known_flag_keys: frozenset[str] = frozenset(),
+    gates: tuple[ts_gates.Gate, ...] = (),
 ) -> str:
     """:func:`transform_flag`, keeping only the diff.
 
@@ -846,7 +1025,7 @@ def run_piranha(
     """
     return transform_flag(
         repo_dir, language, flag_key, treatment, paths, accessors,
-        known_flag_keys=known_flag_keys,
+        known_flag_keys=known_flag_keys, gates=gates,
     ).diff
 
 
@@ -858,6 +1037,62 @@ def transform_flag(
     paths: list[str] | None = None,
     accessors: tuple[str, ...] = (),
     known_flag_keys: frozenset[str] = frozenset(),
+    gates: tuple[ts_gates.Gate, ...] = (),
+) -> TransformOutcome:
+    """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
+
+    The work is in :func:`_transform_flag`. This wrapper exists for the
+    test-double pre-pass (:mod:`flag_cleanup.mock_stubs`), the one edit made
+    to the customer's files before the engine runs, and it does two things:
+
+    * Every way out of the transform that raises puts those files back, and
+      there are a dozen. Restoring after a Gate 1 refusal repeats what the
+      refusal already wrote, which is harmless — the bytes are the customer's
+      either way.
+    * When the engine folded no real read, the pass's edits have no
+      justification, and the engine has already run over them. The whole
+      transform is undone and run again WITHOUT the pass, so the outcome is
+      exactly what it was before the pass existed: a stub the fold breaks is
+      refused, a Moq stub is left alone. Withdrawing the edits and keeping the
+      engine's output instead would hand the stubs back un-refused — and
+      with ``tests/`` configured as its own directory, that is a pull request
+      leaving stubs of a read the ``src/`` pass removed.
+    """
+    doubles: list[mock_stubs.Prepass] = []
+    # One listing of the checkout for every scan this transform makes, and for
+    # the retry: nothing here adds or removes a file. Inside a run's scope,
+    # the run's listing.
+    with source_index.run_scope():
+        try:
+            return _transform_flag(
+                repo_dir, language, flag_key, treatment, paths, accessors,
+                known_flag_keys, doubles, gates,
+            )
+        except _NoReadFolded:
+            return _transform_flag(
+                repo_dir, language, flag_key, treatment, paths, accessors,
+                known_flag_keys, None, gates,
+            )
+        except BaseException:
+            for prepass in doubles:
+                prepass.restore_all()
+            raise
+
+
+class _NoReadFolded(Exception):
+    """The test-double pre-pass was undone because no real read was folded."""
+
+
+def _transform_flag(
+    repo_dir: str,
+    language: str,
+    flag_key: str,
+    treatment: bool,
+    paths: list[str] | None,
+    accessors: tuple[str, ...],
+    known_flag_keys: frozenset[str],
+    doubles: list[mock_stubs.Prepass] | None,
+    gates: tuple[ts_gates.Gate, ...] = (),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -887,6 +1122,11 @@ def transform_flag(
         ``rules/<base>_entries.toml`` registry prong. Rendered by
         :func:`render_known_flag_keys`; the empty set disables that prong and
         nothing else.
+    gates:
+        JSX components that render their children only while a flag is on,
+        each with its key prop (``FlagGate[flag]`` in the ``accessors``
+        input). Unwrapped on ``true``, refused on ``false``; see
+        :mod:`flag_cleanup.ts_gates`.
 
     Returns
     -------
@@ -917,10 +1157,22 @@ def transform_flag(
     spec = _language_spec(language)
     piranha_language, base = spec.piranha_id, spec.rule_base
 
+    # Defined before the first return so every later reader of it can rely on
+    # it; replaced once Gate 2 has partitioned the files.
+    resolution = cross_file_keys.Resolution({}, (), frozenset())
+
     if paths is None:
-        paths = _candidate_files(Path(repo_dir), spec.extensions, flag_key)
+        paths = candidate_files(repo_dir, language, flag_key)
     if not paths:
         return TransformOutcome("")
+
+    # A file of a sibling file type (see `candidate_files`) is there only as a
+    # possible cross-file reader, and reaches nothing but the resolution and
+    # the reader invocation. Every pass before the engine asks about the KEY,
+    # which such a file does not hold, and parses with this run's grammar,
+    # which is not the file's own.
+    sibling_readers = [p for p in paths if _grammar_of(p, language) != language]
+    paths = [p for p in paths if p not in sibling_readers]
 
     # PRE-FLIGHT — drop any file the GATE cannot fully parse, before the engine
     # is handed it. Dart only; see `syntax.source_is_unreadable` for the defect
@@ -930,19 +1182,38 @@ def transform_flag(
     # afterwards would be reading a file the engine had already corrupted.
     paths, skipped = _partition_by_readability(paths, language)
 
+    # Resolve the test doubles that stub or verify this read, on the customer's
+    # bytes and BEFORE everything below reads them: Mockito, MockK, Dart
+    # mockito, ts-mockito and gomock take a real call, which the engine would
+    # fold with every other read, leaving nothing to recognise. Kept or undone
+    # after the engine, once it is known whether a real read was folded; see
+    # :mod:`flag_cleanup.mock_stubs`. Before the entry and pinned-test reads
+    # below, so neither describes a test this has already deleted.
+    if doubles is not None and mock_stubs.covers(language):
+        stub_pass = mock_stubs.Prepass(language, flag_key, treatment, accessors)
+        doubles.append(stub_pass)
+        stub_pass.apply(paths)
+
     # Computed here, off the CUSTOMER's bytes, before anything rewrites them.
     # It is the only reading of the tree that has to happen first: every prong
     # in `<base>_entries.toml` declines this shape, so it is still on disk
     # afterwards — but the fold has rewritten the code around it by then, and a
     # file the engine quarantines never reaches the post state at all. Cheap,
     # and bounded by the same candidate list the engine gets.
+    untreated = spec.false_literal if treatment else spec.true_literal
     declined = contradicting.find_contradicting_entries(
-        paths,
-        language,
-        flag_key,
-        spec.false_literal if treatment else spec.true_literal,
-        repo_dir,
+        paths, language, flag_key, untreated, repo_dir
     )
+    # The TypeScript family's answer to the same shape, read off the same
+    # customer bytes for the same reason: the rules strip the pin, so after the
+    # engine there is nothing left to find. See :mod:`flag_cleanup.ts_tests`.
+    pinned_tests = _find_pinned_tests(paths, language, flag_key, untreated)
+
+    # A gate component is decided on the customer's bytes too, and its refusal
+    # raised here, before the engine writes anything — the `false` treatment
+    # cannot be unwrapped, and there is nothing to roll back yet. The test-
+    # double pass above is undone by `transform_flag`, which catches this.
+    gate_paths = _check_gates(paths, language, flag_key, gates, treatment)
 
     if not paths:
         # Every candidate was unreadable, so there is nothing to transform —
@@ -966,8 +1237,7 @@ def transform_flag(
     # the accessor generation below deliberately leaves `rules_file` alone:
     # these rules are reached by edges and match no flag key, so nothing in them
     # varies with the accessors.
-    jsx_rules_file = RULES_DIR / f"{base}_jsx.toml" if spec.parses_jsx else None
-    jsx_edges_file = RULES_DIR / f"{base}_jsx_edges.toml" if spec.parses_jsx else None
+    jsx_rules_file, jsx_edges_file = _jsx_rule_files(spec)
 
     # Flag-keyed ENTRY rules (registry lines, override properties, object-type
     # members) — the residue a read-anchored rule cannot see. Appended like the
@@ -1019,19 +1289,50 @@ def transform_flag(
     # withhold anything. Every other language has no pre-pass, so the file bytes
     # here are identical either way and moving this changes nothing for them.
     with_const, without_const = _partition_by_const_safety(
-        paths, language, flag_key, accessors
+        paths, language, flag_key, accessors, repo_dir=repo_dir
     )
 
-    # THE KOTLIN PRE-PASS — the only thing in this tool that edits the
-    # customer's files before the engine does. It marks the calls the rules are
-    # allowed to rewrite, because Kotlin rules cannot read a string literal and
-    # so cannot tell one flag's guard from another's. Everything it writes is
-    # undone below on every path: it owns the whole responsibility, which is
-    # why the restore is driven from `prepass.originals` rather than from the
-    # engine's summaries (those carry the sentinel-ified text as their
-    # "before", and writing THAT back would leave a sentinel on disk).
+    # CROSS-FILE KEY CONSTANTS -- also before the pre-pass, which has to see
+    # the declaring files this re-admits. Gate 2 above withholds every
+    # declaring file another file could read; the resolution can only WIDEN
+    # that, by proving every mention in the repository is a read the reader
+    # rules remove. See :mod:`flag_cleanup.cross_file_keys`.
+    (
+        resolution,
+        reader_paths,
+        reader_const,
+        regained,
+        with_const,
+        without_const,
+    ) = _resolve_cross_file(
+        repo_dir,
+        language,
+        flag_key,
+        accessors,
+        paths + sibling_readers,
+        with_const,
+        without_const,
+    )
+
+    # THE KOTLIN PRE-PASS — besides the test-double pass, the only thing in
+    # this tool that edits the customer's files before the engine does. It
+    # marks the calls the rules are allowed to rewrite, because Kotlin rules
+    # cannot read a string literal and so cannot tell one flag's guard from
+    # another's. Everything it writes is undone below on every path: it owns
+    # the whole responsibility, which is why the restore is
+    # driven from `prepass.originals` rather than from the engine's summaries
+    # (those carry the pre-pass's text as their "before", and writing THAT
+    # back would leave a sentinel on disk).
+    # A Kotlin reader of a constant declared in another file is folded by the
+    # pre-pass like any other read: it marks each call whose first argument is
+    # one of the texts the resolution proved names this flag's key there.
+    proven = _proven_readers(resolution, paths + sibling_readers)
     prepass = _sentinel_prepass(
-        language, flag_key, accessors, const_key_paths=frozenset(with_const)
+        language,
+        flag_key,
+        accessors,
+        const_key_paths=frozenset(with_const),
+        external_keys=_external_keys(language, resolution, proven),
     )
     if prepass is not None:
         substitutions["sentinel"] = prepass.sentinel
@@ -1046,7 +1347,7 @@ def transform_flag(
             prepass.restore_all()
             logger.warning("refusing to transform for flag %r: %s", flag_key, exc)
             raise UnsafeRewriteError(
-                f"the Kotlin pre-pass refused this transform for flag "
+                f"the {spec.display_name} pre-pass refused this transform for flag "
                 f"{flag_key!r}: {exc}",
                 # The one file the customer has to act on — NOT every candidate.
                 # Falling back to the whole path list named files with no read
@@ -1056,8 +1357,14 @@ def transform_flag(
                 discarded=sorted(set(prepass.originals) - {prepass.failed_path}),
             ) from exc
 
+    reader_rules = _reader_rules(
+        spec, flag_key, rules_file, accessors, resolution, reader_paths, reader_const
+    )
+
     run_groups = partial(
         _execute_groups,
+        reader_rules=reader_rules,
+        language=language,
         piranha_language=piranha_language,
         rules_file=rules_file,
         const_rules_file=const_rules_file,
@@ -1073,10 +1380,17 @@ def transform_flag(
 
     unprocessable: list[str] = list(skipped)
     summaries: list = []
+    # What the engine is actually handed. `paths` can be wider: the snapshot
+    # also covers files that only mention a key constant, and a file that is
+    # neither a proven reader nor holds the key gives every rule nothing to do.
+    engine_paths = with_const + without_const + list(reader_paths)
     try:
         try:
             run_groups(
-                with_const=with_const, without_const=without_const, collected=summaries
+                with_const=with_const,
+                without_const=without_const,
+                reader_paths=reader_paths,
+                collected=summaries,
             )
         except PiranhaTransformError as abort:
             # Gate 2 made this run the engine TWICE, which quietly falsified the
@@ -1094,7 +1408,12 @@ def transform_flag(
             _restore(summaries)
             try:
                 summaries, quarantined = _quarantine_and_retry(
-                    paths, language, flag_key, run_groups, accessors
+                    engine_paths, language, flag_key, run_groups, accessors,
+                    repo_dir=repo_dir,
+                    reader_paths=reader_paths,
+                    regained=regained,
+                    proven=proven,
+                    blocked=resolution.blocked,
                 )
                 # Extend, never rebind: the pre-flight skips above are already in
                 # here, and `_quarantine_and_retry` only ever knows about the files
@@ -1104,7 +1423,7 @@ def transform_flag(
                 if prepass is not None:
                     prepass.restore_all()
                 raise
-            if len(quarantined) == len(paths):
+            if len(quarantined) == len(engine_paths):
                 # Nothing survived, so there is no partial removal to offer and no
                 # reason to soften the failure: report it exactly as before.
                 if prepass is not None:
@@ -1128,12 +1447,16 @@ def transform_flag(
         # report have to be accumulated as they are produced.
         entries, entry_paths = _flag_keyed_entries(summaries, repo_dir)
 
-        # Python only. Resolve a read the customer bound to a local and hand
-        # the result back to the engine, so the literal is created inside the
-        # cascade where the edges apply. See `_inline_bound_reads` (#3029).
-        if language == "python":
+        # Python and the TypeScript family. Resolve a local the fold left bound
+        # to a literal and hand the result back to the engine, so the literal
+        # is created inside the cascade where the edges apply. See
+        # `_inline_bound_reads` (#3029) and :mod:`flag_cleanup.ts_fold`.
+        inline = _BOUND_LITERAL_INLINERS.get(language)
+        if inline is not None:
             summaries, entries, entry_paths = _inline_bound_reads(
                 summaries,
+                inline=inline,
+                language=language,
                 run_groups=run_groups,
                 with_const=with_const,
                 marker=substitutions["marker"],
@@ -1155,6 +1478,14 @@ def transform_flag(
     # and it has to reach the refusal path below rather than be left there.
     if prepass is not None:
         summaries = prepass.rebase(summaries)
+
+    # Keep the test-double edits only if the engine folded a real read, then
+    # give the summaries the customer's bytes as their "before". Asked BEFORE
+    # that rebase: the engine's own "before" already holds the edits, so a
+    # deleted stub is not mistaken for a fold.
+    summaries, test_doubles = _settle_test_doubles(
+        summaries, doubles, language, accessors, repo_dir, unprocessable
+    )
 
     # PHP only, and BEFORE the whitespace tidy rather than beside the Python
     # fold below — that ordering is the point. Promoting a mid-chain `elseif`
@@ -1179,6 +1510,36 @@ def transform_flag(
     if language == "ruby":
         summaries = _fold_ruby_literals(summaries)
 
+    # Kotlin's subject-less `when { <read> -> … }` is the same construct again,
+    # and Kotlin carried no residue entry for it either, so the dead arm
+    # shipped. AFTER the sentinel rebase above, so the "before" the fold
+    # compares against is the customer's bytes rather than the sentinel-ified
+    # ones. See :mod:`flag_cleanup.kotlin_fold`.
+    if language == "kt":
+        summaries = _apply_literal_fold(
+            summaries, lambda before, after, _path: fold_kotlin_literal_whens(before, after)
+        )
+        # The import a proven Kotlin reader bound the constant's name with
+        # names a declaration this run deletes once its last read is folded.
+        # BEFORE the whitespace tidy and Gate 1, like every other text pass.
+        summaries = _drop_stranded_key_imports(summaries, resolution)
+
+    # `switch (true) { case <read>: … }` -- the TypeScript family's spelling of
+    # the same guard, with PHP's default fall-through. See
+    # :mod:`flag_cleanup.ts_switch_fold`.
+    if language in ("ts", "tsx", "js"):
+        summaries = _apply_literal_fold(
+            summaries,
+            lambda before, after, path: fold_switch_true(
+                before, after, _grammar_of(path, language)
+            ),
+        )
+
+    # Replace each configured gate on this flag with the children it rendered.
+    # Before the whitespace tidy and the stranded-binding pass: the gate's own
+    # import is stranded by this edit, and that pass is what removes it.
+    summaries = _unwrap_gates(summaries, gate_paths, language, flag_key, gates)
+
     # Tidy whitespace this transform stranded mid-line, BEFORE Gate 1 judges the
     # result and before the diff is built — the customer must be shown, and the
     # gate must validate, the exact bytes that stay on disk. Writing back is not
@@ -1201,6 +1562,27 @@ def transform_flag(
     # `\r\r\n` shape once the pass above has cut its dangling `;`. See
     # `_collapse_entry_carriage_returns`.
     summaries = _collapse_entry_carriage_returns(summaries, language, entry_paths)
+
+    # Put back a test file the rewrite left still naming the key as data: its
+    # overrides drive code that still reads the flag, so stripping them (and
+    # deleting its tests) breaks it. Before the test deletion below, which
+    # must not run on such a file, and before the stranded passes.
+    summaries, kept = _restore_tests_using_key_as_data(
+        summaries, language, flag_key, repo_dir
+    )
+    restored = {path for path, _reason in kept}
+    pinned_tests = {
+        path: tests
+        for path, tests in pinned_tests.items()
+        if os.path.relpath(path, repo_dir) not in restored
+    }
+
+    # Delete the tests whose subject is the branch the fold removed. Before the
+    # stranded-statement and stranded-binding passes, because a deleted test
+    # can be the last user of an import, and that pass is what removes it.
+    summaries, deleted_tests = _delete_pinned_tests(
+        summaries, language, pinned_tests, repo_dir
+    )
 
     # Delete what the fold stranded, for the same reason and in the same window:
     # Gate 1 must judge, and the customer must see, the bytes that stay on disk.
@@ -1230,6 +1612,16 @@ def transform_flag(
     # shapes and why the INPUT is what holds the answer to all of them.
     summaries = _reindent_folds(summaries, language)
 
+    # Private methods the fold stranded, AFTER the reindent pass and still
+    # before Gate 1. Whole-line deletions need no reindenting, and run earlier
+    # one sitting beside a fold threw off the indentation the reindent pass gave
+    # the folded line. A second call into the same pass rather than a new one:
+    # deleting a method can strand an import, and that pass owns imports.
+    summaries, method_bindings = _remove_stranded_bindings(
+        summaries, language, repo_dir, include_methods=True
+    )
+    bindings = bindings + method_bindings
+
     # GATE 1 — if the transform broke any file, discard ALL of it. A partial
     # rewrite is not an option: the flag would look half-removed, and a diff
     # that removes the flag from three files while a fourth still reads it is
@@ -1241,45 +1633,79 @@ def transform_flag(
     # and the run exits non-zero. Loud-and-nothing beats quiet-and-partial;
     # quiet-and-nothing — what this used to do — is the one unacceptable
     # combination.
+    # A file the test-double pre-pass edited is judged from that pass's output:
+    # its deletions are deliberate and self-checked (see
+    # `mock_stubs.resolve`), and the differential checks below would read a
+    # deleted test as a fold that lost something.
     changed = [s for s in summaries if s.original_content != s.content]
-    refused = sorted(
-        {
-            s.path
-            for s in changed
-            if transform_broke_syntax(s.original_content, s.content, language)
-            # A surviving sentinel means the engine did not consume a read the
-            # pre-pass marked. It parses, so Gate 1's checks are blind to it,
-            # and it would ship an identifier that does not compile and that no
-            # customer can interpret. Refuse — never diff.
-            or (prepass is not None and prepass.survived(s.content))
-            # The same hazard from the other end of the run: a marker
-            # `_inline_bound_reads` wrote and the engine did not consume. That
-            # pass already unwinds such a file to its previous content, so
-            # this is the belt to its braces — and it is the one outcome where
-            # a quiet pass-through would ship a NameError.
-            or (language == "python" and substitutions["marker"] in s.content)
-        }
-    )
+    reasons: dict[str, str] = {}
+    for s in changed:
+        reason = refusal_reason(
+            doubles[0].gate_baseline(s.path, s.original_content)
+            if doubles
+            else s.original_content,
+            s.content,
+            _grammar_of(s.path, language),
+        )
+        # A surviving sentinel means the engine did not consume a read the
+        # pre-pass marked. It parses, so Gate 1's checks are blind to it, and
+        # it would ship an identifier that does not compile and that no
+        # customer can interpret. Refuse — never diff.
+        if reason is None and prepass is not None and prepass.survived(s.path, s.content):
+            reason = "the engine left an internal marker in place of a flag read"
+        # The same hazard from the other end of the run: a marker
+        # `_inline_bound_reads` wrote and the engine did not consume. That pass
+        # already unwinds such a file to its previous content, so this is the
+        # belt to its braces — and it is the one outcome where a quiet
+        # pass-through would ship a NameError.
+        if (
+            reason is None
+            and language in _BOUND_LITERAL_INLINERS
+            and substitutions["marker"] in s.content
+        ):
+            reason = "the engine left an internal marker in place of a flag read"
+        if reason is not None:
+            reasons[s.path] = reason
+    # A proven cross-file reader must come out naming none of the constants it
+    # was proven against: anything left would point at a declaration this run
+    # may delete, and that breaks the build in another file, where no parse of
+    # the reader alone can see it.
+    for path in _proven_readers(resolution, paths + sibling_readers):
+        if path in unprocessable or path in reasons:
+            continue
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            text = ""
+        if cross_file_keys.still_mentions(
+            path, text, language, resolution, accessors, repo_dir
+        ):
+            reasons[path] = (
+                "a read of a key constant declared in another file was not rewritten"
+            )
+    refused = sorted(reasons)
     if refused:
         _restore(changed)
         discarded = sorted({s.path for s in changed} - set(refused))
+        named = "; ".join(f"{path} ({reasons[path]})" for path in refused)
         logger.warning(
             "refusing the rewrite of %s for flag %r: the result did not survive "
-            "the post-transform syntax check. %d other file(s) rewrote cleanly "
+            "the post-transform checks. %d other file(s) rewrote cleanly "
             "and were rolled back with it (%s), so this flag produces no diff at "
             "all until the refused file(s) are changed by hand or the key is "
             "added to the `ignore` input",
-            ", ".join(refused),
+            named,
             flag_key,
             len(discarded),
             ", ".join(discarded) or "none",
         )
         raise UnsafeRewriteError(
-            f"the rewrite of {', '.join(refused)} for flag {flag_key!r} did not "
-            "survive the post-transform syntax check, so it was rolled back "
-            f"along with {len(discarded)} file(s) that rewrote cleanly",
+            f"the rewrite of {named} for flag {flag_key!r} did not survive the "
+            "post-transform checks, so it was rolled back along with "
+            f"{len(discarded)} file(s) that rewrote cleanly",
             refused=refused,
             discarded=discarded,
+            reasons=reasons,
         )
 
     return TransformOutcome(
@@ -1289,6 +1715,413 @@ def transform_flag(
         bindings,
         entries,
         declined,
+        test_doubles,
+        deleted_tests,
+        kept,
+        tuple(
+            (os.path.relpath(r.path, repo_dir), r.line, r.reason, r.text)
+            for r in resolution.refusals
+            if not r.entry
+        ),
+        tuple(
+            (os.path.relpath(r.path, repo_dir), r.line, r.reason, r.text)
+            for r in cross_file_keys.enum_findings(resolution)
+        ),
+    )
+
+
+def _check_gates(
+    paths: list[str],
+    language: str,
+    flag_key: str,
+    gates: tuple[ts_gates.Gate, ...],
+    treatment: bool,
+) -> list[str]:
+    """The files holding a gate on ``flag_key`` to unwrap; raise if one cannot be.
+
+    A test file is skipped, gate and all: see :mod:`flag_cleanup.ts_gates`.
+    An unreadable file yields nothing, as in :func:`_find_pinned_tests`.
+    """
+    if not gates or not ts_gates.covers(language):
+        return []
+    found: list[str] = []
+    reasons: dict[str, str] = {}
+    for path in paths:
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not ts_gates.find_gates(source, language, flag_key, gates):
+            continue
+        if ts_tests.is_test_file(source, language):
+            continue
+        reason = ts_gates.refusal_reason(source, language, flag_key, gates, treatment)
+        if reason is not None:
+            reasons[path] = reason
+        else:
+            found.append(path)
+    if reasons:
+        refused = sorted(reasons)
+        named = "; ".join(f"{path} ({reasons[path]})" for path in refused)
+        logger.warning("refusing to transform for flag %r: %s", flag_key, named)
+        raise UnsafeRewriteError(
+            f"a gate component on flag {flag_key!r} cannot be removed: {named}",
+            refused=refused,
+            discarded=[],
+            reasons=reasons,
+        )
+    return found
+
+
+def _unwrap_gates(
+    summaries,
+    gate_paths: list[str],
+    language: str,
+    flag_key: str,
+    gates: tuple[ts_gates.Gate, ...],
+) -> list:
+    """Unwrap the gates in ``gate_paths``, adding a summary for any file the
+    engine did not touch — a file whose only mention of the flag is a gate."""
+    if not gate_paths:
+        return summaries
+    by_path = {summary.path: summary for summary in summaries}
+    result = list(summaries)
+    for path in gate_paths:
+        summary = by_path.get(path)
+        before = (
+            summary.content
+            if summary is not None
+            else Path(path).read_text(encoding="utf-8")
+        )
+        after, count = ts_gates.unwrap_gates(before, language, flag_key, gates)
+        if not count:
+            continue
+        Path(path).write_text(after, encoding="utf-8")
+        rewrite = Rewrite(path, summary.original_content if summary else before, after)
+        if summary is None:
+            result.append(rewrite)
+        else:
+            result[result.index(summary)] = rewrite
+    return result
+
+
+def _restore_tests_using_key_as_data(
+    summaries, language: str, flag_key: str, repo_dir: str
+) -> tuple[list, tuple[tuple[str, str], ...]]:
+    """Write back, whole, each rewritten test file still naming the key as data."""
+    if not ts_tests.covers(language):
+        return summaries, ()
+    result = []
+    kept: list[tuple[str, str]] = []
+    for summary in summaries:
+        grammar = _grammar_of(summary.path, language)
+        if summary.original_content == summary.content or not ts_tests.is_test_file(
+            summary.content, grammar
+        ):
+            result.append(summary)
+            continue
+        line = ts_tests.data_mention(summary.content, grammar, flag_key)
+        if line is None:
+            result.append(summary)
+            continue
+        Path(summary.path).write_text(summary.original_content, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, summary.original_content))
+        kept.append(
+            (
+                os.path.relpath(summary.path, repo_dir),
+                f"this test still hands the key to the code under test ({line}), "
+                "so its overrides still drive a read of the flag; it was left "
+                "exactly as it was",
+            )
+        )
+    return result, tuple(kept)
+
+
+def _find_pinned_tests(
+    paths: list[str], language: str, flag_key: str, untreated: str
+) -> dict[str, list[ts_tests.PinnedTest]]:
+    """The tests to delete per path; empty outside the TypeScript family.
+
+    An unreadable file yields nothing rather than raising, as in
+    :func:`~flag_cleanup.contradicting.find_contradicting_entries`: what is
+    lost is a deletion, and the pin it would have explained is still stripped.
+    """
+    if not ts_tests.covers(language):
+        return {}
+    found: dict[str, list[ts_tests.PinnedTest]] = {}
+    for path in paths:
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        tests = ts_tests.find_pinned_tests(source, language, flag_key, untreated)
+        if tests:
+            found[path] = tests
+    return found
+
+
+def _delete_pinned_tests(
+    summaries, language: str, pinned: dict[str, list], repo_dir: str
+) -> tuple[list, tuple[tuple[str, str], ...]]:
+    """Delete the chosen tests from each changed file; report each by title."""
+    if not pinned:
+        return summaries, ()
+    result = []
+    deleted: list[tuple[str, str]] = []
+    for summary in summaries:
+        tests = pinned.get(summary.path)
+        if not tests or summary.original_content == summary.content:
+            result.append(summary)
+            continue
+        content, titles = ts_tests.delete_tests(summary.content, language, tests)
+        if not titles:
+            result.append(summary)
+            continue
+        Path(summary.path).write_text(content, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, content))
+        relative = os.path.relpath(summary.path, repo_dir)
+        deleted.extend((relative, title) for title in titles)
+    return result, tuple(deleted)
+
+
+def _external_keys(
+    language: str, resolution: cross_file_keys.Resolution, proven: list[str]
+) -> dict[str, frozenset[str]]:
+    """Per proven Kotlin reader, the argument texts that mean this flag's key.
+
+    Empty for every other language: their readers are folded by generated
+    reader rules, not by a pre-pass.
+    """
+    if language != "kt":
+        return {}
+    return {
+        path: frozenset(
+            ".".join(p for p in (ref.owner, ref.member, ref.accessor) if p)
+            for ref in resolution.readers[str(Path(path).resolve())]
+        )
+        for path in proven
+    }
+
+
+def _drop_stranded_key_imports(summaries, resolution: cross_file_keys.Resolution) -> list:
+    """Remove from each rewritten Kotlin reader the key imports it no longer uses."""
+    if not resolution.readers:
+        return summaries
+    result = []
+    for summary in summaries:
+        if (
+            summary.original_content == summary.content
+            or str(Path(summary.path).resolve()) not in resolution.readers
+        ):
+            result.append(summary)
+            continue
+        cleaned = cross_file_kotlin.drop_stranded_imports(
+            summary.content, resolution.declarations
+        )
+        if cleaned == summary.content:
+            result.append(summary)
+            continue
+        Path(summary.path).write_text(cleaned, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, cleaned))
+    return result
+
+
+def _proven_readers(
+    resolution: cross_file_keys.Resolution, paths: list[str]
+) -> list[str]:
+    """The resolution's proven readers, spelled as they are in ``paths``.
+
+    A reader missing from ``paths`` (outside what the caller let the engine
+    touch) is left out; :func:`_resolve_cross_file` keeps every declaration
+    when that happens.
+    """
+    by_resolved = {str(Path(p).resolve()): p for p in paths}
+    return [by_resolved[r] for r in sorted(resolution.readers) if r in by_resolved]
+
+
+def _resolve_cross_file(
+    repo_dir: str,
+    language: str,
+    flag_key: str,
+    accessors: tuple[str, ...],
+    paths: list[str],
+    with_const: list[str],
+    without_const: list[str],
+) -> tuple[
+    cross_file_keys.Resolution,
+    list[str],
+    frozenset[str],
+    list[str],
+    list[str],
+    list[str],
+]:
+    """Resolve key constants read from other files, and regroup the engine's files.
+
+    Returns ``(resolution, reader_paths, reader_const, regained, with_const,
+    without_const)``:
+
+    * ``reader_paths`` -- the proven readers, for the reader invocation. Only
+      when this language ships ``<base>_xconst.toml``; otherwise a reader stays
+      in the Gate 2 group it was already in.
+    * ``regained`` -- declaring files Gate 2 withheld only because another file
+      reads their constant, which the resolution has now proven deletable. They
+      move to the const group, and only if every proven reader is in
+      ``reader_paths`` (one the reader invocation does not rewrite would be
+      left pointing at nothing) and the file still passes the in-file Gate 2
+      check. Kotlin has no reader invocation: its sentinel pre-pass folds a
+      proven read wherever the reader sits, so there every proven reader has
+      to be among the files handed to the transform instead, and each stays
+      in its Gate 2 group. A declaring file that is also
+      a reader is never regained, so the reader invocation never needs the
+      const rules for a file whose declaration it would delete.
+    * ``reader_const`` -- the readers Gate 2 allowed the const rules for (a
+      reader that also holds the key may declare constants of its own).
+
+    Every file that neither holds the key nor is a proven reader leaves both
+    groups: it is in ``paths`` for the undo snapshot alone.
+    """
+    key_paths = _key_paths(paths, flag_key)
+    resolution = cross_file_keys.resolve(repo_dir, language, flag_key, key_paths, accessors)
+    proven = _proven_readers(resolution, paths)
+    template = RULES_DIR / f"{_language_spec(language).rule_base}_xconst.toml"
+    reader_paths = proven if template.exists() else []
+
+    # The readers this run rewrites. Kotlin's are covered by the pre-pass's
+    # external keys, which `_transform_flag` builds from exactly `proven`.
+    covered = proven if language == "kt" else reader_paths
+    # Every other proven reader -- one in another file type of the family, or
+    # outside the files handed to the transform -- keeps its read, so it keeps
+    # the declaration, and is reported as the reason.
+    resolution = cross_file_keys.report_uncovered(
+        resolution, covered, _language_spec(language).extensions
+    )
+    regained: list[str] = []
+    if len(covered) == len(resolution.readers):
+        deletable = resolution.deletable
+        proven_set = set(proven)
+        for path in without_const:
+            if str(Path(path).resolve()) not in deletable or path in proven_set:
+                continue
+            source = Path(path).read_text(encoding="utf-8")
+            if const_path_is_safe(source, language, flag_key, accessors):
+                regained.append(path)
+    elif resolution.readers:
+        logger.info(
+            "%d proven reader(s) of a key constant are outside the files this "
+            "run rewrites, so every declaration is kept",
+            len(resolution.readers) - len(covered),
+        )
+
+    # A declaring file some refusal keeps loses the const rules, whatever the
+    # in-file gate decided: that gate asks only whether another file spells
+    # the constant's name AND its owner, and a subclass reading it bare, say,
+    # spells only the name. The refusal is what the pull request reports as
+    # the reason the declaration stayed, so it has to stay.
+    withheld = [p for p in with_const if _is_blocked(resolution, p)]
+    with_const = [p for p in with_const if p not in withheld]
+    without_const = without_const + withheld
+
+    keyed = set(key_paths)
+    readers = set(reader_paths)
+    reader_const = frozenset(p for p in with_const if p in readers)
+    stays = keyed | set(proven)
+    with_const = [p for p in with_const + regained if p in stays and p not in readers]
+    without_const = [
+        p for p in without_const if p not in regained and p in stays and p not in readers
+    ]
+    return resolution, reader_paths, reader_const, regained, with_const, without_const
+
+
+def _is_blocked(resolution: cross_file_keys.Resolution, path: str) -> bool:
+    """Whether a refusal keeps a declaration in ``path`` (see ``Resolution.blocked``)."""
+    return str(Path(path).resolve()) in resolution.blocked
+
+
+def _key_paths(paths: list[str], flag_key: str) -> list[str]:
+    return [
+        p
+        for p in paths
+        if flag_key in Path(p).read_text(encoding="utf-8", errors="replace")
+    ]
+
+
+@dataclass(frozen=True)
+class _ReaderGroup:
+    """The readers that share one set of proven references, and their rules.
+
+    A clone matches its reference by TEXT alone -- the bare ``K`` of
+    ``import { NAME as K }``, the ``ns`` of ``import * as ns`` -- and that text
+    means the constant only in the file it was proven in. Another reader can
+    bind the same text to something else entirely (``const K = "other"``), so
+    each reader is run under the clones of its own references and no others.
+
+    A reader whose text lacks the key needs the base seeds' key hole removed,
+    or the engine skips the file (``keyless``). One whose text holds the key
+    too needs them as shipped, or its own direct reads are left standing
+    (``keyed``).
+    """
+
+    paths: frozenset[str]
+    keyless: str
+    keyed: str
+
+
+@dataclass(frozen=True)
+class _ReaderRules:
+    """The rule texts for the reader invocations, and which reader gets which.
+
+    A keyed reader also gets the const rules when Gate 2 allowed them.
+    """
+
+    groups: tuple[_ReaderGroup, ...]
+    keyed_paths: frozenset[str]
+    const_paths: frozenset[str]
+
+
+def _reader_rules(
+    spec: _Language,
+    flag_key: str,
+    rules_file: Path,
+    accessors: tuple[str, ...],
+    resolution: cross_file_keys.Resolution,
+    reader_paths: list[str],
+    reader_const: frozenset[str],
+) -> _ReaderRules | None:
+    if not reader_paths:
+        return None
+    template = (RULES_DIR / f"{spec.rule_base}_xconst.toml").read_text(encoding="utf-8")
+    base = rules_file.read_text(encoding="utf-8")
+    keyed = frozenset(_key_paths(reader_paths, flag_key))
+    # Grouped by the exact set of references each reader was proven to make,
+    # so readers proven alike still share one invocation.
+    by_refs: dict[frozenset, list[str]] = {}
+    for path in reader_paths:
+        refs = resolution.readers[str(Path(path).resolve())]
+        by_refs.setdefault(
+            frozenset((r.owner, r.member, r.accessor) for r in refs), []
+        ).append(path)
+    groups: list[_ReaderGroup] = []
+    for paths in by_refs.values():
+        refs = [
+            ref
+            for path in paths
+            for ref in resolution.readers[str(Path(path).resolve())]
+        ]
+        groups.append(
+            _ReaderGroup(
+                paths=frozenset(paths),
+                keyless=rule_synthesis.cross_file_key_rules(
+                    base, template, refs, accessors=accessors
+                ),
+                keyed=rule_synthesis.cross_file_key_rules(
+                    base, template, refs, accessors=accessors, strip_key_hole=False
+                ),
+            )
+        )
+    return _ReaderRules(
+        groups=tuple(groups),
+        keyed_paths=keyed,
+        const_paths=reader_const & keyed,
     )
 
 
@@ -1298,6 +2131,8 @@ def _execute_groups(
     without_const: list[str],
     const_rules_file: Path,
     collected: list,
+    reader_paths: Iterable[str] = (),
+    reader_rules: _ReaderRules | None = None,
     **kwargs,
 ) -> list:
     """Run the engine over both Gate 2 groups, collecting every summary.
@@ -1315,14 +2150,91 @@ def _execute_groups(
     for group, use_const_rules in ((with_const, True), (without_const, False)):
         if not group:
             continue
-        collected.extend(
-            _execute(
-                paths=group,
-                const_rules_file=const_rules_file if use_const_rules else None,
-                **kwargs,
-            )
+        _execute_each_grammar(
+            collected,
+            paths=group,
+            const_rules_file=const_rules_file if use_const_rules else None,
+            **kwargs,
         )
+    reader_paths = list(reader_paths)
+    if reader_paths and reader_rules is not None:
+        _execute_readers(reader_paths, reader_rules, const_rules_file, collected, kwargs)
     return collected
+
+
+def _execute_each_grammar(
+    collected: list, *, paths: list[str], language: str, **kwargs
+) -> None:
+    """:func:`_execute` once per grammar among ``paths``, extending ``collected``.
+
+    Every path is of ``language`` except a cross-file reader of a sibling file
+    type, which the engine must be handed under its own grammar: the
+    ``typescript`` language silently skips a ``.tsx`` file, and the JSX rules
+    are a compile error under it. ``collected`` is extended after each
+    invocation, for the reason :func:`_execute_groups` gives.
+    """
+    by_grammar: dict[str, list[str]] = {}
+    for path in paths:
+        by_grammar.setdefault(_grammar_of(path, language), []).append(path)
+    for grammar, members in by_grammar.items():
+        overrides: dict[str, object] = {}
+        if grammar != language:
+            spec = _LANGUAGES[grammar]
+            jsx_rules_file, jsx_edges_file = _jsx_rule_files(spec)
+            overrides = {
+                "piranha_language": spec.piranha_id,
+                "jsx_rules_file": jsx_rules_file,
+                "jsx_edges_file": jsx_edges_file,
+            }
+        collected.extend(_execute(paths=members, **{**kwargs, **overrides}))
+
+
+def _execute_readers(
+    reader_paths: list[str],
+    rules: _ReaderRules,
+    const_rules_file: Path,
+    collected: list,
+    kwargs: dict,
+) -> None:
+    """The third invocation: proven cross-file readers, under the reader rules.
+
+    Run once per :class:`_ReaderGroup`, so no reader is handed another
+    reader's clones. A reader without the key gets no entry rules either: every
+    one of them is a seed holding the key hole, and one such seed is enough for
+    the engine to skip a file that lacks the key.
+    """
+    with tempfile.TemporaryDirectory(prefix="flag-cleanup-xconst-") as tmp:
+        for index, group in enumerate(rules.groups):
+            members = [p for p in reader_paths if p in group.paths]
+            if not members:
+                continue
+            keyless = [p for p in members if p not in rules.keyed_paths]
+            keyed_const = [
+                p for p in members if p in rules.keyed_paths and p in rules.const_paths
+            ]
+            keyed_plain = [
+                p
+                for p in members
+                if p in rules.keyed_paths and p not in rules.const_paths
+            ]
+            keyless_file = Path(tmp) / f"xconst_rules_{index}.toml"
+            keyless_file.write_text(group.keyless, encoding="utf-8")
+            keyed_file = Path(tmp) / f"xconst_keyed_rules_{index}.toml"
+            keyed_file.write_text(group.keyed, encoding="utf-8")
+            invocations = (
+                (keyless, keyless_file, None, {**kwargs, "entries_rules_file": None}),
+                (keyed_const, keyed_file, const_rules_file, kwargs),
+                (keyed_plain, keyed_file, None, kwargs),
+            )
+            for paths, rules_file, const_file, group_kwargs in invocations:
+                if not paths:
+                    continue
+                _execute_each_grammar(
+                    collected,
+                    paths=paths,
+                    const_rules_file=const_file,
+                    **{**group_kwargs, "rules_file": rules_file},
+                )
 
 
 def _quarantine_and_retry(
@@ -1331,6 +2243,12 @@ def _quarantine_and_retry(
     flag_key: str,
     run_groups,
     accessors: tuple[str, ...] = (),
+    *,
+    repo_dir: str | None = None,
+    reader_paths: Iterable[str] = (),
+    regained: Iterable[str] = (),
+    proven: Iterable[str] = (),
+    blocked: frozenset[str] = frozenset(),
 ) -> tuple[list, list[str]]:
     """Find the file(s) the engine cannot process, then transform the rest.
 
@@ -1360,8 +2278,24 @@ def _quarantine_and_retry(
     something bad for a file we did understand", and that one must never become a
     partial removal.
     """
-    allowed, _withheld = _partition_by_const_safety(paths, language, flag_key, accessors)
-    const_ok = frozenset(allowed)
+    readers = frozenset(reader_paths)
+    regained_set = frozenset(regained)
+
+    def unblocked(group: list[str]) -> tuple[list[str], list[str]]:
+        """``group`` split into (not kept by a refusal, kept by one)."""
+        kept = [p for p in group if str(Path(p).resolve()) in blocked]
+        return [p for p in group if p not in kept], kept
+
+    allowed, withheld = _partition_by_const_safety(
+        [p for p in paths if p not in readers], language, flag_key, accessors,
+        repo_dir=repo_dir,
+    )
+    allowed, kept = unblocked(allowed)
+    withheld = withheld + kept
+    # The cross-file regrouping is part of the decision the real run made: a
+    # proven reader goes to the reader invocation, and a regained declaring
+    # file to the const group.
+    const_ok = frozenset(allowed) | (regained_set & frozenset(withheld))
     survivors: list[str] = []
     unprocessable: list[str] = []
     for path in paths:
@@ -1371,8 +2305,10 @@ def _quarantine_and_retry(
         # for a reason the real run never had; computing the partition without
         # the accessors would do the mirror image, withholding from the probe a
         # file the real run cleans.
-        one = {"with_const": [path], "without_const": []}
-        if path not in const_ok:
+        one: dict[str, list[str]] = {"with_const": [path], "without_const": []}
+        if path in readers:
+            one = {"with_const": [], "without_const": [], "reader_paths": [path]}
+        elif path not in const_ok:
             one = {"with_const": [], "without_const": [path]}
         probe: list = []
         try:
@@ -1389,12 +2325,29 @@ def _quarantine_and_retry(
             _restore(probe)
     if not survivors:
         return [], unprocessable
-    with_const, without_const = _partition_by_const_safety(survivors, language, flag_key)
+    with_const, without_const = _partition_by_const_safety(
+        [p for p in survivors if p not in readers], language, flag_key, accessors,
+        repo_dir=repo_dir,
+    )
+    with_const, kept = unblocked(with_const)
+    without_const = without_const + kept
+    # A regained declaration may go only while every proven reader is still
+    # being rewritten. One the engine could not process keeps reading it.
+    # `proven` adds the readers a pre-pass folds in their own Gate 2 group
+    # (Kotlin), which `reader_paths` never lists.
+    if not (readers | frozenset(proven)) & frozenset(unprocessable):
+        back = [p for p in without_const if p in regained_set]
+        with_const = with_const + back
+        without_const = [p for p in without_const if p not in back]
+    groups: dict[str, list[str]] = {
+        "with_const": with_const,
+        "without_const": without_const,
+    }
+    if readers:
+        groups["reader_paths"] = [p for p in survivors if p in readers]
     summaries: list = []
     try:
-        run_groups(
-            with_const=with_const, without_const=without_const, collected=summaries
-        )
+        run_groups(collected=summaries, **groups)
     except PiranhaTransformError:
         # A file that passed its own probe and then aborted in company. Nothing
         # sound is left to offer, so restore and let the caller report the abort.
@@ -1473,13 +2426,14 @@ def _sentinel_prepass(
     flag_key: str,
     accessors: tuple[str, ...] = (),
     const_key_paths: frozenset[str] = frozenset(),
+    external_keys: dict[str, frozenset[str]] | None = None,
 ) -> kotlin_sentinel.SentinelPrePass | None:
     """The pre-pass this language needs, or ``None`` for the languages that don't.
 
     Only Kotlin has one, and it is a workaround for a specific engine
     limitation rather than a general stage — see
     :mod:`flag_cleanup.kotlin_sentinel`. Keeping the decision in one function
-    means the three places `run_piranha` has to care about it all ask the same
+    means the places `run_piranha` has to care about it all ask the same
     question.
     """
     if language != "kt":
@@ -1489,6 +2443,7 @@ def _sentinel_prepass(
         sentinel=kotlin_sentinel.sentinel_for(flag_key),
         accessors=accessors,
         const_key_paths=const_key_paths,
+        external_keys=dict(external_keys or {}),
     )
 
 
@@ -1504,7 +2459,7 @@ def _tidy_trailing_whitespace(summaries, language: str) -> list:
             tidied.append(summary)
             continue
         cleaned = strip_introduced_trailing_whitespace(
-            summary.original_content, summary.content, language
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
         )
         if cleaned == summary.content:
             tidied.append(summary)
@@ -1528,7 +2483,7 @@ def _collapse_entry_double_spaces(summaries, language: str, entry_paths: set[str
             tidied.append(summary)
             continue
         cleaned = collapse_introduced_double_spaces(
-            summary.original_content, summary.content, language
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
         )
         if cleaned == summary.content:
             tidied.append(summary)
@@ -1556,7 +2511,7 @@ def _collapse_entry_carriage_returns(summaries, language: str, entry_paths: set[
             tidied.append(summary)
             continue
         cleaned = collapse_introduced_carriage_returns(
-            summary.original_content, summary.content, language
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
         )
         if cleaned == summary.content:
             tidied.append(summary)
@@ -1575,7 +2530,9 @@ def _strip_type_separators(summaries, language: str, entry_paths: set[str]) -> l
         if summary.original_content == summary.content or summary.path not in entry_paths:
             tidied.append(summary)
             continue
-        cleaned = strip_dangling_type_separators(summary.content, language)
+        cleaned = strip_dangling_type_separators(
+            summary.content, _grammar_of(summary.path, language)
+        )
         if cleaned == summary.content:
             tidied.append(summary)
             continue
@@ -1648,6 +2605,26 @@ def _fold_ruby_literals(summaries) -> list:
     return folded
 
 
+def _apply_literal_fold(summaries, fold) -> list:
+    """Run a ``(before, after, path) -> after`` post-engine fold over every summary.
+
+    Writes the result back, because the PR path commits from the working tree
+    and Gate 1 must judge the bytes that stay on disk.
+    """
+    folded = []
+    for summary in summaries:
+        if summary.original_content == summary.content:
+            folded.append(summary)
+            continue
+        result = fold(summary.original_content, summary.content, summary.path)
+        if result == summary.content:
+            folded.append(summary)
+            continue
+        Path(summary.path).write_text(result, encoding="utf-8")
+        folded.append(Rewrite(summary.path, summary.original_content, result))
+    return folded
+
+
 #: Rounds of (inline → re-run the engine) before the Python marker pass gives
 #: up. A runaway guard only: every round deletes at least one binding and a
 #: file holds finitely many, so it converges on its own. Chaining needs more
@@ -1658,9 +2635,32 @@ def _fold_ruby_literals(summaries) -> list:
 _MAX_MARKER_ROUNDS = 5
 
 
+def _inline_python_bindings(before: str, after: str, marker: str, *, language: str) -> str:
+    del language  # one grammar; the signature matches the TypeScript inliner's
+    return inline_literal_bindings(before, after, marker)
+
+
+def _inline_ts_bindings(before: str, after: str, marker: str, *, language: str) -> str:
+    return ts_fold.inline_literal_bindings(before, after, language, marker)
+
+
+#: The languages whose post-engine inliner hands its result back to the engine
+#: through a marker rule. Each needs that rule in its base rules file; a
+#: language listed here without one would have every marker survive and every
+#: such file unwound, which is safe and useless.
+_BOUND_LITERAL_INLINERS = {
+    "python": _inline_python_bindings,
+    "ts": _inline_ts_bindings,
+    "tsx": _inline_ts_bindings,
+    "js": _inline_ts_bindings,
+}
+
+
 def _inline_bound_reads(
     summaries,
     *,
+    inline,
+    language: str,
     run_groups,
     with_const: list[str],
     marker: str,
@@ -1668,7 +2668,7 @@ def _inline_bound_reads(
     entries: tuple[tuple[str, str], ...],
     entry_paths: set[str],
 ):
-    """Resolve Python reads bound to a local, through the engine (#3029).
+    """Resolve reads the fold left bound to a local, through the engine (#3029).
 
     `python_fold.inline_literal_bindings` is the only way a read bound to a
     name is resolved at all — no rule of ours can do it, because the useful
@@ -1688,6 +2688,12 @@ def _inline_bound_reads(
     second copy of the engine's cascade is what kept the TypeScript parenthesis
     defect alive in the engine for a full release, because the downstream copy
     was the one running.
+
+    The TypeScript family runs the same loop with
+    :func:`flag_cleanup.ts_fold.inline_literal_bindings`, for a different gap:
+    its const rules inline a binding of the READ, but not one of an expression
+    around it that only the fold turns into a literal (``const show = on ||
+    x``). ``inline`` is whichever of the two the language uses.
 
     Five things are load-bearing:
 
@@ -1731,8 +2737,11 @@ def _inline_bound_reads(
         for path, summary in current.items():
             if summary.original_content == summary.content or path in declined:
                 continue
-            inlined = inline_literal_bindings(
-                summary.original_content, summary.content, marker
+            inlined = inline(
+                summary.original_content,
+                summary.content,
+                marker,
+                language=_grammar_of(path, language),
             )
             if inlined != summary.content:
                 staged[path] = (summary.content, inlined)
@@ -1751,7 +2760,7 @@ def _inline_bound_reads(
             )
         except PiranhaTransformError:
             logger.warning(
-                "the transform engine aborted while resolving %d Python "
+                "the transform engine aborted while resolving %d "
                 "read(s) bound to a local; those file(s) keep the result of "
                 "the previous pass: %s",
                 len(staged),
@@ -1826,7 +2835,7 @@ def _reindent_folds(summaries, language: str) -> list:
             reindented.append(summary)
             continue
         result = reindent_spliced_lines(
-            summary.original_content, summary.content, language
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
         )
         if result == summary.content:
             reindented.append(summary)
@@ -1839,7 +2848,7 @@ def _reindent_folds(summaries, language: str) -> list:
 def _remove_stranded_statements(
     summaries, language: str, repo_dir: str
 ) -> tuple[list, tuple[tuple[str, str], ...]]:
-    """Delete unreachable statements from each changed file; report what went.
+    """Delete unreachable statements and dead loops from each changed file; report what went.
 
     Paths are reported relative to ``repo_dir`` because they end up in a pull
     request body, where an absolute container path means nothing.
@@ -1850,9 +2859,14 @@ def _remove_stranded_statements(
         if summary.original_content == summary.content:
             cleaned_summaries.append(summary)
             continue
+        grammar = _grammar_of(summary.path, language)
         cleaned, removed = remove_unreachable_statements(
-            summary.original_content, summary.content, language
+            summary.original_content, summary.content, grammar
         )
+        # Dead loops in the languages that pass does not cover, reported in the
+        # same list: both are code that could never run, and the customer wrote it.
+        cleaned, dead = remove_dead_loops(summary.original_content, cleaned, grammar)
+        removed = removed + dead
         if not removed:
             cleaned_summaries.append(summary)
             continue
@@ -1866,7 +2880,7 @@ def _remove_stranded_statements(
 
 
 def _remove_stranded_bindings(
-    summaries, language: str, repo_dir: str
+    summaries, language: str, repo_dir: str, *, include_methods: bool = False
 ) -> tuple[list, tuple[tuple[str, str, str], ...]]:
     """Delete the imports and locals each fold stranded; report what went.
 
@@ -1879,8 +2893,14 @@ def _remove_stranded_bindings(
         if summary.original_content == summary.content:
             cleaned_summaries.append(summary)
             continue
+        grammar = _grammar_of(summary.path, language)
         cleaned, acted = remove_stranded_bindings(
-            summary.original_content, summary.content, language
+            summary.original_content,
+            summary.content,
+            grammar,
+            include_methods=include_methods,
+            path=summary.path,
+            root=repo_dir,
         )
         if not acted:
             cleaned_summaries.append(summary)
@@ -1890,8 +2910,54 @@ def _remove_stranded_bindings(
             Rewrite(summary.path, summary.original_content, cleaned)
         )
         relative = os.path.relpath(summary.path, repo_dir)
-        bindings.extend((relative, c.kind, c.text) for c in acted)
+        kept = "marked import" if grammar == "python" else "bare import"
+        bindings.extend(
+            (relative, kept, c.replacement)
+            if c.replacement is not None
+            else (relative, c.kind, c.text)
+            for c in acted
+        )
     return cleaned_summaries, tuple(bindings)
+
+
+def _settle_test_doubles(
+    summaries,
+    doubles: list[mock_stubs.Prepass] | None,
+    language: str,
+    accessors: tuple[str, ...],
+    repo_dir: str,
+    unprocessable: list[str],
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Keep or undo the test-double pre-pass, after the engine.
+
+    A stub is deleted on the strength of the read it stubs having been folded,
+    and that read usually lives in another file. If no rewrite in this run
+    removed a real read — a key the rules cannot match, or ``tests/``
+    configured as a directory of its own — everything is undone and
+    :func:`transform_flag` runs again without the pass (see there for why
+    keeping the engine's output is not an option).
+
+    Kept, every edited file becomes a summary whose "before" is the
+    customer's own text, so the diff, Gate 1 and the rollback all see it.
+    """
+    stub_pass = doubles[0] if doubles else None
+    if stub_pass is None or not stub_pass.originals:
+        return summaries, ()
+    # A file the engine could not process is reported as left untouched.
+    stub_pass.withdraw(unprocessable)
+    if not stub_pass.originals:
+        return summaries, ()
+    changed = [s for s in summaries if s.original_content != s.content]
+    if any(
+        mock_stubs.folded_a_read(
+            s.original_content, s.content, _grammar_of(s.path, language), accessors
+        )
+        for s in changed
+    ):
+        return stub_pass.rebase(summaries, Rewrite), stub_pass.report(repo_dir)
+    _restore(changed)
+    stub_pass.restore_all()
+    raise _NoReadFolded
 
 
 def _restore(summaries: Iterable) -> None:
@@ -1908,8 +2974,112 @@ def _restore(summaries: Iterable) -> None:
             Path(summary.path).write_text(summary.original_content, encoding="utf-8")
 
 
+def checkout_root(repo_dir: str) -> str:
+    """The root of the git checkout holding ``repo_dir``, or ``repo_dir`` itself.
+
+    ``repo_dir`` is the directory this run was configured to transform, which
+    can be a subdirectory of the repository. A file elsewhere in the same
+    checkout can still read a constant declared under it, so every question of
+    the form "does anything else mention this?" is asked of the whole
+    checkout. Read-only (`git rev-parse`); outside a git checkout the answer is
+    ``repo_dir``.
+    """
+    directory = Path(repo_dir)
+    if not directory.is_dir():
+        directory = directory.parent
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        top = ""
+    else:
+        top = result.stdout.strip()
+    if top:
+        return top
+    if repo_dir not in _OUTSIDE_A_CHECKOUT:
+        _OUTSIDE_A_CHECKOUT.add(repo_dir)
+        logger.info(
+            "%s is not inside a git checkout; other readers of a key constant are "
+            "looked for under it only",
+            repo_dir,
+        )
+    return repo_dir
+
+
+#: The directories :func:`checkout_root` has already reported falling back for.
+_OUTSIDE_A_CHECKOUT: set[str] = set()
+
+
+def _source_index(repo_dir: str) -> dict[Path, str]:
+    """Every readable source file in ``repo_dir``'s checkout (resolved path -> text).
+
+    The whole checkout, not just ``repo_dir``: a reader outside the configured
+    directory is still a reader (see :func:`checkout_root`). Built once per
+    partition and shared by every declaring file in it. Every source extension
+    the tool knows is included, because a constant declared in one language is
+    routinely read from another (a Java constant from Kotlin, a TS constant from
+    a .js file). The files are :mod:`~flag_cleanup.source_index`'s listing; the
+    text is read here, because a pass earlier in the same flag may have
+    rewritten it.
+    """
+    index: dict[Path, str] = {}
+    for source in source_index.files(repo_dir, KNOWN_EXTENSIONS):
+        try:
+            index[Path(source.resolved)] = source.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return index
+
+
+def _token(word: str) -> re.Pattern[str]:
+    # Shared with the cross-file resolution, so both count a `"$NAME"`
+    # template as a mention; see `cross_file_keys.mention_pattern`.
+    return cross_file_keys.mention_pattern([word])
+
+
+def _referenced_elsewhere(
+    index: dict[Path, str],
+    declaring_path: str,
+    consts: tuple[VisibleKeyConst, ...],
+) -> list[str]:
+    """Other source files that could be reading one of ``consts``.
+
+    Deliberately textual and deliberately wide: a comment or a string naming the
+    constant counts. The question is whether deleting the declaration could
+    strand something, and over-answering "yes" only keeps a line that a later
+    run will remove once the readers are resolved. A reader has to mention the
+    constant's name and, for a type member, the owning type's name too; an
+    unexported Go name is only readable from the declaring directory.
+    """
+    declaring = Path(declaring_path).resolve()
+    patterns = [
+        (c, _token(c.name), _token(c.owner) if c.owner else None) for c in consts
+    ]
+    hits: list[str] = []
+    for path, text in index.items():
+        if path == declaring:
+            continue
+        for const, name_re, owner_re in patterns:
+            if const.same_directory_only and path.parent != declaring.parent:
+                continue
+            if name_re.search(text) and (owner_re is None or owner_re.search(text)):
+                hits.append(str(path))
+                break
+    return hits
+
+
 def _partition_by_const_safety(
-    paths: list[str], language: str, flag_key: str, accessors: tuple[str, ...] = ()
+    paths: list[str],
+    language: str,
+    flag_key: str,
+    accessors: tuple[str, ...] = (),
+    *,
+    repo_dir: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Split candidate files into (const rules allowed, const rules withheld).
 
@@ -1919,8 +3089,16 @@ def _partition_by_const_safety(
     are half the answer -- pass one without the other and the feature is either
     inert (gate withholds the file the clone would have cleaned) or unsafe (the
     delete rule strands a reference nothing rewrote). See #2730.
+
+    ``repo_dir`` extends that question past the file. The const rules' delete
+    guard is file-scoped, so a declaration that another file could read would be
+    deleted with nothing left to define it. Such a file is withheld whole, and
+    "another file" means anywhere in ``repo_dir``'s git checkout. A
+    declaration no other file can name (private, local, not exported) is never
+    withheld on that ground, however many other files reuse its identifier.
     """
     allowed, withheld = [], []
+    index: dict[Path, str] | None = None
     for path in paths:
         try:
             source = Path(path).read_text(encoding="utf-8")
@@ -1928,6 +3106,21 @@ def _partition_by_const_safety(
             withheld.append(path)
             continue
         allowed_here = const_path_is_safe(source, language, flag_key, accessors)
+        if allowed_here and repo_dir is not None:
+            consts = externally_visible_key_consts(source, language, flag_key)
+            if consts:
+                if index is None:
+                    index = _source_index(repo_dir)
+                elsewhere = _referenced_elsewhere(index, path, consts)
+                if elsewhere:
+                    logger.info(
+                        "%s: key constant %s is referenced from %d other file(s), "
+                        "so its declaration is kept",
+                        path,
+                        ", ".join(c.name for c in consts),
+                        len(elsewhere),
+                    )
+                    allowed_here = False
         (allowed if allowed_here else withheld).append(path)
     return allowed, withheld
 

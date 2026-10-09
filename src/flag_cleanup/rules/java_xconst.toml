@@ -1,0 +1,133 @@
+# Reader rules for a flag key hoisted to a constant declared in ANOTHER file.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `Owner.NAME`, `# xconst: bare` for a
+# statically imported `NAME`.
+#
+# Blocks marked `# xconst: enum-*` match a read through an enum entry's
+# accessor (`Flags.X.key()`, `Flags.X.key`, or the statically imported
+# `X.key()` / `X.key`), with __XCONST_ACCESSOR__ replaced by the accessor's name.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules. Which reads are this
+# flag's was proven before the engine ran.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_boolvariation_read"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list . (field_access object: (identifier) @key_owner field: (identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_boolvariation_read"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list . (identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-call
+name = "xconst_enum_qualified_call_boolvariation_read"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list
+      . (method_invocation
+          object: (field_access object: (identifier) @key_owner field: (identifier) @key_member)
+          name: (identifier) @key_accessor
+          arguments: (argument_list) @key_accessor_args))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+  (#eq? @key_accessor_args "()")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_qualified_field_boolvariation_read"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list
+      . (field_access
+          object: (field_access object: (identifier) @key_owner field: (identifier) @key_member)
+          field: (identifier) @key_accessor))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-bare-call
+name = "xconst_enum_bare_call_boolvariation_read"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list
+      . (method_invocation
+          object: (identifier) @key_member
+          name: (identifier) @key_accessor
+          arguments: (argument_list) @key_accessor_args))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+  (#eq? @key_accessor_args "()")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-bare-field
+name = "xconst_enum_bare_field_boolvariation_read"
+query = """(
+  (method_invocation
+    name: (identifier) @sdk_fn
+    arguments: (argument_list
+      . (field_access object: (identifier) @key_member field: (identifier) @key_accessor))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]

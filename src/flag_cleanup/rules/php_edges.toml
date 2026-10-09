@@ -35,3 +35,17 @@
 scope = "Parent"
 from = "if_cleanup"
 to = ["php_emptied_else_cleanup"]
+
+# A folded early return strands everything after it, and the built-in
+# `delete_all_statements_after_return` removes ONE statement per firing: the
+# engine resolves `replace_node = "trailing"` to the first node bearing that
+# capture, and nothing fires the rule again on what is left. Measured:
+# `if (<read>) { return 1; } a(); b(); return 2;` came out as
+# `return 1; b(); return 2;`. The self-edge re-fires it on the parent block
+# until no statement follows the return — the same edge the engine's own Ruby
+# graph carries. Parent scope matches the `if_cleanup` edge that reaches the
+# rule in the first place, so this reaches nothing the first firing could not.
+[[edges]]
+scope = "Parent"
+from = "delete_all_statements_after_return"
+to = ["delete_all_statements_after_return"]
