@@ -74,7 +74,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -83,6 +83,10 @@ import tree_sitter_kotlin
 from tree_sitter import Language, Node, Parser
 
 logger = logging.getLogger(__name__)
+
+#: A byte range to mark, and optionally the text written after the sentinel:
+#: ``"()"`` for a read with no call of its own (a property getter).
+Span = tuple[int, int] | tuple[int, int, str]
 
 #: The Kotlin SDK's boolean read. One name, matched exactly — the Kotlin/Android
 #: client SDK exposes `boolVariation(key, defaultValue)` and nothing else that
@@ -425,6 +429,8 @@ def rewrite(
     accessors: tuple[str, ...] = DEFAULT_ACCESSORS,
     resolve_consts: bool = True,
     external: Mapping[str, str] | None = None,
+    extra_spans: Iterable[Span] = (),
+    marks_reads: bool = True,
 ) -> str | None:
     """``source`` with every matching callee replaced by ``sentinel``.
 
@@ -432,19 +438,39 @@ def rewrite(
     leaves it untouched, which keeps a file that cannot change out of the
     restore bookkeeping entirely.
 
-    Raises :class:`SentinelCollisionError` if ``sentinel`` already occurs.
+    ``extra_spans`` are byte ranges proven elsewhere to stand for a read of
+    this flag: the callee of a call to a keyless wrapper, see
+    :mod:`flag_cleanup.wrapper_inline`. They are marked like a read's callee.
+    A span's optional third element is written after the sentinel.
+    ``marks_reads=False`` marks only those, without parsing the source as
+    Kotlin at all — the mode a Java file is marked in.
+
+    Raises :class:`SentinelCollisionError` if ``sentinel`` already occurs, and
+    ``ValueError`` if two spans overlap: a read and a wrapper call never do,
+    so an overlap is a defect upstream, and splicing it would corrupt the file.
     """
     if sentinel in source:
         raise SentinelCollisionError(
             f"{sentinel!r} already appears in this source, so a rewrite could "
             "not be told apart from what was already there"
         )
-    spans = _callee_spans(source, flag_key, accessors, resolve_consts, external)
-    if not spans:
+    spans = (
+        _callee_spans(source, flag_key, accessors, resolve_consts, external)
+        if marks_reads
+        else []
+    )
+    marks = {(start, end): "" for start, end in spans}
+    for span in extra_spans:
+        marks[(span[0], span[1])] = span[2] if len(span) > 2 else ""
+    ordered = sorted(marks, reverse=True)
+    for (start, _end), (_start, previous_end) in zip(ordered, ordered[1:]):
+        if previous_end > start:
+            raise ValueError(f"overlapping sentinel spans at byte {start}")
+    if not ordered:
         return None
     raw = source.encode("utf-8")
-    for start, end in spans:
-        raw = raw[:start] + sentinel.encode("ascii") + raw[end:]
+    for start, end in ordered:
+        raw = raw[:start] + (sentinel + marks[(start, end)]).encode("ascii") + raw[end:]
     return raw.decode("utf-8")
 
 
@@ -485,6 +511,13 @@ class SentinelPrePass:
     #: cross-file resolution, for the readers it proved; see
     #: :mod:`flag_cleanup.cross_file_kotlin`.
     external_keys: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: path -> byte ranges of calls to a keyless wrapper the wrapper pass
+    #: proved stand for a read of this flag. Marked like a read's callee; see
+    #: :mod:`flag_cleanup.wrapper_inline`.
+    extra_spans: dict[str, tuple[Span, ...]] = field(default_factory=dict)
+    #: False for a language with no Kotlin read to mark (Java): only
+    #: ``extra_spans`` are marked, and the source is never parsed as Kotlin.
+    marks_reads: bool = True
 
     #: path -> the file's text before this pre-pass touched it.
     originals: dict[str, str] = field(default_factory=dict)
@@ -514,6 +547,8 @@ class SentinelPrePass:
                         text: self.flag_key
                         for text in self.external_keys.get(path, frozenset())
                     },
+                    extra_spans=self.extra_spans.get(path, ()),
+                    marks_reads=self.marks_reads,
                 )
             except SentinelCollisionError:
                 self.failed_path = path

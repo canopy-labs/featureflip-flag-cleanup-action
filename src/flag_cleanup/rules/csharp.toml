@@ -72,6 +72,55 @@
 # than this call — ordinary, unrelated code in the same file was verified to be
 # left untouched (Piranha's edges only reach ancestors of the actual rewrite
 # site), so this tool cannot trigger it.
+
+# --- @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
+#
+# Reached ONLY through the wrapper pass (`wrapper_inline`), which proves that a
+# call such as `_flags.IsCheckoutEnabled(userId)` or a property read such as
+# `_flags.IsCheckoutEnabled` is bound to a member whose whole body is a read of
+# this flag, and replaces it with the run's sentinel identifier:
+# `__ff_cleanup_<hash>(userId)`, or `__ff_cleanup_<hash>()` for a property,
+# which has no call of its own. Which reads are this flag's was decided there,
+# one by one, so these rules check nothing but the sentinel. A sentinel these
+# rules do not consume is a refusal, never a diff (`SentinelPrePass.survived`).
+#
+# The wrapper is declared `bool` (never `bool?`, never `Task<bool>`), so the
+# literal substituted here has the type the call had, and the nullable-bool
+# note above holds for it unchanged. No expression-tree filter: the pass
+# refuses a call whose receiver is a lambda's own parameter, which is the shape
+# that filter exists for, and a call inside a mocking statement.
+#
+# Holes name `sentinel` and not `stale_flag_name`: a call-site file names no
+# key, and the engine skips a file holding none of a seed's hole values.
+#
+# The discarded-statement rule comes first, for the reason the two below it
+# do: `true;` is not a C# statement (CS0201), and declared second it would
+# never fire. Only a method can be called as a statement, and the pass refuses
+# every call whose arguments hold a call, an assignment or an increment.
+[[rules]]
+name = "delete_discarded_sentinel_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: (identifier) @sdk_fn)) @statement
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["sentinel"]
+
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (invocation_expression
+    function: (identifier) @sdk_fn) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
 # --- reads whose value is DISCARDED -> the whole statement is deleted
 #
 # Same defect as Java's and Go's (#2691), reached by a different route and so

@@ -28,7 +28,8 @@
 # neither. THE INVARIANT: the rules and the gate must accept the SAME set of
 # declaration forms. `_swift_key_consts` accepts a `let` property declaration
 # whose initialiser is exactly the key, at file scope, in a type body, or local
-# to a function — which is what the three scopes below enumerate.
+# to a function — which is what the four scopes below enumerate (a caseless
+# `enum` holding keys has an `enum_class_body`, not a `class_body`).
 #
 # EXACTLY ONE binding per declaration. `let k = "old-checkout", other = "x"`
 # is ONE `property_declaration` holding the name/value pairs as flat siblings,
@@ -90,6 +91,16 @@ enclosing_node = """(
        . (type_annotation)
        . (line_string_literal (_) @flag_name) .)])
    (class_body
+     [(property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])
+   (enum_class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
@@ -165,6 +176,16 @@ enclosing_node = """(
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
        . (line_string_literal (_) @flag_name) .)])
+   (enum_class_body
+     [(property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @decl_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)])
    (statements
      [(property_declaration
        (value_binding_pattern) @binding
@@ -218,6 +239,16 @@ query = """(
        . (pattern (simple_identifier) @variable_name)
        . (type_annotation)
        . (line_string_literal (_) @flag_name) .)] @declaration)
+   (enum_class_body
+     [(property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @variable_name)
+       . (line_string_literal (_) @flag_name) .)
+      (property_declaration
+       (value_binding_pattern) @binding
+       . (pattern (simple_identifier) @variable_name)
+       . (type_annotation)
+       . (line_string_literal (_) @flag_name) .)] @declaration)
    (statements
      [(property_declaration
        (value_binding_pattern) @binding
@@ -236,7 +267,7 @@ replace = ""
 holes = ["stale_flag_name"]
 
 [[rules.filters]]
-enclosing_node = """([(source_file) (class_body) (function_declaration)] @container)"""
+enclosing_node = """([(source_file) (class_body) (enum_class_body) (function_declaration)] @container)"""
 not_contains = ["""(
   (call_expression
     (call_suffix

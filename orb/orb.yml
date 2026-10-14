@@ -1,0 +1,307 @@
+version: 2.1
+
+description: >-
+  Remove dead and stale feature flags from a GitHub-hosted repository with
+  Featureflip. Each run reads removal candidates from your Featureflip
+  project, rewrites the code that reads each flag with AST-level transforms,
+  and opens one pull request per flag. No LLM is involved. It runs the same
+  image as the Featureflip Flag Cleanup GitHub Action, so the supported
+  languages, safety checks and pull requests are identical. The repository
+  must be hosted on GitHub, because the pull requests are opened there.
+
+display:
+  home_url: https://featureflip.io/docs/integrations/flag-cleanup-action/
+  source_url: https://github.com/canopy-labs/featureflip-flag-cleanup-action
+
+executors:
+  default:
+    description: >-
+      A Linux machine with Docker. The cleanup image runs with the checkout
+      bind-mounted, which a Docker executor cannot do.
+    parameters:
+      machine-image:
+        type: string
+        default: ubuntu-2404:current
+    machine:
+      image: << parameters.machine-image >>
+
+commands:
+  cleanup:
+    description: >-
+      Run flag cleanup against the checked-out repository in the working
+      directory. Needs Docker and a bind mount, so use it on a machine
+      executor after `checkout`.
+    parameters:
+      api-token:
+        type: env_var_name
+        default: FEATUREFLIP_API_TOKEN
+        description: >-
+          Name of the environment variable holding your Featureflip API token.
+          Store the token in a context or project environment variable. The
+          `remove` mode needs the Viewer role, and Member as well to link each
+          pull request on its flag. `archive-sweep` needs a separate token with
+          the Member role.
+      github-token:
+        type: env_var_name
+        default: GITHUB_TOKEN
+        description: >-
+          Name of the environment variable holding a GitHub token that can push
+          branches and open pull requests on this repository (contents and
+          pull requests write). Not needed for a dry run.
+      org:
+        type: string
+        description: Featureflip organization slug.
+      project:
+        type: string
+        description: Featureflip project slug.
+      mode:
+        type: enum
+        enum: ["remove", "archive-sweep"]
+        default: remove
+        description: >-
+          `remove` opens removal pull requests. `archive-sweep` archives flags
+          whose removal pull request has merged. The GitHub Action's
+          event-driven modes are not offered here, because they read a GitHub
+          Actions event payload that CircleCI does not have.
+      deployed-refs:
+        type: string
+        default: ""
+        description: >-
+          `archive-sweep` only. Refs that must contain a removal before its
+          flag is archived. Empty archives on the merge alone.
+      api-url:
+        type: string
+        default: https://api.featureflip.io
+        description: Featureflip API origin.
+      staleness:
+        type: string
+        default: dead
+        description: Which candidates to fetch, `dead` (ready-for-review pull requests) or `stale` (draft pull requests).
+      accessors:
+        type: string
+        default: ""
+        description: >-
+          Comma-separated names of your own functions that read a flag, on top
+          of the SDK's. Without them a wrapped read is invisible to the run.
+      inline-wrappers:
+        type: boolean
+        default: true
+        description: >-
+          Inline a Kotlin, Java or C# wrapper whose whole body reads the flag
+          being removed (a method, a Kotlin property getter or top-level
+          function, or a C# get-only bool property), at every call site that
+          is provably bound to it.
+      languages:
+        type: string
+        default: ""
+        description: Comma-separated languages to process. Empty means all.
+      directories:
+        type: string
+        default: "."
+        description: Comma-separated directories to scan, relative to the checkout.
+      ignore:
+        type: string
+        default: ""
+        description: Comma-separated flag keys to skip even when they are removal candidates.
+      flags:
+        type: string
+        default: ""
+        description: Comma-separated flag keys to limit the run to. Empty means every candidate.
+      base-branch:
+        type: string
+        default: ""
+        description: Branch to open pull requests against. Empty means the repository default.
+      pr-labels:
+        type: string
+        default: ""
+        description: Comma-separated labels to add to each pull request.
+      max-prs:
+        type: integer
+        default: 10
+        description: Most pull requests to open in one run.
+      dry-run:
+        type: boolean
+        default: false
+        description: >-
+          Print the diff each flag would get and open nothing. Worth doing on
+          the first run.
+      repository:
+        type: string
+        default: ""
+        description: >-
+          The GitHub repository as `owner/name`. Empty derives it from the
+          CircleCI project, which works for projects that follow a GitHub
+          repository.
+      github-server-url:
+        type: string
+        default: https://github.com
+        description: GitHub web origin. Change it only for GitHub Enterprise Server.
+      github-api-url:
+        type: string
+        default: https://api.github.com
+        description: GitHub API origin. Change it only for GitHub Enterprise Server.
+      image:
+        type: string
+        default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v1
+        description: The cleanup image. Pin a full version or a digest to stop it moving.
+    steps:
+      - run:
+          name: Featureflip flag cleanup
+          command: |
+            set -euo pipefail
+
+            repository="<< parameters.repository >>"
+            if [ -z "$repository" ]; then
+              if [ -z "${CIRCLE_PROJECT_USERNAME:-}" ] || [ -z "${CIRCLE_PROJECT_REPONAME:-}" ]; then
+                echo "Could not work out the GitHub repository from this pipeline. Set the orb's repository parameter to owner/name." >&2
+                exit 2
+              fi
+              repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+            fi
+
+            server_host="<< parameters.github-server-url >>"
+            server_host="${server_host#*://}"
+            server_host="${server_host%%/*}"
+            case "${CIRCLE_REPOSITORY_URL:-}" in
+              "" | *"@${server_host}:"* | *"://${server_host}/"*) ;;
+              *)
+                echo "This project is hosted at ${CIRCLE_REPOSITORY_URL}, not on ${server_host}. Flag cleanup opens GitHub pull requests, so it needs a GitHub-hosted repository." >&2
+                exit 2
+                ;;
+            esac
+
+            # Secrets are exported and passed to docker by NAME, so their
+            # values never appear in a process's argument list.
+            export FEATUREFLIP_API_TOKEN="${<< parameters.api-token >>:-}"
+            export GITHUB_TOKEN="${<< parameters.github-token >>:-}"
+            export GITHUB_REPOSITORY="$repository"
+            export GITHUB_SERVER_URL="<< parameters.github-server-url >>"
+            export GITHUB_API_URL="<< parameters.github-api-url >>"
+            export FEATUREFLIP_ORG="<< parameters.org >>"
+            export FEATUREFLIP_PROJECT="<< parameters.project >>"
+            export FEATUREFLIP_API_URL="<< parameters.api-url >>"
+            export FEATUREFLIP_MODE="<< parameters.mode >>"
+            export FEATUREFLIP_DEPLOYED_REFS="<< parameters.deployed-refs >>"
+            export FEATUREFLIP_STALENESS="<< parameters.staleness >>"
+            export FEATUREFLIP_LANGUAGES="<< parameters.languages >>"
+            export FEATUREFLIP_ACCESSORS="<< parameters.accessors >>"
+            export FEATUREFLIP_INLINE_WRAPPERS="<< parameters.inline-wrappers >>"
+            export FEATUREFLIP_DIRECTORIES="<< parameters.directories >>"
+            export FEATUREFLIP_IGNORE="<< parameters.ignore >>"
+            export FEATUREFLIP_FLAGS="<< parameters.flags >>"
+            export FEATUREFLIP_BASE_BRANCH="<< parameters.base-branch >>"
+            export FEATUREFLIP_PR_LABELS="<< parameters.pr-labels >>"
+            export FEATUREFLIP_MAX_PRS="<< parameters.max-prs >>"
+            export FEATUREFLIP_DRY_RUN="<< parameters.dry-run >>"
+
+            docker run --rm \
+              -v "$PWD:/workspace" \
+              -w /workspace \
+              -e FEATUREFLIP_API_TOKEN \
+              -e GITHUB_TOKEN \
+              -e GITHUB_REPOSITORY \
+              -e GITHUB_SERVER_URL \
+              -e GITHUB_API_URL \
+              -e FEATUREFLIP_ORG \
+              -e FEATUREFLIP_PROJECT \
+              -e FEATUREFLIP_API_URL \
+              -e FEATUREFLIP_MODE \
+              -e FEATUREFLIP_DEPLOYED_REFS \
+              -e FEATUREFLIP_STALENESS \
+              -e FEATUREFLIP_LANGUAGES \
+              -e FEATUREFLIP_ACCESSORS \
+              -e FEATUREFLIP_INLINE_WRAPPERS \
+              -e FEATUREFLIP_DIRECTORIES \
+              -e FEATUREFLIP_IGNORE \
+              -e FEATUREFLIP_FLAGS \
+              -e FEATUREFLIP_BASE_BRANCH \
+              -e FEATUREFLIP_PR_LABELS \
+              -e FEATUREFLIP_MAX_PRS \
+              -e FEATUREFLIP_DRY_RUN \
+              "<< parameters.image >>"
+
+jobs:
+  cleanup:
+    description: >-
+      Check out the repository and run flag cleanup. Trigger it from a
+      scheduled pipeline, for example weekly on the default branch.
+    executor: default
+    parameters:
+      api-token:
+        type: env_var_name
+        default: FEATUREFLIP_API_TOKEN
+        description: Name of the environment variable holding your Featureflip API token.
+      github-token:
+        type: env_var_name
+        default: GITHUB_TOKEN
+        description: Name of the environment variable holding a GitHub token that can push and open pull requests.
+      org:
+        type: string
+        description: Featureflip organization slug.
+      project:
+        type: string
+        description: Featureflip project slug.
+      mode:
+        type: enum
+        enum: ["remove", "archive-sweep"]
+        default: remove
+        description: "`remove` opens removal pull requests. `archive-sweep` archives flags whose removal has merged."
+      staleness:
+        type: string
+        default: dead
+        description: Which candidates to fetch, `dead` (ready-for-review pull requests) or `stale` (draft pull requests).
+      dry-run:
+        type: boolean
+        default: false
+        description: Print the diffs and open nothing.
+      image:
+        type: string
+        default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v1
+        description: The cleanup image.
+    steps:
+      - checkout
+      - cleanup:
+          api-token: << parameters.api-token >>
+          github-token: << parameters.github-token >>
+          org: << parameters.org >>
+          project: << parameters.project >>
+          mode: << parameters.mode >>
+          staleness: << parameters.staleness >>
+          dry-run: << parameters.dry-run >>
+          image: << parameters.image >>
+
+examples:
+  weekly_cleanup:
+    description: >-
+      Open removal pull requests for dead flags once a week. Add a scheduled
+      trigger for this workflow in the project settings, and put
+      FEATUREFLIP_API_TOKEN and GITHUB_TOKEN in a context.
+    usage:
+      version: 2.1
+      orbs:
+        featureflip: featureflip/flag-cleanup@1
+      workflows:
+        flag-cleanup:
+          jobs:
+            - featureflip/cleanup:
+                context: featureflip
+                org: my-org
+                project: my-project
+                dry-run: true
+  archive_sweep:
+    description: >-
+      Archive flags whose removal pull request has merged. Archiving needs a
+      token with the Member role, so give it its own variable.
+    usage:
+      version: 2.1
+      orbs:
+        featureflip: featureflip/flag-cleanup@1
+      workflows:
+        archive-sweep:
+          jobs:
+            - featureflip/cleanup:
+                context: featureflip
+                mode: archive-sweep
+                api-token: FEATUREFLIP_ARCHIVE_TOKEN
+                org: my-org
+                project: my-project

@@ -146,6 +146,22 @@ def files(
     ]
 
 
+def run_listing(repo_dir: str) -> tuple[SourceFile, ...] | None:
+    """The run's whole listing of ``repo_dir``'s checkout, every suffix and
+    ignored files included, inside :func:`run_scope`; None outside one.
+
+    The same object for the whole run and a new one for the next, so a
+    caller can key what it works out from the listing on its identity.
+    """
+    if _listings is None:
+        return None
+    root = checkout_root(repo_dir)
+    listing = _listings.get(root)
+    if listing is None:
+        listing = _listings[root] = _list(root)
+    return listing
+
+
 def _list(root: str) -> tuple[SourceFile, ...]:
     from flag_cleanup.piranha_runner import _SKIP_DIRS, _is_go_vendor_tree, source_files
 

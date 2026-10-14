@@ -30,7 +30,9 @@ payload. This mode asks *this deployed commit — which merged removals does it
 contain, and which of their flags are still outstanding?* The second half of
 that question is :func:`~flag_cleanup.backlog.outstanding_archives` exactly, so
 it is called rather than re-derived, and the first half is one
-``GET /compare`` per candidate. Both halves therefore agree with the sweep by
+``GET /compare`` per candidate, through the same
+:func:`~flag_cleanup.backlog.partition_by_containment` the sweep's
+``deployed-refs`` gate uses. Both halves therefore agree with the sweep by
 construction: a flag this mode leaves outstanding is one the sweep will find.
 
 **It costs what the sweep costs, and for the same reason.**
@@ -74,15 +76,15 @@ import logging
 from collections.abc import Mapping
 
 from flag_cleanup.archive import ArchiveResult
-from flag_cleanup.backlog import OutstandingArchive, archive_outstanding, outstanding_archives
+from flag_cleanup.backlog import (
+    ContainmentGate,
+    archive_outstanding,
+    outstanding_archives,
+    partition_by_containment,
+)
 from flag_cleanup.client import FeatureflipClient
 from flag_cleanup.config import Config
-from flag_cleanup.github_ops import (
-    GitHubApi,
-    GitHubApiError,
-    GitHubEnv,
-    commit_is_contained,
-)
+from flag_cleanup.github_ops import GitHubApi, GitHubEnv
 from flag_cleanup.pr_event import DEPLOYMENT_SUCCESS, DeploymentEvent, deployment_event
 
 logger = logging.getLogger(__name__)
@@ -150,8 +152,8 @@ def run_archive_on_deploy(
     )
     try:
         candidates = outstanding_archives(config, active_gh, github.repository, client=active)
-        deployed, pending = _partition_by_containment(
-            active_gh, github.repository, candidates, deployment.sha
+        deployed, pending = partition_by_containment(
+            active_gh, github.repository, candidates, _deployment_gate(deployment.sha)
         )
         return pending + archive_outstanding(
             config,
@@ -202,102 +204,18 @@ def _skip_reason(deployment: DeploymentEvent, environment: str) -> ArchiveResult
     return None
 
 
-def _partition_by_containment(
-    gh: GitHubApi,
-    repo: str,
-    candidates: list[OutstandingArchive],
-    deployed_sha: str,
-) -> tuple[list[OutstandingArchive], list[ArchiveResult]]:
-    """Split the backlog into *this deploy shipped it* and *not yet*.
-
-    Returns the candidates to archive, and a ready-made report line for each
-    one held back. Held back is never permanent: nothing is written to record
-    it, the flag's own unarchived state is what puts it back in the backlog,
-    and the next deploy that contains the merge picks it up — as does the
-    sweep, if one is also configured.
-
-    **Isolated per flag**, like :func:`~flag_cleanup.backlog.archive_outstanding`
-    and for the same reason. A compare GitHub will not answer is a fact about
-    ONE candidate — a merge commit orphaned by a history rewrite, two commits
-    with no common ancestor, a 500 on a comparison too large to compute — and
-    letting it out of this loop would abandon the whole run before anything was
-    archived, discarding the lines already computed for every other flag. That
-    turns one unanswerable candidate into a mode that is inert on every
-    subsequent deployment, which is the permanent silent no-op this whole
-    module exists to end.
-    """
-    deployed: list[OutstandingArchive] = []
-    pending: list[ArchiveResult] = []
-
-    for candidate in candidates:
-        if not candidate.merge_commit_sha:
-            # Degraded rather than absent evidence: the merge is proven (that
-            # is what put this flag in the backlog), but the commit it produced
-            # was not named, so there is nothing to compare. Reported on its own
-            # line rather than quietly grouped with the not-yet-deployed, since
-            # the remedy differs — this one will not clear on the next deploy.
-            pending.append(
-                ArchiveResult(
-                    action_taken="pending-deploy",
-                    detail=(
-                        "the merged pull request did not name the commit it "
-                        "merged, so there is no way to tell whether this "
-                        "deployment contains the removal. Left outstanding; "
-                        "`mode: archive-sweep` archives it on the merge alone"
-                    ),
-                    key=candidate.key,
-                    pull_request=candidate.pull_request,
-                )
-            )
-            continue
-
-        try:
-            contained = commit_is_contained(
-                gh, repo, candidate.merge_commit_sha, within=deployed_sha
-            )
-        except GitHubApiError as exc:
-            # Reported as `failed` rather than `pending-deploy`, deliberately:
-            # the run goes red and this flag is named, because "I could not
-            # tell" is not the same as "not yet" and will not clear by itself.
-            # The flag key leads the line — the exception names only the two
-            # shas, which is not something a customer can act on.
-            logger.warning("could not place flag %s against this deploy: %s", candidate.key, exc)
-            pending.append(
-                ArchiveResult(
-                    action_taken="failed",
-                    detail=(
-                        f"could not tell whether this deployment contains the removal: "
-                        f"{exc} The flag is left outstanding; `mode: archive-sweep` "
-                        f"archives it on the merge alone"
-                    ),
-                    key=candidate.key,
-                    pull_request=candidate.pull_request,
-                )
-            )
-            continue
-
-        if contained:
-            deployed.append(candidate)
-            continue
-
-        logger.info(
-            "flag %s stays outstanding: %s is not contained in the deployed commit %s",
-            candidate.key,
-            candidate.merge_commit_sha[:12],
-            deployed_sha[:12],
-        )
-        pending.append(
-            ArchiveResult(
-                action_taken="pending-deploy",
-                detail=(
-                    f"the removal merged as {candidate.merge_commit_sha[:12]}, which "
-                    f"this deployment ({deployed_sha[:12]}) does not contain — so "
-                    f"the code that reads this flag is still running. Left "
-                    f"outstanding for the deploy that ships it"
-                ),
-                key=candidate.key,
-                pull_request=candidate.pull_request,
-            )
-        )
-
-    return deployed, pending
+def _deployment_gate(sha: str) -> ContainmentGate:
+    """One ref — the commit this deployment shipped — in this mode's words."""
+    return ContainmentGate(
+        refs=(sha,),
+        subject="this deployment",
+        label="this deployment ({ref})",
+        no_merge_commit=(
+            "; `mode: archive-sweep` without `deployed-refs` archives it on the "
+            "merge alone"
+        ),
+        unanswered=(
+            "; `mode: archive-sweep` without `deployed-refs` archives it on the "
+            "merge alone"
+        ),
+    )

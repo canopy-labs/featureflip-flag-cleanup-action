@@ -118,13 +118,20 @@ class Config:
     project: str
     api_url: str = DEFAULT_API_URL
     #: See :data:`MODES`. Everything below this line is ``remove``-only EXCEPT
-    #: ``api_url``, ``dry_run`` and ``deployment_environment``, each of which
-    #: names the modes that read it; no archive mode touches a checkout, so
-    #: none of them reads a transform input.
+    #: ``api_url``, ``dry_run``, ``deployment_environment`` and
+    #: ``deployed_refs``, each of which names the modes that read it; no
+    #: archive mode touches a checkout, so none of them reads a transform
+    #: input.
     mode: str = DEFAULT_MODE
     #: ``archive-on-deploy`` only: the deployment environment whose successful
     #: deployments authorize an archive. Ignored by every other mode.
     deployment_environment: str = DEFAULT_DEPLOYMENT_ENVIRONMENT
+    #: ``archive-sweep`` only: git refs (tags, branches or commit shas) that
+    #: stand for what is deployed. When set, a flag is archived only once its
+    #: removal's merge commit is contained in EVERY one of them. Empty is the
+    #: ungated sweep, which archives on the merge alone. See
+    #: :func:`flag_cleanup.backlog.partition_by_containment`.
+    deployed_refs: tuple[str, ...] = ()
     staleness: str = DEFAULT_STALENESS
     directories: tuple[str, ...] = (".",)
     languages: tuple[str, ...] = supported_languages()
@@ -156,6 +163,10 @@ class Config:
     base_branch: str = DEFAULT_BASE_BRANCH
     pr_labels: tuple[str, ...] = ()
     dry_run: bool = False
+    #: Inline keyless wrappers at their proven call sites (Kotlin, Java); see
+    #: :mod:`flag_cleanup.wrapper_inline`. ``False`` folds the read inside a
+    #: wrapper and stops there.
+    inline_wrappers: bool = True
     #: Most pull requests one run may propose; ``0`` means no limit. A bound on
     #: blast radius rather than on correctness — see :data:`DEFAULT_MAX_PRS`.
     max_prs: int = DEFAULT_MAX_PRS
@@ -242,6 +253,7 @@ class Config:
                 "FEATUREFLIP_DEPLOYMENT_ENVIRONMENT",
                 DEFAULT_DEPLOYMENT_ENVIRONMENT,
             ),
+            deployed_refs=_parse_deployed_refs(_get(env, "FEATUREFLIP_DEPLOYED_REFS", "")),
             staleness=staleness,
             directories=_split_csv(_get(env, "FEATUREFLIP_DIRECTORIES", "."), default=(".",)),
             languages=languages,
@@ -253,6 +265,10 @@ class Config:
             pr_labels=_split_csv(_get(env, "FEATUREFLIP_PR_LABELS", ""), default=()),
             dry_run=_parse_bool(
                 "FEATUREFLIP_DRY_RUN", _get(env, "FEATUREFLIP_DRY_RUN", "")
+            ),
+            inline_wrappers=_parse_bool(
+                "FEATUREFLIP_INLINE_WRAPPERS",
+                _get(env, "FEATUREFLIP_INLINE_WRAPPERS", "true"),
             ),
             max_prs=_parse_non_negative_int(
                 "FEATUREFLIP_MAX_PRS",
@@ -301,6 +317,51 @@ def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
     for name in names:
         seen[name] = None
     return tuple(seen), tuple(gates)
+
+
+#: A deployed ref is pasted into a compare URL's PATH, as the first half of
+#: ``{ref}...{merge}``. Held to the characters a plain git ref name uses, so
+#: none of the ways a value could change the question gets through: a ``...``
+#: or ``..`` that re-splits the compare, a ``?`` or ``#`` that ends the path
+#: early, whitespace, or the reflog syntax ``@{``. Narrower than git itself
+#: allows, deliberately — a tag that needs more is rare, and one that slipped
+#: through would compare against something nobody configured.
+_DEPLOYED_REF_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._/+-]*\Z")
+
+
+def _parse_deployed_refs(value: str) -> tuple[str, ...]:
+    """Split, validate and de-duplicate ``FEATUREFLIP_DEPLOYED_REFS``.
+
+    Newlines AND commas separate, because a YAML block scalar is the natural
+    way to list refs in a workflow and every other list input here takes
+    commas. De-duplicated keeping first position: each ref costs one compare
+    per outstanding flag, and a repeat only pays for the same answer twice.
+    """
+    refs = tuple(item.strip() for item in re.split(r"[,\n]", value) if item.strip())
+    invalid = [ref for ref in refs if not _is_plain_ref(ref)]
+    if invalid:
+        raise ConfigError(
+            f"unsupported FEATUREFLIP_DEPLOYED_REFS value(s): "
+            f"{', '.join(repr(ref) for ref in invalid)}; each must be a tag, branch "
+            "or commit sha made of letters, digits and . _ / + -, starting with "
+            "a letter, digit or _, with no '..', no '//', no '/'-separated part "
+            "starting with '.', and not ending in '/', '.' or '.lock'. Each is "
+            "compared against your removals' merge commits in a GitHub API path, "
+            "so anything else would compare against a ref you did not name"
+        )
+    return tuple(dict.fromkeys(refs))
+
+
+def _is_plain_ref(ref: str) -> bool:
+    return (
+        _DEPLOYED_REF_RE.match(ref) is not None
+        and ".." not in ref
+        and "//" not in ref
+        and not ref.endswith(("/", ".", ".lock"))
+        # git forbids a component starting with `.`, and a `.` segment is one
+        # a URL normaliser may silently drop, comparing a ref nobody named.
+        and not any(part.startswith(".") for part in ref.split("/"))
+    )
 
 
 def _get(env: Mapping[str, str], name: str, default: str) -> str:
@@ -388,8 +449,8 @@ _FALSE = frozenset({"0", "false", "no", "off", ""})
 def _parse_bool(name: str, value: str) -> bool:
     """Parse a boolean env value, rejecting anything that isn't clearly one.
 
-    Deliberately strict, because the only boolean here is ``dry-run`` and a
-    lenient parse fails toward the destructive side: a typo like ``ture`` or a
+    Deliberately strict, because for ``dry-run``, the boolean it was written
+    for, a lenient parse fails toward the destructive side: a typo like ``ture`` or a
     quoted ``"true"`` would silently read as False and open real pull requests
     against the customer's repository. Every other malformed input in this file
     aborts with a clear message before anything is touched (exit 2); this one

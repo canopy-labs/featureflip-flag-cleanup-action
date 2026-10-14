@@ -45,6 +45,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
+from flag_cleanup.ts_param_pins import pinned_calls
 from flag_cleanup.ts_syntax import _parse, _walk
 
 #: The callees that name a test or a group of tests.
@@ -105,10 +106,20 @@ def find_pinned_tests(
     pattern = _removed_state_pattern(flag_key, untreated)
     titled = _titled_tests(root, data)
     index = {id_: n for n, id_ in enumerate(node.id for node, _, _ in titled)}
+    # A helper's call pins the flag as plainly as a literal does when the
+    # helper's parameter is proven to feed the override. See
+    # :mod:`flag_cleanup.ts_param_pins`.
+    calls = pinned_calls(source, language, flag_key)
+
+    def pins(node: Node, value: str) -> bool:
+        return _pins(node, data, flag_key, value) or (
+            calls.get((node.start_byte, node.end_byte)) == value
+            and node.type == "call_expression"
+        )
 
     chosen: dict[int, Node] = {}
     for pair in _walk(root):
-        if not _pins(pair, data, flag_key, untreated):
+        if not pins(pair, untreated):
             continue
         ancestor = pair.parent
         while ancestor is not None:
@@ -130,7 +141,7 @@ def find_pinned_tests(
     for node, _callee, title in titled:
         if not keyed.search(title) or _HEDGES.search(title):
             continue
-        if any(_pins(pair, data, flag_key, treated) for pair in _walk(node)):
+        if any(pins(pair, treated) for pair in _walk(node)):
             continue
         chosen[node.id] = node
 
@@ -176,6 +187,33 @@ def delete_tests(source: str, language: str, tests: list[PinnedTest]) -> tuple[s
 def is_test_file(source: str, language: str) -> bool:
     """Whether ``source`` declares a test: an ``it``/``test``/``describe`` with a title."""
     return bool(_titled_tests(_parse(source, language), source.encode("utf-8")))
+
+
+def title_nodes(root: Node, data: bytes) -> frozenset[int]:
+    """The ids of every test TITLE argument in ``root``, for any TS-family tree.
+
+    ``data`` is the whole source as bytes, never ``root.text``: the root node
+    starts after any leading whitespace, so a file opening with a blank line
+    would shift every offset and no callee would read as a test.
+
+    Narrower than :func:`_titled_tests`: the call must also hand over a
+    callback as its second argument. A title is a string nothing is typed
+    against and nothing looks up, which is what makes it inert — but a function
+    that merely happens to be called ``test`` and is handed the key is a call,
+    and may well be typed against the flag registry. The callback is what tells
+    the two apart.
+    """
+    found = set()
+    for node, _callee, _title in _titled_tests(root, data):
+        arguments = node.child_by_field_name("arguments")
+        named = arguments.named_children if arguments is not None else []
+        if len(named) >= 2 and named[1].type in _CALLBACKS:
+            found.add(named[0].id)
+    return frozenset(found)
+
+
+#: The second argument of a call that declares a test.
+_CALLBACKS = frozenset({"arrow_function", "function_expression", "function"})
 
 
 def data_mention(source: str, language: str, flag_key: str) -> str | None:
@@ -334,7 +372,9 @@ def _own_lines(statement: Node, data: bytes) -> tuple[int, int] | None:
     if following.strip() == b"" and end < len(data):
         if previous is None or not previous.strip() or previous.rstrip().endswith(b"{"):
             return start, end + len(following)
-    if previous is not None and not previous.strip() and following.lstrip().startswith(b"}"):
+    if previous is not None and not previous.strip() and (
+        following.lstrip().startswith(b"}") or not data[end:].strip()
+    ):
         return start - len(previous) - 1, end
     return start, end
 

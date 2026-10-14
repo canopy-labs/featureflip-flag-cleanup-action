@@ -40,3 +40,7 @@ tests/smoke
 
 # Becomes the public repository's real workflow once this directory is its root.
 .github
+
+# The CircleCI orb's source. The orb is published from the public repository,
+# and its registry page links back there as the orb's source.
+orb

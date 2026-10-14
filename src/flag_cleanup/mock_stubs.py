@@ -294,6 +294,45 @@ def _mockito_patterns(read_call: str, read: str, key: str) -> list[tuple[str, st
     ]
 
 
+@dataclass(frozen=True)
+class WrapperStub:
+    """Resolve the doubles of keyless wrappers instead of the SDK read.
+
+    A wrapper takes no key, so a stub of it is recognised by the wrapper's
+    name on a receiver the wrapper pass proved is the wrapper (see
+    :mod:`flag_cleanup.wrapper_inline`), with any arguments: matchers such as
+    ``any()`` are calls, and a stub is deleted, never inlined, so they drop
+    nothing.
+    """
+
+    names: tuple[str, ...]
+
+
+def _wrapper_patterns(language: str, names: str, receivers: str) -> list[tuple[str, str]]:
+    receiver = rf"(?:this\s*\.\s*)?(?:{receivers})"
+    read_call = rf"{receiver}\s*\.\s*(?:{names})\(\s*{_BALANCED}\)"
+    when = r"(?:(?:Mockito|BDDMockito)\.)?(?:when|`when`|whenever|given)"
+    times = rf"(?:\s*,\s*(?:Mockito\.)?\w+\({_BALANCED}\))?"
+    patterns = [
+        (STUB, rf"{when}\(\s*{read_call}\s*\)\s*\.\s*(?:thenReturn|willReturn)\(\s*{_BOOL}\s*\)"),
+        (
+            STUB,
+            rf"(?:Mockito\.)?doReturn\(\s*{_BOOL}\s*\)\s*\.\s*when\(\s*{receiver}\s*\)"
+            rf"\s*\.\s*(?:{names})\(\s*{_BALANCED}\)",
+        ),
+        (
+            VERIFICATION,
+            rf"(?:Mockito\.)?verify\(\s*{receiver}{times}\s*\)\s*\.\s*(?:{names})\(\s*{_BALANCED}\)",
+        ),
+    ]
+    if language == "kt":
+        patterns += [
+            (STUB, rf"(?:co)?every\s*\{{\s*{read_call}\s*\}}\s*returns\s+{_BOOL}"),
+            (VERIFICATION, rf"(?:co)?verify\s*(?:\({_BALANCED}\))?\s*\{{\s*{read_call}\s*\}}"),
+        ]
+    return patterns
+
+
 def _java_patterns(read: str, key: str) -> list[tuple[str, str]]:
     return _mockito_patterns(rf"{_CHAIN}(?:{read})\(\s*{key}{_TAIL}", read, key)
 
@@ -453,23 +492,43 @@ def resolve(
     flag_key: str,
     treatment: bool,
     accessors: tuple[str, ...] = (),
+    *,
+    wrapper: WrapperStub | None = None,
+    receivers: frozenset[str] = frozenset(),
 ) -> tuple[str, list[Removal]]:
     """``source`` with every decidable test-double line resolved; what went.
+
+    With ``wrapper``, the doubles resolved are those of the named keyless
+    wrappers on one of ``receivers``, instead of the SDK read's.
 
     Pure: no file is read or written. See the module docstring for the policy.
     """
     profile = _PROFILES.get(language)
     if profile is None:
         return source, []
-    reads = _reads(language, accessors)
-    if not re.search(rf"\b(?:{reads})\b", source):
-        return source, []
-    data = source.encode("utf-8")
-    root = profile.parse(source, language)
-    consts = [k.name for k in key_const.key_consts(root, data, language, flag_key)]
-    key = _key(flag_key, consts)
-    mention = re.compile(rf"\b(?:{reads})\s*\(\s*{key}")
-    patterns = [(kind, re.compile(p)) for kind, p in profile.patterns(reads, key)]
+    if wrapper is not None:
+        if language not in ("java", "kt") or not receivers or not wrapper.names:
+            return source, []
+        reads = "|".join(re.escape(n) for n in sorted(wrapper.names, key=len, reverse=True))
+        if not re.search(rf"\b(?:{reads})\b", source):
+            return source, []
+        data = source.encode("utf-8")
+        root = profile.parse(source, language)
+        mention = re.compile(rf"\b(?:{reads})\s*\(")
+        alternation = "|".join(re.escape(r) for r in sorted(receivers, key=len, reverse=True))
+        patterns = [
+            (kind, re.compile(p)) for kind, p in _wrapper_patterns(language, reads, alternation)
+        ]
+    else:
+        reads = _reads(language, accessors)
+        if not re.search(rf"\b(?:{reads})\b", source):
+            return source, []
+        data = source.encode("utf-8")
+        root = profile.parse(source, language)
+        consts = [k.name for k in key_const.key_consts(root, data, language, flag_key)]
+        key = _key(flag_key, consts)
+        mention = re.compile(rf"\b(?:{reads})\s*\(\s*{key}")
+        patterns = [(kind, re.compile(p)) for kind, p in profile.patterns(reads, key)]
 
     statements = [
         node
@@ -573,6 +632,29 @@ def _parse_errors(root: Node) -> int:
     return sexp.count("(ERROR") + sexp.count("(MISSING")
 
 
+def in_test_double(node: Node, data: bytes, language: str) -> bool:
+    """Whether ``node`` sits in a statement of a mocking DSL.
+
+    The statement is the nearest ancestor that is a direct child of one of the
+    language's statement blocks. For Kotlin a bare ``when`` is the language's
+    own keyword, never Mockito's (which Kotlin spells `` `when` `` or
+    ``whenever``), so it does not count there.
+    """
+    profile = _PROFILES.get(language)
+    if profile is None:
+        return False
+    statement = node
+    while statement.parent is not None and statement.parent.type not in profile.blocks:
+        statement = statement.parent
+    text = _text(statement, data)
+    for match in _DSL.finditer(text):
+        if language == "kt" and match.group(0) == "when":
+            if text[max(0, match.start() - 1) : match.start()] != "`":
+                continue
+        return True
+    return False
+
+
 def _describes_read(text: str, mention: re.Pattern[str]) -> bool:
     return bool(mention.search(text)) and bool(_DSL.search(text))
 
@@ -671,6 +753,10 @@ class Prepass:
     flag_key: str
     treatment: bool
     accessors: tuple[str, ...] = ()
+    #: Resolve keyless wrappers' doubles instead of the SDK read's.
+    wrapper: WrapperStub | None = None
+    #: path (as handed to :meth:`apply`) -> the receivers proven to be a wrapper.
+    receivers: dict[str, frozenset[str]] = field(default_factory=dict)
     #: absolute path -> the customer's text before this pass touched it.
     originals: dict[str, str] = field(default_factory=dict)
     #: absolute path -> what was deleted there.
@@ -685,7 +771,9 @@ class Prepass:
             except (OSError, UnicodeDecodeError):
                 continue
             resolved, removed = resolve(
-                source, self.language, self.flag_key, self.treatment, self.accessors
+                source, self.language, self.flag_key, self.treatment, self.accessors,
+                wrapper=self.wrapper,
+                receivers=self.receivers.get(path, frozenset()),
             )
             if not removed:
                 continue

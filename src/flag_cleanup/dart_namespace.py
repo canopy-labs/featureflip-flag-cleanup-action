@@ -113,6 +113,24 @@ def _parser() -> Parser:
     return Parser(Language(tree_sitter_dart.language()))
 
 
+def parse(source: bytes) -> Node:
+    """``source`` parsed with this module's grammar, errors and all."""
+    return _parser().parse(source).root_node
+
+
+def library_names(path: Path, root: Path) -> Namespace | None:
+    """Everything the library at ``path`` exports, or ``None`` if any of it
+    cannot be known; see the module docstring."""
+    return _library_names(path, root, set(), 0)
+
+
+def uri_text(node: Node) -> str | None:
+    """The text of a ``uri`` node's plain quoted string; ``None`` for a raw,
+    multi-line or interpolated one."""
+    match = _QUOTED.match(node.text.decode("utf-8", "replace"))
+    return match.group(2) if match else None
+
+
 def resolver(importer: str, root: str) -> Callable[[str], Namespace | None]:
     """A memoised ``uri -> Namespace`` lookup for imports written in ``importer``.
 
@@ -126,7 +144,7 @@ def resolver(importer: str, root: str) -> Callable[[str], Namespace | None]:
 
     def resolve(uri: str) -> Namespace | None:
         if uri not in cache:
-            target = _locate(uri, importer_path, root_path)
+            target = locate(uri, importer_path, root_path)
             cache[uri] = (
                 None if target is None else _library_names(target, root_path, set(), 0)
             )
@@ -135,7 +153,7 @@ def resolver(importer: str, root: str) -> Callable[[str], Namespace | None]:
     return resolve
 
 
-def _locate(uri: str, importer: Path, root: Path) -> Path | None:
+def locate(uri: str, importer: Path, root: Path) -> Path | None:
     """The file ``uri`` names, relative to ``importer``, if it is in ``root``.
 
     A relative URI resolves against the importer's directory. A ``package:``
@@ -146,8 +164,8 @@ def _locate(uri: str, importer: Path, root: Path) -> Path | None:
     """
     if uri.startswith("package:"):
         package, _, rest = uri[len("package:"):].partition("/")
-        home = _package_root(importer, root)
-        if home is None or not rest or _package_name(home) != package:
+        home = package_root(importer, root)
+        if home is None or not rest or package_name(home) != package:
             return None
         target = home / "lib" / rest
     elif ":" in uri.split("/", 1)[0]:
@@ -160,7 +178,7 @@ def _locate(uri: str, importer: Path, root: Path) -> Path | None:
     return target
 
 
-def _package_root(importer: Path, root: Path) -> Path | None:
+def package_root(importer: Path, root: Path) -> Path | None:
     """The nearest directory above ``importer`` holding a ``pubspec.yaml``
     that is itself inside ``root`` — resolved, so a symlink out of the
     checkout is not followed."""
@@ -175,7 +193,7 @@ def _package_root(importer: Path, root: Path) -> Path | None:
     return None
 
 
-def _package_name(home: Path) -> str | None:
+def package_name(home: Path) -> str | None:
     try:
         text = (home / "pubspec.yaml").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -217,13 +235,13 @@ def _library_names(
         # there. Only an export cycle reaches this.
         return _EMPTY
     seen = seen | {path}
-    program = _read(path)
+    program = read(path)
     if program is None:
         return None
     if any(c.type == "part_of_directive" for c in program.named_children):
         # A part cannot be imported; whatever this is, it is not a library.
         return None
-    collected = _declared_names(program)
+    collected = declared_names(program)
     if collected is None:
         return None
     for child in program.named_children:
@@ -248,12 +266,12 @@ def _library_names(
     )
 
 
-def _read(path: Path) -> Node | None:
+def read(path: Path) -> Node | None:
     try:
         source = path.read_bytes()
     except OSError:
         return None
-    program = _parser().parse(source).root_node
+    program = parse(source)
     return None if program.has_error else program
 
 
@@ -261,21 +279,21 @@ def _part_names(directive: Node, library: Path, root: Path) -> Namespace | None:
     uri_node = next((c for c in directive.named_children if c.type == "uri"), None)
     if uri_node is None:
         return None
-    match = _QUOTED.match(uri_node.text.decode("utf-8", "replace"))
-    if match is None:
+    uri = uri_text(uri_node)
+    if uri is None:
         return None
-    target = _locate(match.group(2), library, root)
+    target = locate(uri, library, root)
     if target is None:
         return None
-    program = _read(target)
-    return None if program is None else _declared_names(program)
+    program = read(target)
+    return None if program is None else declared_names(program)
 
 
 def _exported_names(
     export: Node, library: Path, root: Path, seen: set[Path], depth: int
 ) -> Namespace | None:
     uri = uri_of(export)
-    target = None if uri is None else _locate(uri, library, root)
+    target = None if uri is None else locate(uri, library, root)
     if target is None:
         return None
     namespace = _library_names(target, root, seen, depth + 1)
@@ -360,7 +378,7 @@ def _extension_member_names(extension: Node) -> frozenset[str] | None:
     return frozenset(names)
 
 
-def _declared_names(program: Node) -> Namespace | None:
+def declared_names(program: Node) -> Namespace | None:
     """The names declared directly in ``program``, private ones included;
     ``None`` when the top level holds anything this function cannot read."""
     names: set[str] = set()

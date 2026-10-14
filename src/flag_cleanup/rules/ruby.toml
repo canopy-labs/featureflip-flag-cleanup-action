@@ -83,6 +83,48 @@ replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
+# --- <recv>.fetch_boolean_value(flag_key: "KEY", …) -> @treated --------------
+#
+# OpenFeature's Ruby client (`openfeature-sdk`) reads a boolean with KEYWORD
+# arguments only: `fetch_boolean_value(flag_key:, default_value:,
+# evaluation_context: nil)`. So the key is not the first positional argument,
+# as in every other read rule here, but a `(pair key: (hash_key_symbol) …)`
+# that may sit anywhere in the argument list. The pattern is unanchored inside
+# `argument_list` on purpose: keyword order is the caller's choice
+# (`openfeature_fetch_boolean_value` covers both orders).
+#
+# Everything else is the seed rule above: the `"."` anchor excludes `&.`, the
+# leading-`.` arm admits a receiverless call without letting `&.` back in, and
+# `(string . (string_content) @flag_name .)` excludes an interpolated key. Each
+# was re-verified for this rule by removing it and watching
+# `openfeature_untouched_shapes` fold.
+#
+# Not matched, deliberately: the hash-rocket form (`:flag_key => "k"`), which is
+# a `(pair key: (simple_symbol))` and not how anyone calls a keyword-argument
+# method, and a key arriving through `**opts`, which names no key at the call.
+#
+# Known over-matches, both contrived: a keyword splat AFTER the key
+# (`flag_key: "k", **opts` where opts carries :flag_key, which Ruby resolves
+# last-wins) and a duplicated `flag_key:` keyword. The query cannot express
+# "no later splat", so both fold on the first literal key.
+[[rules]]
+name = "replace_openfeature_fetch_boolean_value_with_boolean_literal"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list
+       (pair key: (hash_key_symbol) @kw value: (string . (string_content) @flag_name .))))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list
+       (pair key: (hash_key_symbol) @kw value: (string . (string_content) @flag_name .))))] @call
+  (#eq? @sdk_fn "fetch_boolean_value")
+  (#eq? @kw "flag_key")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
 # --- the elsif gap ----------------------------------------------------------
 #
 # The engine's built-ins carry `replace_elsif_true` and nothing for the FALSE

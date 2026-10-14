@@ -33,6 +33,15 @@ needs a token with ``pull-requests: read``. That is a real trade against the
 property that made the other mode unusually cheap, and it is documented in the
 README rather than quietly widened.
 
+**Merged is not deployed, and ``deployed-refs`` is how the sweep can tell.**
+Ungated, the only thing between a merge and an archive is the platform's
+refusal to archive a flag it can still see being evaluated — which reads
+telemetry, so it cannot tell a dead flag from one whose code is deployed but
+was not reached recently. Given refs that stand for what is deployed, the sweep
+narrows its backlog exactly as ``archive-on-deploy`` does — through
+:func:`partition_by_containment`, shared so the two cannot drift — and archives
+only removals EVERY ref contains. That needs ``contents: read`` as well.
+
 **Per-flag isolation**, like ``orchestrate`` and unlike ``archive-on-merge``:
 one flag the domain refuses does not stop the other nine from draining, and
 every outcome gets its own reported line. The exception is a token that cannot
@@ -58,10 +67,13 @@ from flag_cleanup.client import (
 from flag_cleanup.config import Config
 from flag_cleanup.github_ops import (
     GitHubApi,
+    GitHubApiError,
     GitHubEnv,
     UnsafeFlagKeyError,
+    commit_is_contained,
     merged_removal,
     removal_branch,
+    short_ref,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,10 +90,35 @@ class OutstandingArchive:
     #: ``""`` when it carried no URL. Both degrade rather than discarding the
     #: merge evidence itself, which is the part that authorizes the archive.
     pull_request_url: str
-    #: The commit the merge produced on the base branch, or ``""``. Read by
-    #: ``mode: archive-on-deploy`` alone — the sweep archives on the strength
-    #: of the merge itself, and the merge-triggered mode never gets here.
+    #: The commit the merge produced on the base branch, or ``""``. Read only
+    #: where containment is checked — ``mode: archive-on-deploy``, and the
+    #: sweep when ``deployed-refs`` is set. The ungated sweep archives on the
+    #: strength of the merge itself, and the merge-triggered mode never gets
+    #: here.
     merge_commit_sha: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ContainmentGate:
+    """The refs a removal must be contained in, and how a report line names them.
+
+    The two callers ask the same question of different things — one deployed
+    commit, or a list of refs the customer says stand for what is deployed —
+    so the loop is shared and only the wording differs.
+    """
+
+    refs: tuple[str, ...]
+    #: The refs taken together, as the subject of a sentence.
+    subject: str
+    #: One ref, with ``{ref}`` standing for it.
+    label: str
+    #: Appended to the line for a merge that named no commit to compare.
+    no_merge_commit: str
+    #: Appended to the line for a compare GitHub would not answer.
+    unanswered: str
+
+    def name(self, ref: str) -> str:
+        return self.label.format(ref=short_ref(ref))
 
 
 def outstanding_archives(
@@ -164,12 +201,155 @@ def run_archive_sweep(
     )
     try:
         candidates = outstanding_archives(config, active_gh, github.repository, client=active)
-        return archive_outstanding(config, candidates, active)
+        if not config.deployed_refs:
+            return archive_outstanding(config, candidates, active)
+
+        logger.info(
+            "archiving only removals contained in every deployed ref: %s",
+            ", ".join(config.deployed_refs),
+        )
+        deployed, pending = partition_by_containment(
+            active_gh, github.repository, candidates, _sweep_gate(config.deployed_refs)
+        )
+        # The WHOLE outstanding set as merge evidence, not the gated part: a
+        # dependent still waiting on a deploy is still on its way out, so its
+        # prerequisite is deferred rather than failed — `archive-on-deploy`'s
+        # reasoning exactly.
+        return pending + archive_outstanding(
+            config,
+            deployed,
+            active,
+            merged_removals={candidate.key for candidate in candidates},
+        )
     finally:
         if owned_gh:
             active_gh.close()
         if owned_client:
             active.close()
+
+
+def _sweep_gate(refs: tuple[str, ...]) -> ContainmentGate:
+    return ContainmentGate(
+        refs=refs,
+        subject="every deployed ref",
+        label="the deployed ref {ref}",
+        no_merge_commit=(
+            ". It will not clear by itself: archive the flag by hand once you "
+            "know the removal is deployed"
+        ),
+        unanswered=", and the next sweep asks again",
+    )
+
+
+def partition_by_containment(
+    gh: GitHubApi,
+    repo: str,
+    candidates: list[OutstandingArchive],
+    gate: ContainmentGate,
+) -> tuple[list[OutstandingArchive], list[ArchiveResult]]:
+    """Split the backlog into *every ref in the gate contains it* and *not yet*.
+
+    Returns the candidates to archive, and a ready-made report line for each
+    one held back. Shared by ``mode: archive-on-deploy`` (one ref: the deployed
+    commit) and the sweep's ``deployed-refs`` gate (every listed ref), so the
+    two cannot drift on compare order, per-flag isolation or wording.
+
+    **Every ref, not any.** A flag key does not say which surface reads it, so
+    a removal live in one deployed build but not another is still being read
+    by the other. The refs are asked in order and the first that does not
+    contain the merge decides — later ones cannot change the answer.
+
+    Held back is never permanent: nothing is written to record it, the flag's
+    own unarchived state is what puts it back in the backlog, and the next run
+    whose refs contain the merge picks it up.
+
+    **Isolated per flag**, like :func:`archive_outstanding` and for the same
+    reason. A compare GitHub will not answer is a fact about ONE candidate — a
+    merge commit orphaned by a history rewrite, two commits with no common
+    ancestor, a 500 on a comparison too large to compute — and letting it out
+    of this loop would abandon the whole run before anything was archived,
+    discarding the lines already computed for every other flag. That turns one
+    unanswerable candidate into a run that is inert every time, which is the
+    permanent silent no-op the archive modes exist to end.
+    """
+    deployed: list[OutstandingArchive] = []
+    pending: list[ArchiveResult] = []
+
+    for candidate in candidates:
+        if not candidate.merge_commit_sha:
+            # Degraded rather than absent evidence: the merge is proven (that
+            # is what put this flag in the backlog), but the commit it produced
+            # was not named, so there is nothing to compare. Reported on its own
+            # line rather than quietly grouped with the not-yet-deployed, since
+            # the remedy differs — this one will not clear on the next deploy.
+            pending.append(
+                ArchiveResult(
+                    action_taken="pending-deploy",
+                    detail=(
+                        "the merged pull request did not name the commit it "
+                        f"merged, so there is no way to tell whether {gate.subject} "
+                        f"contains the removal. Left outstanding{gate.no_merge_commit}"
+                    ),
+                    key=candidate.key,
+                    pull_request=candidate.pull_request,
+                )
+            )
+            continue
+
+        held = _hold_back(gh, repo, candidate, gate)
+        if held is None:
+            deployed.append(candidate)
+        else:
+            pending.append(held)
+
+    return deployed, pending
+
+
+def _hold_back(
+    gh: GitHubApi, repo: str, candidate: OutstandingArchive, gate: ContainmentGate
+) -> ArchiveResult | None:
+    """The line holding ``candidate`` back, or ``None`` when every ref has it."""
+    for ref in gate.refs:
+        try:
+            contained = commit_is_contained(gh, repo, candidate.merge_commit_sha, within=ref)
+        except GitHubApiError as exc:
+            # Reported as `failed` rather than `pending-deploy`, deliberately:
+            # the run goes red and this flag is named, because "I could not
+            # tell" is not the same as "not yet" and may not clear by itself.
+            # The flag key leads the line — the exception names only the two
+            # refs, which is not something a customer can act on alone.
+            logger.warning("could not place flag %s against %s: %s", candidate.key, ref, exc)
+            return ArchiveResult(
+                action_taken="failed",
+                detail=(
+                    f"could not tell whether {gate.name(ref)} contains the removal: "
+                    f"{exc} The flag is left outstanding{gate.unanswered}"
+                ),
+                key=candidate.key,
+                pull_request=candidate.pull_request,
+            )
+
+        if contained:
+            continue
+
+        logger.info(
+            "flag %s stays outstanding: %s is not contained in %s",
+            candidate.key,
+            candidate.merge_commit_sha[:12],
+            short_ref(ref),
+        )
+        return ArchiveResult(
+            action_taken="pending-deploy",
+            detail=(
+                f"the removal merged as {candidate.merge_commit_sha[:12]}, which "
+                f"{gate.name(ref)} does not contain — so the code that reads "
+                f"this flag is still running. Left outstanding for the deploy "
+                f"that ships it"
+            ),
+            key=candidate.key,
+            pull_request=candidate.pull_request,
+        )
+    return None
 
 
 def archive_outstanding(
@@ -181,16 +361,16 @@ def archive_outstanding(
 ) -> list[ArchiveResult]:
     """One archive attempt per candidate, isolated from each other.
 
-    Shared with ``mode: archive-on-deploy``, which hands it a NARROWER list —
-    the outstanding archives a deployed commit actually contains — and nothing
-    else. Keeping the loop here rather than copying it is what makes the two
+    Shared with ``mode: archive-on-deploy`` and the gated sweep, which hand it
+    a NARROWER list — the outstanding archives their refs actually contain —
+    and nothing else. Keeping the loop here rather than copying it is what makes the two
     modes report in one vocabulary: same outcome names, same dry-run wording,
     and one place where the per-flag/whole-token distinction below is decided.
 
     ``merged_removals`` is every flag key known to have a merged removal and no
-    archive yet; it defaults to the candidates' own keys. ``archive-on-deploy``
-    passes the WHOLE outstanding set, because a dependent its deployed commit
-    does not contain is still a dependent on its way out.
+    archive yet; it defaults to the candidates' own keys. Both gated callers
+    pass the WHOLE outstanding set, because a dependent their refs do not
+    contain yet is still a dependent on its way out.
 
     **A prerequisite refusal is ``deferred`` when every dependent it names is in
     ``merged_removals``.** Removing a client-side flag and then the server

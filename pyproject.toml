@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.3.0"
+version = "1.4.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -234,7 +234,14 @@ dependencies = [
     # reads before the engine ran. The pre-pass is gone, and the reads reach
     # the engine as written. Only the Dart rev moved, and Dart's Gate 1 grammar
     # comes from PyPI, so `+canopy.3` stays.
-    "polyglot-piranha==0.17.1",
+    #
+    # 0.17.2 (piranha#114). The engine's codebase walk ran on rayon's global
+    # pool, which gives up with an error if the walk has not started within one
+    # second, and the engine dropped that error. On a loaded runner it saw no
+    # files and returned an empty rewrite, so a flag with live reads reported
+    # `no-changes`. The walk is now serial, and a walk error fails the run. No
+    # grammar rev moved, so `+canopy.3` stays.
+    "polyglot-piranha==0.17.2",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

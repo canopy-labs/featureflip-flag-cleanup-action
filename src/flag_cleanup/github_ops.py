@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -85,6 +86,8 @@ _API_VERSION = "2022-11-28"
 # a merge commit contained in the commit that was deployed?). `ahead` and
 # `diverged` both mean the second ref carries commits of its own.
 _SECOND_REF_CONTAINED = frozenset({"identical", "behind"})
+
+_FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 # GitHub's compare endpoint returns at most this many commits in `commits`,
 # with the true count in `total_commits`. See :func:`branch_commits`.
@@ -710,7 +713,7 @@ def commit_is_contained(gh: GitHubApi, repo: str, commit: str, *, within: str) -
         _raise_api_error(
             response,
             f"could not tell whether {commit[:12]} is contained in the deployed "
-            f"commit {within[:12]}; refusing to assume it is",
+            f"{_describe_ref(within)}; refusing to assume it is",
         )
 
     try:
@@ -718,6 +721,17 @@ def commit_is_contained(gh: GitHubApi, repo: str, commit: str, *, within: str) -
     except ValueError:
         status = None
     return status in _SECOND_REF_CONTAINED
+
+
+def short_ref(ref: str) -> str:
+    """``ref`` as a report line should print it: a full sha abbreviated, a
+    name — ``prod/web``, ``release/2026-10`` — never, since cutting a name
+    short can make it read as a different ref."""
+    return ref[:12] if _FULL_SHA_RE.match(ref) else ref
+
+
+def _describe_ref(ref: str) -> str:
+    return f"commit {short_ref(ref)}" if _FULL_SHA_RE.match(ref) else f"ref {ref}"
 
 
 def open_pr(

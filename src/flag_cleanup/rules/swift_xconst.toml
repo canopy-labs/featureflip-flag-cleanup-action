@@ -1,0 +1,119 @@
+# Reader rules for a Swift flag key held in a constant declared in ANOTHER
+# file.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `Owner.NAME` and `Outer.Inner.NAME`;
+# `# xconst: bare` for a top-level `NAME`.
+#
+# The owner is matched by its WHOLE TEXT (`#eq?` on a non-leaf node compares
+# the node's source text), so one block covers `Outer.Inner` as well as
+# `Owner`. Only the owner node is compared: `Keys . NAME` matches owner `Keys`
+# too. That is safe only because the reader proof accepts a read spelled
+# exactly as identifiers and dots, and refuses the whole file otherwise.
+#
+# The shapes are `swift.toml`'s two seeds -- the negated read, folded to
+# `!@treated`, and the plain one -- with the key slot widened to a member
+# access or an identifier. The bang split and the `?.` guard are theirs, for
+# the reasons given there.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_negated_boolvariation_read"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
+     (prefix_expression (simple_identifier) @sdk_fn)]
+    (call_suffix
+      (value_arguments
+        . (value_argument
+            (navigation_expression
+              [(simple_identifier) (navigation_expression)] @key_owner
+              (navigation_suffix (simple_identifier) @key_member)))))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#match? @call "^![^!]")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_boolvariation_read"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
+     (simple_identifier) @sdk_fn]
+    (call_suffix
+      (value_arguments
+        . (value_argument
+            (navigation_expression
+              [(simple_identifier) (navigation_expression)] @key_owner
+              (navigation_suffix (simple_identifier) @key_member)))))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#not-match? @call "^!")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_negated_boolvariation_read"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
+     (prefix_expression (simple_identifier) @sdk_fn)]
+    (call_suffix
+      (value_arguments
+        . (value_argument (simple_identifier) @key_member)))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#match? @call "^![^!]")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_boolvariation_read"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
+     (simple_identifier) @sdk_fn]
+    (call_suffix
+      (value_arguments
+        . (value_argument (simple_identifier) @key_member)))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#not-match? @call "^!")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]

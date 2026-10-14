@@ -1,0 +1,208 @@
+# Reader rules for a flag key hoisted to a constant declared in ANOTHER file.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `owner.NAME` (`app.keys.NAME`, `k.NAME`),
+# `# xconst: bare` for an imported `NAME` or its `as` alias.
+#
+# The qualified blocks match the WHOLE key expression's text, because the
+# owner can be a dotted chain of any depth: an `attribute` node's text is
+# `app.keys.NAME` exactly when it is spelled without whitespace, and a read
+# spelled with any is left standing, which the post-transform check refuses.
+#
+# The three read shapes and their anchors are `python.toml`'s, unchanged: the
+# boolean-literal default is the only evidence a `variation` read is a boolean
+# one. Accessor clones are made from the `get_boolean_value` blocks' pattern
+# (key anchored only), which is what an accessor read is proven against.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules. Which reads are this
+# flag's was proven before the engine ran.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_variation_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (attribute) @key_ref
+      . (_)
+      . [(true) (false)])
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_variation_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (identifier) @key_member
+      . (_)
+      . [(true) (false)])
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_variation_keyword_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (attribute) @key_ref
+      (keyword_argument
+        name: (identifier) @kw
+        value: [(true) (false)]))
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @kw "default")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_variation_keyword_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (identifier) @key_member
+      (keyword_argument
+        name: (identifier) @kw
+        value: [(true) (false)]))
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @kw "default")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_get_boolean_value_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (attribute) @key_ref)
+  ) @call
+  (#eq? @sdk_fn "get_boolean_value")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_get_boolean_value_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "get_boolean_value")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+# Blocks marked `# xconst: enum-qualified-field` match a read through an enum
+# member's `.value` (`Owner.MEMBER.value`), with __XCONST_ACCESSOR__ replaced
+# by `value`. As for `# xconst: qualified`, the WHOLE key expression's text is
+# matched, so an owner of any depth (`F`, `app.flags.Flags`, `m.Flags`) needs
+# no further shape, and a read spelled with whitespace is left standing.
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_variation_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (attribute) @key_ref
+      . (_)
+      . [(true) (false)])
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__.__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_variation_keyword_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (attribute) @key_ref
+      (keyword_argument
+        name: (identifier) @kw
+        value: [(true) (false)]))
+  ) @call
+  (#eq? @sdk_fn "variation")
+  (#eq? @kw "default")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__.__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_get_boolean_value_read"
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (attribute) @key_ref)
+  ) @call
+  (#eq? @sdk_fn "get_boolean_value")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__.__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]

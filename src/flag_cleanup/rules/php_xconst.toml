@@ -1,0 +1,132 @@
+# Reader rules for a PHP flag key held in a constant declared in ANOTHER file.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `Owner::NAME` -- the owner as written:
+# imported, aliased, fully qualified (`\App\Flags\Keys`), qualified through a
+# namespace import, or `namespace\`-relative -- and `# xconst: bare` for a
+# namespace constant read as `NAME`.
+#
+# The owner is matched by its WHOLE TEXT and in its own case (PHP ignores
+# case; the proof records the spelling at the read), which is safe because the
+# proof accepts only an owner spelled as names and backslashes. A backslash
+# reaches this file as four (see `rule_synthesis._query_text`).
+#
+# `(argument . X .)`: the constant is the argument's only child. A named
+# argument (`key: Keys::NAME`) has two, and the proof refuses it, so no
+# proven read can fail to match here and none of these can match one.
+#
+# One shape per block, `php_const.toml`'s: `boolVariation(<ref>, ...)` called
+# as a method or a function, folded to @treated. No statement deletes: a bare
+# `true;` is legal PHP, and `php.toml` has none either.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules. Which reads are this
+# flag's was proven before the engine ran.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_boolvariation_read"
+query = """(
+  [(member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments
+        . (argument
+            . (class_constant_access_expression
+                . [(name) (qualified_name) (relative_name)] @key_owner
+                (name) @key_member .) .)))
+   (function_call_expression
+      function: (name) @sdk_fn
+      arguments: (arguments
+        . (argument
+            . (class_constant_access_expression
+                . [(name) (qualified_name) (relative_name)] @key_owner
+                (name) @key_member .) .)))] @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+# NEVER INSIDE STRING INTERPOLATION. `"m={$c->boolVariation(...)}"` folded reads
+# `"m={true}"`: it parses, and prints the braces and the word instead of `1`.
+# `{$` needs a variable after the brace, so no literal can take the call's
+# place there; the read is left for a person, and `key_const` does not count
+# it as removable, so a const it reads is kept. The root capture is required:
+# an uncaptured root never matches (see `csharp.toml`).
+not_enclosing_node = """([(encapsed_string) (heredoc)] @interpolation)"""
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_boolvariation_read"
+query = """(
+  [(member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments . (argument . (name) @key_member .)))
+   (function_call_expression
+      function: (name) @sdk_fn
+      arguments: (arguments . (argument . (name) @key_member .)))] @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+# NEVER INSIDE STRING INTERPOLATION. `"m={$c->boolVariation(...)}"` folded reads
+# `"m={true}"`: it parses, and prints the braces and the word instead of `1`.
+# `{$` needs a variable after the brace, so no literal can take the call's
+# place there; the read is left for a person, and `key_const` does not count
+# it as removable, so a const it reads is kept. The root capture is required:
+# an uncaptured root never matches (see `csharp.toml`).
+not_enclosing_node = """([(encapsed_string) (heredoc)] @interpolation)"""
+
+# Blocks marked `# xconst: enum-qualified-field` match a read through a
+# backed-enum case's `->value` (`Owner::CASE->value`), with __XCONST_ACCESSOR__
+# replaced by `value`. The owner is spelled as for `# xconst: qualified`. A
+# nullsafe `?->value` is a different node and never matches; the proof
+# refuses it.
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_qualified_field_boolvariation_read"
+query = """(
+  [(member_call_expression
+      name: (name) @sdk_fn
+      arguments: (arguments
+        . (argument
+            . (member_access_expression
+                object: (class_constant_access_expression
+                  . [(name) (qualified_name) (relative_name)] @key_owner
+                  (name) @key_member .)
+                name: (name) @key_accessor) .)))
+   (function_call_expression
+      function: (name) @sdk_fn
+      arguments: (arguments
+        . (argument
+            . (member_access_expression
+                object: (class_constant_access_expression
+                  . [(name) (qualified_name) (relative_name)] @key_owner
+                  (name) @key_member .)
+                name: (name) @key_accessor) .)))] @call
+  (#eq? @sdk_fn "boolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+# NEVER INSIDE STRING INTERPOLATION, as for `# xconst: qualified`.
+not_enclosing_node = """([(encapsed_string) (heredoc)] @interpolation)"""

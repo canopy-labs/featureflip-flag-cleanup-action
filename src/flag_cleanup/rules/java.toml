@@ -27,6 +27,53 @@
 # 1. The flag read
 # ===========================================================================
 
+# --- @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
+#
+# Reached ONLY through the wrapper pass (`wrapper_inline`), which proves that a
+# call such as `featureFlags.shouldEnableX(userId)` is bound to a method whose
+# whole body is a read of this flag, and replaces the call's callee with the
+# run's sentinel identifier: `__ff_cleanup_<hash>(userId)`. Which calls are
+# this flag's was decided there, call by call, so these rules check nothing but
+# the sentinel. A sentinel these rules do not consume is a refusal, never a
+# diff (`SentinelPrePass.survived`).
+#
+# Holes name `sentinel` and not `stale_flag_name`: a call-site file names no
+# key, and the engine skips a file holding none of a seed's hole values.
+# `rule_synthesis` never clones these (an `@` value is a hole, not a callee).
+#
+# The discarded-statement rule comes first for the reason
+# `delete_discarded_boolvariation_statement` does: `true;` is not a Java
+# statement. Unlike that rule it needs no call-counting filter, because the
+# wrapper pass refuses every call whose arguments hold a call or assignment.
+[[rules]]
+name = "delete_discarded_sentinel_statement"
+query = """(
+  (expression_statement
+    (method_invocation
+      !object
+      name: (identifier) @sdk_fn
+    ) @call
+  ) @stmt
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "stmt"
+replace = ""
+holes = ["sentinel"]
+
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (method_invocation
+    !object
+    name: (identifier) @sdk_fn
+  ) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
 # --- <obj>.boolVariation("KEY", ...); AS A WHOLE STATEMENT -> deleted
 #
 # A read whose value is DISCARDED. It is not a guard and it is not a value: a

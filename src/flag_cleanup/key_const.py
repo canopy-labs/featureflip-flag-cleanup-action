@@ -108,6 +108,12 @@ class _Profile:
     rule strand a live reference, and a rule without the gate is inert, since
     the whole file is withheld before it runs (#2730).
 
+    ``withholds`` -- optional, a whole-file veto for what the per-reference loop
+    cannot express: it is handed every hoisted key and returns ``True`` to
+    withhold the file whatever the count says. Swift needs it because a bare
+    name can mean a member of an enclosing type's supertype, which no binding
+    in the file shows.
+
     Exactly one of ``is_binding`` (per node) or ``binding_ids`` (whole tree at
     once) must be supplied. The second exists for TypeScript, whose binding
     rules are already written -- and carefully reasoned about -- in
@@ -120,6 +126,7 @@ class _Profile:
     is_removable_read: Callable[[Node, frozenset[str]], bool]
     is_binding: Callable[[Node], bool] | None = None
     binding_ids: Callable[[Node], set[int]] | None = None
+    withholds: Callable[[Node, bytes, list[KeyConst]], bool] | None = None
 
 
 # Populated at the bottom of this module, once every profile function exists.
@@ -180,6 +187,8 @@ def path_is_safe(
     consts = profile.key_consts(root, source_bytes, flag_key)
     if not consts:
         return True
+    if profile.withholds is not None and profile.withholds(root, source_bytes, consts):
+        return False
 
     declared_ids = {node.id for const in consts for node in const.name_nodes}
     # Computed once for the whole file rather than per candidate node.
@@ -898,7 +907,14 @@ def _php_is_removable_read(name_node: Node, accessors: frozenset[str]) -> bool:
         if last is None or last.id != name_node.id:
             return False
         candidate = parent
-    call = _first_argument_of(candidate, "argument", "arguments")
+    return _php_is_removable_argument(candidate, accessors)
+
+
+def _php_is_removable_argument(value: Node, accessors: frozenset[str]) -> bool:
+    """Whether ``value`` is the first argument of a read the PHP rules fold:
+    a ``boolVariation`` (or configured accessor) call, outside string
+    interpolation."""
+    call = _first_argument_of(value, "argument", "arguments")
     if call is None or call.type not in (
         "member_call_expression",
         "function_call_expression",
@@ -908,7 +924,16 @@ def _php_is_removable_read(name_node: Node, accessors: frozenset[str]) -> bool:
     if callee is None or callee.type != "name":
         return False
     name = callee.text.decode("utf-8")
-    return name in _PHP_FLAG_READ_CALLEES or name in accessors
+    if name not in _PHP_FLAG_READ_CALLEES and name not in accessors:
+        return False
+    # The rules never fold a read inside string interpolation (`"{$c->...}"`
+    # would become `"{true}"`), so it stays, and so must the const it reads.
+    ancestor = call.parent
+    while ancestor is not None:
+        if ancestor.type in ("encapsed_string", "heredoc"):
+            return False
+        ancestor = ancestor.parent
+    return True
 
 
 # ===========================================================================
@@ -1243,6 +1268,16 @@ def _python_is_binding(node: Node) -> bool:
     parent = node.parent
     if parent is None:
         return False
+    # A capture pattern (`case X:`, `case [X]:`) binds X: a `dotted_name` of
+    # one name directly in a `case_pattern`. A dotted value pattern
+    # (`case a.X:`) binds nothing.
+    if (
+        parent.type == "dotted_name"
+        and len(parent.named_children) == 1
+        and parent.parent is not None
+        and parent.parent.type == "case_pattern"
+    ):
+        return True
     if parent.type in _PYTHON_NAME_FIELD_PARENTS:
         name = parent.child_by_field_name("name")
         if name is not None and name.id == node.id:
@@ -1287,6 +1322,15 @@ def _python_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bo
     call = _first_argument_of(identifier, "identifier", "argument_list")
     if call is None or call.type != "call":
         return False
+    return _python_is_removable_call(call, accessors)
+
+
+def _python_is_removable_call(call: Node, accessors: frozenset[str]) -> bool:
+    """Whether ``call`` is a read ``python_const.toml`` (or an accessor clone) removes.
+
+    The key's position is the caller's business: an identifier here, an
+    attribute for a reader of another module's constant.
+    """
     function = call.child_by_field_name("function")
     if function is None:
         return False
@@ -1389,8 +1433,8 @@ def _swift_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[Ke
 
     Must accept exactly what `swift_const.toml` accepts -- looser here and the
     delete rule strands a live reference, tighter and a file is withheld the
-    rules could have cleaned. That file names three scopes (`source_file`,
-    `class_body`, `statements`); this walk does not filter on scope at all,
+    rules could have cleaned. That file names four scopes (`source_file`,
+    `class_body`, `enum_class_body`, `statements`); this walk does not filter on scope at all,
     which is the safe direction of the two: a declaration seen HERE but not
     matched by the rules is simply never deleted.
 
@@ -1435,12 +1479,247 @@ def _swift_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[Ke
             continue
         consts.append(
             KeyConst(
-                name=_text(name_node, source_bytes),
+                name=_swift_name(name_node, source_bytes),
                 declaration=node,
                 name_nodes=(name_node,),
             )
         )
     return consts
+
+
+def _swift_name(node: Node, source_bytes: bytes) -> str:
+    """The name an identifier spells. Backticks may wrap any Swift name
+    without changing it (`` `k` `` is `k`), and the grammar keeps them in the
+    node's text, so a name is compared without them -- or a backticked
+    binding of the constant's name is invisible to the count."""
+    text = _text(node, source_bytes)
+    if len(text) > 2 and text[0] == "`" and text[-1] == "`":
+        return text[1:-1]
+    return text
+
+
+def _swift_is_reference(node: Node, source_bytes: bytes, name: str) -> bool:
+    return node.type == "simple_identifier" and _swift_name(node, source_bytes) == name
+
+
+def _swift_opens_a_supertype(node: Node) -> bool:
+    """Whether the members of something other than ``node``'s own body are in
+    unqualified scope inside it: an inheritance clause on a type, or any
+    `extension` -- whose members are the extended type's, declared wherever
+    that is. A `where Self: X` constraint, the other way to bring X's members
+    in, is written only on an extension (or a method in one) among the
+    declarations that hold code, so the extension test covers it; a `where`
+    on a generic type constrains its parameters, not `Self`."""
+    if node.type not in ("class_declaration", "protocol_declaration"):
+        return False
+    return any(c.type in ("extension", "inheritance_specifier") for c in node.children)
+
+
+def _swift_adds_a_supertype(extension: Node, source_bytes: bytes) -> bool:
+    """Whether an `extension` gives its type a supertype: an inheritance
+    clause (`extension S: P {}`), or a `where Self: X` / `where Self == X`
+    constraint. A `where T: Q` on a generic parameter adds nothing."""
+    if any(c.type == "inheritance_specifier" for c in extension.children):
+        return True
+    for clause in (c for c in extension.named_children if c.type == "type_constraints"):
+        for constraint in (c for c in clause.named_children if c.type == "type_constraint"):
+            for inner in constraint.named_children:
+                constrained = inner.child_by_field_name("constrained_type")
+                if constrained is not None and _swift_name(constrained, source_bytes) == "Self":
+                    return True
+    return False
+
+
+@dataclass(frozen=True)
+class _SwiftSupertypes:
+    """What one Swift file says about which of its types have a supertype."""
+
+    #: Last names of the types an extension here gives a supertype.
+    extended: frozenset[str]
+    #: Names of the types declared here with an inheritance clause.
+    clause: frozenset[str]
+    #: An extension here adds a supertype to a name this file cannot tie to
+    #: one of its own types by its full path, so it may extend any of them.
+    anything: bool
+
+    def has_one(self, name: str) -> bool:
+        return self.anything or name in self.extended or name in self.clause
+
+
+def _swift_supertypes(root: Node, source_bytes: bytes) -> _SwiftSupertypes:
+    """Which types of THIS file may have a supertype.
+
+    A type declared with no inheritance clause still gains the protocol's
+    extension members when an extension adds the conformance, and they are
+    in unqualified scope in the type's ORIGINAL body too.
+
+    An extension is TIED to a type of this file only when its full written
+    path is a nesting chain declared here: `extension S` needs a TOP-LEVEL
+    `S` (a nested or function-local `S` is not visible at file scope), and
+    `extension Keys.V` needs `V` declared in `Keys`'s body (or in an
+    extension of `Keys`). A tied extension counts for its type, matched on
+    the read's path by LAST name, which is coarser and can only withhold
+    more. Any other extension (spelled through a typealias from this file or
+    another, `extension T: P {}`, `extension NS.T: P {}`; module-qualified,
+    `extension App.S: P {}`, since this file cannot tell a module name from
+    a type's; or of an outside type, `extension UIViewController: P {}`)
+    cannot be tied, so it counts for every type here. An extension of sugar
+    (`[Int]`, `Int?`) names a standard-library type, never one declared
+    here, so it is not counted."""
+    chains: set[tuple[str, ...]] = set()
+    clause: set[str] = set()
+    adding: list[list[str]] = []
+    for node in _walk(root):
+        own = _swift_type_name(node, source_bytes)
+        if own is not None:
+            chain = _swift_type_chain(node, source_bytes)
+            if chain is not None:
+                chains.add(chain)
+            if any(c.type == "inheritance_specifier" for c in node.children):
+                clause.add(own)
+            continue
+        if node.type != "class_declaration" or not any(c.type == "extension" for c in node.children):
+            continue
+        if not _swift_adds_a_supertype(node, source_bytes):
+            continue
+        written = node.child_by_field_name("name")
+        if written is None or written.type != "user_type":
+            continue
+        segments = [_swift_name(c, source_bytes) for c in written.named_children if c.type == "type_identifier"]
+        if segments:
+            adding.append(segments)
+    aliases = {
+        _swift_name(name, source_bytes)
+        for node in _walk(root)
+        if node.type == "typealias_declaration"
+        for name in [node.child_by_field_name("name")]
+        if name is not None
+    }
+    anything = any(
+        tuple(segments) not in chains or any(s in aliases for s in segments) for segments in adding
+    )
+    return _SwiftSupertypes(
+        frozenset(segments[-1] for segments in adding), frozenset(clause), anything
+    )
+
+
+def _swift_type_chain(node: Node, source_bytes: bytes) -> tuple[str, ...] | None:
+    """The dotted path a type declared here is reachable by from file scope
+    (`("Keys", "V")` for `struct V` in `enum Keys`, or in an `extension
+    Keys`); None for a type declared inside a function or anything else
+    that is not a type body."""
+    own = _swift_type_name(node, source_bytes)
+    if own is None:
+        return None
+    body = node.parent
+    if body is None:
+        return None
+    if body.type == "source_file":
+        return (own,)
+    holder = body.parent
+    if body.type not in ("class_body", "enum_class_body", "protocol_body") or holder is None:
+        return None
+    if any(c.type == "extension" for c in holder.children):
+        written = holder.child_by_field_name("name")
+        if written is None or written.type != "user_type" or holder.parent is None or holder.parent.type != "source_file":
+            return None
+        outer = tuple(_swift_name(c, source_bytes) for c in written.named_children if c.type == "type_identifier")
+        return (*outer, own) if outer else None
+    outer_chain = _swift_type_chain(holder, source_bytes)
+    return None if outer_chain is None else (*outer_chain, own)
+
+
+def _swift_type_name(node: Node, source_bytes: bytes) -> str | None:
+    """The name a struct/class/enum/actor/protocol declaration introduces;
+    None for an extension (or anything else)."""
+    if node.type not in ("class_declaration", "protocol_declaration"):
+        return None
+    if any(c.type == "extension" for c in node.children):
+        return None
+    name = node.child_by_field_name("name")
+    return None if name is None else _swift_name(name, source_bytes)
+
+
+def _swift_is_static_member(member: Node, source_bytes: bytes) -> bool:
+    """A `static` or `class` member: a type-level context. The grammar puts
+    `class func`'s `class` straight under the declaration, not in its
+    modifiers."""
+    if any(not c.is_named and c.type in ("static", "class") for c in member.children):
+        return True
+    return any(
+        m.type == "property_modifier" and _text(m, source_bytes) in ("static", "class")
+        for mods in member.named_children if mods.type == "modifiers"
+        for m in mods.named_children
+    )
+
+
+def _swift_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bool:
+    """The Swift hazards the per-reference count cannot see.
+
+    1. **A backtick.** The rules compare the name as WRITTEN, so a backticked
+       declaration and a plain read (or the reverse) never match: the fold
+       skips the read and the delete strands it.
+    2. **A supertype's member.** Unqualified lookup tries every enclosing
+       type's members, its superclass's and its protocols' extensions' before
+       an outer scope. So a read below a type (or extension) that the
+       declaration's own scope does not hold, and that inherits anything,
+       may mean a member declared in another file or outside the checkout.
+       The `enclosing_node` filter cannot see that member and would fold this
+       flag's value over a different string. A type with no inheritance
+       clause of its own counts too when an extension in this file gives it
+       a supertype (`extension S: P {}`), or when one here extends a name
+       this file cannot tie to its own types. One added in ANOTHER file
+       stays invisible here.
+    3. **An instance context in the holder.** A `static let` cannot be used
+       from an instance method, initializer, accessor or computed property of
+       its own type: that does not compile. So a bare read there that does
+       compile means an instance member something else supplies (a
+       supertype, a conformance added in another file, a macro), and it is
+       withheld whatever this file says about the holder's supertypes.
+    4. **A mention outside the declaration's scope node.** The fold rules
+       reach only reads inside the node that holds the declaration (the file,
+       a type body, a function's statements). A read elsewhere, such as in the
+       type's own body when the constant is declared in an extension of it,
+       would be left behind by the delete.
+    """
+    types: _SwiftSupertypes | None = None
+    for const in consts:
+        declared = const.name_nodes[0]
+        if _text(declared, source_bytes) != const.name:
+            return True
+        scope = const.declaration.parent
+        if scope is None:
+            return True
+        holder = scope.parent if scope.type != "source_file" else None
+        if holder is not None and holder.type not in ("class_declaration", "protocol_declaration"):
+            holder = None
+        if holder is not None and not _swift_is_static_member(const.declaration, source_bytes):
+            holder = None  # an instance constant: the holder's own member wins in an instance context
+        for node in _walk(root):
+            if node.id == declared.id or not _swift_is_reference(node, source_bytes, const.name):
+                continue
+            current = node.parent
+            member: Node | None = None
+            nested = False
+            while current is not None and current.id != scope.id:
+                if _swift_opens_a_supertype(current):
+                    return True
+                own = _swift_type_name(current, source_bytes)
+                if own is not None:
+                    nested = True
+                    if types is None:
+                        types = _swift_supertypes(root, source_bytes)
+                    if types.has_one(own):
+                        return True
+                member = current
+                current = current.parent
+            if current is None:
+                return True  # outside the scope the rules fold in: the delete would strand it
+            if holder is None or nested or member is None:
+                continue
+            if not _swift_is_static_member(member, source_bytes):
+                return True
+    return False
 
 
 def _swift_is_binding(node: Node) -> bool:
@@ -1481,6 +1760,9 @@ def _swift_is_removable_read(identifier: Node, accessors: frozenset[str]) -> boo
             (c for c in callee.named_children if c.type == "simple_identifier"), None
         )
     if callee is None or callee.type != "simple_identifier":
+        return False
+    # A backticked key is never removed: the rules compare it as written.
+    if identifier.text.startswith(b"`"):
         return False
     name = callee.text.decode("utf-8")
     return name in _SWIFT_FLAG_READ_CALLEES or name in accessors
@@ -1583,11 +1865,10 @@ _PROFILES.update(
         },
         "swift": _Profile(
             key_consts=_swift_key_consts,
-            is_reference=lambda n, b, name: _is_named_identifier(
-                n, b, name, ("simple_identifier",)
-            ),
+            is_reference=_swift_is_reference,
             is_binding=_swift_is_binding,
             is_removable_read=_swift_is_removable_read,
+            withholds=_swift_withholds,
         ),
         "kt": _Profile(
             key_consts=_kotlin_key_consts,
@@ -1597,7 +1878,14 @@ _PROFILES.update(
         ),
         "python": _Profile(
             key_consts=_python_key_consts,
-            is_reference=lambda n, b, name: _is_named_identifier(n, b, name, ("identifier",)),
+            # A string whose whole content is the name counts too: `__all__`
+            # listing it, or `globals()["NAME"]`, reaches the constant by
+            # name, so deleting it breaks `from m import *` or the lookup.
+            # It is neither a binding nor a removable read, so the file is
+            # withheld.
+            is_reference=lambda n, b, name: _is_named_identifier(
+                n, b, name, ("identifier", "string_content")
+            ),
             is_binding=_python_is_binding,
             is_removable_read=_python_is_removable_read,
         ),

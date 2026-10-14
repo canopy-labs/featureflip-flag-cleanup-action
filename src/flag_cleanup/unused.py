@@ -105,7 +105,10 @@ import tree_sitter_dart
 import tree_sitter_go
 import tree_sitter_java
 import tree_sitter_kotlin
+import tree_sitter_php
 import tree_sitter_python
+import tree_sitter_ruby
+import tree_sitter_swift
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
@@ -130,22 +133,38 @@ from flag_cleanup import dart_namespace
 #:
 #: ``python`` is the gate's grammar too, and the one whose IMPORTS this pass
 #: never deletes: see ``_python_import_candidates``.
+#:
+#: ``swift`` is the gate's grammar too. Only its LOCALS are cleaned; no Swift
+#: import is ever a candidate (see ``_import_candidates``).
+#:
+#: ``ruby`` is the gate's grammar too, and only its locals are cleaned: a
+#: ``require`` runs the file it names, so none is ever a candidate.
+#:
+#: ``php`` is the PHP grammar with its inline-HTML text, the one every other
+#: PHP pass here parses with.
 _GRAMMARS = {
     "dart": tree_sitter_dart.language,
     "go": tree_sitter_go.language,
     "java": tree_sitter_java.language,
     "kt": tree_sitter_kotlin.language,
+    "php": tree_sitter_php.language_php,
     "python": tree_sitter_python.language,
+    "ruby": tree_sitter_ruby.language,
+    "swift": tree_sitter_swift.language,
     "csharp": tree_sitter_c_sharp.language,
     "ts": tree_sitter_typescript.language_typescript,
     "tsx": tree_sitter_typescript.language_tsx,
     "js": tree_sitter_typescript.language_tsx,
 }
 
-#: The languages this pass acts on at all. PHP, Ruby and Swift are absent
-#: because they are not where the build failures are, not because the
-#: mechanism forbids them — each would need its own measured decidability
-#: table before being added. Python is here because ruff's DEFAULT rule set
+#: The languages this pass acts on at all. Ruby is here because RuboCop's
+#: DEFAULT `Lint/UselessAssignment` flags an unused local and exits 1 on it
+#: (and `ruby -w` warns). PHP is here for tidiness, like Java: `php -l` reports neither an unused local nor
+#: an unused `use`, and the linters that do (PHP-CS-Fixer's
+#: `no_unused_imports`, Psalm's unused-variable check) are opt-in rule sets.
+#: Swift is here because `swiftc` warns on an unused local
+#: ("initialization of immutable value 'x' was never used"), and
+#: `-warnings-as-errors` fails the build on it. Python is here because ruff's DEFAULT rule set
 #: includes F401 (unused import) and F841 (unused local) and exits non-zero on
 #: either, so a project that lints in CI cannot merge a pull request leaving
 #: one. Dart is here because `dart analyze` reports both
@@ -167,9 +186,14 @@ _IMPORT_ROOTS = {
     "go": frozenset({"import_declaration"}),
     "java": frozenset({"import_declaration"}),
     "kt": frozenset({"import"}),
+    "php": frozenset({"namespace_use_declaration"}),
     "python": frozenset({
         "import_statement", "import_from_statement", "future_import_statement",
     }),
+    # A `require` is a call here, so this root matches nothing; no Ruby import
+    # is ever a candidate.
+    "ruby": frozenset(),
+    "swift": frozenset({"import_declaration"}),
     "csharp": frozenset({"using_directive"}),
     "ts": frozenset({"import_statement"}),
     "tsx": frozenset({"import_statement"}),
@@ -218,8 +242,14 @@ def references(source: str, name: str, language: str) -> int:
     Only childless nodes are considered, because those are the file's actual
     tokens — a name inside a string literal therefore counts too, which is the
     conservative direction.
+
+    PHP compares without case: a class or function name resolves through a
+    ``use`` whatever its case (``new flow()`` reads ``use App\\Flow``). A
+    constant's does not, and counting it anyway only costs a missed tidy.
     """
-    word = re.compile(rf"\b{re.escape(name)}\b")
+    folded = language == "php"
+    word = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE if folded else 0)
+    wanted = name.casefold() if folded else name
     total = 0
     for node in _walk(_parse(source, language)):
         if node.child_count and not _read_by_words(node, language):
@@ -227,15 +257,17 @@ def references(source: str, name: str, language: str) -> int:
         text = node.text.decode("utf-8", "replace")
         if _read_by_words(node, language):
             total += len(word.findall(text))
-        elif _spelling(text, language) == name and not _inside_import(node, language):
+        elif not _inside_import(node, language) and (
+            _spelling(text, language).casefold() if folded else _spelling(text, language)
+        ) == wanted:
             total += 1
     return total
 
 
 def _spelling(text: str, language: str) -> str:
-    """The name a leaf spells. The Kotlin grammar keeps an identifier's
-    backticks in its text, and `` `count` `` reads ``count``."""
-    if language == "kt" and len(text) > 2 and text[0] == text[-1] == "`":
+    """The name a leaf spells. The Kotlin and Swift grammars keep an
+    identifier's backticks in its text, and `` `count` `` reads ``count``."""
+    if language in {"kt", "swift"} and len(text) > 2 and text[0] == text[-1] == "`":
         return text[1:-1]
     return text
 
@@ -1043,6 +1075,55 @@ def _python_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate
     return candidates
 
 
+def _php_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
+    """Every PHP ``use`` that binds one name, offered as a deletion.
+
+    ``use App\\Legacy\\Flow;`` binds ``Flow``, and ``use App\\Ledger as
+    Book;`` binds ``Book``; ``use function`` and ``use const`` bind the same
+    way. A ``use`` runs nothing: it only tells the compiler how to spell a
+    name, and no class is loaded until one is used. A use the file still
+    makes is still spelled, in code, an attribute or a docblock's
+    ``@param Flow``, and every one of those is counted.
+
+    Not offered: a group (``use App\\{A, B};``) or a list (``use A, B;``),
+    which would need one clause cut from the middle, and kept for the rest;
+    and any use in a file with more than one ``namespace``.
+    """
+    if sum(1 for node in _walk(root) if node.type == "namespace_definition") > 1:
+        # Each `namespace` block has its own uses, and the count here is the
+        # file's, so a stranded `Foo` in one would take an unused `Foo` in
+        # another with it.
+        return []
+    candidates = []
+    for node in _walk(root):
+        if node.type != "namespace_use_declaration":
+            continue
+        clauses = [c for c in node.named_children if c.type == "namespace_use_clause"]
+        # A group's clauses sit inside its `namespace_use_group`, so a group
+        # has none here.
+        if len(clauses) != 1:
+            continue
+        clause = clauses[0]
+        name_node = clause.child_by_field_name("alias")
+        if name_node is None:
+            path = next(
+                (c for c in clause.named_children if c.type in {"qualified_name", "name"}),
+                None,
+            )
+            if path is not None and path.type == "qualified_name":
+                path = next(
+                    (c for c in reversed(path.named_children) if c.type == "name"), None
+                )
+            name_node = path
+        if name_node is None:
+            continue
+        name = name_node.text.decode("utf-8", "replace")
+        if not name.isidentifier():
+            continue
+        candidates.append(_candidate(name, node, source_bytes, "import"))
+    return candidates
+
+
 def _import_candidates(
     source: str,
     language: str,
@@ -1066,8 +1147,16 @@ def _import_candidates(
         return _java_import_candidates(root, source_bytes)
     if language == "kt":
         return _kotlin_import_candidates(root, source_bytes)
+    if language == "php":
+        return _php_import_candidates(root, source_bytes)
     if language == "python":
         return _python_import_candidates(root, source_bytes)
+    if language == "swift":
+        # Never one. `swiftc` does not report an unused import, so leaving one
+        # costs nothing, and spelling cannot decide one: an import also brings
+        # in extensions, conformances and operators that no use spells.
+        # `import Combine` is what makes `publisher.sink { … }` resolve.
+        return []
     if language in {"ts", "tsx", "js"}:
         return _ts_import_candidates(root, source_bytes, before)
     if language == "csharp":
@@ -1196,15 +1285,79 @@ def _kotlin_string_is_inert(node: Node) -> bool:
     return not _KOTLIN_TEMPLATE.search(node.text.decode("utf-8", "replace"))
 
 
-#: Python's additions. A member access (``attribute``) is inert as it is for
-#: C#, Dart, Kotlin and TypeScript, properties and ``__getattr__`` included:
-#: the same trade those languages accept. An index (``subscript``) is NOT,
-#: as in Kotlin: ``__getitem__`` is the customer's as often as not, and a
-#: ``KeyError`` is a result. An f-string's ``interpolation`` calls
-#: ``__format__`` and is absent, so such a string is effectful.
+#: What a Python local may hold and still be deleted: a literal, for Swift's
+#: and PHP's reason. CPython counts references, and measured on 3.12 a local
+#: holds its object until the function returns, so deleting one that holds
+#: an object (a name, an attribute, a call's result) or keeping its call as
+#: a bare statement runs the object's ``__del__`` at once instead:
+#: ``tempfile.TemporaryDirectory()`` then removes its directory before the
+#: code after it runs. Every named node, leaves included, must be one of
+#: these, so a bare ``identifier`` fails. An f-string's ``interpolation``
+#: calls ``__format__`` and is absent, so such a string fails too.
 _PYTHON_INERT_NODES = frozenset({
-    "integer", "float", "none", "ellipsis", "list", "tuple", "set",
-    "dictionary", "concatenated_string", "attribute",
+    "integer", "float", "true", "false", "none", "ellipsis", "string",
+    "string_start", "string_content", "string_end", "escape_sequence",
+    "concatenated_string", "list", "tuple", "set", "dictionary", "pair",
+    "parenthesized_expression",
+})
+
+
+#: What a Swift local may hold and still be deleted: a VALUE, never a
+#: reference. Swift's set is the narrowest here, and not out of caution about
+#: side effects alone. A `let` keeps its object alive to the end of its
+#: scope, and measured on `swiftc` 6.0, at `-Onone` and `-O` alike, deleting
+#: one moves the object's `deinit` earlier. A name, a member and a closure
+#: (which captures) can each hold the last strong reference to something
+#: whose `deinit` cancels a subscription or releases a lock, so none of them
+#: is here. A literal is a standard-library value with no `deinit`.
+#:
+#: A string literal is judged by its children, so one holding an
+#: ``interpolated_expression`` (``"\(x)"`` calls ``description``) is not
+#: inert. A dictionary is absent: a duplicate key traps at run time.
+_SWIFT_INERT_NODES = frozenset({
+    "integer_literal", "real_literal", "boolean_literal", "hex_literal",
+    "oct_literal", "bin_literal", "line_string_literal",
+    "multi_line_string_literal", "raw_string_literal", "array_literal",
+    "tuple_expression",
+})
+
+#: What a PHP local may hold and still be deleted: a literal, for Swift's
+#: reason. PHP counts references, and measured on PHP 8.2 an object held by
+#: a local is destroyed at the end of the function, but at once when the
+#: assignment is gone, so its ``__destruct`` would move. Every named node in
+#: the value must be one of these, leaves included: a bare ``name`` is a
+#: constant, which throws when undefined, and a ``variable_name`` can hold an
+#: object. An interpolated string holds a ``variable_name`` and so fails.
+_PHP_INERT_NODES = frozenset({
+    "integer", "float", "boolean", "null", "string", "string_content",
+    "escape_sequence", "encapsed_string", "heredoc", "heredoc_start",
+    "heredoc_body", "heredoc_end", "nowdoc", "nowdoc_body", "nowdoc_string",
+    "array_creation_expression", "array_element_initializer",
+})
+_PHP_NUMBERS = frozenset({"integer", "float"})
+
+
+#: What a stranded Ruby local may hold and still be deleted: a literal, and
+#: every named node in it, leaves included, must be one of these. A bare
+#: ``identifier`` is absent because it can be a method call (``c = compute``),
+#: and a ``constant`` because a reference to one can autoload a file. A
+#: heredoc is absent for a reason of SHAPE: its body is a sibling after the
+#: statement, outside the assignment's span, and deleting the line would
+#: leave the body behind.
+_RUBY_INERT_NODES = frozenset({
+    "integer", "float", "rational", "complex", "nil", "true", "false",
+    "string", "string_content", "escape_sequence", "simple_symbol",
+    "delimited_symbol", "array", "hash", "pair", "hash_key_symbol", "range",
+})
+
+
+#: Swift's literals, the only operands its ``-``, ``+`` and ``!`` are known to
+#: apply the built-in operator to. Any type can overload a prefix operator,
+#: and a CUSTOM one (``√4``) is the customer's function whatever it applies
+#: to.
+_SWIFT_LITERALS = frozenset({
+    "integer_literal", "real_literal", "boolean_literal", "hex_literal",
+    "oct_literal", "bin_literal",
 })
 
 
@@ -1283,17 +1436,75 @@ def _subtree_is_inert(node: Node, language: str = "") -> bool:
     # rewritten to a discard while the identical `x := "plain"` beside it was
     # deleted — two string literals, two different diffs, for no reason a
     # reviewer of the output could defend.
-    if node.child_count == 0:
-        return True
     if language == "python":
+        if not node.is_named:
+            return True
         if node.type == "unary_operator":
             # `-x` calls `__neg__`; only a number takes the built-in one.
             operand = node.child_by_field_name("argument")
             return operand is not None and operand.type in {"integer", "float"}
-        if node.type in _PYTHON_INERT_NODES:
-            return all(
-                _subtree_is_inert(child, language) for child in node.named_children
+        return node.type in _PYTHON_INERT_NODES and all(
+            _subtree_is_inert(child, language) for child in node.children
+        )
+    if language == "ruby":
+        if not node.is_named:
+            return True
+        if node.type == "unary":
+            # Ruby reads `-3` as a negative literal; the grammar spells it as
+            # an operator. Any other operand is a method call.
+            operand = node.child_by_field_name("operand")
+            return operand is not None and operand.type in {
+                "integer", "float", "rational", "complex",
+            }
+        if node.type == "pair" and node.child_by_field_name("value") is None:
+            # `{compute:}` reads the local `compute` or calls the method.
+            return False
+        return node.type in _RUBY_INERT_NODES and all(
+            _subtree_is_inert(child, language) for child in node.children
+        )
+    if language == "php":
+        if not node.is_named:
+            return True
+        if node.type == "unary_op_expression":
+            # `~true` throws and `~1.5` warns, so only the operators that do
+            # neither: a sign on a number, a `!` on a boolean.
+            operand = node.child_by_field_name("argument")
+            operator = node.children[0].type
+            return operand is not None and (
+                (operator in {"-", "+"} and operand.type in _PHP_NUMBERS)
+                or (operator == "!" and operand.type == "boolean")
             )
+        if node.type == "array_element_initializer" and any(
+            child.type == "=>" for child in node.children
+        ):
+            # A float key warns that it loses precision, and only an integer
+            # or a string is a key PHP keeps as written.
+            key = node.named_children[0] if node.named_children else None
+            if key is None or key.type not in {"integer", "string", "encapsed_string"}:
+                return False
+        return node.type in _PHP_INERT_NODES and all(
+            _subtree_is_inert(child, language) for child in node.children
+        )
+    if language == "swift" and node.type == "simple_identifier":
+        # A name is a token, but in Swift it can hold a reference, and the
+        # `let` holding it is what keeps the object alive; see
+        # `_SWIFT_INERT_NODES`.
+        return False
+    if node.child_count == 0:
+        return True
+    if language == "swift":
+        if node.type == "prefix_expression":
+            operation = node.child_by_field_name("operation")
+            target = node.child_by_field_name("target")
+            return (
+                operation is not None
+                and operation.text in {b"-", b"+", b"!"}
+                and target is not None
+                and target.type in _SWIFT_LITERALS
+            )
+        if node.type not in _SWIFT_INERT_NODES:
+            return False
+        return all(_subtree_is_inert(child, language) for child in node.named_children)
     if language == "kt":
         if node.type in _KOTLIN_STRINGS:
             return _kotlin_string_is_inert(node)
@@ -1374,7 +1585,10 @@ _VARIABLE_DECLARATIONS = {
     "go": ("short_var_declaration", "left", "right"),
     "java": ("local_variable_declaration", None, None),
     "kt": ("property_declaration", None, None),
+    "php": ("expression_statement", None, None),
     "python": ("expression_statement", None, None),
+    "ruby": ("assignment", None, None),
+    "swift": ("property_declaration", None, None),
     "csharp": ("local_declaration_statement", None, None),
     "ts": ("lexical_declaration", None, None),
     "tsx": ("lexical_declaration", None, None),
@@ -1388,7 +1602,7 @@ _VARIABLE_DECLARATIONS = {
 #: reachable from no other file at all.
 _FUNCTION_BODIES = frozenset({
     "block", "function_body", "statement_block", "function_declaration",
-    "method_declaration", "function_definition",
+    "method_declaration", "function_definition", "method", "singleton_method",
 })
 
 #: The languages where a top-level declaration can be FILE-PRIVATE, plus the
@@ -1487,6 +1701,12 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
             pair = _kotlin_declared_name_and_value(node)
         elif language == "python":
             pair = _python_declared_name_and_value(node)
+        elif language == "swift":
+            pair = _swift_declared_name_and_value(node)
+        elif language == "php":
+            pair = _php_declared_name_and_value(node)
+        elif language == "ruby":
+            pair = _ruby_declared_name_and_value(node)
         else:
             pair = _declared_name_and_value(node, name_field, value_field)
             if pair is not None:
@@ -1680,10 +1900,13 @@ def _python_declared_name_and_value(
 
     Declined: any local of a function that spells one of
     ``_PYTHON_NAMESPACE_READERS``, a target that is not a bare name (``a, b = …``, ``self.x =
-    …``, ``items[0] = …``) and an annotation with no value (``x: int``),
-    which binds nothing at run time. A chain (``a = b = make()``) is offered
-    and then left: its value is the inner assignment, which is neither inert
-    nor a call.
+    …``, ``items[0] = …``), an annotation with no value (``x: int``),
+    which binds nothing at run time, and a name assigned more than once in
+    its function. Each assignment's own name is blanked, so ``lock = None``
+    releasing what ``lock = Lock()`` held reads as stranded, and deleting it
+    keeps the lock to the end of the function. A chain (``a = b = make()``)
+    is offered and then left: its value is the inner assignment, which is
+    not a literal.
     """
     scope = node.parent
     while scope is not None and scope.type not in _PYTHON_SCOPES:
@@ -1703,7 +1926,246 @@ def _python_declared_name_and_value(
     value = assignment.child_by_field_name("right")
     if name_node is None or name_node.type != "identifier" or value is None:
         return None
+    if sum(
+        1
+        for other in _walk(scope)
+        if other.type == "assignment"
+        and (target := other.child_by_field_name("left")) is not None
+        and target.type == "identifier"
+        and target.text == name_node.text
+    ) > 1:
+        return None
     return name_node, (value.start_byte, value.end_byte)
+
+
+#: The children a Swift local may have and still be judged here: ``let``/
+#: ``var``, its name, a type and a value. Anything else is declined, and each
+#: for a reason: an ``attribute`` is a property wrapper, whose ``init`` runs
+#: code; ``lazy`` runs the initializer on first read, never at the
+#: declaration; ``weak``/``unowned`` arrive as ``modifiers``; and a
+#: ``willset_didset_block`` or ``computed_property`` is code of its own.
+#: ``async let`` starts a child task, and its ``async`` is an ANONYMOUS
+#: child, so it is checked for apart from these.
+_SWIFT_LOCAL_PARTS = frozenset({"value_binding_pattern", "pattern", "type_annotation"})
+
+
+def _swift_declared_name_and_value(
+    node: Node,
+) -> tuple[Node, tuple[int, int] | None] | None:
+    """The one name a Swift local ``let``/``var`` binds and the span of its
+    value, or ``None`` when it is not one this pass can judge.
+
+    ``property_declaration`` is a type's stored property as well, and a
+    file's top-level ``let`` in a ``main.swift`` is a global, so only a
+    declaration that is a statement (its parent is ``statements``) is a local.
+
+    Declined: a second name (``let a = 1, b = 2``) or a pattern (``let (a,
+    b) = pair()``), any child outside ``_SWIFT_LOCAL_PARTS``, and a TYPED
+    local with a value. A literal is only a standard-library value when
+    nothing names its type: ``let x: Money = 3`` runs the customer's
+    ``init(integerLiteral:)``.
+    """
+    if node.parent is None or node.parent.type != "statements":
+        return None
+    if any(
+        (child.is_named and child.type not in _SWIFT_LOCAL_PARTS
+         and node.field_name_for_child(index) != "value")
+        or child.type == "async"
+        for index, child in enumerate(node.children)
+    ):
+        return None
+    names = [
+        node.child(index)
+        for index in range(node.child_count)
+        if node.field_name_for_child(index) == "name"
+    ]
+    if len(names) != 1:
+        return None
+    # A pattern (`(a, b)`) has no `bound_identifier`; only a plain name does.
+    bound = names[0].child_by_field_name("bound_identifier")
+    if bound is None:
+        return None
+    value = node.child_by_field_name("value")
+    if value is None:
+        return bound, None
+    if any(child.type == "type_annotation" for child in node.children):
+        return None
+    return bound, (value.start_byte, value.end_byte)
+
+
+#: The PHP nodes that read every local of their scope without spelling one:
+#: an included file runs in the including function's scope, and ``$$name`` is
+#: any local at all. A scope holding one offers no local.
+_PHP_NAMESPACE_READERS = frozenset({
+    "include_expression", "include_once_expression", "require_expression",
+    "require_once_expression", "dynamic_variable_name",
+})
+
+#: The PHP functions that do the same by name: ``compact('total')`` reads
+#: ``$total`` by a string. Matched as ANY ``name`` leaf, so a qualified
+#: ``\\get_defined_vars()`` counts, and PHP refuses to call any of them
+#: dynamically, so a name is the only way to reach one.
+_PHP_NAMESPACE_FUNCTIONS = frozenset({
+    b"compact", b"extract", b"get_defined_vars", b"eval", b"parse_str",
+})
+
+#: Variables every scope shares. Writing one is never local.
+_PHP_SUPERGLOBALS = frozenset({
+    "GLOBALS", "_SERVER", "_GET", "_POST", "_FILES", "_COOKIE", "_SESSION",
+    "_REQUEST", "_ENV", "this",
+})
+
+#: The PHP nodes that start a new variable scope.
+_PHP_SCOPES = frozenset({
+    "function_definition", "method_declaration", "anonymous_function",
+    "arrow_function",
+})
+
+
+def _php_reader_aliases(node: Node) -> frozenset[bytes]:
+    """The local names a ``use function`` gives one of
+    ``_PHP_NAMESPACE_FUNCTIONS`` in the file holding ``node``
+    (``use function get_defined_vars as vars;``)."""
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    aliases = set()
+    for clause in _walk(root):
+        if clause.type != "namespace_use_clause":
+            continue
+        alias = clause.child_by_field_name("alias")
+        target = next(
+            (c for c in clause.named_children if c.type in {"qualified_name", "name"}),
+            None,
+        )
+        if alias is None or target is None:
+            continue
+        last = target.text.rsplit(b"\\", 1)[-1].lower()
+        if last in _PHP_NAMESPACE_FUNCTIONS:
+            aliases.add(alias.text.lower())
+    return frozenset(aliases)
+
+
+def _php_assigned_name(node: Node) -> str | None:
+    """The variable a plain ``$name = value;`` statement writes, or ``None``."""
+    if node.type != "expression_statement":
+        return None
+    statements = [c for c in node.named_children if "comment" not in c.type]
+    if len(statements) != 1 or statements[0].type != "assignment_expression":
+        return None
+    left = statements[0].child_by_field_name("left")
+    if left is None or left.type != "variable_name":
+        return None
+    name_node = next((c for c in left.named_children if c.type == "name"), None)
+    return None if name_node is None else name_node.text.decode("utf-8", "replace")
+
+
+def _php_declared_name_and_value(
+    node: Node,
+) -> tuple[Node, tuple[int, int] | None] | None:
+    """The one variable a PHP assignment statement writes in a function, and
+    the span of the value, or ``None`` when it is not one this pass can judge.
+
+    PHP has no declaration: ``$total = 3;`` is the binding, and it may also
+    be a REASSIGNMENT. Every way to bind the name other than a plain
+    assignment spells it (a parameter, ``global``, ``static``, ``foreach …
+    as``, a reference), and a spelling keeps the count above zero. A second
+    plain assignment does not, since each one's own name is blanked, so a
+    variable assigned more than once in its scope is declined: the one left
+    standing may be what releases an object the other held.
+
+    Only a function's or a method's own scope: a closure or an arrow
+    function has no name to pair, and a file's top-level variables are
+    globals that an including file shares. Declined: any local of a scope
+    holding one of ``_PHP_NAMESPACE_READERS`` or calling one of
+    ``_PHP_NAMESPACE_FUNCTIONS``, a superglobal, and anything but a plain
+    ``$name = value`` (``$a = &$b``, ``$a += 1`` and ``$a[] = 1`` are other
+    nodes or another left side).
+    """
+    scope = node.parent
+    while scope is not None and scope.type not in _PHP_SCOPES:
+        scope = scope.parent
+    if scope is None:
+        return None
+    readers = _PHP_NAMESPACE_FUNCTIONS | _php_reader_aliases(node)
+    if any(
+        leaf.type in _PHP_NAMESPACE_READERS
+        or (leaf.type == "name" and leaf.text.lower() in readers)
+        for leaf in _walk(scope)
+    ):
+        return None
+    name = _php_assigned_name(node)
+    if name is None or name in _PHP_SUPERGLOBALS:
+        return None
+    if sum(1 for other in _walk(scope) if _php_assigned_name(other) == name) > 1:
+        # `$lock = null;` releasing what `$lock = new Lock();` held: deleting
+        # it would move that object's `__destruct` to the end of the function.
+        return None
+    assignment = next(c for c in node.named_children if "comment" not in c.type)
+    left = assignment.child_by_field_name("left")
+    value = assignment.child_by_field_name("right")
+    if value is None:
+        return None
+    name_node = next(c for c in left.named_children if c.type == "name")
+    return name_node, (value.start_byte, value.end_byte)
+
+
+#: The Ruby nodes that start a new local scope. A block and a lambda see the
+#: locals around them, but bind their own.
+_RUBY_SCOPES = frozenset({
+    "method", "singleton_method", "block", "do_block", "lambda", "class",
+    "module", "singleton_class",
+})
+
+#: Names whose use reads a method's locals without spelling them: ERB's
+#: ``template.result(binding)`` is the everyday one. A scope that spells one
+#: offers no local at all.
+_RUBY_NAMESPACE_READERS = frozenset({
+    b"binding", b"local_variables", b"eval", b"instance_eval", b"class_eval",
+    b"module_eval", b"instance_exec", b"class_exec", b"module_exec",
+})
+
+
+def _ruby_declared_name_and_value(
+    node: Node,
+) -> tuple[Node, tuple[int, int] | None] | None:
+    """The local a Ruby assignment statement writes in a method, and the span
+    of its value, or ``None`` when it is not one this pass can judge.
+
+    Ruby has no declaration: the first ``legacy = …`` makes ``legacy`` a
+    local, and a later one reassigns it. Every other way the name comes to
+    exist spells it (a parameter, a block parameter, ``legacy ||= …``, a
+    multiple assignment), and a spelling keeps the count above zero.
+
+    Declined: every local of a scope that spells one of
+    ``_RUBY_NAMESPACE_READERS``. A scope that is not a ``def`` is declined
+    when it is paired (``_ruby_scope_key``). A left side that is not a plain
+    name (``@x``, ``$x``, ``obj.x``, ``a, b``) fails the name test every
+    candidate gets, and a constant cannot be assigned in a method.
+
+    An assignment inside an expression (``log(a = 3)``, ``a = 3 if ok``) is
+    offered like any other. Its value is its right side, so keeping the call
+    keeps the expression's value, and a deletion there always shares its line
+    with the rest of the expression, which ``_ruby_deletable_lines`` declines.
+    """
+    scope = node.parent
+    while scope is not None and scope.type not in _RUBY_SCOPES:
+        scope = scope.parent
+    if scope is None:
+        return None
+    if any(
+        leaf.text.lstrip(b":") in _RUBY_NAMESPACE_READERS
+        for leaf in _walk(scope)
+        if not leaf.child_count
+    ):
+        # Spelled as a name or as a symbol: `send(:binding)` and
+        # `method(:eval)` reach the same thing.
+        return None
+    left = node.child_by_field_name("left")
+    value = node.child_by_field_name("right")
+    if left is None or value is None:
+        return None
+    return left, (value.start_byte, value.end_byte)
 
 
 #: The words before a Dart local's name that are NOT a type annotation.
@@ -1835,9 +2297,10 @@ def _sole_bound_name(name_node: Node) -> Node | None:
 #: guard below is the honest backstop for the rest.
 _DISCARD_PREFIX = {"go": "_ = "}
 
-#: The languages whose discard needs no ``;``. Kotlin and Python end a
-#: statement at the newline, and ktlint's `no-semi` flags one written anyway.
-_NO_STATEMENT_TERMINATOR = frozenset({"go", "kt", "python"})
+#: The languages whose discard needs no ``;``. Kotlin, Python and Ruby end a
+#: statement at the newline, and ktlint's `no-semi` and RuboCop's
+#: `Style/Semicolon` flag one written anyway.
+_NO_STATEMENT_TERMINATOR = frozenset({"go", "kt", "python", "ruby"})
 
 #: Node types that ARE a legal expression statement in Java, C# and TS. Java's
 #: list is JLS 14.8; C# and TS admit the same shapes plus ``await``.
@@ -1874,9 +2337,12 @@ _DART_STATEMENT_STARTS = frozenset({"identifier", "new_expression", "this"})
 _LEADING_BLANK_IS_MEANINGLESS = frozenset({"ts", "tsx", "js", "csharp", "dart", "java", "kt"})
 
 #: The languages whose standard linter fails on two blank lines in a row,
-#: which a deleted import between two blank lines leaves behind: ktlint's
-#: `no-consecutive-blank-lines`, in its default rule set.
-_BLANK_RUN_IS_AN_ERROR = frozenset({"kt"})
+#: which a deleted line between two blank lines leaves behind: ktlint's
+#: `no-consecutive-blank-lines` and SwiftLint's `vertical_whitespace`, each
+#: in its default rule set, PHP-CS-Fixer's `no_extra_blank_lines`, which
+#: every PSR-12 and Symfony rule set includes, and RuboCop's default
+#: `Layout/EmptyLines`.
+_BLANK_RUN_IS_AN_ERROR = frozenset({"kt", "php", "ruby", "swift"})
 
 
 def _apply(source: str, candidate: Candidate, language: str) -> str | None:
@@ -1919,11 +2385,35 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
             + data[candidate.end :]
         ).decode("utf-8")
     deletable = candidate.kind == "import" or is_inert(candidate, source, language)
-    lines = (
-        _python_deletable_lines(source, candidate) if language == "python" else None
-    )
-    if language == "python" and lines is None:
-        deletable = False
+    lines = None
+    if language == "python":
+        lines = _python_deletable_lines(source, candidate)
+        if lines is None:
+            deletable = False
+    elif language == "swift" and candidate.kind == "variable":
+        lines = _swift_deletable_lines(source, candidate)
+        if lines is None:
+            deletable = False
+    elif language == "php":
+        if candidate.kind == "import":
+            block = _php_lone_block(source, candidate)
+            if block is not None:
+                return (data[: block[0]] + data[block[1] :]).decode("utf-8")
+        lines = _php_deletable_lines(source, candidate)
+        if lines is None and candidate.kind == "variable":
+            deletable = False
+        if lines is None and candidate.kind == "import":
+            # Sharing its line (`<?php use X; $y = 1; ?>`): the space after it
+            # goes too, or the tag is left followed by two.
+            end = candidate.end
+            while data[end : end + 1] in (b" ", b"\t"):
+                end += 1
+            if data[candidate.end : end] and data[end : end + 1] not in (b"\n", b"\r", b""):
+                return (data[: candidate.start] + data[end:]).decode("utf-8")
+    elif language == "ruby":
+        lines = _ruby_deletable_lines(source, candidate)
+        if lines is None:
+            deletable = False
     if deletable and not _fills_a_parent_slot(source, candidate, language):
         start, end = candidate.start, candidate.end
         if _sits_in_comma_separated_list(source, candidate, language):
@@ -1959,9 +2449,29 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
         if not _kotlin_initializer_is_a_statement(source, candidate):
             return None
     elif language == "python":
-        value = _node_at(source, "python", init_start, init_end)
-        if value is None or value.type not in {"call", "await"}:
+        # Never, for PHP's reason: CPython would free the call's object at
+        # once, where the local held it until the function returned, and its
+        # `__del__` would move. Measured on 3.12.
+        return None
+    elif language == "ruby":
+        # Only a call, which a statement can be on its own: RuboCop's
+        # `Lint/Void` flags a constant, a literal or a variable kept as one,
+        # and a bare name may be a method call or may not.
+        value = _node_at(source, "ruby", init_start, init_end)
+        if value is None or value.type != "call":
             return None
+    elif language == "php":
+        # Never, for Swift's reason below: a call's object would be
+        # destroyed at once, where the variable held it to the end of the
+        # function, and its `__destruct` would move.
+        return None
+    elif language == "swift":
+        # Never. `_ = LegacyFlow(ctx)` is `swiftc`'s own fix-it, and it
+        # releases the object at once where the `let` held it to the end of
+        # the scope: measured, a `deinit` that cancels a subscription or
+        # releases a lock then runs before the code after it. No spelling
+        # keeps both the call and the lifetime, so the declaration stays.
+        return None
     elif prefix is None and not _is_statement_expression(source, candidate, language):
         return None
     replacement = f"{prefix or ''}{initializer}"
@@ -2026,6 +2536,166 @@ def _python_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int
         ):
             # It would become the body's docstring.
             return None
+    return line_start, line_end
+
+
+def _ruby_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] | None:
+    """The whole lines a Ruby assignment can be deleted as, or ``None``.
+
+    Two shapes cannot lose the statement:
+
+    * the LAST statement of its body, whose value is the method's, the
+      block's or the branch's: deleting ``limit = 3`` at the end of a method
+      changes what it returns. The kept call (the discard) returns the same
+      value, so it is still offered;
+    * one sharing its line with another (``n = 3; go``). A trailing ``#``
+      comment goes with it.
+
+    A line the one above continues into with ``\\`` needs no check: the
+    assignment is then an argument, and was never a statement here.
+    """
+    data = source.encode("utf-8")
+    line_start = max(data.rfind(b"\n", 0, candidate.start) + 1, _bom_length(data))
+    line_end = data.find(b"\n", candidate.end)
+    line_end = len(data) if line_end == -1 else line_end + 1
+    tail = data[candidate.end:line_end].strip()
+    if data[line_start:candidate.start].strip() or (tail and not tail.startswith(b"#")):
+        return None
+    node = next(
+        (
+            n for n in _walk(_parse(source, "ruby"))
+            if n.type == "assignment"
+            and (n.start_byte, n.end_byte) == (candidate.start, candidate.end)
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    following = node.next_named_sibling
+    while following is not None and following.type == "comment":
+        following = following.next_named_sibling
+    if following is None or following.type in {"rescue", "else", "ensure"}:
+        # A `rescue`, `else` or `ensure` clause is a sibling in the body, not
+        # a statement after this one: the value is still the body's.
+        return None
+    return line_start, line_end
+
+
+def _php_lone_block(source: str, candidate: Candidate) -> tuple[int, int] | None:
+    """The bytes of a ``<?php ... ?>`` block whose only statement is the
+    ``use`` ``candidate``, with the one newline straight after ``?>``; None
+    for any other ``use``.
+
+    A template's ``<?php use App\\Flags; ?>`` would otherwise be left as an
+    empty ``<?php  ?>``. PHP never outputs the newline that follows ``?>``,
+    and the block outputs nothing, so the page renders the same without it.
+    """
+    data = source.encode("utf-8")
+    node = next(
+        (
+            n
+            for n in _walk(_parse(source, "php"))
+            if n.type == "namespace_use_declaration" and n.start_byte == candidate.start
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    before, after = node.prev_sibling, node.next_sibling
+    if before is not None and before.type == "text_interpolation" and before.child_count:
+        before = before.children[-1]
+    if before is None or before.type != "php_tag" or before.text.lower() != b"<?php":
+        return None
+    if after is None or after.type != "text_interpolation" or not after.child_count:
+        return None
+    close = after.children[0]
+    if close.type != "php_end_tag":
+        return None
+    end = close.end_byte
+    if data[end : end + 2] == b"\r\n":
+        end += 2
+    elif data[end : end + 1] == b"\n":
+        end += 1
+    return before.start_byte, end
+
+
+def _php_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] | None:
+    """The whole lines a PHP assignment or ``use`` can be deleted as, or
+    ``None`` when it shares its line with something that is not a comment,
+    or is the unbraced body of a ``declare``.
+
+    Deleting the statement alone would be legal PHP, but a statement left
+    behind on the line would keep the deleted one's indentation and the
+    space after its ``;``, so an assignment is then left. A ``use`` is
+    deleted alone, since nothing indents one. A trailing ``//`` or ``#`` comment goes with the
+    binding, unless it holds a ``?>``, which ends PHP mode even inside a line
+    comment and so takes markup with it.
+    """
+    data = source.encode("utf-8")
+    line_start = max(data.rfind(b"\n", 0, candidate.start) + 1, _bom_length(data))
+    line_end = data.find(b"\n", candidate.end)
+    line_end = len(data) if line_end == -1 else line_end + 1
+    tail = data[candidate.end:line_end].strip()
+    if data[line_start:candidate.start].strip():
+        return None
+    node = _node_at(source, "php", candidate.start, candidate.end)
+    if node is not None and node.parent is not None and node.parent.type == "declare_statement":
+        # `declare(ticks=1) $v = 2;` holds its body in no field, so
+        # `_fills_a_parent_slot` cannot see it; the next statement would
+        # become the body.
+        return None
+    if tail and (
+        not tail.startswith((b"//", b"#")) or tail.startswith(b"#[") or b"?>" in tail
+    ):
+        return None
+    return line_start, line_end
+
+
+def _swift_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] | None:
+    """The whole lines a Swift local can be deleted as, or ``None``.
+
+    Two shapes cannot lose the declaration, and each would ship source
+    ``swiftc`` rejects although tree-sitter parses it:
+
+    * one sharing its line with another statement. ``let n = 3; go()``
+      would leave ``; go()``, and "';' statements are not allowed". A
+      trailing ``//`` comment is not another statement: it annotates the
+      binding, and goes with it. A ``/*`` one is declined, because the line
+      can go on after it closes, or the comment can close on a later line;
+    * the only statement of a ``case``, which "must have at least one
+      executable statement".
+    """
+    data = source.encode("utf-8")
+    line_start = max(data.rfind(b"\n", 0, candidate.start) + 1, _bom_length(data))
+    line_end = data.find(b"\n", candidate.end)
+    line_end = len(data) if line_end == -1 else line_end + 1
+    tail = data[candidate.end:line_end].strip()
+    if data[line_start:candidate.start].strip() or (
+        tail and not tail.startswith(b"//")
+    ):
+        return None
+    # By type: a block holding only this declaration spans the same bytes,
+    # and ``_node_at`` would answer with it.
+    node = next(
+        (
+            n for n in _walk(_parse(source, "swift"))
+            if n.type == "property_declaration"
+            and (n.start_byte, n.end_byte) == (candidate.start, candidate.end)
+        ),
+        None,
+    )
+    if node is None or node.parent is None:
+        return None
+    statements = node.parent
+    if (
+        statements.parent is not None
+        and statements.parent.type == "switch_entry"
+        and not any(
+            sibling.id != node.id and "comment" not in sibling.type
+            for sibling in statements.named_children
+        )
+    ):
+        return None
     return line_start, line_end
 
 
@@ -2367,6 +3037,40 @@ _SCOPE_ROOTS["kt"] = frozenset({
 #: and cannot hold an assignment anyway.
 _SCOPE_ROOTS["python"] = _PYTHON_SCOPES
 
+#: Swift's named scopes are a ``func``, an ``init`` and a ``deinit``. The
+#: rest stop the walk so that a local inside one is declined by
+#: ``_swift_scope_key`` rather than paired by the function around it: a
+#: closure has no name, a getter and a setter are each spelled ``get``/``set``
+#: in every property, and a subscript's accessors are the same.
+_SWIFT_ANONYMOUS_SCOPES = frozenset({
+    "lambda_literal", "computed_property", "computed_getter", "computed_setter",
+    "computed_modify", "willset_clause", "didset_clause", "subscript_declaration",
+})
+_SWIFT_NAMED_SCOPES = frozenset({
+    "function_declaration", "init_declaration", "deinit_declaration",
+})
+_SCOPE_ROOTS["swift"] = _SWIFT_NAMED_SCOPES | _SWIFT_ANONYMOUS_SCOPES
+
+#: Ruby's named scopes are a ``def`` and a ``def self.``. The rest stop the
+#: walk and are declined by ``_ruby_scope_key``: a block and a lambda have no
+#: name, and a class body's locals are not a method's.
+_SCOPE_ROOTS["ruby"] = _RUBY_SCOPES
+
+#: PHP's named scopes are a function and a method; a closure and an arrow
+#: function stop the walk and are declined by ``_php_scope_key``.
+_SCOPE_ROOTS["php"] = _PHP_SCOPES
+
+#: The PHP declarations whose header qualifies a method inside them.
+_PHP_TYPE_DECLARATIONS = frozenset({
+    "class_declaration", "trait_declaration", "interface_declaration",
+    "enum_declaration",
+})
+
+#: The Swift declarations whose header qualifies a scope inside them.
+#: ``class_declaration`` is also every ``struct``, ``enum``, ``actor`` and
+#: ``extension``.
+_SWIFT_TYPE_DECLARATIONS = frozenset({"class_declaration", "protocol_declaration"})
+
 #: The Kotlin scopes ``_kotlin_scope_key`` cannot name.
 _KOTLIN_ANONYMOUS_SCOPES = frozenset({
     "anonymous_initializer", "getter", "setter", "lambda_literal",
@@ -2429,6 +3133,12 @@ def _scope_key(scope: Node, language: str) -> str | None:
         return _kotlin_scope_key(scope)
     if language == "python":
         return _python_scope_key(scope)
+    if language == "swift":
+        return _swift_scope_key(scope)
+    if language == "php":
+        return _php_scope_key(scope)
+    if language == "ruby":
+        return _ruby_scope_key(scope)
     return _scope_name(scope)
 
 
@@ -2538,6 +3248,67 @@ def _python_scope_key(scope: Node) -> str | None:
         if node.type == "lambda":
             return None
         if node.type in {"function_definition", "class_definition"}:
+            body = node.child_by_field_name("body")
+            end = body.start_byte if body is not None else node.end_byte
+            header = node.text[: end - node.start_byte].decode("utf-8", "replace")
+            parts.append(" ".join(header.split()))
+        node = node.parent
+    return " / ".join(reversed(parts))
+
+
+def _swift_scope_key(scope: Node) -> str | None:
+    """The scope's header, qualified by every function and type it sits in,
+    or ``None`` when any of them is anonymous.
+
+    The header rather than the name, for the reason Kotlin's is: overloads
+    share a name (``func run(_ id: Int)`` beside ``func run(_ name:
+    String)``), and every type in a file can have its own ``init``.
+    """
+    parts: list[str] = []
+    node: Node | None = scope
+    while node is not None:
+        if node.type in _SWIFT_ANONYMOUS_SCOPES:
+            return None
+        if node.type in _SWIFT_NAMED_SCOPES | _SWIFT_TYPE_DECLARATIONS:
+            body = node.child_by_field_name("body")
+            end = body.start_byte if body is not None else node.end_byte
+            header = node.text[: end - node.start_byte].decode("utf-8", "replace")
+            parts.append(" ".join(header.split()))
+        node = node.parent
+    return " / ".join(reversed(parts))
+
+
+def _ruby_scope_key(scope: Node) -> str | None:
+    """The ``def`` line, qualified by every class and module it sits in, or
+    ``None`` when the scope is not a method: a block's, a lambda's and a
+    class body's locals have no name to pair. The header rather than the
+    name: every class in a file can have a ``call``."""
+    if scope.type not in {"method", "singleton_method"}:
+        return None
+    parts: list[str] = []
+    node: Node | None = scope
+    while node is not None:
+        if node.type in {"method", "singleton_method", "class", "module", "singleton_class"}:
+            body = node.child_by_field_name("body")
+            end = body.start_byte if body is not None else node.end_byte
+            header = node.text[: end - node.start_byte].decode("utf-8", "replace")
+            parts.append(" ".join(header.split()))
+        node = node.parent
+    return " / ".join(reversed(parts))
+
+
+def _php_scope_key(scope: Node) -> str | None:
+    """The function's header, qualified by every type and function it sits
+    in, or ``None`` inside a closure or an arrow function. The header rather
+    than the name: every class in a file can have a ``run``."""
+    parts: list[str] = []
+    node: Node | None = scope
+    while node is not None:
+        if node.type in {"anonymous_function", "arrow_function"}:
+            return None
+        if node.type in {"function_definition", "method_declaration"} | (
+            _PHP_TYPE_DECLARATIONS
+        ):
             body = node.child_by_field_name("body")
             end = body.start_byte if body is not None else node.end_byte
             header = node.text[: end - node.start_byte].decode("utf-8", "replace")
@@ -2705,7 +3476,9 @@ def _references_in_scope(
 _MEMBER_ACCESS_PROPERTY = {
     "go": ("selector_expression", "field"),
     "java": ("field_access", "field"),
+    "php": ("member_access_expression", "name"),
     "python": ("attribute", "attribute"),
+    "swift": ("navigation_suffix", "suffix"),
     "csharp": ("member_access_expression", "name"),
     "ts": ("member_expression", "property"),
     "tsx": ("member_expression", "property"),
@@ -2765,6 +3538,41 @@ def _is_member_access_property(leaf: Node, language: str) -> bool:
                 and access.parent.children[0].id == access.id
             )
         )
+    if language == "ruby":
+        if leaf.type == "hash_key_symbol":
+            # `retries: 3` names a key; `retries:` alone (Ruby 3.1) reads the
+            # local `retries`, so only a key with a value is excluded.
+            pair = leaf.parent
+            return (
+                pair is not None
+                and pair.type == "pair"
+                and pair.child_by_field_name("value") is not None
+            )
+        # `obj.legacy`, `legacy(1)` and `legacy { }` call a method even
+        # beside a local of that name. Arguments WITHOUT parentheses do not:
+        # the grammar cannot know `legacy` is a local, so `legacy [1]` and
+        # `legacy -1` arrive as calls, and Ruby, which can, indexes and
+        # subtracts. A bare `legacy` is an `identifier`, never this.
+        call = leaf.parent
+        if call is None or call.type != "call":
+            return False
+        method = call.child_by_field_name("method")
+        if method is None or method.id != leaf.id:
+            return False
+        arguments = call.child_by_field_name("arguments")
+        return (
+            call.child_by_field_name("receiver") is not None
+            or call.child_by_field_name("block") is not None
+            or (arguments is not None and arguments.text.startswith(b"("))
+        )
+    if (
+        language == "swift"
+        and leaf.parent is not None
+        and leaf.parent.type == "value_argument_label"
+    ):
+        # `modern(retries: config.retries)` reads neither `retries` the
+        # label nor `retries` the member; a label is never a read.
+        return True
     member_type, field = _MEMBER_ACCESS_PROPERTY.get(language, (None, None))
     if member_type is None:
         return False
@@ -3024,8 +3832,42 @@ def _import_references(source: str, candidate: Candidate, language: str) -> int:
     """How often ``source`` spells any binding of the import ``candidate``."""
     return sum(
         _references_excluding_own_declaration(source, name, language)
+        - (_php_member_spellings(source, name) if language == "php" else 0)
         for name in (candidate.names or (candidate.name,))
     )
+
+
+#: PHP nodes whose ``name`` field is a member of an object or class.
+_PHP_MEMBER_ACCESSES = frozenset(
+    {
+        "member_access_expression",
+        "nullsafe_member_access_expression",
+        "member_call_expression",
+        "nullsafe_member_call_expression",
+        "scoped_call_expression",
+    }
+)
+
+
+def _php_member_spellings(source: str, name: str) -> int:
+    """How many of the leaves :func:`references` counts for ``name`` are a
+    member's name: ``X::NAME``, ``$x->NAME``, ``$x?->NAME``, ``$x->NAME()`` or
+    ``X::NAME()``. No ``use`` binds a member, so none of them reads one, and a
+    fold that removes one strands nothing."""
+    wanted = name.casefold()
+    total = 0
+    for node in _walk(_parse(source, "php")):
+        if node.type != "name" or node.text.decode("utf-8", "replace").casefold() != wanted:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if parent.type == "class_constant_access_expression":
+            total += parent.named_children[0].id != node.id
+        elif parent.type in _PHP_MEMBER_ACCESSES:
+            member = parent.child_by_field_name("name")
+            total += member is not None and member.id == node.id
+    return total
 
 
 def remove_stranded_bindings(

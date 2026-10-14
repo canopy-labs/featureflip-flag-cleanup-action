@@ -449,10 +449,30 @@ def _without_comment_lines(text: str) -> str:
     return "\n".join(kept) + "\n"
 
 
-def _without_key_hole(match: re.Match[str]) -> str:
-    holes = [h.strip() for h in match.group(1).split(",") if h.strip()]
-    kept = [h for h in holes if h.strip("\"'") not in _READER_ABSENT_HOLES]
-    return f"holes = [{', '.join(kept)}]"
+def _query_text(text: str) -> str:
+    """``text`` as written inside a query's string literal inside a TOML basic
+    string: each backslash escaped once for each. Only a PHP owner holds one
+    (``\\App\\Flags\\Keys``); a raw ``\\A`` would fail TOML parsing, and one
+    escape alone would leave the query matching ``AppFlagsKeys``."""
+    return text.replace("\\", "\\\\\\\\")
+
+
+#: The wrapper pass's mark. A reader carries it only when it also calls a
+#: keyless wrapper this run inlines, so it is stripped like the key for every
+#: other reader -- see ``rules/java.toml``'s sentinel rules.
+_SENTINEL_HOLE = "sentinel"
+
+
+def _without_holes(absent: frozenset[str]):
+    def strip(match: re.Match[str]) -> str:
+        holes = [h.strip() for h in match.group(1).split(",") if h.strip()]
+        kept = [h for h in holes if h.strip("\"'") not in absent]
+        return f"holes = [{', '.join(kept)}]"
+
+    return strip
+
+
+_without_key_hole = _without_holes(_READER_ABSENT_HOLES)
 
 
 def cross_file_key_rules(
@@ -462,6 +482,7 @@ def cross_file_key_rules(
     *,
     accessors: tuple[str, ...] = (),
     strip_key_hole: bool = True,
+    marked: bool = False,
 ) -> str:
     """Rules for the reader invocation: one clone per proven reference.
 
@@ -486,6 +507,11 @@ def cross_file_key_rules(
     ``strip_key_hole=False`` keeps the base rules as shipped, for a reader whose
     text holds the key too: there the engine does not skip the file, and the
     stripped seeds would leave that reader's direct reads standing.
+
+    ``marked`` says the reader also holds the wrapper pass's sentinel. When it
+    does not, the ``sentinel`` hole is stripped too, for the same reason as the
+    key: a seed whose query names a value the file lacks makes the engine skip
+    the file. Measured: Java's sentinel rules alone made every reader skip.
     """
     blocks = [
         b for b in _split_blocks(_strip_comments_keep_markers(template_text))[1:]
@@ -534,10 +560,10 @@ def cross_file_key_rules(
         else:
             chosen = qualified if owner is not None else bare
         for block in chosen:
-            block = block.replace("__XCONST_NAMESPACE__", namespace)
-            block = block.replace("__XCONST_OWNER__", owner_text)
-            block = block.replace("__XCONST_MEMBER__", member)
-            block = block.replace("__XCONST_ACCESSOR__", accessor.removesuffix("()"))
+            block = block.replace("__XCONST_NAMESPACE__", _query_text(namespace))
+            block = block.replace("__XCONST_OWNER__", _query_text(owner_text))
+            block = block.replace("__XCONST_MEMBER__", _query_text(member))
+            block = block.replace("__XCONST_ACCESSOR__", _query_text(accessor.removesuffix("()")))
             variants = [("", block)]
             if _SDK_FN_PREDICATE.search(block) is not None:
                 variants += [
@@ -561,6 +587,9 @@ def cross_file_key_rules(
                     _RULE_HEADER + "\n" + clone.removeprefix(_RULE_HEADER).strip() + "\n"
                 )
     stripped_base = _without_comment_lines(base_rules_text)
-    if strip_key_hole:
-        stripped_base = _HOLES_LINE.sub(_without_key_hole, stripped_base)
+    absent = (_READER_ABSENT_HOLES if strip_key_hole else frozenset()) | (
+        frozenset() if marked else frozenset({_SENTINEL_HOLE})
+    )
+    if absent:
+        stripped_base = _HOLES_LINE.sub(_without_holes(absent), stripped_base)
     return "\n".join(clones) + "\n" + stripped_base

@@ -1,0 +1,258 @@
+# Reader rules for a C# flag key held in a `const string` declared in ANOTHER
+# file.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `Owner.NAME` -- where the owner is a type,
+# a chain of nested types (`FeatureFlags.Checkout`) or a `using` alias -- and
+# `# xconst: bare` for a `NAME` brought in by `using static`.
+#
+# The owner is matched by its WHOLE TEXT (`#eq?` on a non-leaf node compares
+# the node's source text), so one block covers every nesting depth. That is
+# safe only because the reader proof accepts a chain spelled exactly as
+# identifiers and dots: a chain with a space, a comment or a generic argument
+# inside it is refused before the engine runs, so no proven read can fail to
+# match here.
+#
+# The four shapes, and their order, are `csharp_const.toml`'s:
+#
+#   1. a discarded awaited `GetBooleanValueAsync(<ref>, ...)` statement -> deleted
+#   2. a discarded `BoolVariation(<ref>, ...)` statement -> deleted
+#   3. `await GetBooleanValueAsync(<ref>, ...)` -> @treated (the `await` too)
+#   4. `BoolVariation(<ref>, ...)` -> @treated
+#
+# Statement deletes come first: a bare `true;` is an ERROR in the C# grammar,
+# and the engine's own self-check panics before any gate runs. Awaited shapes
+# come before plain ones: a configured accessor is cloned from BOTH, and an
+# awaited accessor read folded by the plain clone would leave `await true`,
+# which does not compile and which no re-parse can see.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules. Which reads are this
+# flag's was proven before the engine ran.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_discarded_getbooleanvalueasync_statement"
+query = """(
+  (expression_statement
+    (await_expression
+      (invocation_expression
+        function: [(member_access_expression name: (identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (argument_list
+          . (argument (member_access_expression
+              expression: [(identifier) (member_access_expression)] @key_owner
+              name: (identifier) @key_member)))))) @statement
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (member_access_expression
+            expression: [(identifier) (member_access_expression)] @key_owner
+            name: (identifier) @key_member))))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_getbooleanvalueasync_read"
+query = """(
+  (await_expression
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (member_access_expression
+            expression: [(identifier) (member_access_expression)] @key_owner
+            name: (identifier) @key_member))))
+  ) @await
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_boolvariation_read"
+query = """(
+  (invocation_expression
+    function: [(member_access_expression name: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (argument (member_access_expression
+          expression: [(identifier) (member_access_expression)] @key_owner
+          name: (identifier) @key_member)))
+  ) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+# A call DESCRIBED to a mock (`Setup(c => c.BoolVariation(Keys.X, ...))`) is an
+# expression tree whose text is the payload; see `csharp.toml`. The reader
+# proof refuses the same shape, so the two halves agree. The root capture is
+# load-bearing: an uncaptured root silently guards nothing.
+not_enclosing_node = """(
+  (lambda_expression
+    parameters: [(implicit_parameter) @lambda_param
+                 (parameter_list (parameter (identifier) @lambda_param .))]
+    body: (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @lambda_receiver))
+  ) @mock_expression
+  (#eq? @lambda_receiver @lambda_param)
+)"""
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_discarded_getbooleanvalueasync_statement"
+query = """(
+  (expression_statement
+    (await_expression
+      (invocation_expression
+        function: [(member_access_expression name: (identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (argument_list
+          . (argument (identifier) @key_member))))) @statement
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (identifier) @key_member)))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_getbooleanvalueasync_read"
+query = """(
+  (await_expression
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (identifier) @key_member)))
+  ) @await
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_boolvariation_read"
+query = """(
+  (invocation_expression
+    function: [(member_access_expression name: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (argument (identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (lambda_expression
+    parameters: [(implicit_parameter) @lambda_param
+                 (parameter_list (parameter (identifier) @lambda_param .))]
+    body: (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @lambda_receiver))
+  ) @mock_expression
+  (#eq? @lambda_receiver @lambda_param)
+)"""

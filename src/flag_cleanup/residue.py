@@ -10,6 +10,10 @@ caveat:
   the most urgent entry, because it can turn the pull request red;
 * a file that names the flag ONLY IN COMMENTS — prose to update, nothing that
   can break;
+* a JavaScript-family file that names it only in TEST TITLES (and comments):
+  prose as well — ``it('renders the page when the flag is on')`` is a string
+  no code reads as a key — but prose in front of every run of the suite, so
+  the pull request lists it apart from the comments;
 * a file whose only mention of the key is an ENUM MEMBER's value (or, in
   TypeScript, a property of an ``as const`` object, which the run reads as
   one): resolved for some languages and forms, so the pull request says which;
@@ -29,7 +33,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_ts, mock_stubs, syntax, unused
+from flag_cleanup import cross_file_ts, mock_stubs, syntax, ts_tests, unused
 
 #: Extension to the grammar this module parses it with. ERB is absent: its
 #: Ruby lives inside a template, and a comment verdict there would need the
@@ -63,6 +67,9 @@ class Residue:
     #: is an enum member's value: the member's first line. Resolved for some
     #: languages and some forms only, so the pull request says which.
     enum_held: tuple[tuple[str, str], ...] = ()
+    #: TypeScript-family files every mention of the flag in which sits in a
+    #: test's title or a comment, with at least one in a title.
+    title_only: tuple[str, ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
@@ -70,12 +77,19 @@ def _mention(flag_key: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![\w.-]){re.escape(flag_key)}(?![\w.-])")
 
 
-def _comment_only(root: Node, mention: re.Pattern[str]) -> bool:
+def _comment_only(
+    root: Node, mention: re.Pattern[str], inert: frozenset[int] = frozenset()
+) -> bool:
+    """Whether every mention sits in a comment, or in a node ``inert`` names.
+
+    At least one has to be found there: a file whose mention matched no node
+    at all is not proven anything.
+    """
     in_comments = 0
     stack = [root]
     while stack:
         node = stack.pop()
-        if "comment" in node.type:
+        if "comment" in node.type or node.id in inert:
             in_comments += len(mention.findall(node.text.decode("utf-8", "replace")))
             continue
         if node.child_count == 0:
@@ -86,9 +100,37 @@ def _comment_only(root: Node, mention: re.Pattern[str]) -> bool:
     return in_comments > 0
 
 
+#: The grammars whose tests carry a title :mod:`flag_cleanup.ts_tests` can read.
+_TITLED = frozenset({"ts", "tsx", "js"})
+
+
+def _title_only(
+    root: Node, source: str, mention: re.Pattern[str], language: str
+) -> bool:
+    """Whether every mention sits in a test title or a comment, one in a title."""
+    if language not in _TITLED:
+        return False
+    titles = ts_tests.title_nodes(root, source.encode("utf-8"))
+    in_titles = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if "comment" in node.type:
+            continue
+        if node.id in titles:
+            in_titles += len(mention.findall(node.text.decode("utf-8", "replace")))
+            continue
+        if node.child_count == 0:
+            if mention.search(node.text.decode("utf-8", "replace")):
+                return False
+            continue
+        stack.extend(node.children)
+    return in_titles > 0
+
+
 #: The grammar node of one enum member, per language (measured, not guessed).
 #: Python has no enum syntax: an assignment in a class whose bases name an
-#: ``...Enum`` is the member there.
+#: ``...Enum`` or a Django ``...Choices`` is the member there.
 _ENUM_MEMBERS = {
     "java": "enum_constant",
     "dart": "enum_constant",
@@ -100,7 +142,7 @@ _ENUM_MEMBERS = {
     "csharp": "enum_member_declaration",
     "php": "enum_case",
 }
-_PYTHON_ENUM_BASE = re.compile(r"\w*Enum\b")
+_PYTHON_ENUM_BASE = re.compile(r"\w*(?:Enum|Choices)\b")
 
 
 #: Substrings of a node type that mark a callable or a body. A mention below
@@ -216,6 +258,7 @@ def classify(
     mention = _mention(flag_key)
     stubbed: list[tuple[str, str]] = []
     comment_only: list[str] = []
+    title_only: list[str] = []
     enum_held: list[tuple[str, str]] = []
     for path in paths:
         language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
@@ -235,19 +278,31 @@ def classify(
         if _comment_only(root, mention):
             comment_only.append(path)
             continue
+        if _title_only(root, source, mention, language):
+            title_only.append(path)
+            continue
         held = _enum_held(root, mention, language)
         if held is not None:
             enum_held.append((path, held))
-    return Residue(tuple(stubbed), tuple(comment_only), tuple(enum_held))
+    return Residue(
+        tuple(stubbed), tuple(comment_only), tuple(enum_held), tuple(title_only)
+    )
 
 
 def live_references(paths: tuple[str, ...], flag_key: str) -> tuple[str, ...]:
-    """``paths`` without the files that name the flag only in comments.
+    """``paths`` without the files that name the flag only in comments and,
+    in the TypeScript family, test titles.
 
     The NEGATIVE of the comment verdict, so it errs the other way from
     :func:`classify`: a file this module cannot parse, or whose extension it
     does not know, counts as a live reference. The caller keeps a registry
     entry while any survives, and an entry kept for nothing costs one line.
+
+    A test title is the one string let through, because it is the one that is
+    inert by construction: nothing is typed against it and nothing looks it
+    up, so deleting the entry cannot break it. Any other string stays live
+    even in a test file, where fixture data borrowing the key may still reach
+    a lookup by key — see :func:`flag_cleanup.ts_tests.title_nodes`.
     """
     mention = _mention(flag_key)
     live: list[str] = []
@@ -259,6 +314,15 @@ def live_references(paths: tuple[str, ...], flag_key: str) -> tuple[str, ...]:
         except (OSError, UnicodeDecodeError):
             live.append(path)
             continue
-        if language is None or not _comment_only(_parse(source, language), mention):
+        if language is None:
+            live.append(path)
+            continue
+        root = _parse(source, language)
+        inert = (
+            ts_tests.title_nodes(root, source.encode("utf-8"))
+            if ts_tests.covers(language)
+            else frozenset()
+        )
+        if not _comment_only(root, mention, inert):
             live.append(path)
     return tuple(live)

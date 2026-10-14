@@ -132,6 +132,15 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
 [[rules.filters]]
+# NEVER INSIDE STRING INTERPOLATION. `"m={$c->boolVariation(...)}"` folded reads
+# `"m={true}"`: it parses, and prints the braces and the word instead of `1`.
+# `{$` needs a variable after the brace, so no literal can take the call's
+# place there; the read is left for a person, and `key_const` does not count
+# it as removable, so a const it reads is kept. The root capture is required:
+# an uncaptured root never matches (see `csharp.toml`).
+not_enclosing_node = """([(encapsed_string) (heredoc)] @interpolation)"""
+
+[[rules.filters]]
 enclosing_node = """(
   [(declaration_list
      (const_declaration
@@ -180,6 +189,15 @@ replace_node = "call"
 replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+# NEVER INSIDE STRING INTERPOLATION. `"m={$c->boolVariation(...)}"` folded reads
+# `"m={true}"`: it parses, and prints the braces and the word instead of `1`.
+# `{$` needs a variable after the brace, so no literal can take the call's
+# place there; the read is left for a person, and `key_const` does not count
+# it as removable, so a const it reads is kept. The root capture is required:
+# an uncaptured root never matches (see `csharp.toml`).
+not_enclosing_node = """([(encapsed_string) (heredoc)] @interpolation)"""
 
 [[rules.filters]]
 enclosing_node = """((program) @scope)"""

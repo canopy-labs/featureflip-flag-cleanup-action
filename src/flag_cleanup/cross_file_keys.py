@@ -20,8 +20,8 @@ can reach the declaration is a proven read. Which mentions can reach it is the
 profiles' question -- the declaring language's, or, for a file in another
 language that can name its constants, that language's own: Java and Kotlin
 judge each other, and Groovy and Scala, which this tool never transforms, are
-judged by a profile that proves nothing and only refuses. A file in any other
-language is never asked.
+judged by a profile that proves nothing and only refuses; so are Razor, XAML,
+VB and F# for C#. A file in any other language is never asked.
 """
 
 from __future__ import annotations
@@ -46,6 +46,10 @@ NOT_A_READ = "not-a-read"
 REBOUND = "rebound"
 OTHER_LANGUAGE = "other-language"
 UNSUPPORTED_FORM = "unsupported-form"
+#: A proven reader left unfolded because a declaration it reads is kept by
+#: another refusal (:attr:`Profile.readers_need_deletable`). Its own form is
+#: fine; the refusal that keeps the declaration is listed beside it.
+DECLARATION_KEPT = "declaration-kept"
 
 #: What a declaration is. A constant can be deleted once every mention of it is
 #: a proven read; an enum entry never is (see :func:`enum_findings`).
@@ -83,11 +87,22 @@ class KeyDeclaration:
     #: ``"key()"`` for a method, ``"key"`` for a field or Kotlin property, and
     #: ``""`` for a TypeScript member, which is the key itself.
     accessors: frozenset[str] = frozenset()
+    #: How an enum entry is written in its own language, for reports, when
+    #: ``Owner.NAME`` would not be: a PHP owner is stored lowercased (class
+    #: names fold case there), and PHP spells a case ``Owner::NAME``. Empty
+    #: for every other language.
+    entry_text: str = ""
+    #: Declared in third-party code the run never rewrites (PHP's Composer
+    #: ``vendor/``). Its reads still fold, but the pull request never lists it
+    #: as safe to delete: it is not the reviewer's code.
+    third_party: bool = False
 
     @property
     def entry(self) -> str:
         """``Owner.NAME`` for an enum entry, the name a finding is reported under."""
-        return f"{self.owner}.{self.name}" if self.kind == ENUM_ENTRY else ""
+        if self.kind != ENUM_ENTRY:
+            return ""
+        return self.entry_text or f"{self.owner}.{self.name}"
 
 
 @dataclass(frozen=True)
@@ -136,6 +151,16 @@ class Resolution:
     #: included: each is reported at its own declaration (see
     #: :func:`enum_findings`), whatever happened to its reads.
     entries: tuple[KeyDeclaration, ...] = ()
+    #: :attr:`Profile.readers_need_deletable` of the profile that resolved
+    #: this, so :func:`report_uncovered` applies it to what it blocks.
+    readers_need_deletable: bool = False
+    #: Constant findings of :attr:`Profile.entry_findings` in a declaring
+    #: file no other file names a constant of, and that only stop other files
+    #: trusting its value (:attr:`Profile.home_constant_names`). They keep
+    #: nothing: with no reader elsewhere the file is the in-file gate's alone,
+    #: folded exactly as it would be with no cross-file pass. The runner reports them only where that gate withholds
+    #: the file, as the reason it stays.
+    home_findings: tuple[Refusal, ...] = ()
 
 
 #: ``(module, owner, name)`` -- what a reader's import or qualifier names.
@@ -220,6 +245,36 @@ class Profile:
     enum_unparsed_escapes: (
         Callable[[str, str, tuple[KeyDeclaration, ...], str], list[Refusal]] | None
     ) = None
+    #: Whether a proven read folds only when every declaration its file
+    #: spells is deletable. For a language whose constants are not constant
+    #: (Python's: any module can assign one), a refusal that keeps a
+    #: declaration may be a write of another value, which a fold would
+    #: replace with the declared one; telling such a write from a harmless
+    #: mention would take a list of hazards. So any refusal keeping a
+    #: declaration voids every reader that spells it, each listed as
+    #: :data:`DECLARATION_KEPT` at its first mention, and a voided reader keeps
+    #: every other declaration it spells, which can void more (see
+    #: :func:`_void_readers_of_kept`). A constant finding of
+    #: :attr:`entry_findings` (one with no ``entry``) keeps its file too,
+    #: unless no other file spells a constant of that file (see
+    #: :attr:`home_constant_names`).
+    #: Off, a kept declaration leaves its proven reads folding.
+    readers_need_deletable: bool = False
+    #: Whether an escape (:attr:`enum_escapes`) can change what an entry's
+    #: accessor returns, not only hand the enum on. Python's can (a write of a
+    #: member's ``_value_``, the class replaced in its module), so no read of
+    #: an escaped entry folds: every reader of one is voided like a reader of
+    #: a kept declaration, each listed as :data:`DECLARATION_KEPT`. Off, an
+    #: escape leaves only its own file (TypeScript's).
+    escapes_void_readers: bool = False
+    #: ``(path, source, flag_key)``: for a profile with
+    #: :attr:`readers_need_deletable`, the name of every constant holding the
+    #: key in the file when nothing there can give one another value, so its
+    #: :attr:`entry_findings` only stop other files trusting it; empty
+    #: otherwise. A file no other file spells one of these in has those
+    #: findings set aside as :attr:`Resolution.home_findings` instead of
+    #: keeping the file.
+    home_constant_names: Callable[[str, str, str], set[str]] | None = None
 
 
 class DeclarationsUnreadable(Exception):
@@ -306,11 +361,16 @@ class CheckoutIndex(Generic[_Contribution, _Index]):
         extensions: tuple[str, ...],
         parse: Callable[[str], tuple[_Contribution, bool]],
         combine: Callable[[list[tuple[str, _Contribution]], bool, bool], _Index],
+        exclude: Callable[[Path], bool] | None = None,
     ) -> None:
         self._language = language
         self._extensions = extensions
         self._parse = parse
         self._combine = combine
+        #: Files the index never reads, by resolved path: a language's
+        #: third-party tree (PHP's Composer ``vendor/``) that cannot declare
+        #: the checkout's own types and would dominate the cost.
+        self._exclude = exclude
         self._files: dict[str, _Parsed[_Contribution]] = {}
         self._built: dict[str, tuple[tuple, _Index]] = {}
 
@@ -327,6 +387,8 @@ class CheckoutIndex(Generic[_Contribution, _Index]):
             repo_dir, walk_suffixes(self._extensions), with_ignored=True
         ):
             if not source.path.name.endswith(self._extensions):
+                continue
+            if self._exclude is not None and self._exclude(Path(source.resolved)):
                 continue
             parsed = self._parsed(source)
             if parsed is None or not parsed.complete:
@@ -412,9 +474,16 @@ def _load_profiles() -> None:
     # Imported for their registration side effect. Kept here rather than at
     # module top so a profile can import this module's dataclasses freely.
     from flag_cleanup import (  # noqa: F401
+        cross_file_csharp,
+        cross_file_dart,
+        cross_file_dotnet_guest,
         cross_file_java,
         cross_file_jvm_guest,
         cross_file_kotlin,
+        cross_file_php,
+        cross_file_php_guest,
+        cross_file_python,
+        cross_file_swift,
         cross_file_ts,
     )
 
@@ -430,6 +499,16 @@ def _extensions(language: str) -> tuple[str, ...]:
         # Languages this tool never transforms but whose files can read a
         # constant it may delete, so the mention scan has to see them.
         _EXTENSIONS_BY_LANGUAGE.update(GUEST_EXTENSIONS)
+        from flag_cleanup.cross_file_dotnet_guest import DOTNET_GUEST_EXTENSIONS
+
+        # Razor, XAML, VB and F# can read a C# constant; MSBuild files hold
+        # project-wide `<Using>` items. Both have to be in the listing.
+        _EXTENSIONS_BY_LANGUAGE.update(DOTNET_GUEST_EXTENSIONS)
+        from flag_cleanup.cross_file_php_guest import PHP_GUEST_EXTENSIONS
+
+        # Twig, Latte and Smarty templates and Symfony configuration can
+        # read a PHP constant.
+        _EXTENSIONS_BY_LANGUAGE.update(PHP_GUEST_EXTENSIONS)
     return _EXTENSIONS_BY_LANGUAGE.get(language, ())
 
 
@@ -494,6 +573,7 @@ def mention_files(
     if not names and also is None:
         return []
     pattern = mention_pattern(names)
+    folded = re.compile(pattern.pattern, re.IGNORECASE)
     excluded = {str(Path(p).resolve()) for p in exclude}
     found: list[str] = []
     suffixes = source_index.all_suffixes() | extra_suffixes if extra_suffixes else None
@@ -507,9 +587,19 @@ def mention_files(
             # and the caller refuses it rather than letting it vanish.
             found.append(source.resolved)
             continue
-        if pattern.search(text) or (also is not None and also.search(text)):
+        spells = (folded if _case_insensitive(source.resolved) else pattern).search(text)
+        if spells or (also is not None and also.search(text)):
             found.append(source.resolved)
     return found
+
+
+def _case_insensitive(path: str) -> bool:
+    """Whether ``path`` is in a language whose names ignore case: VB, and
+    PHP for class and namespace names."""
+    from flag_cleanup.cross_file_dotnet_guest import CASE_INSENSITIVE_SUFFIXES
+    from flag_cleanup.cross_file_php import PHP_EXTENSIONS
+
+    return path.lower().endswith(CASE_INSENSITIVE_SUFFIXES + PHP_EXTENSIONS)
 
 
 def within(path: Path, scope: Path) -> bool:
@@ -522,8 +612,12 @@ def _line_of(path: str, needle: str) -> tuple[int, str]:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return 1, ""
+    # A case-insensitive language's declarations are recorded lowercased
+    # (PHP's owners), so `keys` has to find `class Keys`.
+    fold = _case_insensitive(path)
+    wanted = needle.lower() if fold else needle
     for number, line in enumerate(lines, start=1):
-        if needle in line:
+        if wanted in (line.lower() if fold else line):
             return number, line.strip()
     return 1, ""
 
@@ -543,6 +637,8 @@ def resolve(
 
     declarations: list[KeyDeclaration] = []
     entry_refusals: list[Refusal] = []
+    # Per file, the names of its constants, when it has a constant finding.
+    findings_in: dict[str, set[str]] = {}
     for path in key_files:
         try:
             source = Path(path).read_text(encoding="utf-8")
@@ -551,9 +647,26 @@ def resolve(
         resolved = str(Path(path).resolve())
         declarations.extend(profile.declarations(resolved, source, flag_key))
         if profile.entry_findings is not None:
-            entry_refusals.extend(profile.entry_findings(resolved, source, flag_key))
+            found = profile.entry_findings(resolved, source, flag_key)
+            entry_refusals.extend(found)
+            if profile.home_constant_names is not None and any(not r.entry for r in found):
+                findings_in[resolved] = profile.home_constant_names(resolved, source, flag_key)
+    home = _unnamed_elsewhere(repo_dir, findings_in)
+    home_findings = tuple(r for r in entry_refusals if r.path in home and not r.entry)
+    entry_refusals = [r for r in entry_refusals if r not in home_findings]
+    # A constant finding at its own declaration keeps that file, when kept
+    # declarations decide what folds.
+    kept_at_home = (
+        {r.path for r in entry_refusals if not r.entry}
+        if profile.readers_need_deletable
+        else set()
+    )
     if not declarations:
-        return Resolution({}, tuple(entry_refusals), frozenset())
+        return Resolution(
+            {}, tuple(entry_refusals), frozenset(), blocked=frozenset(kept_at_home),
+            readers_need_deletable=profile.readers_need_deletable,
+            home_findings=home_findings,
+        )
 
     refusals: list[Refusal] = list(entry_refusals)
     entries_found = tuple(d for d in declarations if d.kind == ENUM_ENTRY)
@@ -571,31 +684,41 @@ def resolve(
                 refusals.append(Refusal(decl.path, line, NAME_NOT_UNIQUE, text, decl.entry))
     if not unique:
         return Resolution(
-            {}, tuple(refusals), frozenset(), blocked=frozenset(duplicated), entries=entries_found
+            {}, tuple(refusals), frozenset(), blocked=frozenset(duplicated | kept_at_home),
+            entries=entries_found, readers_need_deletable=profile.readers_need_deletable,
+            home_findings=home_findings,
         )
 
     declaring = {decl.path for decl in unique if decl.kind == CONSTANT}
 
-    def spelled_in(source: str) -> set[str]:
+    def spelled_in(source: str, path: str) -> set[str]:
         """The declaring files whose constant ``source`` spells by name.
 
         A refusal in a file keeps exactly these: the file's mentions of any
         other declaration's name do not exist, and its reads of these are
-        dropped with the rest of the file's.
+        dropped with the rest of the file's. A VB file spells a name in any
+        case.
         """
+        flags = re.IGNORECASE if _case_insensitive(path) else 0
         return {
             d.path
             for d in unique
-            if d.kind == CONSTANT and mention_pattern([d.name]).search(source)
+            if d.kind == CONSTANT
+            and re.compile(mention_pattern([d.name]).pattern, flags).search(source)
         }
 
     family_extensions = tuple(
         ext for lang in profile.language_family for ext in _extensions(lang)
     )
     readers: dict[str, tuple[KeyReference, ...]] = {}
-    blocked: set[str] = set()  # declaring files some mention stops from being deleted
+    # declaring files some mention stops from being deleted
+    blocked: set[str] = set(kept_at_home)
     names = {decl.name for decl in unique}
-    owners = {decl.owner for decl in unique if decl.owner is not None}
+    # Every segment of a nested owner (`Outer.Inner`): a file declaring only
+    # `Outer` can still supply it, and has to be read to be seen competing.
+    owners = {
+        part for decl in unique if decl.owner is not None for part in decl.owner.split(".")
+    }
     scope = Path(repo_dir).resolve()
     sources: dict[str, str | None] = {}
     # A file can use an enum's module without spelling a name: `use(m)` after
@@ -633,10 +756,12 @@ def resolve(
         else set()
     )
     spells_a_name = mention_pattern(names | judged_owners)
+    spells_a_name_folded = re.compile(spells_a_name.pattern, re.IGNORECASE)
     for path, source in sources.items():
         if unparsed and Path(path).suffix in unparsed:
             continue  # never rewritten: the escape scan below refuses a read in it
-        if source is not None and not spells_a_name.search(source):
+        spells = spells_a_name_folded if _case_insensitive(path) else spells_a_name
+        if source is not None and not spells.search(source):
             continue
         if path in ignored:
             continue  # build output: the next build rewrites it, a commit never carries it
@@ -670,7 +795,7 @@ def resolve(
                 entry = first.entry if first is not None else ""
             reason = UNSUPPORTED_FORM if not in_scope else OTHER_LANGUAGE
             refusals.append(Refusal(path, line, reason, text, entry))
-            blocked |= spelled_in(source)
+            blocked |= spelled_in(source, path)
             continue
         # A declaring file is still a reader of the OTHER declarations; its
         # mentions of its own are the in-file check's business.
@@ -682,13 +807,14 @@ def resolve(
             readers[path] = tuple(reads)
         if refused:
             refusals.extend(refused)
-            blocked |= spelled_in(source)
+            blocked |= spelled_in(source, path)
     notes: list[Refusal] = []
     entries = tuple(d for d in live if d.kind == ENUM_ENTRY)
     if entries and profile.enum_escapes is not None:
         # An escape on a line a reader's refusal already names for the same
         # entry is that refusal: its reason is the constant's for the spelling.
         refused_at = {(r.path, r.line, r.entry) for r in refusals if r.entry}
+        escaped: set[str] = set()
         unread = _UnparsedUses(profile, entries, repo_dir)
         for path, source in sorted(sources.items()):
             if path in ignored:
@@ -702,14 +828,33 @@ def resolve(
             else:
                 escapes = profile.enum_escapes(path, source, entries, repo_dir)
             for escape in escapes:
+                escaped.add(escape.entry)
                 if (escape.path, escape.line, escape.entry) not in refused_at:
                     refused_at.add((escape.path, escape.line, escape.entry))
                     refusals.append(escape)
+        if profile.escapes_void_readers and escaped:
+            # The entry's accessor may not return its key: no read of it folds.
+            for path in sorted(readers):
+                hit = [
+                    ref for ref in readers[path]
+                    if ref.declaration is not None and ref.declaration.entry in escaped
+                ]
+                if not hit:
+                    continue
+                del readers[path]
+                blocked |= spelled_in(sources.get(path) or "", path)
+                line, text = _line_of(path, hit[0].member)
+                for entry in sorted({ref.declaration.entry for ref in hit}):
+                    refusals.append(Refusal(path, line, DECLARATION_KEPT, text, entry))
     if entries and profile.enum_dynamic_uses is not None:
         for path, source in sorted(sources.items()):
             if source is None or path in ignored or not path.endswith(family_extensions):
                 continue
             notes.extend(profile.enum_dynamic_uses(path, source, entries, repo_dir))
+    if profile.readers_need_deletable:
+        readers, refusals, blocked = _void_readers_of_kept(
+            readers, refusals, blocked | duplicated, unique, lambda path: sources.get(path)
+        )
     return Resolution(
         readers,
         tuple(refusals),
@@ -718,7 +863,89 @@ def resolve(
         frozenset(blocked | duplicated),
         tuple(notes),
         entries_found,
+        readers_need_deletable=profile.readers_need_deletable,
+        home_findings=home_findings,
     )
+
+
+def _unnamed_elsewhere(repo_dir: str, names_by_file: dict[str, set[str]]) -> set[str]:
+    """The files of ``names_by_file`` whose names no other file spells.
+
+    Any other file in the checkout counts, in any language, ignored ones
+    included, and so does one that cannot be read: a file counted here when
+    it reads nothing only keeps a declaration, as the check it skips would.
+    """
+    if not names_by_file:
+        return set()
+    every = set().union(*names_by_file.values())
+    spelled: dict[str, str | None] = {}
+    for hit in mention_files(repo_dir, every, exclude=(), with_ignored=True):
+        try:
+            spelled[hit] = Path(hit).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            spelled[hit] = None
+    home: set[str] = set()
+    for path, names in names_by_file.items():
+        token = mention_pattern(names)
+        if names and not any(
+            hit != path and (text is None or token.search(text)) for hit, text in spelled.items()
+        ):
+            home.add(path)
+    return home
+
+
+def _void_readers_of_kept(
+    readers: dict[str, tuple[KeyReference, ...]],
+    refusals: Iterable[Refusal],
+    blocked: Iterable[str],
+    declarations: Iterable[KeyDeclaration],
+    source_of: Callable[[str], str | None],
+) -> tuple[dict[str, tuple[KeyReference, ...]], list[Refusal], set[str]]:
+    """``readers`` without each one that spells a kept declaration, for
+    :attr:`Profile.readers_need_deletable`.
+
+    A voided reader keeps all its reads, so every declaration it spells is
+    kept as well, which can void another reader in turn: repeated until
+    nothing changes. Each voided reader is listed at the first line that
+    spells a kept declaration, as :data:`DECLARATION_KEPT`.
+    """
+    readers = dict(readers)
+    refusals = list(refusals)
+    blocked = set(blocked)
+    constants = [d for d in declarations if d.kind == CONSTANT]
+    changed = True
+    while changed:
+        changed = False
+        for path in sorted(readers):
+            source = source_of(path)
+            spelled = [
+                d for d in constants if source is None or mention_pattern([d.name]).search(source)
+            ]
+            kept = [d for d in spelled if d.path in blocked]
+            if not kept:
+                continue
+            # Its reads of enum entries stay too: each entry is left, never
+            # reported as safe to delete.
+            entry_reads = [ref for ref in readers[path] if ref.declaration is not None]
+            del readers[path]
+            blocked |= {d.path for d in spelled}
+            changed = True
+            line, text = 1, ""
+            if source is not None:
+                token = mention_pattern(sorted({d.name for d in kept}))
+                lines = source.splitlines()
+                number = next((i for i, each in enumerate(lines) if token.search(each)), 0)
+                line, text = number + 1, lines[number].strip() if lines else ""
+            refusals.append(
+                Refusal(path, line, DECLARATION_KEPT, text)
+            )
+            if entry_reads:
+                at, quoted = _line_of(path, entry_reads[0].member)
+                refusals.extend(
+                    Refusal(path, at, DECLARATION_KEPT, quoted, entry)
+                    for entry in sorted({ref.declaration.entry for ref in entry_reads})
+                )
+    return readers, refusals, blocked
 
 
 class _UnparsedUses:
@@ -824,9 +1051,26 @@ def report_uncovered(
         }
     if not refusals:
         return resolution
+    readers = resolution.readers
+    refusals = list(resolution.refusals) + refusals
+    if resolution.readers_need_deletable:
+        # Each uncovered reader is listed above; the rest fold only if
+        # what they read is still deletable.
+        readers = {path: refs for path, refs in readers.items() if path in rewritten}
+
+        def source_of(path: str) -> str | None:
+            try:
+                return Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return None
+
+        readers, refusals, blocked = _void_readers_of_kept(
+            readers, refusals, blocked, resolution.declarations, source_of
+        )
     return replace(
         resolution,
-        refusals=resolution.refusals + tuple(refusals),
+        readers=readers,
+        refusals=tuple(refusals),
         deletable=resolution.deletable - blocked,
         blocked=frozenset(blocked),
     )
@@ -862,7 +1106,8 @@ def _competing(
     different value, and which one a reader gets is decided by the build, not
     by anything in the source. For an owner-bearing declaration a second OWNER
     of the same qualified name is enough: it can supply ``Owner.NAME`` by
-    inheritance or as an alias without spelling ``NAME`` at all. Such a
+    inheritance or as an alias without spelling ``NAME`` at all. A nested
+    owner's enclosing types count as owners of it too. Such a
     declaration is VOID: none of its reads is proven, and its file is never
     deletable.
 
@@ -879,9 +1124,16 @@ def _competing(
     """
     by_name = {(d.module, d.owner, d.name): d for d in unique}
     by_owner: dict[tuple[str, str], list[KeyDeclaration]] = defaultdict(list)
+    # A nested owner (`Outer.Inner`) is also supplied by any type of one of
+    # its enclosing names: a second `Outer` can hand out `Outer.Inner`
+    # through a base class's nested type without declaring `Inner` at all.
+    by_owner_prefix: dict[tuple[str, str], list[KeyDeclaration]] = defaultdict(list)
     for decl in unique:
         if decl.owner is not None:
             by_owner[(decl.module, decl.owner)].append(decl)
+            parts = decl.owner.split(".")
+            for end in range(1, len(parts)):
+                by_owner_prefix[(decl.module, ".".join(parts[:end]))].append(decl)
     voided: set[KeyDeclaration] = set()
     for path, source in sources.items():
         if source is None:
@@ -896,8 +1148,14 @@ def _competing(
         except DeclarationsUnreadable:
             for decl in unique:
                 spelled = [w for w in (decl.name, decl.owner) if w is not None]
+                flags = re.IGNORECASE if _case_insensitive(path) else 0
                 needle = next(
-                    (w for w in spelled if mention_pattern([w]).search(source)), None
+                    (
+                        w
+                        for w in spelled
+                        if re.compile(mention_pattern([w]).pattern, flags).search(source)
+                    ),
+                    None,
                 )
                 if needle is not None:
                     found.append((decl, needle, UNSUPPORTED_FORM))
@@ -913,7 +1171,8 @@ def _competing(
                     )
             for classifier in classifiers:
                 found.extend(
-                    (d, classifier[1], NAME_NOT_UNIQUE) for d in by_owner.get(classifier, ())
+                    (d, classifier[1], NAME_NOT_UNIQUE)
+                    for d in (*by_owner.get(classifier, ()), *by_owner_prefix.get(classifier, ()))
                 )
         here: set[KeyDeclaration] = set()  # one refusal per declaration per file
         for decl, needle, reason in found:
@@ -964,8 +1223,9 @@ def enum_findings(resolution: Resolution) -> tuple[Refusal, ...]:
     ``left-competing`` for one only a competing declaration names (its reads
     were never judged, so none is listed), and ``kept`` for one a proven read
     was folded through and nothing refused. Either way the entry stays,
-    because deleting an enum entry can renumber stored ordinals and break
-    ``valueOf`` lookups, and no build catches either.
+    because deleting an enum entry can change stored values (ordinals,
+    backing values) and break lookups by name or value, and no build catches
+    either.
     """
     refused = tuple(r for r in resolution.refusals if r.entry)
     against = {r.entry for r in refused}
@@ -984,7 +1244,7 @@ def enum_findings(resolution: Resolution) -> tuple[Refusal, ...]:
             reason, found = LEFT, left
         elif decl.entry in against:
             reason, found = LEFT_COMPETING, left
-        elif decl in folded:
+        elif decl in folded and not decl.third_party:
             reason, found = KEPT, kept
         else:
             continue

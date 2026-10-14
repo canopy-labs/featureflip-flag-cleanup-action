@@ -49,10 +49,11 @@ inputs:
       every flag in the project whose removal pull request merged but which is
       still live, and attempts it. Nothing is written anywhere to record a
       deferral — the flag being unarchived IS the record — so re-running is
-      harmless and there is no state to reset. See "Archive the flag once the
-      removal is deployed" in the README, including the one case no archive
-      mode can close: clients you cannot update (mobile, desktop, embedded),
-      where evaluations never stop arriving.
+      harmless and there is no state to reset. Set `deployed-refs` (below) to
+      require that the removal is also DEPLOYED, not just merged. See "Archive
+      the flag once the removal is deployed" in the README, including the one
+      case no archive mode can close: clients you cannot update (mobile,
+      desktop, embedded), where evaluations never stop arriving.
 
       `archive-on-merge` is DEPRECATED and will be removed in the next major
       version; every run prints a warning saying so. It archives the flag whose
@@ -82,7 +83,7 @@ inputs:
       whether that flag's removal branch ever produced a merged pull request
       (`pull-requests: read`); `archive-on-deploy` asks that too and then
       compares each merge commit against the deployed one (`contents: read` as
-      well). Pass the token through in the workflow's `env:` and give the job
+      well), and so does the sweep when `deployed-refs` is set. Pass the token through in the workflow's `env:` and give the job
       those permissions. Needing a token at all is the cost those two modes pay
       for not firing on the merge event: the deprecated `archive-on-merge`
       reads its pull request straight out of the event payload, so it needs
@@ -171,6 +172,21 @@ inputs:
       every other mode.
     required: false
     default: 'production'
+  deployed-refs:
+    description: >-
+      `archive-sweep` only: git refs that stand for what you have deployed —
+      tags, branches or commit shas, one per line or comma-separated (for
+      example a tag your production deploy moves to the commit it shipped).
+      When set, a flag is archived only once its removal's merge commit is
+      contained in EVERY ref listed, asked of GitHub's compare endpoint; a
+      flag whose removal some ref does not contain yet is reported
+      `pending-deploy`, exits `0`, and is picked up by the first sweep after
+      the deploy that ships it. Every ref rather than any, because a flag key
+      does not say which deployed build reads it. Needs `contents: read` as
+      well as `pull-requests: read`. Unset (the default) is the ungated
+      sweep, which archives on the merge alone. Ignored by every other mode.
+    required: false
+    default: ''
   api-url:
     description: >-
       Featureflip public API origin. Override only for a staging or
@@ -199,6 +215,19 @@ inputs:
       children, and a `false` removal of a flag it gates is refused.
     required: false
     default: ''
+  inline-wrappers:
+    description: >-
+      When `true` (the default), a Kotlin, Java or C# wrapper whose whole body
+      is one read of the flag being removed (a method, a Kotlin property getter
+      or top-level function, or a C# get-only `bool` property) is inlined at
+      every call site its file proves is bound to it, and deleted once nothing
+      calls it. Each call
+      that cannot be proven is left as it is and listed in the pull request
+      with its reason. `false` folds the read inside the method and stops
+      there, listing the method's callers for you to change by hand. See
+      README's "Wrapping the SDK".
+    required: false
+    default: 'true'
   languages:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
@@ -327,9 +356,11 @@ runs:
     FEATUREFLIP_API_URL: ${{ inputs.api-url }}
     FEATUREFLIP_MODE: ${{ inputs.mode }}
     FEATUREFLIP_DEPLOYMENT_ENVIRONMENT: ${{ inputs.deployment-environment }}
+    FEATUREFLIP_DEPLOYED_REFS: ${{ inputs.deployed-refs }}
     FEATUREFLIP_STALENESS: ${{ inputs.staleness }}
     FEATUREFLIP_LANGUAGES: ${{ inputs.languages }}
     FEATUREFLIP_ACCESSORS: ${{ inputs.accessors }}
+    FEATUREFLIP_INLINE_WRAPPERS: ${{ inputs.inline-wrappers }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
     FEATUREFLIP_FLAGS: ${{ inputs.flags }}

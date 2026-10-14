@@ -556,6 +556,7 @@ def _regenerate(
             kept,
             unresolved,
             enum_findings,
+            wrapper_findings,
         ):
             if transform_error is not None:
                 # Not turned into a reply: a refused transform is the one
@@ -568,7 +569,10 @@ def _regenerate(
                 raise transform_error
             unprocessed = orchestrate.all_unprocessed(config, key, unprocessable)
             residue = classify_residue(unprocessed, key, config.accessors)
-            wrappers = constant_wrappers.find_constant_wrappers(diff, config.directories)
+            wrappers = pr_content.without_inlined(
+                constant_wrappers.find_constant_wrappers(diff, config.directories),
+                wrapper_findings,
+            )
             if not diff:
                 # Loud, not silent: an open pull request is proposing a removal
                 # the code no longer needs. Nothing is pushed and the pull
@@ -609,7 +613,7 @@ def _regenerate(
                 caveats = _dry_run_caveats(
                     unprocessed, stranded, bindings, entries, declined,
                     test_doubles, residue, deleted_tests, wrappers, kept, unresolved,
-                    enum_findings,
+                    enum_findings, wrapper_findings,
                 )
                 return _reply(
                     gh,
@@ -685,6 +689,7 @@ def _regenerate(
                 left_in_place=kept,
                 unresolved=unresolved,
                 enum_findings=enum_findings,
+                wrapper_findings=wrapper_findings,
             )
             draft_note = _draft_note(pull, candidate)
             github_ops.update_pull_request(
@@ -780,6 +785,7 @@ def _dry_run_caveats(
     kept: tuple[tuple[str, str], ...] = (),
     unresolved: tuple[tuple[str, int, str, str], ...] = (),
     enum_findings: tuple[tuple[str, int, str, str], ...] = (),
+    wrapper_findings: tuple[tuple[str, int, str, str, str], ...] = (),
 ) -> str:
     """A short summary of what a real run's pull-request body would call out.
 
@@ -807,8 +813,25 @@ def _dry_run_caveats(
         notes.append(f"{len(unprocessed)} file(s) would still reference this flag")
     if stranded:
         notes.append(f"{len(stranded)} unreachable statement(s) would be deleted")
-    if bindings:
-        notes.append(f"{len(bindings)} stranded import(s)/local(s) would be cleaned up")
+    unread = sum(1 for _, kind, _ in bindings if kind == "unread parameter")
+    unread_bindings = sum(1 for _, kind, _ in bindings if kind == "unread binding")
+    emptied = sum(1 for _, kind, _ in bindings if kind == "emptied override")
+    dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
+    cleaned = len(bindings) - unread - unread_bindings - emptied - dropped
+    if cleaned:
+        notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
+    if dropped:
+        notes.append(f"{dropped} unused parameter(s) would be removed")
+    if unread:
+        notes.append(
+            f"{unread} C# primary-constructor parameter(s) would be left unread (CS9113)"
+        )
+    if unread_bindings:
+        notes.append(
+            f"{unread_bindings} binding(s) would be left unread by a removed override"
+        )
+    if emptied:
+        notes.append(f"{emptied} override literal(s) would be left empty")
     if entries:
         noun = "entry" if len(entries) == 1 else "entries"
         notes.append(f"{len(entries)} flag-keyed {noun} would be removed")
@@ -838,6 +861,12 @@ def _dry_run_caveats(
         notes.append(
             f"{len(deleted_tests)} test(s) testing the branch being removed "
             "would be deleted"
+        )
+    statuses = [f[2] for f in wrapper_findings if f[2] in ("complete", "partial")]
+    if statuses:
+        notes.append(
+            f"{len(statuses)} keyless wrapper(s) would be inlined "
+            f"({statuses.count('complete')} complete, {statuses.count('partial')} partial)"
         )
     if wrappers:
         notes.append(

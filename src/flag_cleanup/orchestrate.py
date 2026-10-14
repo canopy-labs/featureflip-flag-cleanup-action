@@ -117,6 +117,8 @@ from flag_cleanup.pr_content import (
     note_declined_entries,
     note_enum_findings,
     note_unresolved_references,
+    note_wrapper_findings,
+    without_inlined,
     note_deleted_tests,
     note_kept,
     note_removed_entries,
@@ -710,6 +712,7 @@ def _process_candidate(
         kept,
         unresolved,
         enum_findings,
+        wrapper_findings,
     ):
         # Inside the `with`, and for the same reason the PR path computes it
         # there: `_unprocessed_references` reads the REWRITTEN tree, and the
@@ -722,12 +725,15 @@ def _process_candidate(
             enum_held = classify_residue(
                 unprocessed, candidate.key, config.accessors
             ).enum_held
-            wrappers = find_constant_wrappers(diff, config.directories)
+            wrappers = without_inlined(
+                find_constant_wrappers(diff, config.directories), wrapper_findings
+            )
 
     if transform_error is not None:
         return _refusal_result(candidate, transform_error)
 
     _warn_on_unprocessed_references(config, candidate.key, unprocessed)
+    note_wrapper_findings(wrapper_findings)
     note_constant_wrappers(wrappers)
     note_rewritten_build_output(diff)
     note_removed_entries(entries)
@@ -817,6 +823,7 @@ def _process_candidate_for_pr(
     kept: tuple[tuple[str, str], ...] = ()
     unresolved: tuple[tuple[str, int, str, str], ...] = ()
     enum_findings: tuple[tuple[str, int, str, str], ...] = ()
+    wrapper_findings: tuple[tuple[str, int, str, str, str], ...] = ()
     enum_held: tuple[tuple[str, str], ...] = ()
     refused: tuple[str, ...] = ()
     reasons: tuple[tuple[str, str], ...] = ()
@@ -852,6 +859,7 @@ def _process_candidate_for_pr(
             kept,
             unresolved,
             enum_findings,
+            wrapper_findings,
         ):
             # Inside the `with`, this flag's edits — and only this flag's —
             # are on disk. That is the only window in which the commit can be
@@ -906,6 +914,7 @@ def _process_candidate_for_pr(
                         deleted_tests=deleted_tests,
                         unresolved=unresolved,
                         enum_findings=enum_findings,
+                        wrapper_findings=wrapper_findings,
                         wrappers=wrappers,
                         left_in_place=kept,
                     ),
@@ -1074,6 +1083,7 @@ def _process_candidate_for_pr(
         note_declined_entries(declined)
         note_unresolved_references(unresolved)
         note_enum_findings(enum_findings, enum_held)
+        note_wrapper_findings(wrapper_findings)
         note_deleted_tests(deleted_tests)
         note_kept(kept)
     else:
@@ -1461,7 +1471,9 @@ def piranha_transform(
     reference to a cross-file key constant the run could not prove is a read
     of this flag, and so why its declaration was kept. A 13th element,
     ``enum_findings``, is ``(path, line, reason, text)`` for what the run found
-    about enum entries holding the key.
+    about enum entries holding the key, and a 14th, ``wrapper_findings``,
+    ``(path, line, reason, text, wrapper)`` for what became of each keyless
+    wrapper (see :mod:`flag_cleanup.wrapper_inline`).
 
     The body of the ``with`` runs while the edits are still on disk — that is
     what lets the PR path commit them. On exit the tree is restored no matter
@@ -1493,6 +1505,7 @@ def piranha_transform(
     kept: list[tuple[str, str]] = []
     unresolved: list[tuple[str, int, str, str]] = []
     enum_findings: list[tuple[str, int, str, str]] = []
+    wrapper_findings: list[tuple[str, int, str, str, str]] = []
     transform_error: TransformRefusal | None = None
     try:
         try:
@@ -1502,10 +1515,11 @@ def piranha_transform(
             # turns that mention into a compile error or a crash: the registry
             # is usually what the key's TYPE is derived from, and what a lookup
             # by key reads its default out of. So when anything but a comment
-            # still names the key once the removal is on disk, the whole
-            # removal is undone and run again without the registry prong, and
-            # the entries it would have deleted are reported as kept. Nothing
-            # else changes between the two runs; see `_live_references`.
+            # (or a TS-family test title) still names the key once the removal
+            # is on disk, the whole removal is undone and run again without the
+            # registry prong, and the entries it would have deleted are
+            # reported as kept. Nothing else changes between the two runs; see
+            # `_live_references`.
             if known_flag_keys and any(o.entries for o in outcomes):
                 live = _live_references(
                     config,
@@ -1526,7 +1540,7 @@ def piranha_transform(
                         (
                             path,
                             f"registry entry {text} kept: {len(live)} file(s) still "
-                            f"name the key outside a comment ({named}), and "
+                            f"name the key outside a comment or test title ({named}), and "
                             "deleting the entry they are typed against would "
                             "break them",
                         )
@@ -1548,6 +1562,7 @@ def piranha_transform(
                 kept.extend(outcome.kept)
                 unresolved.extend(outcome.unresolved)
                 enum_findings.extend(outcome.enum_findings)
+                wrapper_findings.extend(outcome.wrapper_findings)
             kept.extend(kept_entries)
         except (PiranhaTransformError, UnsafeRewriteError) as exc:
             # Both are refusals, and both abandon the flag ENTIRELY — note the
@@ -1604,6 +1619,8 @@ def piranha_transform(
             () if transform_error is not None else tuple(unresolved),
             # Dropped on refusal like `unresolved`: nothing was judged.
             () if transform_error is not None else tuple(enum_findings),
+            # Dropped on refusal too: nothing was inlined or deleted.
+            () if transform_error is not None else tuple(wrapper_findings),
         )
     except BaseException as body_error:
         # try/except/else rather than `finally`: the undo needs to know whether
@@ -1655,12 +1672,17 @@ def _run_plan(
             accessors=config.accessors,
             known_flag_keys=known_flag_keys,
             gates=config.gates,
+            inline_wrappers=config.inline_wrappers,
         )
         outcomes.append(
             replace(
                 outcome,
                 unresolved=qualify(outcome.unresolved, directory),
                 enum_findings=qualify(outcome.enum_findings, directory),
+                wrapper_findings=tuple(
+                    (os.path.normpath(os.path.join(directory, path)), line, reason, text, label)
+                    for path, line, reason, text, label in outcome.wrapper_findings
+                ),
             )
         )
     return outcomes
@@ -1669,7 +1691,8 @@ def _run_plan(
 def _live_references(
     config: Config, flag_key: str, engine_skipped: Iterable[str]
 ) -> tuple[str, ...]:
-    """The files that still name ``flag_key`` other than in a comment.
+    """The files that still name ``flag_key`` other than in a comment or a
+    test title (see :func:`~flag_cleanup.residue.live_references`).
 
     Asked with the removal on disk, like :func:`all_unprocessed`, whose list
     this narrows. A file this cannot parse counts as live: keeping a registry
@@ -1703,7 +1726,12 @@ def _transform_plan(
             _committable(
                 directory,
                 candidate_files(
-                    directory, language, candidate.key, languages=config.languages
+                    directory,
+                    language,
+                    candidate.key,
+                    languages=config.languages,
+                    accessors=config.accessors,
+                    inline_wrappers=config.inline_wrappers,
                 ),
             ),
         )

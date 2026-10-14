@@ -1073,20 +1073,21 @@ _INTRODUCED_CR_RUN = re.compile(r"([^\r\n]*)\r\r+\n")
 def collapse_introduced_carriage_returns(before: str, after: str, language: str) -> str:
     """Drop the stray carriage return an entry deletion leaves in a CRLF file.
 
-    A NEW residue class, and one the read/statement path does not have: those
-    rules delete a node mid-line and the engine keeps the line, so its ending is
-    untouched. An entry deletion takes a WHOLE line, and the engine's idea of a
-    line ends at `\n` — the `\r` in front of it is just whitespace to the
-    grammar. So `…},\r\n…'old-checkout': …,\r\n` comes back as `…},\r\r\n`,
+    Any deletion that takes a WHOLE line leaves it -- an entry deletion, or a
+    Python fold dropping an ``if`` block -- because the engine's idea of a
+    line ends at `\n` and the `\r` in front of it is just whitespace to the
+    grammar. A read deleted mid-line keeps its line, and its ending. So `…},\r\n…'old-checkout': …,\r\n` comes back as `…},\r\r\n`,
     a line whose ending git renders as a change and most editors render as a
     stray character (measured on TypeScript and Python).
 
     Same two conditions as :func:`strip_introduced_trailing_whitespace` and
     :func:`collapse_introduced_double_spaces`, for the same reasons:
 
-    * **The run must not appear verbatim in the input.** A file that already
-      had a doubled carriage return on some line keeps it — this pass fixes
-      what the transform made, never what it found.
+    * **The line ending in the run must not appear verbatim in the input.**
+      A line the file already had, doubled carriage return and all, keeps it:
+      this pass fixes what the transform made, never what it found. A line the
+      transform changed is collapsed whatever it held before, which only ever
+      removes a ``\r`` outside a token.
     * **The run must not sit inside a token.** A lone `\r` inside a multi-line
       template literal or a raw string is *data*, and decided from the parse
       tree rather than from a list of node types.

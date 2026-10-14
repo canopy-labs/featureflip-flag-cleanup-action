@@ -156,6 +156,13 @@ def _rewritten_build_output(diff: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+#: ``bindings`` kinds that name something KEPT, each with a callout of its own,
+#: rather than a binding this run removed.
+REPORTED_BINDING_KINDS = frozenset(
+    {"bare import", "marked import", "unread parameter", "unread binding", "emptied override"}
+)
+
+
 def _bare_import_lines(bare_imports: list[tuple[str, str]]) -> list[str]:
     """The callout naming each import cut down to a bare one, or nothing.
 
@@ -189,6 +196,86 @@ def _bare_import_lines(bare_imports: list[tuple[str, str]]) -> list[str]:
         "whether it does. If it does nothing, delete the line:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in bare_imports[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_parameter_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each C# primary-constructor parameter the fold left
+    unread, or nothing.
+
+    First of the binding notes because it is the one that can fail a build:
+    CS9113 is a warning, and an error under ``TreatWarningsAsErrors``. Nothing
+    was changed, so each is listed for the reviewer to act on; see
+    :mod:`~flag_cleanup.primary_constructor` for why it is not removed.
+    """
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "parameter is" if count == 1 else "parameters are"
+    return [
+        f"> **⚠️ {count} primary-constructor {noun} no longer read.** Every "
+        "read was a flag read this pull request removed, so the C# compiler "
+        "now warns CS9113 (`Parameter '…' is unread`), which fails the build "
+        "in a project with `TreatWarningsAsErrors`. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        "removing a parameter changes the constructor that every `new` and "
+        "every dependency-injection registration of the type calls. Remove "
+        f"{'it' if count == 1 else 'each'} along with the argument callers "
+        "pass, or suppress CS9113 for it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_binding_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each binding left unread by a deleted override, or nothing.
+
+    The override read the binding and nothing else did (that is what made the
+    entry deletable, see :mod:`~flag_cleanup.ts_bound_overrides`), so the
+    binding is now dead. It is not removed: a parameter is part of a signature
+    every caller passes into.
+    """
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "binding is" if count == 1 else "bindings are"
+    return [
+        f"> **{count} {noun} no longer read.** {'It' if count == 1 else 'Each'} "
+        "held the value an override of this flag was set to, and that override "
+        "was removed. "
+        f"{'It was' if count == 1 else 'They were'} left in place because a "
+        "call may still pass it, and removing a parameter changes every call "
+        f"that does. Remove {'it' if count == 1 else 'each'}, and any argument "
+        "callers pass for it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _emptied_override_lines(emptied: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each object literal the entry deletions emptied, or nothing.
+
+    Reported rather than removed: the literal is harmless, but the prop or
+    argument carrying it may be pointless now, and whether it can go depends on
+    whether it is optional, which is declared somewhere else.
+    """
+    if not emptied:
+        return []
+    count = len(emptied)
+    noun = "literal was" if count == 1 else "literals were"
+    return [
+        f"> **ℹ️ {count} override {noun} left empty.** Removing this flag's "
+        f"entry left {'it' if count == 1 else 'each'} as `{{}}`. That is "
+        "harmless, but if the prop or argument carrying it is optional, it can "
+        "go too:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in emptied[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -238,6 +325,7 @@ def pr_body(
     left_in_place: tuple[tuple[str, str], ...] = (),
     unresolved: tuple[tuple[str, int, str, str], ...] = (),
     enum_findings: tuple[tuple[str, int, str, str], ...] = (),
+    wrapper_findings: tuple[tuple[str, int, str, str, str], ...] = (),
 ) -> str:
     """The PR description: what was removed, why, and which branch survived.
 
@@ -264,7 +352,12 @@ def pr_body(
     false. See :func:`~flag_cleanup.unused.remove_stranded_bindings`. Its
     ``"bare import"`` entries are pulled out into a callout of their own:
     those statements were kept, not removed, and each is a line the reviewer
-    is asked to judge (see :func:`_bare_import_lines`).
+    is asked to judge (see :func:`_bare_import_lines`). So are its
+    ``"unread parameter"`` entries, which name a C# parameter left in place
+    that the build may now reject (see :func:`_unread_parameter_lines`), and
+    the TypeScript family's ``"unread binding"`` and ``"emptied override"``
+    entries (see :func:`_unread_binding_lines` and
+    :func:`_emptied_override_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
 
     ``entries`` is a FOURTH case: a flag-keyed entry — a registry line, an
     override property, an object-type member — deleted under one of the two
@@ -289,8 +382,8 @@ def pr_body(
     it. Named because each was the customer's test code.
 
     ``residue`` sorts ``unprocessed`` rather than adding to it. A test that
-    still stubs the removed read and a file naming the flag only in comments
-    each get their own paragraph, and only what is left keeps the generic
+    still stubs the removed read, a file naming the flag only in comments and
+    one naming it only in test titles each get their own paragraph, and only what is left keeps the generic
     caveat — one undifferentiated list used to put a test about to fail beside
     a doc comment, with nothing to say which mattered.
 
@@ -346,7 +439,12 @@ def pr_body(
         ]
     stubbed_paths = list(dict.fromkeys(path for path, _ in residue.stubbed))
     held_paths = [path for path, _ in residue.enum_held]
-    sorted_out = set(stubbed_paths) | set(residue.comment_only) | set(held_paths)
+    sorted_out = (
+        set(stubbed_paths)
+        | set(residue.comment_only)
+        | set(residue.title_only)
+        | set(held_paths)
+    )
     generic = tuple(path for path in unprocessed if path not in sorted_out)
     if residue.stubbed:
         lines += [
@@ -399,6 +497,22 @@ def pr_body(
             *(
                 [f"> - ...and {len(residue.comment_only) - len(shown)} more"]
                 if len(residue.comment_only) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.title_only:
+        shown = residue.title_only[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.title_only)} test file(s) name this flag only "
+            "in test titles** (and perhaps comments). A title is never read as "
+            "a key, so nothing there can break, but a title describing the "
+            "flag's state now describes a condition that no longer exists:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.title_only) - len(shown)} more"]
+                if len(residue.title_only) > len(shown)
                 else []
             ),
             "",
@@ -477,9 +591,19 @@ def pr_body(
     marked_imports = [
         (path, text) for path, kind, text in bindings if kind == "marked import"
     ]
-    bindings = tuple(
-        b for b in bindings if b[1] not in {"bare import", "marked import"}
-    )
+    unread_parameters = [
+        (path, text) for path, kind, text in bindings if kind == "unread parameter"
+    ]
+    unread_bindings = [
+        (path, text) for path, kind, text in bindings if kind == "unread binding"
+    ]
+    emptied = [
+        (path, text) for path, kind, text in bindings if kind == "emptied override"
+    ]
+    bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
+    lines += _unread_parameter_lines(unread_parameters)
+    lines += _unread_binding_lines(unread_bindings)
+    lines += _emptied_override_lines(emptied)
     lines += _bare_import_lines(bare_imports)
     lines += _marked_import_lines(marked_imports)
     if bindings:
@@ -497,7 +621,8 @@ def pr_body(
         # deletion would tell the customer something false about their own PR.
         import_count = sum(1 for _, kind, _ in bindings if kind == "import")
         method_count = sum(1 for _, kind, _ in bindings if kind == "private method")
-        variable_count = len(bindings) - import_count - method_count
+        parameter_count = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
+        variable_count = len(bindings) - import_count - method_count - parameter_count
 
         def _plural(n: int, noun: str) -> str:
             return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
@@ -509,6 +634,8 @@ def pr_body(
             counted.append(_plural(variable_count, "local variable"))
         if method_count:
             counted.append(_plural(method_count, "private method"))
+        if parameter_count:
+            counted.append(_plural(parameter_count, "parameter"))
 
         sentences = [
             # Go is the only unconditionally-true claim here: javac has no
@@ -541,6 +668,13 @@ def pr_body(
                 "above it, only when nothing else in its file still names it; "
                 "a method in a `partial` type, an overloaded one, or one "
                 "carrying an attribute or annotation is never touched."
+            )
+        if parameter_count:
+            sentences.append(
+                "A parameter is deleted only when an override of this flag was "
+                "its last reader, it is the last parameter of a function that "
+                "nothing outside its file can call, and no remaining call "
+                "passes it."
             )
 
         lines += [
@@ -603,7 +737,8 @@ def pr_body(
             f"> **{count} flag-keyed {noun} removed.** Each was an entry keyed by "
             "this flag inside a literal that is provably about flags: either "
             "another key in the same literal is a different flag of this project, "
-            "or the entry's value is a boolean. None is a flag read — these are "
+            "or the entry's value is a boolean (a literal, or a name bound only "
+            "to one). None is a flag read — these are "
             "the registry and override lines a reviewer used to delete by hand.",
             ">",
             *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in entries[:20]],
@@ -693,6 +828,9 @@ def pr_body(
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+    if wrapper_findings:
+        lines += _wrapper_lines(wrapper_findings)
+    wrappers = without_inlined(wrappers, wrapper_findings)
     if wrappers:
         lines += _constant_wrapper_lines(wrappers)
     if left_in_place:
@@ -715,6 +853,126 @@ def pr_body(
         "_Generated by the Featureflip flag-cleanup Action._",
     ]
     return "\n".join(lines)
+
+
+#: Not refusals: what became of a keyless wrapper (see `wrapper_inline`).
+_WRAPPER_STATUSES = ("complete", "partial")
+
+
+def _by_wrapper(
+    findings: tuple[tuple[str, int, str, str, str], ...],
+) -> dict[str, tuple[tuple[str, int, str, str, str] | None, list[tuple[str, int, str, str, str]]]]:
+    """wrapper label -> (its status row or ``None``, its refusal rows), in order."""
+    grouped: dict[str, tuple[tuple | None, list]] = {}
+    for finding in findings:
+        status, refusals = grouped.get(finding[4], (None, []))
+        if finding[2] in _WRAPPER_STATUSES:
+            status = finding
+        else:
+            refusals.append(finding)
+        grouped[finding[4]] = (status, refusals)
+    return grouped
+
+
+def without_inlined(
+    wrappers: tuple[ConstantWrapper, ...],
+    wrapper_findings: tuple[tuple[str, int, str, str, str], ...],
+) -> tuple[ConstantWrapper, ...]:
+    """``wrappers`` less the members the run inlined (completely or partly).
+
+    Those have their own section, which names every caller still left; the
+    "now returns a constant" one would tell the reviewer to fix callers the
+    run already fixed. A wrapper that did not qualify is kept: its siblings
+    and callers are exactly what that section is for.
+    """
+    inlined = {
+        label
+        for label, (status, _) in _by_wrapper(wrapper_findings).items()
+        if status is not None
+    }
+    return tuple(w for w in wrappers if w.member not in inlined)
+
+
+def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list[str]:
+    """The body section for keyless wrappers: what was inlined, and what was left."""
+    grouped = _by_wrapper(findings)
+    inlined = {label: v for label, v in grouped.items() if v[0] is not None}
+    lines: list[str] = []
+    if inlined:
+        partial = sum(1 for status, _ in inlined.values() if status[2] == "partial")
+        lines += [
+            "> **🔁 Wrappers inlined.** Each member below read only this flag and "
+            "took no key. Every call this run could tie to it was folded to the "
+            "value the flag serves, and a member nothing calls any more was "
+            "deleted.",
+            ">",
+        ]
+        for label, (status, refusals) in list(inlined.items())[:20]:
+            path, line = status[0], status[1]
+            if status[2] == "complete":
+                lines.append(
+                    f"> - {_md_code(label)} ({_md_code(f'{path}:{line}')}) — complete: "
+                    "every caller folded, and the member deleted."
+                )
+                continue
+            lines.append(
+                f"> - {_md_code(label)} ({_md_code(f'{path}:{line}')}) — partial: kept, "
+                "because these were left as they are:"
+            )
+            lines += [
+                f">   - {_md_code(f'{p}:{n}')} ({r})" + (f" {_md_code(_one_line(t))}" if t else "")
+                for p, n, r, t, _ in refusals[:20]
+            ]
+            if len(refusals) > 20:
+                lines.append(f">   - ...and {len(refusals) - 20} more")
+        if partial:
+            lines += [
+                ">",
+                "> A kept member is left as this run left it: returning the "
+                "value the flag serves, or, where it says `not-folded`, still "
+                "reading the flag. Check each remaining caller before relying "
+                "on the member staying.",
+            ]
+        lines.append("")
+    refused = {label: v for label, v in grouped.items() if v[0] is None}
+    if refused:
+        lines += [
+            "> **ℹ️ Wrappers not inlined.** The read inside each was folded, but "
+            "its callers were left, for the reason given:",
+            ">",
+            *[
+                f"> - {_md_code(label)} ({_md_code(f'{r[0][0]}:{r[0][1]}')}) — {r[0][2]}"
+                for label, (_, r) in list(refused.items())[:20]
+            ],
+            "",
+        ]
+    return lines
+
+
+def note_wrapper_findings(findings: tuple[tuple[str, int, str, str, str], ...]) -> None:
+    """Log what became of each keyless wrapper, one line each.
+
+    WARNING, like the other notes here: a dry run has no pull request body,
+    so this is where it shows every caller a real run would leave, and that a
+    member the diff deletes went because nothing called it any more.
+    """
+    for label, (status, refusals) in _by_wrapper(findings).items():
+        if status is None:
+            first = refusals[0]
+            logger.warning(
+                "%s: not inlined (%s) at %s:%d", label, first[2], first[0], first[1]
+            )
+        elif status[2] == "complete":
+            logger.warning("%s: complete — inlined at its call sites and deleted", label)
+        else:
+            logger.warning(
+                "%s: partial — kept; remaining callers: %s",
+                label,
+                "; ".join(
+                    f"{p}:{n} ({r})" + (f" {_one_line(t)}" if t else "")
+                    for p, n, r, t, _ in refusals
+                ),
+            )
 
 
 def _constant_wrapper_lines(wrappers: tuple[ConstantWrapper, ...]) -> list[str]:
@@ -970,8 +1228,8 @@ def _enum_lines(
     if dynamic:
         lines += [
             f"> **⚠️ The enum holding this flag's key is used dynamically in "
-            f"{len(dynamic)} place(s)** (`values()`, `entries`, `valueOf`, a class "
-            "literal, or the enum object itself). A use like this can reach the "
+            f"{len(dynamic)} place(s)** (`values()`, `entries`, `valueOf`, `cases()`, "
+            "`from()`, a class literal, or the enum object itself). A use like this can reach the "
             "entry without naming it, so the flag may still be evaluated there. "
             "Check each one before archiving the flag:",
             ">",
@@ -986,8 +1244,8 @@ def _enum_lines(
             f"this flag's key {'was' if len(kept) == 1 else 'were'} left in place, "
             f"and no read through {'it' if len(kept) == 1 else 'them'} that this "
             "run could find remains.** Removing an enum entry can change stored "
-            "ordinals, `valueOf` lookups and iteration over the enum, none of "
-            "which a build catches. Delete each one once nothing depends on it:",
+            "values, lookups by name or value and iteration over the enum, none "
+            "of which a build catches. Delete each one once nothing depends on it:",
             ">",
             *listed(
                 f"> - {_md_code(f'{path}:{line}')} — {_md_code(text)}"
@@ -998,11 +1256,11 @@ def _enum_lines(
         lines += [
             f"> **ℹ️ {len(held)} file(s) still hold this flag's key in an enum "
             "entry, and this run resolved no read through it.** Enum-held keys "
-            "are resolved only in Java, Kotlin and TypeScript, and only through "
+            "are resolved only in Dart, Java, Kotlin, PHP, Python and TypeScript, and only through "
             "the forms the README lists. For each one, resolve the reads through "
             "it by hand; delete the entry only once nothing depends on it, since "
-            "removing an enum entry can change stored ordinals, `valueOf` "
-            "lookups and iteration over the enum:",
+            "removing an enum entry can change stored values, lookups by name "
+            "or value and iteration over the enum:",
             ">",
             *listed(f"> - {_md_code(path)} — {_md_code(text)}" for path, text in held),
         ]
