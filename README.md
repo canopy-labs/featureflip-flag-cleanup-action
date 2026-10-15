@@ -630,7 +630,7 @@ entries dropped.
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`). See [Wrapping the SDK](#wrapping-the-sdk). |
-| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java and C#: inline a method, Kotlin property getter, Kotlin top-level function or C# get-only `bool` property whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
+| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript and JavaScript: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function or TypeScript or JavaScript function or class method whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. |
@@ -1018,7 +1018,7 @@ wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
 key is not at the call site and no name will make it matchable. Those reads are
 reported as unremoved rather than guessed at.
 
-**A wrapper that takes no key is inlined at its callers, in Kotlin, Java and C#.**
+**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript and JavaScript.**
 A flag is often read once, inside a method, and checked everywhere else through
 that method:
 
@@ -1146,12 +1146,222 @@ reflection with no attribute on it (a view model passed to a JSON serializer)
 loses the member when it is deleted. Read the deletion in the diff when the
 wrapper's class is also a data object.
 
+In Go, a wrapper is a top-level function or a method with one unnamed `bool`
+result and no type parameters, whose body is exactly `{ return read }`:
+
+```go
+func NewCheckout(u string) bool {
+	return client.BoolVariation("old-checkout", u, false)
+}
+
+// elsewhere
+if flags.NewCheckout(u) { … }
+```
+
+The read is `BoolVariation` (or one of your `accessors`) with the key as a
+literal or as a constant in the same file, or OpenFeature's
+`Boolean(ctx, "key", …)`. Go has no inheritance, so a call is folded when its
+file shows which function or method it reaches:
+
+- a function called bare in its own package (same directory, same `package`
+  clause) with no local of that name in scope, or called as
+  `pkg.NewCheckout(…)` through the file's import of its package. The import
+  path is read from the nearest `go.mod`, and it must be the same `go.mod`
+  for the caller and the function. The import must be aliased, or its path
+  must end in the package's own name, so that it can be removed once its
+  last use is folded;
+- a method called on a receiver whose type the file spells. That covers a
+  parameter or method receiver with a written type, `var x T`, `x := &T{…}`,
+  `x := T{…}`, `x := new(T)`, and a package-level variable of one of those
+  forms (also as `pkg.Default`). It also covers a struct field declared with
+  the type, followed one `.field` at a time (an embedded field is selected by
+  its type name, as in `s.Flags.NewCheckout()`).
+
+Folding a call drops its receiver and its arguments, and Go does not build
+with an unused local or import. So a local that only the call reads must be
+one the cleanup removes afterwards (see [Supported Go flag-read
+shapes](#supported-go-flag-read-shapes)). A local declared together with
+other names that have values (`var a, b = …`, `a, b := …`), declared by a
+`range` clause, a `select` receive (`case v := <-ch:`) or a type switch
+(`switch v := x.(type)`), declared inside a function literal or in a function
+sharing its name with another in the same file, or spelled again by a comment,
+a struct key, a shadowing declaration or an assignment, is refused
+(`unremovable-local`). A map literal's key (`map[string]bool{k: true}`) is a
+read of `k`, so it counts like any other argument. An argument read through an
+import whose path does not end in its package's name, or through a dot
+import, is refused too (`import-unresolved`), since that import could not be
+removed either.
+
+A call made through `go` or `defer`, with type arguments, or through a
+promoted method (`s.NewCheckout()` where `S` embeds the type) is left alone.
+So is a function or method used without a call (`f := flags.NewCheckout`).
+
+Go interfaces are satisfied without any declaration, so an interface method of
+the same name anywhere in the repository keeps the wrapper
+(`interface-structural`). For the same reason an **exported** method is never
+deleted: a value of its type may be handed to code outside the repository that
+expects an interface with that method. Its callers are still folded, and the
+removal is reported as partial. An unexported method can only satisfy an
+interface of its own package, which the scan covers. A function marked with a
+cgo `//export` comment is kept (`annotated`), and a `//go:linkname` comment
+naming it keeps it too (`unparsed-mention`), as does an `Example` test
+function named after it in its own directory, which `go test` would otherwise
+reject once the function is gone. No call is folded in an external test
+package (`package flags_test`) that declares an `Example` named after
+something (`unparsed-mention`): `go vet` looks that name up through the test
+package's import of `flags`, which a fold can remove. Templates cannot reach anything
+this deletes: they call exported methods, which are never deleted, and reach
+functions only through a `FuncMap` your Go code builds, which keeps them.
+
+In TypeScript and JavaScript, a wrapper is one of these, with a whole body
+that is one read of the flag being removed:
+
+- a top-level `function`;
+- a top-level `const` holding an arrow function or a function expression;
+- a method of a non-generic class, static or not.
+
+The read is `boolVariation` or `useFeatureFlag` (or one of your `accessors`),
+with the key first. The following are not wrappers: `async` functions,
+generators, getters, object-literal methods, and any wrapper of
+`getBooleanValue`, whose folded form is awaited. None of them is inlined or
+deleted. Only the read inside is folded, like any other read. The same goes
+for a wrapper declared as `export default` (a function, or a method of a
+class exported that way): its callers import it under a name of their own,
+which the proof cannot follow, so it is not inlined.
+
+TypeScript's class types are structural. Anything with the same members can
+stand in for a class, so a written type proves nothing on its own. The
+wrapper's name must therefore be declared exactly once across the
+repository's TypeScript and JavaScript (`name-not-unique`). All of these
+count as declarations:
+
+- functions and methods;
+- class fields and constructor parameter properties;
+- object-literal keys and methods;
+- module-level bindings;
+- enum members;
+- declarations inside a namespace or a block;
+- an assignment such as `obj.banner = ...` or `Flags.prototype.banner = ...`;
+- an `export { other as newCheckout }`.
+
+Any string literal in the repository's TypeScript or JavaScript that equals
+the wrapper's name also refuses it, since it may be a computed key (a route,
+a log line or `"banner"` as a key counts). A test fake such as
+`{ newCheckout: () => false }` is a second declaration. So is a committed
+build output (`dist/flags.js`, `flags.d.ts`). A
+`module.exports = { newCheckout }` in the wrapper's own file is the wrapper
+itself, not a second declaration. It still keeps the wrapper. Its callers in
+that file are inlined, and those in other files are `import-unresolved` (see
+below). Re-exporting the wrapper itself
+(`export { newCheckout as nc }`, a barrel) does not refuse it either, and the
+wrapper is kept as partial.
+
+Two more checks refuse a wrapper:
+
+- a property or method signature of the name in any interface or type
+  literal (`interface-structural`);
+- a method whose class extends or implements a type the repository does not
+  declare (`overridable`).
+
+A call is inlined when the calling file binds every name the proof uses
+exactly once. The shapes are:
+
+- `newCheckout(u)`, in the wrapper's own file, through
+  `import { newCheckout }` (aliased or not), or through a top-level
+  `const { newCheckout } = require(...)`;
+- `ns.newCheckout(u)`, through `import * as ns` or `const ns = require(...)`;
+- `Flags.legacy()`, for a static method;
+- `flags.banner(u)`, on a module-level `const flags = new Flags()` in the
+  same file or imported;
+- `f.banner(u)`, `this.gate.banner(u)` and longer `.field` chains. Each
+  parameter, local, field or constructor parameter property in the chain
+  must be written as exactly `Flags`, or initialized with `new Flags(...)`.
+  In JavaScript, a field assigned `new Flags()` once in the constructor
+  counts. An optional field (`gate?: Flags`) is not proven.
+
+Imports resolve the way cross-file key constants' do: relative paths,
+`index` files and `tsconfig`/`jsconfig` `paths`. Default imports,
+re-exports and barrels, and package names are `import-unresolved`. A
+function, a class or an instance resolves through an import (or `ns.` or
+`require`) only when its module exports it directly, as `export function`,
+`export const`, `export class` or `export { newCheckout }`. If that module
+also has an `export *`, re-exports another module's function of that name
+(`export { newCheckout } from "..."`), or assigns `module.exports`, an
+importer may get something else under the name, so its callers there are
+`import-unresolved`. So a wrapper exported only through `module.exports`
+(CommonJS) is not inlined outside its own file, while a function exported
+with `export` and called through `require` is. A sloppy-JavaScript `with`
+block refuses every call under it.
+
+The wrapper's own run also rewrites callers in another file type of the
+family, such as `Checkout.tsx` calling `flags.ts`. Two conditions apply: that
+file type must be configured, and no other run may also rewrite the file. A
+caller that fails either condition is `outside-run`, and the wrapper stays.
+
+A test that stubs the wrapper refuses it entirely (`test-double`), so no test
+that forces the removed branch can turn red. Stubs include
+`jest.spyOn(flags, "newCheckout")`, a `jest.mock` factory key, and
+`mock.banner.mockReturnValue(...)`. So does `jest.mock("./flags")` or
+`vi.mock("./flags")` (or their `doMock` forms, `jest.setMock`,
+`jest.unstable_mockModule`, `jest.createMockFromModule`, `jest.requireMock`,
+`vi.importMock`, or the `mock.module` of Node's and Bun's test runners) of
+the wrapper's own module,
+with or without a factory: an automock replaces the wrapper without naming it.
+The target may be written `import("./flags")` or `require.resolve("./flags")`
+around a plain string. A module mock whose target does not resolve to a file
+in the repository refuses every wrapper in the run, because it could be the
+wrapper's module: a template literal, a variable, a relative path that names
+no file, or a bare name that is not a package, such as an alias defined only
+in a bundler or test config (`vite.config`, Jest's `moduleNameMapper`) rather
+than in `tsconfig`/`jsconfig` `paths`. A mock of a package is not refused: a
+Node built-in (`fs`, `node:fs/promises`), or a name (`axios`, `lodash/fp`,
+`@scope/name`) that a `package.json` in the repository declares in
+`dependencies`, `devDependencies`, `peerDependencies` or
+`optionalDependencies`. So does a
+stub of the wrapper's whole class, which never names the method:
+`sinon.createStubInstance(Flags)`, `mock<Flags>()`, `mockDeep<Flags>()`,
+`createMock<Flags>()`, ts-mockito's `mock(Flags)`, `stubInterface<Flags>()`,
+`Substitute.for<Flags>()`, `td.object(Flags)` or `td.instance(Flags)`, under
+any import name or as a member of the module (`ns.Flags`,
+`require("./flags").Flags`). A dependency-injection test bed that mocks every
+dependency (NestJS `.useMocker(...)`, `TestBed.solitary(...)` or
+`TestBed.sociable(...)` from `@suites/unit`) refuses every method wrapper in
+the run. So do two stubs that name no member: `sinon.stub(obj)` with one
+argument, and `stub(obj, name)` or `spyOn(obj, name)` whose member name is
+not a string literal. Each refuses every wrapper unless `obj` provably is
+something else: an import of another file, a package, or a global such as
+`console`. Test-runner configuration counts too. Jest's `automock: true`
+(in `jest.config.*` or the `jest` key of a `package.json`) refuses every
+wrapper. So does a `moduleNameMapper` or `alias` entry in a Jest, Vite or
+Vitest config that points into a `__mocks__` or `mocks` directory, ends in
+the wrapper module's own name, or resolves to its file. Aliases defined
+anywhere else, such as a webpack config or a Babel plugin, are not read.
+A stub in a setup file, a story, a `__mocks__/` directory, a Cypress or
+end-to-end helper counts, and so does any file that uses `jest.`, `vi.mock`,
+`vi.spyOn`, `vi.fn`, `sinon.` or `cy.stub`.
+
+A call is not inlined (`argument-has-call`) when the wrapper has a parameter
+default that may run code, such as `u = currentUser()` or the destructuring
+`({ id } = { id: currentUser() })`. That holds even when the call passes the
+argument, since an `undefined` argument still runs the default. A default of
+literals and names (`u = "anon"`) does not count.
+
+A decorated method (`@Get("/checkout")`) has its callers inlined but is
+itself kept (`annotated`), whatever the decorator: a decorator is code of your
+own, and may register the method with a framework that calls it by name.
+
+A `private` field or constructor parameter property that only the folded
+calls read stays behind. Under `noUnusedLocals` that is error TS6138, and the
+pull request does not remove it.
+
 A method qualifies when its whole body is one read of the flag being removed
 (`= read`, `{ return read }`, `{ return read; }`), and:
 
 - its name, and its class's name, are each declared once across the
   repository's Java and Kotlin files, or across its C# files, where a field,
-  event or record parameter of that name counts too (for a getter, a Kotlin function or a
+  event or record parameter of that name counts too, or across its Go files,
+  where a struct field or a package-level variable, constant or type of that
+  name counts too (for a getter, a Kotlin function or a
   Java `getX()`/`isX()` of that name counts too, and for a top-level function,
   so does any function, property, class, object or typealias of that name);
 - it is not `open`, `abstract` or an override, and nothing in the repository
@@ -1207,18 +1417,20 @@ is reported as **partial** rather than **complete**:
 
 | Reason | Meaning |
 | --- | --- |
-| `name-not-unique` | The method, its class or the interface method is declared more than once. |
-| `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. |
+| `name-not-unique` | The method, its class or the interface method is declared more than once. In TypeScript and JavaScript, any function, method, class field, parameter property, object key, module-level binding or enum member of the name counts, a committed build output included, and so does any string literal equal to it. |
+| `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare. |
 | `interface-published` | The interface it implements is public, or has another implementation. |
+| `interface-structural` | A Go interface declares a method of the same name, or the wrapper is an exported Go method, which may satisfy an interface outside the repository. Or a TypeScript interface or type literal declares a property or method of the same name. |
 | `receiver-unproven` | Nothing in the file ties the receiver to the method's class. |
-| `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. |
-| `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. |
-| `argument-has-call` | An argument holds a call, a lambda or an assignment. |
+| `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
+| `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module, or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). |
+| `argument-has-call` | An argument holds a call, a lambda or an assignment. In Go, a receive (`<-ch`) or a dereference (`*p`) counts too. In TypeScript and JavaScript, `new`, `await`, `yield`, `delete`, a spread or `++`/`--` counts too, and an arrow or function argument counts only when its body holds one of these or a call. So does a parameter default of the wrapper that may run code, whether or not the call passes that argument. |
+| `unremovable-local` | Go only: folding the call would leave a local unused that the cleanup does not remove (see above), and Go does not build with an unused local. |
 | `other-language` | The call is in a Groovy or Scala file, in a Java file calling a Kotlin method (or the reverse), in Java, Groovy or Scala naming a Kotlin getter (`getEnableX`), or in Kotlin reading a Java getter as a property (`flags.enabled`), or a VB or F# file naming a C# wrapper. |
-| `unparsed-mention` | The name appears in a string (reflection, SpEL), a template, a layout, a Razor view, a C# `cref`, or another file this tool does not parse. |
+| `unparsed-mention` | The name appears in a string (reflection, SpEL), a template, a layout, a Razor view, a C# `cref`, a `//go:linkname` comment, the name of a Go `Example` test, or another file this tool does not parse. Also a Go call in an external test package that declares a named `Example`. |
 | `not-folded` | The read inside the method was not folded, because its file could not be processed. |
-| `test-double` | A stub of the method this run could not resolve. |
-| `annotated` | The method carries an annotation a framework may call it through (`@GetMapping`, `@Bean`, `@JvmName`, …), so it is kept even with no caller left. |
+| `test-double` | A stub of the method this run could not resolve. In TypeScript and JavaScript, any stub of the wrapper or of its whole class, a stub of an object it cannot rule out, an auto-mocking test bed or runner config, or a `jest.mock`/`vi.mock` of its module or of a target that does not resolve to a file or a declared package, refuses it before a caller is inlined. |
+| `annotated` | The method carries an annotation a framework may call it through (`@GetMapping`, `@Bean`, `@JvmName`, …), so it is kept even with no caller left. A Go function marked `//export` is kept the same way, and so is a TypeScript or JavaScript method with any decorator. |
 
 In a partial removal, every call that was folded evaluated to the value the
 flag serves. The method that is kept returns that value too, unless it is
@@ -1233,7 +1445,7 @@ deletion of a public method in the diff before merging. Set
 did.
 
 **A gate that takes no key and is not inlined is reported, not rewritten.**
-That is every such gate outside Kotlin, Java and C#, and one of theirs that
+That is every such gate outside Kotlin, Java, C#, Go, TypeScript and JavaScript, and one of theirs that
 does not qualify, such as a family of gates sharing `IsEnabled` behind
 interfaces with a second implementation each:
 
@@ -1754,7 +1966,7 @@ generator's input no longer names the constant.
 
 #### Enum entries
 
-A key held in an enum entry is resolved too, in Dart, Java, Kotlin, PHP, Python and TypeScript:
+A key held in an enum entry is resolved too, in Dart, Java, Kotlin, PHP, Python, Swift and TypeScript:
 
 ```java
 public enum Flags {
@@ -1774,12 +1986,24 @@ client.boolVariation(Flags.NEW_CHECKOUT.key(), ctx, false);
 | Kotlin | a top-level `enum class Flags(val key: String)` with no secondary constructor; the entry passes the key positionally and has no body | `Flags.X.key`; bare `X.key` under `import pkg.Flags.X`, or `Y.key` under `import pkg.Flags.X as Y`. Only an alias of the entry's own import counts: `F.X.key` under `import pkg.Flags as F` is not resolved (`unsupported-form`) |
 | PHP | a string-backed `enum Flags: string` declared at the top of its file or of a braced namespace, with `case X = 'key';` as a plain string | `Flags::X->value` (or the import alias, a fully qualified `\Ns\Flags::X->value`, or `Flags::X->value` in the enum's own namespace). `?->value`, `->name` and methods of the enum are not resolved (`unsupported-form`); a read inside the enum's own file is not resolved either, nor is a Twig, Latte or Smarty template or Symfony YAML (`!php/enum`, an `enum('...')` expression) or XML configuration that names the case |
 | Python | a top-level `class Flags(StrEnum)`, `(str, Enum)`, `(Enum)` or Django `(models.TextChoices)` whose body holds only members (literals, `auto()`, or for `TextChoices` a `"key", "Label"` or `"key", _("Label")` pair), a docstring and public methods, with no metaclass and no decorator but `@unique`; the member is `X = "key"` as a plain string | `Flags.X.value` through `from pkg.flags import Flags` (or `as F`), `import pkg.flags` (`pkg.flags.Flags.X.value`), `import pkg.flags as m` (`m.Flags.X.value`) or `from pkg import flags` (`flags.Flags.X.value`). A bare `Flags.X` passed as the key is not resolved (`not-a-read`): a `(str, Enum)` member formats as `Flags.X`, and a wrapper receiving the member may read `.name` or `.value` from it. `.name`, `.label` and methods are `unsupported-form`, as is a read inside the enum's own file |
+| Swift | a case of an `enum` declared at the top level or nested in a struct, class, enum or actor, in a module read from `Package.swift` or an Xcode project; the enum and every type around it are not `private` or `fileprivate`, carry no attribute and sit outside `#if`, and the case is alone in its `case` clause with no associated values. Either a raw value, `enum Flags: String` (or `Swift.String`) with `case X = "key"` as a plain single-line string, or a computed `var key: String` (any name; not `static`, `private` or `fileprivate`, no attribute, outside `#if`, declared in the enum's own body) whose getter is one `switch self` whose arms name the enum's cases as `.X` only (no binding, `where`, `_` or other member; `default:` is fine) and whose arm for `X` is `return "key"` or just `"key"`. A raw-value enum's other conformances must be protocols the repository declares or `Equatable`, `Hashable`, `Comparable`, `CaseIterable`, `Codable`, `Encodable`, `Decodable`, `CodingKey`, `Sendable`, `Identifiable`, `CustomStringConvertible` or `CustomDebugStringConvertible`, and nothing in the repository may declare a `rawValue` the enum could pick up instead of its own: in the enum's body, in a protocol it conforms to, or in any extension at all, of any type and however it is spelled (an extension of an unrelated type counts too). With either shape, no member of the enum, and no member of an extension that could reach it, may carry an attribute other than `@available`, `@objc`, `@nonobjc`, `@discardableResult`, `@inlinable`, `@usableFromInline`, `@inline`, `@frozen`, `@preconcurrency`, `@warn_unqualified_access`, `@_disfavoredOverload`, `@Sendable` or `@MainActor` (the last only while the repository declares no macro named `MainActor`): an attached macro there may add members | `Flags.X.rawValue`, or `Flags.X.key` through the property, with `Flags` resolved as a constant's owner is: in the enum's module with no import, from another module after a plain `import` that allows the access. Also `Outer.Flags.X.rawValue` for a nested enum, and `Module.Flags.X.rawValue` when no type, member or local named like the module is in scope. An implicit member (`.X`, anywhere in the repository, `case .X:` included), `Flags.X` passed as a value, another member of the case (`.hashValue`), a read inside the enum's own file, and a read in a module holding an extension of the enum that declares a member named like the accessor are not resolved (`unsupported-form` or `not-a-read`). Neither is a read whose `Flags` (or `Module.Flags`) a typealias in the repository may stand for: one in the reading module, at the top level or inside a type, and for `Module.Flags` one declared anywhere (`import-unresolved`) |
 | TypeScript / TSX / JavaScript | an `export enum` (or `export const enum`) declared once in its file, with `X = "key"`; or an `export const Flags = { X: "key" } as const` object (see below) | `Flags.X` (or the alias's text) through `import { Flags }`, `const { Flags } = require(...)` or `const { Flags: F } = require(...)` (read as `F.X`); `ns.Flags.X` through `import * as ns` or `const ns = require(...)` |
 
 An entry holds the key when its arguments (or a TypeScript member's
 initialiser) spell the key as a whole token: `"new-checkout-v2"` is another
 flag's key, while `PREFIX + "new-checkout"` still holds this one and makes the
 entry `enum-unproven`.
+
+A Swift case holds the key when its raw value, or the literal of a switch arm
+naming it, spells it. Two Swift reads are still resolved and can differ. An
+extension of `RawRepresentable` (or of a protocol on the list above) in a
+library, declaring `rawValue`, gives every raw-value enum that value: the
+same extension in this repository is seen and leaves the case in place, but
+a library's cannot be. And `Module.Flags.X.rawValue` reads a type named
+`Module` from an imported library instead of the module, if a library
+declares one. A library macro named `MainActor` is not seen either: a
+member attribute `@MainActor` is taken to mean the global actor, so a case
+beside it is proven.
 
 In TypeScript, a property of an `as const` object is treated as an enum entry
 throughout, so everything this section says about an enum applies to the object
@@ -1842,7 +2066,9 @@ In Python the same goes for `Flags(...)`, `Flags[...]`, iterating or counting
 the class, handing it on (`register(Flags)`), `Flags.__members__`, and
 Django's `Flags.choices`, `.values`, `.labels` and `.names`. In Dart it is
 `Flags.values` (and so `values.byName(...)`, `values.asNameMap()` and
-iterating it), also as a bare `values` inside the enum. Such a use does
+iterating it), also as a bare `values` inside the enum. In Swift it is
+`Flags.allCases`, `Flags(rawValue:)` and `Flags.init(rawValue:)`, also as a
+bare `allCases` inside the enum or an extension of it. Such a use does
 not stop the removal, but it is listed under `enum-dynamic` so you can check
 it before archiving the flag.
 
@@ -1956,14 +2182,14 @@ reason:
 | Reason | What triggers it |
 | --- | --- |
 | `name-not-unique` | the same qualified constant is declared more than once, or another file declares a competing one: the same name or owner in another source set, build variant or module, or in the other JVM language (a Java `Owner` beside a Kotlin `Owner`). A Kotlin top-level property named like the owner (`val Owner = ...`) or a `@file:JvmName("Owner")` facade counts too. Which declaration a reader gets is then decided by the build, so none is touched. The pull request lists these apart from the other reasons, since a build variant is usually deliberate |
-| `import-unresolved` | nothing in the reading file ties the name to the declaring file: no import or same-package route, an import that resolves to another file or to none, a TypeScript default import, a re-export through a barrel (`export ... from`), a TypeScript import alias of the constant off a name that is not a namespace import of its file (`import K = m.NAME` under `import m = require(...)`), or a TypeScript enum taken off a name that is not a namespace import of its file (`use(m.Flags)`, `const F = m.Flags`, `import F = m.Flags`) or used as a value through an import that does not resolve (`use(Flags)`), or, in a file that names that enum, a computed lookup (`m[k]`) off a namespace or default import of a script that does not resolve, such as a package (`Icons[name]`; a `.css` or `.json` import is not a script); a Python star import beside the name, an absolute import that two files in the checkout could mean, or a `from pkg import keys` or `import pkg.keys` through a package `__init__.py` that is not plain or with a compiled module beside the declaring one, or a PHP read whose `use` is written after it, a class the checkout does not declare (such as a `class_alias`), or a global constant read from inside a namespace, or a Dart import that re-exports the declaring library, is conditional or deferred, names another package of the repository, or does not resolve, or a Swift read from another module with no plain `import` of the declaring one, an access level the import does not allow, or a second imported module that declares the name |
+| `import-unresolved` | nothing in the reading file ties the name to the declaring file: no import or same-package route, an import that resolves to another file or to none, a TypeScript default import, a re-export through a barrel (`export ... from`), a TypeScript import alias of the constant off a name that is not a namespace import of its file (`import K = m.NAME` under `import m = require(...)`), or a TypeScript enum taken off a name that is not a namespace import of its file (`use(m.Flags)`, `const F = m.Flags`, `import F = m.Flags`) or used as a value through an import that does not resolve (`use(Flags)`), or, in a file that names that enum, a computed lookup (`m[k]`) off a namespace or default import of a script that does not resolve, such as a package (`Icons[name]`; a `.css` or `.json` import is not a script); a Python star import beside the name, an absolute import that two files in the checkout could mean, or a `from pkg import keys` or `import pkg.keys` through a package `__init__.py` that is not plain or with a compiled module beside the declaring one, or a PHP read whose `use` is written after it, a class the checkout does not declare (such as a `class_alias`), or a global constant read from inside a namespace, or a Dart import that re-exports the declaring library, is conditional or deferred, names another package of the repository, or does not resolve, or a Swift read from another module with no plain `import` of the declaring one, an access level the import does not allow, or a second imported module that declares the name, or a Swift `Module.Flags.X.rawValue` whose module name a declaration of that name in the reading module, or in a module it imports, could stand for, or a Swift `Flags` or `Module.Flags` a typealias in the repository could stand for |
 | `not-a-read` | the name is used for something other than a flag read: a log line, a map entry, a callable reference (`Owner::NAME`), a TypeScript type-only import, an import left with no read to remove, or a TypeScript enum taken as a value off a namespace import of its file (`use(ns.Flags)`) |
 | `rebound` | the reading file binds the same name itself, or an in-repository supertype supplies a member of that name (in Swift, also an enclosing type, an extension of it, or an extension of a protocol it conforms to, declaring a member or generic parameter of the read's first name); or a Python declaring file binds its constant a second time |
 | `other-language` | the constant is mentioned, in a way that can reach it, from a file in another JVM language (Java reading a Kotlin constant, Kotlin reading a Java one, or a Groovy or Scala file reading either), from a Razor, XAML, VB or F# file reading a C# constant, from a Twig, Latte or Smarty template or Symfony YAML or XML configuration reading a PHP constant or enum case, or a read of it that would be resolved sits in another file type of the family than the declaration (a `.tsx` or `.js` file reading a `.ts` constant) and is not rewritten with it: its language is not configured, or another run rewrites the file |
-| `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries); a Python import of the declaring module nested in a function or a `try`, or a sole-name import whose private alias is already used in the file (or sits beside a submodule of that name in a package `__init__.py` reader), or a relative one through a package `__init__.py` that is not plain, or one whose line cannot take a comment; a Python declaring file with a star import or a route to its own namespace; a Swift file whose module cannot be read from `Package.swift` or an Xcode project |
+| `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum (outside Swift), a Swift implicit member (`.X`) or a Swift read in a module holding an extension of the enum that declares a member named like the accessor, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries); a Python import of the declaring module nested in a function or a `try`, or a sole-name import whose private alias is already used in the file (or sits beside a submodule of that name in a package `__init__.py` reader), or a relative one through a package `__init__.py` that is not plain, or one whose line cannot take a comment; a Python declaring file with a star import or a route to its own namespace; a Swift file whose module cannot be read from `Package.swift` or an Xcode project |
 | `declaration-kept` | Python only: a read of the constant that would have been folded, left as it is because another refusal listed beside it keeps the declaration it reads. A Python constant can be reassigned, so a kept declaration keeps every read of it (see the note on partial close-out above). For an enum entry, a read left because its file also reads a kept constant, or because an escape listed beside it can change the member's value (see Enum entries) |
-| `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name, a PHP enum that is not string-backed (pure or `int`), a PHP case whose value is not the key as a plain string (concatenated, interpolated or a constant expression), a PHP enum file that does not parse, a Python enum whose class is nested, has another base, a metaclass, a decorator other than `@unique`, a `value`, `name` or `label` method or one whose name starts with `_` (`__init__`, `__new__`), `_ignore_`, or a member valued by code, a Python enum its own module hands to other code, a Python member whose value is not the key as a plain string, or a Python enum file with a star import or a route to its own namespace, a Dart enum with more than one constructor (a factory or a second generative one), a field with an initializer or assigned twice, an argument that is not the key as a plain string (interpolated or concatenated), the key at a position the constructor does not store, type arguments on the entry, no public accessor of the field, a private enum or entry, or a Dart enum in a part or in a file that does not parse |
-| `enum-dynamic` | not a refusal: a Dart, Java, Kotlin, PHP or Python use of the whole enum that can reach the entry without naming it. Listed so it can be checked before the flag is archived |
+| `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name, a PHP enum that is not string-backed (pure or `int`), a PHP case whose value is not the key as a plain string (concatenated, interpolated or a constant expression), a PHP enum file that does not parse, a Python enum whose class is nested, has another base, a metaclass, a decorator other than `@unique`, a `value`, `name` or `label` method or one whose name starts with `_` (`__init__`, `__new__`), `_ignore_`, or a member valued by code, a Python enum its own module hands to other code, a Python member whose value is not the key as a plain string, or a Python enum file with a star import or a route to its own namespace, a Dart enum with more than one constructor (a factory or a second generative one), a field with an initializer or assigned twice, an argument that is not the key as a plain string (interpolated or concatenated), the key at a position the constructor does not store, type arguments on the entry, no public accessor of the field, a private enum or entry, a Dart enum in a part or in a file that does not parse, or a Swift case whose enum (or a type around it) is `private`, `fileprivate`, attributed or inside `#if`, or has a type around it with a supertype, or sits in a file whose module cannot be read or that does not parse, whose clause declares another case or associated values, whose raw type is not `String` (a typealias of it included), whose raw value is not the key as a plain single-line string, whose enum conforms to a protocol outside the list above or may pick up another `rawValue` (any extension in the repository declaring one counts), or could gain members from an attached macro: on an attributed extension anywhere in the repository that extends the enum, a typealias or protocol the repository declares, a type the enum's clause names, `RawRepresentable`, `Encodable`, `Decodable` or a protocol on the list above, or on a member of the enum or of such an extension carrying an attribute outside the built-in list above, or whose switch property is `static`, `private`, `fileprivate`, attributed, inside `#if`, has a setter, is declared in an extension, or has an arm with a binding, `where`, `_` or a name that is not a case of the enum |
+| `enum-dynamic` | not a refusal: a Dart, Java, Kotlin, PHP, Python or Swift use of the whole enum that can reach the entry without naming it. Listed so it can be checked before the flag is archived |
 | `kept`, `left`, `left-competing` | not refusals: what happened to an enum entry, reported at its own declaration. `kept`: every read through it found was folded. `left`: a refusal above names it, and those reads stay. `left-competing`: only a competing declaration (`name-not-unique`) names it, so no read through it was resolved, and those reads are not listed |
 
 One refusal in a file drops every read in that file, so a file is either
@@ -2147,16 +2373,32 @@ nothing, rather than deleted. TypeScript's import elision does not make
 deleting it safe: once the read is folded the name is unused, so an eliding
 compiler would drop the whole statement, while the code before the change read
 the name and so loaded the module. A `const { client } = require("./ff")`
-becomes `require("./ff");` for the same reason. The pull request body names
+becomes `require("./ff");` for the same reason. A `require` destructuring that
+binds other names too only loses the stranded one, with its comma
+(`const { client, Client } = require("./ff")` becomes
+`const { Client } = require("./ff")`), as long as the pattern holds nothing
+but plain names. The pull request body names
 each `import` and `require` kept this way, with the exact line, so a reviewer
 can delete the ones whose module does nothing when it loads.
 
 The statement is deleted outright in three cases, because none of them loaded
 anything to begin with: an `import type`, an import whose names the file only
 ever used as types, and an import of a module that another import in the same
-file still loads. A value `import client = require("./ff")` whose last use was
+file still loads. It is also deleted when the module is a file in the
+repository, named by a relative path or a `tsconfig.json` `paths` alias, and
+loading it provably does nothing: that file, and every module it loads in turn,
+only declares types, functions, classes and constants built from literals. A
+module of flag-key constants is the usual case. If anything in that graph calls
+a function, builds an object with `new`, uses a decorator, loads a package or
+cannot be found, the bare import stays. A value `import client = require("./ff")` whose last use was
 folded is left as it is, because no single spelling keeps its load under every
 compiler setting. ESLint's `no-unused-vars` will report it.
+
+When a deleted statement was the file's last `import` or `export`, it becomes
+`export {};` instead. An `import` or `export` is what makes a file a module, and
+without one the file would turn into a script, where top-level `await` does not
+compile and top-level names become globals. `export {};` keeps the file a module
+and loads nothing. The pull request body names each file where this happened.
 
 ## Supported Python flag-read shapes
 
@@ -2743,7 +2985,13 @@ Both are cleaned up automatically: a pass looks for exactly that shape — a
 binding referenced before the fold and referenced nowhere after it — and
 removes it. An import is deleted outright. A variable's declaration goes with
 it when the initializer cannot have a side effect, and is otherwise rewritten
-to discard the value, so whatever it called still runs.
+to discard the value, so whatever it called still runs. A local declared with
+`var` is treated the same way, including a spec on its own line inside a
+`var ( … )` group, and one name of `var a, b T` goes on its own. Some declarations are not
+removed at all: several names declared together with values (`a, b := f()`,
+`var a, b = x, y`), a local inside a function literal, and a local in a
+function that shares its name with another function in the same file. If a
+fold leaves one of those unused, Go reports it.
 
 Fold output itself is `gofmt`-clean, including a multi-statement branch, so a
 repo gating on `gofmt -l` will not flag the pull request over the fold.

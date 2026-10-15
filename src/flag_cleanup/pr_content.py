@@ -159,7 +159,14 @@ def _rewritten_build_output(diff: str) -> tuple[str, ...]:
 #: ``bindings`` kinds that name something KEPT, each with a callout of its own,
 #: rather than a binding this run removed.
 REPORTED_BINDING_KINDS = frozenset(
-    {"bare import", "marked import", "unread parameter", "unread binding", "emptied override"}
+    {
+        "bare import",
+        "marked import",
+        "module marker",
+        "unread parameter",
+        "unread binding",
+        "emptied override",
+    }
 )
 
 
@@ -196,6 +203,34 @@ def _bare_import_lines(bare_imports: list[tuple[str, str]]) -> list[str]:
         "whether it does. If it does nothing, delete the line:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in bare_imports[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _module_marker_lines(marked: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each file whose last import became ``export {};``, or
+    nothing.
+
+    The line is in the diff with no visible reason for it, so the reason is
+    given here: an ``import`` or ``export`` is what makes a TypeScript or
+    JavaScript file a module, and deleting the last one would have turned the
+    file into a script.
+    """
+    if not marked:
+        return []
+    count = len(marked)
+    noun = "file" if count == 1 else "files"
+    return [
+        f"> **{count} {noun} kept as a module with `export {{}};`.** The fold "
+        "left the file's last `import` unused, so the import was removed. An "
+        "`import` or `export` is what makes a file a module, though, and "
+        "without one it becomes a script: top-level `await` stops compiling "
+        "and top-level names become globals. `export {};` keeps it a module "
+        "and loads nothing. If the file never needed to be a module, delete "
+        "the line:",
+        ">",
+        *[f"> - {_md_code(path)}" for path, _ in marked[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -591,6 +626,9 @@ def pr_body(
     marked_imports = [
         (path, text) for path, kind, text in bindings if kind == "marked import"
     ]
+    module_markers = [
+        (path, text) for path, kind, text in bindings if kind == "module marker"
+    ]
     unread_parameters = [
         (path, text) for path, kind, text in bindings if kind == "unread parameter"
     ]
@@ -606,6 +644,7 @@ def pr_body(
     lines += _emptied_override_lines(emptied)
     lines += _bare_import_lines(bare_imports)
     lines += _marked_import_lines(marked_imports)
+    lines += _module_marker_lines(module_markers)
     if bindings:
         # A THIRD case alongside `stranded`, sharing its reasoning — sound by
         # construction, but the code was the customer's — without sharing its
@@ -1256,7 +1295,7 @@ def _enum_lines(
         lines += [
             f"> **ℹ️ {len(held)} file(s) still hold this flag's key in an enum "
             "entry, and this run resolved no read through it.** Enum-held keys "
-            "are resolved only in Dart, Java, Kotlin, PHP, Python and TypeScript, and only through "
+            "are resolved only in Dart, Java, Kotlin, PHP, Python, Swift and TypeScript, and only through "
             "the forms the README lists. For each one, resolve the reads through "
             "it by hand; delete the entry only once nothing depends on it, since "
             "removing an enum entry can change stored values, lookups by name "

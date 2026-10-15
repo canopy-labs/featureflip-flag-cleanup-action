@@ -39,7 +39,8 @@ Anything unproven is left exactly as it is and reported, with its reason.
 
 The shared loop lives here; what a declaration, a receiver and an import look
 like lives in one profile per language (:mod:`flag_cleanup.wrapper_kotlin`,
-:mod:`flag_cleanup.wrapper_java`, :mod:`flag_cleanup.wrapper_csharp`), with
+:mod:`flag_cleanup.wrapper_java`, :mod:`flag_cleanup.wrapper_csharp`,
+:mod:`flag_cleanup.wrapper_go`, :mod:`flag_cleanup.wrapper_ts`), with
 the facts both JVM languages share in :mod:`flag_cleanup.wrapper_jvm`. A
 profile that brings its own repository index and qualification says so; one
 that does not is judged by the JVM ones.
@@ -70,7 +71,8 @@ OVERRIDABLE = "overridable"
 #: is) implemented by something else.
 INTERFACE_PUBLISHED = "interface-published"
 #: The interface is structural, so its implementations cannot be counted.
-#: Never produced for the JVM languages, whose interfaces are nominal.
+#: Never produced for the JVM languages, whose interfaces are nominal. Go's
+#: are structural, and an exported Go method is kept for the same reason.
 INTERFACE_STRUCTURAL = "interface-structural"
 #: Nothing in the file ties the call's receiver to the wrapper.
 RECEIVER_UNPROVEN = "receiver-unproven"
@@ -78,6 +80,10 @@ RECEIVER_UNPROVEN = "receiver-unproven"
 IMPORT_UNRESOLVED = "import-unresolved"
 #: An argument holds a call or an assignment, which inlining would drop.
 ARGUMENT_HAS_CALL = "argument-has-call"
+#: Folding the call would leave a local unused that the stranded-binding
+#: cleanup cannot remove. Only Go produces it: there an unused local does not
+#: build.
+UNREMOVABLE_LOCAL = "unremovable-local"
 #: A mention in a file of another language, which this run does not rewrite.
 OTHER_LANGUAGE = "other-language"
 #: A test double of the wrapper that could not be resolved.
@@ -238,6 +244,23 @@ class Profile:
     #: ``(root, name)`` -> the member declarations of ``name`` a close-out may
     #: delete; ``None`` for the JVM ones.
     members: Callable[[Node, str], list[Node]] | None = None
+    #: Node types that spell the wrapper's name where it is used, for the
+    #: close-out's leftover scan. Go spells ``pkg.F`` and ``s.M`` with a
+    #: ``field_identifier``.
+    mention_types: frozenset[str] = frozenset({"identifier"})
+    #: ``(wrapper)`` -> why a wrapper is kept even when every caller folds, or
+    #: ``None``. A Go exported method may satisfy an interface declared
+    #: outside the repository.
+    keep: Callable[[Wrapper], str | None] | None = None
+    #: Languages of the same family whose files this language's run rewrites
+    #: itself when a caller there is admitted (``.tsx`` callers of a ``.ts``
+    #: wrapper): their calls are found with their own profile, and count as
+    #: this language's rather than ``other-language``.
+    siblings: tuple[str, ...] = ()
+    #: Annotation names that say nothing about who calls a member. Empty for
+    #: TypeScript and JavaScript, where a decorator is a function of the
+    #: codebase's own: ``@Override`` there can register the method anywhere.
+    inert_annotations: frozenset[str] = _INERT_ANNOTATIONS
 
 
 _PROFILES: dict[str, Profile] = {}
@@ -249,7 +272,7 @@ def register(profile: Profile) -> None:
 
 def profile(language: str) -> Profile | None:
     """The language's profile, or ``None`` for a language not covered yet."""
-    from flag_cleanup import wrapper_csharp, wrapper_java, wrapper_kotlin  # noqa: F401 - registration
+    from flag_cleanup import wrapper_csharp, wrapper_go, wrapper_java, wrapper_kotlin, wrapper_ts  # noqa: F401 - registration
 
     return _PROFILES.get(language)
 
@@ -329,20 +352,26 @@ def qualify_all(
 def _occurrences_in(
     language: str, path: str, wrapper: Wrapper, index: wrapper_jvm.Index
 ) -> tuple[bool, list[Occurrence]]:
-    """``(same language, occurrences)`` for one parsed file of the index."""
+    """``(this run's, occurrences)`` for one parsed file of the index: a file
+    of this language or of a sibling is this run's, a peer's is not."""
     same = profile(language)
     lang = next(
         (
             p
-            for p in (same, *(profile(peer) for peer in same.peers))
+            for p in (
+                same,
+                *(profile(s) for s in same.siblings),
+                *(profile(peer) for peer in same.peers),
+            )
             if p is not None and path.endswith(p.extensions)
         ),
         same,
     )
     source = _read(path)
+    ours = lang is same or lang.language in same.siblings
     if source is None:
-        return lang is same, [Occurrence(path, 1, "", None, RECEIVER_UNPROVEN)]
-    return lang is same, lang.occurrences(path, source, wrapper, index)
+        return ours, [Occurrence(path, 1, "", None, RECEIVER_UNPROVEN)]
+    return ours, lang.occurrences(path, source, wrapper, index)
 
 
 def stub_receivers(
@@ -421,6 +450,7 @@ def prove_all(
     says whether this run may rewrite a file: a proven call it may not is
     left, and reported, like any other.
     """
+    lang = profile(language)
     plan = WrapperPlan(findings=list(findings))
     kept: list[Wrapper] = []
     incomplete: set[str] = set()
@@ -477,11 +507,15 @@ def prove_all(
             # member with no caller in the repository may still be called from
             # outside it. The fold inside it is the whole removal, as before.
             continue
-        framework = [a for a in wrapper.annotations if a not in _INERT_ANNOTATIONS]
+        inert = lang.inert_annotations if lang is not None else _INERT_ANNOTATIONS
+        framework = [a for a in wrapper.annotations if a not in inert]
         if framework:
             refused.insert(
                 0, Finding(wrapper.path, wrapper.line, ANNOTATED, wrapper.label, wrapper.label)
             )
+        reason_kept = lang.keep(wrapper) if lang is not None and lang.keep is not None else None
+        if reason_kept:
+            refused.insert(0, Finding(wrapper.path, wrapper.line, reason_kept, wrapper.label, wrapper.label))
         kept.append(wrapper)
         for path, span, receiver in marks:
             plan.spans.setdefault(path, []).append(span)
@@ -637,7 +671,10 @@ def _leftovers(
         lang.foreign_extensions if lang.foreign_extensions is not None else wrapper_jvm.FOREIGN_EXTENSIONS
     )
     parsed = tuple(
-        ext for p in (lang, *(profile(peer) for peer in lang.peers)) if p is not None for ext in p.extensions
+        ext
+        for p in (lang, *(profile(s) for s in lang.siblings), *(profile(peer) for peer in lang.peers))
+        if p is not None
+        for ext in p.extensions
     )
     found: list[tuple[str, int, str]] = []
     for path in cross_file_keys.mention_files(repo_dir, [wrapper.name], exclude=()):
@@ -656,7 +693,7 @@ def _leftovers(
         data = source.encode("utf-8")
         for node in cross_file_keys.walk(root):
             if (
-                node.type == "identifier"
+                node.type in lang.mention_types
                 # C#'s verbatim `@Name` is the same name.
                 and node.text.decode("utf-8", "replace").removeprefix("@") == wrapper.name
                 and not _declaration_name(node, wrapper.kind, path)

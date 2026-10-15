@@ -449,6 +449,61 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["marker"]
 
 
+# --- @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
+#
+# Reached ONLY through the wrapper pass (`wrapper_inline`), as the rules of
+# these names at the top of java.toml and go.toml are. The pass proves that a
+# call such as `newCheckout(u)`, `flags.banner(u)` or `this.flags.banner(u)`
+# reaches a function or method whose whole body is a read of this flag, and
+# replaces the callee with the run's sentinel identifier:
+# `__ff_cleanup_<hash>(u)`. Which calls are this flag's was decided there,
+# call by call, so these rules check nothing but the sentinel. A sentinel
+# left behind is a refusal, never a diff (`SentinelPrePass.survived`).
+#
+# Holes name `sentinel` and not `stale_flag_name`: a call-site file names no
+# key, and the engine skips a file holding none of a seed's hole values.
+#
+# The callee is captured as `@marked_callee`, not `@sdk_fn`, as the marker
+# rule's callee is: it is not an SDK name, so accessor synthesis and the
+# SDK-name tests must not count it as one. The capture must not start with a
+# hole's name (`@sentinel_fn` would be substituted into the query as text).
+#
+# The discarded-statement rule comes first: `true;` would parse, but it is
+# litter, and the wrapper pass refuses every call whose arguments do work, so
+# deleting the statement drops nothing.
+#
+# THESE TWO RULES MUST STAY AFTER `replace_inlined_binding_marker_with_boolean_literal`.
+# With the replace rule placed above it, `tsx/derived_const_inline` lost
+# `<Banner />` in `{!hideBanner && <Banner />}`, for both treatments, in a file
+# holding no sentinel at all. The engine cause was not found, so the order must
+# not be changed.
+[[rules]]
+name = "delete_discarded_sentinel_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @marked_callee
+    ) @call
+  ) @stmt
+  (#eq? @marked_callee "@sentinel")
+)"""
+replace_node = "stmt"
+replace = ""
+holes = ["sentinel"]
+
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: (identifier) @marked_callee
+  ) @call
+  (#eq? @marked_callee "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
 # ===========================================================================
 # 3. Everything after the read belongs to the engine
 # ===========================================================================

@@ -128,7 +128,7 @@ from flag_cleanup.syntax import (
 )
 from flag_cleanup.primary_constructor import unread_parameters
 from flag_cleanup.ts_syntax import strip_dangling_type_separators
-from flag_cleanup.unused import remove_stranded_bindings
+from flag_cleanup.unused import MODULE_MARKER, remove_stranded_bindings
 
 logger = logging.getLogger(__name__)
 
@@ -638,14 +638,23 @@ def candidate_files(
     which may be a keyless wrapper of this flag (one whose whole body is a
     read, judged loosely from the files above; see
     :func:`wrapper_inline.candidate_names`) is included as well, so the undo
-    snapshot covers the call sites the wrapper pass may rewrite. ``accessors``
-    is needed for that judgement and nothing else.
+    snapshot covers the call sites the wrapper pass may rewrite. A caller in a
+    configured sibling of the family (a ``.tsx`` caller of a ``.ts`` wrapper) is
+    included too, under the exclusions above: it must not hold the key, nor
+    mention a constant or a candidate wrapper another configured member
+    declares. ``accessors`` is needed for that judgement and nothing else.
 
     Raises ``ValueError`` for an unsupported ``language``, exactly like
     :func:`run_piranha`.
     """
-    found = _candidate_files_without_wrappers(repo_dir, language, flag_key, languages)
-    if not inline_wrappers or wrapper_inline.profile(language) is None:
+    wrappers_on = inline_wrappers and wrapper_inline.profile(language) is not None
+    # What the other configured family members' runs take, computed at most
+    # once per call and only when a sibling mention turns up.
+    claims: dict[tuple[str, ...], re.Pattern[str]] = {}
+    found = _candidate_files_without_wrappers(
+        repo_dir, language, flag_key, languages, accessors, wrappers_on, claims
+    )
+    if not wrappers_on:
         return found
     names = wrapper_inline.candidate_names(found, language, flag_key, accessors)
     if not names:
@@ -653,20 +662,102 @@ def candidate_files(
     spec = _language_spec(language)
     root = Path(repo_dir)
     resolved_root = root.resolve()
+    siblings = sorted(set(wrapper_inline.profile(language).siblings) & set(languages))
+    sibling_extensions = tuple(ext for sibling in siblings for ext in _LANGUAGES[sibling].extensions)
     extra: list[str] = []
     for mention in cross_file_keys.mention_files(repo_dir, names, exclude=found):
-        if not mention.endswith(spec.extensions):
+        sibling = bool(sibling_extensions) and mention.endswith(sibling_extensions)
+        if not (sibling or mention.endswith(spec.extensions)):
             continue
         if not cross_file_keys.within(Path(mention), resolved_root):
             continue  # outside this run; the wrapper pass reports the call instead
+        if sibling:
+            try:
+                text = Path(mention).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue  # never admitted; the wrapper pass reports it
+            if flag_key in text:
+                continue  # its own run rewrites it
+            if _claimed(claims, root, siblings, flag_key, accessors, True).search(text):
+                continue  # a candidate of another run of the family as well
         if root.is_dir():
             mention = str(root / os.path.relpath(mention, resolved_root))
         extra.append(mention)
     return found + sorted(set(extra) - set(found))
 
 
+def _claimed(
+    claims: dict[tuple[str, ...], re.Pattern[str]],
+    root: Path,
+    siblings: Iterable[str],
+    flag_key: str,
+    accessors: tuple[str, ...],
+    wrappers: bool,
+) -> re.Pattern[str]:
+    """:func:`_claimed_by_siblings` as a pattern, computed once per ``claims``."""
+    key = (*siblings, str(wrappers))
+    if key not in claims:
+        claims[key] = cross_file_keys.mention_pattern(
+            _claimed_by_siblings(root, siblings, flag_key, accessors, wrappers)
+        )
+    return claims[key]
+
+
+def _own_candidates(root: Path, language: str, flag_key: str) -> list[str]:
+    """The files of ``language``'s own extensions its run takes: those holding
+    the key, and those reading a key constant they declare.
+
+    Sibling-type readers are left out on purpose. They are what the caller is
+    deciding about, and asking for them here would call back into the sibling.
+    """
+    extensions = _LANGUAGES[language].extensions
+    holders = _candidate_files(root, extensions, flag_key)
+    if not cross_file_keys.supported(language):
+        return holders
+    names = _key_const_names(holders, language, flag_key)
+    resolved_root = root.resolve()
+    readers = [
+        mention
+        for mention in cross_file_keys.mention_files(str(root), names, exclude=holders)
+        if mention.endswith(extensions) and cross_file_keys.within(Path(mention), resolved_root)
+    ]
+    return holders + sorted(set(readers))
+
+
+def _claimed_by_siblings(
+    root: Path,
+    siblings: Iterable[str],
+    flag_key: str,
+    accessors: tuple[str, ...],
+    wrappers: bool,
+) -> set[str]:
+    """The key constants, and with ``wrappers`` the candidate wrapper names, the
+    other configured members of the family take. A file mentioning one would be
+    rewritten by that member's run as well, so this run must not take it.
+
+    A wrapper may be declared in a file that only reads a key constant, so the
+    names come from the member's own readers too (:func:`_own_candidates`).
+    """
+    names: set[str] = set()
+    for other in siblings:
+        names |= _key_const_names(
+            _candidate_files(root, _LANGUAGES[other].extensions, flag_key), other, flag_key
+        )
+        if wrappers:
+            names |= wrapper_inline.candidate_names(
+                _own_candidates(root, other, flag_key), other, flag_key, accessors
+            )
+    return names
+
+
 def _candidate_files_without_wrappers(
-    repo_dir: str, language: str, flag_key: str, languages: Iterable[str]
+    repo_dir: str,
+    language: str,
+    flag_key: str,
+    languages: Iterable[str],
+    accessors: tuple[str, ...],
+    wrappers: bool,
+    claims: dict[tuple[str, ...], re.Pattern[str]],
 ) -> list[str]:
     spec = _language_spec(language)
     root = Path(repo_dir)
@@ -682,9 +773,6 @@ def _candidate_files_without_wrappers(
     sibling_extensions = tuple(
         ext for sibling in siblings for ext in _LANGUAGES[sibling].extensions
     )
-    # Names declared by the other configured members' key files, read only
-    # once a sibling mention turns up: most runs never need them.
-    claimed: re.Pattern[str] | None = None
     resolved_root = root.resolve()
     extra: list[str] = []
     for mention in cross_file_keys.mention_files(repo_dir, names, exclude=found):
@@ -700,17 +788,7 @@ def _candidate_files_without_wrappers(
         if sibling:
             if flag_key in text:
                 continue  # its own run rewrites it
-            if claimed is None:
-                claimed = cross_file_keys.mention_pattern(
-                    name
-                    for other in siblings
-                    for name in _key_const_names(
-                        _candidate_files(root, _LANGUAGES[other].extensions, flag_key),
-                        other,
-                        flag_key,
-                    )
-                )
-            if claimed.search(text):
+            if _claimed(claims, root, siblings, flag_key, accessors, wrappers).search(text):
                 continue  # a reader in another run of the family as well
         # Spelled under `repo_dir` like every other candidate, so a summary's
         # path and the snapshot's agree however `repo_dir` was written.
@@ -980,6 +1058,9 @@ class TransformOutcome:
     #: ``const { client } = require("./m")`` discarded to ``require("./m");``.
     #: A Python import is never cut down: it is kept whole and marked
     #: ``# noqa: F401``, with kind ``"marked import"`` and that line as text.
+    #: A TS/JS import that was the file's last ``import`` or ``export`` is
+    #: replaced by ``export {};`` so the file stays a module, with kind
+    #: ``"module marker"`` and that line as text.
     #: A C# primary-constructor parameter the fold left unread is NOT deleted
     #: (that would change the constructor's signature) but is listed here with
     #: kind ``"unread parameter"`` and ``Type(<parameter>)`` as text, because
@@ -1351,10 +1432,11 @@ def _transform_flag(
         # engine. See `_inline_bound_reads`.
         "marker": marker_for(flag_key),
     }
-    # Java's and C#'s sentinel rules name the hole whether or not this run
-    # marks a wrapper call, and a hole no substitution supplies aborts the
-    # engine. Kotlin's is supplied by its pre-pass, which always exists.
-    if language in ("java", "csharp"):
+    # The sentinel rules of Java, C#, Go and the TS family name the hole
+    # whether or not this run marks a wrapper call, and a hole no substitution
+    # supplies aborts the engine. Kotlin's is supplied by its pre-pass, which
+    # always exists.
+    if language in _SPAN_ONLY_PREPASS:
         substitutions["sentinel"] = kotlin_sentinel.sentinel_for(flag_key)
     argument_flags = _load_argument_flags(base)
 
@@ -1415,7 +1497,7 @@ def _transform_flag(
     wrappers = wrapper_inline.WrapperPlan()
     if inline_wrappers and wrapper_inline.profile(language) is not None:
         wrappers = _plan_wrappers(
-            repo_dir, language, flag_key, treatment, accessors, paths, resolution,
+            repo_dir, language, flag_key, treatment, accessors, paths + sibling_readers, resolution,
             with_const, without_const, reader_paths, reader_const, doubles,
         )
         # A call-site file that neither holds the key nor reads its constant
@@ -1444,7 +1526,10 @@ def _transform_flag(
     if prepass is not None:
         substitutions["sentinel"] = prepass.sentinel
         try:
-            prepass.apply(paths)
+            # A sibling caller of a keyless wrapper (a `.tsx` caller of a `.ts`
+            # wrapper; see `candidate_files`) is marked like any other. Every
+            # other pre-engine pass still skips it: it holds no key.
+            prepass.apply(paths + [p for p in sibling_readers if p in wrappers.spans])
         except kotlin_sentinel.SentinelCollisionError as exc:
             # "This file must not be transformed", and it can fire after earlier
             # files were already marked — so the undo runs before the refusal
@@ -1749,13 +1834,6 @@ def _transform_flag(
     # Before Gate 1 specifically — in Java these statements are the difference
     # between a branch that compiles and one that does not, which is what this
     # used to refuse over.
-    # Delete each keyless wrapper nothing calls any more, and its interface
-    # member. Before the stranded-statement and stranded-binding passes, which
-    # remove the imports and private helpers the deletion strands.
-    summaries, wrapper_rows = wrapper_inline.close_out(
-        wrappers, repo_dir, summaries, unprocessable, Rewrite
-    )
-
     summaries, stranded = _remove_stranded_statements(summaries, language, repo_dir)
 
     # Delete the imports and locals the fold stranded, in the same window and
@@ -1778,6 +1856,15 @@ def _transform_flag(
     # has to measure. See :mod:`flag_cleanup.reindent` for the three artefact
     # shapes and why the INPUT is what holds the answer to all of them.
     summaries = _reindent_folds(summaries, language)
+
+    # Delete each keyless wrapper nothing calls any more, and its interface
+    # member. AFTER the reindent pass, for the reason the stranded-method pass
+    # below is: a deleted whole member reads to it as a folded header, and it
+    # shifts the next member's body out a level. Before that pass, which
+    # removes the imports and private helpers the deletion strands.
+    summaries, wrapper_rows = wrapper_inline.close_out(
+        wrappers, repo_dir, summaries, unprocessable, Rewrite
+    )
 
     # Private methods the fold stranded, AFTER the reindent pass and still
     # before Gate 1. Whole-line deletions need no reindenting, and run earlier
@@ -2919,6 +3006,10 @@ def _accessor_templates_for(rules_file: Path) -> str | None:
     return templates.read_text(encoding="utf-8") if templates.exists() else None
 
 
+#: The languages whose pre-pass exists only to mark keyless-wrapper calls.
+_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js"})
+
+
 def _sentinel_prepass(
     language: str,
     flag_key: str,
@@ -2931,15 +3022,15 @@ def _sentinel_prepass(
 
     Kotlin always has one, and it is a workaround for a specific engine
     limitation rather than a general stage — see
-    :mod:`flag_cleanup.kotlin_sentinel`. Java and C# have one only when there
-    are keyless-wrapper calls to mark (``wrapper_spans``, see
+    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go and the TS family have one only when
+    there are keyless-wrapper calls to mark (``wrapper_spans``, see
     :mod:`flag_cleanup.wrapper_inline`): it marks those and nothing else, and
-    the sentinel rules in ``rules/java.toml`` and ``rules/csharp.toml`` fold
-    them. Keeping the decision in one function means the places `run_piranha`
+    the sentinel rules in ``rules/java.toml``, ``rules/csharp.toml``,
+    ``rules/go.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
     has to care about it all ask the same question.
     """
     spans = dict(wrapper_spans or {})
-    if language in ("java", "csharp") and spans:
+    if language in _SPAN_ONLY_PREPASS and spans:
         return kotlin_sentinel.SentinelPrePass(
             flag_key=flag_key,
             sentinel=kotlin_sentinel.sentinel_for(flag_key),
@@ -3433,7 +3524,7 @@ def _remove_stranded_bindings(
         relative = os.path.relpath(summary.path, repo_dir)
         kept = "marked import" if grammar == "python" else "bare import"
         bindings.extend(
-            (relative, kept, c.replacement)
+            (relative, "module marker" if c.replacement == MODULE_MARKER else kept, c.replacement)
             if c.replacement is not None
             else (relative, c.kind, c.text)
             for c in acted

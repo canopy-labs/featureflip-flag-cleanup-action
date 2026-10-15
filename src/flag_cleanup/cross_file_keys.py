@@ -787,14 +787,18 @@ def resolve(
             reads, refused = judge.references(path, source, visible, accessor_set, repo_dir)
             if not (reads or refused):
                 continue
-            if refused:
-                line, text, entry = refused[0].line, refused[0].text, refused[0].entry
-            else:
-                line, text = _line_of(path, reads[0].member)
-                first = reads[0].declaration
-                entry = first.entry if first is not None else ""
+            # One refusal per entry it reads or refuses (and one for the
+            # constants), at its first refusal or read: an entry named by
+            # none would be reported kept while its read stays here.
+            sites: dict[str, tuple[int, str]] = {}
+            for refusal in refused:
+                sites.setdefault(refusal.entry, (refusal.line, refusal.text))
+            for ref in reads:
+                entry = ref.declaration.entry if ref.declaration is not None else ""
+                if entry not in sites:
+                    sites[entry] = _line_of(path, ref.member)
             reason = UNSUPPORTED_FORM if not in_scope else OTHER_LANGUAGE
-            refusals.append(Refusal(path, line, reason, text, entry))
+            refusals.extend(Refusal(path, line, reason, text, entry) for entry, (line, text) in sites.items())
             blocked |= spelled_in(source, path)
             continue
         # A declaring file is still a reader of the OTHER declarations; its

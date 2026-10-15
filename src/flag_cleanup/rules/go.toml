@@ -14,6 +14,51 @@
 # 1. The flag read
 # ===========================================================================
 
+# --- @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
+#
+# Reached ONLY through the wrapper pass (`wrapper_inline`), as the rules of
+# these names at the top of java.toml are. The pass proves that a call such as
+# `flags.NewCheckout(u)` or `s.flags.newCheckout(u)` reaches a function or
+# method whose whole body is a read of this flag, and replaces the callee with
+# the run's sentinel identifier: `__ff_cleanup_<hash>(u)`. Which calls are this
+# flag's was decided there, call by call, so these rules check nothing but the
+# sentinel. A sentinel left behind is a refusal, never a diff
+# (`SentinelPrePass.survived`).
+#
+# Holes name `sentinel` and not `stale_flag_name`: a call-site file names no
+# key, and the engine skips a file holding none of a seed's hole values.
+#
+# The discarded-statement rule comes first for the reason the BoolVariation
+# pair below is ordered that way: `true` alone is not a Go statement. It needs
+# no argument filter, because the wrapper pass refuses every call whose
+# arguments hold a call or a receive.
+[[rules]]
+name = "delete_discarded_sentinel_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @sdk_fn
+    ) @call
+  ) @stmt
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "stmt"
+replace = ""
+holes = ["sentinel"]
+
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: (identifier) @sdk_fn
+  ) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
 # --- <obj>.BoolVariation("KEY", ...) AS A WHOLE STATEMENT -> deleted
 #
 # The same shape and the same fix as java.toml's rule of this name — see there

@@ -31,10 +31,22 @@ proven or offered, since the rules compare the text as written.
 A metatype held in a variable (``let k = type(of: holder)``) is not followed.
 Such a read is missed, never folded, and a missed read of a deleted
 declaration is a build error, never a different value.
+
+Enum cases are a second kind of declaration
+(:data:`~flag_cleanup.cross_file_keys.ENUM_ENTRY`): a case of an offerable
+enum holding the key, read as ``Owner.X.rawValue`` (a ``String`` raw value)
+or ``Owner.X.p`` (a computed ``String`` property whose getter is one
+``switch self``). A case is never deleted. ``rawValue`` is not a language
+fact: a member of that name in the enum's body, in an extension of it or of
+any protocol, or in a protocol it conforms to wins over the synthesized one,
+so the proof rules each out (:func:`_raw_value_proven`). A switch property's own declaration cannot be
+overridden by a protocol or by an extension in its module; one in the reading module wins there, which
+the reader proof checks.
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +65,38 @@ _TYPE_KEYWORDS = _OWNER_KINDS | {"extension"}
 _BODIES = frozenset({"class_body", "enum_class_body", "protocol_body"})
 _RANK = {"private": 0, "fileprivate": 1, "internal": 2, "package": 3, "public": 4, "open": 4}
 _IMPORT_KINDS = frozenset({"struct", "class", "enum", "protocol", "typealias", "func", "let", "var"})
+
+#: The member a ``String`` raw-value enum's cases are read through.
+_RAW_VALUE = "rawValue"
+#: How a raw type, and a computed accessor's type, must be written.
+_STRING = frozenset({"String", "Swift.String"})
+#: Conformances a raw-value enum may carry, bare or ``Swift.``-qualified: none
+#: declares a ``rawValue`` of its own. Any other must be a protocol the
+#: checkout declares, because an extension of an outside protocol, in a
+#: library this run cannot read, can declare one that wins over the
+#: synthesized ``rawValue``.
+_ALLOWED_CONFORMANCES = frozenset({
+    "Equatable", "Hashable", "Comparable", "CaseIterable", "Codable", "Encodable",
+    "Decodable", "CodingKey", "Sendable", "Identifiable", "CustomStringConvertible",
+    "CustomDebugStringConvertible",
+})
+#: Protocols an attributed extension of reaches a raw-value enum whatever its
+#: clause says: those it conforms to implicitly, every one it may conform to
+#: (and the protocols they inherit), kept whole rather than followed through
+#: the standard library's inheritance.
+_REACHED = _ALLOWED_CONFORMANCES | {"RawRepresentable", "Encodable", "Decodable"}
+#: Member attributes that cannot be an attached macro. Measured on swiftc 6.0
+#: against a declared macro of each name: the compiler resolves these itself.
+#: Any other attribute on a member may be a peer macro adding declarations
+#: beside it, ``rawValue`` among them.
+_BUILTIN_ATTRIBUTES = frozenset({
+    "available", "objc", "nonobjc", "discardableResult", "inlinable", "usableFromInline", "inline",
+    "frozen", "preconcurrency", "warn_unqualified_access", "_disfavoredOverload", "Sendable",
+})
+#: Member attributes that name a type, so a macro of the same name declared
+#: in the checkout wins over them (measured); built in only when none is.
+_TYPE_ATTRIBUTES = frozenset({"MainActor"})
+_COMMENTS = frozenset({"comment", "multiline_comment"})
 
 
 def parse(source: bytes) -> Node:
@@ -73,6 +117,11 @@ def _ident(node: Node | None) -> str:
     if len(text) > 2 and text[0] == "`" and text[-1] == "`":
         return text[1:-1]
     return text
+
+
+def _code(node: Node) -> list[Node]:
+    """``node``'s named children, comments left out."""
+    return [c for c in node.named_children if c.type not in _COMMENTS]
 
 
 def _kind(node: Node) -> str | None:
@@ -214,11 +263,89 @@ def _placement(declaration: Node) -> _Placement | None:
     )
 
 
+def _entry_placement(enum: Node) -> _Placement | None:
+    """Where an enum sits, when another file can read its cases: as
+    :func:`_placement` places a ``static let``, with the enum as the innermost
+    owner. None besides for an attribute on the enum or on any type around it
+    (an attached macro may add members) and for a backticked name in the
+    chain."""
+    holders = _holders(enum)
+    if holders is None or _in_conditional(enum):
+        return None
+    chain = [*holders, enum]
+    if any(m.type == "attribute" for holder in chain for m in _modifier_nodes(holder)):
+        return None
+    kinds = [_kind(h) for h in chain]
+    if any(k not in _TYPE_KEYWORDS for k in kinds) or "extension" in kinds[1:]:
+        return None
+    names = [_type_name(h) for h in chain]
+    if any(n is None for n in names) or any("`" in _text(h.child_by_field_name("name")) for h in chain):
+        return None
+    outer = kinds[:-1]
+    extension = holders[0] if outer and outer[0] == "extension" else None
+    default = (None if extension is None else _written_access(extension)) or "internal"
+    levels = [_written_access(enum) or default]
+    for holder, kind in zip(holders, outer):
+        written = _written_access(holder)
+        if written is not None:
+            levels.append(written)
+        elif kind != "extension":
+            levels.append("internal")
+    if any(level not in _RANK for level in levels) or min(_RANK[l] for l in levels) < _RANK["internal"]:
+        return None
+    return _Placement(
+        ".".join(names),  # type: ignore[arg-type]
+        min(levels, key=_RANK.__getitem__),
+        names[0] if extension is not None else None,
+    )
+
+
+def _owner_text(enum: Node) -> str:
+    """The enum's dotted name from its file's top level, for a report."""
+    return ".".join([*(_type_name(h) or "?" for h in (_holders(enum) or [])), _type_name(enum) or "?"])
+
+
+def _enum_of(node: Node) -> Node | None:
+    """The enum whose body declares ``node`` directly."""
+    body = node.parent
+    enum = None if body is None or body.type != "enum_class_body" else body.parent
+    return enum if enum is not None and _kind(enum) == "enum" else None
+
+
+def _member_placement(prop: Node) -> _Placement | None:
+    """An instance property declared in an enum's body, placed as its enum
+    and read at the narrower of the two accesses."""
+    enum = _enum_of(prop)
+    if enum is None or _is_static(prop):
+        return None
+    placed = _entry_placement(enum)
+    written = _written_access(prop) or "internal"
+    if placed is None or written not in _RANK:
+        return None
+    return _Placement(placed.owner, min([placed.access, written], key=_RANK.__getitem__), placed.extended)
+
+
 _PLACED: dict[str, tuple[tuple[int, int], dict[tuple[str | None, str], _Placement]]] = {}
 
 
+def _narrower(found: dict[tuple[str | None, str], _Placement], key: tuple[str | None, str], placed: _Placement) -> None:
+    """Record ``placed`` under ``key``, at the narrowest access of every
+    member placed there. A static and an instance member share the key, and
+    which of them a read finds is not this record's to decide."""
+    seen = found.get(key)
+    if seen is None:
+        found[key] = placed
+        return
+    found[key] = _Placement(
+        placed.owner,
+        min([seen.access, placed.access], key=_RANK.__getitem__),
+        seen.extended or placed.extended,
+    )
+
+
 def _placements_of(path: str) -> dict[tuple[str | None, str], _Placement]:
-    """Every offerable ``let`` of the file on disk, by ``(owner, name)``."""
+    """Every offerable ``let`` and enum case of the file on disk, by
+    ``(owner, name)``, each at the narrowest access of its name's members."""
     try:
         info = Path(path).stat()
         text = Path(path).read_text(encoding="utf-8")
@@ -232,12 +359,20 @@ def _placements_of(path: str) -> dict[tuple[str | None, str], _Placement]:
     program = parse(text.encode("utf-8"))
     if not program.has_error:
         for node in xk.walk(program):
+            if node.type == "enum_entry":
+                # A case: placed as its enum, read at the enum's access.
+                enum = _enum_of(node)
+                names = _bound(node)
+                placed = _entry_placement(enum) if enum is not None and len(names) == 1 else None
+                if placed is not None:
+                    _narrower(found, (placed.owner, names[0]), placed)
+                continue
             if node.type != "property_declaration":
                 continue
             names = _bound(node)
-            placed = _placement(node) if len(names) == 1 else None
+            placed = (_placement(node) or _member_placement(node)) if len(names) == 1 else None
             if placed is not None:
-                found[(placed.owner, names[0])] = placed
+                _narrower(found, (placed.owner, names[0]), placed)
     _PLACED[path] = (stamp, found)
     return found
 
@@ -257,6 +392,13 @@ class _Type:
     #: Declared inside a function or other non-type scope: indexed for scope
     #: lookups, but never a type another file can extend.
     local: bool = False
+    #: Each of ``supers`` as written, dotted names whole (``Swift.Codable``);
+    #: "" for one that is not a plain name. What a conformance allow-list reads.
+    clause: tuple[str, ...] = ()
+    #: Carries an attribute (an attached macro may add members to what it extends).
+    attributed: bool = False
+    #: The attributes on its own members (:func:`_member_attributes`).
+    member_attributes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -268,6 +410,8 @@ class _Share:
     #: Modules this file re-exports with ``@_exported import``.
     exported: tuple[str, ...]
     complete: bool
+    #: Every top-level macro name, which ``top`` leaves out.
+    macros: frozenset[str] = frozenset()
 
 
 def _last_name(target: Node | None) -> str:
@@ -279,15 +423,21 @@ def _last_name(target: Node | None) -> str:
     return _ident(names[-1]) if names else ""
 
 
-def _super_name(spec: Node) -> str:
-    return _last_name(spec.child_by_field_name("inherits_from"))
+def _written(target: Node | None) -> str:
+    """A written type as dotted names (``Swift.String``); "" for one that is
+    not a plain name (generic arguments, a composition, an optional)."""
+    if target is None or target.type != "user_type" or not target.named_children:
+        return ""
+    if any(c.type != "type_identifier" for c in target.named_children):
+        return ""
+    return ".".join(_ident(c) for c in target.named_children)
 
 
-def _self_constraints(node: Node) -> list[str]:
+def _self_constraints(node: Node, read=_last_name) -> list[str]:
     """The types a ``where Self: X`` or ``where Self == X`` clause of ``node``
-    names, each as :func:`_last_name` reads it. Inside an extension or a
-    protocol carrying one, or a method of either, X's members are in
-    unqualified scope exactly as a supertype's are."""
+    names, each as ``read`` reads it. Inside an extension or a protocol
+    carrying one, or a method of either, X's members are in unqualified scope
+    exactly as a supertype's are."""
     found: list[str] = []
     for clause in (c for c in node.named_children if c.type == "type_constraints"):
         for constraint in (c for c in clause.named_children if c.type == "type_constraint"):
@@ -295,16 +445,16 @@ def _self_constraints(node: Node) -> list[str]:
                 if inner.type not in ("inheritance_constraint", "equality_constraint"):
                     continue
                 if _ident(inner.child_by_field_name("constrained_type")) == "Self":
-                    found.append(_last_name(inner.child_by_field_name("name")))
+                    found.append(read(inner.child_by_field_name("name")))
     return found
 
 
-def _supers(node: Node) -> list[str]:
+def _supers(node: Node, read=_last_name) -> list[str]:
     """Every supertype a type declaration names: its inheritance clause and
-    its ``where Self`` constraints."""
+    its ``where Self`` constraints, each as ``read`` reads it."""
     return [
-        *(_super_name(c) for c in node.named_children if c.type == "inheritance_specifier"),
-        *_self_constraints(node),
+        *(read(c.child_by_field_name("inherits_from")) for c in node.named_children if c.type == "inheritance_specifier"),
+        *_self_constraints(node, read),
     ]
 
 
@@ -314,12 +464,23 @@ def _names_declared(node: Node) -> list[str]:
     if kind is not None:
         name = _type_name(node)
         return [] if kind == "extension" or name is None else [name]
-    if node.type in ("typealias_declaration", "function_declaration", "macro_declaration"):
+    if node.type in ("typealias_declaration", "function_declaration"):
         name = node.child_by_field_name("name")
         return [] if name is None else [_ident(name)]
     if node.type == "property_declaration":
         return _bound(node)
+    # Not a macro: measured, one in the reader's module hides no imported
+    # type or constant of its name (:func:`_macro_name` keeps it apart).
     return []
+
+
+def _macro_name(node: Node) -> str | None:
+    """The name a top-level macro declaration introduces. The grammar gives
+    it no field: it is the identifier after ``macro``."""
+    if node.type != "macro_declaration":
+        return None
+    name = next((c for c in node.children if c.type == "simple_identifier"), None)
+    return None if name is None else _ident(name)
 
 
 def _member_names(node: Node) -> list[str]:
@@ -336,6 +497,18 @@ def _member_names(node: Node) -> list[str]:
         name = _type_name(node)
         return [] if name is None else [name]
     return []
+
+
+def _member_attributes(body: Node | None) -> frozenset[str]:
+    """The name of every attribute on a declaration directly in ``body``
+    (``inline`` for ``@inline(__always)``): a case, a property, a function, a
+    nested type."""
+    return frozenset(
+        _text(a).lstrip("@").split("(")[0].strip()
+        for child in ([] if body is None else body.named_children)
+        for a in _modifier_nodes(child)
+        if a.type == "attribute"
+    )
 
 
 def _param_name(node: Node) -> Node | None:
@@ -361,7 +534,12 @@ def _type_entry(node: Node, kind: str) -> _Type | None:
         for p in c.named_children if p.type == "type_parameter" and p.named_children
         for ident in [_param_name(p.named_children[0])] if ident is not None
     )
-    return _Type(name, kind, tuple(_supers(node)), members, _written_access(node), found_holders is None)
+    return _Type(
+        name, kind, tuple(_supers(node)), members, _written_access(node), found_holders is None,
+        tuple(_supers(node, _written)),
+        any(m.type == "attribute" for m in _modifier_nodes(node)),
+        _member_attributes(body),
+    )
 
 
 @dataclass(frozen=True)
@@ -396,8 +574,12 @@ def _share(text: str) -> tuple[_Share, bool]:
     program = parse(text.encode("utf-8"))
     top: list[str] = []
     exported: list[str] = []
+    macros: set[str] = set()
     for child in program.named_children:
         top.extend(_names_declared(child))
+        macro = _macro_name(child)
+        if macro is not None:
+            macros.add(macro)
         imported = _import(child)
         if imported is not None and imported.exported:
             exported.append(imported.segments[0])
@@ -413,7 +595,9 @@ def _share(text: str) -> tuple[_Share, bool]:
             name = node.child_by_field_name("name")
             if name is not None:
                 aliases.add(_ident(name))
-    share = _Share(tuple(top), tuple(types), frozenset(aliases), tuple(exported), not program.has_error)
+    share = _Share(
+        tuple(top), tuple(types), frozenset(aliases), tuple(exported), not program.has_error, frozenset(macros)
+    )
     return share, share.complete
 
 
@@ -435,11 +619,14 @@ class _World:
         self.by_last: dict[str, list[_Type]] = {}
         self.by_full: dict[str, list[tuple[str, _Type]]] = {}
         self.aliases: set[str] = set()
+        #: Every macro the checkout declares, in any module.
+        self.macros: set[str] = set()
         every: list[_Type] = []
         for path, share in shares:
             for module in layout.modules_of(path) or ():
                 self._files.setdefault(module, []).append(share)
             self.aliases |= share.aliases
+            self.macros |= share.macros
             every.extend(share.types)
             for entry in share.types:
                 self.by_last.setdefault(entry.name.rsplit(".", 1)[-1], []).append(entry)
@@ -465,18 +652,25 @@ class _World:
     def exported(self, module) -> set[str]:
         return {n for share in self._files.get(module, ()) for n in share.exported}
 
+    def aliases_in(self, module) -> set[str]:
+        """Every typealias name ``module`` declares, members' included."""
+        return {n for share in self._files.get(module, ()) for n in share.aliases}
+
     def types_in(self, module, full: str) -> list[_Type]:
         return [entry for path, entry in self.by_full.get(full, ()) if module in (self.layout.modules_of(path) or ()) and not entry.local]
 
-    def offerable(self, path: str, placed: _Placement, name: str) -> bool:
-        """Whether a constant ``name`` placed so in ``path`` can be offered at all."""
+    def offerable(self, path: str, placed: _Placement, name: str, *, for_enum: bool = False) -> bool:
+        """Whether a constant ``name`` placed so in ``path`` can be offered at
+        all. For an enum's case (``for_enum``), the enum's own conformances
+        are judged by the shape that proves the case, not here; the types
+        around it are judged as a constant's owners are."""
         modules = self.layout.modules_of(path)
         if modules is None or any(self.broken(m) for m in modules):
             return False
         if placed.owner is None:
             return True
         parts = placed.owner.split(".")
-        for part in parts:
+        for part in parts[:-1] if for_enum else parts:
             # By last name, whatever the spelling: `extension App.Keys: P {}` adds a conformance too.
             if any(entry.supers for entry in self.by_last.get(part, ())):
                 return False  # a witness, a superclass's static, KVC: reads that never spell the owner
@@ -510,6 +704,93 @@ class _World:
             )
         return True
 
+
+    def custom_attributed(self, names: frozenset[str]) -> bool:
+        """Whether any of the attribute ``names`` on a member may be an
+        attached macro: one not in :data:`_BUILTIN_ATTRIBUTES`, or one in
+        :data:`_TYPE_ATTRIBUTES` the checkout declares a macro of."""
+        return any(
+            name not in _BUILTIN_ATTRIBUTES and (name not in _TYPE_ATTRIBUTES or name in self.macros)
+            for name in names
+        )
+
+    def macro_extended(self, enum: Node) -> bool:
+        """Whether an attached macro could add a member to ``enum``,
+        ``rawValue`` among them: on a member of its body (a peer macro adds
+        declarations beside the one it is attached to), or on an extension
+        that reaches it or on a member of one (:meth:`custom_attributed`).
+
+        A checkout enum gains members only through itself, a typealias of
+        it, or a protocol it conforms to, so an extension counts when its
+        extended name (any dotted spelling) ends in the enum's own name,
+        names a typealias or a protocol the checkout declares, is one of
+        :data:`_REACHED` (bare or ``Swift.``), or is a type the enum's clause
+        or an extension of it names (bare or ``Swift.``), the raw type
+        included: ``@M extension String`` reaches a ``String`` enum. An
+        attributed extension of any other name (``View``, ``Array``) cannot."""
+        if self.custom_attributed(_member_attributes(enum.child_by_field_name("body"))):
+            return True
+        own = _type_name(enum) or ""
+        extensions = [e for e in self.by_last.get(own, ()) if e.kind == "extension"]
+        clause = [
+            _written(c.child_by_field_name("inherits_from"))
+            for c in enum.named_children
+            if c.type == "inheritance_specifier"
+        ]
+        conforms = {c.removeprefix("Swift.") for c in (*clause, *(c for e in extensions for c in e.clause)) if c}
+        for entries in self.by_last.values():
+            for entry in entries:
+                if entry.kind != "extension" or not (
+                    entry.attributed or self.custom_attributed(entry.member_attributes)
+                ):
+                    continue
+                last = entry.name.rsplit(".", 1)[-1]
+                bare = entry.name.removeprefix("Swift.")
+                if (
+                    last == own
+                    or last in self.aliases
+                    or any(t.kind == "protocol" for t in self.by_last.get(last, ()))
+                    or bare in _REACHED
+                    or bare in conforms
+                ):
+                    return True
+        return False
+
+    def shadows(self, name: str) -> bool:
+        """Whether the checkout declares a type or typealias named like a
+        standard one (a ``struct String``): the standard type is then not
+        what the name means."""
+        return name in self.aliases or any(entry.kind != "extension" for entry in self.by_last.get(name, ()))
+
+    def extends_any_with(self, member: str) -> bool:
+        """Whether any extension in the checkout, of any name or spelling,
+        declares ``member``. Matching what an extension extends (a typealias,
+        ``Swift.RawRepresentable``, a protocol named like a nested type) is
+        where proofs went wrong, and an extension adding ``rawValue`` to an
+        unrelated type is rare enough that refusing on it costs little."""
+        return any(
+            entry.kind == "extension" and member in entry.members
+            for entries in self.by_last.values()
+            for entry in entries
+        )
+
+    def extends_with(self, module, owner: str, member: str) -> bool:
+        """Whether ``module`` holds an extension that may extend ``owner`` (by
+        its last name, or spelled through a typealias) declaring ``member``.
+        Measured: such an extension in the reading module wins there over the
+        enum's own member, silently."""
+        last = owner.rsplit(".", 1)[-1]
+        return any(
+            entry.kind == "extension"
+            and member in entry.members
+            and (
+                entry.name.rsplit(".", 1)[-1] == last
+                or any(segment in self.aliases for segment in entry.name.split("."))
+            )
+            for share in self._files.get(module, ())
+            for entry in share.types
+        )
+
     def _caps(self, module, extended: str) -> list[str]:
         """The written access of the extended type and of each type enclosing it."""
         parts = extended.split(".")
@@ -521,17 +802,28 @@ class _World:
         ]
 
     def access(self, decl: xk.KeyDeclaration) -> str | None:
-        """The declaration's effective access level; None when unreadable."""
-        placed = _placements_of(decl.path).get((decl.owner, decl.name))
+        """The declaration's effective access level; None when unreadable.
+
+        A case read through a computed property is read at that property's
+        access too: where it is not visible, the read finds whatever else of
+        that name the reader sees."""
+        placements = _placements_of(decl.path)
+        placed = placements.get((decl.owner, decl.name))
         if placed is None:
             return None
-        if placed.extended is None:
-            return placed.access
-        modules = self.layout.modules_of(decl.path) or frozenset()
-        caps = [cap for m in modules for cap in self._caps(m, placed.extended)]
-        if not caps or any(cap not in _RANK for cap in caps):
-            return None
-        return min([placed.access, *caps], key=_RANK.__getitem__)
+        levels = [placed.access]
+        for accessor in sorted(decl.accessors - {_RAW_VALUE}):
+            member = placements.get((decl.owner, accessor))
+            if member is None:
+                return None
+            levels.append(member.access)
+        if placed.extended is not None:
+            modules = self.layout.modules_of(decl.path) or frozenset()
+            caps = [cap for m in modules for cap in self._caps(m, placed.extended)]
+            if not caps or any(cap not in _RANK for cap in caps):
+                return None
+            levels += caps
+        return min(levels, key=_RANK.__getitem__)
 
     def type_scope(self, name: str, head: str, seen: set[str] | None = None) -> str | None:
         """``member`` when a checkout type named ``name`` (its extensions,
@@ -581,6 +873,7 @@ def _root_of(path: str) -> str:
 
 def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaration]:
     """The constants in ``path`` holding ``flag_key`` that another file can read.
+    And the enum cases holding it that are proven (see :func:`_enum_entries`).
 
     What the in-file rules delete, narrowed to what another file can reach and
     this profile can follow: see :func:`_placement` and
@@ -602,7 +895,8 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
         if placed is None or not world.offerable(path, placed, const.name):
             continue
         found.append(xk.KeyDeclaration(path, const.name, placed.owner, _CHECKOUT))
-    return found
+    entries, _refused = _enum_entries(path, source, program, flag_key, world)
+    return found + entries
 
 
 def declared_names(path: str, source: str) -> set[xk.QualifiedName]:
@@ -636,6 +930,371 @@ def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:
     if parse(source.encode("utf-8")).has_error:
         raise xk.DeclarationsUnreadable(path)
     return set()
+
+
+@dataclass(frozen=True)
+class _Case:
+    name: str
+    #: The name as written, backticks included.
+    node: Node
+    #: The ``enum_entry`` clause declaring it.
+    entry: Node
+    #: Its raw value; None when it states none.
+    value: Node | None
+    #: Its clause declares only it, with no associated values.
+    alone: bool
+
+
+def _cases(body: Node) -> list[_Case]:
+    """Every case an enum's body declares, each name of a clause paired with
+    its own raw value."""
+    found: list[_Case] = []
+    for entry in (c for c in body.named_children if c.type == "enum_entry"):
+        pairs: list[list] = []
+        for index, child in enumerate(entry.children):
+            field = entry.field_name_for_child(index)
+            if field == "name":
+                pairs.append([child, None])
+            elif field == "raw_value" and pairs:
+                pairs[-1][1] = child
+        alone = len(pairs) == 1 and entry.child_by_field_name("data_contents") is None
+        found.extend(_Case(_ident(name), name, entry, value, alone) for name, value in pairs)
+    return found
+
+
+def _plain_literal(node: Node | None) -> str | None:
+    """The content of a single-line string literal with no interpolation and
+    no escape; None for anything else, a multi-line or raw literal included."""
+    if node is None or node.type != "line_string_literal":
+        return None
+    parts = node.named_children
+    if not parts:
+        return ""
+    if len(parts) != 1 or parts[0].type != "line_str_text":
+        return None
+    return _text(parts[0])
+
+
+def _conformance_allowed(world: _World, written: str, seen: set[str]) -> bool:
+    """Whether a conformance, as written, cannot hand a raw-value enum a
+    ``rawValue``: a ``Swift.``-qualified or undeclared name on
+    :data:`_ALLOWED_CONFORMANCES`, or a protocol the checkout declares with no
+    member of that name whose own conformances pass the same test. Any other
+    name is an outside protocol (or a typealias), whose extensions in a
+    library this run cannot see."""
+    if written.startswith("Swift.") and written.removeprefix("Swift.") in _ALLOWED_CONFORMANCES:
+        return True
+    if not written or "." in written or written in world.aliases:
+        return False
+    declared = world.by_last.get(written, [])
+    if all(entry.kind == "extension" for entry in declared):
+        # Not declared here; its extensions in the checkout are judged with
+        # every other one (:meth:`_World.extends_any_with`).
+        return written in _ALLOWED_CONFORMANCES
+    if any(entry.kind not in ("protocol", "extension") for entry in declared):
+        return False
+    if written in seen:
+        return True
+    seen.add(written)
+    return all(
+        _RAW_VALUE not in entry.members and all(_conformance_allowed(world, c, seen) for c in entry.clause)
+        for entry in declared
+    )
+
+
+def _raw_value_proven(world: _World, enum: Node, value: Node | None, flag_key: str) -> bool:
+    """Whether ``Owner.X.rawValue`` reads the literal ``value`` the case states.
+
+    Measured on Swift 6.0, a member named ``rawValue`` wins over the
+    synthesized one when it is declared in the enum's body, in an extension
+    of the enum (in another file of its module, or in the reading module),
+    in an extension of a protocol the enum conforms to (in its clause or
+    added later), and in an extension of ``RawRepresentable``. So the first
+    inheritance item must be ``String``, every other conformance (the enum's
+    own and any an extension spelled with its name adds) must pass
+    :func:`_conformance_allowed`, and the checkout may declare no such member
+    in the body or in any extension at all (:meth:`_World.extends_any_with`).
+    An extension in a library cannot be seen.
+    """
+    if _plain_literal(value) != flag_key:
+        return False
+    clause = [
+        _written(c.child_by_field_name("inherits_from"))
+        for c in enum.named_children
+        if c.type == "inheritance_specifier"
+    ]
+    if not clause or clause[0] not in _STRING:
+        return False
+    extensions = [e for e in world.by_last.get(_type_name(enum) or "", ()) if e.kind == "extension"]
+    conformances = [*clause[1:], *(c for e in extensions for c in e.clause)]
+    if not all(_conformance_allowed(world, c, set()) for c in conformances):
+        return False
+    body = enum.child_by_field_name("body")
+    if body is None or any(_RAW_VALUE in _member_names(c) for c in body.named_children):
+        return False
+    return not world.extends_any_with(_RAW_VALUE)
+
+
+def _switch_arms(prop: Node) -> list[tuple[list[str], Node | None]] | None:
+    """The arms of a property written ``var p: String { switch self { … } }``
+    (or with the switch in a single ``get { }``): each arm's ``.name``
+    patterns (none for ``default:``) and its statements. None for any other
+    property: ``static``, attributed, ``private`` or ``fileprivate`` (from
+    another file a protocol extension's member of the name would win),
+    inside ``#if`` (a build without the condition reads that member
+    instead), stored, with a setter or effects, with anything but one
+    ``switch self``, or with any arm pattern but ``.name`` (a binding,
+    ``where``, ``_``)."""
+    binding = next((c for c in prop.named_children if c.type == "value_binding_pattern"), None)
+    if binding is None or _text(binding) != "var" or _is_static(prop) or _in_conditional(prop):
+        return None
+    if any(m.type == "attribute" or _text(m) == "class" for m in _modifier_nodes(prop)):
+        return None
+    if _written_access(prop) in ("private", "fileprivate") or "`" in _text(prop.child_by_field_name("name")):
+        return None
+    annotation = next((c for c in prop.named_children if c.type == "type_annotation"), None)
+    if annotation is None or _written(annotation.child_by_field_name("name")) not in _STRING:
+        return None
+    computed = prop.child_by_field_name("computed_value")
+    if computed is None or prop.child_by_field_name("value") is not None:
+        return None
+    parts = _code(computed)
+    if len(parts) == 1 and parts[0].type == "computed_getter":
+        specifier = next((c for c in parts[0].named_children if c.type == "getter_specifier"), None)
+        if specifier is None or _text(specifier) != "get":
+            return None
+        parts = [c for c in _code(parts[0]) if c.type != "getter_specifier"]
+    if len(parts) != 1 or parts[0].type != "statements":
+        return None
+    statements = _code(parts[0])
+    if len(statements) != 1 or statements[0].type != "switch_statement":
+        return None
+    switch = statements[0]
+    subject = switch.child_by_field_name("expr")
+    if subject is None or subject.type != "self_expression":
+        return None
+    arms: list[tuple[list[str], Node | None]] = []
+    for arm in (c for c in switch.named_children if c.type == "switch_entry"):
+        if any(c.type in ("modifiers", "where_keyword") for c in arm.named_children):
+            return None
+        code = next((c for c in arm.named_children if c.type == "statements"), None)
+        if any(c.type == "default_keyword" for c in arm.named_children):
+            arms.append(([], code))
+            continue
+        names: list[str] = []
+        for pattern in (c for c in arm.named_children if c.type == "switch_pattern"):
+            inner = _code(pattern)
+            if len(inner) != 1 or inner[0].type != "pattern":
+                return None
+            tokens = [c for c in inner[0].children if c.type not in _COMMENTS]
+            if [c.type for c in tokens] != [".", "simple_identifier"] or "`" in _text(tokens[1]):
+                return None
+            names.append(_text(tokens[1]))
+        if not names:
+            return None
+        arms.append((names, code))
+    return arms
+
+
+def _arm_literal(statements: Node | None) -> str | None:
+    """The content of an arm whose body is exactly ``return "lit"`` or ``"lit"``."""
+    code = [] if statements is None else _code(statements)
+    if len(code) != 1:
+        return None
+    only = code[0]
+    if only.type == "control_transfer_statement":
+        if not only.children or only.children[0].type != "return":
+            return None
+        return _plain_literal(only.child_by_field_name("result"))
+    return _plain_literal(only)
+
+
+def _switch_properties(body: Node, cases: list[_Case], members: Counter) -> dict[str, dict[str, str | None]]:
+    """Each property of the enum's body a case may be read through, with the
+    literal each case it names maps to (None when that case's arm is not a
+    plain literal, or two arms name it). The first matching arm wins, and an
+    arm naming a static member equal to a case matches that case, so a
+    property whose arms name anything but the enum's own cases is none."""
+    names = {c.name for c in cases}
+    found: dict[str, dict[str, str | None]] = {}
+    for prop in (c for c in body.named_children if c.type == "property_declaration"):
+        bound = _bound(prop)
+        arms = _switch_arms(prop) if len(bound) == 1 and members[bound[0]] == 1 else None
+        if arms is None or any(n not in names for named, _statements in arms for n in named):
+            continue
+        seen = Counter(n for named, _statements in arms for n in named)
+        found[bound[0]] = {
+            n: (_arm_literal(code) if seen[n] == 1 else None) for named, code in arms for n in named
+        }
+    return found
+
+
+def _arm_holders(program: Node, enum: Node, key: re.Pattern[str]) -> list[str]:
+    """The names a switch arm holding the key spells as ``.name``, in the
+    enum or in an extension spelled with its name in the same file: a case
+    such an arm maps holds the key, proven or not."""
+    last = _type_name(enum)
+    scopes = [
+        enum,
+        *(n for n in xk.walk(program) if _kind(n) == "extension" and (_type_name(n) or "").rsplit(".", 1)[-1] == last),
+    ]
+    found: list[str] = []
+    for scope in scopes:
+        for arm in xk.walk(scope):
+            if arm.type != "switch_entry":
+                continue
+            code = next((c for c in arm.named_children if c.type == "statements"), None)
+            if code is None or not key.search(_text(code)):
+                continue
+            for pattern in (c for c in arm.named_children if c.type == "switch_pattern"):
+                found.extend(
+                    _ident(n)
+                    for n in xk.walk(pattern)
+                    if n.type == "simple_identifier" and n.prev_sibling is not None and n.prev_sibling.type == "."
+                )
+    return found
+
+
+def _enum_entries(
+    path: str, source: str, program: Node, flag_key: str, world: _World | None
+) -> tuple[list[xk.KeyDeclaration], list[xk.Refusal]]:
+    """The cases holding ``flag_key`` whose accessor provably returns it, and
+    refusals about every case holding it: ``enum-unproven`` for one that
+    cannot be proven, and each mention of a proven one in its own file.
+
+    A case is proven when its enum is offerable as a constant's owner would
+    be (:func:`_entry_placement`, :meth:`_World.offerable`), its clause
+    declares only it with no associated values, no other member of the enum
+    shares its name, no checkout type shadows ``String``, no attached macro
+    could add a member to the enum (:meth:`_World.macro_extended`), and
+    either its raw value is proven
+    (:func:`_raw_value_proven`) or a switch property maps it to the key
+    (:func:`_switch_properties`). A case holds the key through its raw value
+    or through a switch arm naming it.
+    """
+    key = xk.key_token(flag_key)
+    found: list[xk.KeyDeclaration] = []
+    refused: list[xk.Refusal] = []
+    for enum in xk.walk(program):
+        if _kind(enum) != "enum":
+            continue
+        body = enum.child_by_field_name("body")
+        if body is None:
+            continue
+        cases = _cases(body)
+        names = {c.name for c in cases}
+        holding = [c.name for c in cases if c.value is not None and key.search(_text(c.value))]
+        holding += [n for n in _arm_holders(program, enum, key) if n in names]
+        if not holding:
+            continue
+        placed = None if program.has_error or world is None else _entry_placement(enum)
+        owner = _owner_text(enum) if placed is None else placed.owner
+        members = Counter(m for child in body.named_children for m in _member_names(child))
+        properties = _switch_properties(body, cases, members)
+        for name in dict.fromkeys(holding):
+            mine = [c for c in cases if c.name == name]
+            accessors: set[str] = set()
+            if (
+                placed is not None
+                and len(mine) == 1
+                and mine[0].alone
+                and members[name] == 1
+                and "`" not in _text(mine[0].node)
+                and not _in_conditional(mine[0].entry)
+                and not world.shadows("String")
+                and not world.macro_extended(enum)
+                and world.offerable(path, placed, name, for_enum=True)
+            ):
+                if _raw_value_proven(world, enum, mine[0].value, flag_key):
+                    accessors.add(_RAW_VALUE)
+                accessors |= {prop for prop, mapped in properties.items() if mapped.get(name) == flag_key}
+            reported = f"{owner}.{name}"
+            if not accessors:
+                refused.append(xk.refusal(path, mine[0].entry, xk.ENUM_UNPROVEN, source, reported))
+                continue
+            decl = xk.KeyDeclaration(
+                path, name, owner, _CHECKOUT, kind=xk.ENUM_ENTRY, accessors=frozenset(accessors)
+            )
+            found.append(decl)
+            refused.extend(_in_file_entry_mentions(path, source, program, decl, enum))
+    return found, refused
+
+
+def _implicit(node: Node) -> bool:
+    """Whether a name is written ``.X`` with no owner: an implicit member
+    expression (a ``prefix_expression``), or a case pattern (``case .X:``,
+    ``if case .X = v``, whose ``.`` is the name's previous sibling)."""
+    previous = node.prev_sibling
+    parent = node.parent
+    if previous is not None and previous.type == "." and parent is not None and parent.type != "navigation_suffix":
+        return True
+    return _implicit_chain(node)
+
+
+def _implicit_chain(node: Node) -> bool:
+    """Whether a name is the head of ``.X.member``: it parses as a prefix
+    ``.`` over a navigation chain whose innermost target is the name."""
+    top = node
+    while top.parent is not None and top.parent.type == "navigation_expression":
+        target = top.parent.child_by_field_name("target")
+        if target is None or target.id != top.id:
+            return False
+        top = top.parent
+    parent = top.parent
+    return (
+        top.id != node.id
+        and parent is not None
+        and parent.type == "prefix_expression"
+        and _text(parent.child_by_field_name("operation")) == "."
+    )
+
+
+def _within(node: Node, ancestor: Node) -> bool:
+    current = node.parent
+    while current is not None:
+        if current.id == ancestor.id:
+            return True
+        current = current.parent
+    return False
+
+
+def _in_file_entry_mentions(
+    path: str, source: str, program: Node, decl: xk.KeyDeclaration, enum: Node
+) -> list[xk.Refusal]:
+    """Every mention of a proven case in its own file. The reader invocation
+    never rewrites the declaring file, so a read here is reported, not left.
+
+    A ``case .X`` pattern inside the enum is part of its own definition (a
+    switch property's arms among them) and reads no key; one elsewhere in
+    the file is ``not-a-read``. The names declarations introduce are not
+    mentions."""
+    found: list[xk.Refusal] = []
+    for node in xk.walk(program):
+        if node.type != "simple_identifier" or _ident(node) != decl.name:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if _implicit(node) and parent.type != "prefix_expression" and not _implicit_chain(node):
+            if _within(node, enum):
+                continue
+            reason = xk.NOT_A_READ
+        elif _is_binding(node) or (parent is not None and parent.type == "value_argument_label"):
+            continue
+        else:
+            reason = xk.UNSUPPORTED_FORM
+        refusal = xk.refusal(path, node, reason, source, decl.entry)
+        if refusal not in found:
+            found.append(refusal)
+    return found
+
+
+def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
+    """The cases holding ``flag_key`` that cannot be proven, and every
+    mention of a proven one in its own file."""
+    program = parse(source.encode("utf-8"))
+    world = None if program.has_error else _world(_root_of(path))
+    return _enum_entries(path, source, program, flag_key, world)[1]
 
 
 #: What a lookup answers: the name reaches the declaration; it means
@@ -749,11 +1408,19 @@ class _Judgement:
         self.imports = tuple(i for n in xk.walk(program) if (i := _import(n)) is not None)
         self.reads: list[xk.KeyReference] = []
         self.refused: list[xk.Refusal] = []
-        #: (engine owner text, member) of every read-position mention left
-        #: unproven, for the clone check in :meth:`finish`.
-        self.unproven: list[tuple[str | None, str, Node]] = []
-        self.relied: set[str] = set()
+        #: (engine owner text, member, node, entry) of every read-position
+        #: mention left unproven, for the clone check in :meth:`finish`.
+        self.unproven: list[tuple[str | None, str, Node, str]] = []
+        #: Each name a proven read relies on, and the entries read through it
+        #: (``""`` for a constant), so a refusal of it names what it keeps.
+        self.relied: dict[str, set[str]] = {}
         self.read_nodes: set[int] = set()
+        #: Each proven case read and the node it is reported at, so a file
+        #: refused for anything still names every case it read.
+        self.read_sites: list[tuple[xk.KeyReference, Node]] = []
+        #: Module names a proven ``Module.Owner.X`` read relies on: their
+        #: occurrences in an ``import`` look nothing else up.
+        self.module_prefixes: set[str] = set()
         self._occurrences: dict[str, list[Node]] = {}
         self._memo: dict[tuple, str] = {}
 
@@ -765,8 +1432,9 @@ class _Judgement:
             ]
         return self._occurrences[name]
 
-    def refuse(self, node: Node, reason: str) -> None:
-        self.refused.append(xk.refusal(self.path, node, reason, self.source))
+    def refuse(self, node: Node, reason: str, decl: xk.KeyDeclaration | None = None) -> None:
+        entry = "" if decl is None else decl.entry
+        self.refused.append(xk.refusal(self.path, node, reason, self.source, entry))
 
     # -- what a name means, per module ------------------------------------
 
@@ -784,8 +1452,12 @@ class _Judgement:
             return UNKNOWN
         if module in declaring:
             return PROVEN if world.top_count(module, head) == 1 else UNKNOWN
+        # A typealias of the name in the reader's module may name the owner
+        # itself (`typealias Flags = Kit.Flags`), at the top level or in a
+        # type the read sits in, so the name is not proven to mean another.
+        aliased = head in world.aliases_in(module)
         if world.top_count(module, head):
-            return OTHER  # the module's own declaration wins over every import
+            return UNKNOWN if aliased else OTHER  # the module's own declaration wins over every import
         access = world.access(decl)
         names = {m.name for m in declaring}
         # An `@_exported import` anywhere in the module is an import of every file of it.
@@ -811,7 +1483,64 @@ class _Judgement:
                 continue
             if first in world.layout.opaque_names or world.layout.unnamed:
                 return UNKNOWN
-        return PROVEN if routed else OTHER
+        if routed:
+            return PROVEN
+        return UNKNOWN if aliased else OTHER
+
+    def prefixed(self, decl: xk.KeyDeclaration, prefix: str) -> str:
+        """What ``prefix.Owner`` means in every module the reader is compiled into."""
+        key = (decl.path, decl.owner, decl.name, "module", prefix)
+        if key not in self._memo:
+            found = {self.module_lookup(decl, prefix, module) for module in self.modules}
+            self._memo[key] = found.pop() if len(found) == 1 else UNKNOWN
+        return self._memo[key]
+
+    def module_lookup(self, decl: xk.KeyDeclaration, prefix: str, module) -> str:
+        """``prefix.Owner`` in ``module``: the declaring module's own top-level
+        ``Owner`` when ``prefix`` can only name that module.
+
+        Measured on Swift 6.0: a module-qualified name skips the reader
+        module's own ``Owner``, but a declaration named like the module wins
+        over the module, whether the reader's module or any module it imports
+        declares it (an enclosing type's member too, which :meth:`scope`
+        checks). An outside module cannot be read: one declaring a type named
+        like a checkout module is not seen. The module must be the reader's
+        own or imported plainly, at an access that allows the read."""
+        world = self.world
+        declaring = world.layout.modules_of(decl.path) or frozenset()
+        named = world.layout.named(prefix)
+        if not named or prefix in world.layout.opaque_names:
+            return UNKNOWN
+        head = decl.owner.split(".")[0]
+        if not named & declaring:
+            # Another module's own `Owner`, unless a typealias of that name
+            # anywhere (in that module, or in a type named like it) may be
+            # this one.
+            return UNKNOWN if head in world.aliases else OTHER
+        if not named <= declaring or world.broken(module):
+            return UNKNOWN
+        if world.top_count(module, prefix):
+            return UNKNOWN
+        imports = [*self.imports, *(_Import((n,), False, False, False) for n in sorted(world.exported(module)))]
+        for imported in imports:
+            first = imported.segments[0]
+            others = world.layout.named(first)
+            if not others and (first in world.layout.opaque_names or world.layout.unnamed):
+                return UNKNOWN
+            for other in others:
+                if world.broken(other) or world.top_count(other, prefix):
+                    return UNKNOWN
+                if any(world.layout.named(n) or n in world.layout.opaque_names for n in world.exported(other)):
+                    return UNKNOWN
+        if any(world.broken(d) or world.top_count(d, head) != 1 for d in declaring):
+            return UNKNOWN
+        if module in declaring:
+            return PROVEN
+        access = world.access(decl)
+        route = [i for i in imports if i.segments[0] == prefix]
+        if not route or any(i.unsure or not _allows(access, i.testable, module, declaring) for i in route):
+            return UNKNOWN
+        return PROVEN
 
     def scope(self, node: Node, head: str, bare: bool) -> str | None:
         """A refusal when an enclosing type can claim ``head``."""
@@ -852,6 +1581,9 @@ class _Judgement:
     # -- the mentions of one declaration ------------------------------------
 
     def judge(self, decl: xk.KeyDeclaration) -> None:
+        if decl.kind == xk.ENUM_ENTRY:
+            self.judge_entry(decl)
+            return
         for node in self.occurrences(decl.name):
             parent = node.parent
             if node.type == "type_identifier" or parent is None or parent.type == "value_argument_label":
@@ -958,7 +1690,7 @@ class _Judgement:
         read = _is_read(value, self.accessors)
         if answer == OTHER:
             if read:
-                self.unproven.append((_engine_owner(value), decl.name, segments[-1]))
+                self.unproven.append((_engine_owner(value), decl.name, segments[-1], ""))
             return
         if answer == UNKNOWN:
             self.refuse(segments[-1], xk.IMPORT_UNRESOLVED)
@@ -978,7 +1710,104 @@ class _Judgement:
             return
         self.reads.append(xk.KeyReference(self.path, owner_text, decl.name))
         self.read_nodes.add(segments[0].id)
-        self.relied.add(head)
+        self.relied.setdefault(head, set()).add("")
+
+    def judge_entry(self, decl: xk.KeyDeclaration) -> None:
+        """Every mention of an enum case's name in a reader. Only
+        ``Owner.X.accessor`` can be proven (:meth:`entry_chain`); ``.X``
+        reaches the case without spelling its owner, so it is refused
+        wherever it is spelled."""
+        for node in self.occurrences(decl.name):
+            parent = node.parent
+            if node.type == "type_identifier" or parent is None or parent.type == "value_argument_label":
+                continue
+            if parent.type == "navigation_suffix":
+                nav = parent.parent
+                segments = None if nav is None else _segments(nav)
+                if segments is None:
+                    self.refuse(node, xk.NOT_A_READ, decl)  # `self.X`, `f().X`
+                else:
+                    self.entry_chain(decl, segments, nav)
+            elif _implicit(node):
+                # `.X` as a value, or a `case .X` / `if case .X` pattern.
+                reason = xk.UNSUPPORTED_FORM if parent.type == "prefix_expression" or _implicit_chain(node) else xk.NOT_A_READ
+                self.refuse(node, reason, decl)
+            elif self.in_owner(decl, node):
+                self.refuse(node, xk.UNSUPPORTED_FORM, decl)  # a bare `X` in the enum or an extension of it
+
+    def entry_chain(self, decl: xk.KeyDeclaration, segments: list[Node], nav: Node) -> None:
+        """``Owner.X`` naming a case (``nav`` is that expression): proven only
+        as the whole key argument followed by one of the case's accessors,
+        with the owner resolved as a constant's is, and no extension in the
+        reader's module declaring a member named like the accessor."""
+        texts = [_ident(s) for s in segments]
+        parts = decl.owner.split(".")
+        qualifier = texts[:-1]
+        prefix = None
+        if qualifier != parts:
+            if qualifier[1:] == parts and qualifier[0] in self.world.layout.names:
+                prefix = qualifier[0]
+            else:
+                if self.qualifies(decl, qualifier):
+                    self.refuse(segments[-1], xk.UNSUPPORTED_FORM, decl)
+                return
+        accessor = self.accessor_after(nav)
+        value = nav if accessor is None else nav.parent
+        read = accessor is not None and _is_read(value, self.accessors)
+        owner_text = ".".join(qualifier)
+        head = texts[0]
+        answer = self.answer(decl, head) if prefix is None else self.prefixed(decl, prefix)
+        if answer == OTHER:
+            if read:
+                self.unproven.append((owner_text, decl.name, segments[-1], decl.entry))
+            return
+        if answer == UNKNOWN:
+            self.refuse(segments[-1], xk.IMPORT_UNRESOLVED, decl)
+            return
+        if "." in decl.owner and self.shadowed_owner(decl):
+            self.refuse(segments[-1], xk.UNSUPPORTED_FORM, decl)
+            return
+        reason = self.scope(segments[0], head, bare=False)
+        if reason is not None:
+            self.refuse(segments[-1], reason, decl)
+            return
+        if accessor is None:
+            self.refuse(segments[-1], xk.NOT_A_READ, decl)  # the case as a value, or `case Owner.X:`
+            return
+        name = _ident(accessor)
+        if name not in decl.accessors:
+            self.refuse(segments[-1], xk.UNSUPPORTED_FORM, decl)  # another member of the case
+            return
+        if not read:
+            self.refuse(segments[-1], xk.NOT_A_READ, decl)
+            return
+        if _text(value) != f"{'.'.join(texts)}.{name}":
+            self.refuse(segments[-1], xk.UNSUPPORTED_FORM, decl)  # spaced or backticked
+            return
+        if any(self.world.extends_with(module, decl.owner, name) for module in self.modules):
+            self.refuse(segments[-1], xk.UNSUPPORTED_FORM, decl)
+            return
+        ref = xk.KeyReference(self.path, owner_text, decl.name, name, decl)
+        self.reads.append(ref)
+        self.read_sites.append((ref, segments[-1]))
+        self.read_nodes.add(segments[0].id)
+        self.relied.setdefault(head, set()).add(decl.entry)
+        if prefix is not None:
+            self.module_prefixes.add(prefix)
+
+    @staticmethod
+    def accessor_after(nav: Node) -> Node | None:
+        """The member read off the case in ``Owner.X.member``; None when
+        nothing is."""
+        outer = nav.parent
+        if outer is None or outer.type != "navigation_expression":
+            return None
+        target = outer.child_by_field_name("target")
+        suffix = outer.child_by_field_name("suffix")
+        member = None if suffix is None else suffix.child_by_field_name("suffix")
+        if target is None or target.id != nav.id or member is None or member.type != "simple_identifier":
+            return None
+        return member
 
     # -- the identifiers a proven read relies on ------------------------------
 
@@ -988,7 +1817,14 @@ class _Judgement:
             return False
         if parent.type in ("value_argument_label", "navigation_suffix"):
             return True  # a label, or a member of something else
+        if parent.type == "identifier" and parent.parent is not None and parent.parent.type == "import_declaration":
+            # `import Kit`: names the module a proven `Kit.Owner.X` relies on.
+            return _ident(node) in self.module_prefixes
         if node.type == "simple_identifier":
+            if parent.type == "call_expression":
+                # `Owner(rawValue: s)`: a dynamic use of the type, which
+                # reads no case by name and never blocks a fold.
+                return parent.children[0].id == node.id
             if parent.type != "navigation_expression":
                 return False
             target = parent.child_by_field_name("target")
@@ -1007,11 +1843,13 @@ class _Judgement:
         return follower is None or _ident(follower) not in _METATYPE
 
     def eliminate(self) -> None:
-        for name in sorted(self.relied):
+        for name, entries in sorted(self.relied.items()):
             for node in self.occurrences(name):
                 if node.id in self.read_nodes or self.accepted(node):
                     continue
-                self.refuse(node, xk.REBOUND if _is_binding(node) else xk.NOT_A_READ)
+                reason = xk.REBOUND if _is_binding(node) else xk.NOT_A_READ
+                for entry in sorted(entries):
+                    self.refused.append(xk.refusal(self.path, node, reason, self.source, entry))
 
     def finish(self) -> tuple[list[xk.KeyReference], list[xk.Refusal]]:
         self.eliminate()
@@ -1019,10 +1857,18 @@ class _Judgement:
         # owner and member in the file, so an unproven read-position mention
         # with the same spelling would be folded too.
         proven = {(r.owner, r.member) for r in self.reads}
-        for owner, member, node in self.unproven:
+        for owner, member, node, entry in self.unproven:
             if (owner, member) in proven:
-                self.refuse(node, xk.UNSUPPORTED_FORM)
+                self.refused.append(xk.refusal(self.path, node, xk.UNSUPPORTED_FORM, self.source, entry))
         if self.refused:
+            # Every read goes with the file, so a case read here is named by a
+            # refusal too, or it would be reported kept.
+            named = {r.entry for r in self.refused}
+            for ref, node in self.read_sites:
+                entry = ref.declaration.entry
+                if entry not in named:
+                    named.add(entry)
+                    self.refused.append(xk.refusal(self.path, node, xk.UNSUPPORTED_FORM, self.source, entry))
             return [], self.refused
         return list(dict.fromkeys(self.reads)), []
 
@@ -1037,24 +1883,114 @@ def references(path, source, declarations, accessors, repo_dir):
     """
     data = source.encode("utf-8")
     program = parse(data)
-    words = {d.name for d in declarations} | {d.owner.split(".")[0] for d in declarations if d.owner}
     if program.has_error:
-        return [], [_whole_file(path, source, words)]
+        return [], _whole_file(path, source, declarations)
     world = _world(str(Path(source_index.checkout_root(repo_dir)).resolve()))
     modules = None if world is None else world.layout.modules_of(path)
     if modules is None:
-        return [], [_whole_file(path, source, words)]
+        return [], _whole_file(path, source, declarations)
     judgement = _Judgement(path, data, program, modules, world, accessors)
     for decl in declarations:
         judgement.judge(decl)
     return judgement.finish()
 
 
-def _whole_file(path: str, source: str, words: set[str]) -> xk.Refusal:
+def _whole_file(path: str, source: str, declarations) -> list[xk.Refusal]:
+    """A file refused whole, at the first line spelling anything it might
+    read: once for the constants, and once per case it spells, so a case a
+    refused file may read is reported left rather than kept."""
+    words = {d.name for d in declarations} | {d.owner.split(".")[0] for d in declarations if d.owner}
     token = xk.mention_pattern(words)
     lines = source.splitlines()
     number = next((i for i, line in enumerate(lines) if token.search(line)), 0)
-    return xk.Refusal(path, number + 1, xk.UNSUPPORTED_FORM, lines[number].strip() if lines else "")
+    text = lines[number].strip() if lines else ""
+    entries = [""] if any(d.kind != xk.ENUM_ENTRY for d in declarations) else []
+    entries += sorted({
+        d.entry
+        for d in declarations
+        if d.kind == xk.ENUM_ENTRY and xk.mention_pattern({d.name, *d.owner.split(".")}).search(source)
+    })
+    return [xk.Refusal(path, number + 1, xk.UNSUPPORTED_FORM, text, entry) for entry in entries or [""]]
+
+
+def _last_segment(node: Node | None) -> str:
+    """The last name of a dotted expression (``Flags``, ``App.Flags``)."""
+    if node is None:
+        return ""
+    if node.type == "simple_identifier":
+        return _ident(node)
+    if node.type == "navigation_expression":
+        suffix = node.child_by_field_name("suffix")
+        member = None if suffix is None else suffix.child_by_field_name("suffix")
+        return "" if member is None else _ident(member)
+    return ""
+
+
+def _by_raw_value(call: Node) -> bool:
+    """Whether ``call``'s first argument is labelled ``rawValue:``."""
+    suffix = next((c for c in call.named_children if c.type == "call_suffix"), None)
+    arguments = None if suffix is None else next((c for c in suffix.named_children if c.type == "value_arguments"), None)
+    first = None if arguments is None else next((c for c in arguments.named_children if c.type == "value_argument"), None)
+    label = None if first is None else first.child_by_field_name("name")
+    return label is not None and _text(label).strip() == "rawValue"
+
+
+def _sees(world: _World | None, path: str, imported: set[str], decl: xk.KeyDeclaration) -> bool:
+    """Whether a file can see ``decl``'s module: compiled into it, or importing
+    it by name, here or through an ``@_exported import``. True when either
+    module set is unknown: a note only asks a reviewer to look."""
+    if world is None:
+        return True
+    mine = world.layout.modules_of(path)
+    declaring = world.layout.modules_of(decl.path)
+    if mine is None or declaring is None or mine & declaring:
+        return True
+    names = {m.name for m in declaring}
+    return bool(names & imported) or any(names & world.exported(m) for m in mine)
+
+
+def enum_dynamic_uses(path, source, entries, repo_dir) -> list[xk.Refusal]:
+    """The ``enum-dynamic`` notes for ``path``: ``Owner.allCases``,
+    ``Owner(rawValue:)`` and ``Owner.init(rawValue:)``, and a bare
+    ``allCases`` inside the enum or an extension of it, through which
+    iteration and a lookup by value reach every case. Matched on the owner's
+    last name, in a file that can see the declaring module, without proving
+    which enum it means: a note only asks a reviewer to look."""
+    program = parse(source.encode("utf-8"))
+    if program.has_error:
+        return []
+    world = _world(str(Path(source_index.checkout_root(repo_dir)).resolve()))
+    imported = {i.segments[0] for n in xk.walk(program) if (i := _import(n)) is not None}
+    by_owner: dict[str, list[xk.KeyDeclaration]] = {}
+    for decl in entries:
+        if decl.owner is not None and _sees(world, path, imported, decl):
+            by_owner.setdefault(decl.owner.rsplit(".", 1)[-1], []).append(decl)
+    notes: list[xk.Refusal] = []
+
+    def note(node: Node, owner: str) -> None:
+        for decl in by_owner.get(owner, ()):
+            found = xk.refusal(path, node, xk.ENUM_DYNAMIC, source, decl.entry)
+            if found not in notes:
+                notes.append(found)
+
+    for node in xk.walk(program):
+        if node.type == "simple_identifier" and _ident(node) == "allCases":
+            parent = node.parent
+            if parent is not None and parent.type == "navigation_suffix":
+                nav = parent.parent
+                note(node, _last_segment(None if nav is None else nav.child_by_field_name("target")))
+            elif not _is_binding(node):
+                holder = node.parent
+                while holder is not None and _kind(holder) not in ("enum", "extension"):
+                    holder = holder.parent
+                if holder is not None:
+                    note(node, (_type_name(holder) or "").rsplit(".", 1)[-1])
+        elif node.type == "call_expression" and node.named_children and _by_raw_value(node):
+            callee = node.named_children[0]
+            if callee.type == "navigation_expression" and _last_segment(callee) == "init":
+                callee = callee.child_by_field_name("target")
+            note(node, _last_segment(callee))
+    return notes
 
 
 xk.register(
@@ -1063,6 +1999,8 @@ xk.register(
         language_family=frozenset({"swift"}),
         declarations=declarations,
         references=references,
+        entry_findings=entry_findings,
+        enum_dynamic_uses=enum_dynamic_uses,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
     ),

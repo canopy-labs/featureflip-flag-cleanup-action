@@ -97,7 +97,7 @@ import codecs
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Iterator
 
 import tree_sitter_c_sharp
@@ -112,7 +112,7 @@ import tree_sitter_swift
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import dart_namespace
+from flag_cleanup import dart_namespace, inert_load
 
 #: ``js`` maps to the TSX grammar deliberately, for the same reason
 #: ``ts_syntax._parser`` does: the engine rewrote with it, and JSX in a ``.js``
@@ -341,6 +341,10 @@ class Candidate:
     #: ``const { client } = require("./m")`` discarded to ``require("./m");``
     #: (see ``_kept_require``), the same kept load in CommonJS.
     replacement: str | None = None
+    #: The specifier a bare-import ``replacement`` keeps loading, so the pass
+    #: can delete it instead when that module's load is provably inert (see
+    #: :mod:`flag_cleanup.inert_load`). ``None`` without such a replacement.
+    loads: str | None = None
 
 
 def _candidate(
@@ -349,6 +353,7 @@ def _candidate(
     source_bytes: bytes,
     kind: str,
     replacement: str | None = None,
+    loads: str | None = None,
 ) -> Candidate:
     return Candidate(
         name=name,
@@ -357,7 +362,25 @@ def _candidate(
         kind=kind,
         text=source_bytes[node.start_byte:node.end_byte].decode("utf-8", "replace"),
         replacement=replacement,
+        loads=loads if replacement else None,
     )
+
+
+def go_import_name(path: str) -> str:
+    """The name an unaliased Go import of ``path`` is GUESSED to bind: its
+    last segment, with a ``/vN`` segment or a ``.vN`` suffix dropped.
+
+    A guess, not a lookup: the package's own clause may say otherwise. Why a
+    wrong guess is still safe here is in ``_go_import_candidates``. The
+    keyless-wrapper proof relies on it from the other side, and only proves a
+    call through an unaliased import when this guess IS the clause, so the
+    import can go once the call folds.
+    """
+    segments = path.split("/")
+    last = segments[-1]
+    if len(segments) > 1 and _GO_VERSION_SEGMENT.match(last):
+        last = segments[-2]
+    return _GO_VERSION_SUFFIX.sub("", last)
 
 
 def _go_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
@@ -399,12 +422,7 @@ def _go_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
             path_node = node.child_by_field_name("path")
             if path_node is None:
                 continue
-            path = path_node.text.decode("utf-8", "replace").strip('"`')
-            segments = path.split("/")
-            last = segments[-1]
-            if len(segments) > 1 and _GO_VERSION_SEGMENT.match(last):
-                last = segments[-2]
-            name = _GO_VERSION_SUFFIX.sub("", last)
+            name = go_import_name(path_node.text.decode("utf-8", "replace").strip('"`'))
         if not name.isidentifier():
             continue
         parent = node.parent
@@ -524,6 +542,13 @@ def _ts_import_candidates(
     keep the load. ``_module_load`` decides which statements need it. A
     candidate spanning only part of a clause needs no replacement, because
     the statement survives and still loads the module.
+
+    A replacement also records the specifier it ``loads``. When
+    :func:`remove_stranded_bindings` is about to write the bare import, it
+    first asks :mod:`flag_cleanup.inert_load` whether loading that module
+    does anything, and deletes the statement if it provably does not. That
+    question reads files, so it is asked only of a statement this pass is
+    acting on, never of every import while candidates are being listed.
     """
     candidates = []
     for node in _walk(root):
@@ -540,6 +565,7 @@ def _ts_import_candidates(
         if clause is None:
             continue
         load = _module_load(node, source_bytes, before)
+        loads = _specifier(node)
         if clause.type == "import_require_clause":
             # `import ff = require("./ff")`. The clause binds exactly one
             # name and the statement has no other reason to exist, so the
@@ -585,6 +611,7 @@ def _ts_import_candidates(
                         source_bytes,
                         "import",
                         load if solo else None,
+                        loads,
                     )
                 )
             elif child.type == "namespace_import":
@@ -596,6 +623,7 @@ def _ts_import_candidates(
                         source_bytes,
                         "import",
                         load if solo else None,
+                        loads,
                     )
                 )
             elif child.type == "named_imports":
@@ -623,6 +651,7 @@ def _ts_import_candidates(
                             source_bytes,
                             "import",
                             load if emptied is node else None,
+                            loads,
                         )
                     )
     return candidates
@@ -1629,6 +1658,38 @@ _TS_PROGRAM = "program"
 _MODULE_EVIDENCE = frozenset({"import_statement", "export_statement"})
 
 
+#: What a deleted TS/JS import becomes when it was the file's last ``import`` or
+#: ``export``. Without one the file is a script, not a module: top-level
+#: ``await`` stops compiling (TS1375), and a top-level ``const`` becomes a
+#: global that can collide with another script's or with ``lib.dom``'s
+#: (TS2451). This keeps the file a module and, unlike a bare import, loads
+#: nothing, so it is right whether the deleted import loaded its module, loaded
+#: an inert one, or (``import type``) never loaded anything.
+MODULE_MARKER = "export {};"
+
+
+def _deletes_last_module_marker(source: str, candidate: Candidate, language: str) -> bool:
+    """Whether deleting ``candidate`` leaves ``source`` with no ``import`` or
+    ``export`` statement, having had one.
+
+    Only statements DIRECTLY in the program count: an ``export`` inside a
+    ``declare module "x" { … }`` block declares that ambient module and does not
+    make this file one. A candidate that is one specifier of a statement covers
+    less than the statement, so the statement still counts as remaining.
+    """
+    if language not in _TS_MODULE_LANGUAGES:
+        return False
+    covered = False
+    for node in _parse(source, language).children:
+        if node.type not in _MODULE_EVIDENCE:
+            continue
+        if candidate.start <= node.start_byte and node.end_byte <= candidate.end:
+            covered = True
+        else:
+            return False
+    return covered
+
+
 def _top_level_bindings_are_private(root: Node, language: str) -> bool:
     """Whether a declaration sitting directly in ``root`` is file-private.
 
@@ -1688,6 +1749,8 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
     candidates = []
     for node in _walk(root):
         if node.type != declaration_type:
+            if language == "go" and node.type == "var_declaration" and _has_ancestor(node, _FUNCTION_BODIES):
+                candidates += _go_var_candidates(node, source_bytes)
             continue
         if not _has_ancestor(node, _FUNCTION_BODIES) and not (
             top_level_is_private
@@ -1708,6 +1771,8 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
         elif language == "ruby":
             pair = _ruby_declared_name_and_value(node)
         else:
+            if language in _TS_MODULE_LANGUAGES:
+                candidates += _require_pattern_candidates(node, source_bytes)
             pair = _declared_name_and_value(node, name_field, value_field)
             if pair is not None:
                 name_node, value_node = pair
@@ -1749,6 +1814,83 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
             )
         )
     return candidates
+
+
+def _go_var_candidates(declaration: Node, data: bytes) -> list[Candidate]:
+    """The candidates a Go ``var`` declaration inside a function offers.
+
+    ``var x T`` is a local exactly as ``x := v`` is, and Go rejects it unused
+    the same way, so leaving it to the ``:=`` path alone shipped
+    ``declared and not used`` whenever a fold removed the last read of one.
+    Three shapes, each decided by what the deletion or discard leaves:
+
+    * **A spec binding one name.** Its span is the whole declaration when the
+      spec is the declaration's only one, and the spec alone inside a
+      ``var ( … )`` holding others. ``_apply`` then treats it as it treats
+      ``x := v``: deleted when its value is inert or absent, rewritten to
+      ``_ = v`` when it is not. That discard is a statement on its own and a
+      spec inside a group (``var ( _ = load() )``), so both spans take it.
+      A grouped spec sharing a line with anything (``var (a = 1; b = 2)``)
+      is not offered: deleting it would leave the ``;`` behind.
+    * **A spec binding several names with no value** (``var v, w T``). Each
+      name is a candidate on its own, spanning its token: no value belongs to
+      it, so dropping it and its comma leaves the spec meaning what it meant
+      for the others. The last name left is the first shape again.
+    * **Several names with values** (``var v, w = a, b``) are never offered.
+      Each name owns a value, possibly one shared call, and removing one is
+      two edits this pass does not make. The keyless-wrapper proof refuses a
+      receiver declared that way rather than strand it.
+    """
+    specs = [c for c in declaration.named_children if c.type == "var_spec"]
+    for group in (c for c in declaration.named_children if c.type == "var_spec_list"):
+        specs += [c for c in group.named_children if c.type == "var_spec"]
+    found: list[Candidate] = []
+    whole = data[declaration.start_byte : declaration.end_byte].decode("utf-8", "replace")
+    for spec in specs:
+        names = spec.children_by_field_name("name")
+        if not names or any(n.type != "identifier" or n.text in (b"_", b"") for n in names):
+            continue
+        value = spec.child_by_field_name("value")
+        values = [] if value is None else [c for c in value.named_children if c.type != "comment"]
+        if len(names) == 1:
+            if value is not None and len(values) != 1:
+                continue
+            node = declaration if len(specs) == 1 else spec
+            if node is spec and not _alone_on_its_lines(data, spec):
+                # `var (a = 1; b = 2)`: deleting `a = 1` leaves `(; b = 2)`.
+                continue
+            found.append(
+                Candidate(
+                    name=names[0].text.decode("utf-8", "replace"),
+                    start=node.start_byte,
+                    end=node.end_byte,
+                    kind="variable",
+                    text=data[node.start_byte : node.end_byte].decode("utf-8", "replace"),
+                    initializer=None if not values else (values[0].start_byte, values[0].end_byte),
+                    binder=(names[0].start_byte, names[0].end_byte),
+                )
+            )
+        elif value is None:
+            found += [
+                Candidate(
+                    name=name.text.decode("utf-8", "replace"),
+                    start=name.start_byte,
+                    end=name.end_byte,
+                    kind="variable",
+                    text=whole if len(specs) == 1 else data[spec.start_byte : spec.end_byte].decode("utf-8", "replace"),
+                    binder=(name.start_byte, name.end_byte),
+                )
+                for name in names
+            ]
+    return found
+
+
+def _alone_on_its_lines(data: bytes, node: Node) -> bool:
+    """Whether nothing but whitespace shares ``node``'s first and last lines."""
+    line_start = data.rfind(b"\n", 0, node.start_byte) + 1
+    line_end = data.find(b"\n", node.end_byte)
+    line_end = len(data) if line_end == -1 else line_end
+    return not data[line_start : node.start_byte].strip() and not data[node.end_byte : line_end].strip()
 
 
 def _dart_declared_name_and_value(
@@ -2286,6 +2428,73 @@ def _sole_bound_name(name_node: Node) -> Node | None:
         return name_node
     bound = name_node.named_children
     return bound[0] if len(bound) == 1 else None
+
+
+#: The node a shorthand name in an object pattern is (``a`` in ``{ a, b }``).
+_PATTERN_NAME = "shorthand_property_identifier_pattern"
+
+
+def _is_require(node: Node | None) -> bool:
+    """``require("./m")``: the callee is the identifier, one string argument."""
+    if node is None or node.type != "call_expression":
+        return False
+    callee = node.child_by_field_name("function")
+    arguments = node.child_by_field_name("arguments")
+    specs = [] if arguments is None else [c for c in arguments.named_children if c.type != "comment"]
+    return (
+        callee is not None
+        and callee.type == "identifier"
+        and callee.text == b"require"
+        and len(specs) == 1
+        and specs[0].type == "string"
+    )
+
+
+def _require_pattern_candidates(node: Node, source_bytes: bytes) -> list[Candidate]:
+    """One candidate per name of ``const { a, b } = require("./m")``.
+
+    That declaration is an import in all but spelling, so it loses one name
+    the way ``import { a, b }`` does: the shorthand name alone, with its comma
+    (``_sits_in_comma_separated_list``), and the declaration stays for the
+    others. The candidate's span is the name, its initializer ``None``, so
+    ``_apply`` can only delete it and the ``require`` still runs. Once one
+    name is left the pattern binds one name, and the whole-declaration
+    candidate takes over (``require("./m");``).
+
+    Declined unless the pattern holds nothing but shorthand names. A rest
+    element would receive the dropped property, a default (``{ a = f() }``)
+    is code, and a renamed ``{ a: b }`` is not one token. And only for
+    ``require``: dropping a name from any other object skips a property read,
+    which a getter can make do work. A module's exports are read the same way
+    an import binding is.
+    """
+    declarators = [c for c in node.named_children if c.type == "variable_declarator"]
+    if len(declarators) != 1:
+        return []
+    pattern = declarators[0].child_by_field_name("name")
+    if pattern is None or pattern.type != "object_pattern":
+        return []
+    if not _is_require(declarators[0].child_by_field_name("value")):
+        return []
+    names = [c for c in pattern.named_children if c.type != "comment"]
+    if len(names) < 2 or any(c.type != _PATTERN_NAME for c in names):
+        return []
+    found = []
+    for name in names:
+        text = source_bytes[name.start_byte:name.end_byte].decode("utf-8", "replace")
+        if not text.isidentifier():
+            continue
+        found.append(
+            Candidate(
+                name=text,
+                start=name.start_byte,
+                end=name.end_byte,
+                kind="variable",
+                text=text,
+                binder=(name.start_byte, name.end_byte),
+            )
+        )
+    return found
 
 
 #: How each language spells "evaluate this and throw the value away".
@@ -3344,6 +3553,12 @@ def _matching_scope(
     candidate_node = _node_at(current, language, candidate.start, candidate.end)
     if candidate_node is None:
         return None
+    if candidate_node.type == _PATTERN_NAME:
+        # One name of a `require` pattern: its scope is its declaration's.
+        while candidate_node is not None and candidate_node.type != _VARIABLE_DECLARATIONS[language][0]:
+            candidate_node = candidate_node.parent
+        if candidate_node is None:
+            return None
     current_scope = _enclosing_scope(candidate_node, language)
     if current_scope is None:
         return _module_scopes(before, current, candidate_node, language)
@@ -3425,6 +3640,13 @@ def _references_in_scope(
     still asked for it. Only the binding position is not a read; every other
     leaf inside a declaration is counted like any other leaf in the scope.
     """
+    return sum(count for _, count in _counted_leaves(source, name, language, start, end))
+
+
+def _counted_leaves(
+    source: str, name: str, language: str, start: int, end: int
+) -> list[tuple[Node, int]]:
+    """Each leaf :func:`_references_in_scope` counts, with its count."""
     own_binders = [
         candidate.binder
         for candidate in _variable_candidates(source, language)
@@ -3434,7 +3656,7 @@ def _references_in_scope(
         and candidate.binder[1] <= end
     ]
     word = re.compile(rf"\b{re.escape(name)}\b")
-    total = 0
+    found: list[tuple[Node, int]] = []
     for node in _walk(_parse(source, language)):
         if node.child_count and not _read_by_words(node, language):
             continue
@@ -3457,10 +3679,41 @@ def _references_in_scope(
             continue
         text = node.text.decode("utf-8", "replace")
         if _read_by_words(node, language):
-            total += len(word.findall(text))
+            if count := len(word.findall(text)):
+                found.append((node, count))
         elif _spelling(text, language) == name and not _inside_import(node, language):
-            total += 1
-    return total
+            found.append((node, 1))
+    return found
+
+
+def go_local_reads(source: str, binder: tuple[int, int]) -> list[tuple[int, int]] | None:
+    """What this pass would count as references to the Go local whose name
+    token spans ``binder``, as byte spans; ``None`` when it never removes or
+    neutralises that local, however unused it ends up.
+
+    The keyless-wrapper proof asks this before folding a call that reads the
+    local. Go does not build with an unused local, so a call whose fold would
+    leave one standing has to be refused rather than folded. ``None`` covers
+    every shape this pass declines: several names with values in one
+    declaration, a scope it cannot pair across the fold (a closure, two
+    functions of one name), a declaration naming the local twice. The spans
+    let the caller check the rest: each one must be a read Go counts as a use,
+    or the count here stays above zero after Go has stopped seeing a use.
+    """
+    for candidate in _variable_candidates(source, "go"):
+        if candidate.binder != binder:
+            continue
+        if not _bound_name_occurs_once_in_own_span(candidate, source, "go"):
+            return None
+        scopes = _matching_scope(source, source, candidate, "go")
+        if scopes is None:
+            return None
+        start, end = scopes[1]
+        return [
+            (node.start_byte, node.end_byte)
+            for node, _ in _counted_leaves(source, candidate.name, "go", start, end)
+        ]
+    return None
 
 
 #: ``(member-access node type, property/field NAME)`` per language — the
@@ -3914,7 +4167,10 @@ def remove_stranded_bindings(
     ``path`` and ``root`` — the file's own path and the checkout it lives in
     — let a plain Dart import be judged by the library it names (see
     :func:`_dart_import_candidates`). Without them such an import is never a
-    candidate, which is the conservative reading.
+    candidate, which is the conservative reading. In the TS family they let a
+    stranded statement of a local module whose load is provably inert be
+    deleted rather than kept as a bare import (see
+    :mod:`flag_cleanup.inert_load`); without them it is always kept.
 
     PRIVATE METHODS are offered only with ``include_methods``, and the
     transform asks for them in a SECOND call, after the reindent pass rather
@@ -3955,6 +4211,11 @@ def remove_stranded_bindings(
     resolve = (
         dart_namespace.resolver(path, root)
         if language == "dart" and path is not None and root is not None
+        else None
+    )
+    inert = (
+        lru_cache(maxsize=None)(partial(inert_load.is_inert, path, repo_dir=root))
+        if language in {"ts", "tsx", "js"} and path is not None and root is not None
         else None
     )
     removed: list[Candidate] = []
@@ -4004,6 +4265,15 @@ def remove_stranded_bindings(
                 continue
             if current_count != 0:
                 continue
+            if candidate.loads is not None and inert is not None and inert(candidate.loads):
+                # The bare import would keep a load that does nothing.
+                candidate = replace(candidate, replacement=None, loads=None)
+            if (
+                candidate.kind == "import"
+                and candidate.replacement is None
+                and _deletes_last_module_marker(current, candidate, language)
+            ):
+                candidate = replace(candidate, replacement=MODULE_MARKER)
             updated = _apply(current, candidate, language)
             if updated is None or updated == current:
                 continue

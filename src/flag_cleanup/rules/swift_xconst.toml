@@ -21,6 +21,14 @@
 # `holes` deliberately omits `stale_flag_name`. The engine skips every file
 # whose text lacks a seed rule's hole values, and a reader never contains the
 # key -- that is the whole reason it needs these rules.
+#
+# Blocks marked `# xconst: enum-qualified-field` match a read through an enum
+# case (`Owner.X.rawValue`, `Owner.X.key`), with __XCONST_ACCESSOR__ replaced
+# by the member's name. The WHOLE key expression's text is matched, so an
+# owner of any depth (`Flags`, `Outer.Flags`, `App.Flags`) needs no further
+# shape, and a spelling with whitespace inside is left standing. There is no
+# comment variant: a comment before the key is a sibling of the argument, and
+# the reader proof refuses it.
 
 [[rules]]
 # xconst: qualified
@@ -111,6 +119,50 @@ query = """(
   (#eq? @sdk_fn "boolVariation")
   (#not-match? @receiver_chain "[?]")
   (#eq? @key_member "__XCONST_MEMBER__")
+  (#not-match? @call "^!")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_qualified_field_negated_boolvariation_read"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
+     (prefix_expression (simple_identifier) @sdk_fn)]
+    (call_suffix
+      (value_arguments
+        . (value_argument (navigation_expression) @key_ref)))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__.__XCONST_ACCESSOR__")
+  (#match? @call "^![^!]")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-field
+name = "xconst_enum_qualified_field_boolvariation_read"
+query = """(
+  (call_expression
+    [(navigation_expression
+       (navigation_suffix (simple_identifier) @sdk_fn)) @receiver_chain
+     (simple_identifier) @sdk_fn]
+    (call_suffix
+      (value_arguments
+        . (value_argument (navigation_expression) @key_ref)))
+  ) @call
+  (#eq? @sdk_fn "boolVariation")
+  (#not-match? @receiver_chain "[?]")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__.__XCONST_ACCESSOR__")
   (#not-match? @call "^!")
 )"""
 replace_node = "call"
