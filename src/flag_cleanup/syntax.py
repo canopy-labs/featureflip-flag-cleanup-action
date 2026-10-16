@@ -101,7 +101,7 @@ import tree_sitter_ruby
 import tree_sitter_swift
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import key_const, kotlin_fold, ts_switch_fold, ts_syntax
+from flag_cleanup import key_const, kotlin_fold, ts_dead_code, ts_switch_fold, ts_syntax
 from flag_cleanup.key_const_visibility import VisibleKeyConst, visible_key_consts
 
 #: Languages :mod:`flag_cleanup.ts_syntax` owns outright. `js` is here rather
@@ -1454,10 +1454,19 @@ def _lost_side_effects(source: str, language: str) -> int:
 
 
 #: Statements after which control cannot continue in the same block. Small and
-#: conservative on purpose: this set only ever makes the check see LESS, and
-#: the check's only power is to refuse, so an omission costs a missed refusal
-#: while a wrong entry would refuse a valid rewrite.
-_TERMINAL_STATEMENTS = frozenset({"return_statement", "throw_statement"})
+#: conservative on purpose: an omission costs a missed repair, while a wrong
+#: entry would delete a statement the customer's build considers reachable.
+#:
+#: ``break`` and ``continue`` belong here, labelled or not: each transfers
+#: control out of the list it sits in, so nothing after it in that list can run
+#: (JLS 14.22 says the same of both). They were missing, and the fold reaches
+#: them as easily as a ``return``: ``if (<read>) { break outer; } a();`` leaves
+#: ``break outer; a();`` on the true treatment, which ``javac`` rejects and
+#: ESLint's ``no-unreachable`` fails. Whether a ``break`` lets a LOOP complete
+#: is a separate question, answered by :func:`_escapes`.
+_TERMINAL_STATEMENTS = frozenset(
+    {"return_statement", "throw_statement", "break_statement", "continue_statement"}
+)
 
 
 #: Loops whose ``condition`` the fold can turn into a constant. An
@@ -1508,6 +1517,12 @@ class _Dialect:
     #: Separate from the rest because it is the one part of this pass the
     #: toolchains disagree about — see :data:`_TS_DIALECT`.
     dead_loop_is_fatal: bool
+    #: Whether ``var`` and function declarations are HOISTED: visible from the
+    #: whole enclosing function, so one the fold strands after a ``return``,
+    #: ``break`` or ``continue`` can still be read from code that runs. Such a
+    #: function is never deleted (``no-unreachable`` ignores it too), and a
+    #: ``var`` loses only its initialiser. Only the TypeScript family hoists.
+    hoists: bool = False
 
 
 #: Java's, and Dart's: the Dart profile records that every node name here is
@@ -1544,14 +1559,14 @@ _JAVA_DIALECT = _Dialect(
 #: ``eslint:recommended`` and is an ERROR, and it fires on every shape the true
 #: treatment emits — a stranded statement after a folded ``if``/``else``, after
 #: ``while (true)``, after ``do … while (true)``, at a module's top level and
-#: inside a ``case:``. It says NOTHING about ``while (false) { … }`` or
-#: ``for (…; false; …) { … }``, which is what the FALSE treatment emits;
-#: ``no-unreachable-loop`` is the rule that would, and it is not in the
-#: recommended set. So this pass neither counts nor refuses them — refusing
-#: would trade a working pull request for no pull request. The dead ``while``
-#: is still DELETED, by :func:`remove_dead_loops`, which does the same in every
-#: language this pass does not cover: it is dead code the fold created, whether
-#: or not a toolchain demands its removal.
+#: inside a ``case:``. It says nothing about ``while (false) { … }`` or
+#: ``for (…; false; …) { … }``, which is what the FALSE treatment emits, so
+#: this pass neither counts nor deletes them. They are not lint-clean all the
+#: same: ``no-constant-condition`` rejects both (and a ``do … while`` on either
+#: literal, and ``for (; true; )``), which an earlier version of this comment
+#: missed. The dead ``while`` is deleted by :func:`remove_dead_loops`, the dead
+#: ``for`` and ``do`` by :mod:`flag_cleanup.ts_dead_code`, and whatever those
+#: decline is refused by Gate 1 (``ts_dead_code.constant_condition_loops``).
 _TS_DIALECT = _Dialect(
     parse=ts_syntax._parse,
     blocks=frozenset({"statement_block"}),
@@ -1565,6 +1580,7 @@ _TS_DIALECT = _Dialect(
     # no switch EXPRESSION in this language, so Java's third entry has no twin.
     breakable=_CONDITION_LOOPS | frozenset({"for_in_statement", "switch_statement"}),
     dead_loop_is_fatal=False,
+    hoists=True,
 )
 
 
@@ -1677,8 +1693,31 @@ def _completes_abruptly(node: Node | None, dialect: _Dialect) -> bool:
             node.child_by_field_name("consequence"), dialect
         ) and _completes_abruptly(node.child_by_field_name("alternative"), dialect)
     if node.type in _CONDITION_LOOPS:
-        return _loop_condition_literal(node) == "true" and not _escapes(node, dialect)
+        return _loop_runs_forever(node) and not _escapes(node, dialect)
     return False
+
+
+def _loop_runs_forever(loop: Node) -> bool:
+    """Whether ``loop``'s condition always holds.
+
+    A ``for`` with NO condition counts, and the TypeScript cascade is why: it
+    rewrites ``for (init; true; update)`` to ``for (init; ; update)``, since
+    ``eslint:recommended`` rejects the constant, so the infinite loop the fold
+    made reaches this pass with its condition already gone. The grammars spell
+    the gap differently — Java omits the field, TypeScript fills it with an
+    ``empty_statement`` — and both mean ``true``.
+    """
+    if _loop_condition_literal(loop) == "true":
+        return True
+    # Dart holds its header in a `for_loop_parts` child, so no Dart `for` has
+    # a `condition` field at all: reading the missing field as `true` made
+    # every Dart loop infinite and deleted the live code after it.
+    if loop.type != "for_statement" or any(
+        child.type == "for_loop_parts" for child in loop.children
+    ):
+        return False
+    condition = loop.child_by_field_name("condition")
+    return condition is None or condition.type == "empty_statement"
 
 
 def _unreachable_statements(source: str, language: str) -> int:
@@ -1792,8 +1831,53 @@ def _unreachable_statement_nodes(source: str, language: str) -> list[Node]:
             None,
         )
         if abrupt is not None:
-            stranded.extend(siblings[abrupt + 1 :])
+            stranded.extend(
+                c for c in siblings[abrupt + 1 :] if not _hoisted_and_harmless(c, dialect)
+            )
     return stranded
+
+
+_HOISTED_FUNCTIONS = frozenset({"function_declaration", "generator_function_declaration"})
+
+
+def _hoisted_and_harmless(node: Node, dialect: _Dialect) -> bool:
+    """A stranded declaration that must stay, and that no gate objects to.
+
+    A function declaration and a ``var`` without initialisers are hoisted, so
+    code above them can still use them, and ``no-unreachable`` ignores both.
+    A ``var`` WITH an initialiser is reported, so it is still stranded; the
+    repair keeps its declaration and drops only the initialiser
+    (:func:`_hoisted_replacement`).
+    """
+    if not dialect.hoists:
+        return False
+    if node.type in _HOISTED_FUNCTIONS:
+        return True
+    return node.type == "variable_declaration" and all(
+        d.child_by_field_name("value") is None
+        for d in node.named_children
+        if d.type == "variable_declarator"
+    )
+
+
+def _hoisted_replacement(node: Node, dialect: _Dialect) -> bytes | None:
+    """``var a = 1, b = f();`` -> ``var a, b;``; None to delete ``node`` outright.
+
+    The name stays declared for the code above it that may read it, and the
+    initialiser, which could never run, goes. A destructuring pattern has no
+    such short form, so it is left in place, and Gate 1 refuses the file.
+    """
+    if not dialect.hoists or node.type != "variable_declaration":
+        return None
+    names = []
+    for declarator in node.named_children:
+        if declarator.type == "comment":
+            continue
+        name = declarator.child_by_field_name("name")
+        if declarator.type != "variable_declarator" or name is None or name.type != "identifier":
+            return node.text or b""
+        names.append(name.text or b"")
+    return b"var " + b", ".join(names) + b";"
 
 
 def _expand_to_whole_lines(data: bytes, start: int, end: int) -> tuple[int, int]:
@@ -1859,13 +1943,28 @@ def remove_unreachable_statements(
     data = after.encode("utf-8")
     # Bounded purely as a runaway guard: each round strictly shrinks the file,
     # so it terminates on its own.
+    dialect = _unreachable_dialect(language)
+    assert dialect is not None
     for _ in range(10):
         nodes = _unreachable_statement_nodes(data.decode("utf-8"), language)
-        if not nodes:
+        replacements = {
+            (n.start_byte, n.end_byte): _hoisted_replacement(n, dialect) for n in nodes
+        }
+        # A `var` this cannot shorten (a destructuring pattern) comes back as
+        # its own text: leave it, and let the count refuse the file.
+        spans = [
+            span
+            for span in _outermost(list(replacements))
+            if replacements[span] != data[span[0] : span[1]]
+        ]
+        if not spans:
             break
-        spans = _outermost([(n.start_byte, n.end_byte) for n in nodes])
         for start, end in sorted(spans, reverse=True):
             removed.append(data[start:end].decode("utf-8"))
+            replacement = replacements[(start, end)]
+            if replacement is not None:
+                data = data[:start] + replacement + data[end:]
+                continue
             wide_start, wide_end = _expand_to_whole_lines(data, start, end)
             data = data[:wide_start] + data[wide_end:]
     return data.decode("utf-8"), removed
@@ -2233,6 +2332,12 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
     ):
         return "the fold left statements unreachable"
     if language in _TS_LANGUAGES:
+        # What the engine's loop rules and `ts_dead_code.tidy` declined: a
+        # loop whose constant condition `eslint:recommended` rejects.
+        if ts_dead_code.constant_condition_loops(
+            after, language
+        ) > ts_dead_code.constant_condition_loops(before, language):
+            return "a loop was left testing a constant condition"
         return ts_syntax.refusal_reason(before, after, language)
     if language not in _PROFILES:
         raise ValueError(f"unsupported language {language!r}")

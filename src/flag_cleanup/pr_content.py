@@ -28,6 +28,7 @@ from flag_cleanup.cross_file_keys import (
     LEFT_COMPETING,
     NAME_NOT_UNIQUE,
 )
+from flag_cleanup.mock_stubs import PINNED_PARAMETER, SIBLING_TEST, TEST
 from flag_cleanup.residue import Residue
 from flag_cleanup.urls import without_userinfo
 
@@ -164,6 +165,10 @@ REPORTED_BINDING_KINDS = frozenset(
         "marked import",
         "module marker",
         "unread parameter",
+        "unread member",
+        "removed parameter",
+        "changed constructor",
+        "kept argument local",
         "unread binding",
         "emptied override",
     }
@@ -259,6 +264,101 @@ def _unread_parameter_lines(unread: list[tuple[str, str]]) -> list[str]:
         "every dependency-injection registration of the type calls. Remove "
         f"{'it' if count == 1 else 'each'} along with the argument callers "
         "pass, or suppress CS9113 for it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _removed_constructor_lines(
+    removed: list[tuple[str, str]], changed: list[tuple[str, str]]
+) -> list[str]:
+    """The note naming each constructor parameter this pull request removed,
+    with every caller's argument, or nothing.
+
+    Not a warning: the removal was proven against every caller in the
+    repository. The one thing no proof can see is a caller outside it, which
+    is what the second list is for.
+    """
+    if not removed:
+        return []
+    count = len(removed)
+    noun = "constructor parameter was" if count == 1 else "constructor parameters were"
+    lines = [
+        f"> **{count} {noun} removed.** Every read of "
+        f"{'it' if count == 1 else 'them'} was a flag read this pull request "
+        "removed, so the parameter and the argument each caller passed for it "
+        "were deleted:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+    if changed:
+        one = len(changed) == 1
+        lines += [
+            "> **Constructor signature changed.** "
+            f"{'This class is' if one else 'These classes are'} exported or "
+            "public, so code outside this repository that constructs "
+            f"{'it' if one else 'them'} must drop the same argument:",
+            ">",
+            *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in changed[:20]],
+            *([f"> - ...and {len(changed) - 20} more"] if len(changed) > 20 else []),
+            "",
+        ]
+    return lines
+
+
+def _kept_argument_local_lines(kept: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each local whose only reader was an argument this
+    pull request removed with a constructor parameter, or nothing.
+
+    The local stays because its initializer may do work (a call, a mock), so
+    it is now declared and never read.
+    """
+    if not kept:
+        return []
+    count = len(kept)
+    noun = "local is" if count == 1 else "locals are"
+    return [
+        f"> **⚠️ {count} {noun} no longer read.** {'It was' if count == 1 else 'Each was'} "
+        "passed only as the argument of a constructor parameter this pull request "
+        f"removed. {'It was' if count == 1 else 'They were'} left in place because "
+        "the value it is set to may do work. Remove "
+        f"{'it' if count == 1 else 'each'} if that work is not needed:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in kept[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_member_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each TypeScript or JavaScript private member the fold
+    left unread, or nothing.
+
+    The TypeScript family's counterpart of :func:`_unread_parameter_lines`,
+    and next to it for the same reason: under ``noUnusedLocals`` it fails
+    ``tsc``. See :mod:`~flag_cleanup.ts_unread_members` for why it is not
+    removed.
+    """
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "member is" if count == 1 else "members are"
+    return [
+        f"> **⚠️ {count} private class {noun} no longer read.** Every read was "
+        "a flag read this pull request removed. With `noUnusedLocals` on, "
+        "`tsc` now reports it (TS6133, or TS6138 for a constructor parameter "
+        "property), and ESLint's recommended `no-unused-private-class-members` "
+        "reports a `#` member in any project. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        "removing a constructor parameter property changes the constructor "
+        "that every `new` and every dependency-injection registration of the "
+        "class calls, and a field's initializer may do work. Remove "
+        f"{'it' if count == 1 else 'each'}, with any argument callers pass for "
+        "it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -389,9 +489,10 @@ def pr_body(
     those statements were kept, not removed, and each is a line the reviewer
     is asked to judge (see :func:`_bare_import_lines`). So are its
     ``"unread parameter"`` entries, which name a C# parameter left in place
-    that the build may now reject (see :func:`_unread_parameter_lines`), and
-    the TypeScript family's ``"unread binding"`` and ``"emptied override"``
-    entries (see :func:`_unread_binding_lines` and
+    that the build may now reject (see :func:`_unread_parameter_lines`), its
+    ``"unread member"`` entries, the TypeScript family's counterpart (see
+    :func:`_unread_member_lines`), and the family's ``"unread binding"`` and
+    ``"emptied override"`` entries (see :func:`_unread_binding_lines` and
     :func:`_emptied_override_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
 
     ``entries`` is a FOURTH case: a flag-keyed entry — a registry line, an
@@ -414,7 +515,11 @@ def pr_body(
     :mod:`~flag_cleanup.mock_stubs`). Tests whose mock returned the removed
     value get their own warning, because a whole test went; the stub and
     verification lines that went from tests which stayed are listed beneath
-    it. Named because each was the customer's test code.
+    it. Named because each was the customer's test code. A C# test that read
+    a keyless wrapper's member through a sibling implementation this run
+    deleted (``sibling test``), and a test helper parameter a pin removed
+    (``pinned parameter``, one row per helper), each get a list of their own:
+    neither is a mock line.
 
     ``residue`` sorts ``unprocessed`` rather than adding to it. A test that
     still stubs the removed read, a file naming the flag only in comments and
@@ -632,6 +737,18 @@ def pr_body(
     unread_parameters = [
         (path, text) for path, kind, text in bindings if kind == "unread parameter"
     ]
+    unread_members = [
+        (path, text) for path, kind, text in bindings if kind == "unread member"
+    ]
+    removed_parameters = [
+        (path, text) for path, kind, text in bindings if kind == "removed parameter"
+    ]
+    changed_constructors = [
+        (path, text) for path, kind, text in bindings if kind == "changed constructor"
+    ]
+    kept_argument_locals = [
+        (path, text) for path, kind, text in bindings if kind == "kept argument local"
+    ]
     unread_bindings = [
         (path, text) for path, kind, text in bindings if kind == "unread binding"
     ]
@@ -640,6 +757,9 @@ def pr_body(
     ]
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
+    lines += _unread_member_lines(unread_members)
+    lines += _removed_constructor_lines(removed_parameters, changed_constructors)
+    lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_binding_lines(unread_bindings)
     lines += _emptied_override_lines(emptied)
     lines += _bare_import_lines(bare_imports)
@@ -733,7 +853,11 @@ def pr_body(
             "",
         ]
     mocked_tests = [(path, text) for path, kind, text in test_doubles if kind == "test"]
-    mock_lines = [(path, text) for path, kind, text in test_doubles if kind != "test"]
+    sibling_tests = [(path, text) for path, kind, text in test_doubles if kind == SIBLING_TEST]
+    pinned = [(path, text) for path, kind, text in test_doubles if kind == PINNED_PARAMETER]
+    mock_lines = [
+        (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
+    ]
     if mocked_tests:
         count = len(mocked_tests)
         noun = "test was" if count == 1 else "tests were"
@@ -750,6 +874,34 @@ def pr_body(
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in mocked_tests[:20]
             ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if sibling_tests:
+        count = len(sibling_tests)
+        noun = "test was" if count == 1 else "tests were"
+        lines += [
+            f"> **⚠️ {count} {noun} deleted with a sibling implementation.** Each "
+            "read the member through an implementation this pull request deletes:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in sibling_tests[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if pinned:
+        # The row's text carries its own code spans (the helper's signature,
+        # fenced against its own backticks, and the parameter's name).
+        count = len(pinned)
+        noun = "parameter was" if count == 1 else "parameters were"
+        lines += [
+            f"> **{count} test helper {noun} removed.** Each one only chose the "
+            "value a stub of a deleted wrapper returned, and every remaining "
+            "call passed the value the flag serves:",
+            ">",
+            *[f"> - {_md_code(path)} — {_one_line(text)}" for path, text in pinned[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -896,6 +1048,11 @@ def pr_body(
 
 #: Not refusals: what became of a keyless wrapper (see `wrapper_inline`).
 _WRAPPER_STATUSES = ("complete", "partial")
+#: Not refusals either: a sibling implementation deleted with a complete
+#: wrapper. Grouped with the refusals, and told apart from them on rendering.
+_WRAPPER_NOTES = ("sibling",)
+#: Test-double removal kinds that are not a mock line.
+_NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER)
 
 
 def _by_wrapper(
@@ -939,20 +1096,41 @@ def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list
     lines: list[str] = []
     if inlined:
         partial = sum(1 for status, _ in inlined.values() if status[2] == "partial")
+        siblings = any(
+            r[2] in _WRAPPER_NOTES
+            for status, rows in inlined.values()
+            if status[2] == "complete"
+            for r in rows
+        )
         lines += [
             "> **🔁 Wrappers inlined.** Each member below read only this flag and "
             "took no key. Every call this run could tie to it was folded to the "
             "value the flag serves, and a member nothing calls any more was "
             "deleted.",
+            *(
+                [
+                    ">",
+                    "> A sibling implementation's member is deleted with the wrapper: "
+                    "every caller now gets the value the flag serves, whichever "
+                    "implementation was bound."
+                ]
+                if siblings
+                else []
+            ),
             ">",
         ]
-        for label, (status, refusals) in list(inlined.items())[:20]:
+        for label, (status, rows) in list(inlined.items())[:20]:
             path, line = status[0], status[1]
+            notes = [r for r in rows if r[2] in _WRAPPER_NOTES]
+            refusals = [r for r in rows if r[2] not in _WRAPPER_NOTES]
             if status[2] == "complete":
                 lines.append(
                     f"> - {_md_code(label)} ({_md_code(f'{path}:{line}')}) — complete: "
                     "every caller folded, and the member deleted."
                 )
+                if notes:
+                    lines.append(">   Sibling implementations, each deleted with it:")
+                    lines += [f">   - {_md_code(f'{p}:{n}')} — {_one_line(t)}" for p, n, _, t, _ in notes]
                 continue
             lines.append(
                 f"> - {_md_code(label)} ({_md_code(f'{path}:{line}')}) — partial: kept, "
@@ -973,7 +1151,11 @@ def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list
                 "on the member staying.",
             ]
         lines.append("")
-    refused = {label: v for label, v in grouped.items() if v[0] is None}
+    refused = {
+        label: (status, [r for r in rows if r[2] not in _WRAPPER_NOTES])
+        for label, (status, rows) in grouped.items()
+        if status is None and any(r[2] not in _WRAPPER_NOTES for r in rows)
+    }
     if refused:
         lines += [
             "> **ℹ️ Wrappers not inlined.** The read inside each was folded, but "
@@ -995,14 +1177,24 @@ def note_wrapper_findings(findings: tuple[tuple[str, int, str, str, str], ...]) 
     so this is where it shows every caller a real run would leave, and that a
     member the diff deletes went because nothing called it any more.
     """
-    for label, (status, refusals) in _by_wrapper(findings).items():
+    for label, (status, rows) in _by_wrapper(findings).items():
+        notes = [r for r in rows if r[2] in _WRAPPER_NOTES]
+        refusals = [r for r in rows if r[2] not in _WRAPPER_NOTES]
+        if status is None and not refusals:
+            continue  # notes alone: nothing became of a wrapper to report
         if status is None:
             first = refusals[0]
             logger.warning(
                 "%s: not inlined (%s) at %s:%d", label, first[2], first[0], first[1]
             )
         elif status[2] == "complete":
-            logger.warning("%s: complete — inlined at its call sites and deleted", label)
+            logger.warning(
+                "%s: complete — inlined at its call sites and deleted%s",
+                label,
+                (" (siblings: " + "; ".join(f"{p}:{n} {_one_line(t)}" for p, n, _, t, _ in notes) + ")")
+                if notes
+                else "",
+            )
         else:
             logger.warning(
                 "%s: partial — kept; remaining callers: %s",
@@ -1136,6 +1328,32 @@ def note_removed_entries(entries: tuple[tuple[str, str], ...]) -> None:
             len(entries),
             "y" if len(entries) == 1 else "ies",
             "; ".join(f"{path}: {_one_line(text)}" for path, text in entries),
+        )
+
+
+def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the tests deleted with a sibling implementation, and the test
+    helper parameters pins removed.
+
+    WARNING, like :func:`note_wrapper_findings`: a dry run has no pull request
+    body, and each is a change to the customer's test code the diff shows only
+    as lines gone.
+    """
+    sibling_tests = [(p, t) for p, kind, t in test_doubles if kind == SIBLING_TEST]
+    pinned = [(p, t) for p, kind, t in test_doubles if kind == PINNED_PARAMETER]
+    if sibling_tests:
+        logger.warning(
+            "%d test%s deleted with a sibling implementation: %s",
+            len(sibling_tests),
+            "" if len(sibling_tests) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in sibling_tests),
+        )
+    if pinned:
+        logger.warning(
+            "%d test helper parameter%s removed: %s",
+            len(pinned),
+            "" if len(pinned) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in pinned),
         )
 
 

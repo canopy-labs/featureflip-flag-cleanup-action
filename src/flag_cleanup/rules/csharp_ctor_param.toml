@@ -1,0 +1,44 @@
+# Constructor-parameter removal for C# primary constructors. Rendered per run
+# by `ctor_param_model.render_rules`; see `ts_ctor_param.toml` for why deletion
+# is by a marked identifier rather than by position.
+
+# ctor: parameter
+[[rules]]
+name = "delete_class_primary_parameter"
+query = """(
+  (class_declaration
+    name: (identifier) @class_name
+    (parameter_list
+      (parameter name: (identifier) @param_name) @param))
+  (#eq? @class_name "__CTOR_CLASS__")
+  (#eq? @param_name "__CTOR_PARAM__")
+)"""
+replace_node = "param"
+replace = ""
+is_seed_rule = true
+
+# ctor: parameter
+[[rules]]
+name = "delete_struct_primary_parameter"
+query = """(
+  (struct_declaration
+    name: (identifier) @class_name
+    (parameter_list
+      (parameter name: (identifier) @param_name) @param))
+  (#eq? @class_name "__CTOR_CLASS__")
+  (#eq? @param_name "__CTOR_PARAM__")
+)"""
+replace_node = "param"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_argument"
+query = """(
+  (argument_list (argument (identifier) @id) @arg)
+  (#eq? @id "__CTOR_SENTINEL__")
+)"""
+replace_node = "arg"
+replace = ""
+is_seed_rule = true

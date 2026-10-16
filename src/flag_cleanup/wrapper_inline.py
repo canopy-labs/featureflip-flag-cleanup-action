@@ -32,8 +32,10 @@ answered structurally:
   spells.
 * A sibling implementation of the same interface would be overridden. So a
   member that implements an interface member qualifies only when that
-  interface has exactly one implementation and cannot be implemented outside
-  the repository.
+  interface cannot be implemented outside the repository and every other
+  implementation is inert: its member only returns a literal or its own
+  stored state (C#; the JVM profiles still require exactly one
+  implementation). An inert sibling's member is deleted with the wrapper.
 
 Anything unproven is left exactly as it is and reported, with its reason.
 
@@ -53,12 +55,12 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from tree_sitter import Node
 
-    from flag_cleanup import kotlin_sentinel, wrapper_jvm
+    from flag_cleanup import kotlin_sentinel, mock_stubs, wrapper_jvm
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +76,9 @@ INTERFACE_PUBLISHED = "interface-published"
 #: Never produced for the JVM languages, whose interfaces are nominal. Go's
 #: are structural, and an exported Go method is kept for the same reason.
 INTERFACE_STRUCTURAL = "interface-structural"
-#: Nothing in the file ties the call's receiver to the wrapper.
+#: Nothing in the file ties the call's receiver to the wrapper. Also a use
+#: handing a TypeScript or JavaScript function wrapper's module on as an
+#: object, through which a computed name can call it.
 RECEIVER_UNPROVEN = "receiver-unproven"
 #: The receiver's declared type does not resolve to the wrapper's class.
 IMPORT_UNRESOLVED = "import-unresolved"
@@ -84,6 +88,10 @@ ARGUMENT_HAS_CALL = "argument-has-call"
 #: cleanup cannot remove. Only Go produces it: there an unused local does not
 #: build.
 UNREMOVABLE_LOCAL = "unremovable-local"
+#: The call goes through a pointer that may be nil to a method with a value
+#: receiver, so it panics there, and folding it would remove the panic. Only
+#: Go produces it.
+NIL_RECEIVER = "nil-receiver"
 #: A mention in a file of another language, which this run does not rewrite.
 OTHER_LANGUAGE = "other-language"
 #: A test double of the wrapper that could not be resolved.
@@ -98,9 +106,25 @@ OUTSIDE_RUN = "outside-run"
 #: The name appears where nothing here can parse a call: a string (reflection,
 #: an expression language), a template, a layout, a config file.
 UNPARSED_MENTION = "unparsed-mention"
+#: A JavaScript wrapper's own declaration file (``flags.d.ts`` beside
+#: ``flags.js``) declares it. Its callers are inlined, but the declaration is
+#: hand-written and outside what this run rewrites, so the wrapper stays
+#: with it.
+DECLARATION_FILE = "declaration-file"
 #: The read inside the wrapper was not folded in this run (its file could not
 #: be processed), so the wrapper stays as it was.
 NOT_FOLDED = "not-folded"
+#: Another implementation of the wrapper's interface does more than return
+#: a literal or its own stored state, or cannot be proven not to: it may be
+#: extended, based on a type outside the repository, shared with another
+#: interface declaring the name, or read from outside the repository. Also
+#: a sibling fixed at the value being removed, which whatever builds it
+#: relies on, and a sibling member this run's own edits left where it cannot
+#: be found.
+SIBLING_NOT_INERT = "sibling-not-inert"
+#: The member is read through a receiver typed as an inert sibling, whose
+#: member goes with the wrapper.
+SIBLING_RECEIVER = "sibling-receiver"
 
 #: Annotations that say nothing about who calls a member. Not ``JvmName``:
 #: Java calls the member by the name it gives, which no scan here looks for.
@@ -117,6 +141,9 @@ _STRINGS = frozenset({"string_literal", "text_block", "multiline_string_literal"
 #: Not refusals: what became of a wrapper, reported at its declaration.
 COMPLETE = "complete"
 PARTIAL = "partial"
+#: An inert sibling whose member went with a complete wrapper: what it
+#: returned, and the value its callers now see.
+SIBLING = "sibling"
 
 
 @dataclass(frozen=True)
@@ -128,6 +155,35 @@ class InterfaceMember:
     package: str
     start: int
     end: int
+
+
+@dataclass(frozen=True)
+class Sibling:
+    """Another implementation of the wrapper's interface, whose member is
+    inert and goes with the wrapper (see :mod:`flag_cleanup.csharp_family`)."""
+
+    path: str
+    owner: str
+    namespace: str
+    line: int
+    #: Byte span of the sibling's member declaration.
+    start: int
+    end: int
+    #: What the member returned, as written (``_options.Enabled``, ``true``).
+    returns: str
+    #: The settable member a test fake's member reads, written by tests to
+    #: choose a value; ``None`` for a production sibling.
+    knob: str | None = None
+    #: Declared in a test project, by its project file.
+    test: bool = False
+    #: What a knob other than the member itself holds until something sets
+    #: it: ``"true"``/``"false"``, or ``""`` for a primary-constructor
+    #: parameter every construction passes.
+    knob_default: str | None = None
+    #: The knob is the primary constructor's parameter, set as
+    #: ``new Owner(<value>)``; otherwise a member, set as ``x.Knob = <value>``
+    #: or ``new Owner { Knob = <value> }``.
+    knob_primary: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +206,7 @@ class Wrapper:
     #: companion object: callable through the type's name.
     static: bool = False
     interface: InterfaceMember | None = None
+    siblings: tuple[Sibling, ...] = ()
     #: Simple names of the annotations on the declaration.
     annotations: tuple[str, ...] = ()
     #: ``method``, ``property`` (a Kotlin getter, read with no call) or
@@ -180,7 +237,9 @@ class Occurrence:
     reason: str | None
     #: The receiver identifier, for the test-double pass.
     receiver: str | None = None
-    #: Inside a statement of a mocking DSL.
+    #: Inside a statement of a mocking DSL; for a ``sibling-receiver`` read,
+    #: inside a test method of a test project, which the test-double pass may
+    #: delete whole.
     in_test_double: bool = False
     #: Written after the sentinel: ``"()"`` for a property read, which has
     #: no call of its own for the seed rules to match.
@@ -195,6 +254,17 @@ class Finding:
     text: str
     #: :attr:`Wrapper.label`.
     wrapper: str
+
+
+@dataclass(frozen=True)
+class Refused:
+    """A qualification refusal caused by something other than the wrapper's
+    own declaration (a sibling implementation), reported where it is."""
+
+    reason: str
+    path: str
+    line: int
+    text: str
 
 
 @dataclass
@@ -230,8 +300,9 @@ class Profile:
     #: ``(repo_dir, wrapper)`` -> the repository index; ``None`` for the JVM one.
     index: Callable[[str, Wrapper], wrapper_jvm.Index] | None = None
     #: ``(wrapper, index)`` -> the wrapper with its interface member, or why
-    #: it does not qualify; ``None`` for the JVM rules.
-    qualify: Callable[[Wrapper, wrapper_jvm.Index], tuple[Wrapper | None, str | None]] | None = None
+    #: it does not qualify (a :class:`Refused` when the cause lies elsewhere);
+    #: ``None`` for the JVM rules.
+    qualify: Callable[[Wrapper, wrapper_jvm.Index], tuple[Wrapper | None, str | Refused | None]] | None = None
     #: String literal node types, where a mention is reflection or an
     #: expression language rather than a call.
     strings: frozenset[str] = _STRINGS
@@ -244,6 +315,10 @@ class Profile:
     #: ``(root, name)`` -> the member declarations of ``name`` a close-out may
     #: delete; ``None`` for the JVM ones.
     members: Callable[[Node, str], list[Node]] | None = None
+    #: ``(member)`` -> the byte its deletion ends at, when the grammar keeps a
+    #: separator that goes with it outside the node (a TypeScript class field's
+    #: ``;``, an object literal member's ``,``); ``None``: the node's own end.
+    member_end: Callable[[Node], int] | None = None
     #: Node types that spell the wrapper's name where it is used, for the
     #: close-out's leftover scan. Go spells ``pkg.F`` and ``s.M`` with a
     #: ``field_identifier``.
@@ -261,6 +336,27 @@ class Profile:
     #: TypeScript and JavaScript, where a decorator is a function of the
     #: codebase's own: ``@Override`` there can register the method anywhere.
     inert_annotations: frozenset[str] = _INERT_ANNOTATIONS
+    #: ``(index, path, kind)`` -> whether a mention of ``kind`` (``"string"``,
+    #: a string literal of a parsed file; ``"unparsed"``, a file nothing here
+    #: parses) can be the wrapper's member; ``None``: every one can.
+    mention_counts: Callable[[wrapper_jvm.Index, str, str], bool] | None = None
+    #: ``(repo_dir, wrapper)`` -> every remaining mention after the fold, the
+    #: profile's own judgement; ``None`` for the shared scan.
+    leftovers: Callable[[str, Wrapper], list[tuple[str, int, str]]] | None = None
+    #: ``(wrapper, index)`` -> resolved path -> where a test may stub the
+    #: wrapper there, for the test-double pass that runs before the proof;
+    #: ``None`` for languages whose doubles are found per call
+    #: (:attr:`Occurrence.in_test_double`).
+    stub_targets: Callable[[Wrapper, Any], dict[str, mock_stubs.StubTargets]] | None = None
+    #: ``(wrapper, index, treatment)`` -> what the test-double pass is about to
+    #: settle (class mocks whose stub of the wrapper it deletes), handed back
+    #: to ``index`` as its third argument when the round indexes its result;
+    #: ``None`` where nothing is.
+    settled_mocks: Callable[[Wrapper, Any, bool], Any] | None = None
+    #: ``(path, source, string node)`` -> whether the string is a test's
+    #: title, which a test runner consumes and so never names a member;
+    #: ``None`` where no string is exempt.
+    test_title: Callable[[str, str, Node], bool] | None = None
 
 
 _PROFILES: dict[str, Profile] = {}
@@ -283,6 +379,12 @@ def _profile_for(path: str) -> Profile | None:
     return next((p for p in _PROFILES.values() if path.endswith(p.extensions)), None)
 
 
+def language_for(path: str) -> str | None:
+    """The language whose profile parses ``path``, by its suffix."""
+    lang = _profile_for(path)
+    return None if lang is None else lang.language
+
+
 def line_of(node: Node) -> int:
     return node.start_point[0] + 1
 
@@ -292,8 +394,13 @@ def text_of(node: Node) -> str:
 
 
 def _read(path: str) -> str | None:
+    """The file's text with its line endings as they are, so every byte
+    offset taken from it is one into the file, and a file written back from
+    it keeps CRLF."""
+    from flag_cleanup import mock_stubs
+
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return mock_stubs._read_exact(path)
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -325,11 +432,41 @@ def discover_all(
     return found
 
 
+def _sibling_note(sibling: Sibling, member: str, value: str) -> str:
+    """What a deleted sibling's member returned, and what its callers get now.
+
+    An auto-property returns no expression to quote: it is named, with the
+    ``false`` it holds until something sets it."""
+    if sibling.returns == "auto-property":
+        return f"{sibling.owner} returned its auto-property `{member}` (default `false`); now `{value}`"
+    from flag_cleanup import mock_stubs
+
+    return f"{sibling.owner} returned {mock_stubs.code_span(sibling.returns)}; now `{value}`"
+
+
+def _fixed_at_removed_value(sibling: Sibling, treatment: bool) -> bool:
+    """Whether ``sibling`` is fixed at the value being removed: a literal, or
+    an auto-property left at its ``false`` default. Whatever builds it --
+    production code, or a test through any alias, factory, fixture or
+    language -- relies on the branch being removed, and nothing here can see
+    all of what builds it, so such a sibling never goes. A test fake whose
+    knob DEFAULTS to the removed value is the same: a test that builds it and
+    never sets the knob runs the removed branch."""
+    fixed = {"true": True, "false": False, "auto-property": False}.get(sibling.returns)
+    if fixed is None and sibling.knob is not None:
+        fixed = {"true": True, "false": False}.get(sibling.knob_default or "")
+    return fixed is not None and fixed != treatment
+
+
 def qualify_all(
-    repo_dir: str, wrappers: list[Wrapper]
+    repo_dir: str, wrappers: list[Wrapper], treatment: bool | None = None
 ) -> tuple[list[tuple[Wrapper, wrapper_jvm.Index]], list[Finding]]:
     """The wrappers that qualify, each with the index it was judged on, and a
-    declaration-site finding for each one that does not."""
+    declaration-site finding for each one that does not.
+
+    With the run's ``treatment``, a wrapper with a sibling fixed at the
+    removed value (:func:`_fixed_at_removed_value`) does not qualify either,
+    reported ``sibling-not-inert`` at the sibling."""
     from flag_cleanup import wrapper_jvm
 
     qualified: list[tuple[Wrapper, wrapper_jvm.Index]] = []
@@ -339,11 +476,27 @@ def qualify_all(
         build = lang.index if lang is not None and lang.index is not None else wrapper_jvm.Index.build
         judge = lang.qualify if lang is not None and lang.qualify is not None else wrapper_jvm.qualify
         index = build(repo_dir, wrapper)
+        if treatment is not None and hasattr(index, "treatment"):
+            # A profile that reports what its test doubles leave behind needs
+            # to know which value stays.
+            index.treatment = treatment
         member, reason = judge(wrapper, index)
         if member is None:
-            findings.append(
-                Finding(wrapper.path, wrapper.line, reason or NAME_NOT_UNIQUE, wrapper.label, wrapper.label)
-            )
+            if isinstance(reason, Refused):
+                findings.append(Finding(reason.path, reason.line, reason.reason, reason.text, wrapper.label))
+            else:
+                findings.append(
+                    Finding(wrapper.path, wrapper.line, reason or NAME_NOT_UNIQUE, wrapper.label, wrapper.label)
+                )
+            continue
+        fixed = (
+            [s for s in member.siblings if _fixed_at_removed_value(s, treatment)] if treatment is not None else []
+        )
+        if fixed:
+            findings += [
+                Finding(s.path, s.line, SIBLING_NOT_INERT, f"{s.owner} returns `{s.returns}`", wrapper.label)
+                for s in fixed
+            ]
             continue
         qualified.append((member, index))
     return qualified, findings
@@ -381,8 +534,13 @@ def stub_receivers(
 
     Collected before the test-double pass, which may only resolve a stub
     whose receiver is the wrapper itself.
+
+    C#: that pass matches a stub of ANY of the run's wrappers on the name, so
+    a name stays only where every wrapper stubbed through it in the file
+    proved it there too.
     """
     found: dict[str, set[str]] = {}
+    proven: dict[tuple[str, str], set[str]] = {}
     for wrapper, index in qualified:
         for path in index.parsed:
             same, occurrences = _occurrences_in(language, path, wrapper, index)
@@ -391,7 +549,108 @@ def stub_receivers(
             for o in occurrences:
                 if o.in_test_double and o.receiver and o.reason in (None, ARGUMENT_HAS_CALL):
                     found.setdefault(path, set()).add(o.receiver)
-    return {path: frozenset(names) for path, names in found.items()}
+                    proven.setdefault((wrapper.label, path), set()).add(o.receiver)
+    if language != "csharp":
+        return {path: frozenset(names) for path, names in found.items()}
+    from flag_cleanup import mock_stubs
+
+    result: dict[str, frozenset[str]] = {}
+    for path, names in found.items():
+        source = _read(path) or ""
+        kept = frozenset(
+            name
+            for name in names
+            if all(
+                name in proven.get((wrapper.label, path), ())
+                # Deciding what STAYS: any spelling counts, qualified or not.
+                or not mock_stubs.csharp_mock_mention(name, wrapper.name).search(source)
+                for wrapper, _ in qualified
+            )
+        )
+        if kept:
+            result[path] = kept
+    return result
+
+
+def sibling_receivers(
+    language: str, qualified: list[tuple[Wrapper, wrapper_jvm.Index]]
+) -> dict[str, frozenset[str]]:
+    """path -> receivers typed as a sibling there, read inside a test method.
+
+    For the test-double pass, which deletes a test reading the member through
+    one: the sibling's member goes with the wrapper. Keyed by file, since a
+    name proves nothing outside the file whose binding was proven.
+
+    That pass matches a read of ANY of the run's wrappers through the name,
+    so a name stays only where every wrapper read through it in the file
+    proved it too (the profile drops a name it cannot prove for the whole
+    file).
+    """
+    found: dict[str, set[str]] = {}
+    proven: dict[tuple[str, str], set[str]] = {}
+    for wrapper, index in qualified:
+        for path in index.parsed:
+            same, occurrences = _occurrences_in(language, path, wrapper, index)
+            if not same:
+                continue
+            for o in occurrences:
+                if o.reason == SIBLING_RECEIVER and o.in_test_double and o.receiver:
+                    found.setdefault(path, set()).add(o.receiver)
+                    proven.setdefault((wrapper.label, path), set()).add(o.receiver)
+    from flag_cleanup import mock_stubs
+
+    result: dict[str, frozenset[str]] = {}
+    for path, names in found.items():
+        source = _read(path) or ""
+        kept = frozenset(
+            name
+            for name in names
+            if all(
+                name in proven.get((wrapper.label, path), ())
+                # Deciding what STAYS: any spelling counts, qualified or not.
+                or not mock_stubs.csharp_receiver_read({name}, {wrapper.name}, reads_only=False).search(source)
+                for wrapper, _ in qualified
+            )
+        )
+        if kept:
+            result[path] = kept
+    return result
+
+
+def fake_settings(
+    language: str, qualified: list[tuple[Wrapper, wrapper_jvm.Index]]
+) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[tuple[str, str, bool]]], frozenset[str]]:
+    """C#: ``(path -> knob receivers, path -> fake owners, test paths)`` for
+    the test-double pass: the receivers proven typed as a test fake and
+    written through its knob, the fakes whose simple name is proven to mean
+    them where they are built, and the files of a test project, where those
+    and helper pins may be resolved. Judged against every qualified
+    wrapper's fakes at once, since the pass matches every knob name of the
+    run on every receiver it is given."""
+    if language != "csharp":
+        return {}, {}, frozenset()
+    from flag_cleanup import wrapper_csharp
+
+    fakes = wrapper_csharp.fakes_of(w for w, _ in qualified)
+    paths = sorted({path for _, index in qualified for path in index.parsed})
+    receivers: dict[str, frozenset[str]] = {}
+    owners: dict[str, frozenset[tuple[str, str, bool]]] = {}
+    tests: set[str] = set()
+    repo_dir = qualified[0][1].repo_dir if qualified else ""
+    for path in paths:
+        if wrapper_csharp._test_project(path, repo_dir) is not True:
+            continue
+        tests.add(path)
+        source = _read(path)
+        if source is None or not fakes:
+            continue
+        names = wrapper_csharp.knob_receivers(path, source, fakes, repo_dir)
+        if names:
+            receivers[path] = names
+        built = wrapper_csharp.knob_owners(path, source, fakes, repo_dir)
+        if built:
+            owners[path] = built
+    return receivers, owners, frozenset(tests)
 
 
 def _foreign_lines(path: str, name: str) -> list[tuple[int, str]]:
@@ -427,13 +686,15 @@ def _string_mentions(path: str, name: str, templates: bool = False) -> list[tupl
     root = _parse_for(path, source) if source is not None else None
     if root is None:
         return []
-    strings = _profile_for(path).strings
+    lang = _profile_for(path)
     prefix = r"\$?" if templates else ""
     word = re.compile(rf"(?<![\w$]){prefix}{re.escape(name)}(?![\w$])")
     return [
         (line_of(node), text_of(node))
         for node in cross_file_keys.walk(root)
-        if node.type in strings and word.search(node.text.decode("utf-8", "replace"))
+        if node.type in lang.strings
+        and word.search(node.text.decode("utf-8", "replace"))
+        and not (lang.test_title is not None and lang.test_title(path, source, node))
     ]
 
 
@@ -450,8 +711,9 @@ def prove_all(
     says whether this run may rewrite a file: a proven call it may not is
     left, and reported, like any other.
     """
-    lang = profile(language)
     plan = WrapperPlan(findings=list(findings))
+    lang = profile(language)
+    counts = lang.mention_counts if lang is not None else None
     kept: list[Wrapper] = []
     incomplete: set[str] = set()
     receivers: dict[str, set[str]] = {}
@@ -463,13 +725,20 @@ def prove_all(
                 for line, text in _foreign_lines(path, wrapper.name)
             ]
         for path in index.unparsed:
-            refused += [
-                Finding(path, line, UNPARSED_MENTION, text, wrapper.label)
-                for line, text in _foreign_lines(path, wrapper.name)
-            ]
+            if counts is None or counts(index, path, "unparsed"):
+                refused += [
+                    Finding(path, line, UNPARSED_MENTION, text, wrapper.label)
+                    for line, text in _foreign_lines(path, wrapper.name)
+                ]
         refused += [
             Finding(path, line, OTHER_LANGUAGE, text, wrapper.label)
             for path, line, text in index.synthetic
+        ]
+        # A module object handed on can call the wrapper by a computed name
+        # (TypeScript and JavaScript only).
+        refused += [
+            Finding(path, line, RECEIVER_UNPROVEN, text, wrapper.label)
+            for path, line, text in getattr(index, "escapes", ())
         ]
         if wrapper.interface is not None and not rewritable(wrapper.interface.path):
             refused.append(
@@ -483,10 +752,11 @@ def prove_all(
             )
         marks: list[tuple[str, kotlin_sentinel.Span, str | None]] = []
         for path in index.parsed:
-            refused += [
-                Finding(path, line, UNPARSED_MENTION, text, wrapper.label)
-                for line, text in _string_mentions(path, wrapper.name, wrapper.kind == "property")
-            ]
+            if counts is None or counts(index, path, "string"):
+                refused += [
+                    Finding(path, line, UNPARSED_MENTION, text, wrapper.label)
+                    for line, text in _string_mentions(path, wrapper.name, wrapper.kind == "property")
+                ]
             same, occurrences = _occurrences_in(language, path, wrapper, index)
             for o in occurrences:
                 if not same:
@@ -663,10 +933,13 @@ def _leftovers(
     so does any word-boundary match in a file this tool cannot parse. For a
     top-level function, an import in a ``removable`` file does not count: the
     close-out deletes it. A getter is also read from Java as ``getX()``.
+    A profile with its own judgement (``Profile.leftovers``) answers instead.
     """
     from flag_cleanup import cross_file_keys, wrapper_jvm
 
     lang = profile(wrapper.language)
+    if lang.leftovers is not None:
+        return lang.leftovers(repo_dir, wrapper)
     foreign = (
         lang.foreign_extensions if lang.foreign_extensions is not None else wrapper_jvm.FOREIGN_EXTENSIONS
     )
@@ -741,9 +1014,57 @@ def _without_member(path: str, name: str, expected: int = 1) -> tuple[str, str] 
     after = source
     for member in sorted(members, key=lambda n: n.start_byte, reverse=True):
         start = mock_stubs._with_leading_comments(member, data)
-        text = data[start : member.end_byte].decode("utf-8", "replace")
-        after = unused._delete_method(after, unused.Candidate(name, start, member.end_byte, "method", text))
+        end = _member_end(lang, member)
+        text = data[start:end].decode("utf-8", "replace")
+        after = unused._delete_method(after, unused.Candidate(name, start, end, "method", text))
     return source, after
+
+
+def _member_end(lang: Profile | None, member: Node) -> int:
+    return lang.member_end(member) if lang is not None and lang.member_end is not None else member.end_byte
+
+
+def _without_spans(path: str, spans: list[tuple[int, int]], name: str) -> tuple[str, str] | None:
+    """``(before, after)`` for ``path`` with exactly these declarations of
+    ``name`` deleted, whole lines and their leading comments with them;
+    ``None`` when a span no longer starts and ends one there."""
+    from flag_cleanup import mock_stubs, unused
+
+    source = _read(path)
+    root = _parse_for(path, source) if source is not None else None
+    lang = _profile_for(path)
+    if root is None or lang is None or lang.members is None:
+        return None
+    nodes = {n.start_byte: n for n in lang.members(root, name)}
+    data = source.encode("utf-8")
+    after = source
+    for start, end in sorted(set(spans), reverse=True):
+        member = nodes.get(start)
+        if member is None or member.end_byte != end:
+            return None
+        begin = mock_stubs._with_leading_comments(member, data)
+        finish = _member_end(lang, member)
+        text = data[begin:finish].decode("utf-8", "replace")
+        after = unused._delete_method(after, unused.Candidate(name, begin, finish, "method", text))
+    return source, after
+
+
+def _current_span(sibling: Sibling, summaries: list) -> tuple[int, int] | None:
+    """The sibling member's span in its file as it is now. A file this run
+    rewrote has moved: the member is found again by its own bytes, which
+    must still occur exactly once; ``None`` otherwise."""
+    summary = next(
+        (s for s in summaries if str(Path(s.path).resolve()) == sibling.path and s.original_content != s.content),
+        None,
+    )
+    if summary is None:
+        return sibling.start, sibling.end
+    member = summary.original_content.encode("utf-8")[sibling.start : sibling.end]
+    current = summary.content.encode("utf-8")
+    if not member or current.count(member) != 1:
+        return None
+    start = current.index(member)
+    return start, start + len(member)
 
 
 def close_out(
@@ -752,6 +1073,7 @@ def close_out(
     summaries: list,
     unprocessable: Iterable[str],
     rewrite: Callable,
+    treatment: bool = True,
 ) -> tuple[list, list[Finding]]:
     """Delete each wrapper nothing calls any more; report every wrapper.
 
@@ -759,8 +1081,13 @@ def close_out(
     call, so every one was marked and folded -- its own read was folded (its
     file was rewritten, and not left unprocessed), and a fresh re-scan of the
     repository finds its name nowhere else. Its interface member goes with it,
-    since an implementation cannot be removed from under one. Anything short
-    of that keeps both, and the wrapper is ``partial``.
+    since an implementation cannot be removed from under one, and so does
+    every inert sibling's member, each reported as a ``sibling`` row with
+    what it returned and the ``treatment`` value its callers now see. Anything
+    short of that keeps them all, and the wrapper is ``partial``; so does a
+    sibling sharing the wrapper's or the interface's file, which one edit
+    there already holds, and one whose file this run rewrote so that its
+    member cannot be found again by its own bytes (``sibling-not-inert``).
 
     Returns the summaries with the deletions in them, written to disk, and
     every finding: one ``complete``/``partial`` row per wrapper first, then
@@ -809,6 +1136,27 @@ def close_out(
                     edits.append(
                         (wrapper.interface.path, _without_member(wrapper.interface.path, wrapper.name))
                     )
+                by_path: dict[str, list[tuple[int, int] | None]] = {}
+                for sibling in wrapper.siblings:
+                    by_path.setdefault(sibling.path, []).append(_current_span(sibling, summaries))
+                held = {wrapper.path} | ({wrapper.interface.path} if wrapper.interface is not None else set())
+                moved: list[Finding] = []
+                for sibling_path, spans in sorted(by_path.items()):
+                    # A sibling in the wrapper's or the interface's file:
+                    # that file's edit counts the declarations of the name,
+                    # so refuse rather than edit it twice. Qualification
+                    # already refuses one; this stays as the belt.
+                    if sibling_path in held or None in spans:
+                        edit = None
+                    else:
+                        edit = _without_spans(sibling_path, [s for s in spans if s is not None], wrapper.name)
+                    if edit is None:
+                        moved += [
+                            Finding(s.path, s.line, SIBLING_NOT_INERT, f"{s.owner}.{wrapper.name}", wrapper.label)
+                            for s in wrapper.siblings
+                            if s.path == sibling_path
+                        ]
+                    edits.append((sibling_path, edit))
                 if wrapper.kind == "function":
                     for path in sorted(removable - {wrapper.path}):
                         spans = _function_imports(path, wrapper)
@@ -819,12 +1167,22 @@ def close_out(
                                 raw = raw[:start] + raw[end:]
                             edits.append((path, (before, raw.decode("utf-8"))))
                 if not all(edit is not None for _, edit in edits):
-                    extra.append(
-                        Finding(wrapper.path, wrapper.line, NAME_NOT_UNIQUE, wrapper.label, wrapper.label)
-                    )
+                    # A sibling member this run moved out of reach, or one
+                    # in a file another edit holds, is named at the sibling;
+                    # anything else is a second declaration of the name
+                    # where one was expected.
+                    others = all(e is not None for p, e in edits if p not in by_path)
+                    if moved and others:
+                        extra += moved
+                    else:
+                        extra.append(
+                            Finding(wrapper.path, wrapper.line, NAME_NOT_UNIQUE, wrapper.label, wrapper.label)
+                        )
                 else:
+                    from flag_cleanup import mock_stubs
+
                     for path, (before, after) in edits:
-                        Path(path).write_text(after, encoding="utf-8")
+                        mock_stubs._write_exact(path, after)
                         at = next(
                             (i for i, s in enumerate(summaries) if str(Path(s.path).resolve()) == path),
                             None,
@@ -835,5 +1193,10 @@ def close_out(
                             old = summaries[at]
                             summaries[at] = rewrite(old.path, old.original_content, after)
                     status = COMPLETE
+                    value = "true" if treatment else "false"
+                    extra += [
+                        Finding(s.path, s.line, SIBLING, _sibling_note(s, wrapper.name, value), wrapper.label)
+                        for s in wrapper.siblings
+                    ]
         statuses.append(Finding(wrapper.path, wrapper.line, status, wrapper.label, wrapper.label))
     return summaries, statuses + list(plan.findings) + extra

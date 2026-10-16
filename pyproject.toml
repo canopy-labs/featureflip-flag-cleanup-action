@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.5.0"
+version = "1.6.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -241,11 +241,27 @@ dependencies = [
     # files and returned an empty rewrite, so a flag with live reads reported
     # `no-changes`. The walk is now serial, and a walk error fails the run. No
     # grammar rev moved, so `+canopy.3` stays.
-    "polyglot-piranha==0.17.2",
+    #
+    # 0.17.3 (piranha#117). Compiled tree-sitter queries are cached for the
+    # life of the process instead of per engine call. Rewrites are unchanged;
+    # what changes is cost. Compiling Swift's rules was ~2.7s of every Swift
+    # call and is now paid once per process, and every other language skips
+    # its recompile too. No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.17.4 (piranha#119). The TS cascade folds `true ?? x` / `false ?? x` to
+    # the literal (TS2869 otherwise), rewrites `for (init; true; update)` to
+    # `for (init; ; update)` and `do B while (true);` to `while (true) B`, the
+    # two constant loops `no-constant-condition` rejects. `syntax` treats a
+    # condition-less `for` as infinite for that reason. No grammar rev moved,
+    # so `+canopy.3` stays.
+    "polyglot-piranha==0.17.4",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
     "httpx>=0.27,<1",
+    # Reads GitHub Actions workflows to find which projects a pack step packs
+    # (csharp_workflows.py). safe_load only. Also used by the packaging tests.
+    "pyyaml>=6",
     # Backs the two safety gates in flag_cleanup.ts_syntax (post-transform parse
     # check + pre-flight shadow check). Pure wheels, no Node in the action image.
     # Grammar-version-sensitive like polyglot-piranha, so capped on minor.
@@ -377,17 +393,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
-    # Available for `-n 16`, but deliberately NOT enabled by default — see the
-    # "Test wall-clock" section in CLAUDE.md. Under xdist the metamorphic suite
-    # produces a residue mismatch that never appears serially, and a suite whose
-    # whole purpose is catching nondeterministic rewrites must not be run in a
-    # mode that introduces some.
+    # `-n N` for parallel runs; CI uses `-n 2`. Not in `addopts`, so the worker
+    # count stays a choice made per machine. The skip ledger enforces under it.
     "pytest-xdist>=3.5",
     # `action.yml` is parsed, not regexed, by the packaging and wrapper guards:
     # those tests assert a relationship between twelve inputs and twelve env
     # entries, and a regex that drifts with the file's indentation would fail
     # for reasons that have nothing to do with the property under test.
-    "pyyaml>=6",
+    # (PyYAML itself is a runtime dependency now; see `dependencies`.)
     # The build backend, so `pip wheel --no-build-isolation` needs no network at
     # test time. Same package `[build-system].requires` names; pinned to nothing
     # for the same reason it is unpinned there.

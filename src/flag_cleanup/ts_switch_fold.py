@@ -51,8 +51,18 @@ only true-treatment rewrite, exactly as in PHP:
   goes; arms above keep their precedence. A ``default:`` ABOVE the flag's arm is
   declined: promoting would emit a second one, which does not parse.
 
+**A read can also be the SUBJECT, and then the fold leaves ``switch (false)``.**
+``switch (<read>) { case true: … case false: … }`` becomes ``switch (true)`` or
+``switch (false)``. The first is the guard above, unchanged. The second compares
+every arm against ``false`` instead, so the verdicts swap: ``case false:`` always
+matches and ``case true:`` never does, and the same two rewrites finish it. It
+has to be finished, not left: TypeScript rejects ``case true:`` under a
+``false`` subject (TS2678, the types are not comparable). A non-literal arm under
+``switch (false)`` matches when its value is ``false``, which is no condition a
+fold can decide, so it stays as written and keeps its place in the order.
+
 A ``switch (value) { case true: … }`` compares a value and is ordinary customer
-code; nothing here touches a switch whose subject is anything but ``true``.
+code; nothing here touches a switch whose subject is not a boolean literal.
 """
 
 from __future__ import annotations
@@ -71,7 +81,7 @@ _ARMS = frozenset({"switch_case", "switch_default"})
 
 
 def fold_switch_true(before: str, after: str, language: str) -> str:
-    """Fold every ``switch (true)`` arm the transform left with a literal value."""
+    """Fold every literal-subject ``switch`` arm the transform left with a literal value."""
     return fold_to_fixpoint(
         before,
         after,
@@ -81,7 +91,7 @@ def fold_switch_true(before: str, after: str, language: str) -> str:
 
 
 def literal_arms(source: str, language: str) -> int:
-    """How many ``switch (true)`` arms in ``source`` carry a boolean literal.
+    """How many arms of a ``switch (true)``/``switch (false)`` carry a boolean literal.
 
     Also what `syntax.py` counts for the TypeScript family's residue gate, so
     the shapes this module declines and the shapes the gate refuses are one
@@ -90,7 +100,7 @@ def literal_arms(source: str, language: str) -> int:
     return sum(
         1
         for node in _iter(_parse(source, language))
-        if _is_true_switch(node)
+        if _subject(node) is not None
         for arm in _arms(node)
         if _literal(arm) is not None
     )
@@ -108,11 +118,17 @@ def _unparenthesised(node: Node) -> Node:
     return node
 
 
-def _is_true_switch(node: Node) -> bool:
+def _subject(node: Node) -> bool | None:
+    """The boolean literal ``node`` switches on, or None for any other node."""
     if node.type != "switch_statement":
-        return False
+        return None
     value = node.child_by_field_name("value")
-    return value is not None and _unparenthesised(value).type == "true"
+    return None if value is None else _boolean(value)
+
+
+def _boolean(node: Node) -> bool | None:
+    kind = _unparenthesised(node).type
+    return True if kind == "true" else False if kind == "false" else None
 
 
 def _arms(switch: Node) -> list[Node]:
@@ -126,10 +142,7 @@ def _literal(arm: Node) -> bool | None:
     if arm.type != "switch_case":
         return None
     value = arm.child_by_field_name("value")
-    if value is None:
-        return None
-    kind = _unparenthesised(value).type
-    return True if kind == "true" else False if kind == "false" else None
+    return None if value is None else _boolean(value)
 
 
 def _statements(node: Node, field: str | None) -> list[Node]:
@@ -157,19 +170,20 @@ def _arm_terminates(arm: Node) -> bool:
 
 def _fold_once(source: str, language: str) -> str | None:
     for switch in _iter(_parse(source, language)):
-        if not _is_true_switch(switch):
+        subject = _subject(switch)
+        if subject is None:
             continue
         arms = _arms(switch)
         if not arms or not all(_arm_terminates(arm) for arm in arms[:-1]):
             continue
         for index, arm in enumerate(arms):
-            verdict = _literal(arm)
-            if verdict is None:
+            literal = _literal(arm)
+            if literal is None:
                 continue
             rewritten = (
-                _delete_arm(source, switch, arm, arms)
-                if verdict is False
-                else _promote_to_default(source, arm, arms, index)
+                _promote_to_default(source, arm, arms, index)
+                if literal is subject
+                else _delete_arm(source, switch, arm, arms)
             )
             if rewritten is not None:
                 return rewritten
@@ -180,7 +194,7 @@ def _delete_arm(source: str, switch: Node, arm: Node, arms: list[Node]) -> str |
     """Drop an arm that can never match.
 
     When it was the only arm the whole statement goes: ``switch (true) {}``
-    evaluates a constant and does nothing. Only as a direct child of a block,
+    (or ``switch (false) {}``) evaluates a constant and does nothing. Only as a direct child of a block,
     since a labelled or unbraced position would be left holding nothing.
     """
     if len(arms) == 1:

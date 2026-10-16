@@ -8,10 +8,11 @@ the constructor with nothing reading it, and the compiler warns CS9113
 such warning, so this is the one place a fold that leaves a client behind
 breaks the build.
 
-The parameter is reported, never deleted: removing it changes the constructor
+This module only finds the parameter. Removing it changes the constructor
 every ``new Svc(…)`` and every registration that constructs the type calls,
-and those live in files this run may not even list. The pull request names it
-so the reviewer can make that change.
+and those can live anywhere in the repository, so it is removed only when
+:mod:`flag_cleanup.ctor_param_removal` can prove every caller. Otherwise the
+pull request names it so the reviewer can make that change.
 
 The same differential as :mod:`flag_cleanup.unused` decides it: **a parameter
 is reported only if it was read BEFORE the fold and is read nowhere AFTER

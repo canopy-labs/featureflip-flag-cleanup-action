@@ -814,17 +814,38 @@ def _dry_run_caveats(
     if stranded:
         notes.append(f"{len(stranded)} unreachable statement(s) would be deleted")
     unread = sum(1 for _, kind, _ in bindings if kind == "unread parameter")
+    unread_members = sum(1 for _, kind, _ in bindings if kind == "unread member")
     unread_bindings = sum(1 for _, kind, _ in bindings if kind == "unread binding")
     emptied = sum(1 for _, kind, _ in bindings if kind == "emptied override")
     dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
-    cleaned = len(bindings) - unread - unread_bindings - emptied - dropped
+    removed_ctor = sum(1 for _, kind, _ in bindings if kind == "removed parameter")
+    changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
+    kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
+    cleaned = (
+        len(bindings) - unread - unread_members - unread_bindings - emptied - dropped
+        - removed_ctor - changed_ctor - kept_locals
+    )
     if cleaned:
         notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
     if dropped:
         notes.append(f"{dropped} unused parameter(s) would be removed")
+    if removed_ctor:
+        notes.append(
+            f"{removed_ctor} constructor parameter(s) would be removed, "
+            "with their callers' arguments"
+        )
+    if kept_locals:
+        notes.append(
+            f"{kept_locals} local(s) would be left unread after their argument was removed"
+        )
     if unread:
         notes.append(
             f"{unread} C# primary-constructor parameter(s) would be left unread (CS9113)"
+        )
+    if unread_members:
+        notes.append(
+            f"{unread_members} TypeScript/JavaScript private member(s) would be "
+            "left unread (TS6133/TS6138)"
         )
     if unread_bindings:
         notes.append(
@@ -842,14 +863,24 @@ def _dry_run_caveats(
             "the flag to the branch being removed"
         )
     removed_tests = sum(1 for _, kind, _ in test_doubles if kind == "test")
+    sibling_tests = sum(1 for _, kind, _ in test_doubles if kind == "sibling test")
+    pinned = sum(1 for _, kind, _ in test_doubles if kind == "pinned parameter")
     if removed_tests:
         notes.append(
             f"{removed_tests} test(s) whose mock returns the removed value "
             "would be deleted"
         )
-    if len(test_doubles) > removed_tests:
+    if sibling_tests:
         notes.append(
-            f"{len(test_doubles) - removed_tests} mock stub/verification line(s) "
+            f"{sibling_tests} test(s) reading through a deleted sibling "
+            "implementation would be deleted"
+        )
+    if pinned:
+        notes.append(f"{pinned} test helper parameter(s) would be removed")
+    mock_lines = len(test_doubles) - removed_tests - sibling_tests - pinned
+    if mock_lines:
+        notes.append(
+            f"{mock_lines} mock stub/verification line(s) "
             "of the removed read would be deleted"
         )
     if residue.stubbed:
@@ -868,6 +899,9 @@ def _dry_run_caveats(
             f"{len(statuses)} keyless wrapper(s) would be inlined "
             f"({statuses.count('complete')} complete, {statuses.count('partial')} partial)"
         )
+    siblings = sum(1 for f in wrapper_findings if f[2] == "sibling")
+    if siblings:
+        notes.append(f"{siblings} sibling implementation(s) would be deleted with its wrapper")
     if wrappers:
         notes.append(
             f"{len(wrappers)} member(s) would be left returning a constant that "

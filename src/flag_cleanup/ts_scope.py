@@ -9,8 +9,12 @@ scope walk would have proven.
 Types are not inferred either. A receiver's class is read off what is
 written: a parameter's or field's annotation naming a class, a ``new C()``
 initializer, an import of a module-level ``const x = new C()``, or the class
-name itself for a static call. Anything else (a union, a generic, ``any``,
-an interface, a call's result) has no class here.
+name itself for a static call. A module-level ``const x = { ... }`` is its
+own owner, the way a class is for a static call. Anything else (a union, a
+generic, ``any``, an interface, a call's result) has no class here.
+
+Specifiers resolve as :func:`resolve` reads them, which also follows a
+JavaScript file's declaration file and an explicit ``baseUrl``.
 """
 
 from __future__ import annotations
@@ -122,14 +126,35 @@ class Import:
     type_only: bool = False
     #: At the top of the file, where a proof needs it.
     top: bool = True
+    #: The specifier as written (``"./flags"``, ``"ts-mockito"``); ``None`` when
+    #: it is not a plain string.
+    specifier: str | None = None
+
+
+def resolve(reader_path: str, specifier: str, repo_dir: str) -> str | None:
+    """The file an import on the wrapper path reaches, read as
+    :func:`cross_file_ts.resolve_specifier` reads it, and also through a
+    JavaScript file's own declaration file (``flags.js`` beside
+    ``flags.d.ts``) and an explicit ``baseUrl``, unless the specifier may
+    name a package a runtime reads first. Every specifier the proof or the
+    test-double checks follow is read this way, so they agree."""
+    from flag_cleanup import wrapper_ts  # it imports this module
+
+    return cross_file_ts.resolve_specifier(
+        reader_path,
+        specifier,
+        repo_dir,
+        beside_declarations=True,
+        base_url=lambda reader, spec: not wrapper_ts.may_be_package(reader, spec, repo_dir),
+    )
 
 
 def _imports_of(root: Node, path: str, repo_dir: str) -> list[Import]:
-    def resolve(node: Node | None) -> str | None:
+    def resolve_node(node: Node | None) -> str | None:
         spec = cross_file_ts._string_value(node)
         if spec is None:
             return None
-        found = cross_file_ts.resolve_specifier(path, spec, repo_dir)
+        found = resolve(path, spec, repo_dir)
         return _resolved(found) if found is not None else None
 
     found: list[Import] = []
@@ -137,23 +162,28 @@ def _imports_of(root: Node, path: str, repo_dir: str) -> list[Import]:
     for node in cross_file_keys.walk(root):
         if node.type == "import_statement":
             top = node.parent is not None and node.parent.type == "program"
-            module = resolve(node.child_by_field_name("source"))
+            source = node.child_by_field_name("source")
+            module = resolve_node(source)
+            specifier = cross_file_ts._string_value(source)
             whole_type = any(c.type == "type" for c in node.children)
             for part in node.named_children:
                 if part.type == "import_require_clause":
                     name = next((c for c in part.named_children if c.type == "identifier"), None)
                     if name is not None:
-                        found.append(Import(text(name), "=", resolve(part.child_by_field_name("source")), whole_type, top))
+                        source = part.child_by_field_name("source")
+                        found.append(
+                            Import(text(name), "=", resolve_node(source), whole_type, top, cross_file_ts._string_value(source))
+                        )
                     continue
                 if part.type != "import_clause":
                     continue
                 for clause in part.named_children:
                     if clause.type == "identifier":
-                        found.append(Import(text(clause), "default", module, whole_type, top))
+                        found.append(Import(text(clause), "default", module, whole_type, top, specifier=specifier))
                     elif clause.type == "namespace_import":
                         name = next((c for c in clause.named_children if c.type == "identifier"), None)
                         if name is not None:
-                            found.append(Import(text(name), None, module, whole_type, top))
+                            found.append(Import(text(name), None, module, whole_type, top, specifier=specifier))
                     elif clause.type == "named_imports":
                         for spec in clause.named_children:
                             if spec.type != "import_specifier":
@@ -164,7 +194,7 @@ def _imports_of(root: Node, path: str, repo_dir: str) -> list[Import]:
                             if imported is None or local is None:
                                 continue
                             type_only = whole_type or any(c.type == "type" for c in spec.children)
-                            found.append(Import(text(local), text(imported), module, type_only, top))
+                            found.append(Import(text(local), text(imported), module, type_only, top, specifier=specifier))
         elif node.type == "variable_declarator" and require_global:
             value = node.child_by_field_name("value")
             target = node.child_by_field_name("name")
@@ -177,7 +207,8 @@ def _imports_of(root: Node, path: str, repo_dir: str) -> list[Import]:
             specs = [] if args is None else [c for c in args.named_children if c.type != "comment"]
             if len(specs) != 1:
                 continue
-            module = resolve(specs[0])
+            module = resolve_node(specs[0])
+            specifier = cross_file_ts._string_value(specs[0])
             lexical = node.parent
             top = (
                 lexical is not None
@@ -187,12 +218,12 @@ def _imports_of(root: Node, path: str, repo_dir: str) -> list[Import]:
                 and lexical.parent.type == "program"
             )
             if target.type == "identifier":
-                found.append(Import(text(target), None, module, False, top))
+                found.append(Import(text(target), None, module, False, top, specifier=specifier))
             elif target.type == "object_pattern":
                 # Only the shorthand `{ f }`: a renaming `{ f: g }` is not
                 # needed by the spec's call shapes, and refusing it is safe.
                 found += [
-                    Import(text(p), text(p), module, False, top)
+                    Import(text(p), text(p), module, False, top, specifier=specifier)
                     for p in target.named_children
                     if p.type == "shorthand_property_identifier_pattern"
                 ]
@@ -271,6 +302,22 @@ def top_declarations(root: Node, kinds: tuple[str, ...], name: str) -> list[Node
         if declared is not None and text(declared) == name:
             found.append(node)
     return found
+
+
+def holds_object_literal(declarator: Node | None) -> bool:
+    """Whether a module-level ``const`` declarator is ``name = { ... }`` with no
+    written type: the object is then its own owner, as a class is of its
+    static members."""
+    return (
+        declarator is not None
+        and declarator.type == "variable_declarator"
+        and declarator.child_by_field_name("type") is None
+        and (value := declarator.child_by_field_name("value")) is not None
+        and value.type == "object"
+        and declarator.parent is not None
+        and top_level(declarator.parent)
+        and any(c.type == "const" for c in declarator.parent.children)
+    )
 
 
 def top_value(root: Node, name: str) -> Node | None:
@@ -428,8 +475,11 @@ class Files:
         if source is None:
             if cached is not None:
                 return cached
+            from flag_cleanup import mock_stubs
+
             try:
-                source = Path(key).read_text(encoding="utf-8")
+                # Byte-exact, as the wrapper path's other readers are.
+                source = mock_stubs._read_exact(key)
             except (OSError, UnicodeDecodeError):
                 return None
         if cached is not None and cached.source == source:
@@ -511,8 +561,9 @@ class Files:
         return None
 
     def _exported(self, module: File, name: str) -> TypeRef | None:
-        """``name`` at the top of ``module``: the class itself, or the instance
-        a ``const name = new C()`` holds."""
+        """``name`` at the top of ``module``: the class itself, the object a
+        ``const name = { ... }`` holds, or the instance a ``const name = new
+        C()`` holds."""
         if module.binding(name) is None or not _exports_directly(module.root, name):
             return None
         if len(top_declarations(module.root, _CLASSES, name)) == 1:
@@ -520,6 +571,8 @@ class Files:
         declarator = top_value(module.root, name)
         if declarator is None:
             return None
+        if holds_object_literal(declarator):
+            return TypeRef(module.path, name, static=True)
         made = self.constructed(declarator.child_by_field_name("value"), module)
         written = declarator.child_by_field_name("type")
         if written is not None and self.annotated(written, module) != made:
@@ -537,6 +590,8 @@ class Files:
         if parent.type == "required_parameter" and parent.child_by_field_name("pattern") == bound:
             return self.annotated(parent.child_by_field_name("type"), file)
         if parent.type == "variable_declarator" and parent.child_by_field_name("name") == bound:
+            if holds_object_literal(parent):
+                return TypeRef(file.path, name, static=True)
             made = self.constructed(parent.child_by_field_name("value"), file)
             written = parent.child_by_field_name("type")
             if written is None:

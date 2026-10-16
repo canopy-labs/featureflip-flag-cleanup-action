@@ -332,3 +332,69 @@ jobs:
           git fetch origin "refs/tags/v${VERSION}:refs/tags/v${VERSION}" -f
           git tag -f -a "${MAJOR}" "v${VERSION}^{}" -m "Release ${MAJOR} (v${VERSION})"
           git push origin "refs/tags/${MAJOR}" --force
+
+  # The CircleCI orb in `orb/` has its own version, in `orb/VERSION`, and it
+  # moves only when `orb/orb.yml` does: the orb's default image is the major
+  # tag `promote` moves, so an Action release reaches every orb user without
+  # a new orb version. `scripts/orb_version.py` compares the file with what
+  # the registry holds for that version, and decides.
+  orb:
+    name: Publish the CircleCI orb if its version is new
+    needs: [version, promote]
+    # After `promote`, so an orb that needs a new image never goes out ahead of
+    # it. But most pushes cut no Action release, which SKIPS `promote`, and an
+    # orb change has to ship then too. `!failure()` lets a skipped `promote`
+    # through and still stops the orb when any part of a release failed.
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    # Read-only: this job runs a downloaded binary, and needs no write to this
+    # repository or its packages.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compare orb/orb.yml with the registry
+        id: orb
+        run: python3 scripts/orb_version.py
+
+      # Pinned to a version AND its tarball's hash, written here rather than
+      # read from the release's own checksums file: a checksum fetched beside
+      # the tarball proves only that the download was not corrupted, not that
+      # the release is the one that was reviewed. Bumping the CLI means
+      # changing both values together.
+      - name: Install the CircleCI CLI
+        if: steps.orb.outputs.publish == 'true'
+        env:
+          CLI_VERSION: '1.5.0'
+          CLI_SHA256: 'b9bd70c0fbd3f5738ae950e93a11d464f160cf39364b186cea6a94ed21ba682e'
+        run: |
+          TARBALL="${RUNNER_TEMP}/circleci.tar.gz"
+          curl -fsSL -o "$TARBALL" \
+            "https://github.com/CircleCI-Public/circleci-cli/releases/download/v${CLI_VERSION}/circleci-cli_${CLI_VERSION}_linux_amd64.tar.gz"
+          echo "${CLI_SHA256}  ${TARBALL}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/circleci"
+          tar -xzf "$TARBALL" -C "${RUNNER_TEMP}/circleci" circleci
+          echo "${RUNNER_TEMP}/circleci" >> "$GITHUB_PATH"
+
+      # CIRCLE_TOKEN is a personal API token of a CircleCI organization owner:
+      # publishing a production orb version requires one. The CLI reads it
+      # from the environment, so it never appears on a command line.
+      - name: Validate and publish
+        if: steps.orb.outputs.publish == 'true'
+        env:
+          CIRCLE_TOKEN: ${{ secrets.CIRCLE_TOKEN }}
+          CIRCLE_NO_UPDATE_CHECK: '1'
+          REF: ${{ steps.orb.outputs.ref }}
+        run: |
+          if [ -z "$CIRCLE_TOKEN" ]; then
+            echo "::error::the CIRCLE_TOKEN secret is not set, so ${REF} cannot be published"
+            exit 1
+          fi
+          circleci orb validate orb/orb.yml
+          circleci orb publish orb/orb.yml "$REF"
+
+      # Read back anonymously, the way every pipeline that uses the orb will.
+      - name: Verify the registry serves what was published
+        if: steps.orb.outputs.publish == 'true'
+        run: python3 scripts/orb_version.py --expect-published

@@ -84,6 +84,7 @@ from polyglot_piranha import PiranhaArguments, execute_piranha
 
 from flag_cleanup import (
     contradicting,
+    ctor_param_removal,
     cross_file_dart,
     cross_file_keys,
     cross_file_kotlin,
@@ -93,6 +94,7 @@ from flag_cleanup import (
     mock_stubs,
     source_index,
     ts_bound_overrides,
+    ts_dead_code,
     ts_fold,
     ts_gates,
     ts_param_pins,
@@ -127,6 +129,7 @@ from flag_cleanup.syntax import (
     refusal_reason,
 )
 from flag_cleanup.primary_constructor import unread_parameters
+from flag_cleanup.ts_unread_members import unread_members
 from flag_cleanup.ts_syntax import strip_dangling_type_separators
 from flag_cleanup.unused import MODULE_MARKER, remove_stranded_bindings
 
@@ -638,7 +641,9 @@ def candidate_files(
     which may be a keyless wrapper of this flag (one whose whole body is a
     read, judged loosely from the files above; see
     :func:`wrapper_inline.candidate_names`) is included as well, so the undo
-    snapshot covers the call sites the wrapper pass may rewrite. A caller in a
+    snapshot covers the call sites the wrapper pass may rewrite -- and, for
+    C#, a file naming a type that declares a member of such a name, where a
+    test may set a fake the test-double pass resolves. A caller in a
     configured sibling of the family (a ``.tsx`` caller of a ``.ts`` wrapper) is
     included too, under the exclusions above: it must not hold the key, nor
     mention a constant or a candidate wrapper another configured member
@@ -659,6 +664,13 @@ def candidate_files(
     names = wrapper_inline.candidate_names(found, language, flag_key, accessors)
     if not names:
         return found
+    if language == "csharp":
+        # A test sets a C# fake (an inert sibling) through its knob, spelling
+        # the fake but no wrapper; every type declaring a member of a
+        # candidate's name is a superset of the fakes.
+        from flag_cleanup import wrapper_csharp
+
+        names = names | wrapper_csharp.candidate_fake_owners(repo_dir, names)
     spec = _language_spec(language)
     root = Path(repo_dir)
     resolved_root = root.resolve()
@@ -1065,8 +1077,12 @@ class TransformOutcome:
     #: (that would change the constructor's signature) but is listed here with
     #: kind ``"unread parameter"`` and ``Type(<parameter>)`` as text, because
     #: CS9113 fails a ``TreatWarningsAsErrors`` build. See
-    #: :mod:`~flag_cleanup.primary_constructor`. The TypeScript family adds two
-    #: more kinds that name something KEPT, both reported and never edited:
+    #: :mod:`~flag_cleanup.primary_constructor`. The TypeScript family's
+    #: counterpart is kind ``"unread member"`` with ``Class.member`` as text: a
+    #: ``private`` or ``#`` member the fold left unread, TS6133/TS6138 under
+    #: ``noUnusedLocals``. See :mod:`~flag_cleanup.ts_unread_members`. The
+    #: family adds two more kinds that name something KEPT, both reported and
+    #: never edited:
     #: ``"unread binding"`` (the parameter or local an override deleted by
     #: :mod:`~flag_cleanup.ts_bound_overrides` was the last reader of) and
     #: ``"emptied override"`` (the line of an object literal the entry
@@ -1855,7 +1871,7 @@ def _transform_flag(
     # statement the stranded-statement pass deleted, is part of the shift this
     # has to measure. See :mod:`flag_cleanup.reindent` for the three artefact
     # shapes and why the INPUT is what holds the answer to all of them.
-    summaries = _reindent_folds(summaries, language)
+    summaries = _reindent_folds(summaries, language, doubles)
 
     # Delete each keyless wrapper nothing calls any more, and its interface
     # member. AFTER the reindent pass, for the reason the stranded-method pass
@@ -1863,8 +1879,12 @@ def _transform_flag(
     # shifts the next member's body out a level. Before that pass, which
     # removes the imports and private helpers the deletion strands.
     summaries, wrapper_rows = wrapper_inline.close_out(
-        wrappers, repo_dir, summaries, unprocessable, Rewrite
+        wrappers, repo_dir, summaries, unprocessable, Rewrite, treatment=treatment
     )
+    # A wrapper's test doubles were resolved on the strength of proof
+    # alone. If close-out kept a wrapper proof called complete, those edits
+    # describe a member that stays: refuse the flag rather than ship them.
+    _refuse_wrappers_kept_at_close_out(wrappers, wrapper_rows, doubles, summaries, language, flag_key)
 
     # Private methods the fold stranded, AFTER the reindent pass and still
     # before Gate 1. Whole-line deletions need no reindenting, and run earlier
@@ -1876,11 +1896,28 @@ def _transform_flag(
     )
     bindings = bindings + method_bindings
 
+    # The labels and `static {}` blocks the fold and the passes above left with
+    # nothing to do, which the customer's lint rejects. After the reindent pass,
+    # which reads either edit as a folded header and shifts what follows it.
+    if language in _TS_GRAMMARS:
+        summaries = _remove_ts_orphans(summaries, language)
+
     # C# primary-constructor parameters the fold left unread: CS9113, an error
-    # under TreatWarningsAsErrors. Reported, never edited — see
-    # `primary_constructor`. After the method pass, because a deleted private
-    # helper can be what last read the parameter.
-    bindings = bindings + _unread_primary_parameters(summaries, language, repo_dir)
+    # under TreatWarningsAsErrors — see `primary_constructor`. After the method
+    # pass, because a deleted private helper can be what last read the
+    # parameter. The TypeScript family's counterpart: a `private` or `#` member
+    # the fold left unread is TS6133/TS6138 under `noUnusedLocals` — see
+    # `ts_unread_members`. After the method pass for the same reason.
+    unread_constructor = _unread_primary_parameters(
+        summaries, language, repo_dir
+    ) + _unread_private_members(summaries, language, repo_dir)
+    # Remove the constructor parameters among them whose every caller can be
+    # proven, with each caller's argument; the rest stay reported. Still before
+    # Gate 1, which must judge the callers this rewrites too.
+    summaries, unread_constructor, removed_constructor = (
+        _remove_unread_constructor_parameters(summaries, language, unread_constructor, repo_dir)
+    )
+    bindings = bindings + unread_constructor + removed_constructor
     # A `const` left unread is deleted by the stranded-binding pass above like
     # any other local; only what is still on disk is reported as unread.
     on_disk = {os.path.relpath(s.path, repo_dir): s.content for s in summaries}
@@ -2004,6 +2041,72 @@ def _transform_flag(
     )
 
 
+def _refuse_wrappers_kept_at_close_out(
+    plan: wrapper_inline.WrapperPlan,
+    rows: list,
+    doubles: list[mock_stubs.Prepass] | None,
+    summaries: list,
+    language: str,
+    flag_key: str,
+) -> None:
+    """Roll the whole flag back when a wrapper proof called complete did
+    not end complete, and its test-double pass removed anything.
+
+    The pass deleted stubs, sibling tests, pins and knob writes because the
+    wrapper was going. Close-out can still keep it (its read was not folded,
+    a mention is left, a sibling's member cannot be deleted), and then each
+    of those edits is about a member that stays: a deleted test of surviving
+    code, a loose mock now answering ``false`` to a live read. Nothing is
+    re-resolved here, since the engine has edited the same test files since.
+    Refused the way Gate 1 refuses, with every file put back.
+    """
+    if language not in _STUBS_GATED_PER_WRAPPER or not plan.wrappers:
+        return
+    if not any(p.wrapper is not None and p.removals for p in doubles or ()):
+        return
+    complete = {f.wrapper for f in rows if f.reason == wrapper_inline.COMPLETE}
+    kept = [w for w in plan.wrappers if w.label in plan.complete and w.label not in complete]
+    if not kept:
+        return
+    changed = [s for s in summaries if s.original_content != s.content]
+    _restore(changed)
+    for stub_pass in reversed(doubles or ()):
+        stub_pass.restore_all()
+    spelled = {str(Path(s.path).resolve()): s.path for s in summaries}
+    reasons = {
+        spelled.get(w.path, w.path): (
+            f"the keyless wrapper {w.label} was kept after its test doubles were "
+            "resolved for its removal"
+        )
+        for w in kept
+    }
+    refused = sorted(reasons)
+    discarded = sorted({s.path for s in changed} - set(refused))
+    labels = ", ".join(w.label for w in kept)
+    logger.warning(
+        "refusing every edit for flag %r: the keyless wrapper(s) %s were proven complete, "
+        "but close-out kept them, and the test-double edits made for their removal "
+        "would describe code that stays. %d file(s) were rolled back",
+        flag_key,
+        labels,
+        len(changed),
+    )
+    raise UnsafeRewriteError(
+        f"the keyless wrapper(s) {labels} for flag {flag_key!r} were kept after their "
+        "test doubles were resolved for removal, so the rewrite was rolled back along "
+        f"with {len(discarded)} other file(s)",
+        refused=refused,
+        discarded=discarded,
+        reasons=reasons,
+    )
+
+
+#: The languages whose wrapper test-double edits are gated per wrapper: a
+#: stub, test or pin goes only with a wrapper that ends complete. Each one's
+#: stubs are resolved BEFORE proof, so a wrapper that stays has them put back.
+_STUBS_GATED_PER_WRAPPER = frozenset({"csharp", "java", "kt"})
+
+
 def _plan_wrappers(
     repo_dir: str,
     language: str,
@@ -2041,25 +2144,207 @@ def _plan_wrappers(
         for p in [*with_const, *without_const, *reader_paths]
     }
     found = wrapper_inline.discover_all(language, flag_key, accessors, folded)
-    qualified, refusals = wrapper_inline.qualify_all(repo_dir, found)
+    qualified, refusals = wrapper_inline.qualify_all(repo_dir, found, treatment)
     by_resolved = {str(Path(p).resolve()): p for p in paths}
+    stub_pass: mock_stubs.Prepass | None = None
+    def fakes(kept: frozenset[str]) -> dict:
+        """C#: the knobs and fake owners the pass may resolve: those of the
+        wrappers that complete, and of no fake that also serves one that stays
+        (its knob may be what a test is about)."""
+        staying = {
+            (s.namespace, s.owner) for w, _ in qualified if w.name in kept for s in w.siblings
+        }
+        going = [
+            s
+            for w, _ in qualified
+            if w.name not in kept
+            for s in w.siblings
+            if s.test and s.knob and (s.namespace, s.owner) not in staying
+        ]
+        staying_knobs = {s.knob for w, _ in qualified if w.name in kept for s in w.siblings if s.knob}
+        staying_owners = {owner for _, owner in staying}
+        return {
+            "knobs": frozenset(s.knob for s in going if not s.knob_primary) - staying_knobs,
+            "sibling_owners": frozenset(
+                (s.owner, s.knob, s.knob_primary) for s in going if s.owner not in staying_owners
+            ),
+        }
+
+    if doubles is not None:
+        qualified, refusals = _resolve_wrapper_doubles(
+            repo_dir, language, flag_key, treatment, accessors, found, qualified, refusals, by_resolved, doubles
+        )
     if qualified and doubles is not None:
         receivers = wrapper_inline.stub_receivers(language, qualified)
-        spelled = {by_resolved[r]: names for r, names in receivers.items() if r in by_resolved}
-        if spelled:
+        sibling_reads = wrapper_inline.sibling_receivers(language, qualified)
+        knob_reads, built, test_code = wrapper_inline.fake_settings(language, qualified)
+
+        def spell(found: dict) -> dict:
+            return {by_resolved[r]: names for r, names in found.items() if r in by_resolved}
+
+        spelled, sibling_spelled = spell(receivers), spell(sibling_reads)
+        knob_spelled, built_spelled = spell(knob_reads), spell(built)
+        if spelled or sibling_spelled or knob_spelled or built_spelled:
             stub_pass = mock_stubs.Prepass(
                 language, flag_key, treatment, accessors,
-                wrapper=mock_stubs.WrapperStub(tuple(sorted({w.name for w, _ in qualified}))),
+                wrapper=mock_stubs.WrapperStub(tuple(sorted({w.name for w, _ in qualified})), **fakes(frozenset())),
                 receivers=spelled,
+                siblings=sibling_spelled,
+                knob_receivers=knob_spelled,
+                owners=built_spelled,
+                test_code=frozenset(by_resolved[r] for r in test_code if r in by_resolved),
             )
             doubles.append(stub_pass)
-            stub_pass.apply(sorted(spelled))
-    plan = wrapper_inline.prove_all(
-        language, qualified, refusals, lambda path: path in by_resolved
-    )
+            stub_pass.apply(sorted({*spelled, *sibling_spelled, *knob_spelled, *built_spelled}))
+    def prove():
+        return wrapper_inline.prove_all(language, qualified, refusals, lambda path: path in by_resolved)
+
+    plan = prove()
+    # A stub, a verification and a stub's test -- and for C# a sibling test,
+    # a helper's pin, a fake's knob write and a test decided by a fake's
+    # construction -- go only with a wrapper that completes. One that stays
+    # keeps its reads (and C#'s, its sibling member), and what describes
+    # them: a call the proof refused still runs against the mock in a test,
+    # and without its stub a Mockito or MockK mock answers its default.
+    # Keeping a test or a stub can leave another wrapper with a read in a
+    # test, so this runs until no more wrappers stay.
+    kept: frozenset[str] = frozenset()
+    while stub_pass is not None and language in _STUBS_GATED_PER_WRAPPER and stub_pass.removals:
+        staying = frozenset(w.name for w, _ in qualified if w.label not in plan.complete)
+        if staying <= kept:
+            break
+        kept |= staying
+        stub_pass.reapply(replace(stub_pass.wrapper, kept=kept, **fakes(kept)))
+        plan = prove()
     plan.spans = {by_resolved[r]: spans for r, spans in plan.spans.items()}
     plan.receivers = {by_resolved[r]: names for r, names in plan.receivers.items() if r in by_resolved}
     return plan
+
+
+def _resolve_wrapper_doubles(
+    repo_dir: str,
+    language: str,
+    flag_key: str,
+    treatment: bool,
+    accessors: tuple[str, ...],
+    found: list[wrapper_inline.Wrapper],
+    qualified: list,
+    refusals: list[wrapper_inline.Finding],
+    by_resolved: dict[str, str],
+    doubles: list[mock_stubs.Prepass],
+) -> tuple[list, list[wrapper_inline.Finding]]:
+    """Resolve the stubs of every wrapper refused only as ``test-double``, in a
+    profile that can say where they are (TypeScript and JavaScript).
+
+    All of them are resolved in one round, so a test stubbing two wrappers of
+    the flag to opposite values is seen as stubbing both values. Afterwards
+    each is indexed and judged again, and the call sites of those that
+    qualify are proven. If every one now qualifies and every call it has
+    folds, the round stands. If any does not, every edit of the round is
+    withdrawn and the round runs again without those that failed, until it
+    stands or none is left. So a refused wrapper's stubs are never edited,
+    and no caller is folded while a test can still force the removed branch.
+
+    A wrapper judged again and refused for another reason is reported with
+    that reason: its doubles hid it, since that check runs first. A wrapper
+    that qualifies but would stay partial (a call the proof refuses, such as
+    ``f(u.trim())``) stays ``test-double``: that call is not folded and
+    still reaches the double, so removing the double would turn the test
+    red. So does a wrapper the proof finds no call of at all: a call it
+    cannot see (a name spelled only in data) can still reach the double.
+
+    Each pass joins ``doubles`` before it writes, so a raise anywhere in a
+    round is rolled back with the rest of the transform, and leaves it again
+    once withdrawn.
+    """
+    def is_double_of(f: wrapper_inline.Finding, wrapper: wrapper_inline.Wrapper) -> bool:
+        return (
+            f.reason == wrapper_inline.TEST_DOUBLE and f.path == wrapper.path
+            and f.line == wrapper.line and f.wrapper == wrapper.label
+        )
+
+    def refused_as_double(wrapper: wrapper_inline.Wrapper) -> bool:
+        return any(is_double_of(f, wrapper) for f in refusals)
+
+    def forget(gone: list[mock_stubs.Prepass]) -> None:
+        doubles[:] = [d for d in doubles if not any(d is g for g in gone)]
+
+    pending = [
+        w for w in found
+        if refused_as_double(w)
+        and (lang := wrapper_inline.profile(w.language)) is not None
+        and lang.stub_targets is not None
+    ]
+    while pending:
+        targets: dict[str, dict[str, mock_stubs.StubTargets]] = {}
+        # A class mock whose only stub of the wrapper the pass deletes would
+        # still read as a double afterwards, so it is recorded first.
+        settled: dict[str, object] = {}
+        for wrapper in pending:
+            lang = wrapper_inline.profile(wrapper.language)
+            before = lang.index(repo_dir, wrapper)
+            for path, where in lang.stub_targets(wrapper, before).items():
+                if path in by_resolved:
+                    targets.setdefault(by_resolved[path], {})[wrapper.name] = where
+            if lang.settled_mocks is not None:
+                settled[wrapper.label] = lang.settled_mocks(wrapper, before, treatment)
+        by_language: dict[str, list[str]] = {}
+        for path in sorted(targets):
+            grammar = wrapper_inline.language_for(path)
+            if grammar is not None and mock_stubs.covers(grammar):
+                by_language.setdefault(grammar, []).append(path)
+        names = tuple(sorted({w.name for w in pending}))
+        passes: list[mock_stubs.Prepass] = []
+        for grammar, paths in sorted(by_language.items()):
+            stub_pass = mock_stubs.Prepass(
+                grammar, flag_key, treatment, accessors,
+                wrapper=mock_stubs.WrapperStub(names),
+                targets={p: targets[p] for p in paths},
+            )
+            doubles.append(stub_pass)
+            passes.append(stub_pass)
+            stub_pass.apply(paths)
+        judged = []
+        failed = False
+        for wrapper in pending:
+            lang = wrapper_inline.profile(wrapper.language)
+            if wrapper.label in settled:
+                index = lang.index(repo_dir, wrapper, settled[wrapper.label])
+            else:
+                index = lang.index(repo_dir, wrapper)
+            member, reason = lang.qualify(wrapper, index)
+            if member is None:
+                failed = True
+                if reason not in (None, wrapper_inline.TEST_DOUBLE):
+                    refusals = [
+                        wrapper_inline.Finding(wrapper.path, wrapper.line, reason, wrapper.label, wrapper.label)
+                        if is_double_of(f, wrapper) else f
+                        for f in refusals
+                    ]
+            else:
+                judged.append((wrapper, member, index))
+        if not failed:
+            proof = wrapper_inline.prove_all(
+                language, [(member, index) for _, member, index in judged], [], lambda path: path in by_resolved
+            )
+            partial = {member.label for _, member, _ in judged} - proof.complete
+            if partial:
+                failed = True
+                judged = [j for j in judged if j[1].label not in partial]
+        if not failed:
+            forget([p for p in passes if not p.originals])
+            done = {w.label for w, _, _ in judged}
+            qualified = [*qualified, *((member, index) for _, member, index in judged)]
+            refusals = [
+                f for f in refusals
+                if not (f.reason == wrapper_inline.TEST_DOUBLE and f.wrapper in done)
+            ]
+            break
+        for stub_pass in reversed(passes):
+            stub_pass.withdraw(list(stub_pass.originals))
+        forget(passes)
+        pending = [w for w, _, _ in judged]
+    return qualified, refusals
 
 
 def _check_gates(
@@ -2822,6 +3107,41 @@ def _execute_readers(
                 )
 
 
+def _execute_ctor_param_rules(
+    paths: list[str], language: str, rules_text: str, repo_dir: str
+) -> list:
+    """Run the rendered constructor-parameter rules over ``paths``, once per grammar.
+
+    A run of its own, after the fold: only the declaring files and the proven
+    callers, with no const, JSX, entry or edge rules beside it. Returns the
+    engine's summaries of the files it changed. See
+    :mod:`flag_cleanup.ctor_param_removal`.
+    """
+    collected: list = []
+    with tempfile.TemporaryDirectory(prefix="flag-cleanup-ctor-") as tmp:
+        rules_file = Path(tmp) / "ctor_rules.toml"
+        rules_file.write_text(rules_text, encoding="utf-8")
+        by_grammar: dict[str, list[str]] = {}
+        for path in paths:
+            by_grammar.setdefault(_grammar_of(path, language), []).append(path)
+        for grammar, members in sorted(by_grammar.items()):
+            spec = _LANGUAGES[grammar]
+            collected.extend(
+                _execute(
+                    paths=members,
+                    piranha_language=spec.piranha_id,
+                    rules_file=rules_file,
+                    const_rules_file=None,
+                    edges_file=Path(tmp) / "no_edges.toml",
+                    substitutions={},
+                    argument_flags=_load_argument_flags(spec.rule_base),
+                    flag_key="(constructor parameters)",
+                    repo_dir=repo_dir,
+                )
+            )
+    return collected
+
+
 def _quarantine_and_retry(
     paths: list[str],
     language: str,
@@ -3095,17 +3415,25 @@ def _collapse_entry_double_spaces(summaries, language: str, entry_paths: set[str
     return tidied
 
 
+#: A carriage return that does not begin a CRLF: the one byte a file can hold
+#: inside a token that the stray-`\r` tidy could mistake for its residue.
+_LONE_CARRIAGE_RETURN = re.compile(r"\r(?!\n)")
+
+
 def _collapse_carriage_returns(summaries, language: str, entry_paths: set[str]) -> list:
     """Drop the stray carriage return a whole-line deletion leaves in a CRLF file.
 
-    The files the entry rules touched, and every rewritten Python file: a
-    Python fold deletes the whole block of an ``if`` and strands the ``\r``
-    of its last line after the ``def`` line, through the read rules alone.
-    Not every other file: the guard that keeps a run inside a token asks for
-    the grammar's LEAVES, and Dart's multi-line strings and PHP's heredocs
-    hold bytes no leaf covers, so a ``\r`` inside one would be taken for
-    whitespace. Widening past where the residue was measured would expose
-    that.
+    The files the entry rules touched, every rewritten Python file, and every
+    other rewritten file whose input held no LONE ``\r``. Any fold of an
+    ``if`` leaves it, in every language, through the read rules alone: the
+    kept branch's last line takes the ``\r`` of the line the fold removed
+    (``return newPath(u);\r\r\n``). The guard that keeps a run inside a token
+    asks for the grammar's LEAVES, and Dart's multi-line strings and PHP's
+    heredocs hold bytes no leaf covers, so a ``\r`` inside one would be taken
+    for whitespace. In a file where every ``\r`` began a ``\r\n`` that cannot
+    matter: no token held a ``\r`` of its own, so a doubled one is a pair the
+    transform broke. A file that did hold one is tidied only where the
+    residue was measured, as before.
 
     A SEPARATE pass placed LAST, after the `;` strip — which is
     what makes it cover two residues rather than one. The engine leaves
@@ -3118,7 +3446,9 @@ def _collapse_carriage_returns(summaries, language: str, entry_paths: set[str]) 
     tidied = []
     for summary in summaries:
         if summary.original_content == summary.content or not (
-            summary.path in entry_paths or _grammar_of(summary.path, language) == "python"
+            summary.path in entry_paths
+            or _grammar_of(summary.path, language) == "python"
+            or _LONE_CARRIAGE_RETURN.search(summary.original_content) is None
         ):
             tidied.append(summary)
             continue
@@ -3434,21 +3764,25 @@ def _fold_python_literals(summaries) -> list:
     return folded
 
 
-def _reindent_folds(summaries, language: str) -> list:
+def _reindent_folds(summaries, language: str, doubles: list[mock_stubs.Prepass] | None = None) -> list:
     """Re-emit every changed summary with the fold's indentation restored.
 
     Same passthrough shape as :func:`_tidy_trailing_whitespace`: a file whose
     lines the engine placed correctly is handed back untouched rather than
     copied.
+
+    A file the test-double pass edited is measured from that pass's output,
+    as Gate 1 judges it: the pass's whole-line deletions are not a fold, and
+    measured from the customer's text they read as a splice whose lines
+    moved, so the lines after them were re-indented wrongly.
     """
     reindented = []
     for summary in summaries:
-        if summary.original_content == summary.content:
+        baseline = _gate_baseline(doubles, summary.path, summary.original_content)
+        if baseline == summary.content:
             reindented.append(summary)
             continue
-        result = reindent_spliced_lines(
-            summary.original_content, summary.content, _grammar_of(summary.path, language)
-        )
+        result = reindent_spliced_lines(baseline, summary.content, _grammar_of(summary.path, language))
         if result == summary.content:
             reindented.append(summary)
             continue
@@ -3479,6 +3813,13 @@ def _remove_stranded_statements(
         # same list: both are code that could never run, and the customer wrote it.
         cleaned, dead = remove_dead_loops(summary.original_content, cleaned, grammar)
         removed = removed + dead
+        # The TypeScript family's dead `for` and `do`, which that pass leaves:
+        # each has a part that runs. See :mod:`flag_cleanup.ts_dead_code`.
+        if grammar in _TS_GRAMMARS:
+            cleaned, dead = ts_dead_code.remove_dead_loops(
+                summary.original_content, cleaned, grammar
+            )
+            removed = removed + dead
         if not removed:
             cleaned_summaries.append(summary)
             continue
@@ -3489,6 +3830,27 @@ def _remove_stranded_statements(
         relative = os.path.relpath(summary.path, repo_dir)
         stranded.extend((relative, statement) for statement in removed)
     return cleaned_summaries, tuple(stranded)
+
+
+#: The grammars :mod:`flag_cleanup.ts_dead_code` reads.
+_TS_GRAMMARS = frozenset({"ts", "tsx", "js"})
+
+
+def _remove_ts_orphans(summaries, language: str) -> list:
+    """:func:`flag_cleanup.ts_dead_code.remove_orphans` over each changed file."""
+    cleaned = []
+    for summary in summaries:
+        grammar = _grammar_of(summary.path, language)
+        if summary.original_content == summary.content or grammar not in _TS_GRAMMARS:
+            cleaned.append(summary)
+            continue
+        result = ts_dead_code.remove_orphans(summary.original_content, summary.content, grammar)
+        if result == summary.content:
+            cleaned.append(summary)
+            continue
+        Path(summary.path).write_text(result, encoding="utf-8")
+        cleaned.append(Rewrite(summary.path, summary.original_content, result))
+    return cleaned
 
 
 def _remove_stranded_bindings(
@@ -3549,6 +3911,59 @@ def _unread_primary_parameters(
             for label in unread_parameters(summary.original_content, summary.content)
         )
     return tuple(found)
+
+
+def _unread_private_members(
+    summaries, language: str, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """``(path, "unread member", label)`` for each TypeScript or JavaScript
+    private member the fold left unread. Nothing is written."""
+    found: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content:
+            continue
+        grammar = _grammar_of(summary.path, language)
+        if grammar not in ("ts", "tsx", "js"):
+            continue
+        relative = os.path.relpath(summary.path, repo_dir)
+        found.extend(
+            (relative, "unread member", label)
+            for label in unread_members(summary.original_content, summary.content, grammar)
+        )
+    return tuple(found)
+
+
+def _remove_unread_constructor_parameters(
+    summaries, language: str, unread: tuple[tuple[str, str, str], ...], repo_dir: str
+) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[tuple[str, str, str], ...]]:
+    """Remove each unread constructor parameter whose callers can be proven;
+    see :mod:`~flag_cleanup.ctor_param_removal`.
+
+    Returns the summaries, the unread rows still unread, and the rows naming
+    what went, plus anything the deletions stranded. JavaScript has no
+    parameter properties, so a ``js`` run has nothing to remove.
+    """
+    if language not in ("ts", "tsx", "csharp") or not unread:
+        return summaries, unread, ()
+    result = ctor_param_removal.remove(
+        summaries,
+        language,
+        unread,
+        repo_dir,
+        engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+    )
+    if not result.rewritten:
+        return summaries, result.unread, ()
+    # A deleted argument can strand the local it named, and a deleted
+    # parameter the import of its type: the same pass, over these files only.
+    touched = [s for s in result.summaries if s.path in result.rewritten]
+    cleaned, stranded = _remove_stranded_bindings(touched, language, repo_dir)
+    by_path = {s.path: s for s in cleaned}
+    summaries = [by_path.get(s.path, s) for s in result.summaries]
+    kept = ctor_param_removal.kept_argument_locals(
+        summaries, result.argument_names, language, repo_dir
+    )
+    return summaries, result.unread, result.rows + stranded + kept
 
 
 def _settle_test_doubles(

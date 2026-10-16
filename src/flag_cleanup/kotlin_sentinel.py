@@ -531,9 +531,13 @@ class SentinelPrePass:
 
     def apply(self, paths: list[str]) -> None:
         """Rewrite each of ``paths`` that reads the flag, remembering the original."""
+        from flag_cleanup import mock_stubs
+
         for path in paths:
             try:
-                source = Path(path).read_text(encoding="utf-8")
+                # Byte-exact: a CRLF file read through universal newlines and
+                # written back would come back LF, a whole-file diff.
+                source = mock_stubs._read_exact(path)
             except (OSError, UnicodeDecodeError):  # pragma: no cover - filtered earlier
                 continue
             try:
@@ -556,7 +560,7 @@ class SentinelPrePass:
             if rewritten is None:
                 continue
             self.originals[path] = source
-            Path(path).write_text(rewritten, encoding="utf-8")
+            mock_stubs._write_exact(path, rewritten)
 
     def restore_all(self) -> None:
         """Put every file this pre-pass wrote back to its original bytes.
@@ -565,8 +569,10 @@ class SentinelPrePass:
         anything, so at that point the only edits on disk are this pre-pass's
         own and every one of them has to go.
         """
+        from flag_cleanup import mock_stubs
+
         for path, source in self.originals.items():
-            Path(path).write_text(source, encoding="utf-8")
+            mock_stubs._write_exact(path, source)
 
     def rebase(self, summaries) -> list[Rewrite]:
         """Engine summaries with the sentinel-ified 'before' swapped for the real one.
@@ -585,8 +591,10 @@ class SentinelPrePass:
         for path, source in self.originals.items():
             if path in seen:
                 continue
+            from flag_cleanup import mock_stubs
+
             try:
-                current = Path(path).read_text(encoding="utf-8")
+                current = mock_stubs._read_exact(path)
             except (OSError, UnicodeDecodeError):  # pragma: no cover - just written
                 current = source
             rebased.append(Rewrite(path, source, current))

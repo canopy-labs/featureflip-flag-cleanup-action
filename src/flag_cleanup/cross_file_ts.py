@@ -82,7 +82,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -114,6 +114,9 @@ _WRITTEN_EXTENSIONS = {
     ".mts": (".mts",),
     ".cts": (".cts",),
 }
+#: The declaration file the compiler reads for a JavaScript file beside it,
+#: by the JavaScript file's extension.
+DECLARATION_SUFFIXES = {".js": ".d.ts", ".jsx": ".d.ts", ".mjs": ".d.mts", ".cjs": ".d.cts"}
 #: React Native platform suffixes: a `<stem>.<platform>.<ext>` beside the
 #: compiler's answer is what the bundler picks on that platform.
 _PLATFORMS = ("ios", "android", "native", "web", "windows", "macos")
@@ -430,10 +433,24 @@ class _Unknown(Exception):
     """A specifier whose target cannot be told with certainty."""
 
 
-def _candidates(base: str) -> list[str]:
+def declaration_file(path: str) -> str | None:
+    """The hand-written declaration file of a JavaScript file: ``flags.d.ts``
+    for ``flags.js`` (or ``flags.jsx``), ``.d.mts`` for ``.mjs``, ``.d.cts``
+    for ``.cjs``; ``None`` for any other file."""
+    suffix = Path(path).suffix
+    if suffix not in DECLARATION_SUFFIXES:
+        return None
+    return path[: len(path) - len(suffix)] + DECLARATION_SUFFIXES[suffix]
+
+
+def _candidates(base: str, beside_declarations: bool = False) -> list[str]:
     """The one existing file ``base`` names, as a one-item list, or ``[]``.
 
-    Raises :class:`_Unknown` when more than one file could be meant.
+    Raises :class:`_Unknown` when more than one file could be meant. With
+    ``beside_declarations``, a JavaScript file and its own declaration file
+    (``flags.js`` and ``flags.d.ts``) are one file, the JavaScript: the
+    compiler types the import from the declarations, and the code that runs
+    is the JavaScript.
     """
     path = Path(base)
     suffix = path.suffix
@@ -447,6 +464,9 @@ def _candidates(base: str) -> list[str]:
             tries += [str(path / f"index{ext}") for ext in _PLAIN_EXTENSIONS]
     found = [t for t in tries if Path(t).is_file()]
     hits = sorted({str(Path(t).resolve()) for t in found})
+    if beside_declarations and len(hits) == 2:
+        runs = [h for h in hits if declaration_file(h) is not None and declaration_file(h) in hits]
+        hits = runs if len(runs) == 1 else hits
     if len(hits) > 1:
         raise _Unknown(base)
     # The specifier's own stem, and the stem of the file the compiler picked.
@@ -544,11 +564,17 @@ def _alias(specifier: str, paths: dict[str, list[str]]) -> list[str] | None:
     return [target.replace("*", star) for target in paths[pattern]]
 
 
-def _resolve(reader_path: str, specifier: str, stop: Path) -> str | None:
+def _resolve(
+    reader_path: str,
+    specifier: str,
+    stop: Path,
+    beside_declarations: bool = False,
+    base_url: Callable[[str, str], bool] | None = None,
+) -> str | None:
     reader_dir = Path(reader_path).parent
     try:
         if specifier in (".", "..") or specifier.startswith(("./", "../")):
-            hits = _candidates(os.path.normpath(reader_dir / specifier))
+            hits = _candidates(os.path.normpath(reader_dir / specifier), beside_declarations)
             return hits[0] if hits else None
         if specifier.startswith("/") or not specifier:
             return None
@@ -558,12 +584,38 @@ def _resolve(reader_path: str, specifier: str, stop: Path) -> str | None:
         base, paths = config
         targets = _alias(specifier, paths)
         for target in targets or ():
-            hits = _candidates(os.path.normpath(base / target))
+            hits = _candidates(os.path.normpath(base / target), beside_declarations)
             if hits:
                 return hits[0]
+        if targets is None and base_url is not None:
+            # No `paths` pattern fits, so the compiler tries the specifier
+            # under an explicit `baseUrl` before any package. Where a pattern
+            # fits and names nothing, it is left there: which of the two the
+            # compiler falls back to is not worth betting a rewrite on.
+            explicit = _explicit_base_url(reader_dir, stop)
+            if explicit is not None:
+                hits = _candidates(os.path.normpath(explicit / specifier), beside_declarations)
+                if hits and base_url(reader_path, specifier):
+                    return hits[0]
     except _Unknown:
         return None
     return None
+
+
+def _explicit_base_url(reader_dir: Path, stop: Path) -> Path | None:
+    """The ``baseUrl`` the nearest config writes, as a directory; ``None``
+    when it writes none. Only called once :func:`_config` read that config
+    without raising."""
+    current = reader_dir
+    while True:
+        present = [current / name for name in _CONFIG_NAMES if (current / name).is_file()]
+        if present:
+            data = json.loads(_strip_jsonc(present[0].read_text(encoding="utf-8")))
+            written = data.get("compilerOptions", {}).get("baseUrl")
+            return current / written if isinstance(written, str) else None
+        if current == stop or current.parent == current:
+            return None
+        current = current.parent
 
 
 def _stop_for(repo_dir: str) -> Path:
@@ -572,15 +624,31 @@ def _stop_for(repo_dir: str) -> Path:
     return Path(checkout_root(repo_dir)).resolve()
 
 
-def resolve_specifier(reader_path: str, specifier: str, repo_dir: str) -> str | None:
+def resolve_specifier(
+    reader_path: str,
+    specifier: str,
+    repo_dir: str,
+    *,
+    beside_declarations: bool = False,
+    base_url: Callable[[str, str], bool] | None = None,
+) -> str | None:
     """The absolute path of the file ``specifier`` imports from ``reader_path``.
 
     ``None`` for a package, for anything the compiler and a runtime could read
     differently, and for anything that does not exist. The nearest
     ``tsconfig.json``/``jsconfig.json`` is looked for up to the root of the git
     checkout holding ``repo_dir``.
+
+    Two readings are off unless asked for, since the key-constant
+    resolution's candidate scans (:func:`enum_module_pattern`) do not account
+    for them. ``beside_declarations`` takes a JavaScript file to be the answer
+    where its own declaration file sits beside it (see :func:`_candidates`).
+    ``base_url(reader_path, specifier)`` lets a bare specifier that no
+    ``paths`` pattern fits resolve under the config's explicit ``baseUrl``,
+    when it returns true: a runtime may still read such a specifier as a
+    package, which only the caller can rule out.
     """
-    return _resolve(reader_path, specifier, _stop_for(repo_dir))
+    return _resolve(reader_path, specifier, _stop_for(repo_dir), beside_declarations, base_url)
 
 
 # --- what the reader binds --------------------------------------------------------
@@ -2943,6 +3011,45 @@ def component_escapes(
                 for mention in spelled.finditer(source, begin, end):
                     escape(mention.start(), local)
     return [found[k] for k in sorted(found)]
+
+
+#: An enum name no source can spell. Judged as that enum's file, a module has
+#: every ``ns.<export>`` taken for another export's and left alone, so what
+#: the enum escape scan still finds is the module object itself handed on.
+_NO_ENUM = "\x00"
+
+
+def _whole_modules(modules: Iterable[str]) -> tuple[xk.KeyDeclaration, ...]:
+    return tuple(xk.KeyDeclaration(m, _NO_ENUM, _NO_ENUM, m) for m in sorted(modules))
+
+
+def module_pattern(modules: Iterable[str], repo_dir: str) -> re.Pattern[str]:
+    """What a file's text holds when it can reach one of ``modules`` (see
+    :func:`enum_module_pattern`)."""
+    return enum_module_pattern(_whole_modules(modules), repo_dir)
+
+
+def module_escapes(
+    path: str, source: str, modules: Iterable[str], repo_dir: str, pattern: re.Pattern[str] | None = None
+) -> list[xk.Refusal]:
+    """Every use in ``path`` that hands one of ``modules`` on as an object,
+    which can then reach any of its exports by a name computed at run time.
+
+    Judged as :func:`enum_escapes` judges an enum's file: a namespace import
+    or ``require`` of it used as anything but ``ns.<export>`` or a type, a
+    re-export of it in any form, a dynamic ``import()``, ``import m =
+    require(...)``, and every loader that can load it. A Vue, Svelte or
+    Astro file is judged by :func:`component_escapes`, and its markup by
+    :func:`component_match` against ``pattern`` (built when not given)."""
+    entries = _whole_modules(modules)
+    if Path(path).suffix not in source_index.COMPONENT_SUFFIXES:
+        return enum_escapes(path, source, entries, repo_dir)
+    found = component_escapes(path, source, entries, repo_dir)
+    hit = component_match(path, source, (pattern or module_pattern(modules, repo_dir),))
+    if hit is not None:
+        line = source.count("\n", 0, hit) + 1
+        found.append(xk.Refusal(path, line, xk.UNSUPPORTED_FORM, source.split("\n")[line - 1].strip()))
+    return found
 
 
 def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:

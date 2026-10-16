@@ -68,8 +68,13 @@ def _text(node: Node) -> str:
 
 
 def _read(path: str) -> str | None:
+    """The file's text with its line endings as they are, like every reader
+    on the wrapper path, so a span taken from it is an offset into the file
+    the sentinel pre-pass marks."""
+    from flag_cleanup import mock_stubs
+
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return mock_stubs._read_exact(path)
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -473,6 +478,95 @@ def _method_reason(receiver, wrapper, file, home, packages) -> str | None:
     return None if packages.static_type(receiver, file) == target else wi.RECEIVER_UNPROVEN
 
 
+def _value_receiver(wrapper: wi.Wrapper, home: go_scope.File) -> bool:
+    """Whether the wrapper is a method on ``T`` rather than on ``*T``."""
+    for declaration in home.root.named_children:
+        if declaration.start_byte == wrapper.start and declaration.type == "method_declaration":
+            receiver = declaration.child_by_field_name("receiver")
+            params = [] if receiver is None else [c for c in receiver.named_children if c.type == "parameter_declaration"]
+            written = params[0].child_by_field_name("type") if len(params) == 1 else None
+            return written is not None and written.type != "pointer_type"
+    return False
+
+
+def _fresh_pointer(value: Node | None) -> bool:
+    """``&T{…}`` or ``new(T)``: a pointer that is not nil."""
+    if value is None:
+        return False
+    if value.type == "unary_expression":
+        operator = value.child_by_field_name("operator")
+        return operator is not None and _text(operator) == "&"
+    function = value.child_by_field_name("function") if value.type == "call_expression" else None
+    return function is not None and function.type == "identifier" and _text(function) == "new"
+
+
+def _pointer(binding: go_scope.Binding) -> bool:
+    """Whether a declaration makes its name a pointer: a written ``*T``, or
+    a value that is one."""
+    if binding.type is not None:
+        return binding.type.type == "pointer_type"
+    return _fresh_pointer(binding.value)
+
+
+#: Statements whose ``left`` names can be assigned: ``q = p``, a ``q, err :=``
+#: redeclaring ``q`` in its own scope, ``for q = range`` and ``q = <-ch``.
+_ASSIGNS_ITS_LEFT = ("assignment_statement", "short_var_declaration", "range_clause", "receive_statement")
+
+
+def _may_be_nil(receiver: Node, file: go_scope.File, packages: go_scope.Packages) -> bool:
+    """Whether ``receiver`` may be a nil pointer when the call runs.
+
+    Only a local initialised to ``&T{…}`` or ``new(T)`` is known not to be,
+    and only while nothing assigns it or takes its address, anywhere in the
+    file: an assignment may run first, or through a closure, and an address
+    lets anything assign it. A parameter, a ``var p *T``, a package-level
+    ``var`` (any file of the package may assign it) and a pointer field may
+    all be nil. The receiver's type is already proven, so every shape here
+    resolves; one that somehow does not is treated as possibly nil."""
+    if receiver.type == "selector_expression":
+        operand = receiver.child_by_field_name("operand")
+        field_node = receiver.child_by_field_name("field")
+        if operand is None or field_node is None:
+            return True
+        if operand.type == "identifier" and go_scope.local_binding(operand, _text(operand)) is None:
+            imported = packages.imported(file, _text(operand))
+            if imported is not None:
+                site = packages.package_var_binding(imported.directory, imported.clause, _text(field_node))
+                return site is None or _pointer(site[1])
+        owner = packages.static_type(operand, file)
+        written = None if owner is None else packages.field_written(owner, _text(field_node))
+        return written is None or written[1].type == "pointer_type"
+    if receiver.type != "identifier":
+        return True
+    name = _text(receiver)
+    binding = go_scope.local_binding(receiver, name)
+    if binding is None:
+        site = None if file.clause is None else packages.package_var_binding(file.directory, file.clause, name)
+        return site is None or _pointer(site[1])
+    if not _pointer(binding):
+        return False
+    if binding.type is not None or not _fresh_pointer(binding.value):
+        return True
+    binders = [(b.start_byte, b.end_byte) for b in go_scope.local_binders(receiver, name)]
+    for node in cross_file_keys.walk(file.root):
+        if node.type != "identifier" or _text(node) != name:
+            continue
+        if [(b.start_byte, b.end_byte) for b in go_scope.local_binders(node, name)] != binders:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "unary_expression" and _text(parent.child_by_field_name("operator")) == "&":
+            return True
+        holder = parent.parent if parent is not None and parent.type == "expression_list" else None
+        if (
+            holder is not None
+            and holder.type in _ASSIGNS_ITS_LEFT
+            and holder.child_by_field_name("left") == parent
+            and (node.start_byte, node.end_byte) not in binders
+        ):
+            return True
+    return False
+
+
 #: ``Example<Name>``, the form ``go vet`` resolves ``Name`` for. ``Example``
 #: and ``Example_suffix`` name the package, which always resolves.
 _NAMED_EXAMPLE = re.compile(r"Example[^_]")
@@ -552,22 +646,23 @@ def _is_read(leaf: Node) -> bool:
     return True
 
 
-#: Statements declaring variables the stranded-binding cleanup never
-#: removes: ``for v := range``, ``case v := <-ch`` and ``switch v := x.(type)``.
-_UNCLEANED_HOLDERS = ("range_clause", "receive_statement", "type_switch_statement")
+#: Statements whose header declares variables: ``for v := range``,
+#: ``case v := <-ch`` and ``switch v := x.(type)``. The stranded-binding
+#: cleanup takes an unused one out of the header rather than deleting a
+#: declaration.
+_HEADER_HOLDERS = ("range_clause", "receive_statement", "type_switch_statement")
 
 
-def _uncleaned_variable(binder: Node) -> bool:
+def _header_variable(binder: Node) -> bool:
     """Whether ``binder`` names a ``range``, ``select``-receive or type-switch
-    variable. Go reports each unused once its last read folds, and nothing
-    here removes or blanks one."""
+    variable."""
     parent = binder.parent
     holder = parent.parent if parent is not None else None
     return (
         parent is not None
         and parent.type == "expression_list"
         and holder is not None
-        and holder.type in _UNCLEANED_HOLDERS
+        and holder.type in _HEADER_HOLDERS
         and (holder.child_by_field_name("left") == parent or holder.child_by_field_name("alias") == parent)
     )
 
@@ -575,7 +670,7 @@ def _uncleaned_variable(binder: Node) -> bool:
 def _declaration_of(binder: Node) -> Node | None:
     """The ``var`` spec or ``:=`` that declares a local variable whose name
     token is ``binder``. ``None`` for anything else: a parameter, a constant
-    or a type, and the variables :func:`_uncleaned_variable` names."""
+    or a type, and the variables :func:`_header_variable` names."""
     parent = binder.parent
     if parent is None:
         return None
@@ -633,9 +728,9 @@ def _local_reason(binders: list[Node], file: go_scope.File, packages: go_scope.P
     binder = binders[0]
     declaration = _declaration_of(binder)
     key = (binder.start_byte, binder.end_byte)
-    if declaration is None:
+    if declaration is None and not _header_variable(binder):
         # Go builds with an unused parameter, receiver, constant or type.
-        return wi.UNREMOVABLE_LOCAL if _uncleaned_variable(binder) else None
+        return None
     if key in seen:
         return None
     seen.add(key)
@@ -652,6 +747,10 @@ def _local_reason(binders: list[Node], file: go_scope.File, packages: go_scope.P
             or [(b.start_byte, b.end_byte) for b in go_scope.local_binders(leaf, name)] != [key]
         ):
             return wi.UNREMOVABLE_LOCAL
+    if declaration is None:
+        # A header loses only the name: what it ranges over, receives from or
+        # switches on stays, so nothing else is stranded.
+        return None
     read = [declaration.child_by_field_name(f) for f in ("type", "value", "right")]
     return _strand_reason([n for n in read if n is not None], file, packages, seen)
 
@@ -714,6 +813,8 @@ def _judge(path: str, node: Node, wrapper: wi.Wrapper, file, home, packages) -> 
         reason = _function_reason(node, receiver, wrapper, file, home, packages)
     else:
         reason = _method_reason(receiver, wrapper, file, home, packages)
+    if reason is None and receiver is not None and _value_receiver(wrapper, home) and _may_be_nil(receiver, file, packages):
+        reason = wi.NIL_RECEIVER
     if reason is None:
         reason = _example_reason(file, packages)
     if reason is None and _argument_has_call(call):

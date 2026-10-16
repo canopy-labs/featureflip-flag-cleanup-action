@@ -117,6 +117,7 @@ from flag_cleanup.pr_content import (
     note_declined_entries,
     note_enum_findings,
     note_unresolved_references,
+    note_family_doubles,
     note_wrapper_findings,
     without_inlined,
     note_deleted_tests,
@@ -707,7 +708,7 @@ def _process_candidate(
         _bindings,
         entries,
         declined,
-        _test_doubles,
+        test_doubles,
         deleted_tests,
         kept,
         unresolved,
@@ -734,6 +735,7 @@ def _process_candidate(
 
     _warn_on_unprocessed_references(config, candidate.key, unprocessed)
     note_wrapper_findings(wrapper_findings)
+    note_family_doubles(test_doubles)
     note_constant_wrappers(wrappers)
     note_rewritten_build_output(diff)
     note_removed_entries(entries)
@@ -1084,6 +1086,7 @@ def _process_candidate_for_pr(
         note_unresolved_references(unresolved)
         note_enum_findings(enum_findings, enum_held)
         note_wrapper_findings(wrapper_findings)
+        note_family_doubles(test_doubles)
         note_deleted_tests(deleted_tests)
         note_kept(kept)
     else:
@@ -1509,7 +1512,8 @@ def piranha_transform(
     transform_error: TransformRefusal | None = None
     try:
         try:
-            outcomes = _run_plan(plan, candidate, config, known_flag_keys)
+            with git_ops.guarding_writes(snapshot, ledger):
+                outcomes = _run_plan(plan, candidate, config, known_flag_keys)
             kept_entries: list[tuple[str, str]] = []
             # A registry entry deleted while something still names the key
             # turns that mention into a compile error or a crash: the registry
@@ -1529,7 +1533,8 @@ def piranha_transform(
                 if live:
                     first = [entry for o in outcomes for entry in o.entries]
                     _undo_transform(config, snapshot, pending=None)
-                    outcomes = _run_plan(plan, candidate, config, frozenset())
+                    with git_ops.guarding_writes(snapshot, ledger):
+                        outcomes = _run_plan(plan, candidate, config, frozenset())
                     for entry in (entry for o in outcomes for entry in o.entries):
                         if entry in first:
                             first.remove(entry)

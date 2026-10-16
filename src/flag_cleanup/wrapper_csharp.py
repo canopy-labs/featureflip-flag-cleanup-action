@@ -19,8 +19,8 @@ C# needs three things the JVM profiles do not:
 * **A property read has no call.** It is marked as ``SENTINEL()``, the shape
   the seed rules at the top of ``rules/csharp.toml`` fold.
 * **A public interface is not necessarily published.** It cannot be
-  implemented outside the repository when its project is not packed: no
-  ``.nuspec`` beside it, and no packing property (``IsPackable`` true,
+  implemented outside the repository when its project is not packed: no step
+  that packs it (see :mod:`flag_cleanup.csharp_packing`), and no packing property (``IsPackable`` true,
   ``PackageId``, ``GeneratePackageOnBuild``, package metadata) or ``<Import>``
   in its ``.csproj`` or a ``Directory.Build`` file above it.
 
@@ -44,6 +44,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from xml.etree import ElementTree
 
 from tree_sitter import Node
 
@@ -346,6 +347,9 @@ class TypeDecl:
     #: matches a property.
     methods: dict[str, tuple[int, int]] = field(default_factory=dict)
     properties: dict[str, tuple[int, int]] = field(default_factory=dict)
+    #: Byte span of the whole type declaration.
+    start: int = 0
+    end: int = 0
 
 
 @dataclass
@@ -374,6 +378,11 @@ class Index:
     unparsed: list[str] = field(default_factory=list)
     #: Unused here: C# has no second spelling of a member's name.
     synthetic: list[tuple[str, int, str]] = field(default_factory=list)
+    #: The wrapper's :class:`~flag_cleanup.csharp_family.Family`, once qualified.
+    family: object | None = None
+    #: The run's treatment, when qualified for a run: what a test fake's
+    #: knob left set to the kept value is harmless at.
+    treatment: bool | None = None
 
     @classmethod
     def build(cls, repo_dir: str, wrapper: wi.Wrapper) -> Index:
@@ -510,6 +519,8 @@ def _types_in(path: str, root: Node) -> list[TypeDecl]:
                 supertypes=xcs._supertypes(node),
                 methods=methods,
                 properties=properties,
+                start=node.start_byte,
+                end=node.end_byte,
             )
         )
     return found
@@ -525,8 +536,12 @@ def _word_in_error(root: Node, words: set[str]) -> bool:
 
 
 def _read(path: str) -> str | None:
+    """The file's text with its line endings as they are (see
+    :func:`flag_cleanup.wrapper_inline._read`)."""
+    from flag_cleanup import mock_stubs
+
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return mock_stubs._read_exact(path)
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -537,6 +552,17 @@ class _Readers:
     def __init__(self, repo_dir: str):
         self.repo_dir = repo_dir
         self._by_path: dict[str, xcs._Reader | None] = {}
+        #: Whether a typed service-locator lookup (``sp.GetRequiredService<T>()``)
+        #: can be trusted in the file being read; see :func:`_locator_ok`.
+        self.locator = False
+        #: Likewise for ``Substitute.For<T>()``; see :func:`_substitute_ok`.
+        self.substitute = False
+
+    def factories(self) -> frozenset[str]:
+        """The typed-factory shapes whose declared type may be trusted here."""
+        return frozenset(
+            name for name, on in (("locator", self.locator), ("substitute", self.substitute)) if on
+        )
 
     def add(self, reader: xcs._Reader) -> None:
         self._by_path[reader.path] = reader
@@ -598,33 +624,40 @@ def _find_type(root: Node, chain: str) -> Node | None:
     )
 
 
-def _bases_in_repository(readers: _Readers, path: str, type_node: Node, seen: set[str] | None = None) -> bool:
-    """Whether every base type of ``type_node``, followed transitively, is a
-    repository type, resolved by namespace from the file declaring each. One
-    that is not may declare the wrapper's name, and C# implements an interface
-    member with no keyword at all. A simple name shared with an unrelated
-    repository type is not enough: the lookup has to reach it.
+def _supertypes_of(readers: _Readers, path: str, type_node: Node, seen: dict | None = None) -> list | None:
+    """Every base type of ``type_node``, followed transitively, as checkout
+    index entries, each resolved by namespace from the file declaring it;
+    ``None`` unless every one is a repository type. One that is not may
+    declare the wrapper's name, and C# implements an interface member with
+    no keyword at all. A simple name shared with an unrelated repository
+    type is not enough: the lookup has to reach it.
 
     A base declared only in a file that does not parse whole is missing from
     the checkout index, so it is refused here like a library type."""
-    seen = set() if seen is None else seen
+    seen = {} if seen is None else seen
     reader = readers.get(path)
     if reader is None:
-        return False
+        return None
     checkout = xcs.csharp_index(readers.repo_dir)
     for base in _base_nodes(type_node):
         full = _type_full(base, reader)
         infos = [i for i in checkout.by_full.get(full or "", ()) if not i.generic]
         if full is None or len(infos) != 1 or infos[0].partial:
-            return False
+            return None
         if full in seen:
             continue
-        seen.add(full)
+        seen[full] = infos[0]
         declaring = readers.get(infos[0].path)
         declaration = _find_type(declaring.root, infos[0].chain) if declaring is not None else None
-        if declaration is None or not _bases_in_repository(readers, infos[0].path, declaration, seen):
-            return False
-    return True
+        if declaration is None or _supertypes_of(readers, infos[0].path, declaration, seen) is None:
+            return None
+    return list(seen.values())
+
+
+def _bases_in_repository(readers: _Readers, path: str, type_node: Node) -> bool:
+    """Whether every base type of ``type_node``, transitively, is a
+    repository type (see :func:`_supertypes_of`)."""
+    return _supertypes_of(readers, path, type_node) is not None
 
 
 #: Project properties that pack a project, or describe the package it packs to.
@@ -634,28 +667,7 @@ _PACKING = re.compile(
     r"|Import\b)",
     re.IGNORECASE,
 )
-#: A build script or workflow that packs or pushes a package: any project may
-#: be the one it packs.
-_PACK_STEP = re.compile(r"\bdotnet\s+pack\b|\bnuget\s+(?:push|pack)\b|[-/]t(?:arget)?:\s*pack\b", re.IGNORECASE)
-_SCRIPTS = {".yml", ".yaml", ".sh", ".ps1", ".psm1", ".cmd", ".bat", ".cake", ".props", ".targets", ".proj"}
 _FRIENDS = re.compile(r"InternalsVisibleTo\b")
-
-
-def _packs_anywhere(repo_dir: str) -> bool:
-    """Whether the checkout holds a ``.nuspec`` or a step that packs.
-
-    Walked rather than taken from the source listing, which holds source
-    suffixes only; the walk prunes the same generated directories."""
-    from flag_cleanup import piranha_runner, source_index
-
-    root = Path(source_index.checkout_root(repo_dir))
-    for path in piranha_runner.source_files(root, _SCRIPTS | {".nuspec"}, piranha_runner._SKIP_DIRS):
-        if path.suffix.lower() == ".nuspec":
-            return True
-        text = _read(str(path))
-        if text is None or _PACK_STEP.search(text):
-            return True
-    return False
 
 
 def _has_friends(path: str, repo_dir: str) -> bool:
@@ -683,31 +695,651 @@ def published(path: str, repo_dir: str) -> bool:
     types implemented outside the repository.
 
     Answered from its ``.csproj`` and every ``Directory.Build.props`` or
-    ``.targets`` between it and the repository root, and from the whole
-    checkout: a ``.nuspec`` or a build step that packs (``dotnet pack``,
-    ``nuget push``, ``-t:Pack``) anywhere may pack this project. Anything
-    unreadable, imported, or a file outside every project, counts as
-    published.
+    ``.targets`` between it and the repository root, and from the checkout's
+    pack steps (:mod:`flag_cleanup.csharp_packing`): a step that packs this
+    project, or one that cannot be tied to what it packs, publishes it. So
+    does any project packed either way that references it, directly or
+    through others: its public types ship with that package, bundled into it
+    or as a dependency it names (a test project marked only by an
+    ``<Import>`` is not taken as packed). Anything unreadable, imported, a
+    file outside every project, or a reference graph that cannot be trusted
+    while something is packed, counts as published.
     """
-    from flag_cleanup import source_index
+    from flag_cleanup import csharp_family, csharp_packing
 
     projects = xcs._project_dirs(repo_dir)
     project = xcs._project_of(path, projects)
-    if project is None or _packs_anywhere(repo_dir):
+    if project is None:
         return True
+    packed = csharp_packing.packed_projects(repo_dir)
+    if packed is csharp_packing.ALL or project.resolve() in packed or _packing_mark(project, repo_dir):
+        return True
+    roots = set(packed)
+    for other in projects:
+        if other.resolve() == project.resolve():
+            continue
+        mark = _packing_mark(other, repo_dir)
+        # An `<Import>` alone may make a project packable; a test project is
+        # not packed (its test SDK makes it unpackable) unless a step packs it.
+        # Only the SDK's own marks count here: a library that merely
+        # references a test framework (an assertion helper) may well be packed.
+        if mark == "package" or (mark == "import" and _project_is_test(other, repo_dir, sdk_only=True) is not True):
+            roots.add(other.resolve())
+    if not roots:
+        return False
+    graph = csharp_family.project_graph(repo_dir)
+    if graph is None:
+        return True
+    shipped: set[Path] = set()
+    pending = list(roots)
+    while pending:
+        current = pending.pop()
+        if current in shipped:
+            continue
+        shipped.add(current)
+        pending.extend(graph.get(current, ()))
+    return project.resolve() in shipped
+
+
+def _packing_mark(project: Path, repo_dir: str) -> str | None:
+    """How a project's own ``.csproj``, or a ``Directory.Build`` file between
+    it and the repository root, may make it packable (``_PACKING``):
+    ``"package"`` for a package property or metadata, or a file that cannot
+    be read; ``"import"`` for nothing but an ``<Import>``, whose file may set
+    one; ``None`` for neither."""
+    from flag_cleanup import source_index
+
     root = Path(source_index.checkout_root(repo_dir)).resolve()
     files = sorted(project.glob("*.csproj"))
     for directory in (project, *project.parents):
         files += [directory / name for name in ("Directory.Build.props", "Directory.Build.targets")]
         if directory == root:
             break
+    mark = None
     for file in files:
         if not file.exists():
             continue
         text = _read(str(file))
-        if text is None or _PACKING.search(text):
+        if text is None:
+            return "package"
+        for match in _PACKING.finditer(text):
+            if not match.group(0).lower().startswith("<import"):
+                return "package"
+            mark = "import"
+    return mark
+
+
+# --- Sibling implementations ------------------------------------------------------
+
+#: A test framework's package, or a test SDK, by its name's case-insensitive
+#: prefix.
+_TEST_PACKAGES = (
+    "xunit", "nunit", "mstest", "microsoft.net.test.sdk", "microsoft.testing.platform", "tunit", "expecto", "fixie",
+)
+#: An MSBuild property, item or metadata expression: a value computed when
+#: the project is built, which reading the file cannot know.
+_MSBUILD_EXPRESSION = re.compile(r"[$@%]\(")
+#: A property by which MSBuild imports a file no ``<Import>`` names, or skips
+#: one it would import: ``CustomAfterMicrosoftCommonTargets``,
+#: ``DirectoryBuildPropsPath``, ``ImportDirectoryBuildProps`` and the like,
+#: matched by the lower-cased tag.
+_IMPORT_HOOK = re.compile(
+    r"custom(?:before|after)\w*|directorybuild\w*path|directorypackagespropspath|importdirectory(?:build|packages)\w*"
+)
+#: A test method's attribute, by its simple name with any ``Attribute`` dropped.
+_TEST_ATTRIBUTES = frozenset({"Fact", "Theory", "Test", "TestMethod", "TestCase"})
+
+
+def _nearest(directory: Path, name: str, root: Path) -> Path | None:
+    """The file MSBuild imports implicitly by ``name``: the first one found
+    from ``directory`` up to the checkout root."""
+    for current in (directory, *directory.parents):
+        candidate = current / name
+        if candidate.is_file():
+            return candidate
+        if current == root:
+            return None
+    return None
+
+
+def _test_project(path: str, repo_dir: str) -> bool | None:
+    """Whether ``path``'s project is a test project (:func:`_project_is_test`).
+    A file outside every project is not in one."""
+    project = xcs._project_of(path, xcs._project_dirs(repo_dir))
+    return False if project is None else _project_is_test(project, repo_dir)
+
+
+def _project_is_test(project: Path, repo_dir: str, sdk_only: bool = False) -> bool | None:
+    """Whether the C# project in ``project`` is a test project, read from its
+    project file and everything that file imports, ``Directory.Build`` and
+    ``Directory.Packages`` files included, each parsed as XML
+    (:func:`_test_project_file`). ``None`` when that cannot be read or parsed
+    whole, or the project files of the directory disagree. ``sdk_only``: only
+    what makes the .NET SDK treat it as a test project counts
+    (:func:`_test_project_file`)."""
+    from flag_cleanup import csharp_family, source_index
+
+    root = Path(source_index.checkout_root(repo_dir)).resolve()
+    implicit = [
+        f
+        for f in (
+            _nearest(project, n, root)
+            for n in ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props")
+        )
+        if f
+    ]
+    answers = set()
+    for csproj in sorted(project.glob("*.csproj")):
+        reached = csharp_family._msbuild_files([csproj.resolve()], implicit, closure_only=True)
+        if reached is None:
+            return None
+        found = {_test_project_file(text, sdk_only) for text in reached[1].values()}
+        answers.add(True if True in found else None if None in found else False)
+    return answers.pop() if len(answers) == 1 else None
+
+
+def _test_project_file(text: str, sdk_only: bool = False) -> bool | None:
+    """Whether one MSBuild file, parsed, makes its project a test project: a
+    ``PackageReference`` or ``GlobalPackageReference`` whose ``Include``
+    names a test framework's package, an ``Sdk`` attribute or ``<Sdk Name>``
+    naming a test SDK, or ``<IsTestProject>true``. An ``Update`` never
+    counts: it edits an item the project already has (central version
+    pinning in a ``Directory.Build.targets``) and adds the package to no
+    project. Names and attributes are matched without regard to case,
+    quoting or an XML namespace. ``None`` when the file does not parse, one
+    of those values is computed at build time, or it sets an import-hook
+    property (``_IMPORT_HOOK``): what the file MSBuild then imports, or
+    skips, adds is not read here. ``sdk_only``: a package counts only when it
+    is ``Microsoft.NET.Test.Sdk``, the one whose props make the SDK treat the
+    project as a test project (and unpackable); a test SDK and
+    ``<IsTestProject>`` count as before."""
+    try:
+        document = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return None
+    answers: set[bool | None] = set()
+    for element in document.iter():
+        tag = element.tag.rsplit("}", 1)[-1].lower()
+        if _IMPORT_HOOK.fullmatch(tag):
+            return None
+        attributes = {k.rsplit("}", 1)[-1].lower(): v for k, v in element.attrib.items()}
+        names = [attributes["sdk"]] if "sdk" in attributes else []
+        packages: list[str] = []
+        if tag in ("packagereference", "globalpackagereference") and "include" in attributes:
+            packages.append(attributes["include"])
+        elif tag == "sdk" and "name" in attributes:
+            names.append(attributes["name"])
+        elif tag == "istestproject":
+            value = (element.text or "").strip()
+            answers.add(None if _MSBUILD_EXPRESSION.search(value) else value.lower() == "true")
+        if sdk_only:
+            for package in packages:
+                if _MSBUILD_EXPRESSION.search(package):
+                    answers.add(None)
+                    continue
+                listed = (n.strip().split("/", 1)[0].lower() for n in package.split(";"))
+                answers.add(any(n == "microsoft.net.test.sdk" for n in listed))
+        else:
+            names += packages
+        for name in names:
+            if _MSBUILD_EXPRESSION.search(name):
+                answers.add(None)
+                continue
+            listed = (n.strip().split("/", 1)[0].lower() for n in name.split(";"))
+            answers.add(any(n.startswith(_TEST_PACKAGES) for n in listed if n))
+    return True if True in answers else None if None in answers else False
+
+
+def _holds_test_attribute(root: Node) -> bool:
+    """Whether a file holds an attribute named like a test method's."""
+    for node in cross_file_keys.walk(root):
+        if node.type != "attribute":
+            continue
+        name = node.child_by_field_name("name")
+        last = _text(name).rsplit(".", 1)[-1].rsplit("::", 1)[-1] if name is not None else ""
+        if last.removesuffix("Attribute") in _TEST_ATTRIBUTES or last in _TEST_ATTRIBUTES:
             return True
     return False
+
+
+#: A Razor or MVC view ``@using`` alias: ``@using G = App.Flags.IFeatureFlags``.
+_GUEST_ALIAS = re.compile(r"@using\s+@?(\w+)\s*=\s*((?:global::)?[\w.]+)")
+
+
+def _aliases(repo_dir: str, name: str) -> frozenset[str] | None:
+    """``name`` and every ``using`` alias (in a C# file or a project
+    ``<Using>`` item) that names it, or an alias of it; ``None`` when
+    something that may declare one cannot be read."""
+    usings, readable = xcs.msbuild_usings(repo_dir)
+    if not readable:
+        return None
+    names = {name}
+    while True:
+        before = frozenset(names)
+        for using in usings:
+            if using.kind == "alias" and using.alias and using.target and using.target.rsplit(".", 1)[-1] in before:
+                names.add(using.alias)
+        for path in cross_file_keys.mention_files(repo_dir, sorted(before), exclude=()):
+            if path.lower().endswith(_GUESTS):
+                # Razor's `@using X = ...`, in the file or in an
+                # `_Imports.razor` / `_ViewImports.cshtml` it inherits.
+                text = _read(path)
+                if text is None:
+                    return None
+                for match in _GUEST_ALIAS.finditer(text):
+                    if match.group(2).rsplit(".", 1)[-1].rsplit("::", 1)[-1] in before:
+                        names.add(match.group(1))
+                continue
+            if not path.endswith(EXTENSIONS):
+                continue
+            source = _read(path)
+            if source is None:
+                return None
+            for node in cross_file_keys.walk(parse(source)):
+                alias = node.child_by_field_name("name") if node.type == "using_directive" else None
+                if alias is None:
+                    continue
+                target = next((c for c in reversed(node.named_children) if c.id != alias.id), None)
+                if target is not None and xcs._simple_name(target) in before:
+                    names.add(_text(alias).removeprefix("@"))
+        if names == before:
+            return before
+
+
+def _guest_extends(repo_dir: str, names: frozenset[str]) -> bool:
+    """Whether a .NET guest file (Razor, XAML, Web Forms) extends or
+    implements a type by any of ``names``. Unreadable counts."""
+    for path in cross_file_keys.mention_files(repo_dir, sorted(names), exclude=()):
+        if path.lower().endswith(_GUESTS):
+            text = _read(path)
+            if text is None or any(_guest_implementations(text, n) for n in names):
+                return True
+    return False
+
+
+def _find_type_in(root: Node, namespace: str, chain: str) -> Node | None:
+    """The one type declaration of ``chain`` in ``namespace``, or ``None``."""
+    parts = chain.split(".")
+    found = [
+        n
+        for n in cross_file_keys.walk(root)
+        if n.type in _TYPES and xcs._type_chain(n, strict=False) == parts and xcs._namespace_of(n) == namespace
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _returned(body: Node | None) -> Node | None:
+    """The one expression a body is: ``=> e`` or ``{ return e; }``."""
+    if body is None:
+        return None
+    if body.type == "arrow_expression_clause":
+        parts = _named(body)
+        return parts[0] if len(parts) == 1 else None
+    statements = _named(body)
+    if len(statements) != 1 or statements[0].type != "return_statement":
+        return None
+    returned = _named(statements[0])
+    return returned[0] if len(returned) == 1 else None
+
+
+def _bodiless(prop: Node, names: set[str] | None = None) -> bool:
+    """An auto-property: no expression body, and accessors with neither a
+    body nor a modifier; exactly ``names`` of them, when given."""
+    accessors = prop.child_by_field_name("accessors")
+    if accessors is None:
+        return False
+    parts = _named(accessors)
+    if not parts or any(
+        c.type != "accessor_declaration"
+        or c.child_by_field_name("body") is not None
+        or _child(c, "modifier") is not None
+        for c in parts
+    ):
+        return False
+    if names is None:
+        return True
+    words = [c.child_by_field_name("name") for c in parts]
+    return sorted(_text(w) for w in words if w is not None) == sorted(names) and len(words) == len(names)
+
+
+def _own_state(type_node: Node, name: str) -> Node | None:
+    """The declared type of ``name`` when it is a field or an auto-property
+    the type itself declares, once (a record's positional parameter is
+    one): reading it runs no code. Not one that may be, or replace, another
+    member (``virtual``, ``abstract``, ``override``, ``extern``, ...), whose
+    read a subclass may answer with anything; and a base's member is not the
+    type's own. A declaration inside an ``#if`` is not seen at all, so
+    which branch compiles never matters."""
+    found: list[Node | None] = []
+    body = type_node.child_by_field_name("body")
+    for member in body.named_children if body is not None else ():
+        if member.type == "field_declaration":
+            declaration = _child(member, "variable_declaration")
+            bound = _declarator_type(declaration, name) if declaration is not None else None
+            if bound is not None:
+                found.append(bound if isinstance(bound, Node) else None)
+        elif member.type == "property_declaration" and _name_of(member) == name:
+            plain = _bodiless(member) and not xcs._modifiers(member) & _OVERRIDES
+            found.append(member.child_by_field_name("type") if plain else None)
+        elif name in _member_names(member):
+            found.append(None)
+    if not found and type_node.type in ("record_declaration", "record_struct_declaration"):
+        bound = _primary_parameter(type_node, name)
+        found.append(bound if isinstance(bound, Node) else None)
+    return found[0] if len(found) == 1 else None
+
+
+def _read_chain(expression: Node) -> tuple[Node, bool, list[str]] | None:
+    """``(root, through this, the names read after it)`` of ``e``, ``e.A.B``
+    or ``this.e.A``: a tower of member reads over one identifier, with no
+    call, no ``?.``, no ``!`` and no parentheses."""
+    steps: list[str] = []
+    node = expression
+    while node.type == "member_access_expression":
+        name = node.child_by_field_name("name")
+        inner = node.child_by_field_name("expression")
+        if name is None or inner is None or name.type != "identifier":
+            return None
+        if inner.type == "this":
+            return name, True, steps[::-1]
+        steps.append(_text(name).removeprefix("@"))
+        node = inner
+    return (node, False, steps[::-1]) if node.type == "identifier" else None
+
+
+def _is_plain_bool(type_node: Node | None) -> bool:
+    return type_node is not None and type_node.type == "predefined_type" and _text(type_node) == "bool"
+
+
+def _plain_bool_chain(
+    type_node: Node, steps: list[str], reader: xcs._Reader, readers: _Readers, family: frozenset[str]
+) -> bool:
+    """Whether reading ``steps`` from a value of ``type_node`` runs no code
+    and yields a ``bool``: each step a field or auto-property declared by a
+    class, struct or record of the checkout (never a library type, an
+    interface, or a family type), none of which declares an operator, and
+    the last one literally ``bool``."""
+    checkout = xcs.csharp_index(readers.repo_dir)
+    for step in steps:
+        full = _type_full(type_node, reader)
+        infos = checkout.by_full.get(full or "", ())
+        if full is None or full in family or len(infos) != 1 or infos[0].generic or infos[0].partial:
+            return False
+        reader = readers.get(infos[0].path)
+        node = _find_type_in(reader.root, infos[0].namespace, infos[0].chain) if reader is not None else None
+        if node is None or node.type not in _OWNERS:
+            return False
+        body = node.child_by_field_name("body")
+        if any(
+            m.type in ("operator_declaration", "conversion_operator_declaration")
+            for m in (body.named_children if body is not None else ())
+        ):
+            return False
+        member = _own_state(node, step)
+        if member is None:
+            return False
+        type_node = member
+    return _is_plain_bool(type_node)
+
+
+def _inert_member(
+    member: Node, type_node: Node, test: bool, reader: xcs._Reader, readers: _Readers, family: frozenset[str]
+) -> tuple[str, str | None] | None:
+    """``(what it returns, its knob)`` when the member is inert, else ``None``.
+
+    Inert: a ``bool`` literal; a read of the type's own field or
+    auto-property, or a tower of reads through one, that runs no code and
+    yields a ``bool`` (see :func:`_plain_bool_chain`); or an auto-property
+    with a setter or ``init`` (its own knob). A get-only auto-property is
+    not: a constructor may set it from anything. In a test sibling a bare
+    read of a ``bool`` primary-constructor parameter is inert too, and the
+    parameter is the knob. A method may ignore its parameters, but never
+    read one."""
+    if xcs._modifiers(member) & _OVERRIDES:
+        return None
+    parameters: set[str] = set()
+    if member.type == "property_declaration":
+        if _bodiless(member, {"get", "set"}) or _bodiless(member, {"get", "init"}):
+            if member.child_by_field_name("value") is not None:
+                return None  # an initializer may be anything
+            return "auto-property", _name_of(member)
+        body = _getter_body(member)
+    else:
+        listed = member.child_by_field_name("parameters")
+        parameters = {
+            n.removeprefix("@") for p in (listed.named_children if listed is not None else ()) if (n := _name_of(p))
+        }
+        body = member.child_by_field_name("body")
+    expression = _returned(body)
+    if expression is None:
+        return None
+    returns = " ".join(_text(expression).split())
+    if expression.type == "boolean_literal":
+        return returns, None
+    read = _read_chain(expression)
+    if read is None:
+        return None
+    root, through_this, steps = read
+    word = _text(root).removeprefix("@")
+    if word in parameters:
+        return None
+    state = _own_state(type_node, word)
+    primary = not through_this and type_node.type not in ("record_declaration", "record_struct_declaration") and (
+        _primary_parameter(type_node, word) is not None
+    )
+    bare = expression.type == "identifier" or (through_this and not steps)
+    if state is not None and not primary:
+        if not _plain_bool_chain(state, steps, reader, readers, family):
+            return None
+        return returns, word if bare else None
+    if primary and state is None and test and bare:
+        bound = _primary_parameter(type_node, word)
+        return (returns, word) if isinstance(bound, Node) and _is_plain_bool(bound) else None
+    return None
+
+
+def _siblings(
+    wrapper: wi.Wrapper, interface: TypeDecl, index: Index, readers: _Readers
+) -> tuple[tuple[wi.Sibling, ...], str | wi.Refused | None]:
+    """Every other implementation of ``interface``, each inert, or the reason
+    one is not (``interface-published`` for one this cannot see: a guest
+    file's or a derived interface's).
+
+    Found through the checkout index, by the interface's name or any alias of
+    it, and kept when its base resolves to the interface. An implementation
+    is refused unless it is a top-level, sealed or never extended,
+    non-generic, non-partial class or struct, every base of it (transitively)
+    is a repository type, none but the interface declares the name, no
+    caller outside the repository can reach it, it declares the member
+    once, inertly, and whether it is test code can be told. One in the
+    wrapper's or the interface's own file is refused too: close-out deletes
+    the name there in one edit of its own, which cannot also take the
+    sibling's member, so the wrapper would end partial after its sibling's
+    tests went. A refusal tied to one implementation is a
+    :class:`~flag_cleanup.wrapper_inline.Refused` naming it."""
+    full = _full_name(interface.namespace, interface.name)
+    names = _aliases(index.repo_dir, interface.name)
+    if names is None:
+        return (), wi.SIBLING_NOT_INERT
+    if _guest_extends(index.repo_dir, names):
+        return (), wi.INTERFACE_PUBLISHED
+    checkout = xcs.csharp_index(index.repo_dir)
+    if names != {interface.name} and checkout.incomplete:
+        return (), wi.SIBLING_NOT_INERT
+    candidates = {
+        (str(Path(info.path).resolve()), info.namespace, info.chain): info
+        for infos in checkout.by_full.values()
+        for info in infos
+        if names & set(info.supertypes)
+    }
+    wrapper_path = str(Path(wrapper.path).resolve())
+    held = {wrapper_path, str(Path(interface.path).resolve())}
+    family = frozenset(
+        {full, _full_name(wrapper.package, wrapper.owner)}
+        | {_full_name(namespace, chain) for _, namespace, chain in candidates}
+    )
+    found: list[wi.Sibling] = []
+    for (path, namespace, chain), info in sorted(candidates.items()):
+        if path == wrapper_path and chain == wrapper.owner and namespace == wrapper.package:
+            continue
+        reader = readers.get(path)
+        node = _find_type_in(reader.root, namespace, chain) if reader is not None else None
+
+        def refused(reason: str, at: Node | None = None) -> tuple[tuple[wi.Sibling, ...], wi.Refused]:
+            where = at if at is not None else node
+            return (), wi.Refused(reason, path, wi.line_of(where) if where is not None else 1, chain)
+
+        if node is None:
+            return refused(wi.SIBLING_NOT_INERT)
+        named = [b for b in _base_nodes(node) if xcs._simple_name(b) in names]
+        bases = [_type_full(b, reader) for b in named]
+        if full not in bases:
+            if any(b is None for b in bases):
+                return refused(wi.SIBLING_NOT_INERT)
+            continue  # another type of the same simple name
+        if node.type not in _OWNERS:
+            return refused(wi.INTERFACE_PUBLISHED)  # a derived interface
+        words = xcs._modifiers(node)
+        if (
+            "." in chain
+            or words & {"abstract", "partial", "static"}
+            or _child(node, "type_parameter_list") is not None
+            or _extended(node, info.last, index.repo_dir)
+            or (
+                (words & {"public", "protected"} or _has_friends(path, index.repo_dir))
+                and published(path, index.repo_dir)
+            )
+        ):
+            return refused(wi.SIBLING_NOT_INERT)
+        supertypes = _supertypes_of(readers, path, node)
+        if supertypes is None or any(s.full != full and wrapper.name in s.members for s in supertypes):
+            return refused(wi.SIBLING_NOT_INERT)
+        body = node.child_by_field_name("body")
+        members = [m for m in (body.named_children if body is not None else ()) if wrapper.name in _member_names(m)]
+        kind = "property_declaration" if wrapper.kind == "property" else "method_declaration"
+        if len(members) != 1 or members[0].type != kind:
+            return refused(wi.SIBLING_NOT_INERT)
+        if path in held:
+            return refused(wi.SIBLING_NOT_INERT, members[0])
+        in_project = _test_project(path, index.repo_dir)
+        if in_project is None:
+            return refused(wi.SIBLING_NOT_INERT, members[0])
+        # Only the project says test code. A production project's file that
+        # also holds tests may test the sibling, and nothing edits tests
+        # outside a test project, so deleting its member could leave them
+        # asserting the removed branch: refuse.
+        if not in_project and _holds_test_attribute(reader.root):
+            return refused(wi.SIBLING_NOT_INERT, members[0])
+        test = in_project
+        inert = _inert_member(members[0], node, test, reader, readers, family)
+        if inert is None:
+            return refused(wi.SIBLING_NOT_INERT, members[0])
+        returns, knob = inert
+        default: str | None = None
+        primary = False
+        if test and returns not in ("true", "false"):
+            # A test sets a fake through its knob, and the knob is all that
+            # can be followed: one read some other way is not inert here.
+            if knob is None:
+                return refused(wi.SIBLING_NOT_INERT, members[0])
+            if returns != "auto-property":
+                known = _knob_default(node, members[0], knob, supertypes)
+                if known is None:
+                    return refused(wi.SIBLING_NOT_INERT, members[0])
+                default, primary = known
+        found.append(
+            wi.Sibling(
+                path, info.last, namespace, wi.line_of(members[0]),
+                members[0].start_byte, members[0].end_byte, returns, knob if test else None, test,
+                default, primary,
+            )
+        )
+    return tuple(found), None
+
+
+def _knob_default(
+    type_node: Node, member: Node, knob: str, supertypes: list
+) -> tuple[str, bool] | None:
+    """``(default, primary)`` of a test fake's ``knob`` (``wi.Sibling.knob_default``,
+    ``knob_primary``), when the knob is all that chooses ``member``'s value:
+    declared once, by the fake itself and no supertype of it, never
+    ``static``, with a literal initializer or none, and mentioned nowhere in
+    the fake but its declaration and ``member``'s read (no other reader, no
+    write of the fake's own). A primary constructor's parameter qualifies
+    only in a type declaring no other constructor, which could pass it
+    anything. A struct can always be built as ``default``, which no
+    initializer reaches, so its knob defaults to ``false`` and takes none.
+    ``None`` otherwise."""
+    if any(knob in s.members for s in supertypes):
+        return None
+    struct = type_node.type in ("struct_declaration", "record_struct_declaration")
+    body = type_node.child_by_field_name("body")
+    declared: list[tuple[Node, str | None, bool]] = []  # (name node, default, primary)
+    parameters = _child(type_node, "parameter_list")
+    for parameter in parameters.named_children if parameters is not None else ():
+        if parameter.type == "parameter" and _name_of(parameter) == knob:
+            if _child(parameter, "modifier") is not None or _child(parameter, "attribute_list") is not None:
+                return None
+            name = parameter.child_by_field_name("name")
+            after = [c for c in parameter.named_children if c.start_byte >= name.end_byte]
+            if after and (len(after) != 1 or after[0].type != "boolean_literal"):
+                return None
+            if any(m.type == "constructor_declaration" for m in (body.named_children if body is not None else ())):
+                return None
+            if struct and after:
+                return None
+            default = _text(after[0]) if after else ("false" if struct else "")
+            declared.append((name, default, True))
+    for part in body.named_children if body is not None else ():
+        if part.type == "field_declaration":
+            declaration = _child(part, "variable_declaration")
+            for declarator in declaration.named_children if declaration is not None else ():
+                if declarator.type != "variable_declarator" or _name_of(declarator) != knob:
+                    continue
+                name = declarator.child_by_field_name("name")
+                values = [c for c in declarator.named_children if c.start_byte >= name.end_byte]
+                declared.append((name, _initial(values[0] if values else None, struct), False))
+                if "static" in xcs._modifiers(part):
+                    return None
+        elif part.type == "property_declaration" and _name_of(part) == knob:
+            if "static" in xcs._modifiers(part):
+                return None
+            declared.append((part.child_by_field_name("name"), _initial(part.child_by_field_name("value"), struct), False))
+    if len(declared) != 1 or declared[0][1] is None:
+        return None
+    name_node, default, primary = declared[0]
+    for node in cross_file_keys.walk(type_node):
+        if node.type != "identifier" or _text(node).removeprefix("@") != knob or node.id == name_node.id:
+            continue
+        if not (member.start_byte <= node.start_byte < member.end_byte):
+            return None
+    return default, primary
+
+
+def _initial(value: Node | None, struct: bool) -> str | None:
+    """The default of a field or auto-property initialized with ``value``:
+    ``false`` with none, the literal for a ``bool`` literal, ``None`` for
+    anything else, or for any initializer of a struct's."""
+    if value is None:
+        return "false"
+    if struct or value.type != "boolean_literal":
+        return None
+    return _text(value)
+
+
+def _extended(node: Node, name: str, repo_dir: str) -> bool:
+    """Whether a class may have a subclass: it is not sealed (a struct never
+    has one), and some C# type lists its name or an alias of it as a base, or
+    a guest file extends it. Unreadable counts."""
+    if node.type in ("struct_declaration", "record_struct_declaration") or "sealed" in xcs._modifiers(node):
+        return False
+    names = _aliases(repo_dir, name)
+    if names is None:
+        return True
+    checkout = xcs.csharp_index(repo_dir)
+    if any(names & set(info.supertypes) for infos in checkout.by_full.values() for info in infos):
+        return True
+    return _guest_extends(repo_dir, names)
 
 
 def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str | None]:
@@ -723,7 +1355,8 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     readers = _Readers(index.repo_dir)
     reader = readers.get(wrapper.path)
     owner_node = _find_type(reader.root, wrapper.owner) if reader is not None else None
-    if owner_node is None or not _bases_in_repository(readers, wrapper.path, owner_node):
+    supertypes = _supertypes_of(readers, wrapper.path, owner_node) if owner_node is not None else None
+    if supertypes is None:
         return None, wi.OVERRIDABLE
     member = wrapper
     declared_in = (lambda c: c.properties) if wrapper.kind == "property" else (lambda c: c.methods)
@@ -752,26 +1385,91 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
             interface.partial
             or interface.generic
             or interface.supertypes
-            or index.implementations.get(simple, 0) != 1
             or (
                 (interface.public or _has_friends(interface.path, index.repo_dir))
                 and published(interface.path, index.repo_dir)
             )
         ):
             return None, wi.INTERFACE_PUBLISHED
+        siblings, why = _siblings(wrapper, interface, index, readers)
+        if why is not None:
+            return None, why
         start, end = declared_in(interface)[wrapper.name]
         member = replace(
             wrapper,
             interface=wi.InterfaceMember(interface.path, interface.name, interface.namespace, start, end),
+            siblings=siblings,
         )
         break
+    # Every supertype but the implemented interface must be silent on the
+    # name: a call through another interface declaring it (a second base, or
+    # a base of the interface) dispatches to the wrapper as well, and is not
+    # a family type here.
+    chosen = None if member.interface is None else _full_name(member.interface.package, member.interface.name)
+    if any(info.full != chosen and wrapper.name in info.members for info in supertypes):
+        return None, wi.NAME_NOT_UNIQUE
     interface_at = None if member.interface is None else (member.interface.path, member.interface.start)
     declared = [d for d in index.members.get(wrapper.name, []) if d != interface_at]
-    if len(declared) != 1:
+    family_types = [owner]
+    if member.interface is not None:
+        family_types += [t for t in index.types.get(member.interface.name, []) if t.path == member.interface.path]
+    family_types += [
+        t for s in member.siblings for t in index.types.get(s.owner, []) if t.path == s.path and t.namespace == s.namespace
+    ]
+    inside_family: set[tuple[str, int]] = set()
+    for decl in family_types:
+        inside = [d for d in declared if d[0] == decl.path and decl.start <= d[1] < decl.end]
+        inside_family.update(inside)
+        expected = 0 if decl.kind == "interface" else 1
+        if len(inside) != expected:
+            return None, wi.NAME_NOT_UNIQUE
+    if _extension_declared([d for d in declared if d not in inside_family], wrapper.name):
         return None, wi.NAME_NOT_UNIQUE
     if owner.open or wrapper.owner in index.subclassed:
         return None, wi.OVERRIDABLE
+    from flag_cleanup import csharp_family
+
+    index.family = csharp_family.family_of(index.repo_dir, member, index)
+    fakes = fakes_of([member])
+    if fakes:
+        # A test sets a fake's knob without naming the wrapper, its class or
+        # its interface; it spells the fake, and that file is judged too.
+        owners = {s.owner for group in fakes.values() for s in group}
+        for path in cross_file_keys.mention_files(index.repo_dir, owners, exclude=()):
+            if not path.endswith(EXTENSIONS) or path in index.parsed:
+                continue
+            if _read(path) is None:
+                return None, wi.SIBLING_NOT_INERT
+            index.parsed.append(path)
     return member, None
+
+
+def _full_name(namespace: str, name: str) -> str:
+    return f"{namespace}.{name}" if namespace else name
+
+
+def _extension_declared(declarations: list[tuple[str, int]], name: str) -> bool:
+    """Whether a declaration of ``name`` outside the family may be an
+    extension member: a method with a ``this`` parameter, or anything in a
+    file that may hold an ``extension`` block (which the grammar misreads).
+    Overload resolution falls back to an extension method when the
+    instance member does not fit the call, so a call that looks like the
+    wrapper's may be the extension's. Unreadable counts as one."""
+    from flag_cleanup import csharp_family
+
+    for path in sorted({p for p, _ in declarations}):
+        source = _read(path)
+        if source is None or csharp_family._EXTENSION_BLOCK.search(source):
+            return True
+        starts = {start for p, start in declarations if p == path}
+        for node in cross_file_keys.walk(parse(source)):
+            if node.start_byte not in starts or node.type != "method_declaration" or _name_of(node) != name:
+                continue
+            parameters = node.child_by_field_name("parameters")
+            first = next((p for p in (parameters.named_children if parameters else ()) if p.type == "parameter"), None)
+            if first is not None and any(c.type == "modifier" and _text(c) == "this" for c in first.children):
+                return True
+    return False
 
 
 # --- Call sites -----------------------------------------------------------------
@@ -836,16 +1534,117 @@ def _field(parent: Node, child: Node) -> str | None:
     return xcs._field(parent, child)
 
 
-def _creation_type(value: Node | None) -> Node | str:
-    """The type ``var x = <value>`` binds: a ``new C(...)``'s ``C``."""
+_LOCATORS = frozenset({"GetRequiredService", "GetService", "GetRequiredKeyedService", "GetKeyedService"})
+_DI_NAMESPACE = "Microsoft.Extensions.DependencyInjection"
+_SUBSTITUTE_NAMESPACE = "NSubstitute"
+
+
+def _single_type_argument(generic: Node | None, names: frozenset[str]) -> Node | None:
+    """``T`` in ``Name<T>`` when ``generic`` is a ``generic_name`` whose name
+    is one of ``names`` and which has exactly one type argument."""
+    if generic is None or generic.type != "generic_name" or not generic.named_children:
+        return None
+    if _text(generic.named_children[0]) not in names:
+        return None
+    arguments = _child(generic, "type_argument_list")
+    types = list(arguments.named_children) if arguments is not None else []
+    return types[0] if len(types) == 1 else None
+
+
+def _called_member(value: Node | None) -> Node | None:
+    """The ``member_access_expression`` an invocation calls."""
+    if value is None or value.type != "invocation_expression":
+        return None
+    function = value.child_by_field_name("function")
+    return function if function is not None and function.type == "member_access_expression" else None
+
+
+def _locator_type(value: Node | None) -> Node | None:
+    """``T`` in ``<recv>.GetRequiredService<T>(...)`` (and the other lookups)."""
+    function = _called_member(value)
+    return None if function is None else _single_type_argument(function.child_by_field_name("name"), _LOCATORS)
+
+
+def _substitute_type(value: Node | None) -> Node | None:
+    """``T`` in ``Substitute.For<T>(...)``."""
+    function = _called_member(value)
+    if function is None:
+        return None
+    receiver = function.child_by_field_name("expression")
+    if receiver is None or receiver.type != "identifier" or _text(receiver) != "Substitute":
+        return None
+    return _single_type_argument(function.child_by_field_name("name"), frozenset({"For"}))
+
+
+def _namespace_in_scope(at: Node, reader: xcs._Reader, namespace: str) -> bool:
+    """Whether ``namespace`` is certainly imported at ``at``: items that may
+    or may not reach the file only ever refuse, so they do not count."""
+    return any(
+        u.kind == "namespace" and u.certain and u.target == namespace
+        for level in xcs._levels(at, reader.root, reader.unit_extra)
+        for u in level.usings
+    )
+
+
+def _locator_ok(at: Node, reader: xcs._Reader) -> bool:
+    """Whether a ``GetRequiredService<T>()`` here can only be the DI lookup:
+    its namespace is in scope, and no repository type declares a method of
+    one of those names."""
+    if reader.index.incomplete or not _namespace_in_scope(at, reader, _DI_NAMESPACE):
+        return False
+    return not any(
+        _LOCATORS & info.members for infos in reader.index.by_last.values() for info in infos
+    )
+
+
+def _substitute_ok(at: Node, reader: xcs._Reader, readers: _Readers) -> bool:
+    """Whether ``Substitute.For<T>()`` here can only be NSubstitute's: the
+    namespace is in scope, no repository type named ``Substitute`` has a
+    member ``For``, no alias is named ``Substitute``, and no local, parameter
+    or member shadows the name at a ``Substitute.For`` receiver."""
+    if reader.index.incomplete or not _namespace_in_scope(at, reader, _SUBSTITUTE_NAMESPACE):
+        return False
+    if any("For" in info.members for info in reader.index.by_last.get("Substitute", ())):
+        return False
+    for node in reader.occurrences("Substitute"):
+        if node.type != "identifier":
+            continue
+        use = node.parent
+        if use is not None and use.type == "member_access_expression":
+            if any(
+                u.kind == "alias" and u.alias == "Substitute"
+                for level in xcs._levels(node, reader.root, reader.unit_extra)
+                for u in level.usings
+            ):
+                return False
+            if use.child_by_field_name("expression") == node and (
+                _binding(node, "Substitute", readers, reader.path) is not None
+            ):
+                return False
+    return True
+
+
+def _creation_type(value: Node | None, factories: frozenset[str] = frozenset()) -> Node | str:
+    """The type ``var x = <value>`` binds: a ``new C(...)``'s ``C``, or, where
+    the matching factory is enabled, the ``T`` of a typed lookup."""
     if value is not None and value.type == "object_creation_expression":
         type_node = value.child_by_field_name("type")
         if type_node is not None:
             return type_node
+    if "locator" in factories:
+        found = _locator_type(value)
+        if found is not None:
+            return found
+    if "substitute" in factories:
+        found = _substitute_type(value)
+        if found is not None:
+            return found
     return _UNTYPED
 
 
-def _declarator_type(declaration: Node, name: str) -> Node | str | None:
+def _declarator_type(
+    declaration: Node, name: str, factories: frozenset[str] = frozenset()
+) -> Node | str | None:
     """The type a ``variable_declaration`` binds ``name`` to, if it binds it."""
     type_node = declaration.child_by_field_name("type")
     for declarator in declaration.named_children:
@@ -855,7 +1654,7 @@ def _declarator_type(declaration: Node, name: str) -> Node | str | None:
             return _UNTYPED
         if type_node.type == "implicit_type":
             values = [c for c in _named(declarator) if c.id != declarator.child_by_field_name("name").id]
-            return _creation_type(values[-1] if values else None)
+            return _creation_type(values[-1] if values else None, factories)
         return type_node
     return None
 
@@ -966,7 +1765,9 @@ def _statements_in_scope(scope: Node) -> list[Node]:
     return list(scope.named_children)
 
 
-def _local_binding(statements: list[Node], at: Node, name: str) -> Node | str | None:
+def _local_binding(
+    statements: list[Node], at: Node, name: str, factories: frozenset[str] = frozenset()
+) -> Node | str | None:
     """What the locals and local functions among ``statements`` bind ``name``
     to at ``at``. A local declared after ``at`` cannot be read there, so only
     one declared before counts; a local function is in scope throughout."""
@@ -979,7 +1780,7 @@ def _local_binding(statements: list[Node], at: Node, name: str) -> Node | str | 
         if statement.type == "local_declaration_statement" and statement.start_byte < at.start_byte:
             declaration = _child(statement, "variable_declaration")
             if declaration is not None:
-                found = _declarator_type(declaration, name) or found
+                found = _declarator_type(declaration, name, factories) or found
     return found
 
 
@@ -1006,7 +1807,7 @@ def _binding(
         found: Node | str | None = None
         if not class_only:
             if scope.type in ("block", "switch_section"):
-                found = _local_binding(_statements_in_scope(scope), at, name)
+                found = _local_binding(_statements_in_scope(scope), at, name, readers.factories())
             elif scope.type in ("lambda_expression", "anonymous_method_expression"):
                 # A lambda's parameter, typed or not, may be the parameter of
                 # an expression tree, where the call is the payload.
@@ -1026,10 +1827,13 @@ def _binding(
                 # block's locals are out of scope at ``at``.
                 for part in scope.named_children:
                     if part.type == "variable_declaration" and part.start_byte < at.start_byte:
-                        found = _declarator_type(part, name) or found
+                        found = _declarator_type(part, name, readers.factories()) or found
             elif scope.type == "compilation_unit" and _in_global_statement(at):
                 found = _local_binding(
-                    [c for c in scope.named_children if c.type == "global_statement"], at, name
+                    [c for c in scope.named_children if c.type == "global_statement"],
+                    at,
+                    name,
+                    readers.factories(),
                 )
         if scope.type in _SCOPE_TYPES:
             if locals_only:
@@ -1049,6 +1853,84 @@ def _binding(
         if found is not None:
             return found
         scope = scope.parent
+    return None
+
+
+#: Moq setup and verification methods whose lambda parameter is the mocked type.
+_MOQ_METHODS = frozenset({"Setup", "SetupGet", "Verify", "VerifyGet"})
+
+
+def _moq_mock(access: Node, name: str, readers: _Readers, path: str) -> tuple[str, Node] | None:
+    """For ``name`` a lambda parameter in ``<m>.Setup(name => name.M...)``,
+    where ``<m>``'s declared type is ``Mock<T>``: ``(<m>, T)``."""
+    lam = access.parent
+    while lam is not None and lam.type != "lambda_expression":
+        if lam.type in _MEMBERS:
+            return None
+        lam = lam.parent
+    if lam is None or _parameter_type(lam.child_by_field_name("parameters"), name) is None:
+        return None
+    argument = lam.parent
+    arguments = argument.parent if argument is not None and argument.type == "argument" else None
+    call = arguments.parent if arguments is not None else None
+    if call is None or call.type != "invocation_expression":
+        return None
+    if [c for c in arguments.named_children if c.type == "argument"][:1] != [argument]:
+        return None
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return None
+    method = function.child_by_field_name("name")
+    mock = function.child_by_field_name("expression")
+    if method is None or _text(method) not in _MOQ_METHODS or mock is None or mock.type != "identifier":
+        return None
+    bound = _binding(function, _text(mock), readers, path)
+    if bound is None or isinstance(bound, str):
+        return None
+    argument_type = _moq_argument(bound, function, readers.get(path))
+    return None if argument_type is None else (_text(mock), argument_type)
+
+
+def _moq_argument(node: Node, at: Node, reader: xcs._Reader | None) -> Node | None:
+    """``T`` when declared type ``node`` can only be Moq's ``Mock<T>`` at ``at``."""
+    if reader is None or reader.index.incomplete or reader.index.by_last.get("Mock"):
+        return None
+    if node.type == "qualified_name":
+        qualifier = node.child_by_field_name("qualifier")
+        if qualifier is None or _text(qualifier) != "Moq":
+            return None
+        node = node.child_by_field_name("name")
+    elif not _namespace_in_scope(at, reader, "Moq"):
+        return None
+    return _single_type_argument(node, frozenset({"Mock"}))
+
+
+def _moq_call_receiver(access: Node) -> str | None:
+    """``m`` when ``access`` sits in the lambda of ``m.Setup(…)`` (or
+    ``SetupGet``, ``Verify``, ``VerifyGet``, ``this.m.…``), whatever ``m``
+    is bound to."""
+    lam = access.parent
+    while lam is not None and lam.type != "lambda_expression":
+        if lam.type in _MEMBERS:
+            return None
+        lam = lam.parent
+    argument = lam.parent if lam is not None else None
+    call = argument.parent.parent if argument is not None and argument.parent is not None else None
+    if argument is None or argument.type != "argument" or call is None or call.type != "invocation_expression":
+        return None
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return None
+    method = function.child_by_field_name("name")
+    if method is None or _text(method) not in _MOQ_METHODS:
+        return None
+    mock = _unwrap(function.child_by_field_name("expression"))
+    if mock is not None and mock.type == "identifier":
+        return _text(mock)
+    if mock is not None and mock.type == "member_access_expression":
+        inner, name = mock.child_by_field_name("expression"), mock.child_by_field_name("name")
+        if inner is not None and inner.type == "this" and name is not None and name.type == "identifier":
+            return _text(name)
     return None
 
 
@@ -1175,6 +2057,14 @@ def _in_test_double(at: Node, data: bytes) -> bool:
     return bool(mock_stubs._DSL.search(data[node.start_byte : node.end_byte].decode("utf-8", "replace")))
 
 
+def _enclosing_test_method(at: Node, data: bytes) -> bool:
+    """Whether ``at`` sits in a C# test method, parameterised included."""
+    node = at.parent
+    while node is not None and node.type != "method_declaration":
+        node = node.parent
+    return node is not None and mock_stubs._csharp_any_test(node, data)
+
+
 def _in_nameof(at: Node) -> bool:
     scope = at.parent
     while scope is not None and scope.type not in _MEMBERS:
@@ -1203,11 +2093,21 @@ def _cref_mentions(root: Node, name: str) -> list[Node]:
 
 def names_only(node: Node, kind: str = "method") -> bool:
     """Whether an identifier only names something: the declared name of a
-    method or property, or a named-argument label."""
+    method or property, a record's positional parameter (a property), or a
+    named-argument label."""
     parent = node.parent
     if parent is None:
         return False
     if parent.type in _WRAPPER_DECLARATIONS and parent.child_by_field_name("name") == node:
+        return True
+    if (
+        parent.type == "parameter"
+        and parent.child_by_field_name("name") == node
+        and parent.parent is not None
+        and parent.parent.type == "parameter_list"
+        and parent.parent.parent is not None
+        and parent.parent.parent.type in ("record_declaration", "record_struct_declaration")
+    ):
         return True
     return parent.type == "argument" and _field(parent, node) == "name"
 
@@ -1224,12 +2124,577 @@ def members(root: Node, name: str) -> list[Node]:
     ]
 
 
+# --- Foreign mentions -----------------------------------------------------------
+#
+# Each of these only ever DROPS a mention, as provably not the wrapper's
+# member; none marks one. A wrong answer here lets the wrapper be deleted
+# under a read that was really of it, so every one returns "not foreign"
+# whenever it cannot tell.
+
+
+def _unwrap(receiver: Node | None) -> Node | None:
+    """``x`` in ``x!`` (any number of them); ``(x)`` stays as written."""
+    while receiver is not None and receiver.type == "postfix_unary_expression" and _text(receiver).endswith("!"):
+        receiver = receiver.named_children[0] if receiver.named_children else None
+    return receiver
+
+
+def _foreign_type(type_node: Node, reader: xcs._Reader, family) -> bool:
+    """Whether a declared type certainly is no family type: it does not
+    resolve to one, its simple name is no family type's (nor any alias of
+    one's, which :class:`~flag_cleanup.csharp_family.Family` collects over
+    the checkout), no alias in scope here takes that name, and nothing
+    nearer -- a type parameter, a nested type -- may claim it. A type
+    parameter is never foreign: its constraints may name a family type."""
+    if _type_full(type_node, reader) in family.full_names:
+        return False
+    node: Node | None = type_node
+    while node is not None and node.type in ("nullable_type", "qualified_name") and node.named_children:
+        node = node.child_by_field_name("name") if node.type == "qualified_name" else node.named_children[0]
+    if node is not None and node.type == "generic_name":
+        node = node.named_children[0] if node.named_children else None
+    if node is None:
+        return False
+    if node.type == "predefined_type":
+        return True
+    if node.type != "identifier":
+        return False
+    spelled = _text(node)
+    simple = spelled.removeprefix("@")
+    if simple == "dynamic" or _type_shadowed(node, spelled, reader) or _type_shadowed(node, simple, reader):
+        return False
+    if simple in {n.removeprefix("@") for n in family.simple_names}:
+        return False
+    return not any(
+        u.kind == "alias" and (u.alias or "").removeprefix("@") == simple
+        for level in xcs._levels(type_node, reader.root, reader.unit_extra)
+        for u in level.usings
+    )
+
+
+def _is_family_type(declaration: Node, family) -> bool:
+    """Whether a type declaration may be a family type; unknown counts."""
+    chain = xcs._type_chain(declaration, strict=False)
+    name = _name_of(declaration)
+    if chain is None or name is None:
+        return True
+    namespace = xcs._namespace_of(declaration)
+    full = ".".join([namespace, *chain]) if namespace else ".".join(chain)
+    return full in family.full_names or name.removeprefix("@") in {
+        n.removeprefix("@") for n in family.simple_names
+    }
+
+
+def _in_pattern_path(node: Node) -> bool:
+    """Whether ``node`` is a segment of an extended property pattern's
+    dotted name (``x is T { A.B: true }``), at any position."""
+    top = node
+    while top.parent is not None and top.parent.type == "member_access_expression":
+        top = top.parent
+    if top.id == node.id:
+        return False  # a lone name is a plain property subpattern
+    holder = top.parent
+    first = _named(holder)[:1] if holder is not None and holder.type == "subpattern" else []
+    return bool(first) and first[0].id == top.id
+
+
+def _target_object_type(node: Node, readers: _Readers, path: str) -> Node | None:
+    """The declared type of the OTHER object a bare name is a member of: the
+    created type of an object initializer, the bound type of a ``with`` or
+    ``?.`` receiver, the type of a property pattern. Only the direct parent
+    chain counts (``new T { Inner = { X = 1 } }`` sets ``Inner``'s ``X``,
+    not ``T``'s). ``None`` when unknown."""
+    parent = node.parent
+    if parent is None:
+        return None
+    inner: Node | None = None
+    if parent.type == "assignment_expression" and _field(parent, node) == "left":
+        initializer = parent.parent
+        creation = initializer.parent if initializer is not None and initializer.type == "initializer_expression" else None
+        if creation is None or creation.type != "object_creation_expression" or _field(creation, initializer) != "initializer":
+            return None
+        return creation.child_by_field_name("type")
+    if parent.type in ("with_initializer", "subpattern"):
+        first = _named(parent)[:1]
+        if not first or first[0].id != node.id:
+            return None  # the value, not the member set or matched
+        holder = parent.parent
+        if parent.type == "subpattern":
+            pattern = holder.parent if holder is not None and holder.type == "property_pattern_clause" else None
+            return pattern.child_by_field_name("type") if pattern is not None and pattern.type == "recursive_pattern" else None
+        if holder is None or holder.type != "with_expression" or not _named(holder):
+            return None
+        inner = _named(holder)[0]
+    elif parent.type == "member_binding_expression" and _field(parent, node) == "name":
+        access = parent.parent
+        if access is None or access.type != "conditional_access_expression" or _field(access, parent) == "condition":
+            return None
+        inner = access.child_by_field_name("condition")
+    if inner is None or inner.type != "identifier":
+        return None
+    bound = _binding(node, _text(inner), readers, path)
+    return bound if bound is not None and not isinstance(bound, str) else None
+
+
+def _declaring_scope(at: Node, name: str) -> Node | None:
+    """The node whose scope declares the ``name`` read at ``at``: a block, a
+    function or lambda with that parameter, a ``for``/``foreach``/``using``
+    header, or the enclosing type when no local declares it. ``None`` when
+    that cannot be told: top-level statements, or a primary-constructor
+    parameter of the name (which wins in initializers, not in bodies). A
+    pattern, ``out`` or query variable is the caller's to rule out."""
+    scope = at.parent
+    while scope is not None:
+        if scope.type in ("block", "switch_section"):
+            if _local_binding(_statements_in_scope(scope), at, name) is not None:
+                return scope.parent if scope.type == "switch_section" else scope
+        elif scope.type in _FUNCTIONS:
+            if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+                return scope
+        elif scope.type == "accessor_declaration" and name == "value":
+            return scope
+        elif scope.type == "foreach_statement":
+            left = scope.child_by_field_name("left")
+            if left is not None and left.type == "identifier" and _text(left) == name:
+                return scope
+        elif scope.type in ("for_statement", "using_statement", "fixed_statement"):
+            for part in scope.named_children:
+                if part.type == "variable_declaration" and part.start_byte < at.start_byte and _declarator_type(part, name):
+                    return scope
+        elif scope.type == "compilation_unit":
+            return None
+        if scope.type in _SCOPE_TYPES:
+            return None if _primary_parameter(scope, name) is not None else scope
+        scope = scope.parent
+    return None
+
+
+#: Operators a method group can never be an operand of.
+_VALUE_OPERATORS = frozenset({"&&", "||", "<", ">", "<=", ">=", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"})
+#: Literals of value types: ``==`` against one is never a delegate comparison.
+_VALUE_LITERALS = frozenset({"integer_literal", "real_literal", "character_literal", "boolean_literal"})
+
+
+def _value_use(access: Node) -> bool:
+    """Whether ``x.Other`` here can only be a field, property or event, never
+    a method group: a group converts to a delegate (an extension method's
+    included), so ``Func<int> f = x.Other`` is no evidence of a member."""
+    parent = access.parent
+    if parent is None:
+        return False
+    if parent.type in ("member_access_expression", "element_access_expression"):
+        return _field(parent, access) == "expression"
+    if parent.type == "conditional_access_expression":
+        return _field(parent, access) == "condition"
+    if parent.type == "prefix_unary_expression":
+        return bool(parent.children) and parent.children[0].type in ("!", "~", "-")
+    if parent.type == "binary_expression":
+        operator = parent.child_by_field_name("operator")
+        op = _text(operator) if operator is not None else ""
+        if op in _VALUE_OPERATORS:
+            return True
+        if op in ("==", "!="):
+            left, right = parent.child_by_field_name("left"), parent.child_by_field_name("right")
+            other = right if left is not None and left.id == access.id else left
+            return other is not None and other.type in _VALUE_LITERALS
+    return False
+
+
+def _co_used(at: Node, name: str, family) -> bool:
+    """Whether, where ``name`` is declared, the same binding of ``name`` is
+    also read as ``name.Other`` for a field, property or event no family
+    type declares or inherits: a value of a family type has no ``Other``.
+
+    Judged in the declaring block or function, or, for a name no local
+    declares, in the member around ``at``; a nested lambda, local function
+    or block declaring its own ``name`` is another binding and does not
+    count. Never inside a generic declaration, where the receiver may be a
+    type parameter constrained to a family type and to a type with
+    ``Other``. The caller rules out ``dynamic`` and extension blocks."""
+    if _pattern_binds(at, name):
+        return False
+    scope = _declaring_scope(at, name)
+    if scope is None:
+        return False
+    region: Node | None = scope
+    if scope.type in _SCOPE_TYPES:
+        region = at.parent
+        while region is not None and region.type not in _MEMBERS:
+            if region.type in _SCOPE_TYPES:
+                return False
+            region = region.parent
+        if region is None:
+            return False
+    ancestor = at.parent
+    while ancestor is not None:
+        if _child(ancestor, "type_parameter_list") is not None:
+            return False
+        ancestor = ancestor.parent
+    known = {m.removeprefix("@") for m in family.members}
+    for node in cross_file_keys.walk(region):
+        if node.type != "member_access_expression":
+            continue
+        expression = node.child_by_field_name("expression")
+        member = node.child_by_field_name("name")
+        if expression is None or member is None or expression.type != "identifier" or member.type != "identifier":
+            continue
+        if _text(expression).removeprefix("@") != name.removeprefix("@"):
+            continue
+        if _text(member).removeprefix("@") in known or not _value_use(node):
+            continue
+        same = _declaring_scope(expression, _text(expression))
+        if same is not None and same.id == scope.id:
+            return True
+    return False
+
+
+#: How many declarations deep :func:`_static_type` follows a value.
+_STATIC_DEPTH = 6
+#: A value whose static type is certainly not ``dynamic``, but unknown here.
+_NOT_DYNAMIC = "not-dynamic"
+_DYNAMIC_WORD = re.compile(r"(?<![\w@])@?dynamic\b")
+_LITERALS = frozenset(
+    {
+        "integer_literal",
+        "real_literal",
+        "character_literal",
+        "boolean_literal",
+        "string_literal",
+        "verbatim_string_literal",
+        "raw_string_literal",
+        "interpolated_string_expression",
+    }
+)
+
+
+def _typed(type_node: Node | None, reader: xcs._Reader | None) -> tuple[Node, xcs._Reader] | None:
+    """A declared type, unless it is ``var`` or spells ``dynamic``."""
+    if type_node is None or reader is None or type_node.type == "implicit_type":
+        return None
+    return None if _DYNAMIC_WORD.search(_text(type_node)) else (type_node, reader)
+
+
+def _local_declarator(statements: list[Node], at: Node, name: str) -> tuple[Node, Node] | str | None:
+    """``(variable_declaration, declarator)`` of the local ``name`` that
+    ``statements`` declare before ``at``; ``_UNTYPED`` for a local function."""
+    found: tuple[Node, Node] | None = None
+    for statement in statements:
+        if statement.type == "global_statement" and statement.named_children:
+            statement = statement.named_children[0]
+        if statement.type == "local_function_statement" and _name_of(statement) == name:
+            return _UNTYPED
+        if statement.type == "local_declaration_statement" and statement.start_byte < at.start_byte:
+            declaration = _child(statement, "variable_declaration")
+            hit = _declarator_named(declaration, name) if declaration is not None else None
+            found = hit or found
+    return found
+
+
+def _declarator_named(declaration: Node, name: str) -> tuple[Node, Node] | None:
+    for declarator in declaration.named_children:
+        if declarator.type == "variable_declarator" and _name_of(declarator) == name:
+            return declaration, declarator
+    return None
+
+
+def _declarator_static(
+    declaration: Node, declarator: Node, readers: _Readers, path: str, depth: int
+) -> tuple[Node, xcs._Reader] | str | None:
+    type_node = declaration.child_by_field_name("type")
+    if type_node is not None and type_node.type != "implicit_type":
+        return _typed(type_node, readers.get(path))
+    name = declarator.child_by_field_name("name")
+    values = [c for c in _named(declarator) if name is None or c.id != name.id]
+    return _static_type(values[-1], readers, path, depth + 1) if values else None
+
+
+def _declared_static(at: Node, name: str, readers: _Readers, path: str, depth: int = 0):
+    """The static type the ``name`` read at ``at`` is declared with, as
+    ``(type node, reader of its file)`` or ``_NOT_DYNAMIC``; ``None`` unless
+    it is certainly not ``dynamic``. Only a declaration with an explicit
+    type, or a ``var`` whose initializer :func:`_static_type` proves, counts:
+    an untyped lambda parameter takes its type from the method it is passed
+    to, which may be a library's taking ``dynamic``."""
+    if depth > _STATIC_DEPTH or _pattern_binds(at, name):
+        return None
+    reader = readers.get(path)
+    scope = at.parent
+    while scope is not None:
+        if scope.type in ("block", "switch_section"):
+            hit = _local_declarator(_statements_in_scope(scope), at, name)
+            if isinstance(hit, str):
+                return None
+            if hit is not None:
+                return _declarator_static(*hit, readers, path, depth)
+        elif scope.type in _FUNCTIONS:
+            parameters = scope.child_by_field_name("parameters")
+            found = _parameter_type(parameters, name)
+            if found is not None:
+                return None if isinstance(found, str) else _typed(found, reader)
+        elif scope.type == "accessor_declaration" and name == "value":
+            return None
+        elif scope.type == "foreach_statement":
+            left = scope.child_by_field_name("left")
+            if left is not None and left.type == "identifier" and _text(left) == name:
+                return _typed(scope.child_by_field_name("type"), reader)
+        elif scope.type in ("for_statement", "using_statement", "fixed_statement"):
+            for part in scope.named_children:
+                if part.type == "variable_declaration" and part.start_byte < at.start_byte:
+                    hit = _declarator_named(part, name)
+                    if hit is not None:
+                        return _declarator_static(*hit, readers, path, depth)
+        elif scope.type == "compilation_unit":
+            return None
+        if scope.type in _SCOPE_TYPES:
+            if _primary_parameter(scope, name) is not None:
+                return None
+            member = _member_binding(scope, name)
+            return None if member is None or isinstance(member, str) else _typed(member, reader)
+        scope = scope.parent
+    return None
+
+
+def _can_take(method: Node, arguments: Node) -> bool:
+    """Whether a call with ``arguments`` may apply to ``method``, judged by
+    how many there are and by the names of the named ones: optional
+    parameters may be left out, and a ``params`` one takes any number.
+
+    A call that no instance overload takes binds to an extension method of
+    the name, which may be a library's returning ``dynamic``. This catches
+    only the wrong number or name of arguments: an argument of the wrong
+    type is the same fallback, and it is not caught here."""
+    parameters = method.child_by_field_name("parameters")
+    names: set[str] = set()
+    required = 0
+    variadic = False
+    after_params = False
+    for child in parameters.children if parameters is not None else ():
+        if child.type == "params":
+            variadic = after_params = True
+        elif child.type == "identifier" and after_params:
+            names.add(_text(child).removeprefix("@"))
+            after_params = False
+        elif child.type == "parameter":
+            name = _name_of(child)
+            if name is not None:
+                names.add(name.removeprefix("@"))
+            if not any(c.type == "=" for c in child.children):
+                required += 1
+    given = [a for a in arguments.named_children if a.type == "argument"]
+    named = [n for a in given if (n := a.child_by_field_name("name")) is not None]
+    if any(_text(n).removeprefix("@") not in names for n in named):
+        return False
+    return required <= len(given) and (variadic or len(given) <= len(names))
+
+
+def _member_static(declaration: Node, name: str, reader: xcs._Reader, arguments: Node | None = None):
+    """The static type of the member ``name`` that a non-generic type
+    ``declaration`` itself declares, or ``None`` when any candidate is
+    generic, untyped or ``dynamic``, or none is declared there.
+
+    With ``arguments`` the member is called: only the methods that may take
+    them (:func:`_can_take`) are candidates, and a field or property of the
+    name is a delegate, whose ``Invoke`` may be a library's. Without them it
+    is read: a method of the name is a method group, not a value."""
+    if _child(declaration, "type_parameter_list") is not None:
+        return None
+    body = declaration.child_by_field_name("body")
+    found: list[Node] = []
+    for member in body.named_children if body is not None else ():
+        if member.type in ("field_declaration", "event_field_declaration"):
+            variables = _child(member, "variable_declaration")
+            if variables is None or _declarator_named(variables, name) is None:
+                continue
+            if member.type == "event_field_declaration" or arguments is not None:
+                return None
+            type_node = variables.child_by_field_name("type")
+        elif _name_of(member) != name:
+            continue
+        elif member.type == "method_declaration":
+            if arguments is None:
+                return None
+            if not _can_take(member, arguments):
+                continue
+            if _child(member, "type_parameter_list") is not None:
+                return None
+            type_node = member.child_by_field_name("returns")
+        elif member.type == "property_declaration" and arguments is None:
+            type_node = member.child_by_field_name("type")
+        else:
+            # An invoked property, an event, a nested type, an enum member:
+            # not a typed value here.
+            return None
+        if _typed(type_node, reader) is None:
+            return None
+        found.append(type_node)
+    if not found:
+        return None
+    return (found[0], reader) if len(found) == 1 else _NOT_DYNAMIC
+
+
+def _repository_member(full: str | None, name: str, readers: _Readers, arguments: Node | None = None):
+    """The static type of the member ``name`` of the repository type ``full``,
+    by :func:`_member_static`, when nothing else may declare it: the type is
+    one non-generic, non-``partial`` declaration whose bases are all
+    repository types silent on the name."""
+    if not full:
+        return None
+    checkout = xcs.csharp_index(readers.repo_dir)
+    infos = [i for i in checkout.by_full.get(full, ()) if not i.generic]
+    if checkout.incomplete or len(infos) != 1 or infos[0].partial or name not in infos[0].members:
+        return None
+    reader = readers.get(infos[0].path)
+    declaration = _find_type(reader.root, infos[0].chain) if reader is not None else None
+    if declaration is None or _inherits(declaration, name, readers, infos[0].path):
+        return None
+    return _member_static(declaration, name, reader, arguments)
+
+
+def _type_name_full(node: Node, readers: _Readers, path: str) -> str | None:
+    """The repository type an expression ``T`` or ``N.T`` names, when nothing
+    in the file binds its first name as a value."""
+    reader = readers.get(path)
+    if reader is None:
+        return None
+    if node.type == "identifier":
+        if _binding(node, _text(node), readers, path) is not None:
+            return None
+        return _type_full(node, reader)
+    parts: list[str] = []
+    current = node
+    while current.type == "member_access_expression":
+        name = current.child_by_field_name("name")
+        if name is None or name.type != "identifier":
+            return None
+        parts.append(_text(name))
+        current = current.child_by_field_name("expression")
+        if current is None:
+            return None
+    if current.type != "identifier" or _binding(current, _text(current), readers, path) is not None:
+        return None
+    first = _text(current)
+    if _type_shadowed(current, first, reader) or not _first_clear(first, current, reader):
+        return None
+    full = ".".join([first, *reversed(parts)])
+    return full if full in reader.index.by_full else None
+
+
+def _owner_full(receiver: Node, readers: _Readers, path: str, depth: int) -> str | None:
+    """The repository type whose member ``receiver.Name`` reads: the static
+    type of a value, or the type the receiver names."""
+    found = _static_type(receiver, readers, path, depth + 1)
+    if isinstance(found, tuple):
+        return _type_full(*found)
+    if found is not None:
+        return None
+    return _type_name_full(receiver, readers, path) if receiver.type in ("identifier", "member_access_expression") else None
+
+
+def _argument_static(argument: Node, readers: _Readers, path: str, depth: int) -> bool:
+    """Whether an argument is certainly not ``dynamic``: one that is makes
+    the whole call dynamically bound, whatever the callee returns."""
+    values = [c for c in _named(argument) if _field(argument, c) != "name"]
+    if not values:
+        return False
+    value = values[-1]
+    if value.type in ("lambda_expression", "anonymous_method_expression", "declaration_expression"):
+        return True
+    return _static_type(value, readers, path, depth + 1) is not None
+
+
+def _static_type(expression: Node | None, readers: _Readers, path: str, depth: int = 0):
+    """The static type of ``expression``, as :func:`_declared_static` gives
+    one, or ``None`` unless it is certainly not ``dynamic``. A value counts
+    only when every member it goes through is a repository member with a
+    declared type: a library member may return ``dynamic``."""
+    if expression is None or depth > _STATIC_DEPTH:
+        return None
+    reader = readers.get(path)
+    kind = expression.type
+    if kind == "parenthesized_expression" or (kind == "postfix_unary_expression" and _text(expression).endswith("!")):
+        inner = _named(expression)
+        return _static_type(inner[0], readers, path, depth + 1) if inner else None
+    if kind in _LITERALS or kind == "typeof_expression":
+        return _NOT_DYNAMIC
+    if kind in ("object_creation_expression", "cast_expression"):
+        return _typed(expression.child_by_field_name("type"), reader)
+    if kind == "as_expression":
+        return _typed(expression.child_by_field_name("right"), reader)
+    if kind == "identifier":
+        return _declared_static(expression, _text(expression), readers, path, depth + 1)
+    if kind == "member_access_expression":
+        return _member_access_static(expression, readers, path, depth)
+    if kind == "invocation_expression":
+        function = expression.child_by_field_name("function")
+        arguments = expression.child_by_field_name("arguments")
+        if function is None or arguments is None:
+            return None
+        if not all(
+            _argument_static(a, readers, path, depth) for a in arguments.named_children if a.type == "argument"
+        ):
+            return None
+        if function.type == "member_access_expression":
+            return _member_access_static(function, readers, path, depth + 1, arguments)
+        if function.type == "identifier":
+            return _unqualified_call(function, readers, path, arguments)
+    return None
+
+
+def _member_access_static(
+    access: Node, readers: _Readers, path: str, depth: int, arguments: Node | None = None
+):
+    """The static type of ``Q.N``, or of ``Q.N(arguments)`` when called."""
+    receiver = access.child_by_field_name("expression")
+    name = access.child_by_field_name("name")
+    if receiver is None or name is None or name.type != "identifier":
+        return None
+    return _repository_member(_owner_full(receiver, readers, path, depth), _text(name), readers, arguments)
+
+
+def _unqualified_call(function: Node, readers: _Readers, path: str, arguments: Node):
+    """The static type of ``M(arguments)``: a method the nearest enclosing
+    type declares itself, with no local, parameter, base or other ``partial``
+    part that may claim ``M``."""
+    name = _text(function)
+    scope = _declaring_scope(function, name)
+    enclosing = _enclosing_type(function)
+    if scope is None or enclosing is None or scope.id != enclosing.id:
+        return None
+    if "partial" in xcs._modifiers(enclosing) or _inherits(enclosing, name, readers, path):
+        return None
+    return _member_static(enclosing, name, readers.get(path), arguments)
+
+
 def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> list[wi.Occurrence]:
     root = parse(source)
     data = source.encode("utf-8")
     reader = xcs._Reader(root, path, index.repo_dir)
     readers = _Readers(index.repo_dir)
     readers.add(reader)
+    readers.locator = _locator_ok(root, reader)
+    readers.substitute = _substitute_ok(root, reader, readers)
+    from flag_cleanup import csharp_family
+
+    family = index.family
+    if family is not None and (
+        not csharp_family.reaches(index.repo_dir, path, family)
+        or csharp_family.family_free(source, root, family)
+    ):
+        # No value of a family type can be here: no mention is the wrapper's.
+        return []
+    # A member name is evidence of a type only where nothing can bind any
+    # name -- no `dynamic` and no extension block anywhere in the checkout
+    # (a `var` takes its type from a member of any file) -- and where every
+    # family type's members are known: every C# file parsed, and no
+    # sibling based on a type outside the repository.
+    co_usage = (
+        family is not None
+        and not family.extension_blocks
+        and not family.dynamic_anywhere
+        and not family.opaque
+        and not family.sibling_bases_external
+        and not reader.index.incomplete
+    )
     targets = {f"{wrapper.package}.{wrapper.owner}" if wrapper.package else wrapper.owner}
     if wrapper.interface is not None:
         interface = wrapper.interface
@@ -1238,6 +2703,27 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         wi.Occurrence(path, wi.line_of(c), wi.text_of(c), None, wi.UNPARSED_MENTION)
         for c in _cref_mentions(root, wrapper.name)
     ]
+    found += _knob_leftovers(path, source, root, reader, readers, wrapper, index)
+    test_project: list[bool] = []
+    #: receiver name -> reads of the member through it, and how many of those
+    #: were proven sibling reads.
+    mentions: dict[str, int] = defaultdict(int)
+    sibling_reads: dict[str, int] = defaultdict(int)
+
+    def sibling_read(access: Node, line: int, name: str | None) -> wi.Occurrence:
+        """A read through a receiver typed as a sibling, whose member goes
+        with the wrapper. Never marked: in production it keeps the wrapper;
+        in a test method of a test project the test-double pass may delete
+        the whole test (``in_test_double``)."""
+        if not test_project:
+            test_project.append(_test_project(path, index.repo_dir) is True)
+        in_test = test_project[0] and _enclosing_test_method(access, data)
+        if name is not None:
+            sibling_reads[name] += 1
+        return wi.Occurrence(
+            path, line, wi.text_of(access.parent or access), None, wi.SIBLING_RECEIVER, name, in_test
+        )
+
     # A verbatim identifier (`f.@IsXEnabled`) is the same name; it is not
     # proven, and it keeps the wrapper.
     found += [
@@ -1250,15 +2736,32 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             continue
         parent = node.parent
         line = wi.line_of(node)
+        for spelled_receiver in (_receiver_name(node), _moq_call_receiver(node)):
+            if spelled_receiver is not None:
+                mentions[spelled_receiver] += 1
+        if _in_pattern_path(node):
+            # `{ A.Name: … }` matches a member PATH of the tested value: no
+            # receiver in it is bound where it is written.
+            found.append(wi.Occurrence(path, line, wi.text_of(parent or node), None, wi.RECEIVER_UNPROVEN))
+            continue
         receiver: Node | None = None
         access: Node
         if parent is not None and parent.type == "member_access_expression" and _field(parent, node) == "name":
             access = parent
-            receiver = parent.child_by_field_name("expression")
+            receiver = _unwrap(parent.child_by_field_name("expression"))
         else:
             access = node
         call = access.parent if access.parent is not None and access.parent.type == "invocation_expression" else None
         called = call is not None and call.child_by_field_name("function") == access
+        if family is not None:
+            assigned = (
+                access.parent is not None
+                and access.parent.type == "assignment_expression"
+                and _field(access.parent, access) == "left"
+            )
+            # No family member can be written, or (a property) invoked.
+            if (assigned and not family.settable) or (called and wrapper.kind == "property"):
+                continue
         if wrapper.kind == "method":
             shape_ok = called
         else:
@@ -1276,27 +2779,67 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
                 )
             )
         ):
+            if family is not None and receiver is None and parent is not None:
+                # A member of another object: drop it when that object's
+                # type is certainly no family type.
+                target = _target_object_type(node, readers, path)
+                if target is not None and _foreign_type(target, reader, family):
+                    continue
             found.append(wi.Occurrence(path, line, wi.text_of(parent or node), None, wi.RECEIVER_UNPROVEN))
             continue
         reason: str | None = None
         name: str | None = None
         if receiver is None or receiver.type == "this":
+            in_owner = _in_owner(access, wrapper, path)
+            if receiver is None and family is not None and not in_owner:
+                # A non-family type declaring the name itself: its own member.
+                enclosing = _enclosing_type(access)
+                if (
+                    enclosing is not None
+                    and not _is_family_type(enclosing, family)
+                    and _member_binding(enclosing, wrapper.name) is not None
+                ):
+                    continue
             bound = (
                 _binding(access, wrapper.name, readers, path, locals_only=True) if receiver is None else None
             )
-            if not _in_owner(access, wrapper, path) or bound is not None:
+            if not in_owner or bound is not None:
                 reason = wi.RECEIVER_UNPROVEN
         elif receiver.type == "identifier":
             name = _text(receiver)
             bound = _binding(access, name, readers, path)
+            if family is not None and bound is not None and not isinstance(bound, str):
+                if _foreign_type(bound, reader, family):
+                    continue
+                if _type_full(bound, reader) in family.sibling_full_names:
+                    found.append(sibling_read(access, line, name))
+                    continue
             if bound is None:
                 static_type = wrapper.static and _resolves(receiver, reader, targets) is None
                 reason = None if static_type else wi.RECEIVER_UNPROVEN
                 name = None if static_type else name
             elif isinstance(bound, str):
+                moq = _moq_mock(access, name, readers, path) if bound == _UNTYPED else None
+                if moq is not None and _resolves(moq[1], reader, targets) is None:
+                    found.append(
+                        wi.Occurrence(path, line, wi.text_of(access.parent or access), None, None, moq[0], True)
+                    )
+                    continue
+                if moq is not None and family is not None and _foreign_type(moq[1], reader, family):
+                    continue  # the mock of another type
                 reason = wi.RECEIVER_UNPROVEN
             else:
                 reason = _resolves(bound, reader, targets)
+            if (
+                reason is not None
+                and co_usage
+                and (bound is None or bound == _UNTYPED)
+                # Evidence only against a receiver that cannot be `dynamic`:
+                # a library member may hand back a family value as one.
+                and _declared_static(receiver, name, readers, path) is not None
+                and _co_used(access, name, family)
+            ):
+                continue
         elif (
             receiver.type == "member_access_expression"
             and (inner := receiver.child_by_field_name("expression")) is not None
@@ -1306,11 +2849,25 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         ):
             name = _text(field_name)
             bound = _binding(access, name, readers, path, class_only=True)
+            if family is not None and bound is not None and not isinstance(bound, str):
+                if _foreign_type(bound, reader, family):
+                    continue
+                if _type_full(bound, reader) in family.sibling_full_names:
+                    found.append(sibling_read(access, line, name))
+                    continue
             reason = (
                 wi.RECEIVER_UNPROVEN
                 if bound is None or isinstance(bound, str)
                 else _resolves(bound, reader, targets)
             )
+        elif receiver.type == "object_creation_expression":
+            created = receiver.child_by_field_name("type")
+            if family is not None and created is not None and _foreign_type(created, reader, family):
+                continue
+            if family is not None and created is not None and _type_full(created, reader) in family.sibling_full_names:
+                found.append(sibling_read(access, line, None))
+                continue
+            reason = wi.RECEIVER_UNPROVEN
         else:
             reason = wi.RECEIVER_UNPROVEN
         if reason is None and called and _argument_has_call(call):
@@ -1320,11 +2877,507 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         span = (access.start_byte, access.end_byte) if reason is None else None
         suffix = "()" if wrapper.kind == "property" and reason is None else ""
         found.append(wi.Occurrence(path, line, wi.text_of(shown), span, reason, name, double, suffix))
+    # The test-double pass deletes a test by the receiver's NAME, so a name
+    # counts only where it means the sibling everywhere in the file: every
+    # read of the member through it is a sibling read, and every binding of
+    # it is typed as a sibling. Otherwise the read stays, reported.
+    proven = {
+        name
+        for name, count in sibling_reads.items()
+        if count == mentions[name] and _bound_only_as_sibling(root, name, reader, readers, family)
+    }
+    # The same for a mock's or substitute's name, which the test-double pass
+    # also matches by name: every read through it is proven the wrapper's,
+    # and every binding of it is a mock of, or typed as, the wrapper's class
+    # or interface.
+    bound_reads: dict[str, int] = defaultdict(int)
+    for o in found:
+        if o.receiver is not None and o.reason in (None, wi.ARGUMENT_HAS_CALL):
+            bound_reads[o.receiver] += 1
+    mocks = {
+        name
+        for name, count in bound_reads.items()
+        if count == mentions[name] and _bound_only_as_mock(root, name, reader, readers, targets)
+    }
+    found = [
+        replace(o, receiver=None)
+        if o.receiver is not None
+        and (
+            (o.reason == wi.SIBLING_RECEIVER and o.receiver not in proven)
+            or (o.in_test_double and o.reason in (None, wi.ARGUMENT_HAS_CALL) and o.receiver not in mocks)
+        )
+        else o
+        for o in found
+    ]
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
+
+
+def _receiver_name(node: Node) -> str | None:
+    """The receiver name a read of member ``node`` is spelled through:
+    ``gate`` in ``gate.M`` and in ``this.gate.M``."""
+    parent = node.parent
+    if parent is None or parent.type != "member_access_expression" or _field(parent, node) != "name":
+        return None
+    receiver = _unwrap(parent.child_by_field_name("expression"))
+    if receiver is None:
+        return None
+    if receiver.type == "identifier":
+        return _text(receiver)
+    if receiver.type == "member_access_expression":
+        inner = receiver.child_by_field_name("expression")
+        name = receiver.child_by_field_name("name")
+        if inner is not None and inner.type == "this" and name is not None and name.type == "identifier":
+            return _text(name)
+    return None
+
+
+#: Where an identifier is the name a binding introduces, with a declared
+#: type (field name of the type in the parent, or ``None``: never typed).
+_TYPED_BINDINGS = {
+    "parameter": "type",
+    "property_declaration": "type",
+    "declaration_pattern": "type",
+    "declaration_expression": "type",
+    "catch_declaration": "type",
+    "foreach_statement": "type",
+}
+#: Every other construct whose identifiers may introduce a binding: none of
+#: them is proven typed, so a name bound there is never proven a sibling.
+_UNTYPED_BINDINGS = frozenset(
+    {
+        "from_clause", "let_clause", "join_clause", "join_into_clause", "query_continuation",
+        "group_clause", "tuple_pattern", "recursive_pattern", "parenthesized_variable_designation",
+        "var_pattern", "lambda_expression", "anonymous_method_expression", "local_function_statement",
+        "method_declaration", "event_declaration", "enum_member_declaration", "using_statement",
+        "fixed_statement", "labeled_statement", "type_parameter", "tuple_element",
+    }
+)
+
+
+def _bound_only_as_sibling(root: Node, name: str, reader: xcs._Reader, readers: _Readers, family) -> bool:
+    """Whether every binding of ``name`` in the file is declared with a type
+    that resolves to a sibling (:func:`_bound_only_as`)."""
+    if family is None:
+        return False
+    siblings = family.sibling_full_names
+    return _bound_only_as(root, name, readers, lambda t, at: _type_full(t, reader) in siblings)
+
+
+def _bound_only_as_mock(root: Node, name: str, reader: xcs._Reader, readers: _Readers, targets: set[str]) -> bool:
+    """Whether every binding of ``name`` in the file is declared as Moq's
+    ``Mock<T>``, or as ``T`` itself (an NSubstitute substitute's type), for
+    ``T`` the wrapper's class or interface (:func:`_bound_only_as`)."""
+
+    def mock(type_node: Node, at: Node) -> bool:
+        if _resolves(type_node, reader, targets) is None:
+            return True
+        argument = _moq_argument(type_node, at, reader)
+        return argument is not None and _resolves(argument, reader, targets) is None
+
+    return _bound_only_as(root, name, readers, mock)
+
+
+def _bound_only_as(root: Node, name: str, readers: _Readers, accept: Callable[[Node, Node], bool]) -> bool:
+    """Whether every binding of ``name`` in the file -- a field, local,
+    parameter, property, pattern, ``out var``, ``foreach`` or ``catch``
+    variable -- is declared with a type ``accept`` takes. A lambda
+    parameter, a query variable, a deconstruction or any other binding whose
+    type is not written is not."""
+    bare = name.removeprefix("@")
+
+    def accepted(type_node, at: Node) -> bool:
+        return (
+            type_node is not None
+            and not isinstance(type_node, str)
+            and type_node.type != "implicit_type"
+            and accept(type_node, at)
+        )
+
+    for node in cross_file_keys.walk(root):
+        if node.type not in ("identifier", "implicit_parameter") or _text(node).removeprefix("@") != bare:
+            continue
+        if node.type == "implicit_parameter":
+            return False
+        parent = node.parent
+        if parent is None:
+            continue
+        field_name = _field(parent, node)
+        if parent.type == "variable_declarator" and field_name == "name":
+            declaration = parent.parent
+            if declaration is None or declaration.type != "variable_declaration":
+                return False
+            if not accepted(_declarator_type(declaration, _text(node), readers.factories()), node):
+                return False
+        elif parent.type in _TYPED_BINDINGS and field_name in ("name", "left"):
+            if not accepted(parent.child_by_field_name(_TYPED_BINDINGS[parent.type]), node):
+                return False
+        elif parent.type in _UNTYPED_BINDINGS:
+            return False
+    return True
+
+
+# --- Test fakes: where a knob is set ------------------------------------------------
+
+
+def candidate_fake_owners(repo_dir: str, names: Iterable[str]) -> set[str]:
+    """Simple names of the checkout's types declaring a member of one of
+    ``names``: a superset of every fake a wrapper of those names can have."""
+    wanted = set(names)
+    return {
+        info.last
+        for infos in xcs.csharp_index(repo_dir).by_full.values()
+        for info in infos
+        if info.members & wanted
+    }
+
+
+def fakes_of(wrappers: Iterable[wi.Wrapper]) -> dict[str, tuple[wi.Sibling, ...]]:
+    """Full name -> each test fake of the wrappers that a knob sets: one
+    sibling per wrapper the fake serves, each with its own knob."""
+    found: dict[str, list[wi.Sibling]] = defaultdict(list)
+    for wrapper in wrappers:
+        for s in wrapper.siblings:
+            if s.test and s.knob:
+                found[_full_name(s.namespace, s.owner)].append(s)
+    return {full: tuple(group) for full, group in found.items()}
+
+
+@dataclass(frozen=True)
+class _Setting:
+    """One place that sets, or may set, a test fake's knob."""
+
+    node: Node
+    #: ``fake`` in ``fake.Knob = …`` or ``this.fake.Knob = …``.
+    receiver: str | None
+    #: The ``bool`` literal set, when it is plainly one.
+    value: str | None
+    #: The fake the setting's target is typed as, a sibling per wrapper it
+    #: serves; ``None`` when that type is not known here (it may be any).
+    fake: tuple[wi.Sibling, ...] | None
+    #: The member written (``None`` for a primary constructor's argument).
+    knob: str | None
+
+    @property
+    def sets_knob(self) -> bool:
+        """Whether it sets ``fake``'s knob, or may set some fake's."""
+        if self.fake is None:
+            return True
+        return any(self.knob == (None if s.knob_primary else s.knob) for s in self.fake)
+
+
+def _write_target(node: Node) -> Node | None:
+    """What writes ``node`` (an assignment, a ``ref``/``out`` argument, a
+    ``ref`` expression), or ``None`` for a read."""
+    child, parent = node, node.parent
+    while parent is not None and parent.type == "parenthesized_expression":
+        child, parent = parent, parent.parent
+    if parent is None:
+        return None
+    if parent.type == "assignment_expression" and _field(parent, child) == "left":
+        return parent
+    if parent.type == "ref_expression":
+        return parent
+    if parent.type == "argument" and any(not c.is_named and _text(c) in ("ref", "out") for c in parent.children):
+        return parent
+    while parent is not None and parent.type in ("argument", "tuple_expression"):
+        child, parent = parent, parent.parent
+    if parent is not None and parent.type == "assignment_expression" and _field(parent, child) == "left":
+        return parent
+    return None
+
+
+def _plain_value(target: Node) -> str | None:
+    """The literal a plain ``=`` assignment sets, else ``None``."""
+    if target.type != "assignment_expression":
+        return None
+    operator = target.child_by_field_name("operator")
+    right = target.child_by_field_name("right")
+    if operator is None or _text(operator) != "=" or right is None or right.type != "boolean_literal":
+        return None
+    return _text(right)
+
+
+def _typed_fake(
+    type_node: Node | str | None, reader: xcs._Reader, fakes: dict[str, tuple[wi.Sibling, ...]]
+) -> tuple[bool, tuple[wi.Sibling, ...] | None]:
+    """``(the type is known, the fake it is)``."""
+    if type_node is None or isinstance(type_node, str) or type_node.type == "implicit_type":
+        return False, None
+    full = _type_full(type_node, reader)
+    if full is None:
+        return False, None
+    return True, fakes.get(full)
+
+
+def _knob_settings(
+    root: Node, reader: xcs._Reader, readers: _Readers, path: str, fakes: dict[str, tuple[wi.Sibling, ...]]
+) -> list[_Setting]:
+    """Every place in the file that sets, or may set, a fake's knob: a write
+    of ``x.Knob`` (any write: an assignment, compound or deconstructing, a
+    ``ref``/``out``), an initializer's ``Knob = …``, a ``with``, and a
+    construction of a fake set by its primary constructor. A target whose
+    type is known and is no fake is not one."""
+    siblings = [s for group in fakes.values() for s in group]
+    member_knobs = {s.knob for s in siblings if not s.knob_primary}
+    owners = {s.owner for s in siblings}
+    found: list[_Setting] = []
+    for node in cross_file_keys.walk(root):
+        if node.type == "member_access_expression":
+            name = node.child_by_field_name("name")
+            knob = _text(name).removeprefix("@") if name is not None and name.type == "identifier" else None
+            if knob not in member_knobs:
+                continue
+            target = _write_target(node)
+            if target is None:
+                continue
+            receiver_node = _unwrap(node.child_by_field_name("expression"))
+            receiver, bound = None, None
+            if receiver_node is not None and receiver_node.type == "identifier":
+                receiver = _text(receiver_node)
+                bound = _binding(node, receiver, readers, path)
+            elif (
+                receiver_node is not None
+                and receiver_node.type == "member_access_expression"
+                and (inner := receiver_node.child_by_field_name("expression")) is not None
+                and inner.type == "this"
+                and (field_name := receiver_node.child_by_field_name("name")) is not None
+                and field_name.type == "identifier"
+            ):
+                receiver = _text(field_name)
+                bound = _binding(node, receiver, readers, path, class_only=True)
+            known, fake = _typed_fake(bound, reader, fakes)
+            if known and fake is None:
+                continue
+            found.append(_Setting(target, receiver, _plain_value(target), fake, knob))
+        elif node.type == "assignment_expression" and node.parent is not None and node.parent.type == "initializer_expression":
+            left = node.child_by_field_name("left")
+            knob = _text(left).removeprefix("@") if left is not None and left.type == "identifier" else None
+            if knob not in member_knobs:
+                continue
+            holder = node.parent.parent
+            if holder is not None and holder.type == "object_creation_expression":
+                known, fake = _typed_fake(holder.child_by_field_name("type"), reader, fakes)
+                if known and fake is None:
+                    continue
+            elif holder is not None and holder.type == "anonymous_object_creation_expression":
+                continue
+            else:
+                fake = None
+            found.append(_Setting(node, None, _plain_value(node), fake, knob))
+        elif node.type == "with_initializer":
+            for child in node.named_children:
+                if child.type == "identifier" and _text(child).removeprefix("@") in member_knobs:
+                    found.append(_Setting(node, None, None, None, _text(child).removeprefix("@")))
+        elif node.type in ("object_creation_expression", "implicit_object_creation_expression"):
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                known, fake = _typed_fake(type_node, reader, fakes)
+                simple = xcs._simple_name(type_node)
+                primary = fake is not None and any(s.knob_primary for s in fake)
+                if (known and not primary) or (not known and simple not in owners):
+                    continue
+            else:
+                fake = None
+                if not any(s.knob_primary for s in siblings):
+                    continue
+            arguments = node.child_by_field_name("arguments")
+            if arguments is None:
+                arguments = _child(node, "argument_list")
+            passed = [a for a in arguments.named_children if a.type != "comment"] if arguments is not None else []
+            if fake is None and not passed:
+                continue  # `new()`: no argument chooses anything
+            value: str | None = None
+            if not passed and fake is not None:
+                value = next(s.knob_default for s in fake if s.knob_primary) or None
+            elif len(passed) == 1 and passed[0].named_children and passed[0].named_children[-1].type == "boolean_literal":
+                value = _text(passed[0].named_children[-1])
+            found.append(_Setting(node, None, value, fake, None))
+        elif node.type == "ERROR":
+            text = _text(node)
+            if any(re.search(rf"\b{re.escape(w)}\b", text) for w in member_knobs | owners):
+                found.append(_Setting(node, None, None, None, None))
+    return found
+
+
+def _knob_scan(path: str, source: str, fakes: dict[str, tuple[wi.Sibling, ...]], repo_dir: str):
+    """``(root, reader, readers, settings)`` of a test project's file, or
+    ``None`` when there is no fake set by a knob or the file is no test code."""
+    if not fakes or _test_project(path, repo_dir) is not True:
+        return None
+    root = parse(source)
+    reader = xcs._Reader(root, path, repo_dir)
+    readers = _Readers(repo_dir)
+    readers.add(reader)
+    readers.substitute = _substitute_ok(root, reader, readers)
+    return root, reader, readers, _knob_settings(root, reader, readers, path, fakes)
+
+
+def knob_receivers(
+    path: str, source: str, fakes: dict[str, tuple[wi.Sibling, ...]], repo_dir: str
+) -> frozenset[str]:
+    """Receivers in ``path``, a test project's file, typed as a test fake
+    there and written through its knob (``stub.Enabled = false``): the
+    test-double pass resolves those writes. A name counts only where every
+    binding of it in the file is typed as a fake set by a knob (the bar
+    :func:`_bound_only_as` sets for siblings), and every write through it of
+    any fake's knob -- ``fakes`` holds every wrapper's of the run -- writes
+    its own fake's."""
+    scan = _knob_scan(path, source, fakes, repo_dir)
+    if scan is None:
+        return frozenset()
+    root, reader, readers, settings = scan
+    members = {f for f, group in fakes.items() if any(not s.knob_primary for s in group)}
+    names = {s.receiver for s in settings if s.receiver is not None}
+    return frozenset(
+        name
+        for name in names
+        if all(s.fake is not None and s.sets_knob for s in settings if s.receiver == name)
+        and _bound_only_as(root, name, readers, lambda t, at: _type_full(t, reader) in members)
+    )
+
+
+def knob_owners(
+    path: str, source: str, fakes: dict[str, tuple[wi.Sibling, ...]], repo_dir: str
+) -> frozenset[tuple[str, str, bool]]:
+    """The fakes (``mock_stubs.WrapperStub.sibling_owners``) whose simple
+    name means them at every construction spelled with it in ``path``, a
+    test project's file."""
+    scan = _knob_scan(path, source, fakes, repo_dir)
+    if scan is None:
+        return frozenset()
+    root, reader, _readers, _settings = scan
+    found = set()
+    for full, group in fakes.items():
+        built = [
+            n.child_by_field_name("type")
+            for n in cross_file_keys.walk(root)
+            if n.type == "object_creation_expression"
+            and n.child_by_field_name("type") is not None
+            and xcs._simple_name(n.child_by_field_name("type")) == group[0].owner
+        ]
+        if built and all(_type_full(t, reader) == full for t in built):
+            found |= {(s.owner, s.knob, s.knob_primary) for s in group}
+    return frozenset(found)
+
+
+def _knob_leftovers(
+    path: str, source: str, root: Node, reader: xcs._Reader, readers: _Readers, wrapper: wi.Wrapper, index: Index
+) -> list[wi.Occurrence]:
+    """Every knob setting the test-double pass left that may still choose
+    the removed value: one through a receiver typed as the fake, or of a type
+    not known here in a file that spells a fake's name, the wrapper's, its
+    class's or its interface's. Only a plain write of
+    the kept literal is harmless, the knob's default being the kept value
+    (qualification refuses one that is not). A write of the member itself
+    (an auto-property fake) is a mention of the wrapper's name, judged with
+    the rest."""
+    fakes = fakes_of([wrapper])
+    if not fakes or index.treatment is None:
+        return []
+    kept = "true" if index.treatment else "false"
+    # Deciding what STAYS: a plain search. A file naming a fake, the wrapper,
+    # its class or its interface may hold a fake whatever its receivers say.
+    names = {s.owner for group in fakes.values() for s in group} | {wrapper.name, wrapper.owner}
+    if wrapper.interface is not None:
+        names.add(wrapper.interface.name)
+    spelled = any(re.search(rf"(?<![\w$@]){re.escape(n)}(?![\w$])", source) for n in names)
+    data = source.encode("utf-8")
+    found: list[wi.Occurrence] = []
+    test_project: list[bool] = []
+    for setting in _knob_settings(root, reader, readers, path, fakes):
+        if not setting.sets_knob or setting.knob == wrapper.name or setting.value == kept:
+            continue
+        if setting.fake is None and not spelled:
+            continue
+        if not test_project:
+            test_project.append(_test_project(path, index.repo_dir) is True)
+        in_test = test_project[0] and _enclosing_test_method(setting.node, data)
+        found.append(
+            wi.Occurrence(
+                path, wi.line_of(setting.node), wi.text_of(setting.node), None, wi.SIBLING_RECEIVER, None, in_test
+            )
+        )
+    return found
 
 
 def _index(repo_dir: str, wrapper: wi.Wrapper) -> Index:
     return Index.build(repo_dir, wrapper)
+
+
+#: APIs that reach a member by its name in a string, given any value: none
+#: of them needs the value's type spelled. ``nameof`` is not one: it names a
+#: member at compile time.
+_BY_NAME = re.compile(
+    r"\bGetType\s*\("
+    r"|\bGet(?:Runtime)?(?:Propert(?:y|ies)|Methods?|Fields?|Members?)\b"
+    r"|\bInvokeMember\b|\bTypeDescriptor\b|\bPropertyDescriptor\b|\bDataBinder\b"
+    r"|\bBinding\s*\("
+    r"|\bExpression\s*\.\s*(?:Property|PropertyOrField)\b"
+)
+
+
+def mention_counts(index: Index, path: str, kind: str) -> bool:
+    """Whether a mention of ``kind`` in ``path`` may be the wrapper's member.
+
+    ``"unparsed"``: a file nothing here parses. Only a .NET guest (Razor,
+    XAML, Web Forms, a C# script) binds C# members by name; a file of another
+    language cannot call one. Configuration and documentation are not in the
+    source listing at all, so they never reach this.
+
+    ``"string"``: a string literal of a C# file. It counts only where a value
+    of a family type may be: the project reaches a family type, and the file
+    is not family-free or spells a route that reaches a member by name
+    without naming its type (``o.GetType()``, ``TypeDescriptor``, a
+    ``Binding``, an expression tree's ``Expression.Property``). Anywhere the
+    family can be, when any such file passes a route a name that is not a
+    literal (:func:`~flag_cleanup.csharp_family.computed_name_route`): the
+    name may then be a string of any file. Reflection by assembly scanning,
+    and by-name APIs not listed there, are not caught. Unreadable counts."""
+    from flag_cleanup import csharp_family
+
+    family = index.family
+    if family is None:
+        return True
+    if kind == "unparsed":
+        return path.lower().endswith(_GUESTS)
+    source = _read(path)
+    if source is None:
+        return True
+    if not csharp_family.reaches(index.repo_dir, path, family):
+        return False
+    if csharp_family.computed_name_route(index.repo_dir, family):
+        return True
+    return _BY_NAME.search(source) is not None or not csharp_family.family_free(source, parse(source), family)
+
+
+def leftovers(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, str]]:
+    """Every mention still in the repository that may be the member, read
+    fresh, by the same verdicts as :func:`occurrences` and
+    :func:`mention_counts`: a mention proven to be another type's does not
+    keep the wrapper. A Moq stub the test-double pass left, and a call that
+    was not folded, are leftovers too. A file that could not be read, or
+    whose mention sits where it does not parse, keeps the wrapper."""
+    from flag_cleanup import csharp_family
+
+    index = Index.build(repo_dir, wrapper)
+    if index.unreadable:
+        return [(wrapper.path, wrapper.line, wrapper.label)]
+    index.family = csharp_family.family_of(repo_dir, wrapper, index)
+    found: list[tuple[str, int, str]] = []
+    for path in index.foreign:
+        found += [(path, n, t) for n, t in wi._foreign_lines(path, wrapper.name)]
+    for path in index.unparsed:
+        if mention_counts(index, path, "unparsed"):
+            found += [(path, n, t) for n, t in wi._foreign_lines(path, wrapper.name)]
+    for path in index.parsed:
+        source = _read(path)
+        if source is None:
+            found.append((path, 1, ""))
+            continue
+        if mention_counts(index, path, "string"):
+            found += [(path, n, t) for n, t in wi._string_mentions(path, wrapper.name, wrapper.kind == "property")]
+        found += [(o.path, o.line, o.text) for o in occurrences(path, source, wrapper, index)]
+    return found
 
 
 wi.register(
@@ -1341,5 +3394,7 @@ wi.register(
         foreign_extensions=FOREIGN_EXTENSIONS,
         names_only=names_only,
         members=members,
+        mention_counts=mention_counts,
+        leftovers=leftovers,
     )
 )

@@ -273,8 +273,11 @@ class Packages:
         path = path.resolve()
         if path not in self._files:
             if source is None:
+                from flag_cleanup import mock_stubs
+
                 try:
-                    source = path.read_text(encoding="utf-8")
+                    # Byte-exact, as the wrapper path's other readers are.
+                    source = mock_stubs._read_exact(str(path))
                 except (OSError, UnicodeDecodeError):
                     source = None
             self._files[path] = None if source is None else self._parse(path, source)
@@ -434,6 +437,12 @@ class Packages:
 
     def package_var(self, directory: Path, clause: str, name: str) -> TypeRef | None:
         """The type of a package-level ``var`` declared exactly once."""
+        site = self.package_var_binding(directory, clause, name)
+        return None if site is None else self._binding_type(site[1], site[0])
+
+    def package_var_binding(self, directory: Path, clause: str, name: str) -> tuple[File, Binding] | None:
+        """What the one declaration of a package-level ``var`` says, and its
+        file; ``None`` unless declared exactly once, with a type or value."""
         sites: list[tuple[File, Binding]] = []
         for file in self.package(directory, clause):
             for declaration in file.root.named_children:
@@ -443,8 +452,7 @@ class Packages:
                     sites += [(file, b) for n, b in var_spec_sites(spec) if _text(n) == name]
         if len(sites) != 1 or sites[0][1].opaque:
             return None
-        file, binding = sites[0]
-        return self._binding_type(binding, file)
+        return sites[0]
 
     def _struct(self, owner: TypeRef) -> tuple[File, Node] | None:
         """The one non-generic ``struct`` type declaration of ``owner``, and
@@ -472,6 +480,12 @@ class Packages:
     def field_type(self, owner: TypeRef, name: str) -> TypeRef | None:
         """The type of field ``name`` declared directly in struct ``owner``
         (an embedded field by its type name); never a promoted one."""
+        written = self.field_written(owner, name)
+        return None if written is None else self.resolve_type(written[1], written[0])
+
+    def field_written(self, owner: TypeRef, name: str) -> tuple[File, Node] | None:
+        """The written type of field ``name`` of struct ``owner``, as
+        :meth:`field_type` finds it, and the struct's file."""
         found = self._struct(owner)
         if found is None:
             return None
@@ -490,4 +504,4 @@ class Packages:
                 hits.append(written)
         if len(hits) != 1 or hits[0] is None:
             return None
-        return self.resolve_type(hits[0], file)
+        return file, hits[0]

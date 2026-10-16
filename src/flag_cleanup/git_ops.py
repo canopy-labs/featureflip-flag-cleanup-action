@@ -60,6 +60,7 @@ import logging
 import os
 import subprocess
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -292,6 +293,35 @@ class OwnershipLedger:
         return corrected
 
 
+#: The snapshot and ledger of the transform in progress; see :func:`guarding_writes`.
+_guard: tuple[WorktreeSnapshot, OwnershipLedger] | None = None
+
+
+@contextmanager
+def guarding_writes(snapshot: WorktreeSnapshot, ledger: OwnershipLedger) -> Iterator[None]:
+    """Make :func:`before_writing` extend ``snapshot`` (and ``ledger``) while
+    the transform it was taken for runs."""
+    global _guard
+    previous = _guard
+    _guard = (snapshot, ledger)
+    try:
+        yield
+    finally:
+        _guard = previous
+
+
+def before_writing(paths: Iterable[str]) -> None:
+    """Bring files a pass is about to write under the running transform's undo.
+
+    A no-op outside :func:`guarding_writes`: a direct call of the transform
+    (a test, a library use) has no snapshot to extend.
+    """
+    if _guard is None:
+        return
+    snapshot, ledger = _guard
+    ledger.record(snapshot.extend(paths))
+
+
 @dataclass(frozen=True, slots=True)
 class WorktreeSnapshot:
     """Byte-exact contents of every file a transform could rewrite.
@@ -339,6 +369,26 @@ class WorktreeSnapshot:
                 if owner is not None:
                     owners[resolved] = owner
         return cls(captured, owners)
+
+    def extend(self, paths: Iterable[str]) -> Mapping[str, tuple[int, int]]:
+        """Capture files a transform is about to write that :meth:`take` never
+        listed, and return their owners.
+
+        :meth:`take` runs before the engine and covers every file it can be
+        handed. A later pass that proves a rewrite of some OTHER file (a
+        caller of a constructor it changes) calls this, through
+        :func:`before_writing`, while those files still hold the customer's
+        bytes, so the undo stays a comparison for them too. A path already
+        captured keeps its first bytes.
+        """
+        added = WorktreeSnapshot.take(
+            p for p in paths if os.path.abspath(p) not in self.contents
+        )
+        contents, ownership = self.contents, self.ownership
+        assert isinstance(contents, dict) and isinstance(ownership, dict)
+        contents.update(added.contents)
+        ownership.update(added.ownership)
+        return added.ownership
 
     def restore_ownership(self) -> list[str]:
         """Put back the uid/gid of every snapshotted file whose owner changed.

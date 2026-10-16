@@ -1114,11 +1114,43 @@ C# differs from Java and Kotlin in three places:
 - A public interface still qualifies when its project cannot be packed and
   implemented elsewhere: no `IsPackable` (other than `false`), `PackageId`,
   `GeneratePackageOnBuild`, package metadata or `<Import>` in the `.csproj` or
-  a `Directory.Build.props` or `.targets` above it, and no `.nuspec` or packing
-  step (`dotnet pack`, `nuget push`, `-t:Pack`) anywhere in the repository,
-  since that may pack any project. An `internal` interface qualifies either
-  way, unless its project names a friend assembly (`InternalsVisibleTo`) and
-  can be packed.
+  a `Directory.Build.props` or `.targets` above it, and no step that packs it.
+  A pack step (`dotnet pack`, or `-t:Pack`/`-target:Pack` on `msbuild` or any
+  `dotnet` command) publishes the project or solution it names. Every
+  project a packed project references, directly or through others, is
+  published too, since its public types ship with the package. A test
+  project whose only sign of packing is an `<Import>` is not taken as packed,
+  but only when the .NET SDK itself makes it one: it references
+  `Microsoft.NET.Test.Sdk`, uses a test SDK, or sets
+  `<IsTestProject>true</IsTestProject>`. A library that only references a
+  test framework (an assertion helper, say) counts as packed.
+  - In a GitHub Actions workflow the path is read against the step's
+    `working-directory` (then the job's and the workflow's `defaults.run`). A
+    path that resolves nowhere from that directory publishes every project.
+  - Elsewhere, and in a workflow when the directory is unknown (a
+    `working-directory` holding `${{ }}` or a NUL byte, or a script that
+    changes directory itself), it publishes every project whose path ends
+    with the argument, and every project when none does. A directory
+    argument that a solution's directory also ends with publishes every
+    project too.
+  - A step that names nothing from an unknown directory, or names a path
+    holding a variable or a NUL byte, publishes every project. So do `nuget
+    pack`, any `.nuspec`, a workflow that does not parse, and a `nuget push`
+    that no pack step or `GeneratePackageOnBuild` explains.
+  - So does a package property set outside a project file:
+    `GeneratePackageOnBuild` or `IsPackable` set to anything but `false`, or
+    any `PackageId`. That covers a switch (`-p:GeneratePackageOnBuild=true`,
+    `/p:`, `--property:`), including one in a `Directory.Build.rsp`, which
+    MSBuild applies to every command-line build; an environment variable,
+    which MSBuild reads as a property (a workflow's `env:`, `export`, a
+    Dockerfile `ENV`, `SetEnvironmentVariable(…)`); and a build script's
+    property call such as Cake's `WithProperty(…)`.
+  - When something is packed and a project reference cannot be followed (a
+    property or a wildcard in its path, or one added outside a project file),
+    every project is published.
+
+  An `internal` interface qualifies either way, unless its project names a
+  friend assembly (`InternalsVisibleTo`) and can be packed.
 - Base types are resolved by namespace, the way the compiler resolves them, so
   a library base that shares a simple name with an unrelated type of yours is
   still outside the repository.
@@ -1181,16 +1213,23 @@ Folding a call drops its receiver and its arguments, and Go does not build
 with an unused local or import. So a local that only the call reads must be
 one the cleanup removes afterwards (see [Supported Go flag-read
 shapes](#supported-go-flag-read-shapes)). A local declared together with
-other names that have values (`var a, b = …`, `a, b := …`), declared by a
-`range` clause, a `select` receive (`case v := <-ch:`) or a type switch
-(`switch v := x.(type)`), declared inside a function literal or in a function
-sharing its name with another in the same file, or spelled again by a comment,
+other names that have values (`var a, b = …`, `a, b := …`), declared inside a
+function literal or in a function sharing its name with another in the same
+file, or spelled again by a comment,
 a struct key, a shadowing declaration or an assignment, is refused
 (`unremovable-local`). A map literal's key (`map[string]bool{k: true}`) is a
 read of `k`, so it counts like any other argument. An argument read through an
 import whose path does not end in its package's name, or through a dot
 import, is refused too (`import-unresolved`), since that import could not be
 removed either.
+
+A method with a value receiver (`func (f Flags) On() bool`) called through a
+pointer dereferences it, so on a nil pointer the call panics. Folding it would
+take that panic away, so such a call is refused (`nil-receiver`) unless the
+pointer cannot be nil: a local initialised to `&T{…}` or `new(T)` that nothing
+assigns or takes the address of. A parameter, a `var p *T`, a package-level
+variable and a pointer field may all be nil. A method with a pointer receiver
+is folded as before.
 
 A call made through `go` or `defer`, with type arguments, or through a
 promoted method (`s.NewCheckout()` where `S` embeds the type) is left alone.
@@ -1218,12 +1257,29 @@ that is one read of the flag being removed:
 
 - a top-level `function`;
 - a top-level `const` holding an arrow function or a function expression;
-- a method of a non-generic class, static or not.
+- a method of a non-generic class, static or not;
+- a field of such a class holding an arrow function or a function
+  expression (`banner = (u) => ...`), with no type, `?` or `!` written on it.
+  A field is an own key of every instance, so code that enumerates an
+  instance (`Object.keys(panel)`, `{ ...panel }`) no longer sees it once it
+  is deleted. Instances are passed around too freely to check for that, so
+  read the deletion in the diff if your code does;
+- a method of an object literal that a top-level `const` holds with no
+  written type, or a key of it holding an arrow function or a function
+  expression (`const flags = { banner(u) { ... } }`). The literal must hold
+  no spread and no computed key, since either can put another value under
+  the name. Its members are the object's own keys, so the object must be
+  used only as the receiver of a member (`flags.banner(u)`, `flags.label`)
+  anywhere in the repository, `this` inside it included. `Object.keys(flags)`,
+  `{ ...flags }`, `for (k in flags)`, `flags[k]`, `Object.assign(flags, o)`,
+  passing or storing it, a re-export of its module, or a component naming it
+  would see a deleted member go, or replace it without spelling its name, so
+  any of these refuses it (`overridable`).
 
 The read is `boolVariation` or `useFeatureFlag` (or one of your `accessors`),
 with the key first. The following are not wrappers: `async` functions,
-generators, getters, object-literal methods, and any wrapper of
-`getBooleanValue`, whose folded form is awaited. None of them is inlined or
+generators, getters, members of an object literal nested in another, and any
+wrapper of `getBooleanValue`, whose folded form is awaited. None of them is inlined or
 deleted. Only the read inside is folded, like any other read. The same goes
 for a wrapper declared as `export default` (a function, or a method of a
 class exported that way): its callers import it under a name of their own,
@@ -1248,7 +1304,15 @@ Any string literal in the repository's TypeScript or JavaScript that equals
 the wrapper's name also refuses it, since it may be a computed key (a route,
 a log line or `"banner"` as a key counts). A test fake such as
 `{ newCheckout: () => false }` is a second declaration. So is a committed
-build output (`dist/flags.js`, `flags.d.ts`). A
+build output (`dist/flags.js`, `flags.d.ts`). The one exception is a
+JavaScript wrapper's own declaration file: `flags.d.ts` beside `flags.js`
+(`.d.mts` beside `.mjs`, `.d.cts` beside `.cjs`). Its declaration of the
+wrapper (a function signature, or the member in the class or the object
+type of the owner's name) describes the wrapper instead of competing with
+it, and an import of `./flags` reaches `flags.js`, the file that runs. The
+callers are inlined, and the wrapper is kept with its declaration
+(`declaration-file`): this tool does not edit a hand-written declaration
+file, so delete the two together. A
 `module.exports = { newCheckout }` in the wrapper's own file is the wrapper
 itself, not a second declaration. It still keeps the wrapper. Its callers in
 that file are inlined, and those in other files are `import-unresolved` (see
@@ -1272,7 +1336,9 @@ exactly once. The shapes are:
 - `ns.newCheckout(u)`, through `import * as ns` or `const ns = require(...)`;
 - `Flags.legacy()`, for a static method;
 - `flags.banner(u)`, on a module-level `const flags = new Flags()` in the
-  same file or imported;
+  same file or imported, or on the object literal a module-level
+  `const flags = { ... }` holds, for its own member;
+- a class field wrapper, called the way a method is;
 - `f.banner(u)`, `this.gate.banner(u)` and longer `.field` chains. Each
   parameter, local, field or constructor parameter property in the chain
   must be written as exactly `Flags`, or initialized with `new Flags(...)`.
@@ -1280,7 +1346,13 @@ exactly once. The shapes are:
   counts. An optional field (`gate?: Flags`) is not proven.
 
 Imports resolve the way cross-file key constants' do: relative paths,
-`index` files and `tsconfig`/`jsconfig` `paths`. Default imports,
+`index` files and `tsconfig`/`jsconfig` `paths`. An explicit `baseUrl` is
+followed as well, for a bare specifier no `paths` pattern fits (`lib/flags`
+under `"baseUrl": "src"`), unless a runtime could read it as a package
+first: a Node built-in, a package any `package.json` in the checkout
+declares or a lockfile lists, or one installed in a `node_modules` above the
+importing file. Nor is it followed for a specifier a `paths` pattern fits
+whose targets name no file. Default imports,
 re-exports and barrels, and package names are `import-unresolved`. A
 function, a class or an instance resolves through an import (or `ns.` or
 `require`) only when its module exports it directly, as `export function`,
@@ -1293,52 +1365,157 @@ importer may get something else under the name, so its callers there are
 with `export` and called through `require` is. A sloppy-JavaScript `with`
 block refuses every call under it.
 
+A function wrapper is also kept when anything hands its module on as an
+object, because a name computed at run time can then call it without
+spelling it (`table[gate](u)` after `const table = flags as any`). This
+applies to a namespace import or `require` of the module used as anything
+but `ns.<name>` or a type, and so to it being cast, passed, spread, indexed
+or re-exported. It also applies to `export * as`, a dynamic `import()`,
+`import m = require(...)`, and a glob loader that can load the file. Each
+such use is reported as `receiver-unproven`. The wrapper's callers are still
+inlined, and the removal is partial. An `export * from` the module (a
+barrel) is followed rather than refused, so a namespace of the barrel handed
+on keeps the wrapper too. A method wrapper is reached through an instance,
+so this does not apply to it.
+
 The wrapper's own run also rewrites callers in another file type of the
 family, such as `Checkout.tsx` calling `flags.ts`. Two conditions apply: that
 file type must be configured, and no other run may also rewrite the file. A
 caller that fails either condition is `outside-run`, and the wrapper stays.
 
-A test that stubs the wrapper refuses it entirely (`test-double`), so no test
-that forces the removed branch can turn red. Stubs include
-`jest.spyOn(flags, "newCheckout")`, a `jest.mock` factory key, and
-`mock.banner.mockReturnValue(...)`. So does `jest.mock("./flags")` or
-`vi.mock("./flags")` (or their `doMock` forms, `jest.setMock`,
-`jest.unstable_mockModule`, `jest.createMockFromModule`, `jest.requireMock`,
-`vi.importMock`, or the `mock.module` of Node's and Bun's test runners) of
-the wrapper's own module,
-with or without a factory: an automock replaces the wrapper without naming it.
-The target may be written `import("./flags")` or `require.resolve("./flags")`
-around a plain string. A module mock whose target does not resolve to a file
-in the repository refuses every wrapper in the run, because it could be the
-wrapper's module: a template literal, a variable, a relative path that names
-no file, or a bare name that is not a package, such as an alias defined only
-in a bundler or test config (`vite.config`, Jest's `moduleNameMapper`) rather
-than in `tsconfig`/`jsconfig` `paths`. A mock of a package is not refused: a
-Node built-in (`fs`, `node:fs/promises`), or a name (`axios`, `lodash/fp`,
-`@scope/name`) that a `package.json` in the repository declares in
-`dependencies`, `devDependencies`, `peerDependencies` or
-`optionalDependencies`. So does a
-stub of the wrapper's whole class, which never names the method:
-`sinon.createStubInstance(Flags)`, `mock<Flags>()`, `mockDeep<Flags>()`,
-`createMock<Flags>()`, ts-mockito's `mock(Flags)`, `stubInterface<Flags>()`,
-`Substitute.for<Flags>()`, `td.object(Flags)` or `td.instance(Flags)`, under
-any import name or as a member of the module (`ns.Flags`,
-`require("./flags").Flags`). A dependency-injection test bed that mocks every
-dependency (NestJS `.useMocker(...)`, `TestBed.solitary(...)` or
-`TestBed.sociable(...)` from `@suites/unit`) refuses every method wrapper in
-the run. So do two stubs that name no member: `sinon.stub(obj)` with one
-argument, and `stub(obj, name)` or `spyOn(obj, name)` whose member name is
-not a string literal. Each refuses every wrapper unless `obj` provably is
-something else: an import of another file, a package, or a global such as
-`console`. Test-runner configuration counts too. Jest's `automock: true`
-(in `jest.config.*` or the `jest` key of a `package.json`) refuses every
-wrapper. So does a `moduleNameMapper` or `alias` entry in a Jest, Vite or
-Vitest config that points into a `__mocks__` or `mocks` directory, ends in
-the wrapper module's own name, or resolves to its file. Aliases defined
-anywhere else, such as a webpack config or a Babel plugin, are not read.
-A stub in a setup file, a story, a `__mocks__/` directory, a Cypress or
-end-to-end helper counts, and so does any file that uses `jest.`, `vi.mock`,
-`vi.spyOn`, `vi.fn`, `sinon.` or `cy.stub`.
+A test that stubs the wrapper is resolved before any caller is inlined, the
+way stubs of the SDK's read are. A stub returning the kept value is deleted,
+and a test whose stub returns the removed value is deleted. These spellings
+are resolved:
+
+- `jest.spyOn(target, "m")` or `vi.spyOn(target, "m")`, followed by
+  `.mockReturnValue(bool)`, `.mockReturnValueOnce(bool)` or
+  `.mockImplementation(() => bool)`;
+- `sinon.stub(target, "m").returns(bool)`;
+- `target.m.mockReturnValue(bool)` (or `mockReturnValueOnce`);
+- an entry `m: () => bool`, `m: jest.fn(() => bool)` or
+  `m: vi.fn(() => bool)` in a `jest.mock` or `vi.mock` factory of the
+  wrapper's own module. The entry is deleted, and a
+  factory left empty, or holding only `...jest.requireActual(...)` of the
+  same module, is deleted with its call.
+
+The stub's target must be one the call itself would be proven on: a
+namespace import of the wrapper's module, the module's exported instance, an
+instance whose type is written as the class, `Flags.prototype`, the class
+itself for a static method, or `vi.mocked(...)` or `jest.mocked(...)` of any
+of those.
+
+Stubs are resolved only for a wrapper whose every call is inlined. If a call
+is left, for example `newCheckout(u.trim())` (`argument-has-call`), that call
+still reaches the stub, so the wrapper keeps its stubs and is refused
+(`test-double`).
+
+A mock of a method wrapper's whole class also refuses it, unless the run can
+see that the mock always answers the kept value. An unstubbed class mock
+answers `undefined` (or `null`) for the wrapper, so a test using one may be
+exercising the removed branch. A jest-mock-extended (or
+vitest-mock-extended) `mock<Flags>()` or a ts-mockito `mock(Flags)` is
+resolved when all of these hold:
+
+- it is a `const` declared directly in the callback of an `it` or `test`
+  (and their forms above), or of a `beforeEach`;
+- the first thing done with it is a stub of the wrapper to the kept value,
+  written directly in that callback: `m.banner.mockReturnValue(true)` on a
+  jest-mock-extended mock, or `when(m.banner(anything())).thenReturn(true)`
+  on a ts-mockito one, with one `anything()` for each of the method's
+  parameters, all of which must be required;
+- after that, it is only used through its members (`m.other`), wrapped by
+  ts-mockito's `instance(m)`, or passed to `new` of a class imported from a
+  file that is not test code (`new Svc(m)`). Passing it to any other call
+  (a helper that may call `mockReset`), putting it in an object, an array or
+  a JSX attribute, or using it inside a function declaration (which may run
+  before the stub) does not count;
+- its name is declared only once in the file, and the file never calls
+  `resetAllMocks` or `restoreAllMocks`.
+
+The stub is then deleted and the mock is kept. A test that stubs the removed
+value is deleted along with its mock. Every other class mock still refuses
+the wrapper. That includes `createMock<Flags>()`,
+`sinon.createStubInstance(Flags)` and the others listed below, a
+`mockReturnValueOnce` stub, a ts-mockito stub that matches particular
+argument values, and a mock declared at the top of the file or in a
+`describe` body: a runner's `resetMocks` setting can wipe that stub before
+each test.
+
+A test title that spells the wrapper's name is not a stub. That means a
+string that is the first argument of `describe`, `it` or `test` (including
+`fit`, `xit`, `xtest`, `fdescribe`, `xdescribe`, the `.only`, `.skip`,
+`.concurrent`, `.todo` and `.failing` forms, and the call `.each(...)`
+returns), when the same call also takes a callback. Any other string that
+spells the name still counts, for example `toHaveBeenCalledWith("banner")`,
+an entry in an `.each` table, `obj["banner"]`, or `it.todo("banner")` with no
+callback.
+
+Every stub of a wrapper is resolved, or none is. If one cannot be, the
+wrapper is refused (`test-double`) and none of its stubs is edited, though a
+test may still be deleted for another wrapper's removed value.
+Wrappers are resolved together, so two wrappers stubbed to opposite values
+are both refused. The following cannot be resolved:
+
+- a stub returning a variable;
+- a test stubbing both values (two wrappers of one flag count as one value);
+- a removed-value stub in a `beforeEach` or at the top of a file;
+- an automock (`jest.mock("./flags")` with no factory, including one
+  followed by `jest.mocked(f).mockReturnValue(...)`);
+- a Sinon sandbox;
+- an `expect(spy).toHaveBeenCalled()`;
+- any spelling not listed above.
+
+Some doubles replace the wrapper without spelling its name. They are never
+resolved, and each one refuses the wrapper:
+
+- a `jest.mock` or `vi.mock` (or their `doMock` forms, or
+  `jest.unstable_mockModule`) of the wrapper's own module with no factory, or
+  with a factory this cannot read or whose entry of the wrapper's name cannot
+  be resolved. A factory with no entry of that name does not replace the
+  wrapper and is left alone, whether or not it spreads the real module;
+- `jest.setMock`, `jest.createMockFromModule`, `jest.requireMock`,
+  `vi.importMock`, or the `mock.module` of Node's and Bun's test runners, of
+  the wrapper's own module;
+- a module mock whose target is computed (a template literal, a variable),
+  or does not resolve to a file in the repository and is neither a Node
+  built-in (`fs`, `node:fs/promises`) nor a package (`axios`, `lodash/fp`,
+  `@scope/name`) that a `package.json` in the repository declares in
+  `dependencies`, `devDependencies`, `peerDependencies` or
+  `optionalDependencies`. It refuses every wrapper in the run, because it
+  could be any wrapper's module: a relative path that names no file, or an
+  alias defined only in a bundler or test config (`vite.config`, Jest's
+  `moduleNameMapper`) rather than in `tsconfig`/`jsconfig` `paths`. A target
+  whose last segment is the wrapper file's own name (`@/flags` for
+  `flags.ts`) is refused even when it names a declared package. The target
+  may be written `import("./flags")` or `require.resolve("./flags")` around a
+  plain string;
+- for a method, a mock of any module that names the method's class, or that
+  cannot be read, unless its factory only spreads `jest.requireActual(...)`;
+- a stub of the wrapper's whole class, which never names the method:
+  `sinon.createStubInstance(Flags)`, `mock<Flags>()`, `mockDeep<Flags>()`,
+  `createMock<Flags>()`, ts-mockito's `mock(Flags)`, `stubInterface<Flags>()`,
+  `Substitute.for<Flags>()`, `td.object(Flags)` or `td.instance(Flags)`,
+  under any import name or as a member of the module (`ns.Flags`,
+  `require("./flags").Flags`), except a jest-mock-extended or ts-mockito
+  mock that is resolved as described above;
+- a dependency-injection test bed that mocks every dependency (NestJS
+  `.useMocker(...)`, `TestBed.solitary(...)` or `TestBed.sociable(...)` from
+  `@suites/unit`), for every method wrapper in the run;
+- two stubs that name no member: `sinon.stub(obj)` with one argument, and
+  `stub(obj, name)` or `spyOn(obj, name)` whose member name is not a string
+  literal. Each refuses every wrapper unless `obj` provably is something
+  else: an import of another file, a package, or a global such as `console`;
+- test-runner configuration. Jest's `automock: true` (in `jest.config.*` or
+  the `jest` key of a `package.json`) refuses every wrapper. So does a
+  `moduleNameMapper` or `alias` entry in a Jest, Vite or Vitest config that
+  points into a `__mocks__` or `mocks` directory, ends in the wrapper
+  module's own name, or resolves to its file. Aliases defined anywhere else,
+  such as a webpack config or a Babel plugin, are not read.
+
+A stub in a setup file, a story, a `__mocks__/` directory, or a Cypress or
+end-to-end helper counts as a stub, and so does any file that uses `jest.`,
+`vi.mock`, `vi.spyOn`, `vi.fn`, `sinon.` or `cy.stub`.
 
 A call is not inlined (`argument-has-call`) when the wrapper has a parameter
 default that may run code, such as `u = currentUser()` or the destructuring
@@ -1346,24 +1523,38 @@ default that may run code, such as `u = currentUser()` or the destructuring
 argument, since an `undefined` argument still runs the default. A default of
 literals and names (`u = "anon"`) does not count.
 
+A property getter in an argument (`isCheckoutEnabled(session.user)`, where
+`user` is a `get` accessor) is not detected, as in Kotlin and C#. It reads as
+a plain property, and the inlining drops it with the call, so whatever the
+getter does stops happening. The same is true of a direct read,
+`client.boolVariation("KEY", session.user, false)`: the fold drops the whole
+call, arguments included. Read the diff where an argument is computed by a
+getter that does work.
+
 A decorated method (`@Get("/checkout")`) has its callers inlined but is
 itself kept (`annotated`), whatever the decorator: a decorator is code of your
 own, and may register the method with a framework that calls it by name.
 
 A `private` field or constructor parameter property that only the folded
-calls read stays behind. Under `noUnusedLocals` that is error TS6138, and the
-pull request does not remove it.
+calls read is left unread, which under `noUnusedLocals` is error TS6138 or
+TS6133. A constructor parameter property is removed with every caller's
+argument when every caller can be found; anything else is named in a warning.
+See "Supported JS/TS flag-read shapes".
 
 A method qualifies when its whole body is one read of the flag being removed
 (`= read`, `{ return read }`, `{ return read; }`), and:
 
 - its name, and its class's name, are each declared once across the
-  repository's Java and Kotlin files, or across its C# files, where a field,
-  event or record parameter of that name counts too, or across its Go files,
-  where a struct field or a package-level variable, constant or type of that
-  name counts too (for a getter, a Kotlin function or a
+  repository's Java and Kotlin files, or across its Go files, where a struct
+  field or a package-level variable, constant or type of that name counts too
+  (for a getter, a Kotlin function or a
   Java `getX()`/`isX()` of that name counts too, and for a top-level function,
-  so does any function, property, class, object or typealias of that name);
+  so does any function, property, class, object or typealias of that name).
+  In C# the class's name must be declared once, and the member's name (a
+  field, event or record parameter of that name counts too) once in the
+  class, once in each other implementation of its interface and nowhere else
+  in that interface. Other types may declare the name (see below), but not as
+  an extension method, and no other base type of the class may;
 - it is not `open`, `abstract` or an override, and nothing in the repository
   extends its class, anonymous classes included;
 - if it implements an interface method, that interface is declared in the
@@ -1373,7 +1564,52 @@ A method qualifies when its whole body is one read of the flag being removed
   implement an interface with one abstract method (or a Kotlin
   `fun interface`) anywhere, so its implementations cannot be counted. Code
   outside the repository can implement a public interface, and inlining would
-  override it.
+  override it. In C#, other implementations may exist when each one's member
+  is inert, described below.
+
+In C#, an interface's other implementations do not block the wrapper when
+each one's member is inert. Callers then get the flag's value whichever
+implementation was bound. The member is inert when it is one of:
+
+- a `bool` literal, when it is the value the flag keeps serving;
+- a read of a field or auto-property of its own class (`_enabled`), or a
+  chain of reads through one (`_options.Enabled`). Each step must be a field
+  or an auto-property that is not `virtual`, `abstract` or `override`, on a
+  non-generic class, struct or record of the repository that declares no
+  operator. The last must be declared `bool`;
+- an auto-property with a setter or `init` and no initializer
+  (`bool IsCheckoutEnabled { get; set; }`). It counts as returning `false`,
+  so it is inert only when the flag keeps serving `false`.
+
+The implementation must be a top-level class or struct, not `abstract`,
+`partial`, `static` or generic. It must be sealed or never extended, have every
+base type in the repository, and, if it is public, sit in a project that cannot
+be packed. It must sit in a file of its own too: one in the wrapper's or the
+interface's file is `sibling-not-inert`. An implementation that returns the
+value being removed is `sibling-not-inert`, since whatever builds it relies on
+that value. So is a member shared with another interface, any call, a
+`virtual` member, and anything else. The pull request lists each
+implementation deleted with the wrapper and what it returned.
+
+A test fake is one of these implementations declared in a test project: one
+whose project file, or a file it imports, adds a test framework's package with
+`<PackageReference Include="…">`, names a test SDK, or sets
+`<IsTestProject>true</IsTestProject>`. An `Update` of a package does not
+count. A test attribute such as `[Fact]` in a file of another project does not
+make one. An implementation in such a file is `sibling-not-inert`, since the
+tests beside it are never edited outside a test project and could still check
+the value being removed. A project file that does not parse, or computes one
+of these values, makes the implementation `sibling-not-inert`. A `Condition`
+is not evaluated: a test package that a `Directory.Build.props` adds under one
+counts for every project below it, so a production project there is read as a
+test project. Read the deletion in the diff if your repository does that.
+
+A fake's member may instead return its knob: a settable field or property of
+its own, or a `bool` parameter of its primary constructor, read nowhere else
+in the fake. A knob's default (its initializer, a field's implicit `false`, or
+the parameter's default) must be the value the flag keeps serving. Tests that
+set the knob are resolved like stubs (below): `fake.Enabled = false;`,
+`new FakeFlags { Enabled = false }` and `new FakeFlags(false)`.
 
 A call is folded only when its file proves the receiver is that method's class:
 
@@ -1382,6 +1618,10 @@ A call is folded only when its file proves the receiver is that method's class:
   its type, or created as `FeatureFlags(…)`, `new FeatureFlags(…)` (also as
   `var x = new FeatureFlags(…)` in C#), `mockk<FeatureFlags>()` or
   `mock(FeatureFlags.class)`;
+- in C#, `var x = services.GetRequiredService<IFeatureFlags>()` (and
+  `GetService`, `GetRequiredKeyedService`, `GetKeyedService`), when
+  `Microsoft.Extensions.DependencyInjection` is in scope and no type of yours
+  declares a method of one of those names;
 - `this.field` of such a field;
 - the class's name, for a `static` method or a member of an `object` or
   companion object;
@@ -1390,6 +1630,43 @@ A call is folded only when its file proves the receiver is that method's class:
 The type must reach the class through the file's own package or its imports.
 No argument of a folded call may contain a call or an assignment, because
 folding the call drops its arguments.
+
+A C# member name may also be declared on other types. Call the wrapper's
+class, its interface and the interface's other implementations its types. A
+mention of the name counts only when it may be this member. It does not count
+when:
+
+- its file's project cannot reference a project declaring one of the types
+  (a `.cs` file outside every project included);
+- its file spells none of the types' names, no alias of one, no member or
+  type whose signature leads to one, and no `dynamic`;
+- its receiver's declared type is another type;
+- the same receiver is also read with a member none of the types declares (not
+  counted when a file of yours spells `dynamic` or declares an `extension`
+  block);
+- it is assigned to, and none of the types declares a setter;
+- it is called, and the member is a property.
+
+A mention that counts and whose receiver is not proven, as above, keeps the
+wrapper (`receiver-unproven`). A read through a receiver typed as another
+implementation is `sibling-receiver` in production code (tests: see below).
+
+A string literal spelling the name counts as an `unparsed-mention` only in a
+file whose project can reference the types. There it counts when the file
+spells one of them (as above), or spells a lookup by name: `GetType()`,
+`GetProperty`, `GetMethod`, `GetField`, `GetMember` (and their plurals and
+`GetRuntime…` forms), `InvokeMember`, `TypeDescriptor`, `PropertyDescriptor`,
+`DataBinder`, `new Binding(…)`, `Expression.Property` or
+`Expression.PropertyOrField`. When any such file passes one of those lookups a
+name that is not a string literal, uses `TypeDescriptor` or
+`PropertyDescriptor` at all, or aliases one of those types, a string spelling
+the name counts in every file that can reference the types. `nameof`
+is not a lookup. Other by-name APIs (Dynamic LINQ strings, a JSON path,
+`Activator`, your own reflection helpers) are not seen, and neither is
+reflection that finds the type by scanning assemblies. Files in other
+languages (VB and F# apart, which are `other-language`) and documentation are
+never mentions. A Razor, XAML or Web Forms file always is. Anything this
+cannot read counts as a mention.
 
 In Kotlin, a call with no receiver or through `this` is folded only in the
 owning class body itself. A companion's method is also folded in the
@@ -1408,8 +1685,71 @@ Stubs of the method in tests are resolved the way stubs of the SDK's read are
 `doReturn(…).when(flags).shouldEnableX(…)`, MockK's `every { … } returns …` and
 their `verify` forms, on a mock the file declares with the class as its type. A MockK stub of a getter
 or of a top-level function is not resolved yet, and is reported as `test-double`.
-So is a C# stub (Moq's `Setup(f => f.IsCheckoutEnabled)`, NSubstitute's
-`.Returns(…)`): the wrapper is kept while one remains.
+A wrapper that ends partial keeps its stubs, its `verify` lines and their tests
+as they were, since a call left in place still runs against the mock. If every
+call was proven but the deletion still keeps the wrapper, the stubs were
+already resolved for a removal that does not happen, so every edit for the
+flag is rolled back and the flag is refused.
+
+In C#, Moq's `Setup`, `SetupGet`, `Verify` and `VerifyGet` of the member
+(`flags.Setup(f => f.IsCheckoutEnabled).Returns(false)`) on a
+`Mock<IFeatureFlags>`, and NSubstitute's `.Returns(…)`,
+`.ReturnsForAnyArgs(…)`, `Received(…)` and `DidNotReceive()` on a substitute
+(`Substitute.For<IFeatureFlags>()`), are resolved the same way: a stub of the
+value the flag keeps serving goes, and a test stubbing the value being removed
+goes whole. The mock
+must be declared with that type, or created as `new Mock<IFeatureFlags>(…)`,
+and every binding of its name in the file must be one. In a test project, a
+private test helper's `bool` parameter that only chooses a stub's value
+(`Returns(enabled)`) is pinned the same way, when every call in the file
+passes a literal or relies on a literal default. The stub, the parameter and
+the argument at every call go, and a test whose call passes the value being
+removed goes whole. A helper that is
+not private, is generic, a test, `partial` or has an attribute, a parameter
+named in a doc comment or read by anything else, a call that passes something
+other than a literal, and a use of the helper other than a plain call each
+keep the stub, and the wrapper stays partial.
+
+A test that reads the member through a receiver typed as another
+implementation (`var config = new ConfigFlags(o); … config.IsCheckoutEnabled`)
+is deleted with that implementation. That needs the wrapper to complete, the
+test to be in a test project, the receiver to be a plain name or `this.name`,
+and every binding of that name in the file to be typed as the implementation.
+A wrapper that ends partial keeps all its stubs and these tests as they were.
+If every mention was proven but the deletion still keeps the wrapper (its own
+read was not folded, a mention is left, or another implementation's member
+cannot be deleted), the tests were already changed for a removal that does not
+happen, so every edit for the flag is rolled back and the flag is refused.
+The pull request lists the tests deleted with an implementation, and each
+helper parameter removed, separately from the stubs.
+`Mock.Of<IFeatureFlags>(f => f.IsCheckoutEnabled == false)` is not resolved:
+its read is reported `receiver-unproven`, the test is left as written, and the
+wrapper stays partial.
+
+Some C# shapes are not resolved, and keep the wrapper partial or need a look:
+
+- a test reading the member with no named receiver
+  (`new ConfigFlags(o).IsCheckoutEnabled`) keeps the wrapper partial;
+- a read through another implementation after `?` or `??`, after a comment
+  ending in `.`, or written `(config).IsCheckoutEnabled`, is not removed, and
+  the wrapper stays partial;
+- a test is matched by the receiver's name, so a comment or string in it
+  spelling `config.IsCheckoutEnabled`, where `config` is proven to be another
+  implementation in that file, deletes it too;
+- a fake's knob set in a file that names none of the fake, the wrapper, its
+  class or its interface (through a factory, say) is not seen, and can leave a
+  test failing in the pull request;
+- a pack or push made only through a build tool's own API is not seen:
+  Cake's `DotNetPack(…)` or `DotNetNuGetPush(…)`, or a Nuke build class. A
+  repository that publishes packages only that way reads as packing nothing,
+  so a public interface there can qualify. Read the deletion in the diff if
+  yours does;
+- a `Directory.Build.props` or `.targets` above the repository root is not
+  read, and neither is a project's use of a wrapper with no interface through
+  a package built from the repository (`<PackageReference>`, not
+  `<ProjectReference>`). A mention in such a project can be judged unable to
+  reach the wrapper, so read the deletion in the diff if your repository does
+  either.
 
 Anything unproven is left exactly as it was, and the pull request (and a dry
 run) names its file, line and reason. The method is then kept, and the removal
@@ -1418,18 +1758,22 @@ is reported as **partial** rather than **complete**:
 | Reason | Meaning |
 | --- | --- |
 | `name-not-unique` | The method, its class or the interface method is declared more than once. In TypeScript and JavaScript, any function, method, class field, parameter property, object key, module-level binding or enum member of the name counts, a committed build output included, and so does any string literal equal to it. |
-| `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare. |
-| `interface-published` | The interface it implements is public, or has another implementation. |
+| `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare, or an object literal used other than as a member's receiver (`Object.keys(flags)`, a spread, `flags[k]`, passed or re-exported). |
+| `interface-published` | The interface it implements is public, or has another implementation. In C#, an implementation in a Razor, Web Forms, VB or F# file, or an interface extending it, counts; any other implementation must be inert instead (see `sibling-not-inert`). |
 | `interface-structural` | A Go interface declares a method of the same name, or the wrapper is an exported Go method, which may satisfy an interface outside the repository. Or a TypeScript interface or type literal declares a property or method of the same name. |
-| `receiver-unproven` | Nothing in the file ties the receiver to the method's class. |
+| `receiver-unproven` | Nothing in the file ties the receiver to the method's class. In TypeScript and JavaScript, also a use that hands a function wrapper's module on as an object (see above). |
 | `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
 | `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module, or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). |
 | `argument-has-call` | An argument holds a call, a lambda or an assignment. In Go, a receive (`<-ch`) or a dereference (`*p`) counts too. In TypeScript and JavaScript, `new`, `await`, `yield`, `delete`, a spread or `++`/`--` counts too, and an arrow or function argument counts only when its body holds one of these or a call. So does a parameter default of the wrapper that may run code, whether or not the call passes that argument. |
 | `unremovable-local` | Go only: folding the call would leave a local unused that the cleanup does not remove (see above), and Go does not build with an unused local. |
+| `nil-receiver` | Go only: the call reaches a value-receiver method through a pointer that may be nil, so it panics there, and folding it would remove the panic. |
 | `other-language` | The call is in a Groovy or Scala file, in a Java file calling a Kotlin method (or the reverse), in Java, Groovy or Scala naming a Kotlin getter (`getEnableX`), or in Kotlin reading a Java getter as a property (`flags.enabled`), or a VB or F# file naming a C# wrapper. |
 | `unparsed-mention` | The name appears in a string (reflection, SpEL), a template, a layout, a Razor view, a C# `cref`, a `//go:linkname` comment, the name of a Go `Example` test, or another file this tool does not parse. Also a Go call in an external test package that declares a named `Example`. |
+| `declaration-file` | TypeScript and JavaScript: the wrapper is a JavaScript function or member that its own hand-written declaration file declares (`flags.d.ts` beside `flags.js`). Its callers are inlined, and the wrapper stays with its declaration, for you to delete together. |
 | `not-folded` | The read inside the method was not folded, because its file could not be processed. |
-| `test-double` | A stub of the method this run could not resolve. In TypeScript and JavaScript, any stub of the wrapper or of its whole class, a stub of an object it cannot rule out, an auto-mocking test bed or runner config, or a `jest.mock`/`vi.mock` of its module or of a target that does not resolve to a file or a declared package, refuses it before a caller is inlined. |
+| `test-double` | A stub of the method this run could not resolve. In TypeScript and JavaScript, one stub of the wrapper that cannot be resolved, or any stub of a wrapper with a call that is not inlined, refuses it before a caller is inlined, and none of its stubs is edited. So does a stub of its whole class, a stub of an object it cannot rule out, an auto-mocking test bed or runner config, or a module mock of a target that does not resolve to a file or a declared package. |
+| `sibling-not-inert` | Another implementation of the interface returns the value being removed, calls something, is `virtual`, is shared with another interface, or is otherwise not inert (C#). Reported at that implementation. |
+| `sibling-receiver` | Production code reads the member through a receiver typed as another implementation of the interface (C#). |
 | `annotated` | The method carries an annotation a framework may call it through (`@GetMapping`, `@Bean`, `@JvmName`, …), so it is kept even with no caller left. A Go function marked `//export` is kept the same way, and so is a TypeScript or JavaScript method with any decorator. |
 
 In a partial removal, every call that was folded evaluated to the value the
@@ -1445,9 +1789,9 @@ deletion of a public method in the diff before merging. Set
 did.
 
 **A gate that takes no key and is not inlined is reported, not rewritten.**
-That is every such gate outside Kotlin, Java, C#, Go, TypeScript and JavaScript, and one of theirs that
-does not qualify, such as a family of gates sharing `IsEnabled` behind
-interfaces with a second implementation each:
+That is every such gate outside Kotlin, Java, C#, Go, TypeScript and
+JavaScript, and one of theirs that does not qualify, such as a gate whose
+interface has a second implementation that is not inert:
 
 ```csharp
 public class FeatureflipCheckoutGate : ICheckoutGate
@@ -1804,7 +2148,7 @@ behaviour above: the declaration is left in place and nothing is deleted.
 | Dart | A top-level `const` or `final`, or a `static const`/`static final` member of a class, mixin or extension type. Bare `NAME` through an `import` of the declaring file (a relative URI or `package:` of the reader's own package), `show` and `hide` honoured; `p.NAME` through `import '...' as p`; `Owner.NAME` and `p.Owner.NAME` for a member. The read is the first argument of a non-null-aware `boolVariation(...)` call or of an accessor you named. A read through a re-exporting library, a conditional or deferred import, another package of the repository, a typedef, or from a `part` file is left alone, and the declaration is kept. An import the fold leaves unused is removed, and a `show` naming the deleted constant is trimmed |
 | Java | `Owner.NAME`, with `Owner` in the same package or imported (`import pkg.Owner;`, `import pkg.*;`); bare `NAME` under `import static pkg.Owner.NAME;` or `import static pkg.Owner.*;`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named |
 | Kotlin | `Owner.NAME` for a `const val` in a top-level `object`, or in the `companion object` of a top-level class (`Owner` is the class; `Owner.Companion.NAME`, or `Owner.Keys.NAME` for a companion named `Keys`, works too), with `Owner` imported or in the same package; bare `NAME` (or its `as` alias) under `import pkg.Owner.NAME`, `import pkg.Owner.Companion.NAME` or `import pkg.NAME`, or in the same package for a top-level `const val`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named. A subclass of the class can read a companion's constant without naming it, so a constant read that way is kept |
-| TypeScript / TSX / JavaScript | an `export const` read through `import { NAME }` (or `as`), `import * as ns` (`ns.NAME`), `const ns = require(...)`, or `const { NAME } = require(...)`. Relative specifiers, and `baseUrl` and `paths` from the nearest `tsconfig.json` or `jsconfig.json`, are followed. The read is the first argument of a non-optional `boolVariation(...)` or `useFeatureFlag(...)`, an awaited `getBooleanValue(...)`, or an accessor you named |
+| TypeScript / TSX / JavaScript | an `export const` read through `import { NAME }` (or `as`), `import * as ns` (`ns.NAME`), `const ns = require(...)`, or `const { NAME } = require(...)`. Relative specifiers, and `paths` (against its `baseUrl`) from the nearest `tsconfig.json` or `jsconfig.json`, are followed; a bare specifier that only `baseUrl` would resolve is not. The read is the first argument of a non-optional `boolVariation(...)` or `useFeatureFlag(...)`, an awaited `getBooleanValue(...)`, or an accessor you named |
 | PHP | A single-element `const` in a class, interface or enum declared at the top of a file or namespace block and not `private` (typed or not), or a namespace-level `const`. `Owner::NAME` with `Owner` imported (`use Ns\Owner;`, `use Ns\Owner as Alias;`, `use Ns\{Owner, ...};`), in the reader's namespace, fully qualified (`\Ns\Owner::NAME`), qualified through an imported namespace, or `namespace\`-relative; class names match in any case. Bare `NAME` under `use const Ns\NAME;` or in the constant's own namespace (a global constant only from a file with no namespace). The read is the whole first argument of a `boolVariation(...)` method or function call, or of an accessor you named. Left alone, and the declaration kept: a read through a subclass, an implementer, a `class_alias`, or `self::`/`static::`/`parent::` that may reach it (inside a closure, always), a `use const ... as Alias`, a qualified constant name (`\Ns\NAME`), a named argument, a read inside string interpolation, the name in a string (`constant('...')`), a heredoc or a docblock annotation, a Blade view, a Twig, Latte or Smarty template or Symfony YAML/XML or Nette configuration that spells it, and a file holding PHP under another suffix (`.theme`, `.install`, `.profile`, `.engine`, `.ctp`, `.php7`). A trait's constant is never resolved across files. A file under a Composer `vendor/` directory (beside a `composer.json`) is never rewritten; it keeps the declaration only when it names the owner itself, and it competes only when it parses |
 | Python | a module-level `NAME = "key"` (annotated, `NAME: str = "key"`, and a plain f-string with nothing to fill in count too), read through `from pkg.keys import NAME` (or `as K`), a relative form (`from .keys import NAME`), `import pkg.keys` (`pkg.keys.NAME`), `import pkg.keys as k` (`k.NAME`) or `from pkg import keys` (`keys.NAME`, `as` alias included). An absolute import is resolved when exactly one file in the checkout ends in `pkg/keys.py` or `pkg/keys/__init__.py`; with two, as in a repository holding two services that each have a `pkg` package, the read is refused. The read is the first argument of `variation(...)` with a `True`/`False` default (positional or `default=`), of `get_boolean_value(...)`, or of an accessor you named. Only an import at the top of the module counts |
 | Swift | A top-level `let`, or a `static let` in a struct, class, enum, actor, or an extension of one declared in the same module, including nested types (`Flags.Checkout.NAME`, spelled from the outermost type). The module of each file is read from `Package.swift` targets and committed Xcode projects (classic file lists and Xcode 16 synchronized folders). Within a module, a static is read as `Owner.NAME` and a top-level `let` as bare `NAME`, with no import; a static is never resolved as a bare `NAME`. From another module, after `import Module` with the constant `public` (or `package` within one Swift package, or `internal` under `@testable import`). The read is the first argument of a non-optional-chained `boolVariation(...)` call or of an accessor you named, negated or not. Left alone, and the declaration kept: a bare `NAME` of a static constant read inside its owner, an extension of the owner, or a type that inherits from it (write `Owner.NAME`), a constant carrying an attribute (`@MainActor`, a property wrapper), a `private` or `fileprivate` constant or owner, one inside `#if`, an owner with an inheritance or conformance clause, a module-qualified read (`Module.Owner.NAME`), an implicit member (`.NAME`), a read through a typealias, a subclass or `self`/`Self`, a read inside an extension of a type that has a generic parameter of the owner's name, or of a nested type whose outer type is generic, a read inside an extension whose extended type the tool cannot name (a generic specialisation such as `extension Array<Int>`), a read inside an extension written through a typealias, or in a type whose supertype or protocol is spelled through a typealias, a dotted owner one of whose intermediate types is also redeclared by an extension (an extension adding `typealias Checkout = …`), a bare read inside a type whose supertype or protocol is declared outside the repository, or inside an extension constrained `where Self:` to such a type (a SwiftUI `View`, say: qualify it as `Owner.NAME`), an owner given a member of the same name by an extension written through a typealias (`extension K`, or a dotted spelling with a typealias anywhere in it, such as `extension NS.Keys`), a constant or read whose name is written in backticks, an import inside `#if` or of one declaration (`import struct Module.Owner`), an `import` of a module name that two packages or projects in the repository share, a second imported module that declares the same name or re-exports another, and any file whose module cannot be read (a manifest that computes its targets or lists `sources:`/`exclude:`, a file in no target). One case is still resolved and can differ: a qualified read (`Owner.NAME`) inside a type whose superclass or protocol comes from outside the repository, inside an extension of a type declared outside the repository (`extension UIViewController`), or inside an extension constrained `where Self:` to one. If that outside type declares, or an extension of it declares, a nested type, typealias or generic parameter with the owner's name, Swift reads that one, and the fold uses this repository's value. Bare reads in such types are left alone |
@@ -2335,16 +2679,44 @@ you had already set to a literal yourself (`const DEBUG = false`) is never
 touched.
 
 When a fold makes a following statement unreachable — collapsing an `else if`
-into an `else`, turning `if (<read>) { return a; }` into a bare `return a;`, or
-turning a loop condition into `while (true)` — that statement is **deleted** and
-listed in the pull request body. `no-unreachable` is part of
-`eslint:recommended` and is an error, so leaving it would open a pull request
-that cannot go green. A `break` that exits the loop keeps what follows
-reachable, and nothing after it is touched. A loop the fold makes *dead* rather
-than infinite (`while (false) { … }`, from a flag serving false) is removed
-and listed too — ESLint's recommended set does not require it, but the loop
-can never run, and the same rule holds in every language. See
-[Known gaps](#known-gaps).
+into an `else`, turning `if (<read>) { return a; }` into a bare `return a;` or
+`if (<read>) { break outer; }` into a bare `break outer;`, or turning a loop
+condition into `while (true)` — that statement is **deleted** and listed in the
+pull request body. `no-unreachable` is part of `eslint:recommended` and is an
+error, so leaving it would open a pull request that cannot go green. A `break`
+that exits the loop keeps what follows reachable, and nothing after it is
+touched. Hoisted declarations are the exception, since code above them can
+still use them: a stranded `function` declaration stays, and a stranded
+`var last = x;` becomes `var last;`, losing only the initialiser that could
+never run. A stranded destructuring `var` refuses the flag.
+
+A loop condition the fold makes constant is finished the way your lint
+expects, because `no-constant-condition` rejects every constant loop except
+`while (true)`:
+
+- served **true**, `for (init; <read>; update)` becomes `for (init; ; update)`
+  and `do { … } while (<read>);` becomes `while (true) { … }`;
+- served **false**, `while (<read>)` is deleted, `for (init; <read>; update)`
+  is replaced by its initialiser (nothing for a `let` or `const` whose values
+  cannot run code, the declaration for a `var`, the expression for an
+  assignment), and `do { … } while (<read>);` is replaced by its body, which
+  runs once either way. The body keeps its braces when it declares a `let`,
+  `const`, class or function. Each loop removed is listed in the pull request
+  body.
+
+A `do` whose body has a `break` or `continue` belonging to it, a `for` whose
+`let` or `const` initialiser runs code, and a loop that is not directly in a
+block (an unbraced `if` body, a labelled loop, a `switch` arm) are not
+rewritten, and the flag is **refused** instead of opening a pull request your
+lint fails. As with unreachable statements, a file that already had a dead
+loop is left alone. See [Known gaps](#known-gaps).
+
+Two leftovers are removed without a mention, since nothing of yours goes with
+them: a label whose last `break label` or `continue label` the fold removed
+(`no-unused-labels`, and TypeScript's TS7028), and a `static { … }` block the
+fold emptied (`no-empty-static-block`). `<read> ?? fallback` folds to the
+literal, since a boolean is never nullish. A file that already had an unused
+label or an empty static block keeps them all.
 
 A local variable left with no remaining use after a fold is cleaned up the same
 way an import is — except one level inside a `const Component = () => { ... }`
@@ -2399,6 +2771,46 @@ When a deleted statement was the file's last `import` or `export`, it becomes
 without one the file would turn into a script, where top-level `await` does not
 compile and top-level names become globals. `export {};` keeps the file a module
 and loads nothing. The pull request body names each file where this happened.
+
+A `private` or `#` class member whose every read was a flag read the fold
+removed is left unread. With `noUnusedLocals` on, `tsc` reports it: TS6138 for
+a constructor parameter property (`constructor(private client: Client)`),
+TS6133 for a field, method or accessor. ESLint's recommended
+`no-unused-private-class-members` reports a `#` member in JavaScript too.
+
+A constructor parameter property is removed, together with the argument every
+caller passes for it, when every mention of the class in the repository's
+TypeScript and JavaScript can be accounted for: `new Svc(…)`, a subclass's
+`super(…)`, a type annotation, an import or export, or `instanceof`. Each
+argument removed must be a literal, a name, `this` or a property access, so
+deleting it cannot skip work, and a local that only fed it is cleaned up
+like any other the fold strands.
+The parameter stays, and is named in a warning of its own, when any of these
+holds:
+
+- the class, its constructor or the parameter has a decorator, which is how
+  Angular, NestJS and other dependency-injection containers construct it;
+- the class is a default export, imported under another name, or used as a
+  value (`useClass: Svc`, `[Svc]`, `typeof Svc`, `<Svc />`, `new this()`);
+- a call spreads its arguments or passes one that may do work
+  (`new Svc(createClient(), log)`);
+- a subclass has no constructor of its own;
+- the constructor is overloaded, or still reads the parameter by its bare name;
+- a file that uses the class does not import it from the file that declares
+  it (a package's class of the same name, or one re-exported through another
+  module);
+- a `.vue`, `.svelte` or `.astro` component mentions it;
+- a caller lies outside the directory being cleaned;
+- a file that mentions the class is ignored by git, or does not parse.
+
+If the class is exported, code outside this repository may construct it too,
+so the pull request lists it under "Constructor signature changed".
+
+Fields, methods and accessors always stay, since a field's initializer may do
+work, and the pull request names each one so you can remove it. A member that
+was already unread before the fold is not listed, and neither is a `protected`
+or `public` one, which code elsewhere may still read. A member assigned with
+`this.client = c` but never read counts as unread, as it does for `tsc`.
 
 ## Supported Python flag-read shapes
 
@@ -2557,12 +2969,41 @@ no longer reads stays, along with the constructor that sets it.
 A primary-constructor parameter is the one place that costs a build. When
 every read of `client` in `class Svc(IClient client)` was a flag read the fold
 removed, the parameter is left unread and the compiler warns CS9113, which is
-an error under `TreatWarningsAsErrors`. The parameter stays, since removing it
-changes the constructor every caller and dependency-injection registration
-uses, and the pull request names each one in a warning of its own so you can
-remove it or suppress the warning. A parameter that was already unread before
-the fold is not listed. Neither is one of a `record`, whose parameters become
-properties, or of a `partial` type, whose other parts may still read it.
+an error under `TreatWarningsAsErrors`.
+
+The parameter is removed, together with the argument every caller passes for
+it, when every mention of the type in the repository's C# can be accounted
+for: `new Svc(…)`, a derived type's `: Svc(…)` or `: base(…)`, the type's own
+`: this(…)`, a type position, `nameof(Svc)`, or a generic type argument such
+as `services.AddScoped<Svc>()` (the container resolves constructor parameters
+by type, not position). Each argument removed must be a literal, a name, `this`,
+`default` or a member access. The parameter stays, and is named in a warning
+of its own so you can remove it or suppress the warning, when any of these
+holds:
+
+- a call passes named arguments, or an argument that may do work;
+- `typeof(Svc)` or `ActivatorUtilities` can construct it positionally;
+- a target-typed `new(…)` anywhere in the repository passes a number of
+  arguments the constructor could take;
+- a Razor, `.cshtml` or other non-C# .NET file mentions it, or a `using`
+  alias names it;
+- a spelling of the name may be another type: qualified with a different
+  namespace, or unqualified in a file that neither sits in the type's
+  namespace nor imports it (with `using`, `global using` or an MSBuild
+  `<Using>` item);
+- a generic call passes arguments while naming the type
+  (`new Mock<Svc>(client, log)`, `Substitute.ForPartsOf<Svc>(…)`), which a
+  mock or proxy library uses to construct it positionally;
+- a caller lies outside the directory being cleaned;
+- the parameter has an attribute (`[FromKeyedServices]`) or a modifier, or the
+  type is generic;
+- a derived type has no constructor of its own.
+
+If the type is `public`, code outside this repository may construct it too, so
+the pull request lists it under "Constructor signature changed". A parameter
+that was already unread before the fold is not listed. Neither is one of a
+`record`, whose parameters become properties, or of a `partial` type, whose
+other parts may still read it.
 
 Tests that mock the read — a Moq `Setup` or `Verify`, an NSubstitute stub —
 are resolved along with it: see "Tests that mock the flag read". A `Setup`
@@ -2987,14 +3428,20 @@ removes it. An import is deleted outright. A variable's declaration goes with
 it when the initializer cannot have a side effect, and is otherwise rewritten
 to discard the value, so whatever it called still runs. A local declared with
 `var` is treated the same way, including a spec on its own line inside a
-`var ( … )` group, and one name of `var a, b T` goes on its own. Some declarations are not
+`var ( … )` group, and one name of `var a, b T` goes on its own. A variable
+declared by a statement header leaves the header instead: `for _, v := range us`
+becomes `for range us`, `for i, v := range us` becomes `for i := range us`,
+`case v, ok := <-ch:` becomes `case _, ok := <-ch:`, and `switch v := x.(type)`
+becomes `switch x.(type)`. Some declarations are not
 removed at all: several names declared together with values (`a, b := f()`,
 `var a, b = x, y`), a local inside a function literal, and a local in a
 function that shares its name with another function in the same file. If a
 fold leaves one of those unused, Go reports it.
 
-Fold output itself is `gofmt`-clean, including a multi-statement branch, so a
-repo gating on `gofmt -l` will not flag the pull request over the fold.
+Fold output itself is `gofmt`-clean, including a multi-statement branch, and so
+is what a removed import or declaration leaves behind (no blank line just inside
+`import (`, no two blank lines in a row, no blank lines at the end of the file),
+so a repo gating on `gofmt -l` will not flag the pull request over the fold.
 
 **A flag-keyed map entry is the one exception, and only when `gofmt` aligned
 it.** `gofmt` pads a multi-line map literal's values into a column sized by its
@@ -3281,7 +3728,7 @@ means no PR.
 | A **Java, Go or C# read that is a whole statement** and holds no other call — a warm-up call made for the SDK's exposure event, `client.boolVariation("KEY", ctx, false);` | **the whole statement is deleted.** Its value is discarded by definition, so there is nothing to fold it into and nothing to lose. Any receiver works, including a static import with no receiver and a field chain; the argument list may hold names and literals (and, in Go, composite literals, which have no constructors to run). The key may be a literal or hoisted to a constant — see the row below. In C# the awaited OpenFeature read is covered too, while an un-awaited one is left alone; in Go the OpenFeature `client.Boolean(ctx, "KEY", …)` read and in Java the OpenFeature `client.getBooleanValue("KEY", …)` read are covered the same way. A project's own wrapper named in `accessors` is covered the same way, whether the key is a **literal** or hoisted to a constant |
 | A discarded read whose **key is hoisted to a constant** (`client.boolVariation(FLAG_KEY, ctx, false);`) | **the whole statement is deleted**, and the declaration with it, exactly as for a literal key. The constant may be declared at file scope or local to the method, and must meet the same four conditions as any other hoisted key — see [The key hoisted to a constant](#the-key-hoisted-to-a-constant). A statement holding another call is refused here too: the row above applies unchanged, because the safety rule does not depend on how the key is spelled |
 | A **PHP template written in the alternative syntax** (`<?php if (<read>): ?> … <?php else: ?> … <?php endif; ?>`) | **rewritten**, markup and all: the arm that runs stays, the guard and the dead arm go, and a `<?php … ?>` pair left bracketing nothing goes with them. The rendered HTML keeps the same markup; only insignificant whitespace around the removed lines moves, because the whole `<?php … ?>` line is taken rather than an empty tag pair left behind. `elseif` chains are handled in the same way, in any position |
-| A **multi-way guard** — Go's tagless `switch { case <read>: … }`, Ruby's subject-less `case` / `when <read>`, Kotlin's subject-less `when { <read> -> … }`, or `switch (true) { case <read>: … }` in PHP, TypeScript and JavaScript | **rewritten.** Each arm is a condition and the first true one wins, so this is an `if`/`else if` chain by another spelling. Where the flag serves **false** the dead arm is removed, in any position. Where it serves **true**, an arm with nothing live above it collapses the whole statement to its body (Go and Ruby), and an arm with a live arm above it becomes the terminal `default:` / `else`, taking the arms below it — they sit behind a guard that now always passes. Kotlin collapses only where that cannot change meaning — an expression body in a slot that takes any expression, or a braced body in statement position that declares nothing — and otherwise takes the `else` form, which also keeps a `when` used as a value exhaustive. PHP, TypeScript and JavaScript always take the `default:` form, because a body ending in `break;` is a syntax error outside a switch, or silently becomes a loop's `break` inside one. A switch on a **value** (`switch ($v)`, `case v`, `when (v)`, `switch (v)`) is untouched: there the arms compare values rather than act as guards |
+| A **multi-way guard** — Go's tagless `switch { case <read>: … }`, Ruby's subject-less `case` / `when <read>`, Kotlin's subject-less `when { <read> -> … }`, or `switch (true) { case <read>: … }` in PHP, TypeScript and JavaScript | **rewritten.** Each arm is a condition and the first true one wins, so this is an `if`/`else if` chain by another spelling. Where the flag serves **false** the dead arm is removed, in any position. Where it serves **true**, an arm with nothing live above it collapses the whole statement to its body (Go and Ruby), and an arm with a live arm above it becomes the terminal `default:` / `else`, taking the arms below it — they sit behind a guard that now always passes. Kotlin collapses only where that cannot change meaning — an expression body in a slot that takes any expression, or a braced body in statement position that declares nothing — and otherwise takes the `else` form, which also keeps a `when` used as a value exhaustive. PHP, TypeScript and JavaScript always take the `default:` form, because a body ending in `break;` is a syntax error outside a switch, or silently becomes a loop's `break` inside one. A switch on a **value** (`switch ($v)`, `case v`, `when (v)`, `switch (v)`) is untouched: there the arms compare values rather than act as guards. In TypeScript and JavaScript, a switch whose **subject is the read** (`switch (<read>) { case true: … case false: … }`) is finished the same way: the arm matching the value served becomes the `default:`, and an arm that can never match is removed, which TypeScript requires (`case true:` under `switch (false)` is error TS2678) |
 | A multi-way guard the fold **cannot** finish | **the whole flag is refused**, and the run exits 1 naming the file. In Go: a `fallthrough` anywhere in the switch, a `break` in a body that would be lifted out of it, or a `switch v := f(); {` initializer whose binding the arms use. In Ruby: a `when` listing several patterns (`when <read>, isAdmin(ctx)`), where a literal among alternatives is not the whole condition. In PHP: an arm before the flag's that does not end in `break`/`return`/`continue`/`goto`/`exit`, because PHP falls through **by default** and that arm runs into the flag's with nothing in the source saying so — an arm ending in `throw` or `die()` counts as not terminating, since the grammar cannot tell either from an assignment. In TypeScript and JavaScript: the same fall-through rule, except that `throw` does count as terminating (it is its own statement there), as does a braced arm body ending in a jump. In Kotlin: an arm listing several conditions (`isAdmin(ctx), <read> ->`). In Kotlin, TypeScript and JavaScript: a dead arm sharing its line with another arm |
 | A PHP **`elseif` that is not last in its chain**, where the flag serves **true** | **rewritten**: the clause becomes the chain's `else`, and every branch after it is deleted. That is not tidying — those branches sit behind a guard that now always passes, so they are unreachable, and leaving them would keep an `else` in front of them, which does not parse. Both spellings (`elseif` and `else if`) behave the same. Where the flag serves **false** the dead branch is removed, in any position |
 | A PHP read **inside string interpolation** (`"mode={$client->boolVariation('KEY', $ctx, false)}"`, or the same in a heredoc) | **no change** to that read: PHP's `{$...}` needs a variable after the brace, so a literal cannot take the call's place, and folding it would print the text `{true}`. Other reads in the file are still rewritten, the pull request reports the file as still mentioning the flag, and a key constant that read uses is kept |
@@ -3432,6 +3879,9 @@ means no PR.
   Ruby, where an empty `when` is valid) a `switch` arm; a Python
   `while False: … else: …` (the `else` runs); and a `for` loop with an
   initialiser, which still runs (Java refuses that flag instead; see its
+  section). TypeScript and JavaScript go further, because their lint rejects
+  each of these: a `do … while (false)` becomes its body, a `for` becomes its
+  initialiser, and what cannot be finished is refused (see the TypeScript
   section). A Python loop that was its block's only statement
   becomes `pass`. As with unreachable statements, a file that already
   contained a dead loop is left alone.

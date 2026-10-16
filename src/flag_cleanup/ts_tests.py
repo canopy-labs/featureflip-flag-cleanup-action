@@ -206,14 +206,22 @@ def title_nodes(root: Node, data: bytes) -> frozenset[int]:
     found = set()
     for node, _callee, _title in _titled_tests(root, data):
         arguments = node.child_by_field_name("arguments")
-        named = arguments.named_children if arguments is not None else []
-        if len(named) >= 2 and named[1].type in _CALLBACKS:
-            found.add(named[0].id)
+        if arguments is not None and hands_callback(arguments):
+            found.add(arguments.named_children[0].id)
     return frozenset(found)
 
 
 #: The second argument of a call that declares a test.
 _CALLBACKS = frozenset({"arrow_function", "function_expression", "function"})
+
+
+def hands_callback(arguments: Node) -> bool:
+    """Whether a call's ``arguments`` hand over a callback second, as a call
+    declaring a test does: what tells a runner's title apart from a name
+    handed to a function that only happens to be called ``test``. See
+    :func:`title_nodes`."""
+    named = arguments.named_children
+    return len(named) >= 2 and named[1].type in _CALLBACKS
 
 
 def data_mention(source: str, language: str, flag_key: str) -> str | None:

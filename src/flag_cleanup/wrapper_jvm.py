@@ -136,7 +136,7 @@ class Index:
     def build(cls, repo_dir: str, wrapper: wi.Wrapper) -> Index:
         index = cls()
         try:
-            source = Path(wrapper.path).read_text(encoding="utf-8")
+            source = _exact(wrapper.path)
         except (OSError, UnicodeDecodeError):
             index.unreadable = True
             return index
@@ -158,7 +158,7 @@ class Index:
                     index.unparsed.append(path)
                 continue
             try:
-                text = Path(path).read_text(encoding="utf-8")
+                text = _exact(path)
             except (OSError, UnicodeDecodeError):
                 logger.info("cannot read %s, so no keyless wrapper qualifies", path)
                 index.unreadable = True
@@ -346,9 +346,18 @@ def _text(node: Node) -> str:
     return node.text.decode("utf-8", "replace")
 
 
+def _exact(path: str) -> str:
+    """The file's text with its line endings as they are, like every other
+    reader on the wrapper path, so a span taken here (an interface member's)
+    is an offset into the file on disk."""
+    from flag_cleanup import mock_stubs
+
+    return mock_stubs._read_exact(path)
+
+
 def _read_text(path: str) -> str | None:
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return _exact(path)
     except (OSError, UnicodeDecodeError):
         return None
 

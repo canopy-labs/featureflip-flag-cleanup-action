@@ -9,7 +9,16 @@ constant):
 * a top-level ``function f(...) { return <read>; }``;
 * a top-level ``const f = (...) => <read>`` (or ``=> { return <read>; }``, or
   ``= function (...) { return <read>; }``);
-* a non-``async`` method of a non-generic class declaration, static or not.
+* a non-``async`` method of a non-generic class declaration, static or not,
+  or a field of one holding such a function (``m = (...) => <read>``);
+* a method of the object literal a top-level ``const`` holds, or a key of it
+  holding such a function. The object is the member's owner, and is called
+  through like a class with a static method.
+
+A JavaScript wrapper's own declaration file (``flags.d.ts`` beside
+``flags.js``) describes it rather than competing with it: its callers are
+inlined, and the wrapper stays with the declaration, which nothing here
+rewrites (``declaration-file``).
 
 ``getBooleanValue`` is never a wrapper body: the form the rules fold is
 awaited, which a wrapper would return as a promise, and the synchronous form
@@ -28,13 +37,13 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, cross_file_ts, key_const, ts_scope, ts_tests
+from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_scope, ts_tests
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.ts_scope import text as _text
 
@@ -55,8 +64,13 @@ _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
 
 
 def _read(path: str) -> str | None:
+    """The file's text with its line endings as they are, like every reader
+    on the wrapper path, so a span taken from it is an offset into the file
+    the sentinel pre-pass marks."""
+    from flag_cleanup import mock_stubs
+
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return mock_stubs._read_exact(path)
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -207,16 +221,48 @@ def _decorator_name(decorator: Node) -> str:
 
 
 def decorators(member: Node) -> tuple[str, ...]:
-    """The names of the decorators on a class member. The grammar makes each
-    one a sibling of the member in the class body, so they are the
-    ``decorator`` nodes right before it."""
+    """The names of the decorators on a class member. The grammar makes a
+    method's each a sibling of the method in the class body, the ``decorator``
+    nodes right before it, and a field's each a child of the field."""
     names: list[str] = []
     sibling = member.prev_named_sibling
     while sibling is not None and sibling.type in ("decorator", "comment"):
         if sibling.type == "decorator":
             names.insert(0, _decorator_name(sibling))
         sibling = sibling.prev_named_sibling
-    return tuple(names)
+    return tuple(names) + tuple(_decorator_name(c) for c in member.named_children if c.type == "decorator")
+
+
+def _plain_method(member: Node, is_read: Callable[[Node], bool]) -> bool:
+    """A ``method_definition`` named by a plain identifier, not a constructor,
+    accessor, ``async`` or generator method, whose body is the read."""
+    name = member.child_by_field_name("name")
+    if name is None or name.type != "property_identifier" or _text(name) == "constructor":
+        return False
+    if _has(member, "get", "set", "async", "*") or member.child_by_field_name("type_parameters") is not None:
+        return False
+    return _returns_boolean(member) and _single_read(member.child_by_field_name("body"), is_read)
+
+
+def _function_value(value: Node | None, is_read: Callable[[Node], bool]) -> bool:
+    """An arrow or function expression whose call is the read's value."""
+    return (
+        value is not None
+        and value.type in _FUNCTION_VALUES
+        and _plain_function(value)
+        and _returns_boolean(value)
+        and _single_read(value.child_by_field_name("body"), is_read)
+    )
+
+
+def _field_wrapper(member: Node, is_read: Callable[[Node], bool]) -> bool:
+    """A class field ``m = (...) => <read>``: an own property of each instance
+    (or of the class, ``static``), called like a method. An optional or
+    definite (``?``/``!``) field, a typed one and a private name are not."""
+    name = member.child_by_field_name("name")
+    if name is None or name.type != "property_identifier" or _has(member, "?", "!", "declare", "abstract"):
+        return False
+    return member.child_by_field_name("type") is None and _function_value(member.child_by_field_name("value"), is_read)
 
 
 def _method_wrappers(cls: Node, is_read: Callable[[Node], bool]) -> list[Node]:
@@ -225,15 +271,59 @@ def _method_wrappers(cls: Node, is_read: Callable[[Node], bool]) -> list[Node]:
     body = cls.child_by_field_name("body")
     found = []
     for member in [] if body is None else body.named_children:
-        if member.type != "method_definition":
-            continue
-        name = member.child_by_field_name("name")
-        if name is None or name.type != "property_identifier" or _text(name) == "constructor":
-            continue
-        if _has(member, "get", "set", "async", "*") or member.child_by_field_name("type_parameters") is not None:
-            continue
-        if _returns_boolean(member) and _single_read(member.child_by_field_name("body"), is_read):
+        if member.type == "method_definition" and _plain_method(member, is_read):
             found.append(member)
+        elif member.type == "public_field_definition" and _field_wrapper(member, is_read):
+            found.append(member)
+    return found
+
+
+def object_literal(declaration: Node) -> tuple[Node, Node] | None:
+    """``(name, object)`` of a ``const`` declaring one untyped name with an
+    object literal: ``const flags = { ... }``."""
+    if declaration.type != "lexical_declaration":
+        return None
+    declarators = [c for c in declaration.named_children if c.type == "variable_declarator"]
+    if len(declarators) != 1 or not ts_scope.holds_object_literal(declarators[0]):
+        return None
+    name = declarators[0].child_by_field_name("name")
+    if name is None or name.type != "identifier":
+        return None
+    return name, declarators[0].child_by_field_name("value")
+
+
+def _member_name(member: Node) -> Node | None:
+    return member.child_by_field_name("key" if member.type == "pair" else "name")
+
+
+def _may_replace(member: Node) -> bool:
+    """A spread or a computed key: either may put a value under any name."""
+    if member.type == "spread_element":
+        return True
+    key = _member_name(member)
+    return key is not None and key.type == "computed_property_name"
+
+
+def _object_wrappers(declaration: Node, is_read: Callable[[Node], bool]) -> list[Node]:
+    """The members of a top-level ``const`` object literal whose whole body is
+    the read: ``m(...) { return <read>; }`` or ``m: (...) => <read>``.
+
+    A spread or a computed key anywhere in the literal may put another value
+    under the member's name, so it holds none."""
+    held = object_literal(declaration)
+    if held is None:
+        return []
+    members = [c for c in held[1].named_children if c.type != "comment"]
+    if any(_may_replace(m) for m in members):
+        return []
+    found = []
+    for member in members:
+        if member.type == "method_definition" and _plain_method(member, is_read):
+            found.append(member)
+        elif member.type == "pair":
+            key = _member_name(member)
+            if key is not None and key.type == "property_identifier" and _function_value(member.child_by_field_name("value"), is_read):
+                found.append(member)
     return found
 
 
@@ -269,6 +359,16 @@ def discover(path: str, source: str, is_read: Callable[[Node], bool]) -> list[wi
                     # and deleting it would leave the decorator with nothing to
                     # decorate, so it is kept: ``annotated``.
                     annotations=decorators(member),
+                )
+            )
+        held = object_literal(node)
+        for member in _object_wrappers(node, is_read):
+            # Called through the object itself, like a static method through its class.
+            found.append(
+                wi.Wrapper(
+                    path=path, language=ts_scope.grammar(path), name=_text(_member_name(member)),
+                    owner=_text(held[0]), package=path, line=wi.line_of(member), start=member.start_byte,
+                    end=member.end_byte, static=True, kind="method",
                 )
             )
     return found
@@ -335,10 +435,18 @@ def _mock_specifier(first: Node | None) -> str | None:
 
 
 def _mocks_module(
-    root: Node, path: str, repo_dir: str, module: str, packages: Callable[[], frozenset[str]] = frozenset
+    root: Node, path: str, repo_dir: str, wrapper: wi.Wrapper, packages: Callable[[], frozenset[str]] = frozenset
 ) -> list[Node]:
-    """Every ``jest.mock("...")``-like call in a file that may replace
-    ``module``: its target resolves there, or resolves to no file at all.
+    """Every ``jest.mock("...")``-like call in a file that may hand its tests
+    something else for the wrapper, without spelling its name.
+
+    A call whose target resolves to the wrapper's own module does, unless it
+    is a ``jest.mock``/``vi.mock`` factory the test-double pass can read and
+    no entry of it may be the wrapper (:func:`_factory_hides`). The other
+    callees (``setMock``, ``createMockFromModule``, ``requireMock``,
+    ``importMock``, ``mock.module``) always do. For a method, so does a mock
+    of the module holding the instance it is called on, which is any module
+    spelling the class, or that cannot be read.
 
     Unresolved is refused, not skipped. A template, a variable, a relative
     path that names no file and an alias only a bundler or test config
@@ -346,7 +454,9 @@ def _mocks_module(
     turns a test pinned to the removed branch red. The one unresolved target
     that cannot be the wrapper's module is a package: a Node built-in, or a
     name ``packages()`` (every dependency a ``package.json`` in the checkout
-    declares) holds."""
+    declares) holds, unless it ends in the wrapper file's own name: a
+    ``moduleNameMapper`` or ``baseUrl`` alias can shadow a package."""
+    owner = _word(wrapper.owner) if wrapper.kind == "method" else None
     found = []
     for node in cross_file_keys.walk(root):
         if node.type != "call_expression":
@@ -354,13 +464,25 @@ def _mocks_module(
         function = node.child_by_field_name("function")
         if function is None or not _is_module_mock(function):
             continue
-        arguments = node.child_by_field_name("arguments")
-        first = next((c for c in ([] if arguments is None else arguments.named_children) if c.type != "comment"), None)
+        first = next(iter(mock_stubs.ts_arguments(node)), None)
         spec = _mock_specifier(first) if first is not None and first.type != "spread_element" else None
-        target = None if spec is None else cross_file_ts.resolve_specifier(path, spec, repo_dir)
-        if target is None and spec is not None and _is_package(spec, packages):
-            continue
-        if target is None or str(Path(target).resolve()) == str(Path(module).resolve()):
+        # Only these take a factory the test-double pass resolves.
+        factory = mock_stubs.ts_callee(node) in mock_stubs.TS_MODULE_MOCKS
+        target = None if spec is None else ts_scope.resolve(path, spec, repo_dir)
+        if spec is None:
+            hides = True
+        elif target is None:
+            hides = not _is_package(spec, packages) or _names_wrapper_file(spec, wrapper.path)
+        elif _same_file(target, wrapper.path):
+            hides = not factory or _factory_hides(node, wrapper.name if wrapper.kind == "function" else None)
+        else:
+            held = _read(target) if owner is not None else None
+            hides = (
+                owner is not None
+                and (held is None or bool(owner.search(held)))
+                and (not factory or _factory_hides(node, None))
+            )
+        if hides:
             found.append(node)
     return found
 
@@ -395,6 +517,88 @@ def _is_package(spec: str, packages: Callable[[], frozenset[str]]) -> bool:
         return spec[len("node:"):].split("/")[0] in _NODE_BUILTINS
     name = _package_name(spec)
     return name is not None and (name in _NODE_BUILTINS or name in packages())
+
+
+#: Lockfiles: a package one lists may be installed, hoisted too, where a
+#: runtime looks before any ``baseUrl`` directory.
+_LOCKFILES = frozenset(
+    {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"}
+)
+#: A package's name in any of them: an npm ``node_modules/<name>`` key, or a
+#: ``<name>@<version>`` entry (Yarn, pnpm, Bun). Over-matching only refuses.
+_LOCKED_NAME = re.compile(
+    r"node_modules/((?:@[^/\"'\s]+/)?[^/\"'\s@]+)|(?:^|[\s\"'/,])((?:@[\w.-]+/)?[\w.-]+)@"
+    # pnpm's lockfile v5 keys: `/name/1.0.0:`.
+    r"|^\s+/((?:@[\w.-]+/)?[\w.-]+)/\d",
+    re.MULTILINE,
+)
+#: Checkout root -> :func:`installable_packages`, read once per checkout.
+_INSTALLABLE: dict[str, frozenset[str]] = {}
+
+
+def installable_packages(repo_dir: str) -> frozenset[str]:
+    """Every package a ``package.json`` in the checkout declares or one of its
+    lockfiles lists, so possibly installed whether declared or not."""
+    from flag_cleanup.piranha_runner import _SKIP_DIRS, checkout_root, source_files
+
+    root = str(Path(checkout_root(repo_dir)).resolve())
+    if root not in _INSTALLABLE:
+        names = set(declared_packages(repo_dir)) | _own_names(repo_dir)
+        for path in source_files(Path(root), (".json", ".lock", ".yaml", ".lockb"), _SKIP_DIRS):
+            if path.name not in _LOCKFILES:
+                continue
+            try:
+                # Bun's binary lockfile spells each name as plain bytes.
+                text = path.read_bytes().decode("utf-8" if path.suffix != ".lockb" else "latin-1")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if path.suffix == ".lockb":
+                names.update(re.findall(r"(?:@[\w.-]+/)?[\w.-]+", text))
+                continue
+            names.update(a or b or c for a, b, c in _LOCKED_NAME.findall(text))
+        _INSTALLABLE[root] = frozenset(names)
+    return _INSTALLABLE[root]
+
+
+def _own_names(repo_dir: str) -> set[str]:
+    """The ``name`` of every ``package.json`` in the checkout: Node resolves a
+    package's import of its own name to itself."""
+    import json
+
+    names: set[str] = set()
+    for path in config_files(repo_dir):
+        if path.name != "package.json":
+            continue
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(manifest, dict) and isinstance(manifest.get("name"), str):
+            names.add(manifest["name"])
+    return names
+
+
+def may_be_package(reader_path: str, spec: str, repo_dir: str) -> bool:
+    """Whether a runtime may read a bare specifier as a package although the
+    compiler finds it under ``baseUrl``. Jest's ``moduleDirectories``, and a
+    bundler listing ``node_modules`` first, look there before the alias does:
+    a Node built-in, a package the checkout declares or locks, or a
+    ``node_modules/<name>`` above the reader."""
+    from flag_cleanup.piranha_runner import checkout_root
+
+    if spec.startswith("node:"):
+        return True
+    name = _package_name(spec)
+    if name is None or name in _NODE_BUILTINS or name in installable_packages(repo_dir):
+        return True
+    root = Path(checkout_root(repo_dir)).resolve()
+    directory = Path(reader_path).resolve().parent
+    while True:
+        if (directory / "node_modules" / name).exists():
+            return True
+        if directory == root or directory.parent == directory:
+            return False
+        directory = directory.parent
 
 
 def declared_packages(repo_dir: str, configs: list[Path] | None = None) -> frozenset[str]:
@@ -497,7 +701,7 @@ def _reach(path: str, file: ts_scope.File, wrapper: wi.Wrapper, repo_dir: str, p
         spec = cross_file_ts._string_value(node)
         if spec is None:
             return _UNKNOWN
-        target = cross_file_ts.resolve_specifier(path, spec, repo_dir)
+        target = ts_scope.resolve(path, spec, repo_dir)
         if target is None:
             return _OTHER if _is_package(spec, packages) else _UNKNOWN
         return _WRAPPER if str(Path(target).resolve()) == module else _OTHER
@@ -600,7 +804,7 @@ def _alias_may_stub(spec: str, config: Path, wrapper: wi.Wrapper, repo_dir: str)
     last = re.split(r"[/\\]", spec)[-1]
     if re.sub(r"[\^$()*+?\[\]{}|]", "", last.split(".")[0]) == stem:
         return True
-    target = cross_file_ts.resolve_specifier(str(config), spec, repo_dir)
+    target = ts_scope.resolve(str(config), spec, repo_dir)
     return target is not None and str(Path(target).resolve()) == str(module.resolve())
 
 
@@ -669,6 +873,89 @@ def runner_config_doubles(repo_dir: str, wrapper: wi.Wrapper, configs: list[Path
     return found
 
 
+# --- The wrapper's module handed on ------------------------------------------------
+
+
+def _barrels(path: str, text: str, modules: set[str], repo_dir: str) -> list[tuple[int, int]]:
+    """The byte span of each ``export * from`` one of ``modules`` in a file:
+    a barrel, which re-exports the wrapper but never hands on a module object
+    itself. ``export * as ns``, ``export type *`` and a file that does not
+    parse are left to the escape scan."""
+    root = ts_scope.parse(text, path)
+    if root.has_error:
+        return []
+    found = []
+    for node in root.named_children:
+        if node.type != "export_statement" or not any(c.type == "*" for c in node.children):
+            continue
+        if any(c.type in ("namespace_export", "type") for c in node.children):
+            continue
+        spec = cross_file_ts._string_value(node.child_by_field_name("source"))
+        target = None if spec is None else cross_file_ts.resolve_specifier(path, spec, repo_dir)
+        if target is not None and str(Path(target).resolve()) in modules:
+            found.append((node.start_byte, node.end_byte))
+    return found
+
+
+def _blanked(text: str, spans: list[tuple[int, int]]) -> str:
+    """``text`` with each byte span turned to spaces, every line kept."""
+    raw = text.encode("utf-8")
+    for start, end in spans:
+        raw = raw[:start] + re.sub(rb"[^\n]", b" ", raw[start:end]) + raw[end:]
+    return raw.decode("utf-8")
+
+
+def module_escapes(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, str]]:
+    """``(path, line, text)`` of each use that hands the wrapper's module on as
+    an object (:func:`cross_file_ts.module_escapes`): ``table[gate](u)`` after
+    ``const table = flags as any`` calls the wrapper by a name no scan sees.
+
+    A barrel's ``export * from`` the module is followed rather than refused:
+    the barrel joins the modules judged, so a namespace of it handed on
+    escapes in turn. A file that cannot be read escapes at its first line."""
+    from flag_cleanup import source_index
+
+    module = str(Path(wrapper.path).resolve())
+    modules: set[str] = set()
+    frontier = {module}
+    texts: dict[str, str | None] = {}
+    followed: dict[str, list[tuple[int, int]]] = {}
+    kinds = (*ts_scope.FAMILY_EXTENSIONS, *source_index.COMPONENT_SUFFIXES)
+    while frontier:
+        modules |= frontier
+        found: set[str] = set()
+        for path in cross_file_keys.mention_files(
+            repo_dir,
+            (),
+            exclude=(),
+            also=cross_file_ts.module_pattern(frontier, repo_dir),
+            extra_suffixes=source_index.COMPONENT_SUFFIXES,
+        ):
+            if not path.endswith(kinds):
+                continue
+            if path not in texts:
+                texts[path] = _read(path)
+            text = texts[path]
+            if text is None or not path.endswith(ts_scope.FAMILY_EXTENSIONS):
+                continue
+            spans = _barrels(path, text, frontier, repo_dir)
+            if spans:
+                followed.setdefault(path, []).extend(spans)
+                found.add(str(Path(path).resolve()))
+        frontier = found - modules
+    pattern = cross_file_ts.module_pattern(modules, repo_dir)
+    escapes: list[tuple[str, int, str]] = []
+    for path, text in sorted(texts.items()):
+        if text is None:
+            escapes.append((path, 1, ""))
+            continue
+        lines = text.split("\n")
+        judged = _blanked(text, followed.get(path, []))
+        for refusal in cross_file_ts.module_escapes(path, judged, modules, repo_dir, pattern):
+            escapes.append((path, refusal.line, lines[refusal.line - 1].strip()))
+    return sorted(set(escapes))
+
+
 def _stubs(path: str, text: str) -> bool:
     """Whether a file may stub: a test by name or content, a support file, or
     any file that calls a mocking library."""
@@ -705,6 +992,15 @@ class Index:
     unparsed: list[str] = field(default_factory=list)
     #: Unused: TS has no second spelling of a name.
     synthetic: list[tuple[str, int, str]] = field(default_factory=list)
+    #: ``(path, line, text)`` of each use handing a function wrapper's module
+    #: on as an object (:func:`module_escapes`), which may call it unseen.
+    escapes: list[tuple[str, int, str]] = field(default_factory=list)
+    #: The JavaScript wrapper's own declaration file, resolved, when it has
+    #: one: its declarations of the wrapper describe it rather than compete.
+    declaration_file: str | None = None
+    #: ``(path, line, text)`` of each use of an object-literal owner other
+    #: than as a member's receiver (:func:`owner_escapes`).
+    owner_escapes: list[tuple[str, int, str]] = field(default_factory=list)
     #: Parsed files, shared by every proof of this wrapper.
     files: ts_scope.Files | None = None
     _packages: frozenset[str] | None = None
@@ -722,10 +1018,15 @@ class Index:
         return self._packages
 
     @classmethod
-    def build(cls, repo_dir: str, wrapper: wi.Wrapper) -> Index:
+    def build(cls, repo_dir: str, wrapper: wi.Wrapper, settled: Mapping[str, Settled] | None = None) -> Index:
+        """``settled``: the class mocks a test-double round settled
+        (:func:`settled_mocks`), passed over when this indexes the result."""
         from flag_cleanup.piranha_runner import checkout_root
 
         index = cls(repo_dir=repo_dir, files=ts_scope.Files(checkout_root(repo_dir)))
+        declarations = cross_file_ts.declaration_file(wrapper.path)
+        if declarations is not None and Path(declarations).is_file():
+            index.declaration_file = ts_scope._resolved(declarations)
         word = _word(wrapper.name)
         # As wide as the scan's own: a file found only by ``also`` is not a mention.
         mentions = cross_file_keys.mention_pattern([wrapper.name])
@@ -738,6 +1039,11 @@ class Index:
         patterns = [p for p in (_MODULE_MOCK, _OBJECT_STUB, class_stub, auto_mocker) if p is not None]
         also = re.compile("|".join(f"(?:{p.pattern})" for p in patterns))
         index.test_doubles += runner_config_doubles(repo_dir, wrapper, index.configs())
+        if wrapper.kind == "function":
+            # A method is reached through an instance, never off the module.
+            index.escapes = module_escapes(repo_dir, wrapper)
+        if wrapper.kind == "method" and wrapper.static:
+            index.owner_escapes = owner_escapes(repo_dir, wrapper, index.files)
         for path in cross_file_keys.mention_files(
             repo_dir,
             [wrapper.name],
@@ -754,7 +1060,7 @@ class Index:
                 if _MODULE_MOCK.search(text):
                     index._add_module_mocks(path, text, wrapper)
                 if class_stub is not None and class_stub.search(text):
-                    index._add_class_stubs(path, text, wrapper)
+                    index._add_class_stubs(path, text, wrapper, (settled or {}).get(str(Path(path).resolve())))
                 if _OBJECT_STUB.search(text):
                     index._add_calls(path, _object_stubs(index.files.file(path, text), index._reach(path, text, wrapper)))
                 if auto_mocker is not None and auto_mocker.search(text):
@@ -767,16 +1073,17 @@ class Index:
         return index
 
     def _add_module_mocks(self, path: str, text: str, wrapper: wi.Wrapper) -> None:
-        """A ``jest.mock("./flags")`` replaces the wrapper with an automock (or a
-        factory's value) in every test of that file, without spelling its name."""
+        """A ``jest.mock(...)`` can replace the wrapper in every test of a file
+        without spelling its name: :func:`_mocks_module` says which do."""
         file = self.files.file(path, text)
-        for call in _mocks_module(file.root, path, self.repo_dir, wrapper.path, self.packages):
-            self.test_doubles.append((path, wi.line_of(call), wi.text_of(call)))
+        self._add_calls(path, _mocks_module(file.root, path, self.repo_dir, wrapper, self.packages))
 
-    def _add_class_stubs(self, path: str, text: str, wrapper: wi.Wrapper) -> None:
+    def _add_class_stubs(self, path: str, text: str, wrapper: wi.Wrapper, settled: Settled | None = None) -> None:
         """A ``createStubInstance(Flags)``-like call stubs every method of the
-        class, the wrapper among them, without spelling its name."""
-        self._add_calls(path, _class_stubs(self.files.file(path, text), wrapper, self._reach(path, text, wrapper)))
+        class, the wrapper among them, without spelling its name. One a
+        round settled, whose stub it deleted, is not counted."""
+        calls = _class_stubs(self.files.file(path, text), wrapper, self._reach(path, text, wrapper))
+        self._add_calls(path, [c for c in calls if settled is None or not _still_settled(c, text, settled)])
 
     def _reach(self, path: str, text: str, wrapper: wi.Wrapper) -> _Reach:
         return _reach(path, self.files.file(path, text), wrapper, self.repo_dir, self.packages)
@@ -795,13 +1102,16 @@ class Index:
             logger.info("cannot parse the declarations of %s, so no keyless wrapper qualifies", path)
             self.unreadable = True
         test = _stubs(path, text)
+        described = self.declaration_file is not None and _same_file(path, self.declaration_file)
         for node in cross_file_keys.walk(file.root):
-            kind = _declares(node, name, file, wrapper)
+            if described and describes(node, wrapper):
+                continue
+            kind = None if test and _test_title(node) else _declares(node, name, file, wrapper)
             if kind == "interface":
                 self.interface_members.append((path, node.start_byte))
             elif kind == "member":
                 self.declarations.append((path, node.start_byte))
-            if test and _stub_mention(node, name, word, wrapper.kind, file):
+            if test and (_stub_mention(node, name, word, wrapper.kind, file) or _mockito_call(node, name)):
                 self.test_doubles.append((path, wi.line_of(node), wi.text_of(node.parent or node)))
 
 
@@ -830,6 +1140,51 @@ _FUNCTION_LIKE = frozenset(
         "class_static_block",
     }
 )
+
+
+#: What wraps a top-level declaration in a declaration file:
+#: ``export declare function f(): boolean;``.
+_DECLARATION_WRAPPERS = ("export_statement", "ambient_declaration")
+
+
+def _declared_at_top(node: Node) -> bool:
+    parent = node.parent
+    while parent is not None and parent.type in _DECLARATION_WRAPPERS:
+        parent = parent.parent
+    return parent is not None and parent.type == "program"
+
+
+def describes(node: Node, wrapper: wi.Wrapper) -> bool:
+    """Whether a declaration in the wrapper's own declaration file is the
+    wrapper's: a top-level ``function f(...): boolean;`` or ``const f: ...``
+    for a function; for a member, a member of the name in the top-level
+    ``class Owner { ... }`` or in the type ``const owner: { ... }`` is written
+    with. Its name only names the wrapper, and the file is never rewritten."""
+    declared = _member_name(node)
+    if declared is None or not _is_name(declared, wrapper.name):
+        return False
+    if wrapper.kind == "function":
+        if node.type == "function_signature":
+            return _declared_at_top(node)
+        return node.type == "variable_declarator" and node.parent is not None and _declared_at_top(node.parent)
+    if node.type not in ("method_signature", "property_signature", "public_field_definition"):
+        return False
+    holder = node.parent
+    owner = None if holder is None else holder.parent
+    if holder is not None and holder.type == "class_body":
+        name = None if owner is None or owner.type != "class_declaration" else owner.child_by_field_name("name")
+        return name is not None and _is_name(name, wrapper.owner) and _declared_at_top(owner)
+    if holder is None or holder.type != "object_type" or owner is None or owner.type != "type_annotation":
+        return False
+    declarator = owner.parent
+    name = None if declarator is None or declarator.type != "variable_declarator" else declarator.child_by_field_name("name")
+    return (
+        name is not None
+        and _is_name(name, wrapper.owner)
+        and declarator.child_by_field_name("type") == owner
+        and declarator.parent is not None
+        and _declared_at_top(declarator.parent)
+    )
 
 
 def _local(node: Node) -> bool:
@@ -924,12 +1279,68 @@ def _callee(node: Node) -> bool:
     return parent is not None and parent.type == "call_expression" and parent.child_by_field_name("function") == node
 
 
+#: The calls whose first argument is a test's title, with the focused and
+#: skipped aliases Jest and Jasmine give them.
+_TITLED = frozenset({"describe", "it", "test", "fit", "xit", "xtest", "fdescribe", "xdescribe"})
+#: Their members that take a title the same way: ``it.only("...")``.
+_TITLED_MODIFIERS = frozenset({"only", "skip", "concurrent", "todo", "failing"})
+
+
+def _takes_title(callee: Node) -> bool:
+    """Whether a call through ``callee`` takes a test's title first: ``it``,
+    ``it.only``, or the call ``it.each(table)`` returns."""
+    if callee.type == "identifier":
+        return _text(callee) in _TITLED
+    if callee.type == "member_expression":
+        target = callee.child_by_field_name("object")
+        member = callee.child_by_field_name("property")
+        return (
+            target is not None and target.type == "identifier" and _text(target) in _TITLED
+            and member is not None and _text(member) in _TITLED_MODIFIERS
+        )
+    if callee.type == "call_expression":
+        each = callee.child_by_field_name("function")
+        if each is None or each.type != "member_expression":
+            return False
+        target = each.child_by_field_name("object")
+        member = each.child_by_field_name("property")
+        return (
+            member is not None and _text(member) == "each"
+            and target is not None and target.type != "call_expression" and _takes_title(target)
+        )
+    return False
+
+
+def _test_title(node: Node) -> bool:
+    """Whether a string, or a fragment of one, is a test's title: the literal
+    first argument of :func:`_takes_title`'s calls, handed a callback second
+    (:func:`flag_cleanup.ts_tests.hands_callback`). The runner consumes a
+    title, so it is never a reflective use of a name: no rule that reads
+    strings counts one, in a file that may stub (:func:`_stubs`). Without the
+    callback the call may be a function of the codebase's own that happens
+    to share the runner's name, handed the name to look up, so the string
+    still counts. A template's substitutions are nodes of their own, judged
+    as any other mention."""
+    literal = node.parent if node.type in _STRINGS else node
+    if literal is None or literal.type not in ("string", "template_string"):
+        return False
+    arguments = literal.parent
+    if arguments is None or arguments.type != "arguments":
+        return False
+    if not ts_tests.hands_callback(arguments) or arguments.named_children[0].id != literal.id:
+        return False
+    call = arguments.parent
+    callee = None if call is None or call.type != "call_expression" else call.child_by_field_name("function")
+    return callee is not None and _takes_title(callee)
+
+
 def _stub_mention(
     node: Node, name: str, word: re.Pattern[str], kind: str = "function", file: ts_scope.File | None = None
 ) -> bool:
-    """A test file's mention of the name that is not a call and not an import."""
+    """A test file's mention of the name that is not a call, not an import and
+    not a test's title."""
     if node.type in _STRINGS:
-        return bool(word.search(_text(node)))
+        return bool(word.search(_text(node))) and not _test_title(node)
     if node.type not in MENTION_TYPES or not _is_name(node, name) or names_only(node, kind):
         return False
     if file is not None and _binds_import(node, file, kind):
@@ -958,6 +1369,10 @@ def _known_type(name_node: Node, file: ts_scope.File, files: ts_scope.Files) -> 
 
 def _supertypes_known(wrapper: wi.Wrapper, files: ts_scope.Files) -> bool:
     file = files.file(wrapper.path)
+    if file is not None and ts_scope.holds_object_literal(ts_scope.top_value(file.root, wrapper.owner)):
+        # An object literal extends nothing but ``Object``, which has no
+        # member of a wrapper's name; a spread in it refused discovery.
+        return True
     classes = [] if file is None else ts_scope.top_declarations(file.root, ("class_declaration",), wrapper.owner)
     if len(classes) != 1:
         return False
@@ -978,6 +1393,121 @@ def _supertypes_known(wrapper: wi.Wrapper, files: ts_scope.Files) -> bool:
     return True
 
 
+#: Where a reference to an object-literal owner only names it.
+_NAMING_PARENTS = frozenset(
+    {"import_specifier", "namespace_import", "import_clause", "shorthand_property_identifier_pattern", "type_query"}
+)
+#: A re-export of another module, which hands its objects to importers unseen.
+_REEXPORT = re.compile(r"(?<![\w$])export\s*(\*|\{[^}]*\}\s*from\b)")
+
+
+def _owner_literal(wrapper: wi.Wrapper, files: ts_scope.Files) -> Node | None:
+    file = files.file(wrapper.path)
+    declarator = None if file is None else ts_scope.top_value(file.root, wrapper.owner)
+    return declarator.child_by_field_name("value") if ts_scope.holds_object_literal(declarator) else None
+
+
+def _receiver_only(node: Node) -> bool:
+    """Whether a reference to the object is the object of a ``.name`` access:
+    reading, calling or assigning a member never hands the object itself on."""
+    parent = node.parent
+    if parent is not None and parent.type == "non_null_expression":
+        node, parent = parent, parent.parent
+    return (
+        parent is not None
+        and parent.type == "member_expression"
+        and parent.child_by_field_name("object") == node
+        and (prop := parent.child_by_field_name("property")) is not None
+        and prop.type == "property_identifier"
+    )
+
+
+def owner_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -> list[tuple[str, int, str]]:
+    """Each use of a member's object-literal owner other than as a receiver.
+
+    A class's methods sit on its prototype, out of sight of ``Object.keys``.
+    An object literal's members are its own enumerable keys, so code that
+    takes the object whole (``Object.keys(flags)``, ``{ ...flags }``,
+    ``for (k in flags)``, ``flags[k]``, passing or storing it, a re-export
+    under another name) sees the deleted member go, and one that merges into
+    it (``Object.assign(flags, o)``) may replace the member without spelling
+    its name. Every reference must therefore be ``flags.<name>``: the
+    declaration's own name, an import of it from the wrapper's module (or
+    ``ns.flags`` off a namespace import), a ``require`` of it, a type query,
+    or ``this`` inside the literal. A re-export of the module, the module
+    object itself handed on (:func:`module_escapes`), a component or template
+    naming the object, and a file that cannot be parsed refuse. Another
+    binding of the name in another file is another object."""
+    from flag_cleanup import source_index
+
+    literal = _owner_literal(wrapper, files)
+    if literal is None:
+        return []
+    owner = wrapper.owner
+    found: list[tuple[str, int, str]] = []
+    for node in cross_file_keys.walk(literal):
+        if node.type == "this" and not _receiver_only(node):
+            found.append((wrapper.path, wi.line_of(node), wi.text_of(node.parent or node)))
+    word = _word(owner)
+    for path in cross_file_keys.mention_files(
+        repo_dir, [owner], exclude=(), also=_REEXPORT, extra_suffixes=source_index.COMPONENT_SUFFIXES
+    ):
+        text = _read(path)
+        if text is None:
+            found.append((path, 1, ""))
+            continue
+        if not path.endswith(ts_scope.FAMILY_EXTENSIONS):
+            if word.search(text):
+                found.append((path, 1, owner))
+            continue
+        file = files.file(path, text)
+        if file is None or file.root.has_error:
+            found.append((path, 1, ""))
+            continue
+        home = _same_file(path, wrapper.path)
+        locals_ = {owner} if home else {
+            i.local for i in file.imports if i.imported == owner and i.module == wrapper.path
+        }
+        namespaces = set() if home else {
+            i.local for i in file.imports if i.imported is None and i.module == wrapper.path
+        }
+        for node in cross_file_keys.walk(file.root):
+            if node.type == "export_statement" and node.child_by_field_name("source") is not None:
+                target = ts_scope.resolve(path, cross_file_ts._string_value(node.child_by_field_name("source")) or "", repo_dir)
+                if target is None or _same_file(target, wrapper.path):
+                    if target is not None or word.search(_text(node)):
+                        found.append((path, wi.line_of(node), wi.text_of(node)))
+                continue
+            if node.type == "shorthand_property_identifier" and _text(node) in locals_:
+                found.append((path, wi.line_of(node), wi.text_of(node.parent or node)))  # `{ flags }` stores it
+                continue
+            if node.type == "identifier" and _text(node) in locals_:
+                reference = node
+            elif (
+                node.type == "member_expression"
+                and (obj := node.child_by_field_name("object")) is not None
+                and obj.type == "identifier"
+                and _text(obj) in namespaces
+                and (prop := node.child_by_field_name("property")) is not None
+                and _is_name(prop, owner)
+            ):
+                reference = node
+            elif node.type == "identifier" and _text(node) == owner and file.binding(owner) is None:
+                reference = node  # unbound here: judged as if it were the object
+            else:
+                continue
+            parent = reference.parent
+            if parent is not None and (parent.type in _NAMING_PARENTS or _member_name(parent) == reference):
+                continue  # an import, a type query, or the declaration's own name
+            if parent is not None and parent.type == "export_specifier" and home:
+                alias = parent.child_by_field_name("alias")
+                if alias is None or _is_name(alias, owner):
+                    continue  # `export { flags }`: the object under its own name
+            if not _receiver_only(reference):
+                found.append((path, wi.line_of(reference), wi.text_of(reference.parent or reference)))
+    return found + module_escapes(repo_dir, wrapper)
+
+
 def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str | None]:
     """The wrapper, or why it does not qualify.
 
@@ -994,7 +1524,503 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
         return None, wi.NAME_NOT_UNIQUE
     if wrapper.kind == "method" and not _supertypes_known(wrapper, index.files):
         return None, wi.OVERRIDABLE
+    if index.owner_escapes:
+        for path, line, text in index.owner_escapes:
+            logger.info("%s:%d hands on the object %s, so its member %s is kept: %s", path, line, wrapper.owner, wrapper.name, text)
+        return None, wi.OVERRIDABLE
     return wrapper, None
+
+
+# --- Stub targets -----------------------------------------------------------------
+
+#: Calls that stub a member by its name: ``jest.spyOn(target, "m")``.
+_SPIES = frozenset({"jest.spyOn", "vi.spyOn", "sinon.stub"})
+#: ``vi.mocked(x)``: ``x`` itself, typed as its mock.
+_MOCKED = frozenset({"vi.mocked", "jest.mocked"})
+#: ts-mockito's calls that take a call of the mock and describe it.
+_MOCKITO = frozenset({"when", "verify"})
+#: The packages whose ``mock`` makes an instance of the class it is given.
+_MOCK_LIBRARIES = frozenset({"jest-mock-extended", "vitest-mock-extended", "ts-mockito", "@typestrong/ts-mockito"})
+_RETURNS = frozenset({"mockReturnValue", "mockReturnValueOnce"})
+
+
+def _same_file(a: str, b: str) -> bool:
+    return ts_scope._resolved(a) == ts_scope._resolved(b)
+
+
+def _collapsed(node: Node) -> str:
+    return "".join(_text(node).split())
+
+
+def _module_mock_calls(root: Node) -> list[Node]:
+    """Every ``jest.mock(...)``-like call in a file."""
+    return [
+        n for n in cross_file_keys.walk(root)
+        if n.type == "call_expression" and mock_stubs.ts_callee(n) in mock_stubs.TS_MODULE_MOCKS
+    ]
+
+
+_SOURCE_EXTENSION = re.compile(r"\.(?:[cm]?[jt]s|[jt]sx)$")
+
+
+def _names_wrapper_file(specifier: str, wrapper_path: str) -> bool:
+    """Whether an unresolved specifier ends in the wrapper file's name. The
+    resolver cannot read every alias (a Jest ``moduleNameMapper``, a
+    ``baseUrl``), so ``@/flags`` may still be the wrapper's own module."""
+    last = _SOURCE_EXTENSION.sub("", specifier.rstrip("/").rsplit("/", 1)[-1])
+    path = Path(wrapper_path)
+    stem = _SOURCE_EXTENSION.sub("", path.name)
+    return last == stem or (stem == "index" and last == path.parent.name)
+
+
+def _factory_hides(call: Node, name: str | None) -> bool:
+    """Whether a module mock may hand its importers something else for the
+    wrapper. An automock does, and so does a factory this cannot read, or one
+    spreading anything but the real module. With ``name`` (a function
+    wrapper's own module), only an entry of that name, or one whose key cannot
+    be read, replaces it; without (a module holding a method's receiver), any
+    entry may."""
+    found = mock_stubs.ts_factory_object(call)
+    if found is None:
+        return True
+    specifier = mock_stubs.ts_module_specifier(next(iter(mock_stubs.ts_arguments(call)), None))
+    for entry in [c for c in found.named_children if c.type != "comment"]:
+        if mock_stubs.ts_actual_spread(entry, specifier):
+            continue
+        if entry.type == "spread_element" or name is None or mock_stubs.ts_entry_name(entry) in (None, name):
+            return True
+    return False
+
+
+def _mockito_call(node: Node, name: str) -> bool:
+    """``x.name(...)`` handed to ts-mockito's ``when`` or ``verify``: the call
+    describes a stub rather than making one."""
+    if node.type not in MENTION_TYPES or not _is_name(node, name) or not _callee(node):
+        return False
+    callee = node.parent if node.parent is not None and node.parent.type == "member_expression" else node
+    call = callee.parent
+    holder = None if call is None else call.parent
+    outer = None if holder is None or holder.type != "arguments" else holder.parent
+    function = outer.child_by_field_name("function") if outer is not None and outer.type == "call_expression" else None
+    return function is not None and function.type == "identifier" and _text(function) in _MOCKITO
+
+
+def _stub_receivers(root: Node, name: str) -> list[Node]:
+    """The receiver of every stub-shaped mention of ``name``: a spy's first
+    argument, the object of ``x.name.mockReturnValue(...)``, and the mock in
+    ts-mockito's ``when(x.name(...))``/``verify(x.name(...))``."""
+    found: list[Node] = []
+    for node in cross_file_keys.walk(root):
+        if node.type != "call_expression":
+            continue
+        callee = mock_stubs.ts_callee(node)
+        args = mock_stubs.ts_arguments(node)
+        if callee in _SPIES and len(args) == 2 and cross_file_ts._string_value(args[1]) == name:
+            found.append(args[0])
+            continue
+        if callee in _MOCKITO and len(args) == 1 and args[0].type == "call_expression":
+            inner = args[0].child_by_field_name("function")
+            prop = inner.child_by_field_name("property") if inner is not None and inner.type == "member_expression" else None
+            if prop is not None and _is_name(prop, name):
+                found.append(inner.child_by_field_name("object"))
+            continue
+        function = node.child_by_field_name("function")
+        if function is None or function.type != "member_expression":
+            continue
+        returns = function.child_by_field_name("property")
+        stubbed = function.child_by_field_name("object")
+        if returns is None or _text(returns) not in _RETURNS or stubbed is None or stubbed.type != "member_expression":
+            continue
+        prop = stubbed.child_by_field_name("property")
+        if prop is not None and _is_name(prop, name):
+            found.append(stubbed.child_by_field_name("object"))
+    return [n for n in found if n is not None]
+
+
+def _mock_of(node: Node, file: ts_scope.File, files: ts_scope.Files) -> ts_scope.TypeRef | None:
+    """The class ``const m = mock<C>()`` (jest-mock-extended) or ``const m =
+    mock(C)`` (ts-mockito) makes a mock of, when ``mock`` is imported from one
+    of those libraries."""
+    bound = file.binding(_text(node))
+    declarator = None if bound is None else bound.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("name") != bound:
+        return None
+    value = declarator.child_by_field_name("value")
+    function = value.child_by_field_name("function") if value is not None and value.type == "call_expression" else None
+    if function is None or function.type != "identifier":
+        return None
+    imported = file.import_of(_text(function))
+    if imported is None or imported.imported != "mock" or imported.specifier not in _MOCK_LIBRARIES:
+        return None
+    args = mock_stubs.ts_arguments(value)
+    type_arguments = value.child_by_field_name("type_arguments")
+    if type_arguments is not None:
+        written = [c for c in type_arguments.named_children if c.type != "comment"]
+        named = written[0] if len(written) == 1 and written[0].type == "type_identifier" and not args else None
+    else:
+        named = args[0] if len(args) == 1 and args[0].type == "identifier" else None
+    return None if named is None else files.class_named(_text(named), file)
+
+
+def _declaration_of(wrapper: wi.Wrapper, files: ts_scope.Files) -> Node | None:
+    file = files.file(wrapper.path)
+    if file is None:
+        return None
+    return next(
+        (n for n in cross_file_keys.walk(file.root) if (n.start_byte, n.end_byte) == (wrapper.start, wrapper.end)),
+        None,
+    )
+
+
+def _is_field(wrapper: wi.Wrapper, files: ts_scope.Files) -> bool:
+    declaration = _declaration_of(wrapper, files)
+    return declaration is not None and declaration.type == "public_field_definition"
+
+
+def _proven_receiver(node: Node, wrapper: wi.Wrapper, file: ts_scope.File, files: ts_scope.Files) -> bool:
+    """Whether a stub's receiver is one the call-site proof accepts: a namespace
+    import of a function wrapper's module; for a method, an instance of its
+    class (written type, ``new``, the exported instance), ``C.prototype``, the
+    class itself for a static method, or a library mock of the class; and
+    ``vi.mocked(...)`` of any of those."""
+    if node.type == "call_expression":
+        args = mock_stubs.ts_arguments(node)
+        return mock_stubs.ts_callee(node) in _MOCKED and len(args) == 1 and _proven_receiver(args[0], wrapper, file, files)
+    if wrapper.kind == "function":
+        module = files._namespace(node, file)
+        return (
+            module is not None
+            and _same_file(module.path, wrapper.path)
+            and _function_reason(wrapper.name, node, wrapper, file, files) is None
+        )
+    prop = node.child_by_field_name("property") if node.type == "member_expression" else None
+    if prop is not None and node.child_by_field_name("optional_chain") is None and _text(prop) == "prototype":
+        owner = node.child_by_field_name("object")
+        # A field is an own property of each instance, never on the prototype.
+        return (
+            not wrapper.static
+            and not _is_field(wrapper, files)
+            and owner is not None
+            and files.static_type(owner, file) == ts_scope.TypeRef(wrapper.path, wrapper.owner, True)
+        )
+    if files.static_type(node, file) == ts_scope.TypeRef(wrapper.path, wrapper.owner, wrapper.static):
+        return True
+    return (
+        not wrapper.static
+        and node.type == "identifier"
+        and _mock_of(node, file, files) == ts_scope.TypeRef(wrapper.path, wrapper.owner)
+    )
+
+
+def stub_targets(wrapper: wi.Wrapper, index: Index) -> dict[str, mock_stubs.StubTargets]:
+    """resolved path -> where a stub of ``wrapper`` may sit in that file, for the
+    test-double pass. Only files that may stub (:func:`_stubs`) are looked at,
+    and only receivers the call-site proof would accept are kept. Module-mock
+    specifiers are kept for a function wrapper's own module: a method is never
+    a module's export."""
+    files = index.files if index.files is not None else ts_scope.Files(index.repo_dir)
+    found: dict[str, mock_stubs.StubTargets] = {}
+    for path in index.parsed:
+        text = _read(path)
+        if text is None or not _stubs(path, text):
+            continue
+        file = files.file(path, text)
+        if file is None:
+            continue
+        receivers = frozenset(
+            _collapsed(node)
+            for node in _stub_receivers(file.root, wrapper.name)
+            if _proven_receiver(node, wrapper, file, files)
+        )
+        modules: set[str] = set()
+        if wrapper.kind == "function" and _home_reason(wrapper, files) is None:
+            for call in _module_mock_calls(file.root):
+                specifier = mock_stubs.ts_module_specifier(next(iter(mock_stubs.ts_arguments(call)), None))
+                target = None if specifier is None else ts_scope.resolve(path, specifier, index.repo_dir)
+                if target is not None and _same_file(target, wrapper.path):
+                    modules.add(specifier)
+        if receivers or modules:
+            found[file.path] = mock_stubs.StubTargets(receivers, frozenset(modules))
+    return found
+
+
+# --- Class mocks a round settles --------------------------------------------------
+
+#: jest-mock-extended's spelling of a stub, and ts-mockito's.
+_MOCK_EXTENDED = frozenset({"jest-mock-extended", "vitest-mock-extended"})
+_TS_MOCKITO = frozenset({"ts-mockito", "@typestrong/ts-mockito"})
+#: Hooks whose callback runs before each test, after a runner's own resets.
+_EACH_HOOKS = frozenset({"beforeEach"})
+#: Calls that wipe every mock's stubs at once.
+_RESETS_ALL = re.compile(r"(?<![\w$])(?:resetAllMocks|restoreAllMocks)(?![\w$])")
+#: Declarations that run wherever their scope starts, before any statement.
+_HOISTED = frozenset({"function_declaration", "generator_function_declaration"})
+#: Nodes that hand on the value they wrap.
+_TRANSPARENT = frozenset({"parenthesized_expression", "as_expression", "satisfies_expression", "non_null_expression"})
+
+
+@dataclass(frozen=True)
+class Settled:
+    """The class mocks of one file a test-double round may settle: each is
+    stubbed to the kept value before anything else uses it.
+
+    ``text`` is the file before the round, ``calls`` the ``(row, column)``
+    of each such ``mock<C>()``/``mock(C)`` call in it. The round only
+    deletes lines, so :func:`_still_settled` finds them again after it."""
+
+    text: str
+    calls: frozenset[tuple[int, int]]
+
+
+def _unit_body(block: Node, data: bytes) -> bool:
+    """Whether ``block`` is the callback of a test or of ``beforeEach``. Those
+    run after a runner's ``resetMocks``; a stub made while the file is
+    collected (top level, ``describe``) is wiped before each test by it."""
+    function = block.parent
+    holder = None if function is None else function.parent
+    call = None if holder is None or holder.type != "arguments" else holder.parent
+    statement = None if call is None or call.type != "call_expression" else call.parent
+    if function is None or function.type not in ("arrow_function", "function_expression") or statement is None:
+        return False
+    if statement.type != "expression_statement" or statement.named_children[0] != call:
+        return False
+    return mock_stubs._ts_test(statement, data) is not None or _callee_name(call) in _EACH_HOOKS
+
+
+def _library_of(name: str, file: ts_scope.File) -> str | None:
+    imported = file.import_of(name)
+    return None if imported is None else imported.specifier
+
+
+def _required_parameters(wrapper: wi.Wrapper, files: ts_scope.Files) -> int | None:
+    """How many parameters the method takes, when every one is required:
+    ts-mockito answers a stub only for a call with as many arguments."""
+    text = _read(wrapper.path)
+    file = None if text is None else files.file(wrapper.path, text)
+    member = None if file is None else file.root.descendant_for_byte_range(wrapper.start, wrapper.end)
+    parameters = None if member is None else member.child_by_field_name("parameters")
+    if parameters is None:
+        return None
+    written = [c for c in parameters.named_children if c.type != "comment"]
+    for parameter in written:
+        pattern = parameter.child_by_field_name("pattern")
+        if (
+            parameter.type != "required_parameter"
+            or parameter.child_by_field_name("value") is not None
+            or pattern is None
+            or pattern.type != "identifier"
+        ):
+            return None
+    return len(written)
+
+
+def _kept_stub(
+    statement: Node, name: str, library: str, wrapper: wi.Wrapper, treatment: bool, file: ts_scope.File, arity: int | None
+) -> bool:
+    """``m.<wrapper>.mockReturnValue(<kept>)`` on a jest-mock-extended mock, or
+    ``when(m.<wrapper>(anything(), ...)).thenReturn(<kept>)`` on a ts-mockito
+    one: a stub every later call of the wrapper on ``m`` answers."""
+    call = statement.named_children[0] if statement.type == "expression_statement" and statement.named_children else None
+    function = call.child_by_field_name("function") if call is not None and call.type == "call_expression" else None
+    if function is None or function.type != "member_expression" or function.child_by_field_name("optional_chain"):
+        return False
+    args = mock_stubs.ts_arguments(call)
+    if len(args) != 1 or args[0].type != str(treatment).lower():
+        return False
+    method = _text(function.child_by_field_name("property"))
+    target = function.child_by_field_name("object")
+    if library in _MOCK_EXTENDED and method == "mockReturnValue":
+        return target is not None and _member_of(target, name, wrapper.name)
+    if library not in _TS_MOCKITO or method != "thenReturn" or target is None or target.type != "call_expression":
+        return False
+    when = target.child_by_field_name("function")
+    if when is None or when.type != "identifier" or _library_of(_text(when), file) not in _TS_MOCKITO:
+        return False
+    described = mock_stubs.ts_arguments(target)
+    if len(described) != 1 or described[0].type != "call_expression":
+        return False
+    matchers = mock_stubs.ts_arguments(described[0])
+    return (
+        _member_of(described[0].child_by_field_name("function"), name, wrapper.name)
+        and arity is not None
+        and len(matchers) == arity
+        and all(_any_matcher(m, file) for m in matchers)
+    )
+
+
+def _member_of(node: Node | None, name: str, member: str) -> bool:
+    """Whether ``node`` is ``name.member``, spelled plainly."""
+    if node is None or node.type != "member_expression" or node.child_by_field_name("optional_chain"):
+        return False
+    owner = node.child_by_field_name("object")
+    prop = node.child_by_field_name("property")
+    return (
+        owner is not None and owner.type == "identifier" and _text(owner) == name
+        and prop is not None and prop.type == "property_identifier" and _text(prop) == member
+    )
+
+
+def _any_matcher(node: Node, file: ts_scope.File) -> bool:
+    function = node.child_by_field_name("function") if node.type == "call_expression" else None
+    return (
+        function is not None and function.type == "identifier" and _text(function) == "anything"
+        and not mock_stubs.ts_arguments(node) and _library_of("anything", file) in _TS_MOCKITO
+    )
+
+
+def _accounted(use: Node, file: ts_scope.File, repo_dir: str) -> bool:
+    """Whether a use of the mock leaves its stubs as they are: one of its
+    members, ``instance(m)`` (ts-mockito), or an argument of ``new`` of a
+    class imported from a file that is not test code. Anything else hands the
+    mock to code that may reset it under another name (a helper, an array's
+    ``forEach(mockReset)``, an object read later), so it is not accounted. A
+    use inside a function declaration is not either: the declaration is
+    hoisted, and may run before the stub."""
+    if any(a.type in _HOISTED for a in _ancestors(use)):
+        return False
+    node = use
+    while node.parent is not None and node.parent.type in _TRANSPARENT:
+        node = node.parent
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "member_expression":
+        # A computed `m[k]` is a `subscript_expression`, and so not accounted.
+        return parent.child_by_field_name("object") == node and parent.child_by_field_name("optional_chain") is None
+    call = parent.parent if parent.type == "arguments" else None
+    if call is None:
+        return False
+    if call.type == "call_expression":
+        function = call.child_by_field_name("function")
+        return (
+            function is not None and function.type == "identifier" and _text(function) == "instance"
+            and _library_of("instance", file) in _TS_MOCKITO and len(mock_stubs.ts_arguments(call)) == 1
+        )
+    constructor = call.child_by_field_name("constructor") if call.type == "new_expression" else None
+    imported = None if constructor is None or constructor.type != "identifier" else file.import_of(_text(constructor))
+    target = None if imported is None else cross_file_ts.resolve_specifier(file.path, imported.specifier, repo_dir)
+    text = None if target is None else _read(target)
+    return text is not None and not _stubs(target, text)
+
+
+def _ancestors(node: Node) -> Iterable[Node]:
+    while node.parent is not None:
+        node = node.parent
+        yield node
+
+
+def _settles(
+    call: Node,
+    file: ts_scope.File,
+    files: ts_scope.Files,
+    wrapper: wi.Wrapper,
+    treatment: bool,
+    arity: int | None,
+    repo_dir: str,
+) -> bool:
+    """Whether a class-mock call makes a mock every use of which sees the
+    wrapper stubbed to the kept value: a ``const`` in a test or ``beforeEach``,
+    whose first use is such a stub, sitting directly in that callback, and
+    whose every other use is accounted for (:func:`_accounted`)."""
+    declarator = call.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("value") != call:
+        return False
+    bound = declarator.child_by_field_name("name")
+    declaration = declarator.parent
+    block = None if declaration is None else declaration.parent
+    if (
+        bound is None
+        or bound.type != "identifier"
+        or declaration.type != "lexical_declaration"
+        or _text(declaration.children[0]) != "const"
+        or block is None
+        or block.type != "statement_block"
+        or not _unit_body(block, file.root.text)
+        or _mock_of(bound, file, files) != ts_scope.TypeRef(wrapper.path, wrapper.owner)
+    ):
+        return False
+    function = call.child_by_field_name("function")
+    library = _library_of(_text(function), file) if function is not None and function.type == "identifier" else None
+    name = _text(bound)
+    stubs = [
+        s for s in block.named_children
+        if s.start_byte > declaration.start_byte and _kept_stub(s, name, library or "", wrapper, treatment, file, arity)
+    ]
+    # `File.binding` (through `_mock_of`) proved this the file's one binding
+    # of the name, so every identifier spelling it is a use of this mock.
+    uses = sorted(
+        (
+            n for n in cross_file_keys.walk(file.root)
+            if n.type in ("identifier", "shorthand_property_identifier") and _text(n) == name and n != bound
+        ),
+        key=lambda n: n.start_byte,
+    )
+
+    def in_stub(node: Node) -> bool:
+        return any(s.start_byte <= node.start_byte < s.end_byte for s in stubs)
+
+    return bool(stubs) and bool(uses) and in_stub(uses[0]) and all(in_stub(u) or _accounted(u, file, repo_dir) for u in uses)
+
+
+def settled_mocks(wrapper: wi.Wrapper, index: Index, treatment: bool) -> dict[str, Settled]:
+    """resolved path -> the class mocks of a method wrapper a test-double
+    round may settle there, judged before it runs.
+
+    An unstubbed class mock answers ``undefined``/``null`` for the wrapper, so
+    the index counts every one as a double, and goes on counting it once the
+    round has deleted its stub. A mock found here is stubbed to the kept value
+    before any use, and deleting that stub is what the round does, so after
+    the round the index passes it over (:class:`Index` with ``settled``). A
+    file whose runner resets every mock (``resetAllMocks``) settles none."""
+    if wrapper.kind != "method" or wrapper.static:
+        return {}
+    files = index.files if index.files is not None else ts_scope.Files(index.repo_dir)
+    arity = _required_parameters(wrapper, files)
+    found: dict[str, Settled] = {}
+    for path in sorted({p for p, _, _ in index.test_doubles}):
+        text = _read(path)
+        if text is None or not _stubs(path, text) or _RESETS_ALL.search(text):
+            continue
+        file = files.file(path, text)
+        if file is None:
+            continue
+        calls = frozenset(
+            (c.start_point[0], c.start_point[1])
+            for c in _class_stubs(file, wrapper, _reach(path, file, wrapper, index.repo_dir, index.packages))
+            if _settles(c, file, files, wrapper, treatment, arity, index.repo_dir)
+        )
+        if calls:
+            found[str(Path(path).resolve())] = Settled(text, calls)
+    return found
+
+
+def _still_settled(call: Node, text: str, settled: Settled) -> bool:
+    """Whether a class-mock call in ``text`` (the file after a round) is one
+    of ``settled.calls``. The round only deletes whole lines, so the file's
+    lines are a subsequence of the old ones. Every old line the call's line
+    could be, under any such match, must hold a settled call at its column:
+    a line the match cannot pin down is judged by every reading of it."""
+    old = settled.text.split("\n")
+    new = text.split("\n")
+    earliest: list[int] = []
+    i = 0
+    for line in new:
+        while i < len(old) and old[i] != line:
+            i += 1
+        if i == len(old):
+            return False  # not a deletion of whole lines
+        earliest.append(i)
+        i += 1
+    latest = [0] * len(new)
+    i = len(old) - 1
+    for j in range(len(new) - 1, -1, -1):
+        while old[i] != new[j]:
+            i -= 1
+        latest[j] = i
+        i -= 1
+    row, column = call.start_point
+    candidates = [k for k in range(earliest[row], latest[row] + 1) if old[k] == new[row]]
+    return all((k, column) in settled.calls for k in candidates)
 
 
 # --- Call sites -----------------------------------------------------------------
@@ -1021,21 +2047,37 @@ def names_only(node: Node, kind: str = "method") -> bool:
     if kind == "method" and node.type == "identifier":
         return not _in_with(node)
     parent = node.parent
-    if parent is None or parent.child_by_field_name("name") != node:
+    if parent is None or _member_name(parent) != node:
         return False
     if parent.type == "function_declaration":
         return ts_scope.top_level(parent)
-    if parent.type == "method_definition":
-        return parent.parent is not None and parent.parent.type == "class_body"
+    if parent.type in ("method_definition", "public_field_definition", "pair"):
+        return _top_member(parent)
     if parent.type == "variable_declarator":
         return parent.parent is not None and ts_scope.top_level(parent.parent)
     return False
 
 
+def _top_member(member: Node) -> bool:
+    """A member of a class body (a method or a field), or of the object
+    literal a top-level ``const`` holds (a method or a key)."""
+    holder = member.parent
+    if holder is None:
+        return False
+    if holder.type == "class_body":
+        return member.type != "pair"
+    return (
+        holder.type == "object"
+        and member.type != "public_field_definition"
+        and ts_scope.holds_object_literal(holder.parent)
+    )
+
+
 def members(root: Node, name: str) -> list[Node]:
     """Every declaration of ``name`` a close-out may delete: a top-level
-    function or single-declarator ``const`` (with its ``export``), or a
-    method of a top-level class."""
+    function or single-declarator ``const`` (with its ``export``), a method or
+    field of a top-level class, or a method or key of a top-level ``const``
+    object literal."""
     found: list[Node] = []
     for statement in root.named_children:
         node = statement.child_by_field_name("declaration") if statement.type == "export_statement" else statement
@@ -1050,13 +2092,40 @@ def members(root: Node, name: str) -> list[Node]:
             declared = declarators[0].child_by_field_name("name") if len(declarators) == 1 else None
             if declared is not None and _is_name(declared, name):
                 found.append(statement)
+            held = object_literal(node)
+            for member in [] if held is None else held[1].named_children:
+                declared = _member_name(member) if member.type in ("method_definition", "pair") else None
+                if declared is not None and declared.type == "property_identifier" and _is_name(declared, name):
+                    found.append(member)
         elif node.type == "class_declaration":
             body = node.child_by_field_name("body")
             for member in [] if body is None else body.named_children:
                 declared = member.child_by_field_name("name")
-                if member.type == "method_definition" and declared is not None and _is_name(declared, name):
+                if (
+                    member.type in ("method_definition", "public_field_definition")
+                    and declared is not None
+                    and _is_name(declared, name)
+                ):
                     found.append(member)
     return found
+
+
+def member_end(member: Node) -> int:
+    """Where deleting ``member`` ends: past the ``;`` after a class field, or
+    the ``,`` after an object literal's member, which the grammar keeps as the
+    member's next sibling rather than inside it, and past a comment before
+    that separator or after it on the same line. A separator left behind
+    would start the next member's line with ``,``."""
+    after = member.next_sibling
+    while after is not None and after.type == "comment":
+        after = after.next_sibling
+    if after is None or after.type not in (";", ","):
+        return member.end_byte
+    end = after.end_byte
+    trailing = after.next_sibling
+    if trailing is not None and trailing.type == "comment" and trailing.start_point[0] == after.end_point[0]:
+        end = trailing.end_byte
+    return end
 
 
 #: Argument nodes that do work inlining the call would drop.
@@ -1102,13 +2171,7 @@ def _default_does_work(wrapper: wi.Wrapper, files: ts_scope.Files) -> bool:
     it. "Inert" is the stranded-binding pass's whitelist."""
     from flag_cleanup.unused import _subtree_is_inert
 
-    file = files.file(wrapper.path)
-    if file is None:
-        return True
-    declaration = next(
-        (n for n in cross_file_keys.walk(file.root) if (n.start_byte, n.end_byte) == (wrapper.start, wrapper.end)),
-        None,
-    )
+    declaration = _declaration_of(wrapper, files)
     function = None if declaration is None else next(
         (n for n in cross_file_keys.walk(declaration) if n.type in _FUNCTION_LIKE), None
     )
@@ -1159,21 +2222,29 @@ def _import_reason(imported: ts_scope.Import | None, wrapper: wi.Wrapper, namesp
     return None
 
 
+def _home_reason(wrapper: wi.Wrapper, files: ts_scope.Files) -> str | None:
+    """Whether the wrapper's own file lets an importer reach the declaration."""
+    # The wrapper's own file must still bind the name once, as its declaration:
+    # an assignment there makes an importer's call reach something else.
+    home = files.file(wrapper.path)
+    declared = None if home is None else home.binding(wrapper.name)
+    if declared is None or not names_only(declared, "function"):
+        return wi.RECEIVER_UNPROVEN
+    # And export that declaration itself: an ``export *``, an ``export { f }
+    # from`` or a ``module.exports = ...`` there can hand importers of the
+    # name something else, whatever the file declares.
+    if not ts_scope._exports_directly(home.root, wrapper.name):
+        return wi.IMPORT_UNRESOLVED
+    return None
+
+
 def _function_reason(
     local: str, receiver: Node | None, wrapper: wi.Wrapper, file: ts_scope.File, files: ts_scope.Files
 ) -> str | None:
     if file.path != wrapper.path:
-        # The wrapper's own file must still bind the name once, as its declaration:
-        # an assignment there makes an importer's call reach something else.
-        home = files.file(wrapper.path)
-        declared = None if home is None else home.binding(wrapper.name)
-        if declared is None or not names_only(declared, "function"):
-            return wi.RECEIVER_UNPROVEN
-        # And export that declaration itself: an ``export *``, an ``export { f }
-        # from`` or a ``module.exports = ...`` there can hand importers of the
-        # name something else, whatever the file declares.
-        if not ts_scope._exports_directly(home.root, wrapper.name):
-            return wi.IMPORT_UNRESOLVED
+        home = _home_reason(wrapper, files)
+        if home is not None:
+            return home
     if receiver is None:
         if file.path == wrapper.path:
             bound = file.binding(local)
@@ -1247,6 +2318,7 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     file = files.file(path, source)
     if file is None:
         return [wi.Occurrence(path, 1, "", None, wi.RECEIVER_UNPROVEN)]
+    described = index.declaration_file is not None and _same_file(path, index.declaration_file)
     names = {wrapper.name}
     if wrapper.kind == "function":
         names |= {
@@ -1259,6 +2331,9 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         if node.type != "identifier" and _text(node) != wrapper.name:
             continue  # an alias is only ever an identifier
         parent = node.parent
+        if described and parent is not None and _member_name(parent) == node and describes(parent, wrapper):
+            found.append(wi.Occurrence(path, wi.line_of(node), wi.text_of(parent), None, wi.DECLARATION_FILE))
+            continue
         if parent is not None and parent.type == "import_specifier":
             continue
         if _binds_import(node, file, wrapper.kind):
@@ -1272,8 +2347,8 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
 # --- Registration -----------------------------------------------------------------
 
 
-def _index(repo_dir: str, wrapper: wi.Wrapper) -> Index:
-    return Index.build(repo_dir, wrapper)
+def _index(repo_dir: str, wrapper: wi.Wrapper, settled: Mapping[str, Settled] | None = None) -> Index:
+    return Index.build(repo_dir, wrapper, settled)
 
 
 def _parser(language: str) -> Callable[[str], Node]:
@@ -1303,8 +2378,12 @@ for _language, _extensions in _FAMILY:
             foreign_extensions=(),
             names_only=names_only,
             members=members,
+            member_end=member_end,
             mention_types=MENTION_TYPES,
             siblings=tuple(other for other, _ in _FAMILY if other != _language),
             inert_annotations=frozenset(),
+            stub_targets=stub_targets,
+            settled_mocks=settled_mocks,
+            test_title=lambda path, source, node: _stubs(path, source) and _test_title(node),
         )
     )

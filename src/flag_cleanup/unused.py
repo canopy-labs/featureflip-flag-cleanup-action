@@ -1751,6 +1751,8 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
         if node.type != declaration_type:
             if language == "go" and node.type == "var_declaration" and _has_ancestor(node, _FUNCTION_BODIES):
                 candidates += _go_var_candidates(node, source_bytes)
+            if language == "go" and node.type in _GO_HEADER_NAMES and _has_ancestor(node, _FUNCTION_BODIES):
+                candidates += _go_header_candidates(node, source_bytes)
             continue
         if not _has_ancestor(node, _FUNCTION_BODIES) and not (
             top_level_is_private
@@ -1883,6 +1885,91 @@ def _go_var_candidates(declaration: Node, data: bytes) -> list[Candidate]:
                 for name in names
             ]
     return found
+
+
+#: The Go statements whose HEADER declares variables, and the field holding
+#: the names: ``for v := range``, ``case v := <-ch:``, ``switch v := x.(type)``.
+_GO_HEADER_NAMES = {"range_clause": "left", "receive_statement": "left", "type_switch_statement": "alias"}
+
+
+def _go_header_candidates(holder: Node, data: bytes) -> list[Candidate]:
+    """One candidate per name a Go statement header declares with ``:=``.
+
+    Go rejects each unused exactly as it rejects an unused ``x := v``, but
+    none can be deleted or discarded the way that is: the statement stays,
+    and only its name goes (see :func:`_go_header_rewrite`). Every name of
+    one header spans the same node, the name list, so its own-span check
+    sees the other names and nothing else. ``for k, v = range`` assigns
+    and declares nothing, so it is not offered."""
+    names = holder.child_by_field_name(_GO_HEADER_NAMES[holder.type])
+    if names is None or names.type != "expression_list":
+        return []
+    if not any(child.type == ":=" for child in holder.children):
+        return []
+    if any(name.type != "identifier" for name in names.named_children):
+        return []
+    end = holder.end_byte
+    if holder.type == "type_switch_statement":
+        end = next((c.end_byte for c in holder.children if c.type == ")"), end)
+    text = data[names.start_byte : end].decode("utf-8", "replace")
+    return [
+        Candidate(
+            name=name.text.decode("utf-8", "replace"),
+            start=names.start_byte,
+            end=names.end_byte,
+            kind="variable",
+            text=text,
+            binder=(name.start_byte, name.end_byte),
+        )
+        for name in names.named_children
+        if name.text != b"_"
+    ]
+
+
+def _go_header_names(source: str, candidate: Candidate) -> Node | None:
+    """The name list of the Go header ``candidate`` was offered from, or
+    ``None`` when it is some other kind of candidate."""
+    node = _node_at(source, "go", candidate.start, candidate.end)
+    if node is None or node.type != "expression_list":
+        return None
+    holder = node.parent
+    if holder is None or holder.type not in _GO_HEADER_NAMES:
+        return None
+    return node if holder.child_by_field_name(_GO_HEADER_NAMES[holder.type]) == node else None
+
+
+def _go_header_rewrite(source: str, candidate: Candidate, names: Node) -> str:
+    """``source`` with ``candidate``'s name gone from its statement header.
+
+    The name becomes ``_``, and trailing blanks are dropped since they mean
+    nothing there: ``for i, _ := range`` is ``for i := range``, and
+    ``case v, _ := <-ch`` receives just as ``case v := <-ch`` does. When no
+    name is left the ``:=`` goes too, because ``for _ := range`` declares no
+    new variable and does not build: ``for range us``, ``case <-ch:`` and
+    ``switch x.(type)`` are what remains. A blank before a live name stays
+    (``for _, v := range``)."""
+    data = source.encode("utf-8")
+    kept = [
+        b"_" if (name.start_byte, name.end_byte) == candidate.binder else name.text
+        for name in names.named_children
+    ]
+    while kept and kept[-1] == b"_":
+        kept.pop()
+    if kept:
+        return (data[: names.start_byte] + b", ".join(kept) + data[names.end_byte :]).decode("utf-8")
+    operator = next(c for c in names.parent.children if c.type == ":=")
+    rest = operator.next_sibling
+    end = rest.start_byte if rest is not None else operator.end_byte
+    return (data[: names.start_byte] + data[end:]).decode("utf-8")
+
+
+def _go_header_scope(node: Node) -> Node | None:
+    """What a Go header variable is visible in: its loop, its ``select``
+    case or its type switch. ``None`` for any other node."""
+    holder = node.parent
+    if node.type != "expression_list" or holder is None or holder.type not in _GO_HEADER_NAMES:
+        return None
+    return holder if holder.type == "type_switch_statement" else holder.parent
 
 
 def _alone_on_its_lines(data: bytes, node: Node) -> bool:
@@ -2587,6 +2674,10 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
         and _kotlin_ends_a_value_block(source, candidate)
     ):
         return None
+    if language == "go" and candidate.kind == "variable":
+        names = _go_header_names(source, candidate)
+        if names is not None:
+            return _go_header_rewrite(source, candidate, names)
     if candidate.replacement is not None:
         return (
             data[: candidate.start]
@@ -2637,6 +2728,8 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
             # the imports from the code would now open the file.
             while data[end:].startswith((b"\n", b"\r\n")):
                 end += 1 if data[end : end + 1] == b"\n" else 2
+        elif language == "go":
+            start, end = _go_blank_lines(data, start, end)
         elif (
             language in _BLANK_RUN_IS_AN_ERROR
             and (start, end) != (candidate.start, candidate.end)
@@ -2689,6 +2782,41 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
     return (
         data[: candidate.start] + replacement.encode("utf-8") + data[candidate.end :]
     ).decode("utf-8")
+
+
+_BLANK_LINE = re.compile(rb"[ \t]*\r?\n")
+
+
+def _go_blank_lines(data: bytes, start: int, end: int) -> tuple[int, int]:
+    """Widen a deleted run of whole Go lines so what is left is gofmt-clean.
+
+    A customer's CI that runs ``gofmt -l`` fails on three things a deletion
+    leaves, none of which stops the build: two blank lines in a row (one
+    above the deleted lines and one below), a blank line just inside a
+    group's ``(`` or ``)`` (the first or last spec of ``import ( … )`` went),
+    and blank lines at the end of the file (the last declaration went). Each
+    is closed by taking the blank lines with the deletion. A blank line
+    inside a function's braces is left: gofmt keeps those.
+    """
+    if not (start == 0 or data[start - 1 : start] == b"\n") or data[end - 1 : end] != b"\n":
+        return start, end
+    below = end
+    while match := _BLANK_LINE.match(data, below):
+        below = match.end()
+    above = start
+    while above > 0 and (previous := data.rfind(b"\n", 0, above - 1) + 1) < above and not data[previous:above].strip():
+        above = previous
+    if below == len(data):
+        # Nothing but blank lines after it: the file ends at the last line kept.
+        return above, below
+    if data[:above].rstrip().endswith(b"("):
+        return above, below
+    if data[below:].lstrip(b" \t").startswith(b")"):
+        return above, below
+    if above < start:
+        # Blank above, so any blank below would make two.
+        return start, below
+    return start, end
 
 
 def _python_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] | None:
@@ -3129,21 +3257,51 @@ def _bom_length(data: bytes) -> int:
 
 
 def _expand_over_separator(data: bytes, start: int, end: int) -> tuple[int, int]:
-    """Swallow the comma that would otherwise be left dangling."""
-    after = end
-    while after < len(data) and data[after : after + 1] in (b" ", b"\t"):
-        after += 1
+    """Swallow the comma that would otherwise be left dangling.
+
+    A ``/* … */`` comment between the name and its comma is stepped over, and
+    goes with the name: ``import { client /* c */, Client }`` used to stop at
+    the comment and leave ``{  /* c */, Client }``, which does not parse.
+    Gate 1 refused that, so nothing broken shipped, but the whole flag was lost
+    over a comment. A comment on the far side of the comma stays, since it may
+    describe the neighbour.
+    """
+    after = _skip_blanks_and_comments(data, end)
     if data[after : after + 1] == b",":
         after += 1
         while after < len(data) and data[after : after + 1] in (b" ", b"\t"):
             after += 1
         return start, after
-    before = start
-    while before > 0 and data[before - 1 : before] in (b" ", b"\t"):
-        before -= 1
+    before = _skip_blanks_and_comments_back(data, start)
     if data[before - 1 : before] == b",":
         return before - 1, end
     return start, end
+
+
+def _skip_blanks_and_comments(data: bytes, position: int) -> int:
+    """``position`` moved past spaces, tabs and ``/* … */`` comments on its line."""
+    while True:
+        while position < len(data) and data[position : position + 1] in (b" ", b"\t"):
+            position += 1
+        if not data.startswith(b"/*", position):
+            return position
+        close = data.find(b"*/", position + 2)
+        if close == -1 or b"\n" in data[position:close]:
+            return position
+        position = close + 2
+
+
+def _skip_blanks_and_comments_back(data: bytes, position: int) -> int:
+    """:func:`_skip_blanks_and_comments`, walking left from ``position``."""
+    while True:
+        while position > 0 and data[position - 1 : position] in (b" ", b"\t"):
+            position -= 1
+        if not data[:position].endswith(b"*/"):
+            return position
+        opening = data.rfind(b"/*", 0, position - 2)
+        if opening == -1 or b"\n" in data[opening:position]:
+            return position
+        position = opening
 
 
 def _own_binder_spans(source: str, name: str, language: str) -> list[tuple[int, int]]:
@@ -3572,6 +3730,13 @@ def _matching_scope(
     ]
     if len(matches) != 1:
         return None
+    # A Go header variable is visible only in its own statement, so that is
+    # all the count after the fold needs to read. Counting the whole function
+    # let a second loop's own `v` keep the first loop's stranded `v` standing.
+    # Every read of it is inside, so a narrower span hides none of them.
+    header_scope = _go_header_scope(candidate_node) if language == "go" else None
+    if header_scope is not None:
+        current_scope = header_scope
     return (matches[0].start_byte, matches[0].end_byte), (
         current_scope.start_byte,
         current_scope.end_byte,
