@@ -3372,11 +3372,19 @@ locals are left alone too:
 * every local of a function that calls `locals()`, `vars()`, `dir()`, `eval`
   or `exec`, which read locals without naming them
   (`render(request, "home.html", locals())`);
+* every local of a function that spells any name outside ASCII. Python
+  compares names after NFKC normalization, so `ｒetries` (with a fullwidth
+  `ｒ`) reads `retries`;
+* a dunder such as `__class__`, which the language reads itself (a
+  zero-argument `super()` reads `__class__`);
+* a value that looks literal but raises: `~` on a number (`~1.5` and `~2j`
+  raise, so no `~` is taken), and a container inside a set or used as a dict
+  key (`{[1]}` raises, since a list is unhashable);
 * the only statement in a block (`if ready:` needs a body);
 * a statement that shares its line with another (`n = 3; go()`), or that the
   line above continues into with `\`;
-* a function's first statement when a bare string follows it, since that
-  string would become the docstring.
+* a function's first statement when a bare string follows it, parenthesised
+  or not (`("doc")`), since that string would become the docstring.
 
 **An import is never deleted.** It is kept as it was and marked
 `# noqa: F401`, which is what ruff and flake8 read to accept it. Importing a
@@ -3726,19 +3734,23 @@ reads as `foo(bar(1, 2))`), and a dead branch in an argument. Fix those by
 hand, or add the key to `ignore`.
 
 A local that only the removed branch read is cleaned up too. RuboCop's default
-`Lint/UselessAssignment` fails on it, and `ruby -w` warns. In a method, a local
-holding a literal (a number, `nil`, `true`, `false`, a string without
-interpolation, a symbol, or an array, hash or range of those) is deleted,
-along with a comment on the same line. One that calls something keeps the
-call: `flow = LegacyFlow.new(ctx)` becomes `LegacyFlow.new(ctx)`. A local
-nothing read even before, whose name the removed branch spelled as a method or
-a hash key (`obj.retries`, `g(retries: 1)`), is cleaned up the same way. Some
-locals are left alone:
+`Lint/UselessAssignment` fails on it, and `ruby -w` warns. In a method,
+including in a block or lambda inside it, a local holding a literal (a number, `nil`,
+`true`, `false`, a string without interpolation, a symbol, or an array, hash
+or range of those) is deleted, along with a comment on the same line, and so is
+an only `x ||= <literal>` or `x &&= <literal>`. One that calls something keeps
+the call: `flow = LegacyFlow.new(ctx)` becomes `LegacyFlow.new(ctx)`. A
+method's or block's last statement keeps its value, since that is what it
+returns: `total = 80` there becomes `80`. A local nothing read even before,
+whose name the removed branch spelled as a method or a hash key
+(`obj.retries`, `g(retries: 1)`), is cleaned up the same way. Some locals are
+left alone:
 
-* a method's last statement holding a literal, since that value is what the
-  method returns, including before a `rescue`, `else` or `ensure` (a call is
-  still kept, which returns the same value);
-* locals in a block, a lambda or a class body, and at the top of a file;
+* the last statement of any other body (an `if` branch, a loop, a `begin`)
+  holding a literal, and a statement before a `rescue`, `else` or `ensure`
+  (a call is still kept, which returns the same value);
+* locals in a block or lambda outside any method or in a class body, at the
+  top of a file, and a block's own `|a; x|` locals;
 * every local of a method that uses `binding`, `local_variables` or a
   string `eval`, by name or as a symbol (`ERB.new(template).result(binding)`
   and `send(:binding)` read them all);
@@ -3747,7 +3759,11 @@ locals are left alone:
   can autoload a file, and which RuboCop flags when it stands alone), an
   interpolated string, a heredoc, an operator, an index, or a hash using the
   `key:` shorthand, which reads `key`;
-* a write other than `name = value` (`||=`, `+=`, `a, b = …`);
+* a value that looks literal but raises: `~` on anything but an integer
+  (`~1.5`), and a range whose ends do not compare (`1..'a'`, `!1..2`);
+* a local next to a range left open at the end of a line (`x = 1..`), which
+  Ruby continues onto the next line;
+* any other write (`+=`, `||= compute`, `a, b = …`);
 * a statement sharing its line with another (`limit = 3; go`).
 
 A `require` is never removed: it runs the file it names.
@@ -4172,8 +4188,11 @@ end of the function. Variables are also left alone when they:
 * are at the top level of a file (an including file shares them) or in a
   closure or arrow function;
 * are in a function that also uses `compact()`, `extract()`,
-  `get_defined_vars()`, `eval()`, `include`/`require` or `$$name` in any
-  spelling, all of which reach variables without naming them;
+  `get_defined_vars()`, `eval()`, `parse_str()`, `include`/`require` or
+  `$$name` in any spelling, all of which reach variables without naming them,
+  or that names `assert`, `mb_ereg_replace` or `mb_eregi_replace` anywhere
+  (an `Assert::` class included), which on PHP 7 can run a string that reads
+  them as code;
 * are assigned more than once in the function: `$lock = null;` can be what
   lets go of an object an earlier assignment made;
 * are a superglobal such as `$_SESSION`;

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.7.0"
+version = "1.8.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -424,7 +424,22 @@ dependencies = [
     # `x` as an expression instead of string text. C# moved, so its Gate 1
     # grammar moves with it to `tree-sitter-c-sharp==0.23.5+canopy.1` (see
     # that entry). TypeScript's rev did not move, so `+canopy.3` stays.
-    "polyglot-piranha==0.34.0",
+    #
+    # 0.35.0. Python's and PHP's engines delete the locals their own fold
+    # stranded, as Go's, Ruby's and Dart's do: Python an `x = <literal>`
+    # statement, PHP a `$x = <literal>;` and a one-clause `use` nothing else
+    # names. The three rule names are in `_ENGINE_STRANDED_LOCAL_RULES` and
+    # `_ENGINE_STRANDED_IMPORT_RULES`, and `unused.py`'s Python and PHP
+    # branches stay as the backstop. Ruby's engine rules now cover block
+    # locals, an only `||=`/`&&=` of a literal, and a body's last `x = v`,
+    # which becomes `v`; they withhold a literal that raises (`~1.5`,
+    # `1..'a'`) or an endless range Ruby would continue onto the next line,
+    # and `unused.py` withholds the same. A deleted statement takes
+    # the comment after it on its line, code after it on that line keeps a
+    # line of its own, and deleting a last clause (`elif`, `else`, `finally`)
+    # keeps the blank lines after it. No grammar rev moved, so `+canopy.3`
+    # stays.
+    "polyglot-piranha==0.35.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

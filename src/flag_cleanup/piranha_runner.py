@@ -1139,12 +1139,15 @@ def _engine_stranded(summaries, language: str, repo_dir: str) -> tuple[tuple[str
 #: The engine's built-in rules that delete an import its own fold stranded,
 #: each mapped to the capture the pull request names it by. Never the match: a
 #: spec's match also holds the comments and blank lines it took (``spec``), and
-#: the ``*_solo`` pair's starts at the declaration before it (``decl``).
+#: the ``*_solo`` pair's starts at the declaration before it (``decl``). The
+#: PHP rule deletes a one-clause ``use`` declaration and is named by the whole
+#: of it (``decl``), since a deleted line's match also holds the comment after it.
 _ENGINE_STRANDED_IMPORT_RULES = {
     "delete_stranded_import_aliased": "spec",
     "delete_stranded_import_unaliased": "spec",
     "delete_stranded_import_aliased_solo": "decl",
     "delete_stranded_import_unaliased_solo": "decl",
+    "delete_stranded_php_import": "decl",
 }
 
 
@@ -1160,6 +1163,9 @@ _ENGINE_STRANDED_IMPORT_RULES = {
 #: match also holds the comment after it. The two Dart rules delete an inert
 #: local, or keep a call's value as a bare statement (``final x = call();``
 #: becomes ``call();``), and are named by the whole declaration (``decl``).
+#: The one Python rule deletes an ``x = <literal>`` statement, and the one PHP
+#: rule a ``$x = <literal>;`` statement; each is named by the statement
+#: (``decl``), since a deleted line's match also holds the comment after it.
 _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_short_var": "decl",
     "blank_stranded_short_var": "decl",
@@ -1196,6 +1202,8 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "discard_stranded_ruby_local": "a",
     "delete_stranded_dart_local": "decl",
     "discard_stranded_dart_local": "decl",
+    "delete_stranded_python_local": "decl",
+    "delete_stranded_php_local": "decl",
 }
 
 

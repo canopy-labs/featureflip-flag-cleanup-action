@@ -7,6 +7,47 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.8.0
+
+### Behaviour changes
+
+- **Python:** a local the fold left unread is kept, not deleted, when deleting
+  it could change or break the function. That covers a function that spells any
+  non-ASCII name (Python reads `ｒetries` as `retries`), a dunder such as
+  `__class__`, a `~` on a number (`~1.5` raises), a container inside a set or
+  used as a dict key (`{[1]}` raises), and a first statement followed by a
+  parenthesised string (`("doc")` would become the docstring).
+- **C#, Dart, Go, Java, JavaScript, Kotlin, PHP, Ruby, Swift and TypeScript:**
+  a comment at the end of a removed statement's line is removed with it. It
+  used to be left at the end of the line above (`{ // remove after rollout`)
+  or after the member that stays, where it read as a note about kept code.
+- **C#, Dart, Go, Java, JavaScript, Kotlin, PHP, Ruby, Swift and TypeScript:**
+  code that followed a removed statement on its line keeps a line of its own.
+  It used to be joined onto the line above, and could end up inside a comment
+  there. In Kotlin and Swift, a removed statement followed on its line by a
+  block comment and more code (`dead(); /* note */ next()`) is refused
+  instead, because the line left behind does not parse.
+- **Python:** removing the last `elif`, `else`, `except` or `finally` clause
+  keeps the blank lines after it, so the two blank lines before the next
+  top-level function stay. The same holds for a `finally` on its own line
+  after a `catch` in TypeScript and JavaScript.
+- **Python:** a literal local the fold left unread is removed even when a
+  comment on its line mentions its name (`retries = 3  # retries left`).
+- **Ruby:** more locals the fold left unread are removed: one written in a
+  block inside a method, an only `x ||= <literal>` or `x &&= <literal>`, and a
+  method's or block's last `x = value`, which becomes `value`, so what it
+  returns is unchanged. Removing a last `elsif` or `else` also removes a blank
+  line directly above it, which would have sat just before `end`.
+- **Ruby:** a local is kept when deleting it could change or break the method:
+  a `~` on anything but an integer (`~1.5` raises), a range whose ends do not
+  compare (`1..'a'` raises), a range end under `!`, `not` or `defined?`
+  (`!1..2` raises), and a local
+  next to a range left open at the end of a line (`x = 1..`), which Ruby
+  continues onto the next line.
+- **PHP:** a local is kept when its function names `assert`,
+  `mb_ereg_replace` or `mb_eregi_replace`, which on PHP 7 can run a string
+  that reads it as code. An `Assert::` class counts too.
+
 ## 1.7.0
 
 ### Removes more

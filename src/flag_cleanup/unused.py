@@ -1379,6 +1379,9 @@ _PYTHON_INERT_NODES = frozenset({
     "concatenated_string", "list", "tuple", "set", "dictionary", "pair",
     "parenthesized_expression",
 })
+_PYTHON_CONTAINERS = frozenset({
+    "list", "tuple", "set", "dictionary", "parenthesized_expression",
+})
 
 
 #: What a Swift local may hold and still be deleted: a VALUE, never a
@@ -1428,6 +1431,39 @@ _RUBY_INERT_NODES = frozenset({
     "string", "string_content", "escape_sequence", "simple_symbol",
     "delimited_symbol", "array", "hash", "pair", "hash_key_symbol", "range",
 })
+
+
+#: What each end of a Ruby range literal is, for ``_ruby_range_ends_compare``.
+_RUBY_RANGE_ENDS = {
+    "integer": "real", "float": "real", "rational": "real", "nil": "nil",
+    "string": "string", "simple_symbol": "symbol", "delimited_symbol": "symbol",
+}
+
+
+def _ruby_range_ends_compare(node: Node) -> bool:
+    """Whether a Ruby range literal's ends are known to compare.
+
+    ``Range.new`` raises ArgumentError when ``begin <=> end`` is nil, so
+    ``1..'a'``, ``true..false`` and ``1i..2i`` raise, and so does ``!1..2``,
+    which is ``false..2``. Two real numbers (under a sign or ``~``), two
+    strings or two symbols compare, and a missing or ``nil`` end is always
+    accepted.
+    """
+    kinds = set()
+    for field in ("begin", "end"):
+        end = node.child_by_field_name(field)
+        if end is None:
+            continue
+        if end.type == "unary":
+            operator = end.child_by_field_name("operator")
+            if operator is None or operator.type not in {"-", "+", "~"}:
+                return False
+            end = end.child_by_field_name("operand")
+        kind = _RUBY_RANGE_ENDS.get(end.type) if end is not None else None
+        if kind is None:
+            return False
+        kinds.add(kind)
+    return len(kinds - {"nil"}) <= 1
 
 
 #: Swift's literals, the only operands its ``-``, ``+`` and ``!`` are known to
@@ -1519,9 +1555,24 @@ def _subtree_is_inert(node: Node, language: str = "") -> bool:
         if not node.is_named:
             return True
         if node.type == "unary_operator":
-            # `-x` calls `__neg__`; only a number takes the built-in one.
+            # `-x` calls `__neg__`; only a number takes the built-in one. And
+            # `~` not even then: `~1.5` and `~2j` raise.
             operand = node.child_by_field_name("argument")
-            return operand is not None and operand.type in {"integer", "float"}
+            operator = node.child_by_field_name("operator")
+            return (
+                operand is not None
+                and operand.type in {"integer", "float"}
+                and (operator is None or operator.type != "~")
+            )
+        # A set's element and a dict's key are hashed, and a container may
+        # not be (`{[1]}` raises), so none is taken.
+        hashed = (
+            node.named_children if node.type == "set"
+            else [node.child_by_field_name("key")] if node.type == "pair"
+            else []
+        )
+        if any(child is None or child.type in _PYTHON_CONTAINERS for child in hashed):
+            return False
         return node.type in _PYTHON_INERT_NODES and all(
             _subtree_is_inert(child, language) for child in node.children
         )
@@ -1530,11 +1581,17 @@ def _subtree_is_inert(node: Node, language: str = "") -> bool:
             return True
         if node.type == "unary":
             # Ruby reads `-3` as a negative literal; the grammar spells it as
-            # an operator. Any other operand is a method call.
+            # an operator. Any other operand is a method call. Only an
+            # Integer has `~`: `~1.5` raises NoMethodError.
             operand = node.child_by_field_name("operand")
+            operator = node.child_by_field_name("operator")
+            if operator is not None and operator.type == "~":
+                return operand is not None and operand.type == "integer"
             return operand is not None and operand.type in {
                 "integer", "float", "rational", "complex",
             }
+        if node.type == "range" and not _ruby_range_ends_compare(node):
+            return False
         if node.type == "pair" and node.child_by_field_name("value") is None:
             # `{compute:}` reads the local `compute` or calls the method.
             return False
@@ -2187,7 +2244,8 @@ def _python_declared_name_and_value(
     the scope's count never reaches zero.
 
     Declined: any local of a function that spells one of
-    ``_PYTHON_NAMESPACE_READERS``, a target that is not a bare name (``a, b = …``, ``self.x =
+    ``_PYTHON_NAMESPACE_READERS`` or any non-ASCII name, a dunder (the
+    language reads it), a target that is not a bare name (``a, b = …``, ``self.x =
     …``, ``items[0] = …``), an annotation with no value (``x: int``),
     which binds nothing at run time, and a name assigned more than once in
     its function. Each assignment's own name is blanked, so ``lock = None``
@@ -2195,6 +2253,12 @@ def _python_declared_name_and_value(
     keeps the lock to the end of the function. A chain (``a = b = make()``)
     is offered and then left: its value is the inner assignment, which is
     not a literal.
+
+    Since engine 0.35.0 the engine removes the Python literal locals its own
+    fold stranded first, so this branch is the backstop: it acts on what the
+    engine withholds (a local whose function holds a class, an outer
+    function's local a nested one stopped reading) and on strands this side's
+    own edits make.
     """
     scope = node.parent
     while scope is not None and scope.type not in _PYTHON_SCOPES:
@@ -2202,9 +2266,12 @@ def _python_declared_name_and_value(
     if scope is None or scope.type != "function_definition":
         return None
     if any(
-        leaf.type == "identifier" and leaf.text in _PYTHON_NAMESPACE_READERS
+        leaf.type == "identifier"
+        and (leaf.text in _PYTHON_NAMESPACE_READERS or not leaf.text.isascii())
         for leaf in _walk(scope)
     ):
+        # A non-ASCII name may read any of them: Python compares names after
+        # NFKC normalization, so the fullwidth `ｒetries` is `retries`.
         return None
     statements = [c for c in node.named_children if c.type != "comment"]
     if len(statements) != 1 or statements[0].type != "assignment":
@@ -2213,6 +2280,10 @@ def _python_declared_name_and_value(
     name_node = assignment.child_by_field_name("left")
     value = assignment.child_by_field_name("right")
     if name_node is None or name_node.type != "identifier" or value is None:
+        return None
+    if re.fullmatch(rb"__.*__", name_node.text):
+        # A dunder is read by the language: `__class__ = 3` changes what a
+        # zero-argument `super()` resolves to.
         return None
     if sum(
         1
@@ -2291,10 +2362,16 @@ _PHP_NAMESPACE_READERS = frozenset({
 
 #: The PHP functions that do the same by name: ``compact('total')`` reads
 #: ``$total`` by a string. Matched as ANY ``name`` leaf, so a qualified
-#: ``\\get_defined_vars()`` counts, and PHP refuses to call any of them
-#: dynamically, so a name is the only way to reach one.
+#: ``\\get_defined_vars()`` counts, and PHP refuses to call the first five
+#: dynamically, so a name is the only way to reach one. The last three run a
+#: string as code in this scope on PHP 7 (``assert`` given a string, the
+#: ``mb_ereg*_replace`` pair under the ``e`` option), where a dynamic call of
+#: them is not refused; the name is all that can be checked. Any ``name``
+#: leaf counts, so an ``Assert::`` class withholds too, as it does in the
+#: engine.
 _PHP_NAMESPACE_FUNCTIONS = frozenset({
     b"compact", b"extract", b"get_defined_vars", b"eval", b"parse_str",
+    b"assert", b"mb_ereg_replace", b"mb_eregi_replace",
 })
 
 #: Variables every scope shares. Writing one is never local.
@@ -2369,6 +2446,11 @@ def _php_declared_name_and_value(
     ``_PHP_NAMESPACE_FUNCTIONS``, a superglobal, and anything but a plain
     ``$name = value`` (``$a = &$b``, ``$a += 1`` and ``$a[] = 1`` are other
     nodes or another left side).
+
+    Since engine 0.35.0 the engine removes the PHP literal locals and the
+    ``use`` imports its own fold stranded first, so this branch is the
+    backstop: it acts on what the engine withholds and on strands this side's
+    own edits make.
     """
     scope = node.parent
     while scope is not None and scope.type not in _PHP_SCOPES:
@@ -2962,7 +3044,8 @@ def _python_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int
       ``IndentationError`` that tree-sitter does not report;
     * a statement the line above continues into with ``\\``;
     * a body's first statement when a bare string follows it, which would
-      become the ``__doc__``.
+      become the ``__doc__``. A parenthesised one (``("doc")``) is one too,
+      so any parenthesised expression there stops it.
 
     A call kept as a statement (the discard) fills either just as well, so
     ``None`` here only stops the deletion.
@@ -2998,7 +3081,8 @@ def _python_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int
     if statements[0].id == node.id and len(statements) > 1:
         following = statements[1]
         if following.type == "expression_statement" and following.named_child_count == 1 and (
-            following.named_children[0].type in {"string", "concatenated_string"}
+            following.named_children[0].type
+            in {"string", "concatenated_string", "parenthesized_expression"}
         ):
             # It would become the body's docstring.
             return None
@@ -3018,7 +3102,12 @@ def _ruby_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] 
       comment goes with it.
 
     A line the one above continues into with ``\\`` needs no check: the
-    assignment is then an argument, and was never a statement here.
+    assignment is then an argument, and was never a statement here. A range
+    left open at the end of a line does: Ruby runs it on into the next line,
+    comments skipped, though the grammar ends the statement at the line
+    break. So ``legacy = 1..`` before ``settle`` is ``legacy = 1..settle``,
+    and ``log 1..`` before ``legacy = 3`` is ``log(1..(legacy = 3))``, and
+    deleting either assignment would hand the range a different end.
     """
     data = source.encode("utf-8")
     line_start = max(data.rfind(b"\n", 0, candidate.start) + 1, _bom_length(data))
@@ -3036,6 +3125,14 @@ def _ruby_deletable_lines(source: str, candidate: Candidate) -> tuple[int, int] 
         None,
     )
     if node is None:
+        return None
+    value = node.child_by_field_name("right")
+    if value is not None and value.text.rstrip().endswith(b".."):
+        return None
+    preceding = node.prev_named_sibling
+    while preceding is not None and preceding.type == "comment":
+        preceding = preceding.prev_named_sibling
+    if preceding is not None and preceding.text.rstrip().endswith(b".."):
         return None
     following = node.next_named_sibling
     while following is not None and following.type == "comment":
