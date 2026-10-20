@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.8.0"
+version = "1.9.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -439,7 +439,17 @@ dependencies = [
     # line of its own, and deleting a last clause (`elif`, `else`, `finally`)
     # keeps the blank lines after it. No grammar rev moved, so `+canopy.3`
     # stays.
-    "polyglot-piranha==0.35.0",
+    #
+    # 0.36.0. Swift's, Java's and Kotlin's engines delete the locals their
+    # own fold stranded: Swift a `let`/`var x = <literal>` in a function,
+    # Java a `T x = <literal>;` in a block, Kotlin a `val`/`var x =
+    # <literal>` in a block or lambda. Java's and Kotlin's also delete an
+    # import whose name the file no longer spells; Kotlin's takes an aliased
+    # import only when neither the alias nor the original name is spelled.
+    # The five rule names are in `_ENGINE_STRANDED_LOCAL_RULES` and
+    # `_ENGINE_STRANDED_IMPORT_RULES`, and `unused.py`'s three branches stay
+    # as the backstop. No grammar rev moved, so `+canopy.3` stays.
+    "polyglot-piranha==0.36.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

@@ -3853,7 +3853,10 @@ or constructs something is rewritten to keep the call as a statement:
 are left alone:
 
 * locals inside a lambda, an anonymous function, an object expression, an
-  `init` block or a property accessor;
+  `init` block or a property accessor, unless the value is a literal (a
+  number, a character, a string without `$`, `true`, `false` or `null`), which
+  is deleted there too. A lambda's last statement stays even then, because it
+  is the lambda's value;
 * destructuring declarations and delegated locals (`val x by lazy { … }`);
 * a local with a declared type whose initializer is not a literal.
   `val user: User = javaApi()` checks a Java value for null and throws on it,
@@ -3865,11 +3868,12 @@ are left alone:
 
 An import goes when the name it binds (`import a.b.C` binds `C`) is spelled
 nowhere in the file any more. A read inside a string template or in
-backticks still counts. Some imports are never removed: star imports, aliased
-imports (`import a.b.C as D` also hides `C` from the star imports, so removing
-it could change what `C` means), and imports of a name Kotlin calls by
-convention without spelling it, such as `getValue` (used by `by`), `plus`
-(used by `+`), `invoke` or `component1`.
+backticks still counts. An aliased import (`import a.b.C as D`) goes only when
+neither `D` nor `C` is spelled anywhere in the file: it also hides `C` from the
+star imports, so while a bare `C` is left, removing it could change what `C`
+means. Some imports are never removed: star imports, and imports of a name
+Kotlin calls by convention without spelling it, such as `getValue` (used by
+`by`), `plus` (used by `+`), `invoke` or `component1`.
 
 ## Supported Java flag-read shapes
 

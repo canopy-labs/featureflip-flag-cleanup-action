@@ -1142,12 +1142,16 @@ def _engine_stranded(summaries, language: str, repo_dir: str) -> tuple[tuple[str
 #: the ``*_solo`` pair's starts at the declaration before it (``decl``). The
 #: PHP rule deletes a one-clause ``use`` declaration and is named by the whole
 #: of it (``decl``), since a deleted line's match also holds the comment after it.
+#: The Java and Kotlin rules delete one import declaration and are named by the
+#: whole of it (``decl``) for the same reason.
 _ENGINE_STRANDED_IMPORT_RULES = {
     "delete_stranded_import_aliased": "spec",
     "delete_stranded_import_unaliased": "spec",
     "delete_stranded_import_aliased_solo": "decl",
     "delete_stranded_import_unaliased_solo": "decl",
     "delete_stranded_php_import": "decl",
+    "delete_stranded_java_import": "decl",
+    "delete_stranded_kotlin_import": "decl",
 }
 
 
@@ -1166,6 +1170,8 @@ _ENGINE_STRANDED_IMPORT_RULES = {
 #: The one Python rule deletes an ``x = <literal>`` statement, and the one PHP
 #: rule a ``$x = <literal>;`` statement; each is named by the statement
 #: (``decl``), since a deleted line's match also holds the comment after it.
+#: The one Swift, Java and Kotlin rules each delete a literal local's whole
+#: declaration and are named by it (``decl``), for the same reason.
 _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_short_var": "decl",
     "blank_stranded_short_var": "decl",
@@ -1204,6 +1210,9 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "discard_stranded_dart_local": "decl",
     "delete_stranded_python_local": "decl",
     "delete_stranded_php_local": "decl",
+    "delete_stranded_swift_local": "decl",
+    "delete_stranded_java_local": "decl",
+    "delete_stranded_kotlin_local": "decl",
 }
 
 

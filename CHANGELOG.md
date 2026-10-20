@@ -7,6 +7,24 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.9.0
+
+### Behaviour changes
+
+- **Java:** a local holding a literal that the fold left unread is removed
+  inside a lambda, an anonymous class or a `static` initializer too. It used to
+  be left there.
+- **Kotlin:** a local holding a literal that the fold left unread is removed
+  inside a lambda, an anonymous function, an object expression, an `init`
+  block or a property accessor too. It used to be left there. A lambda's last
+  statement still stays, since it is the lambda's value.
+- **Kotlin:** an aliased import the fold left unused (`import a.b.C as D`) is
+  removed when the file spells neither `D` nor `C`. It used to be kept in every
+  case.
+- **Java and Kotlin:** removing an import that sat alone between two blank
+  lines also removes one of them, so the file is not left with two blank lines
+  in a row.
+
 ## 1.8.0
 
 ### Behaviour changes

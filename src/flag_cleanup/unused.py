@@ -488,6 +488,12 @@ def _java_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
     (``import static org.junit.Assert.assertEquals`` binds ``assertEquals``),
     which is the same last-segment rule the non-static form uses for the simple
     type name — so one branch serves both.
+
+    Since engine 0.36.0 the engine removes the imports and the literal locals
+    its own Java fold stranded first, so this branch and the Java local branch
+    are the backstop: they act on what the engine withholds (a non-literal
+    value, an annotated or multi-declarator local, a file javac reads
+    differently from the grammar) and on strands this side's own edits make.
     """
     candidates = []
     for node in _walk(root):
@@ -1003,9 +1009,12 @@ def _kotlin_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate
     An ALIASED import is never offered: ``import java.util.Date as JDate``
     also hides ``java.util.Date`` from the file's star imports, so deleting
     it can change what a bare ``Date`` resolves to, with no ``JDate`` left to
-    show it. A star import binds names it never spells and is excluded
-    structurally, by its ``*`` child. A name in backticks fails the
-    identifier test and is left alone.
+    show it. Since engine 0.36.0 the engine deletes an aliased import its own
+    fold stranded, but only when the original name is spelled nowhere in the
+    file either, so no bare ``Date`` is left whose resolution could move; this
+    side still never offers one. A star import binds names it never spells
+    and is excluded structurally, by its ``*`` child. A name in backticks
+    fails the identifier test and is left alone.
 
     Kotlin spells almost every use of an import, an extension call included
     (``"s".shout()`` — the import count, unlike a local's, keeps a member
@@ -1015,6 +1024,12 @@ def _kotlin_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate
 
     Loading has no effect to lose: a JVM class initialises on first use,
     never at import.
+
+    Since engine 0.36.0 the engine removes the imports and the literal locals
+    its own Kotlin fold stranded first, so this branch and the Kotlin local
+    branch are the backstop: they act on what the engine withholds (a
+    non-literal value, a lambda's last statement, a name the grammar can lex
+    as a keyword) and on strands this side's own edits make.
     """
     candidates = []
     for node in _walk(root):
@@ -2323,6 +2338,12 @@ def _swift_declared_name_and_value(
     local with a value. A literal is only a standard-library value when
     nothing names its type: ``let x: Money = 3`` runs the customer's
     ``init(integerLiteral:)``.
+
+    Since engine 0.36.0 the engine removes the literal locals its own fold
+    stranded in a function first, so this branch is the backstop: it acts on
+    what the engine withholds (a local beside a call label of its name, a
+    closure's or an accessor's local, a function holding ``#if``) and on
+    strands this side's own edits make.
     """
     if node.parent is None or node.parent.type != "statements":
         return None
