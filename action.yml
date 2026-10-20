@@ -341,7 +341,7 @@ inputs:
 
 runs:
   using: 'docker'
-  image: 'Dockerfile'
+  image: 'docker://ghcr.io/canopy-labs/featureflip-flag-cleanup-action@sha256:708670079d120230580e18c70227527e65588a31dbe694d86b92363b1d7f6e93'
   # GitHub maps an input `foo-bar` to `INPUT_FOO-BAR`, which is not a name
   # `flag_cleanup.config` reads. This block bridges each declared input to
   # the exact `FEATUREFLIP_*` environment variable `Config.from_env` expects
