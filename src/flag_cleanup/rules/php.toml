@@ -61,13 +61,13 @@ query = """(
   [(member_call_expression
       name: (name) @sdk_fn
       arguments: (arguments
-        . (argument [(string (string_content) @flag_name)
-                     (encapsed_string (string_content) @flag_name)])))
+        . (argument [(string . (string_content) @flag_name .)
+                     (encapsed_string . (string_content) @flag_name .)])))
    (function_call_expression
       function: (name) @sdk_fn
       arguments: (arguments
-        . (argument [(string (string_content) @flag_name)
-                     (encapsed_string (string_content) @flag_name)])))] @call
+        . (argument [(string . (string_content) @flag_name .)
+                     (encapsed_string . (string_content) @flag_name .)])))] @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -284,8 +284,8 @@ query = """(
   (member_call_expression
       name: (name) @sdk_fn
       arguments: (arguments
-        . (argument [(string (string_content) @flag_name)
-                     (encapsed_string (string_content) @flag_name)]))) @call
+        . (argument [(string . (string_content) @flag_name .)
+                     (encapsed_string . (string_content) @flag_name .)]))) @call
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @flag_name "@stale_flag_name")
 )"""

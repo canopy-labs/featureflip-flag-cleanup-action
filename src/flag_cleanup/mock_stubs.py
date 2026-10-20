@@ -327,11 +327,11 @@ class WrapperStub:
     """
 
     names: tuple[str, ...]
-    #: C#: the receivers of one file proven typed as a sibling implementation
-    #: inside a test. A test reading a member through one goes whole,
-    #: whatever its rows -- but only for a wrapper that completes, whose
-    #: sibling member is deleted with it (see ``kept``).
-    siblings: frozenset[str] = frozenset()
+    #: C#: ``(test method, receiver)`` of one file, each receiver proven typed
+    #: as a sibling implementation in that test. The test, reading a member
+    #: through it, goes whole, whatever its rows -- but only for a wrapper
+    #: that completes, whose sibling member is deleted with it (see ``kept``).
+    siblings: frozenset[tuple[str, str]] = frozenset()
     #: Names of the wrappers that do NOT complete. A statement naming one is
     #: left with its whole test; for C#, their sibling members stay, and a
     #: test mentioning one through a sibling receiver stays, whatever else
@@ -1083,7 +1083,7 @@ def _apply(
     extra: Iterable[tuple[int, int, Removal]] = (),
     *,
     wrapper: WrapperStub | None = None,
-    siblings: frozenset[str] = frozenset(),
+    siblings: frozenset[tuple[str, str]] = frozenset(),
     fakes: bool = False,
     owners: dict[str, tuple[str, bool]] | None = None,
 ) -> tuple[str, list[Removal]]:
@@ -1105,20 +1105,21 @@ def _apply(
     # sibling's member goes with the wrapper, so the test goes, whatever it
     # stubs. A write (`fake.IsXEnabled = true`) is not a read.
     sibling_tests: list[tuple[Node, str, str]] = []
-    if siblings:
-        sibling_read = csharp_receiver_read(siblings, wrapper.names, reads_only=True)
-        kept_mention = (
-            csharp_receiver_read(siblings, wrapper.kept, reads_only=False) if wrapper.kept else None
-        )
-        sibling_tests = [
-            (node, _text(node.child_by_field_name("name"), data), SIBLING_TEST)
-            for node in _walk(root)
-            if _csharp_any_test(node, data)
-            and node.child_by_field_name("name") is not None
-            and reads_through(_text(node, data), sibling_read)
-            # Deciding what STAYS: any spelling counts, qualified or not.
-            and (kept_mention is None or not kept_mention.search(_text(node, data)))
-        ]
+    by_test: dict[str, set[str]] = {}
+    for method, receiver in siblings:
+        by_test.setdefault(method, set()).add(receiver)
+    for node in _walk(root) if by_test else ():
+        name = node.child_by_field_name("name")
+        names = by_test.get(_text(name, data)) if name is not None else None
+        if not names or not _csharp_any_test(node, data):
+            continue
+        text = _text(node, data)
+        if not reads_through(text, csharp_receiver_read(names, wrapper.names, reads_only=True)):
+            continue
+        # Deciding what STAYS: any spelling counts, qualified or not.
+        if wrapper.kept and csharp_receiver_read(names, wrapper.kept, reads_only=False).search(text):
+            continue
+        sibling_tests.append((node, _text(name, data), SIBLING_TEST))
     # A statement naming a wrapper that stays describes a read that still
     # happens, so its whole unit -- stub, verification, test -- is left as is.
     kept_word = (
@@ -1483,10 +1484,10 @@ class Prepass:
     wrapper: WrapperStub | None = None
     #: path (as handed to :meth:`apply`) -> the receivers proven to be a wrapper.
     receivers: dict[str, frozenset[str]] = field(default_factory=dict)
-    #: path (as handed to :meth:`apply`) -> the receivers proven typed as a
-    #: sibling there (:attr:`WrapperStub.siblings`). Per file: a name proven
-    #: in one file says nothing about the same name in another.
-    siblings: dict[str, frozenset[str]] = field(default_factory=dict)
+    #: path (as handed to :meth:`apply`) -> ``(test method, receiver)`` proven
+    #: typed as a sibling there (:attr:`WrapperStub.siblings`). Per file and
+    #: test: a name proven in one test says nothing about it in another.
+    siblings: dict[str, frozenset[tuple[str, str]]] = field(default_factory=dict)
     #: C#, path (as handed to :meth:`apply`) -> the receivers proven typed as
     #: a test fake there, whose knob writes are resolved.
     knob_receivers: dict[str, frozenset[str]] = field(default_factory=dict)

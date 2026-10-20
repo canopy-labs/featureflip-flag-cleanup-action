@@ -84,14 +84,33 @@ holes = ["treated", "sentinel"]
 # takes `!strict` and `-1` with it, which is over-refusal in a position where
 # neither is a plausible argument to a boolean flag read — the direction this
 # tool errs in everywhere else.
+#
+# `go <read>` and `defer <read>` discard the value just as surely, and the read
+# is their operand rather than an expression statement's. Left to the rule
+# below they became `go true` / `defer true`, which `go build` rejects
+# (`expression in go must be function call`). They are deleted under the same
+# filters: `defer` evaluates the call's arguments at once and `go` in the
+# caller's goroutine, so an argument list the filters pass loses nothing either
+# way. One they decline still folds to `go true`, and Gate 1's literal-statement
+# count refuses the file.
 [[rules]]
 name = "delete_discarded_boolvariation_statement"
 query = """(
-  (expression_statement
-    (call_expression
-      function: [(selector_expression field: (field_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
-      arguments: (argument_list . (interpreted_string_literal (_) @flag_name)))) @statement
+  [(expression_statement
+     (call_expression
+       function: [(selector_expression field: (field_identifier) @sdk_fn)
+                  (identifier) @sdk_fn]
+       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))))
+   (go_statement
+     (call_expression
+       function: [(selector_expression field: (field_identifier) @sdk_fn)
+                  (identifier) @sdk_fn]
+       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))))
+   (defer_statement
+     (call_expression
+       function: [(selector_expression field: (field_identifier) @sdk_fn)
+                  (identifier) @sdk_fn]
+       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))))] @statement
   (#eq? @sdk_fn "BoolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -118,10 +137,12 @@ not_contains = ["""((unary_expression) @receive_or_negation)"""]
 # `Wrong number of arguments to #eq? predicate. Expected 2, got 4.`: the query
 # parser does not honour the escape, it splits on the raw quote.
 #
-# `(_)` binds the sole named child of an escape-free literal. It cannot bind an
-# escape sequence for a key this tool accepts, because `ensure_supported_key`
-# already restricts keys to [A-Za-z0-9_-]. Verified positively AND negatively:
-# the right key matches, a different key does not.
+# `(_)` is ANCHORED as the literal's only named child, so it binds the content
+# of an escape-free literal and nothing else. Unanchored it matched the first
+# content chunk of a literal that an escape splits: `"old-checkout\x2dv2"` is
+# content `old-checkout`, an escape sequence and content `v2`, and it names a
+# different flag. Verified positively AND negatively: the right key matches, a
+# different key does not. `go_const.toml` spells the key the same way.
 #
 # Both callee shapes are accepted so a dot-imported or re-exported helper is
 # covered, exactly as in ts.toml. `#eq?` throughout and never `#any-of?`, which
@@ -135,7 +156,7 @@ query = """(
     function: [(selector_expression field: (field_identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (interpreted_string_literal (_) @flag_name))
+      . (interpreted_string_literal . (_) @flag_name .))
   ) @call
   (#eq? @sdk_fn "BoolVariation")
   (#eq? @flag_name "@stale_flag_name")
@@ -162,18 +183,33 @@ holes = ["treated", "stale_flag_name"]
 # fires, because the read has already become a literal by the time it is
 # reached.
 #
-# Same two filters and the same safety argument as the twin, and the same
-# second-argument anchor as the OpenFeature read rule below.
+# Same two filters, the same safety argument and the same `go`/`defer` arms as
+# the twin, and the same second-argument anchor as the OpenFeature read rule
+# below.
 [[rules]]
 name = "delete_discarded_openfeature_boolean_statement"
 query = """(
-  (expression_statement
-    (call_expression
-      function: [(selector_expression field: (field_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
-      arguments: (argument_list
-        . (_)
-        . (interpreted_string_literal (_) @flag_name)))) @statement
+  [(expression_statement
+     (call_expression
+       function: [(selector_expression field: (field_identifier) @sdk_fn)
+                  (identifier) @sdk_fn]
+       arguments: (argument_list
+         . (_)
+         . (interpreted_string_literal . (_) @flag_name .))))
+   (go_statement
+     (call_expression
+       function: [(selector_expression field: (field_identifier) @sdk_fn)
+                  (identifier) @sdk_fn]
+       arguments: (argument_list
+         . (_)
+         . (interpreted_string_literal . (_) @flag_name .))))
+   (defer_statement
+     (call_expression
+       function: [(selector_expression field: (field_identifier) @sdk_fn)
+                  (identifier) @sdk_fn]
+       arguments: (argument_list
+         . (_)
+         . (interpreted_string_literal . (_) @flag_name .))))] @statement
   (#eq? @sdk_fn "Boolean")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -226,7 +262,7 @@ query = """(
                (identifier) @sdk_fn]
     arguments: (argument_list
       . (_)
-      . (interpreted_string_literal (_) @flag_name))
+      . (interpreted_string_literal . (_) @flag_name .))
   ) @call
   (#eq? @sdk_fn "Boolean")
   (#eq? @flag_name "@stale_flag_name")

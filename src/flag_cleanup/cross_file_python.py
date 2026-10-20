@@ -60,6 +60,7 @@ from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
 from flag_cleanup import cross_file_python_enums as enums
+from flag_cleanup import cross_file_python_proofs as proofs
 from flag_cleanup import key_const
 from flag_cleanup.cross_file_python_packages import _opaque_line, _opaque_spots, _sys_modules
 from flag_cleanup.cross_file_python_proofs import references as _constant_references
@@ -322,6 +323,10 @@ xk.register(
         # `_value_` writes reach a member unnamed: each refuses its entries.
         enum_escapes=enums.enum_escapes,
         enum_module_pattern=enums.enum_module_pattern,
+        # A module is a value: handed on or read by a computed name, it
+        # reaches every constant it holds without spelling one.
+        constant_escapes=proofs.constant_escapes,
+        constant_module_pattern=proofs.constant_module_pattern,
         escapes_void_readers=True,
         # Any module can write a constant's attribute, and no rule tells such
         # a write from a harmless mention: a kept declaration keeps every read.

@@ -1,6 +1,13 @@
-# Constructor-parameter removal for C# primary constructors. Rendered per run
-# by `ctor_param_model.render_rules`; see `ts_ctor_param.toml` for why deletion
-# is by a marked identifier rather than by position.
+# Constructor-parameter removal for C#, and the deletion of whatever else a
+# pass marked. Rendered per run by `ctor_param_model.render_rules`; see
+# `ts_ctor_param.toml` for why deletion is by a marked identifier rather than
+# by position.
+#
+# `parameter` blocks delete a primary constructor's parameter, `classic`
+# blocks an explicit constructor's (its name is the class's). The `argument`
+# blocks delete each span the caller replaced with a form of the sentinel
+# (`ctor_param_model.CSHARP_FORMS`): an argument, a member, a statement, a
+# whole type declaration, a `using` directive.
 
 # ctor: parameter
 [[rules]]
@@ -32,6 +39,21 @@ replace_node = "param"
 replace = ""
 is_seed_rule = true
 
+# ctor: classic
+[[rules]]
+name = "delete_class_constructor_parameter"
+query = """(
+  (constructor_declaration
+    name: (identifier) @ctor
+    parameters: (parameter_list
+      (parameter name: (identifier) @param_name) @param))
+  (#eq? @ctor "__CTOR_CLASS__")
+  (#eq? @param_name "__CTOR_PARAM__")
+)"""
+replace_node = "param"
+replace = ""
+is_seed_rule = true
+
 # ctor: argument
 [[rules]]
 name = "delete_ctor_marked_argument"
@@ -40,5 +62,52 @@ query = """(
   (#eq? @id "__CTOR_SENTINEL__")
 )"""
 replace_node = "arg"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_marked_member"
+query = """(
+  (method_declaration name: (identifier) @name) @member
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "member"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_marked_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: (identifier) @name
+      arguments: (argument_list))) @statement
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "statement"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_marked_type"
+query = """(
+  (class_declaration name: (identifier) @name) @type
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "type"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_marked_using"
+query = """(
+  (using_directive (identifier) @name) @using
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "using"
 replace = ""
 is_seed_rule = true

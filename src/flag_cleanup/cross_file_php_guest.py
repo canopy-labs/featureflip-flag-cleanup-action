@@ -1,6 +1,6 @@
 """Files outside PHP that can still read a PHP constant.
 
-A Twig, Latte or Smarty template reads one with ``constant('Ns\\\\Owner::NAME')``
+A Twig, Latte, Smarty or Phalcon Volt template reads one with ``constant('Ns\\\\Owner::NAME')``
 (Smarty also as ``{Owner::NAME}``), and Symfony configuration does with
 ``!php/const`` (``!php/enum`` for an enum case) in YAML or ``type="constant"``
 in XML. This tool transforms none of them and parses none of them, so a
@@ -28,9 +28,9 @@ from flag_cleanup import cross_file_keys as xk
 _PHP_ELSEWHERE = (".theme", ".install", ".profile", ".engine", ".ctp", ".php7", ".neon")
 #: Listed for the cross-file scan and judged by :func:`references`.
 PHP_GUEST_EXTENSIONS: dict[str, tuple[str, ...]] = {
-    "php_guest": (".twig", ".latte", ".tpl", ".yaml", ".yml", ".xml", *_PHP_ELSEWHERE),
+    "php_guest": (".twig", ".latte", ".tpl", ".volt", ".yaml", ".yml", ".xml", *_PHP_ELSEWHERE),
 }
-_TEMPLATES = (".twig", ".latte", ".tpl")
+_TEMPLATES = (".twig", ".latte", ".tpl", ".volt")
 #: Judged whatever their text: no marker is needed to name a constant.
 _ALWAYS = _TEMPLATES + _PHP_ELSEWHERE
 #: What makes a configuration file name a PHP constant or enum case at all.
@@ -90,6 +90,18 @@ def references(
     return [], refused
 
 
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """A class taken whole by text (``constant('Ns\\\\Owner::' ~ name)``,
+    ``Owner::class``), in a file :func:`references` would judge."""
+    if not path.lower().endswith(_ALWAYS) and _CONSTANT_MARKER.search(source) is None:
+        return []
+    from flag_cleanup import cross_file_php
+
+    return cross_file_php.template_escapes(path, source, constants, repo_dir)
+
+
 def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaration]:
     return []
 
@@ -110,5 +122,7 @@ xk.register(
         references=references,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
+        # A template can build a constant's name from its class's at run time.
+        constant_escapes=constant_escapes,
     ),
 )

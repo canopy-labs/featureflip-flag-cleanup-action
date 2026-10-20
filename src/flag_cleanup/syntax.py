@@ -85,7 +85,7 @@ parses as intended, and a wrong rewrite can pass that. It is a net, not a proof
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import re
 
@@ -101,7 +101,7 @@ import tree_sitter_ruby
 import tree_sitter_swift
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import key_const, kotlin_fold, ts_dead_code, ts_switch_fold, ts_syntax
+from flag_cleanup import key_const, kotlin_when_arms, ts_dead_code, ts_switch_arms, ts_syntax
 from flag_cleanup.key_const_visibility import VisibleKeyConst, visible_key_consts
 
 #: Languages :mod:`flag_cleanup.ts_syntax` owns outright. `js` is here rather
@@ -141,6 +141,10 @@ class _Profile:
     #: PHP, and for Go — whose two entries are deliberately different kinds and
     #: say so at the profile.
     literal_residues: tuple[tuple[str, str], ...] = ()
+    #: Node types whose CONDITION is their first named child, with no field
+    #: name to ask for: what ``literal_residues`` would say if the grammar gave
+    #: the condition one. Counted the same way, through the same wrappers.
+    unfielded_literal_residues: frozenset[str] = frozenset()
     #: Node types this grammar spells a boolean literal as, when they are not
     #: the usual ``true``/``false``. PHP is the one language here that gives
     #: both values a single ``boolean`` node type, which is why the residue
@@ -259,11 +263,12 @@ _PROFILES: dict[str, _Profile] = {
         # read becomes `case false:` and nothing else moves, so the dead arm
         # stays with the flag key gone from the file.
         #
-        # This used to refuse the shape outright. Since #2692 `go_fold` folds
-        # it, so what survives to be counted here is only what that module
-        # DECLINES — a `fallthrough` anywhere in the switch, a `break` in a body
-        # about to be spliced out of it, an initializer whose bindings the arms
-        # use, or a `default:` above the flag's arm. Each of those is a shape
+        # This used to refuse the shape outright. The engine's Go cascade folds
+        # it now, so what survives to be counted here is only what the engine
+        # DECLINES — a `fallthrough` or a labeled `break`/`continue`/`goto`
+        # anywhere in the switch, a `break` or a declaration in a body about to
+        # be spliced out of it, an initializer whose bindings the arms use, or
+        # a `default:` above the flag's arm. Each of those is a shape
         # with no correct local edit, so this stays the backstop that turns them
         # into a refusal rather than a permanent residue. Narrowed in scope, not
         # weakened: deleting this entry would ship those four silently.
@@ -297,9 +302,14 @@ _PROFILES: dict[str, _Profile] = {
         # method on `T` so C#'s identical-looking `false.Returns(true)` may
         # even compile. See the README's mocking-DSL gap for the languages
         # where the same fold is silent instead.
+        #
+        # The third entry is a read in the switch's SUBJECT. `switch <read> {`
+        # folds to `switch true {` and every arm is left comparing against the
+        # literal: correct, but the dead arms stay with the flag key gone.
         literal_residues=(
             ("expression_case", "value"),
             ("selector_expression", "operand"),
+            ("expression_switch_statement", "value"),
         ),
         # `case false:` holds its value in an `expression_list`, which is
         # transparent only when it has exactly one child — `case a, b:` is a
@@ -329,8 +339,14 @@ _PROFILES: dict[str, _Profile] = {
         # and Swift has no bare block to keep it in. Correct and compiling, but
         # the flag key is gone from the file, so nothing could ever revisit it —
         # refused here instead. `while` is absent for the reason Python gives:
-        # a `while true` loop is shipped as a documented residue.
-        literal_residues=(("if_statement", "condition"), ("guard_statement", "condition")),
+        # a `while true` loop is shipped as a documented residue. A `switch`
+        # whose subject was the read is left as `switch true`, every arm
+        # comparing against the literal.
+        literal_residues=(
+            ("if_statement", "condition"),
+            ("guard_statement", "condition"),
+            ("switch_statement", "expr"),
+        ),
         boolean_nodes=frozenset({"boolean_literal"}),
     ),
     "kt": _Profile(
@@ -376,8 +392,9 @@ _PROFILES: dict[str, _Profile] = {
         # Two residues, both of which this tool's Python rules can really
         # leave: a condition it declined to fold, and a name bound to the
         # literal that `python_fold` declined to inline. Neither survives the
-        # common case any more — the post-engine fold finishes both — but the
-        # gate is what makes DECLINING safe, so it stays exactly as strict.
+        # common case any more — the engine's folds and the inliner finish
+        # both — but the gate is what makes DECLINING safe, so it stays exactly
+        # as strict.
         # `python_fold.inline_literal_bindings` refuses a binding it cannot
         # prove is a function-local (module-level and class-body ones are
         # public API, a second binder may shadow it), and this is what turns
@@ -393,12 +410,16 @@ _PROFILES: dict[str, _Profile] = {
         # `pair` (a dict value) is absent for the opposite reason: `{"k": True}`
         # is a COMPLETE fold, not a half-finished one. There is nothing further
         # to clean once the read becomes a constant in that position.
+        #
+        # `match <read>:` folds to `match True:`, every `case` left comparing
+        # against the literal: the same stopped fold, spelled as a match.
         literal_residues=(
             ("if_statement", "condition"),
             ("elif_clause", "condition"),
             ("assignment", "right"),
             ("augmented_assignment", "right"),
             ("named_expression", "value"),
+            ("match_statement", "subject"),
         ),
         native_parser=True,
     ),
@@ -446,7 +467,7 @@ _PROFILES: dict[str, _Profile] = {
         # before this gate and only where it can produce a complete rewrite; a
         # shape it declines — a braceless body, a chain mixing body spellings,
         # the `match` arm — still lands here and still refuses. Same
-        # relationship `python_fold` has with the Python entries above: the
+        # relationship the engine's Python folds have with the entries above: the
         # fold is what makes the shapes rare, the gate is what makes declining
         # them safe. Do not relax the table because the fold covers a case; the
         # fold's coverage is measured per shape and the gate's is not.
@@ -465,6 +486,13 @@ _PROFILES: dict[str, _Profile] = {
             # this grammar), the `switch (…): … endswitch;` alternative syntax,
             # or a `default:` above the flag's arm.
             ("case_statement", "value"),
+            # A `match` on the read is folded to the arm the value selects,
+            # except when that arm lists another condition before the literal
+            # (`audit(), true => …`): choosing it would skip the call. The
+            # engine leaves `match (true)` with every arm standing. A
+            # `match (true)` the customer wrote is counted on both sides of
+            # the rewrite, so it never trips this.
+            ("match_expression", "condition"),
         ),
         # This grammar gives BOTH values one `boolean` node type, and wraps
         # every condition in `parenthesized_expression` — a `match` arm's
@@ -504,9 +532,21 @@ _PROFILES: dict[str, _Profile] = {
         frozenset({"true", "false", "null", "class", "return", "if", "else",
                    "void", "new", "this", "super", "static", "final", "const",
                    "import", "late", "required"}),
-        # No `literal_residues`: the engine's Dart cascade folds the condition
-        # AND inlines a local bound to the read, so a count here could only ever
-        # be zero.
+        # One `literal_residues` row, and not for a condition: the engine's
+        # Dart cascade folds the condition AND inlines a local bound to the
+        # read, so a condition row could only ever count zero. What it does not
+        # fold is a nullable read's default, `<read> ?? 'x'` -> `true ?? 'x'`,
+        # which `dart analyze` reports as `dead_null_aware_expression` and, as
+        # below, exits non-zero on.
+        literal_residues=(("if_null_expression", "first"),),
+        # A collection-`if` the engine declined to fold: it deletes the dead
+        # element only where that cannot change what runs or the type the
+        # literal infers, so `[for (final i in getterXs) if (false) i]` keeps
+        # its literal on purpose. `dart analyze` reports the dead element and
+        # exits non-zero. This grammar gives the condition no field name.
+        unfielded_literal_residues=frozenset({"if_element"}),
+        # So that `if ((false))` is still a literal condition to the row above.
+        transparent_nodes=frozenset({"parenthesized_expression"}),
         #
         # `unreachable_is_fatal` IS on, making Dart the second language after
         # Java to carry it — and the decision was made by running the real
@@ -592,13 +632,39 @@ _PROFILES: dict[str, _Profile] = {
         # loudly, PHP's entry covered `if`/`else_if`/`match` but not `case`,
         # and Ruby said nothing at all.
         #
-        # `ruby_fold` folds the shape now, so what reaches this entry is only
-        # what that module declines — a `when` listing several patterns, where a
-        # literal among alternatives is not the whole condition. The pattern
+        # The engine folds the shape now, so what reaches this entry is only
+        # what it declines — a `when` listing several patterns, where a literal
+        # among alternatives is not the whole condition, the only `when` of a
+        # `case` that keeps an `else`, or a body that cannot be spliced into an
+        # expression. The pattern
         # node wraps the literal, which `transparent_nodes` below is what walks
         # through.
-        literal_residues=(("when", "pattern"),),
-        transparent_nodes=frozenset({"pattern"}),
+        #
+        # The `if` family joined it with engine 0.25.0. Until then the engine
+        # unwrapped every literal `if`, so none could be left behind, but in
+        # some positions the unwrap was wrong: `x = if true; a; b end` became
+        # `x = a` plus a loose `b`, and `if c then a else b end` became
+        # `then a`. The engine now DECLINES where the kept branch cannot stand
+        # in the `if`'s place (several statements as a value or behind an
+        # inline `then`, a call without parentheses as a value, a dead branch
+        # outside an assignment), which leaves a literal condition for these
+        # rows to count. A parenthesized condition is walked through like a
+        # pattern.
+        #
+        # `case <read>` with a subject folds to `case true`, every `when` left
+        # comparing against the literal (`===`), which no row above can see.
+        # A pattern-matching `case <read> in …` is a different node, and the
+        # engine leaves it the same way: `case true`, every `in` matching
+        # against the literal.
+        literal_residues=(
+            ("when", "pattern"),
+            ("case", "value"),
+            ("case_match", "value"),
+            ("if", "condition"),
+            ("unless", "condition"),
+            ("elsif", "condition"),
+        ),
+        transparent_nodes=frozenset({"pattern", "parenthesized_statements"}),
         # Unreachable code after a folded `if`/`else` is not fatal in Ruby
         # (there is no compile step to reject it, and no standard gate that
         # fails on it), so `unreachable_is_fatal` stays off as it does
@@ -628,9 +694,9 @@ _PROFILES: dict[str, _Profile] = {
     # parse with ZERO errors and none of the 324 runs is refused.
     #
     # It also fixes a SECOND, independent defect, and that one writes to disk:
-    # registering any `erb` profile arms `strip_introduced_trailing_whitespace`
-    # and `reindent.reindent_spliced_lines`, both gated on `supported()` and
-    # both reading the profile's grammar over the REAL file. Under the Ruby
+    # registering any `erb` profile arms `strip_introduced_trailing_whitespace`,
+    # which is gated on `supported()` and reads the profile's grammar over the
+    # REAL file. Under the Ruby
     # grammar `_leaf_spans` shreds markup into identifiers with the whitespace
     # falling BETWEEN leaves, so the pass strips significant trailing spaces
     # out of `<pre>` and `<textarea>` — changing what the page renders. Under
@@ -657,14 +723,11 @@ _PROFILES: dict[str, _Profile] = {
         # re-opened for `.erb`. A template does not parse as a `case` under any
         # grammar in play, so nothing on THIS side of the split could see it.
         #
-        # `ruby_fold` is deliberately NOT extended to `erb`. `piranha_runner`
-        # gates `_fold_ruby_literals` on `language == "ruby"` and it parses
-        # with the Ruby grammar, so it cannot see a template's `when` either.
-        # The consequence is that for `.erb` a `when` residue is REFUSED rather
-        # than folded — loud instead of silent, which is the right side to fail
-        # on, and the same state Go was in before #2692. Do not quietly extend
-        # the fold to close it; extending it means teaching that module the
-        # template grammar, which is its own decision.
+        # The engine folds a `case` written inside ONE tag, which is plain
+        # Ruby. A `case` whose `when` arms sit in separate tags never reaches
+        # its rules -- the engine's template view does not parse it and skips
+        # the file -- so for `.erb` that `when` residue is REFUSED rather than
+        # folded: loud instead of silent, which is the right side to fail on.
         code_view="ruby",
     ),
     "csharp": _Profile(
@@ -759,12 +822,10 @@ def _code_view(source: str, language: str) -> str:
     than a ``code`` one and so contributes nothing, as does ``<%% … %>``.
 
     **This is a DERIVED string and its byte offsets are its own.** Nothing that
-    edits the file may be pointed at it — :func:`_leaf_spans`,
-    :func:`_construct_at` and :func:`_construct_spans` all reason about offsets
-    into the REAL file and are consumed by
-    :func:`strip_introduced_trailing_whitespace` and by
-    :mod:`flag_cleanup.reindent`, so aiming those here would make the
-    whitespace pass index a different document. Only the three checks that ask
+    edits the file may be pointed at it — :func:`_leaf_spans` reasons about
+    offsets into the REAL file and is consumed by
+    :func:`strip_introduced_trailing_whitespace`, so aiming it here would make
+    the whitespace pass index a different document. Only the three checks that ask
     a question ABOUT THE CODE (the error count, the stranded keywords and the
     literal residues) look at it; the structural half keeps parsing real bytes.
 
@@ -811,9 +872,7 @@ def _root_node(source: str, language: str) -> Node:
     """The parse tree root, from whichever of the two parsers owns ``language``.
 
     Cached because a single pass over one file asks several independent
-    questions of the same tree — :func:`_leaf_spans`, :func:`_construct_at` and
-    :func:`_construct_spans` each want it, and :mod:`flag_cleanup.reindent` asks
-    once per changed hunk. Four entries is deliberately just enough to hold one
+    questions of the same tree. Four entries is deliberately just enough to hold one
     file's ``before`` and ``after`` without the interleaving evicting either;
     holding a node holds its whole tree, so this is a bound, not a store.
     """
@@ -822,45 +881,6 @@ def _root_node(source: str, language: str) -> Node:
         if language in _TS_LANGUAGES
         else _parse(source, language)
     )
-
-
-def _construct_at(source: str, language: str, start: int, beyond: int) -> str | None:
-    """Type of the innermost node that BEGINS at ``start`` and ends past ``beyond``.
-
-    "The construct this line opens" — for an ``if`` header, the ``if`` statement
-    itself. Naming no type and reading one off the tree is the same trade
-    :func:`_leaf_spans` makes: the caller compares what it finds here against
-    what it finds in the rewritten file, so the type is data, never a list to
-    keep current.
-
-    INNERMOST, and found by descending rather than by comparing sizes, because a
-    body container routinely begins at the very same byte. Go's
-    ``statement_list``, Ruby's ``body_statement``, Swift's ``statements`` and
-    Python's ``block`` all start at their block's FIRST STATEMENT, which IS the
-    header whenever the header is the first thing in an enclosing block — and in
-    Ruby the container and the ``if`` even share an end byte, so "the smaller of
-    the two" does not separate them while "the deeper of the two" does.
-
-    ``None`` when the line opens nothing that outlives it: a ``} else {`` line
-    begins with the brace closing the block above it, and a line holding a
-    complete statement is over before ``beyond``. Also ``None`` when the only
-    thing beginning here is the CONTAINER the line is the first element of —
-    see :func:`_begins_a_sequence`, which is the same four containers the
-    paragraph above names, asked about the line BELOW the header instead.
-    """
-    node, found = _root_node(source, language), None
-    while True:
-        for child in node.children:
-            if child.start_byte <= start < child.end_byte:
-                if child.start_byte == start and child.end_byte > beyond:
-                    found = child
-                node = child
-                break
-        else:
-            break
-    if found is None or _begins_a_sequence(found, beyond):
-        return None
-    return found.type
 
 
 def _begins_a_sequence(node: Node, beyond: int) -> bool:
@@ -933,15 +953,6 @@ def _begins_a_sequence(node: Node, beyond: int) -> bool:
     return all(
         node.field_name_for_child(index) is None for index in range(node.child_count)
     )
-
-
-def _construct_spans(source: str, language: str, kind: str) -> list[tuple[int, int]]:
-    """Byte ranges of every node whose type is ``kind``."""
-    return [
-        (node.start_byte, node.end_byte)
-        for node in _walk(_root_node(source, language))
-        if node.type == kind
-    ]
 
 
 def strip_introduced_trailing_whitespace(before: str, after: str, language: str) -> str:
@@ -1272,9 +1283,10 @@ def _literal_residues(source: str, language: str) -> int:
     # code view restores Ruby's entry verbatim.
     if profile.code_view is not None:
         return _literal_residues(_code_view(source, language), profile.code_view)
-    if not profile.literal_residues:
+    if not profile.literal_residues and not profile.unfielded_literal_residues:
         return 0
     wanted = dict(profile.literal_residues)
+    unfielded = profile.unfielded_literal_residues
     booleans = profile.boolean_nodes or _BOOLEAN_LITERALS
 
     def is_literal(node: Node) -> bool:
@@ -1287,17 +1299,44 @@ def _literal_residues(source: str, language: str) -> int:
     # `condition` field per clause, and the engine leaves
     # `if let x = lookup(), false` standing (folding it would drop the call)
     # with the literal in the SECOND clause.
-    return sum(
-        1
-        for node in _walk(_parse(source, language))
-        if node.type in wanted
-        for condition in node.children_by_field_name(wanted[node.type])
-        if is_literal(condition)
-    )
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type in wanted:
+            count += sum(
+                1 for condition in node.children_by_field_name(wanted[node.type])
+                if is_literal(condition)
+            )
+        elif node.type in unfielded and node.named_child_count and is_literal(
+            node.named_children[0]
+        ):
+            count += 1
+    return count
 
 
-#: The multi-way guards whose literal arms `literal_residues` cannot express,
-#: counted by the fold module that finishes them. Kotlin's subject-less
+def _go_tagless_alternatives(source: str) -> int:
+    """How many literals sit among SEVERAL values of a tagless Go ``case``.
+
+    ``case n == 3, <read>:`` folds to ``case n == 3, true:``, an arm that
+    always matches. The ``literal_residues`` row for ``expression_case`` sees a
+    lone value only, since ``_through_wrappers`` deliberately does not pick one
+    child out of a genuine list. Under a TAGLESS switch every value in the list
+    is a condition of its own, so each literal among them is counted; under
+    ``switch x`` they are values compared with ``x``, which this leaves alone.
+    """
+    count = 0
+    for node in _walk(_parse(source, "go")):
+        if node.type != "expression_switch_statement" or node.child_by_field_name("value"):
+            continue
+        for arm in node.named_children:
+            values = arm.child_by_field_name("value") if arm.type == "expression_case" else None
+            if values is None or values.type != "expression_list" or values.named_child_count < 2:
+                continue
+            count += sum(1 for value in values.named_children if value.type in _BOOLEAN_LITERALS)
+    return count
+
+
+#: The multi-way guards whose literal arms `literal_residues` cannot express.
+#: The engine finishes both; these count what it leaves. Kotlin's subject-less
 #: ``when { true -> … }`` and the TypeScript family's ``switch (true) { case
 #: true: … }`` are the same construct as Go's tagless switch, Ruby's
 #: subject-less ``case`` and PHP's ``switch (true)``, and had the same gap: the
@@ -1310,15 +1349,16 @@ def _literal_residues(source: str, language: str) -> int:
 #: node-TYPE test cannot tell ``true`` from any name; and in both languages the
 #: residue is a literal arm under a guard with NO SUBJECT, while the same arm
 #: under ``when (x)``/``switch (x)`` is a complete fold comparing a value. A
-#: (node type, field) pair can say neither. Delegating to the fold's own count
-#: also makes "what the fold declines" and "what this refuses" one definition
-#: by construction: the fold handles what it can, and every arm it leaves —
-#: a fall-through it cannot rule out, a ``default``/``else`` above the flag's
-#: arm, an arm sharing its line — is refused here instead of shipped.
+#: (node type, field) pair can say neither. Each counts EVERY literal arm under
+#: a subject-less guard, not only the shapes the engine rewrites, which is what
+#: keeps a decline safe: every arm the engine leaves — a fall-through it cannot
+#: rule out, a ``default:`` above the flag's arm, an arm listing several
+#: conditions — is refused here instead of shipped.
 _MULTIWAY_LITERAL_ARMS: dict[str, Callable[[str], int]] = {
-    "kt": kotlin_fold.literal_arms,
+    "kt": kotlin_when_arms.literal_arms,
+    "go": _go_tagless_alternatives,
     **{
-        language: (lambda source, language=language: ts_switch_fold.literal_arms(source, language))
+        language: (lambda source, language=language: ts_switch_arms.literal_arms(source, language))
         for language in _TS_LANGUAGES
     },
 }
@@ -1392,6 +1432,110 @@ def _null_literal_comparisons(source: str, language: str) -> int:
     return total
 
 
+#: Per grammar: the guard node, and whether a ``false`` guard is itself a
+#: compile error. javac rejects `case String s when false` wherever it stands
+#: ("a guard that is a constant expression with value 'false'"); C# accepts it.
+_GUARDS = {"java": ("guard", True), "csharp": ("when_clause", False)}
+
+
+def _guard_literal(guard: Node) -> str | None:
+    """``"true"``/``"false"`` when ``guard``'s condition is that literal, else None."""
+    named = [c for c in guard.named_children if c.type != "comment"]
+    condition = named[-1] if named else None
+    while condition is not None and condition.type == "parenthesized_expression":
+        inner = [c for c in condition.named_children if c.type != "comment"]
+        condition = inner[0] if len(inner) == 1 else None
+    if condition is None:
+        return None
+    # Java names the literal by its value; C# has one node type for both.
+    if condition.type in ("true", "false"):
+        return condition.type
+    if condition.type == "boolean_literal" and condition.text in (b"true", b"false"):
+        return condition.text.decode()
+    return None
+
+
+def _is_catch_all(case: Node, language: str) -> bool:
+    """Whether a later arm or label is the switch's unguarded catch-all.
+
+    C#: a ``_`` arm or a ``default:`` section. Java: a ``default`` label,
+    which has no named child.
+    """
+    if language == "java":
+        return case.type == "switch_label" and case.named_child_count == 0
+    if case.type == "switch_expression_arm":
+        named = [c for c in case.named_children if c.type != "comment"]
+        return len(named) == 2 and named[0].type == "discard"
+    return case.type == "switch_section" and bool(case.children) and (
+        case.children[0].type == "default"
+    )
+
+
+def _later_cases(guard: Node, language: str) -> list[Node]:
+    """The arms (C#) or labels (Java) after the one ``guard`` belongs to."""
+    arm = guard.parent
+    if arm is None:
+        return []
+    if language == "java":
+        rule = arm.parent
+        block = rule.parent if rule is not None else None
+        if block is None:
+            return []
+        return [
+            label
+            for sibling in block.named_children
+            if sibling.start_byte >= rule.end_byte
+            for label in sibling.named_children
+            if label.type == "switch_label"
+        ]
+    container = arm.parent
+    if container is None:
+        return []
+    return [
+        c
+        for c in container.named_children
+        if c.start_byte >= arm.end_byte and c.type in ("switch_expression_arm", "switch_section")
+    ]
+
+
+def _constant_guards(source: str, language: str) -> int:
+    """Pattern guards left holding a literal the compiler acts on.
+
+    ``case X when <read>`` folds to ``case X when true``, and both compilers
+    read a constant ``true`` guard as NO guard. ``X`` then subsumes every later
+    case it covers, and each of those stops compiling: CS8510/CS8120 in C#,
+    "dominated by a preceding case label" from javac. The source compiled only
+    because the guard was not constant, so nothing above can see it.
+
+    Which later cases ``X`` covers depends on types, so any later case counts
+    except the catch-all (``_``, ``default``): an arm worth guarding leaves
+    values out, so the catch-all still has something to match. The engine
+    deletes a later case with the SAME pattern, which is the shape a flag
+    usually leaves (``X when <read> => new, X => old``); what it leaves is
+    counted here. Refused rather than repaired, for the reason it is left.
+
+    Java also rejects a constant ``false`` guard outright. The engine deletes
+    an arrow rule holding one; a colon-form label (``case X when false:``),
+    which a label above can fall into, is left and counted.
+    """
+    entry = _GUARDS.get(language)
+    if entry is None:
+        return 0
+    guard_type, false_is_fatal = entry
+    total = 0
+    for node in _walk(_parse(source, language)):
+        if node.type != guard_type:
+            continue
+        literal = _guard_literal(node)
+        if literal == "false" and false_is_fatal:
+            total += 1
+        elif literal == "true" and any(
+            not _is_catch_all(case, language) for case in _later_cases(node, language)
+        ):
+            total += 1
+    return total
+
+
 def _literal_statements(source: str, language: str) -> int:
     """How many boolean literals in ``source`` stand ALONE as a statement.
 
@@ -1414,6 +1558,12 @@ def _literal_statements(source: str, language: str) -> int:
     is why the tool's only fixture for a mock-framework read was written for
     the one language that could not exhibit the bug.
 
+    Go's ``go`` and ``defer`` take the read as their operand the same way
+    (``go client.BoolVariation(…)``), and ``go true`` is the same failure:
+    tree-sitter reads ``(go_statement (true))`` with no ERROR node, ``go build``
+    says ``expression in go must be function call``. Those two kinds exist only
+    in the Go grammar.
+
     Differential like everything else: a file that somehow already contained
     one is judged on the rest, and only a rewrite that ADDS one is refused.
     """
@@ -1423,10 +1573,15 @@ def _literal_statements(source: str, language: str) -> int:
     return sum(
         1
         for node in _walk(_parse(source, language))
-        if node.type == "expression_statement"
+        if node.type in _LITERAL_HOLDING_STATEMENTS
         and node.named_child_count == 1
         and node.named_children[0].type in _BOOLEAN_LITERALS
     )
+
+
+#: Statements whose whole content may be the read, and so the literal after a
+#: fold: :func:`_literal_statements`.
+_LITERAL_HOLDING_STATEMENTS = frozenset({"expression_statement", "go_statement", "defer_statement"})
 
 
 def _lost_side_effects(source: str, language: str) -> int:
@@ -1523,12 +1678,17 @@ class _Dialect:
     #: function is never deleted (``no-unreachable`` ignores it too), and a
     #: ``var`` loses only its initialiser. Only the TypeScript family hoists.
     hoists: bool = False
+    #: Statements after which nothing in the same list runs. Java adds
+    #: ``yield``, which ends a switch-rule block the way ``return`` ends a
+    #: method; Dart spells a generator's ``yield`` with the same node type, and
+    #: that one hands a value back and carries on.
+    terminals: frozenset[str] = _TERMINAL_STATEMENTS
 
 
-#: Java's, and Dart's: the Dart profile records that every node name here is
-#: present and identical in that grammar, which is why it needed the flag and
-#: no new code.
-_JAVA_DIALECT = _Dialect(
+#: Dart's, and Java's below: the Dart profile records that every node name here
+#: is present and identical in that grammar, which is why it needed the flag and
+#: no new code. The one difference is ``yield`` (see ``terminals``).
+_DART_DIALECT = _Dialect(
     parse=_parse,
     blocks=frozenset({"block"}),
     statement_lists=frozenset({"block"}),
@@ -1536,6 +1696,10 @@ _JAVA_DIALECT = _Dialect(
     label_nodes=frozenset({"identifier"}),
     breakable=_BREAKABLE,
     dead_loop_is_fatal=True,
+)
+
+_JAVA_DIALECT = replace(
+    _DART_DIALECT, terminals=_TERMINAL_STATEMENTS | {"yield_statement"}
 )
 
 #: The TypeScript family's. Four node names differ from Java's and each was
@@ -1564,9 +1728,10 @@ _JAVA_DIALECT = _Dialect(
 #: this pass neither counts nor deletes them. They are not lint-clean all the
 #: same: ``no-constant-condition`` rejects both (and a ``do … while`` on either
 #: literal, and ``for (; true; )``), which an earlier version of this comment
-#: missed. The dead ``while`` is deleted by :func:`remove_dead_loops`, the dead
-#: ``for`` and ``do`` by :mod:`flag_cleanup.ts_dead_code`, and whatever those
-#: decline is refused by Gate 1 (``ts_dead_code.constant_condition_loops``).
+#: missed. The engine deletes the dead ``while`` and most dead ``for`` loops,
+#: :mod:`flag_cleanup.ts_dead_code` the ``for`` it declines and the ``do``, and
+#: whatever is still left is refused by Gate 1
+#: (``ts_dead_code.constant_condition_loops``).
 _TS_DIALECT = _Dialect(
     parse=ts_syntax._parse,
     blocks=frozenset({"statement_block"}),
@@ -1596,8 +1761,20 @@ def _unreachable_dialect(language: str) -> _Dialect | None:
     """
     profile = _PROFILES.get(language)
     if profile is not None:
-        return _JAVA_DIALECT if profile.unreachable_is_fatal else None
+        if not profile.unreachable_is_fatal:
+            return None
+        return _JAVA_DIALECT if language == "java" else _DART_DIALECT
     return _TS_DIALECT if language in _TS_LANGUAGES else None
+
+
+def unreachable_is_fatal(language: str) -> bool:
+    """Whether ``language``'s build rejects a statement that can never run.
+
+    The question :func:`remove_unreachable_statements` is scoped by, for a
+    caller that only needs the answer: the pull request names the engine's own
+    deletions of such statements in exactly these languages.
+    """
+    return _unreachable_dialect(language) is not None
 
 
 def _loop_condition_literal(loop: Node) -> str | None:
@@ -1683,8 +1860,10 @@ def _completes_abruptly(node: Node | None, dialect: _Dialect) -> bool:
         if len(inner) != 1:
             return False
         node = inner[0]
-    if node.type in _TERMINAL_STATEMENTS:
+    if node.type in dialect.terminals:
         return True
+    if node.type in _TRY_STATEMENTS:
+        return _try_completes_abruptly(node, dialect)
     if node.type in dialect.blocks:
         statements = [c for c in node.named_children if c.type != "comment"]
         return bool(statements) and _completes_abruptly(statements[-1], dialect)
@@ -1695,6 +1874,46 @@ def _completes_abruptly(node: Node | None, dialect: _Dialect) -> bool:
     if node.type in _CONDITION_LOOPS:
         return _loop_runs_forever(node) and not _escapes(node, dialect)
     return False
+
+
+#: A try statement, in every grammar this pass reads; Java's resource form too.
+_TRY_STATEMENTS = frozenset({"try_statement", "try_with_resources_statement"})
+
+
+def _try_completes_abruptly(node: Node, dialect: _Dialect) -> bool:
+    """Whether control can never fall out of the bottom of a try statement.
+
+    JLS 14.21 again: a ``try`` completes normally when its body or any catch
+    block does AND its finally block does. So it is abrupt when its finally
+    block is, or when its body and every catch block are. The fold reaches
+    this through the body: ``try { if (<read>) { return a; } b(); }`` leaves
+    ``try { return a; }``, and the statement after the ``try`` stops compiling.
+
+    The grammars hang a catch block in two places. Java and TypeScript put it
+    inside a ``catch_clause``; Dart puts it beside one, as a block directly
+    under the ``try`` (an ``on E { … }`` arm has no ``catch_clause`` at all).
+    Both are collected, and the body is told apart by its field.
+    """
+    body = node.child_by_field_name("body")
+    handlers: list[Node | None] = []
+    for child in node.named_children:
+        if child.type == "finally_clause":
+            blocks = [c for c in child.named_children if c.type in dialect.blocks]
+            if blocks and _completes_abruptly(blocks[-1], dialect):
+                return True
+        elif child.type == "catch_clause":
+            catch_body = child.child_by_field_name("body")
+            if catch_body is None:
+                # Dart: the block follows the clause as a sibling, below.
+                continue
+            handlers.append(catch_body)
+        elif child.type in dialect.blocks and (
+            body is None or child.id != body.id
+        ):
+            handlers.append(child)
+    return _completes_abruptly(body, dialect) and all(
+        _completes_abruptly(h, dialect) for h in handlers
+    )
 
 
 def _loop_runs_forever(loop: Node) -> bool:
@@ -1803,12 +2022,16 @@ def _unreachable_statement_nodes(source: str, language: str) -> list[Node]:
         # A `while` the fold emptied is dead in its ENTIRETY, so the statement
         # itself is what goes. Deleting only the body leaves `while (false) { }`,
         # which is the same compile error — measured, along with
-        # `while (false);`, whose body is merely an empty statement.
+        # `while (false);`, whose body is merely an empty statement. A label
+        # goes with its loop: nothing outside the loop can jump to it. What
+        # the statement becomes is :func:`_dead_loop_replacement`'s call.
         if (
             dialect.dead_loop_is_fatal
             and node.type == "while_statement"
             and _loop_condition_literal(node) == "false"
         ):
+            while node.parent is not None and node.parent.type == "labeled_statement":
+                node = node.parent
             stranded.append(node)
             continue
         # Everything else is ONE rule applied to statement LISTS, because a
@@ -1858,6 +2081,57 @@ def _hoisted_and_harmless(node: Node, dialect: _Dialect) -> bool:
         for d in node.named_children
         if d.type == "variable_declarator"
     )
+
+
+#: Where a dead Java or Dart loop can simply go: lists of statements, where
+#: one fewer is always valid. Java's ``case`` group falls through whether or
+#: not it holds a statement, so deleting from it changes nothing.
+_LOOP_STATEMENT_LISTS = frozenset(
+    {
+        "block",
+        "constructor_body",
+        "switch_block_statement_group",
+        "switch_statement_case",
+        "switch_statement_default",
+    }
+)
+
+#: Dart's ``case`` and ``default``. Dart 3 runs an EMPTY case into the next
+#: one's body, so a case must not be emptied.
+_DART_CASES = frozenset({"switch_statement_case", "switch_statement_default"})
+
+
+def _dead_loop_replacement(node: Node, dialect: _Dialect) -> bytes | None:
+    """What a dead Java or Dart loop (or the label holding one) becomes; None deletes it.
+
+    Anywhere but a statement list the loop is the BODY of something, an
+    unbraced ``if``, ``else`` or loop, and deleting it would make the next
+    statement that body instead: ``if (c) while (false) x(); b();`` would run
+    ``b()`` only when ``c``. It becomes ``{}``, which both compilers accept
+    without a warning. A Dart case whose only statement it is becomes
+    ``break;``, which keeps the case from running the next one's body.
+    """
+    loop = node
+    while loop is not None and loop.type == "labeled_statement":
+        loop = loop.named_children[-1] if loop.named_children else None
+    if (
+        not dialect.dead_loop_is_fatal
+        or loop is None
+        or loop.type != "while_statement"
+        or _loop_condition_literal(loop) != "false"
+    ):
+        return None
+    parent = node.parent
+    if parent is None or parent.type not in _LOOP_STATEMENT_LISTS:
+        return b"{}"
+    if parent.type in _DART_CASES:
+        colon = next(i for i, c in enumerate(parent.children) if c.type == ":")
+        statements = [
+            c for c in parent.children[colon + 1 :] if c.is_named and c.type != "comment"
+        ]
+        if [(c.start_byte, c.end_byte) for c in statements] == [(node.start_byte, node.end_byte)]:
+            return b"break;"
+    return None
 
 
 def _hoisted_replacement(node: Node, dialect: _Dialect) -> bytes | None:
@@ -1948,7 +2222,9 @@ def remove_unreachable_statements(
     for _ in range(10):
         nodes = _unreachable_statement_nodes(data.decode("utf-8"), language)
         replacements = {
-            (n.start_byte, n.end_byte): _hoisted_replacement(n, dialect) for n in nodes
+            (n.start_byte, n.end_byte): _dead_loop_replacement(n, dialect)
+            or _hoisted_replacement(n, dialect)
+            for n in nodes
         }
         # A `var` this cannot shorten (a destructuring pattern) comes back as
         # its own text: leave it, and let the count refuse the file.
@@ -1970,199 +2246,70 @@ def remove_unreachable_statements(
     return data.decode("utf-8"), removed
 
 
-@dataclass(frozen=True)
-class _DeadLoopSpec:
-    """How one grammar spells a pre-test loop, and where deleting one is safe.
-
-    ``loops`` maps a loop node type to the literal that makes it dead —
-    ``while`` dies on ``false``, Ruby's ``until`` on ``true``. Only PRE-test
-    loops are listed: a ``do … while (false)`` / ``repeat … while false`` /
-    ``begin … end while false`` runs its body once and is not dead.
-
-    ``containers`` are the parents a loop may be deleted from — statement lists
-    where one fewer statement is always valid. A loop anywhere else (an
-    unbraced ``if`` body, a labelled statement, a switch arm) is left standing,
-    because deleting it there can break the syntax or, for a label, a ``goto``.
-    """
-
-    loops: dict[str, str]
-    literal_types: frozenset[str]
-    containers: frozenset[str]
+_PARENTHESES = frozenset({"parenthesized_expression", "tuple_expression"})
 
 
-#: Every language the fold can leave a dead loop in, EXCEPT Java and Dart,
-#: whose dead loops :func:`remove_unreachable_statements` already deletes
-#: (``dead_loop_is_fatal``) — two passes over one loop would race. ERB is
-#: absent: its loops live across template tags, which this cannot see.
-_DEAD_LOOP_SPECS: dict[str, _DeadLoopSpec] = {
-    **{
-        lang: _DeadLoopSpec(
-            loops={"while_statement": "false"},
-            literal_types=frozenset({"false"}),
-            containers=frozenset({"statement_block", "program"}),
-        )
-        for lang in _TS_LANGUAGES
-    },
-    # kotlin-ng parses the literal as an `identifier`; a name cannot be spelled
-    # `false` in Kotlin, so the text decides. A label is a CHILD of the loop.
-    "kt": _DeadLoopSpec(
-        loops={"while_statement": "false"},
-        literal_types=frozenset({"identifier", "boolean_literal"}),
-        containers=frozenset({"block"}),
-    ),
-    "csharp": _DeadLoopSpec(
-        loops={"while_statement": "false"},
-        literal_types=frozenset({"boolean_literal"}),
-        containers=frozenset({"block"}),
-    ),
-    # Go's `for <cond> { }` is its while. The condition has no field name, and
-    # a `for_clause` form is skipped: its initializer runs even when the
-    # condition is false.
-    "go": _DeadLoopSpec(
-        loops={"for_statement": "false"},
-        literal_types=frozenset({"false"}),
-        containers=frozenset({"statement_list"}),
-    ),
-    "php": _DeadLoopSpec(
-        loops={"while_statement": "false"},
-        literal_types=frozenset({"boolean"}),
-        containers=frozenset({"compound_statement", "colon_block", "program"}),
-    ),
-    # The block form only; `x while false` and `begin … end while false` are
-    # `while_modifier`, and the second runs its body once.
-    "ruby": _DeadLoopSpec(
-        loops={"while": "false", "until": "true"},
-        literal_types=frozenset({"false", "true"}),
-        containers=frozenset({"body_statement", "program", "then", "else", "do", "begin"}),
-    ),
-    "python": _DeadLoopSpec(
-        loops={"while_statement": "False"},
-        literal_types=frozenset({"false"}),
-        containers=frozenset({"block", "module"}),
-    ),
-    # A label is a SIBLING statement here, and a `case` whose only statement
-    # was the loop would be left empty, which Swift rejects.
-    "swift": _DeadLoopSpec(
-        loops={"while_statement": "false"},
-        literal_types=frozenset({"boolean_literal"}),
-        containers=frozenset({"statements"}),
-    ),
-}
-
-_PARENTHESES = frozenset({"parenthesized_expression", "parenthesized_statements", "tuple_expression"})
-
-
-def _dead_loop_condition(loop: Node, language: str) -> Node | None:
-    """The loop's condition with parentheses peeled off, or None if it has none we model."""
-    if language == "go":
-        named = [c for c in loop.named_children if c.type != "comment"]
-        # `for false { … }` is exactly [condition, block]. A `for_clause` or
-        # `range_clause` form has a different shape and is not a while.
-        if len(named) != 2 or named[1].type != "block":
-            return None
-        condition = named[0]
-    else:
-        condition = loop.child_by_field_name("condition")
-    while condition is not None and condition.type in _PARENTHESES:
-        inner = [c for c in condition.named_children if c.type != "comment"]
-        condition = inner[0] if len(inner) == 1 else None
-    return condition
-
-
-def _is_dead_loop(node: Node, source: bytes, language: str, spec: _DeadLoopSpec) -> bool:
-    literal = spec.loops.get(node.type)
-    if literal is None:
-        return False
-    condition = _dead_loop_condition(node, language)
-    if condition is None or condition.type not in spec.literal_types or condition.named_child_count:
-        return False
-    text = source[condition.start_byte : condition.end_byte].decode("utf-8")
-    # PHP's literals are case-insensitive; everywhere else the spelling is exact.
-    return (text.lower() == literal.lower()) if language == "php" else text == literal
-
-
-def _dead_loops(source: str, language: str) -> list[Node]:
-    """Pre-test loops in ``source`` whose condition is the dead literal."""
-    spec = _DEAD_LOOP_SPECS.get(language)
-    if spec is None:
-        return []
+def _swift_dead_loops(source: str) -> list[Node]:
+    """Swift's ``while false`` loops, the condition read through parentheses."""
     data = source.encode("utf-8")
-    return [
-        node
-        for node in _walk(_root_node(source, language))
-        if _is_dead_loop(node, data, language, spec)
-    ]
+    loops = []
+    for node in _walk(_root_node(source, "swift")):
+        if node.type != "while_statement":
+            continue
+        condition = node.child_by_field_name("condition")
+        while condition is not None and condition.type in _PARENTHESES:
+            inner = [c for c in condition.named_children if c.type != "comment"]
+            condition = inner[0] if len(inner) == 1 else None
+        if (
+            condition is not None
+            and condition.type == "boolean_literal"
+            and data[condition.start_byte : condition.end_byte] == b"false"
+        ):
+            loops.append(node)
+    return loops
 
 
-def _deletable(loop: Node, language: str) -> bool:
-    """Whether deleting ``loop`` keeps the file valid and its meaning intact."""
-    spec = _DEAD_LOOP_SPECS[language]
+def _swift_deletable(loop: Node) -> bool:
+    """Whether deleting ``loop`` keeps the file valid and its meaning intact.
+
+    Only from a ``statements`` list, never a labelled loop (the label is a
+    SIBLING statement here, possibly with comments between the two), and never
+    from a ``case``, which Swift rejects once it is left empty.
+    """
     parent = loop.parent
-    if parent is None or parent.type not in spec.containers:
+    if parent is None or parent.type != "statements":
         return False
-    if language == "go" and (parent.parent is None or parent.parent.type != "block"):
+    previous = loop.prev_named_sibling
+    while previous is not None and previous.type in ("comment", "multiline_comment"):
+        previous = previous.prev_named_sibling
+    if previous is not None and previous.type == "statement_label":
         return False
-    if language == "kt" and any(c.type == "label" for c in loop.children):
-        return False
-    if language == "swift":
-        previous = loop.prev_named_sibling
-        while previous is not None and previous.type in ("comment", "multiline_comment"):
-            previous = previous.prev_named_sibling
-        if previous is not None and previous.type == "statement_label":
-            return False
-        if parent.parent is not None and parent.parent.type == "switch_entry":
-            return False
-    # `while False: … else: …` runs its `else` — the loop is not dead code.
-    if language == "python" and loop.child_by_field_name("alternative") is not None:
-        return False
-    return True
+    return parent.parent is None or parent.parent.type != "switch_entry"
 
 
 def remove_dead_loops(before: str, after: str, language: str) -> tuple[str, list[str]]:
-    """Delete loops the fold made dead; return the new source and their text.
+    """Delete the Swift dead loop the engine leaves; return the new source and its text.
 
-    A flag read as a loop condition folds to ``while (false)`` on the false
-    treatment, and that loop can never run its body. Java and Dart delete it
-    already, because their toolchains reject it; this deletes it everywhere
-    else, on the plainer ground that it is dead code the flag removal created.
-    Every loop removed is returned so the pull request can name it — the same
-    rule as :func:`remove_unreachable_statements`: behaviour-neutral, but the
-    code was the customer's.
+    The engine deletes a loop its own fold made dead (``while (false)``, Go's
+    ``for false``, Ruby's ``until true``) in every language's cascade, and its
+    summary names the rule, which is how the pull request lists it. Its Swift
+    rules decline one position this side can still finish: a loop with a
+    comment directly above it. A query cannot look past a run of comments for
+    a label the loop might carry; :func:`_swift_deletable` can. Every other
+    language is the engine's alone, so this is a no-op outside Swift.
 
-    Conservative in the same two ways as that pass:
-
-    * **Nothing is touched if ``before`` already had a dead loop.** Then this
-      cannot tell the fold's from the customer's own.
-    * **A loop is deleted only where deleting it is plainly valid** — see
-      :func:`_deletable`. Anything else is left standing, which is what every
-      language did before this existed.
-
-    Python is the one language where a block cannot be empty, so a loop that
-    was its block's only statement becomes ``pass`` rather than nothing.
+    Nothing is touched if ``before`` already had a dead loop: then this cannot
+    tell the fold's from the customer's own.
     """
-    if language not in _DEAD_LOOP_SPECS or after == before:
+    if language != "swift" or after == before or _swift_dead_loops(before):
         return after, []
-    if _dead_loops(before, language):
-        return after, []
-    loops = [n for n in _dead_loops(after, language) if _deletable(n, language)]
+    loops = [n for n in _swift_dead_loops(after) if _swift_deletable(n)]
     if not loops:
         return after, []
     data = after.encode("utf-8")
     removed: list[str] = []
-    spans = _outermost([(n.start_byte, n.end_byte) for n in loops])
-    sole = {
-        (n.start_byte, n.end_byte)
-        for n in loops
-        if language == "python"
-        and n.parent is not None
-        and n.parent.type == "block"
-        and len([c for c in n.parent.named_children if c.type != "comment"]) == 1
-    }
-    for start, end in sorted(spans, reverse=True):
+    for start, end in sorted(_outermost([(n.start_byte, n.end_byte) for n in loops]), reverse=True):
         removed.append(data[start:end].decode("utf-8"))
-        if (start, end) in sole:
-            data = data[:start] + b"pass" + data[end:]
-            continue
         wide_start, wide_end = _expand_to_whole_lines(data, start, end)
         data = data[:wide_start] + data[wide_end:]
     return data.decode("utf-8"), removed
@@ -2218,11 +2365,27 @@ _MOCK_STUBBING_ARROW_NAMES = ("verifyNever", "verify", "when")
 #: never reaches the DSL. Swift has no such library surface in the rules.
 _MOCK_STUBBING_DSL_LANGUAGES = frozenset({"java", "kt", "dart", "ts", "tsx", "js"})
 
-_MOCK_STUBBED_LITERAL = re.compile(
-    r"\b(?:" + "|".join(_MOCK_STUBBING_PAREN_NAMES) + r")\s*\(\s*(?:true|false)\s*\)"
-    r"|\b(?:" + "|".join(_MOCK_STUBBING_BRACE_NAMES) + r")\s*\{\s*(?:true|false)\s*\}"
-    r"|\b(?:" + "|".join(_MOCK_STUBBING_ARROW_NAMES) + r")\s*\(\s*\(\s*\)\s*(?:async\s*)?=>"
-    r"\s*(?:true|false)\s*\)"
+def _stubbed_literal_pattern(paren_names: str) -> re.Pattern[str]:
+    return re.compile(
+        paren_names + r"\s*\(\s*(?:true|false)\s*\)"
+        r"|\b(?:" + "|".join(_MOCK_STUBBING_BRACE_NAMES) + r")\s*\{\s*(?:true|false)\s*\}"
+        r"|\b(?:" + "|".join(_MOCK_STUBBING_ARROW_NAMES) + r")\s*\(\s*\(\s*\)\s*(?:async\s*)?=>"
+        r"\s*(?:true|false)\s*\)"
+    )
+
+
+_MOCK_STUBBED_LITERAL = _stubbed_literal_pattern(
+    r"\b(?:" + "|".join(_MOCK_STUBBING_PAREN_NAMES) + r")"
+)
+
+#: Kotlin's bare ``when`` is the language's own keyword: ``when (<read>) {
+#: true -> …; false -> … }`` folds to ``when (true) { … }``, which stubs
+#: nothing. Mockito's ``when`` can only be called with backticks there, so
+#: that is the spelling counted, as :func:`mock_stubs.in_test_double` does.
+_KOTLIN_MOCK_STUBBED_LITERAL = _stubbed_literal_pattern(
+    r"(?:\b(?:"
+    + "|".join(name for name in _MOCK_STUBBING_PAREN_NAMES if name != "when")
+    + r")|`when`)"
 )
 
 
@@ -2277,7 +2440,8 @@ def _mock_stubbed_literals(source: str, language: str) -> int:
     """
     if language not in _MOCK_STUBBING_DSL_LANGUAGES:
         return 0
-    return len(_MOCK_STUBBED_LITERAL.findall(source))
+    pattern = _KOTLIN_MOCK_STUBBED_LITERAL if language == "kt" else _MOCK_STUBBED_LITERAL
+    return len(pattern.findall(source))
 
 
 def transform_broke_syntax(before: str, after: str, language: str) -> bool:
@@ -2322,6 +2486,10 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
     # family as well as for Kotlin, so it must run ahead of the delegation.
     if _multiway_literal_arms(after, language) > _multiway_literal_arms(before, language):
         return "a switch/when/case arm was left testing a literal"
+    if language == "kt" and kotlin_when_arms.literal_subjects(
+        after
+    ) > kotlin_when_arms.literal_subjects(before):
+        return "a when was left switching on a literal subject"
     # The repair in `remove_unreachable_statements` has already run by the time
     # the runner asks this, so what reaches here is what the repair declined:
     # a file that ALREADY had unreachable code, where the fold's strands cannot
@@ -2332,12 +2500,17 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
     ):
         return "the fold left statements unreachable"
     if language in _TS_LANGUAGES:
-        # What the engine's loop rules and `ts_dead_code.tidy` declined: a
+        # What the engine's loop rules and `ts_dead_code.remove_dead_loops` declined: a
         # loop whose constant condition `eslint:recommended` rejects.
         if ts_dead_code.constant_condition_loops(
             after, language
         ) > ts_dead_code.constant_condition_loops(before, language):
             return "a loop was left testing a constant condition"
+        # A dead branch declaring a `var` is one the engine will not delete.
+        if ts_dead_code.constant_condition_ifs(
+            after, language
+        ) > ts_dead_code.constant_condition_ifs(before, language):
+            return "an if was left testing a constant condition"
         return ts_syntax.refusal_reason(before, after, language)
     if language not in _PROFILES:
         raise ValueError(f"unsupported language {language!r}")
@@ -2358,9 +2531,102 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
         before, language
     ):
         return "a boolean literal is now compared with null"
+    if _constant_guards(after, language) > _constant_guards(before, language):
+        return "a case guard became a constant: it hides a later case or does not compile"
     if _lost_side_effects(after, language) < _lost_side_effects(before, language):
         return "the fold would drop code that runs whatever the flag says"
+    if _stranded_template_reads(before, after, language):
+        return "a string template still reads a variable the rewrite deleted"
     return None
+
+
+#: The string nodes a ``$name`` template can sit in, per grammar.
+_TEMPLATE_STRINGS = {
+    "dart": frozenset({"string_literal"}),
+    "kt": frozenset({"string_literal", "multiline_string_literal"}),
+}
+
+#: A short-form ``$name`` template. A backslash before the ``$`` escapes it,
+#: and ``${…}`` does not match (its name is an ordinary node, which the
+#: engine rewrites with every other read).
+_SHORT_TEMPLATE = re.compile(r"(?<!\\)\$([^\W\d]\w*)")
+
+
+def _template_names(root: Node, language: str) -> list[str]:
+    """The name each short-form ``$name`` template in ``root`` reads.
+
+    Read from the string's TEXT, because neither grammar gives the read an
+    ordinary name node: Kotlin splits ``"x $ok y"`` across ``string_content``
+    leaves (``'$'``, then ``'ok y'``), and Dart puts the name in an
+    ``identifier_dollar_escaped`` leaf. A Dart raw string (``r'$ok'``)
+    interpolates nothing.
+    """
+    names: list[str] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in _TEMPLATE_STRINGS[language]:
+            text = node.text.decode("utf-8", "replace")
+            if not (language == "dart" and text[:1] in "rR"):
+                names.extend(_SHORT_TEMPLATE.findall(text))
+            continue
+        stack.extend(node.children)
+    return names
+
+
+def _declared_names(root: Node, language: str) -> dict[str, int]:
+    """How many variable declarations in ``root`` bind each name."""
+    counts: dict[str, int] = {}
+    for node in _walk(root):
+        name = None
+        if language == "kt" and node.type == "variable_declaration":
+            name = next((c for c in node.named_children if c.type == "identifier"), None)
+        elif language == "dart" and node.type == "initialized_variable_definition":
+            name = node.child_by_field_name("name")
+        elif language == "dart" and node.type == "initialized_identifier":
+            name = next((c for c in node.named_children if c.type == "identifier"), None)
+        if name is not None:
+            text = name.text.decode("utf-8", "replace").strip("`")
+            counts[text] = counts.get(text, 0) + 1
+    return counts
+
+
+def _stranded_template_reads(before: str, after: str, language: str) -> bool:
+    """Whether a ``$name`` template in ``after`` reads a variable whose
+    declaration the rewrite deleted, or now reads ``$true``/``$false``.
+
+    Inlining a local bound to the read deletes its declaration and rewrites
+    every read that is a name node. A short-form template is not one (see
+    :func:`_template_names`), so it is left naming a variable that no longer
+    exists: ``Undefined name`` to Dart, ``Unresolved reference`` to Kotlin.
+    A Kotlin raw string's ``$ok`` IS a name node, and rewriting it gives a raw
+    string holding ``$false``, which Kotlin rejects (a keyword is not a
+    reference).
+    Both parse, so nothing above sees them. Refused rather than repaired:
+    keeping the binding means leaving the customer's file as it was.
+
+    Differential on the declarations: a name only counts when ``after``
+    declares it fewer times than ``before``. Over-refuses when a same-named
+    variable elsewhere in the file is the one the template reads, which is
+    the safe direction.
+    """
+    if language not in _TEMPLATE_STRINGS:
+        return False
+    before_root = _parse(before, language)
+    after_root = _parse(after, language)
+    reads = _template_names(after_root, language)
+    if not reads:
+        return False
+    literals = ("true", "false")
+    if sum(name in literals for name in reads) > sum(
+        name in literals for name in _template_names(before_root, language)
+    ):
+        return True
+    declared_before = _declared_names(before_root, language)
+    declared_after = _declared_names(after_root, language)
+    return any(
+        declared_after.get(name, 0) < declared_before.get(name, 0) for name in set(reads)
+    )
 
 
 def const_path_is_safe(
@@ -2416,8 +2682,8 @@ def const_path_is_safe(
         # Safe to point at the derived string precisely because this question
         # produces a BOOLEAN and no edit: `path_is_safe` reads text out of the
         # tree it is given and never hands an offset back to a caller. That is
-        # what separates it from `_leaf_spans`/`_construct_at`, which must keep
-        # indexing the real file.
+        # what separates it from `_leaf_spans`, which must keep indexing the
+        # real file.
         #
         # Markup is dropped, and dropping it is correct rather than merely
         # convenient: a constant's name occurring in the page's TEXT is not a

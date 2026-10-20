@@ -36,7 +36,8 @@ worse than the one it was recovering from.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from flag_cleanup import (
@@ -185,8 +186,13 @@ def parse_command(body: str) -> str | None:
     Deliberately strict about the trailing text: "@featureflip-cleanup rerun
     please" is a person talking, and guessing that they meant the command is
     the sort of helpfulness that force-pushes a branch nobody asked about.
+
+    Only lines the comment SHOWS as text are read: a line inside a fenced or
+    indented code block is a command being explained ("to discard this,
+    comment ``@featureflip-cleanup recreate``"), and one inside an HTML comment
+    is not rendered at all. See :func:`_rendered_text_lines`.
     """
-    for line in body.splitlines():
+    for line in _rendered_text_lines(body):
         stripped = line.strip()
         lowered = stripped.lower()
         if not lowered.startswith(COMMAND_PREFIX):
@@ -201,6 +207,51 @@ def parse_command(body: str) -> str | None:
         if verb in COMMANDS:
             return verb
     return None
+
+
+# A fence opener: up to any indentation, three or more backticks or tildes. A
+# backtick fence's info string cannot itself hold a backtick, which is what
+# keeps a one-line ```...``` (inline code) from opening a block.
+_FENCE_OPEN = re.compile(r"^\s*(?:(`{3,})[^`]*|(~{3,}).*)$")
+_HTML_COMMENT = re.compile(r"<!--.*?-->")
+
+
+def _rendered_text_lines(body: str) -> Iterator[str]:
+    """The lines of ``body`` that are neither code nor inside an HTML comment.
+
+    Errs towards treating a line as code: a fence opener is recognised at any
+    indentation, and any line indented four columns or more is skipped even
+    where Markdown would fold it into the paragraph above. The cost of that is
+    a command that does not fire and says so (``not-a-command``); the cost of
+    the opposite is a command nobody issued.
+    """
+    fence = ""
+    in_comment = False
+    for line in body.splitlines():
+        if fence:
+            # Closed only by the same character, at least as many, and
+            # nothing after it; an unclosed fence runs to the end.
+            closing = line.strip()
+            if closing.startswith(fence) and closing == closing[0] * len(closing):
+                fence = ""
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        opener = _FENCE_OPEN.match(line)
+        if opener:
+            fence = opener.group(1) or opener.group(2)
+            continue
+        if "<!--" in _HTML_COMMENT.sub("", line):
+            # Opens a comment this line does not close. The line itself still
+            # carries the marker, so it can never be a whole-line command.
+            in_comment = True
+            continue
+        expanded = line.expandtabs(4)
+        if len(expanded) - len(expanded.lstrip(" ")) >= 4:
+            continue
+        yield line
 
 
 def run_pr_command(
@@ -815,15 +866,17 @@ def _dry_run_caveats(
         notes.append(f"{len(stranded)} unreachable statement(s) would be deleted")
     unread = sum(1 for _, kind, _ in bindings if kind == "unread parameter")
     unread_members = sum(1 for _, kind, _ in bindings if kind == "unread member")
+    unread_ctor = sum(1 for _, kind, _ in bindings if kind == "unread constructor parameter")
     unread_bindings = sum(1 for _, kind, _ in bindings if kind == "unread binding")
     emptied = sum(1 for _, kind, _ in bindings if kind == "emptied override")
     dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
     removed_ctor = sum(1 for _, kind, _ in bindings if kind == "removed parameter")
+    removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     cleaned = (
-        len(bindings) - unread - unread_members - unread_bindings - emptied - dropped
-        - removed_ctor - changed_ctor - kept_locals
+        len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
+        - removed_ctor - removed_members - changed_ctor - kept_locals
     )
     if cleaned:
         notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
@@ -834,6 +887,8 @@ def _dry_run_caveats(
             f"{removed_ctor} constructor parameter(s) would be removed, "
             "with their callers' arguments"
         )
+    if removed_members:
+        notes.append(f"{removed_members} private field(s) would be removed")
     if kept_locals:
         notes.append(
             f"{kept_locals} local(s) would be left unread after their argument was removed"
@@ -846,6 +901,11 @@ def _dry_run_caveats(
         notes.append(
             f"{unread_members} TypeScript/JavaScript private member(s) would be "
             "left unread (TS6133/TS6138)"
+        )
+    if unread_ctor:
+        notes.append(
+            f"{unread_ctor} TypeScript/JavaScript constructor parameter(s) would be "
+            "left unread (TS6133)"
         )
     if unread_bindings:
         notes.append(
@@ -902,6 +962,9 @@ def _dry_run_caveats(
     siblings = sum(1 for f in wrapper_findings if f[2] == "sibling")
     if siblings:
         notes.append(f"{siblings} sibling implementation(s) would be deleted with its wrapper")
+    documented = sum(1 for f in wrapper_findings if f[2] == "doc-reference")
+    if documented:
+        notes.append(f"{documented} doc comment reference(s) to a deleted wrapper would become plain text")
     if wrappers:
         notes.append(
             f"{len(wrappers)} member(s) would be left returning a constant that "

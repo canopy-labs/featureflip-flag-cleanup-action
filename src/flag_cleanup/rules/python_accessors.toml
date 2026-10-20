@@ -64,7 +64,7 @@ query = """(
     function: [(attribute attribute: (identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (string (string_content) @flag_name))
+      . (string (string_start) . (string_content) @flag_name . (string_end)))
   ) @call
   (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
   (#eq? @flag_name "@stale_flag_name")

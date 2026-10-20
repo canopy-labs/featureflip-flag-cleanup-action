@@ -1,10 +1,15 @@
-"""Remove a constructor parameter the fold left unread, and its arguments.
+"""Remove a constructor parameter or private field the fold left unread.
 
 The report passes (:mod:`flag_cleanup.ts_unread_members`,
 :mod:`flag_cleanup.primary_constructor`) name a parameter nothing reads any
-more. When every caller can be proven (:mod:`flag_cleanup.ctor_param_ts`,
+more: a TypeScript parameter property, a plain TypeScript or JavaScript
+constructor parameter, or a C# primary-constructor parameter. When every caller can be proven (:mod:`flag_cleanup.ctor_param_ts`,
 :mod:`flag_cleanup.ctor_param_csharp`), each caller's argument is replaced by a
 sentinel identifier and the engine deletes the sentinels and the parameter.
+A TypeScript or JavaScript private field (:mod:`flag_cleanup.ts_field_removal`)
+is marked the same way, with the constructor statement that assigns it, and
+takes the constructor parameter it was assigned from when nothing else reads
+that parameter.
 Deleting by a marked identity rather than by position matters: the engine
 applies a rule until it stops matching, so a positional rule would also delete
 the argument that moves into the emptied slot.
@@ -26,12 +31,20 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import ctor_param_csharp, ctor_param_ts, git_ops, syntax, ts_scope
+from flag_cleanup import (
+    ctor_param_csharp,
+    ctor_param_ts,
+    git_ops,
+    syntax,
+    ts_field_removal,
+    ts_scope,
+)
 from flag_cleanup.ctor_param_model import (
     IDENT,
     Refusal,
     Removal,
     choose_sentinel,
+    forms_for,
     mark,
     render_rules,
     tidy,
@@ -42,8 +55,9 @@ from flag_cleanup.unused import _parse
 logger = logging.getLogger(__name__)
 
 _ARGUMENT_LISTS = frozenset({"arguments", "argument_list"})
-#: The unread-row kind each language's report pass writes.
-_KINDS = {"ts": "unread member", "tsx": "unread member", "csharp": "unread parameter"}
+#: The unread-row kinds each language's report passes write.
+_TS_KINDS = frozenset({"unread member", "unread constructor parameter"})
+_KINDS = {"ts": _TS_KINDS, "tsx": _TS_KINDS, "js": _TS_KINDS, "csharp": frozenset({"unread parameter"})}
 
 Row = tuple[str, str, str]
 
@@ -53,7 +67,8 @@ class Result:
     summaries: list
     #: The unread rows still unread: refused, or rolled back.
     unread: tuple[Row, ...]
-    #: ``(path, "removed parameter", label)`` and ``(path, "changed constructor", class)``.
+    #: ``(path, "removed parameter", label)``, ``(path, "removed member", label)``
+    #: and ``(path, "changed constructor", class)``.
     rows: tuple[Row, ...]
     #: The summary paths this pass rewrote, spelled as in ``summaries``.
     rewritten: frozenset[str]
@@ -106,10 +121,17 @@ def _inside(removal: Removal, repo_dir: str) -> Removal | Refusal:
     return removal
 
 
-def _plan(summary, label: str, language: str, repo_dir: str) -> Removal | Refusal:
-    planner = ctor_param_csharp.plan if language == "csharp" else ctor_param_ts.plan
+def _plan(summary, kind: str, label: str, language: str, repo_dir: str) -> Removal | Refusal:
     try:
-        return planner(summary.path, summary.content, label, repo_dir)
+        if language == "csharp":
+            return ctor_param_csharp.plan(summary.path, summary.content, label, repo_dir)
+        if kind == "unread constructor parameter":
+            return ctor_param_ts.plan_parameter(summary.path, summary.content, label, repo_dir)
+        outcome = ctor_param_ts.plan(summary.path, summary.content, label, repo_dir)
+        if isinstance(outcome, Refusal) and outcome.quiet:
+            # Not a parameter property: a field, or a method or accessor.
+            return ts_field_removal.plan(summary.path, summary.content, label, repo_dir)
+        return outcome
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         return Refusal(label, f"could not be checked: {exc}")
 
@@ -123,22 +145,23 @@ def remove(
     engine: Callable[[list[str], str], list],
 ) -> Result:
     """Remove every unread constructor parameter in ``unread`` whose callers
-    can all be proven, through ``engine(paths, rules_text)``."""
+    can all be proven, and every unread TypeScript or JavaScript field that
+    can be, through ``engine(paths, rules_text)``."""
     unchanged = Result(summaries, tuple(unread), (), frozenset())
-    kind = _KINDS.get(language)
+    kinds = _KINDS.get(language, frozenset())
     by_path = {os.path.relpath(s.path, repo_dir): s for s in summaries}
     removals: list[tuple[Row, Removal]] = []
     for row in unread:
         path, row_kind, label = row
         summary = by_path.get(path)
-        if row_kind != kind or summary is None:
+        if row_kind not in kinds or summary is None:
             continue
-        outcome = _plan(summary, label, language, repo_dir)
+        outcome = _plan(summary, row_kind, label, language, repo_dir)
         if isinstance(outcome, Removal):
             outcome = _inside(outcome, repo_dir)
         if isinstance(outcome, Refusal):
             log = logger.debug if outcome.quiet else logger.info
-            log("keeping the unread parameter %s in %s: %s", label, path, outcome.reason)
+            log("keeping %s unread in %s: %s", label, path, outcome.reason)
             continue
         removals.append((row, outcome))
     if not removals:
@@ -160,14 +183,19 @@ def remove(
     sentinel = choose_sentinel(before.values())
     if sentinel is None:
         logger.warning(
-            "keeping %d unread constructor parameter(s): no free sentinel name", len(removals)
+            "keeping %d unread constructor parameter(s) or field(s): no free sentinel name",
+            len(removals),
         )
         return unchanged
 
-    marks: dict[str, list[tuple[int, int]]] = {}
+    marks: dict[str, list[tuple[int, int, str]]] = {}
+    parameters: dict[str, list[tuple[int, int]]] = {}
     for _, removal in removals:
         for site in removal.sites:
-            marks.setdefault(_key(site.path), []).append((site.start, site.end))
+            marks.setdefault(_key(site.path), []).append((site.start, site.end, site.form))
+        if removal.param_name is not None:
+            key = _key(removal.declaring_path)
+            parameters.setdefault(key, []).extend(_parameter_spans(before[key], removal, language))
     rules = render_rules(
         "csharp" if language == "csharp" else "ts", [r for _, r in removals], sentinel
     )
@@ -175,9 +203,16 @@ def remove(
     # writes under the running transform's undo first.
     git_ops.before_writing([spelling[key] for key in files])
     try:
-        marked = {key: mark(before[key], marks.get(key, ()), sentinel) for key in files}
-        for key in marks:
-            Path(key).write_bytes(marked[key])
+        marked = {
+            key: mark(
+                before[key], marks.get(key, ()), sentinel, parameters.get(key, ()),
+                forms=forms_for(language),
+            )
+            for key in files
+        }
+        for key in files:
+            if marked[key] != before[key]:
+                Path(key).write_bytes(marked[key])
         engine([spelling[key] for key in files], rules)
         # The engine leaves the spaces around each gap on a single-line list.
         # A deleted line of a multi-line list leaves its `\r` behind in a CRLF
@@ -205,7 +240,9 @@ def remove(
     if failure is not None:
         for key, data in before.items():
             Path(key).write_bytes(data)
-        logger.warning("keeping %d unread constructor parameter(s): %s", len(removals), failure)
+        logger.warning(
+            "keeping %d unread constructor parameter(s) or field(s): %s", len(removals), failure
+        )
         return unchanged
 
     after = {key: Path(key).read_bytes() for key in files}
@@ -226,16 +263,25 @@ def remove(
         rewritten.add(spelling[key])
     names: list[tuple[str, str]] = []
     for key, spans in marks.items():
-        for start, end in spans:
+        for start, end, form in spans:
             text = before[key][start:end].decode("utf-8", "replace")
-            if IDENT.fullmatch(text):
+            if form == "argument" and IDENT.fullmatch(text):
                 names.append((spelling[key], text))
     done = {row for row, _ in removals}
     rows: list[Row] = []
     for row, removal in removals:
-        rows.append((row[0], "removed parameter", removal.label))
+        if removal.field is None:
+            rows.append((row[0], "removed parameter", removal.label))
+        else:
+            rows.append((row[0], "removed member", removal.label))
+            if removal.param_name is not None:
+                rows.append(
+                    (row[0], "removed parameter", f"{removal.class_name}({removal.param_name})")
+                )
         if removal.exported:
             rows.append((row[0], "changed constructor", removal.class_name))
+        for path, heir in removal.heirs:
+            rows.append((os.path.relpath(path, repo_dir), "changed constructor", heir))
     return Result(
         result,
         tuple(r for r in unread if r not in done),
@@ -283,10 +329,23 @@ def kept_argument_locals(
     return tuple(rows)
 
 
+def _parameter_spans(data: bytes, removal: Removal, language: str) -> list[tuple[int, int]]:
+    """Byte spans of ``removal``'s parameter in ``data``, byte-order mark included."""
+    offset = 3 if data.startswith(b"\xef\xbb\xbf") else 0
+    source = _decode(data)
+    if language == "csharp":
+        spans = ctor_param_csharp.parameter_spans(source, removal.class_name, removal.param_name)
+    else:
+        spans = ctor_param_ts.parameter_spans(
+            source, ts_scope.grammar(removal.declaring_path), removal.class_name, removal.param_name
+        )
+    return [(start + offset, end + offset) for start, end in spans]
+
+
 def _postcondition(
     files: list[str],
     before: dict[str, bytes],
-    marks: dict[str, list[tuple[int, int]]],
+    marks: dict[str, list[tuple[int, int, str]]],
     removals: list[tuple[Row, Removal]],
     sentinel: str,
     language: str,
@@ -299,22 +358,27 @@ def _postcondition(
         grammar = _grammar(key, language)
         if _parse(_decode(after), grammar).has_error:
             return f"{key}: no longer parses"
-        # A parameter is not an argument, so only marks change the count.
-        expected = _arguments(before[key], grammar) - len(marks.get(key, ()))
+        # A parameter is not an argument, so only argument marks change the count.
+        arguments = [m for m in marks.get(key, ()) if m[2] == "argument"]
+        expected = _arguments(before[key], grammar) - len(arguments)
         if _arguments(after, grammar) != expected:
             return f"{key}: lost a different number of arguments than it had marks"
     for _, removal in removals:
         source = _decode(Path(removal.declaring_path).read_bytes())
+        grammar = _grammar(removal.declaring_path, language)
+        if removal.field is not None and ts_field_removal.has_field(
+            source, grammar, removal.class_name, removal.field
+        ):
+            return f"{removal.declaring_path}: the field {removal.field} is still declared"
+        if removal.param_name is None:
+            continue
         if language == "csharp":
             present = ctor_param_csharp.has_parameter(
                 source, removal.class_name, removal.param_name
             )
         else:
             present = ctor_param_ts.has_parameter(
-                source,
-                ts_scope.grammar(removal.declaring_path),
-                removal.class_name,
-                removal.param_name,
+                source, grammar, removal.class_name, removal.param_name
             )
         if present:
             return f"{removal.declaring_path}: the parameter {removal.param_name} is still declared"

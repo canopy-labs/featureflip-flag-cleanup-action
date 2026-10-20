@@ -1,18 +1,23 @@
-# Constructor-parameter removal, rendered per run by
+# Constructor-parameter and private-field removal, rendered per run by
 # `ctor_param_model.render_rules`. Never loaded as shipped.
 #
 # Blocks start at a `# ctor: <kind>` line. `parameter` blocks are cloned once per
-# removal, with __CTOR_CLASS__ and __CTOR_PARAM__ filled in. The `argument` block
-# is rendered once, with __CTOR_SENTINEL__: the caller has already replaced every
-# argument to delete with that identifier, so deletion is by identity and the
-# engine's apply-until-no-match loop stops after the marked arguments. Matching by
-# position would re-fire on the argument that shifts into the deleted slot.
+# removal, with __CTOR_CLASS__ and __CTOR_PARAM__ filled in. They match a
+# parameter property and a plain parameter alike: a parameter's name is unique
+# in its list, and the caller has proven which one goes. The `argument` blocks
+# are rendered once, with __CTOR_SENTINEL__: the caller has already replaced
+# every argument to delete with that identifier, every field with a method of
+# that name and every statement with that identifier and a `;`
+# (`ctor_param_model.FORMS`), so deletion is by identity and the engine's
+# apply-until-no-match loop stops after the marked spans. Matching by position
+# would re-fire on the argument that shifts into the deleted slot, and the
+# engine deletes a field without the `;` after it.
 #
 # No holes and no edges: every rule is a seed that matches on its own.
 
 # ctor: parameter
 [[rules]]
-name = "delete_ctor_parameter_property"
+name = "delete_ctor_parameter"
 query = """(
   (class_declaration
     name: (type_identifier) @class_name
@@ -21,7 +26,6 @@ query = """(
         name: (property_identifier) @ctor
         parameters: (formal_parameters
           (required_parameter
-            (accessibility_modifier)
             pattern: (identifier) @param_name) @param))))
   (#eq? @class_name "__CTOR_CLASS__")
   (#eq? @ctor "constructor")
@@ -33,7 +37,7 @@ is_seed_rule = true
 
 # ctor: parameter
 [[rules]]
-name = "delete_ctor_optional_parameter_property"
+name = "delete_ctor_optional_parameter"
 query = """(
   (class_declaration
     name: (type_identifier) @class_name
@@ -42,7 +46,6 @@ query = """(
         name: (property_identifier) @ctor
         parameters: (formal_parameters
           (optional_parameter
-            (accessibility_modifier)
             pattern: (identifier) @param_name) @param))))
   (#eq? @class_name "__CTOR_CLASS__")
   (#eq? @ctor "constructor")
@@ -54,7 +57,7 @@ is_seed_rule = true
 
 # ctor: parameter
 [[rules]]
-name = "delete_abstract_ctor_parameter_property"
+name = "delete_abstract_ctor_parameter"
 query = """(
   (abstract_class_declaration
     name: (type_identifier) @class_name
@@ -63,7 +66,6 @@ query = """(
         name: (property_identifier) @ctor
         parameters: (formal_parameters
           (required_parameter
-            (accessibility_modifier)
             pattern: (identifier) @param_name) @param))))
   (#eq? @class_name "__CTOR_CLASS__")
   (#eq? @ctor "constructor")
@@ -75,7 +77,7 @@ is_seed_rule = true
 
 # ctor: parameter
 [[rules]]
-name = "delete_abstract_ctor_optional_parameter_property"
+name = "delete_abstract_ctor_optional_parameter"
 query = """(
   (abstract_class_declaration
     name: (type_identifier) @class_name
@@ -84,7 +86,6 @@ query = """(
         name: (property_identifier) @ctor
         parameters: (formal_parameters
           (optional_parameter
-            (accessibility_modifier)
             pattern: (identifier) @param_name) @param))))
   (#eq? @class_name "__CTOR_CLASS__")
   (#eq? @ctor "constructor")
@@ -102,5 +103,27 @@ query = """(
   (#eq? @arg "__CTOR_SENTINEL__")
 )"""
 replace_node = "arg"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_member"
+query = """(
+  (class_body (method_definition name: (property_identifier) @name) @member)
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "member"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_statement"
+query = """(
+  (statement_block (expression_statement (identifier) @name) @statement)
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "statement"
 replace = ""
 is_seed_rule = true

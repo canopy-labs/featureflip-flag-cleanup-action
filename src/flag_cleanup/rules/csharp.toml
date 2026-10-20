@@ -35,7 +35,7 @@
 # Each call argument is wrapped in its own `argument` node (C# has no
 # equivalent of Java's bare `argument_list . (string_literal …)` — the anchor
 # has to walk through `argument` first): `arguments: (argument_list . (argument
-# (string_literal (string_literal_content) @flag_name)))`. The leading `.`
+# (string_literal . (string_literal_content) @flag_name .)))`. The leading `.`
 # anchors the match to the FIRST argument only, so arity is otherwise
 # unconstrained — this SDK's `BoolVariation(string key, EvaluationContext
 # context, bool defaultValue)` is fixed at three arguments today, but the rule
@@ -174,7 +174,7 @@ query = """(
       function: [(member_access_expression name: (identifier) @sdk_fn)
                  (identifier) @sdk_fn]
       arguments: (argument_list
-        . (argument (string_literal (string_literal_content) @flag_name))))) @statement
+        . (argument (string_literal . (string_literal_content) @flag_name .))))) @statement
   (#eq? @sdk_fn "BoolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -207,7 +207,7 @@ query = """(
         function: [(member_access_expression name: (identifier) @sdk_fn)
                    (identifier) @sdk_fn]
         arguments: (argument_list
-          . (argument (string_literal (string_literal_content) @flag_name)))))) @statement
+          . (argument (string_literal . (string_literal_content) @flag_name .)))))) @statement
   (#eq? @sdk_fn "GetBooleanValueAsync")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -260,7 +260,7 @@ query = """(
       function: [(member_access_expression name: (identifier) @sdk_fn)
                  (identifier) @sdk_fn]
       arguments: (argument_list
-        . (argument (string_literal (string_literal_content) @flag_name))))
+        . (argument (string_literal . (string_literal_content) @flag_name .))))
   ) @await
   (#eq? @sdk_fn "GetBooleanValueAsync")
   (#eq? @flag_name "@stale_flag_name")
@@ -278,7 +278,7 @@ query = """(
     function: [(member_access_expression name: (identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (argument (string_literal (string_literal_content) @flag_name)))
+      . (argument (string_literal . (string_literal_content) @flag_name .)))
   ) @call
   (#eq? @sdk_fn "BoolVariation")
   (#eq? @flag_name "@stale_flag_name")

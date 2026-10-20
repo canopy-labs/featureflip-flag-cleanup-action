@@ -139,12 +139,12 @@ contains = """(
      (modifiers) @mods
      type: (_) . (variable_declarator
        name: (identifier) @decl_name
-       value: (string_literal (string_fragment) @flag_name)) .)
+       value: (string_literal . (string_fragment) @flag_name .)) .)
    (local_variable_declaration
      (modifiers) @mods
      type: (_) . (variable_declarator
        name: (identifier) @decl_name
-       value: (string_literal (string_fragment) @flag_name)) .)] @declaration
+       value: (string_literal . (string_fragment) @flag_name .)) .)] @declaration
   (#match? @mods "(^|[^A-Za-z])final([^A-Za-z]|$)")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -179,7 +179,7 @@ contains = """(
   (constant_declaration
     type: (_) . (variable_declarator
       name: (identifier) @decl_name
-      value: (string_literal (string_fragment) @flag_name)) .) @declaration
+      value: (string_literal . (string_fragment) @flag_name .)) .) @declaration
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -231,12 +231,12 @@ contains = """(
      (modifiers) @mods
      type: (_) . (variable_declarator
        name: (identifier) @decl_name
-       value: (string_literal (string_fragment) @flag_name)) .)
+       value: (string_literal . (string_fragment) @flag_name .)) .)
    (local_variable_declaration
      (modifiers) @mods
      type: (_) . (variable_declarator
        name: (identifier) @decl_name
-       value: (string_literal (string_fragment) @flag_name)) .)] @declaration
+       value: (string_literal . (string_fragment) @flag_name .)) .)] @declaration
   (#match? @mods "(^|[^A-Za-z])final([^A-Za-z]|$)")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -280,7 +280,7 @@ contains = """(
   (constant_declaration
     type: (_) . (variable_declarator
       name: (identifier) @decl_name
-      value: (string_literal (string_fragment) @flag_name)) .) @declaration
+      value: (string_literal . (string_fragment) @flag_name .)) .) @declaration
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -315,13 +315,13 @@ query = """(
        (modifiers) @mods
        type: (_) . (variable_declarator
          name: (identifier) @variable_name
-         value: (string_literal (string_fragment) @flag_name)) .) @declaration)
+         value: (string_literal . (string_fragment) @flag_name .)) .) @declaration)
    (block
      (local_variable_declaration
        (modifiers) @mods
        type: (_) . (variable_declarator
          name: (identifier) @variable_name
-         value: (string_literal (string_fragment) @flag_name)) .) @declaration)] @scope
+         value: (string_literal . (string_fragment) @flag_name .)) .) @declaration)] @scope
   (#match? @mods "(^|[^A-Za-z])final([^A-Za-z]|$)")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -344,7 +344,7 @@ query = """(
     (constant_declaration
       type: (_) . (variable_declarator
         name: (identifier) @variable_name
-        value: (string_literal (string_fragment) @flag_name)) .) @declaration) @scope
+        value: (string_literal . (string_fragment) @flag_name .)) .) @declaration) @scope
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "declaration"

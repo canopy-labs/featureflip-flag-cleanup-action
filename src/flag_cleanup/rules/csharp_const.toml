@@ -85,6 +85,16 @@
 # `const string A = "k", B = "j";` therefore matches nothing here, so the delete
 # rule can never take a statement that also binds something else.
 #
+# --- the key spelled `Owner.NAME` ---------------------------------------------
+#
+# Every read rule also takes the key as `Owner.NAME`: a key-holding class in
+# the same file as its reader is read through the class, exactly as it is from
+# another file. The query matches ANY `X.NAME`; what makes that safe is Gate 2
+# again: `key_const._csharp_qualified_by_owner` admits a qualified reference
+# only when `X` is the type declaring the constant and can mean nothing else at
+# the read, and any other `X.NAME` in the file withholds this whole file. The
+# delete rule's sequencing guard sees both spellings for the same reason.
+#
 # Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
 
 # --- BoolVariation(FlagKey, …); AS A WHOLE STATEMENT -> deleted --------------
@@ -125,7 +135,10 @@ query = """(
       function: [(member_access_expression name: (identifier) @sdk_fn)
                  (identifier) @sdk_fn]
       arguments: (argument_list
-        . (argument (identifier) @key_const)))) @statement
+        . (argument [(identifier) @key_const
+                     (member_access_expression
+                       expression: (identifier)
+                       name: (identifier) @key_const)])))) @statement
   (#eq? @sdk_fn "BoolVariation")
 )"""
 replace_node = "statement"
@@ -146,13 +159,13 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))
+         (string_literal . (string_literal_content) @flag_name .)) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))]
+         (string_literal . (string_literal_content) @flag_name .)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -183,7 +196,10 @@ query = """(
         function: [(member_access_expression name: (identifier) @sdk_fn)
                    (identifier) @sdk_fn]
         arguments: (argument_list
-          . (argument (identifier) @key_const))))) @statement
+          . (argument [(identifier) @key_const
+                       (member_access_expression
+                         expression: (identifier)
+                         name: (identifier) @key_const)]))))) @statement
   (#eq? @sdk_fn "GetBooleanValueAsync")
 )"""
 replace_node = "statement"
@@ -204,13 +220,13 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))
+         (string_literal . (string_literal_content) @flag_name .)) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))]
+         (string_literal . (string_literal_content) @flag_name .)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -238,7 +254,10 @@ query = """(
     function: [(member_access_expression name: (identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (argument (identifier) @key_const))
+      . (argument [(identifier) @key_const
+                   (member_access_expression
+                     expression: (identifier)
+                     name: (identifier) @key_const)]))
   ) @call
   (#eq? @sdk_fn "BoolVariation")
 )"""
@@ -261,13 +280,13 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))
+         (string_literal . (string_literal_content) @flag_name .)) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))]
+         (string_literal . (string_literal_content) @flag_name .)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -306,7 +325,10 @@ query = """(
       function: [(member_access_expression name: (identifier) @sdk_fn)
                  (identifier) @sdk_fn]
       arguments: (argument_list
-        . (argument (identifier) @key_const)))
+        . (argument [(identifier) @key_const
+                     (member_access_expression
+                       expression: (identifier)
+                       name: (identifier) @key_const)])))
   ) @await
   (#eq? @sdk_fn "GetBooleanValueAsync")
 )"""
@@ -329,13 +351,13 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))
+         (string_literal . (string_literal_content) @flag_name .)) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal (string_literal_content) @flag_name)) .))]
+         (string_literal . (string_literal_content) @flag_name .)) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -365,14 +387,14 @@ query = """(
        (variable_declaration
          type: (_) . (variable_declarator
            name: (identifier) @variable_name
-           (string_literal (string_literal_content) @flag_name)) .)) @declaration)
+           (string_literal . (string_literal_content) @flag_name .)) .)) @declaration)
    (block
      (local_declaration_statement
        (modifier) @const_modifier
        (variable_declaration
          type: (_) . (variable_declarator
            name: (identifier) @variable_name
-           (string_literal (string_literal_content) @flag_name)) .)) @declaration)] @scope
+           (string_literal . (string_literal_content) @flag_name .)) .)) @declaration)] @scope
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -391,6 +413,8 @@ holes = ["stale_flag_name"]
 enclosing_node = """((compilation_unit) @container)"""
 not_contains = ["""(
   (invocation_expression
-    arguments: (argument_list . (argument (identifier) @first_arg))) @surviving_read
+    arguments: (argument_list
+      . (argument [(identifier) @first_arg
+                   (member_access_expression name: (identifier) @first_arg)]))) @surviving_read
   (#eq? @first_arg "@variable_name")
 )"""]

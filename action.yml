@@ -87,8 +87,8 @@ inputs:
       those permissions. Needing a token at all is the cost those two modes pay
       for not firing on the merge event: the deprecated `archive-on-merge`
       reads its pull request straight out of the event payload, so it needs
-      nothing from GitHub, and reads only `api-token`, `org`, `project` and
-      `api-url` — `dry-run` included in what it ignores, since it archives
+      nothing from GitHub, and reads only `api-token`, `org`, `project`,
+      `api-url` and `base-branch` — `dry-run` included in what it ignores, since it archives
       exactly the one flag its trigger names.
 
       `pr-command` re-runs the removal for the flag whose pull request a
@@ -281,8 +281,12 @@ inputs:
       carries commits the base branch does not, since a removal branch is cut
       from the checkout and would otherwise drag them into every PR: run this
       Action from a checkout of the base branch (`on: schedule` or `on: push`),
-      not from a `pull_request` merge commit. Read only by `remove` mode —
-      `pr-command` regenerates against the pull request's OWN base and makes
+      not from a `pull_request` merge commit. The archive modes read it too,
+      as the only branch a removal's merge counts on (a removal merged into
+      any other branch never reached this one), so give them the same value
+      as the cleanup workflow; `archive-on-merge` falls back to the default
+      branch the event payload names, the others look it up. `pr-command`
+      ignores it — it regenerates against the pull request's OWN base and makes
       the same containment check against that, but reports it as exit 1, since
       there it is one pull request's problem rather than a broken workflow.
     required: false

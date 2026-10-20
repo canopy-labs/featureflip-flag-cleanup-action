@@ -19,8 +19,9 @@ every pull request this Action has already opened rather than only on ones
 opened after this shipped.
 
 **Two quiet no-ops, one soft outcome, one loud failure.** A pull request that
-closed without merging, and a pull request from a branch this Action did not
-create, are both ordinary — the customer's workflow fires on every closed pull
+closed without merging (or merged into some branch other than the base, which
+the removal has therefore not reached), and a pull request from a branch this
+Action did not create, are both ordinary — the customer's workflow fires on every closed pull
 request in the repository and almost none of them are ours. Neither is worth a
 red build. Almost everything else is: a token that cannot archive, a project
 slug that does not match, or a flag the domain refuses to archive all mean this
@@ -80,7 +81,11 @@ from flag_cleanup.github_ops import (
     merged_removal,
     removal_branch,
 )
-from flag_cleanup.pr_event import MergedPullRequest, merged_pull_request
+from flag_cleanup.pr_event import (
+    MergedPullRequest,
+    PullRequestEventError,
+    merged_pull_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +194,45 @@ def _archive_for(
             pull_request=pull_request.number or None,
         )
 
+    if not _same_repository(pull_request):
+        # A fork's branch name is whatever its author typed, so a removal-shaped
+        # one names a flag nobody here asked to remove — and under
+        # `pull_request_target` this run holds a token that can archive it.
+        # The canonical encoding is no defence: anyone can produce it.
+        return ArchiveResult(
+            action_taken="not-a-removal-branch",
+            detail=(
+                f"{pull_request.head_ref} comes from "
+                f"{pull_request.head_repository or 'a repository that no longer exists'}"
+                f", not {pull_request.repository or 'this repository'}, so this "
+                "Action did not open it and there is no flag to archive"
+            ),
+            pull_request=pull_request.number or None,
+        )
+
+    base = config.base_branch.strip() or pull_request.default_branch
+    if not base:
+        raise PullRequestEventError(
+            "the event payload names neither the repository's default branch nor "
+            "the branch the pull request merged into, so there is no telling "
+            "whether the removal reached it; set the `base-branch` input"
+        )
+    if pull_request.base_ref != base:
+        # Merged, but not where the removal has to land: a pull request
+        # retargeted to a spike branch and merged there leaves the flag's code
+        # on the base branch exactly as it was.
+        return ArchiveResult(
+            action_taken="not-merged",
+            detail=(
+                f"the pull request merged into "
+                f"{pull_request.base_ref or 'a branch the event did not name'}, not "
+                f"the base branch {base}, so the removal has not reached it and "
+                "nothing is archived"
+            ),
+            key=key,
+            pull_request=pull_request.number or None,
+        )
+
     owned = client is None
     active = client or FeatureflipClient(config.api_url, config.api_token)
     try:
@@ -209,7 +253,7 @@ def _archive_for(
             pull_request=pull_request.number or None,
         )
     except FlagHasDependentsError as exc:
-        if not _dependents_all_removed(exc.dependents, env=env, gh=gh):
+        if not _dependents_all_removed(exc.dependents, base=base, env=env, gh=gh):
             raise
         logger.info(
             "archive of flag %s deferred: dependents %s have merged removals",
@@ -235,9 +279,20 @@ def _archive_for(
     )
 
 
+def _same_repository(pull_request: MergedPullRequest) -> bool:
+    """Whether the pull request's branch lives in this repository, not a fork.
+
+    Compared case-insensitively, as GitHub resolves repository names; an empty
+    side — a deleted fork, a payload that omits it — is never a match.
+    """
+    head = pull_request.head_repository.casefold()
+    return bool(head) and head == pull_request.repository.casefold()
+
+
 def _dependents_all_removed(
     dependents: tuple[str, ...],
     *,
+    base: str,
     env: Mapping[str, str] | None,
     gh: GitHubApi | None,
 ) -> bool:
@@ -261,7 +316,7 @@ def _dependents_all_removed(
     try:
         for dependent in dependents:
             branch = removal_branch(dependent)
-            if merged_removal(active, github.repository, branch) is None:
+            if merged_removal(active, github.repository, branch, base=base) is None:
                 return False
         return True
     except (UnsafeFlagKeyError, GitHubApiError, httpx.HTTPError) as exc:

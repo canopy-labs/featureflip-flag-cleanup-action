@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, prerequisite_hold, source_index
+from flag_cleanup import git_ops, github_ops, prerequisite_hold, ruby_owner_reach, source_index
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -201,8 +201,8 @@ class FlagResult:
       or closed, ``prior_removal`` says which: such a flag is never proposed
       again, so the report must not promise that it will be. Reachable in a
       dry run too, which looks the pull request up but never holds it.
-    * ``"piranha-error"`` — the engine aborted (its own syntax self-check);
-      ``diff`` is empty, but this is a REFUSAL, not a no-match.
+    * ``"piranha-error"`` — the engine aborted (it could read none of the
+      files, or rejected its own rewrite of one); ``diff`` is empty, but this is a REFUSAL, not a no-match.
     * ``"unsafe-rewrite"`` — Gate 1 refused the rewrite of at least one file
       and it was rolled back, taking the whole flag's transform with it;
       ``refused_files`` names the file(s). Also a refusal, and the one most
@@ -228,9 +228,9 @@ class FlagResult:
       run continued with the next candidate.
 
     A dry run produces only ``dry-run``, ``ignored``, ``not-selected``,
-    ``unsafe-key``, ``blocked``, ``already-handled``, ``piranha-error`` and
-    ``unsafe-rewrite`` — everything that WRITES to GitHub is unreachable, but
-    every refusal is reachable and is reported identically in both modes, and
+    ``unsafe-key``, ``duplicate``, ``blocked``, ``already-handled``,
+    ``piranha-error`` and ``unsafe-rewrite`` — everything that WRITES to
+    GitHub is unreachable, but every refusal is reachable and is reported identically in both modes, and
     so is ``already-handled`` whenever the dry run has a token to ask with.
     That symmetry is the point of dry-run: a flag a real run would refuse, or
     would skip, must be visible in the dry run that preceded it. Without a
@@ -412,10 +412,18 @@ def run(
     ledger = git_ops.OwnershipLedger()
     try:
         known_flag_keys = fetch_known_flag_keys(resolved_client, config)
+        # One flag key can legitimately appear twice in one paginated fetch
+        # (a cursor re-read, a backend listing it under two reasons). Without
+        # this the second copy's `already_handled` would have to see the branch
+        # the first copy pushed *seconds* earlier, making correctness depend on
+        # the remote's read-after-write timing. Dry-run dedupes the same way,
+        # or its preview — and its `max-prs` count — shows the copy twice.
+        seen_branches: set[str] = set()
         if config.dry_run:
             process = partial(
                 _process_candidate,
                 config=config,
+                seen_branches=seen_branches,
                 ledger=ledger,
                 known_flag_keys=known_flag_keys,
                 lookup=(
@@ -428,18 +436,13 @@ def run(
             # there is nothing yet for Featureflip to link.
             reporter = None
         else:
-            # One flag key can legitimately appear twice in one paginated fetch
-            # (a cursor re-read, a backend listing it under two reasons).
-            # Without this the second copy's `already_handled` would have to
-            # see the branch the first copy pushed *seconds* earlier, making
-            # correctness depend on the remote's read-after-write timing.
             process = partial(
                 _process_candidate_for_pr,
                 config=config,
                 gh=resolved_gh,
                 github=resolved_github,
                 base=_resolve_base(config, resolved_gh, resolved_github),
-                seen_branches=set(),
+                seen_branches=seen_branches,
                 ledger=ledger,
                 known_flag_keys=known_flag_keys,
             )
@@ -644,6 +647,7 @@ def _attach_partial_results(exc: BaseException, results: list[FlagResult]) -> No
 def _process_candidate(
     candidate: Candidate,
     config: Config,
+    seen_branches: set[str],
     ledger: git_ops.OwnershipLedger,
     known_flag_keys: frozenset[str] = frozenset(),
     lookup: _ReadOnlyLookup | None = None,
@@ -684,6 +688,10 @@ def _process_candidate(
     unsupported = _unsupported_key_result(candidate)
     if unsupported is not None:
         return unsupported
+
+    duplicate = _duplicate_result(candidate, branch, seen_branches)
+    if duplicate is not None:
+        return duplicate
 
     # Asked once, before either check that needs it, and in the PR path's
     # order: blocked first, then already handled. Never holds or releases —
@@ -755,6 +763,21 @@ def _process_candidate(
     )
 
 
+def _duplicate_result(
+    candidate: Candidate, branch: str, seen_branches: set[str]
+) -> FlagResult | None:
+    """``duplicate`` when this run already dealt with ``branch``; else claim it."""
+    if branch in seen_branches:
+        logger.info(
+            "skipping %s: this run already handled %s", candidate.key, branch
+        )
+        return FlagResult(
+            candidate.key, candidate.treatment, candidate.status, "", "duplicate"
+        )
+    seen_branches.add(branch)
+    return None
+
+
 def _process_candidate_for_pr(
     candidate: Candidate,
     config: Config,
@@ -792,14 +815,9 @@ def _process_candidate_for_pr(
     if unsupported is not None:
         return unsupported
 
-    if branch in seen_branches:
-        logger.info(
-            "skipping %s: this run already handled %s", candidate.key, branch
-        )
-        return FlagResult(
-            candidate.key, candidate.treatment, candidate.status, "", "duplicate"
-        )
-    seen_branches.add(branch)
+    duplicate = _duplicate_result(candidate, branch, seen_branches)
+    if duplicate is not None:
+        return duplicate
 
     if candidate.blocked_by:
         return _blocked_result(
@@ -1913,9 +1931,19 @@ def _unprocessed_references(config: Config, flag_key: str) -> tuple[str, ...]:
     # body says "2 file(s) still reference this flag" and lists it twice.
     seen: dict[str, str] = {}
     for directory in config.directories:
-        for path in _files_matching(Path(directory), KNOWN_EXTENSIONS, flag_key):
+        for path in _files_matching(Path(directory), _RESIDUE_SUFFIXES, flag_key):
             seen.setdefault(str(path.resolve()), str(path))
     return tuple(seen.values())
+
+
+#: What :func:`_unprocessed_references` reads: every suffix the tool knows, and
+#: the Ruby no language rewrites. That is views (``.haml``, ``.slim``,
+#: ``.jbuilder``), project files (``config.ru``, a ``.gemspec``) and, among
+#: files with no suffix, a ``Rakefile``, a ``Gemfile`` or a script with a Ruby
+#: shebang. A read in one of them survives every removal, so this caveat is the
+#: only place it can surface. They stay out of ``KNOWN_EXTENSIONS``, which also
+#: feeds every language's cross-file scans.
+_RESIDUE_SUFFIXES = KNOWN_EXTENSIONS | source_index.RUBY_SUFFIXES | source_index.NO_SUFFIX
 
 
 def all_unprocessed(
@@ -1992,6 +2020,10 @@ def _mentions_flag_key(text: str, flag_key: str) -> bool:
 def _files_matching(root: Path, extensions: Iterable[str], flag_key: str) -> list[Path]:
     """Files under ``root`` with one of ``extensions`` whose text mentions the key.
 
+    A file with no suffix counts only when it holds Ruby (a ``Rakefile``, a
+    ``bin/`` script with a Ruby shebang): a ``Makefile`` or a shell script is
+    configuration, which the scan does not read under any suffix either.
+
     The *question* is deliberately not ``piranha_runner._candidate_files``'s:
     that one is keyed on a language and prefilters with a substring, while this
     one is for the extensions no language covers and must be exact (see
@@ -2003,6 +2035,8 @@ def _files_matching(root: Path, extensions: Iterable[str], flag_key: str) -> lis
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            continue
+        if not path.suffix and not ruby_owner_reach.is_ruby(path, text):
             continue
         if _mentions_flag_key(text, flag_key):
             hits.append(path)

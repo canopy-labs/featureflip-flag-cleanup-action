@@ -489,6 +489,10 @@ class Rewrite:
     path: str
     original_content: str
     content: str
+    #: The run deleted the file (``content`` is then empty): the diff names
+    #: it as a deletion and a rollback re-creates it from
+    #: ``original_content``. See :mod:`flag_cleanup.file_deletion`.
+    deleted: bool = False
 
 
 @dataclass

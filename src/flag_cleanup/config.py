@@ -15,6 +15,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+import httpx
+
+from flag_cleanup.client import token_is_sendable
 from flag_cleanup.piranha_runner import supported_languages
 from flag_cleanup.ts_gates import Gate, parse_gate
 from flag_cleanup.urls import redact_userinfo
@@ -197,6 +200,18 @@ class Config:
         missing = [name for name in required if not _get(env, name, "")]
         if missing:
             raise ConfigError(f"missing required environment variable(s): {', '.join(missing)}")
+        # Only the ENDS are stripped above. Anything left inside — the second
+        # line of a secret pasted with its neighbour, a stray space — would
+        # fail in the HTTP layer with a message quoting the whole header,
+        # token included, and in `pr-command` mode that message is posted on
+        # the pull request. So: refused here, and never echoed.
+        if not token_is_sendable(_get(env, "FEATUREFLIP_API_TOKEN", "")):
+            raise ConfigError(
+                "FEATUREFLIP_API_TOKEN contains whitespace, a control character or a "
+                "non-ASCII character, so it cannot be sent in an Authorization "
+                "header. Check the secret holds exactly one token on one line. The "
+                "value is not shown."
+            )
 
         languages = _split_csv(
             _get(env, "FEATUREFLIP_LANGUAGES", ""), default=supported_languages()
@@ -390,12 +405,12 @@ def _ensure_absolute_url(value: str) -> None:
     is configuration, not a bug.
 
     The host is not resolved and nothing is requested: this asks only whether
-    the string is a URL at all. The value is echoed back through
-    :func:`~flag_cleanup.urls.redact_userinfo` — not ``without_userinfo``,
-    which parses the URL to keep the host and port intact, and everything
-    reaching these two messages is by definition something that did not parse
-    — because a self-hosted ``api-url`` may carry credentials and a workflow
-    log is world-readable on a public repository.
+    the string is a URL httpx can send a request to. The value is echoed back
+    through :func:`~flag_cleanup.urls.redact_userinfo` — not
+    ``without_userinfo``, which parses the URL to keep the host and port
+    intact, and much of what reaches these messages is by definition something
+    that did not parse — because a self-hosted ``api-url`` may carry
+    credentials and a workflow log is world-readable on a public repository.
     """
     try:
         parts = urlsplit(value)
@@ -415,6 +430,32 @@ def _ensure_absolute_url(value: str) -> None:
             f"FEATUREFLIP_API_URL must be an absolute http(s) URL, got "
             f"{redact_userinfo(value)!r} — include the scheme, e.g. {DEFAULT_API_URL}"
         )
+    # httpx turns URL userinfo into Basic auth, and on the wire that takes the
+    # one `Authorization` header the Featureflip token needs: the token would
+    # never be sent, every request would be refused, and the error would blame
+    # the token. Both cannot travel, so this is refused rather than one of
+    # them dropped without a word.
+    if "@" in netloc:
+        raise ConfigError(
+            f"FEATUREFLIP_API_URL must not carry credentials, got "
+            f"{redact_userinfo(value)!r}. Requests authenticate with "
+            "FEATUREFLIP_API_TOKEN in the Authorization header, which user:password@ "
+            "in the URL would replace; remove that part of the URL"
+        )
+    # `urlsplit` silently drops a tab or newline and keeps a NUL or DEL, and
+    # never looks at IDNA, so each of those passed the checks above and died
+    # at the first request as `httpx.InvalidURL` or an `IDNAError` —
+    # tracebacks, exit 1. Asking httpx itself to parse the URL, and decoding
+    # and length-checking the host the way the connection will, catches them
+    # here instead.
+    try:
+        url = httpx.URL(value)
+        url.host  # decodes `xn--` labels, raising on a malformed one
+        url.raw_host.decode("ascii").encode("idna")  # empty or over-long labels
+    except (httpx.InvalidURL, UnicodeError) as exc:
+        raise ConfigError(
+            f"FEATUREFLIP_API_URL is not a valid URL: {redact_userinfo(value)!r} ({exc})"
+        ) from exc
 
 
 def _parse_non_negative_int(name: str, value: str) -> int:

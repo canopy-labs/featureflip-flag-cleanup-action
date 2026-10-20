@@ -58,8 +58,9 @@ GATE_RE = re.compile(
     r"\[(?P<prop>[A-Za-z_][A-Za-z0-9_]*)\]\Z"
 )
 
-#: The languages whose grammar has JSX. Mirrors
-#: ``piranha_runner._Language.parses_jsx``.
+#: The languages whose grammar has JSX: both parse with the TSX grammar, the
+#: same split the engine draws when it loads its TSX-only JSX cleanup. Plain
+#: ``ts`` shares their rule base and not their grammar.
 _LANGUAGES = frozenset({"tsx", "js"})
 
 _ELEMENTS = frozenset({"jsx_element", "jsx_self_closing_element"})

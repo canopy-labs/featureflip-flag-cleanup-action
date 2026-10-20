@@ -137,12 +137,12 @@ enclosing_node = """(
      (const_declaration
        . (const_spec
            name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal (_) @flag_name) .)) .))
+           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))
    (statement_list
      (const_declaration
        . (const_spec
            name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal (_) @flag_name) .)) .))] @scope
+           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -183,12 +183,12 @@ enclosing_node = """(
      (const_declaration
        . (const_spec
            name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal (_) @flag_name) .)) .))
+           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))
    (statement_list
      (const_declaration
        . (const_spec
            name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal (_) @flag_name) .)) .))] @scope
+           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -214,12 +214,12 @@ query = """(
      (const_declaration
        . (const_spec
            name: (identifier) @variable_name
-           value: (expression_list . (interpreted_string_literal (_) @flag_name) .)) .) @declaration)
+           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .) @declaration)
    (statement_list
      (const_declaration
        . (const_spec
            name: (identifier) @variable_name
-           value: (expression_list . (interpreted_string_literal (_) @flag_name) .)) .) @declaration)] @scope
+           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .) @declaration)] @scope
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "declaration"

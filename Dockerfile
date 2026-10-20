@@ -32,7 +32,7 @@ RUN git config --system --add safe.directory '*'
 WORKDIR /action
 
 # Install from pyproject.toml so the dependency set (polyglot-piranha, httpx,
-# tree-sitter, tree-sitter-typescript) stays single-sourced. Do not hardcode
+# tree-sitter and its grammars) stays single-sourced. Do not hardcode
 # a duplicate package list here — pyproject.toml is the one place versions
 # are pinned/floated, and it changes independently of this file.
 #

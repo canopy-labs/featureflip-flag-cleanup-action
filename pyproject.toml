@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.6.0"
+version = "1.7.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -254,7 +254,177 @@ dependencies = [
     # two constant loops `no-constant-condition` rejects. `syntax` treats a
     # condition-less `for` as infinite for that reason. No grammar rev moved,
     # so `+canopy.3` stays.
-    "polyglot-piranha==0.17.4",
+    #
+    # 0.17.5 (piranha#127). The JSX container cleanup a folded gate leaves
+    # behind (`{(<Panel />)}`, `{<Panel />}`, `{false}` in child position) is
+    # now a built-in, loaded by the `tsx` and `javascript` arms and not by
+    # `typescript`. The rules carry the same names as the downstream copies
+    # they replace, so those were deleted in the same change: a user rule wins
+    # a name collision, and keeping them would have shadowed the engine's. No
+    # grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.18.0. The engine re-indents the text a fold splices, so the pass that
+    # used to restore it here was deleted in the same change. Two engine-side
+    # differences reach the output: the blank line a removed closer left
+    # behind is gone, and Ruby's dead-code-after-`return` cleanup now reaches
+    # bodies it did not before, keeping heredoc bodies and a method's
+    # `rescue`/`ensure`/`else`. No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.19.0. The engine folds Go's tagless `switch { case <literal>: … }`
+    # itself: a `false` arm is deleted, the arms below a `true` arm go, and the
+    # `true` arm is promoted to `default:` (or, first, collapsed to its body).
+    # It declines on `fallthrough`, a labeled `break`/`continue` or `goto`, an
+    # initializer, a `default` above the true arm, and a collapse whose body
+    # declares anything or holds a `break`; the residue gate still refuses
+    # those. So the Go post-pass that used to finish this was deleted in the
+    # same change. The engine also folds the TypeScript family's
+    # `switch (true)`, but not yet a read in the SUBJECT or `switch (false)`, so
+    # the TypeScript post-pass stays until it does. No grammar rev moved, so
+    # `+canopy.3` stays.
+    #
+    # 0.20.0. The Python built-ins fold every literal `if`/`elif` shape,
+    # multi-statement branches included, so the post-pass that finished those
+    # folds here was deleted in the same change. Only the literal inlining of a
+    # bound read stays here, because it needs the whole file. No grammar rev
+    # moved, so `+canopy.3` stays.
+    #
+    # 0.21.0. Three engine-side differences reach the output, all whitespace:
+    # deleting a file's first statement takes the line break after it, so the
+    # file no longer starts with one extra blank line; a fold keeps the blank
+    # lines between the statements it moves; and two statements that shared a
+    # line stay on it. It also unwraps a TypeScript `do … while (false)`,
+    # deletes a label nothing jumps to and an emptied `static {}` block, and
+    # substitutes rule templates in one pass. No grammar rev moved, so
+    # `+canopy.3` stays.
+    #
+    # 0.22.0. The engine folds PHP's `switch (true)` multi-way guard itself: a
+    # `false` arm is deleted, the arms below a `true` arm go, and the `true`
+    # arm is promoted to `default:`. It declines when an arm but the last can
+    # fall through (a braced body counts as one that can), a `goto` label sits
+    # in the switch, or a `default` is above the true arm; the residue gate
+    # still refuses those. So the PHP post-pass that finished this was deleted
+    # in the same change; the `if`/`elseif` fold stays. No grammar rev moved, so
+    # `+canopy.3` stays.
+    #
+    # 0.23.0. The engine folds Ruby's subject-less `case` itself: a `when
+    # false` is deleted, a first `when true` collapses the `case` to its body,
+    # and a later one becomes the `else`, taking the arms below it. In
+    # expression position (`x = case … end`) it collapses only a single simple
+    # expression and otherwise declines, as it does for `when a, b` and for the
+    # only `when` of a `case` that keeps an `else`; the residue gate refuses
+    # those. So the Ruby post-pass that finished this was deleted in the same
+    # change. No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.24.0. The engine folds Kotlin's subject-less `when` itself: a `false ->`
+    # arm is deleted, a first `true ->` arm collapses the `when` to its body
+    # where the body can stand in its place, and any other `true ->` arm
+    # becomes the `else`, taking the arms below it. It declines an arm listing
+    # several conditions and the only arm of a `when` that is not a statement
+    # of a block; the residue gate refuses those. So the Kotlin post-pass that
+    # finished this, and the shared fold helper it was the last user of, were
+    # deleted in the same change. No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.25.0. Four Ruby changes and one ERB change reach the output. A folded
+    # `if`/`unless` is unwrapped by where it stands: in a statement list any
+    # branch replaces it, in value position only one simple expression does,
+    # and the engine declines the rest instead of splicing them in wrong
+    # (`x = if true; a; b end` used to become `x = a` plus a loose `b`). Those
+    # declines leave a literal condition, so the residue gate now counts
+    # Ruby's `if`/`unless`/`elsif` conditions and refuses them. A dead branch
+    # that was a method's or block's last statement becomes `nil`, keeping
+    # what it returns; the dead-loop rules gained twins for that, which
+    # `_ENGINE_DEAD_LOOP_RULES` lists. No built-in Ruby rule is a seed any
+    # more, so a callback condition (`if: -> { true }`) or an empty RSpec hook
+    # the customer wrote is left alone, and only one a fold produced goes. In
+    # ERB, a tag the cascade rewrote comes back as one tag whatever blank lines
+    # it held. No grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.26.0 and 0.27.0. In Go the engine deletes the locals and imports its
+    # own fold stranded: a local is deleted or discarded to `_ = v`, a header
+    # name becomes `_` or goes, and an import goes when nothing in the file
+    # reads it. An unaliased import is deleted only through a per-file fact
+    # naming the package it binds, which `piranha_runner` passes from
+    # `unused.go_import_facts`. Those removals are read back by rule name and
+    # reported as the text pass's are; that pass still runs after, for what
+    # the engine withholds and for strands this side's own edits make. 0.27.0
+    # makes a removed import leave gofmt's output, taking its comments and the
+    # blank lines it would strand, which the text pass used to tidy for it. It
+    # also keeps a side-effecting left operand of `x || true` / `x && false`,
+    # and leaves string literals alone when collapsing blank lines. No grammar
+    # rev moved, so `+canopy.3` stays.
+    #
+    # 0.28.0. Fold soundness in eight languages, each a rewrite that changed
+    # what the code did. Go withholds an inline when another binding shares the
+    # name (`go_inline` still refuses a read of an outer variable above the
+    # local's declaration, which the engine cannot see), splits a two-name
+    # declaration (the `split_*` pair, added to `_GO_INLINE_RULES`), and deletes
+    # what follows a folded jump in a block or clause. Ruby and Swift inline a
+    # local only when its one write reaches every read, and Ruby replaces a
+    # value-position write by its value. C# keeps `out`/`ref` locals and a local
+    # function after a `return`; C# and Java delete a later arm a `when true`
+    # dominates. TS keeps a comment's `else` statement, parenthesises an arrow
+    # body's object literal and declines a dead branch holding a `var`. Kotlin
+    # declines a multi-statement value-position `if` and folds `this.prop`;
+    # Dart keeps an unbraced `if` body; PHP casts a kept operand to `(bool)` in
+    # a value position. A comment after a folded `}` trails the moved body, and
+    # an ERB tag takes what its trim markers trimmed. No grammar rev moved, so
+    # `+canopy.3` stays.
+    #
+    # 0.29.0. More fold soundness. TS moves code that followed a spliced body
+    # ending in a line comment onto a line of its own, and keeps a folded
+    # callee or `delete` operand unbound as `(0, obj.m)`. Ruby's `replace_not_*`
+    # rules need a real `!`/`not`, a local read by `defined?` is not inlined, a
+    # `case` whose only `when` is the read collapses to its `else` on false,
+    # and a right-literal `&&`/`||` keeps the literal where the value is read.
+    # Swift folds a false `if` expression. Java folds `this.field` whole when
+    # the field is provably the class's own. No grammar rev moved, so
+    # `+canopy.3` stays.
+    #
+    # 0.30.0. A TS/JS callee folded to a plain name loses its parentheses,
+    # `other()`, because TypeScript's CommonJS output turns `(other)()` into a
+    # call bound to the module object. `delete` of a folded plain name keeps
+    # `(0, x)`, since `delete (x)` is a strict-mode syntax error. No grammar
+    # rev moved, so `+canopy.3` stays.
+    #
+    # 0.31.0. Go's stranded-local deletes take a trailing `// comment` with
+    # the line, and cover a two-name declaration and a binding nothing reads;
+    # the new rule names are in `_ENGINE_STRANDED_LOCAL_RULES`. Kotlin and Dart
+    # rewrite a `$name` template to `${literal}` and inline a local only when
+    # every use lies inside its block after the declaration; a Kotlin private
+    # property read bare from a lambda, extension, object expression or nested
+    # class, or shadowed by a constructor parameter, is kept. Dart counts
+    # untyped, field and super formals as bindings and deletes a dead
+    # collection `for`. PHP folds a brace-less `if`, guards a dangling `else`,
+    # drops dead `match(true)` arms and parenthesises for precedence. Scope is
+    # resolved by position, not by the first twin with the same signature. No
+    # grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.32.0. Ruby's engine deletes the locals its own fold stranded, as Go's
+    # does: an inert `x = v` goes with the comment on its line, and a call
+    # keeps `v` as a statement. The two rule names are in
+    # `_ENGINE_STRANDED_LOCAL_RULES`, and `unused.py`'s Ruby branch stays as the
+    # backstop for what the engine withholds. Go is unchanged. No grammar rev
+    # moved, so `+canopy.3` stays.
+    #
+    # 0.33.0. Dart's engine deletes the locals its own fold stranded, as Go's
+    # and Ruby's do: an inert value (or none) goes with the comment on its
+    # line, and a call, constructor or `await` keeps its value as a statement.
+    # The two rule names are in `_ENGINE_STRANDED_LOCAL_RULES`, and
+    # `unused.py`'s Dart branch stays as the backstop for what the engine
+    # withholds. A blank line a deletion leaves just inside its container
+    # (after the opening delimiter, or before the closing `}`/`end`) is
+    # removed, except in Go and ERB. A file that was CRLF throughout stays
+    # CRLF through deletions and folds, so `_collapse_carriage_returns` no
+    # longer finds the doubled `\r` there; it stays as defence in depth. No
+    # grammar rev moved, so `+canopy.3` stays.
+    #
+    # 0.34.0. The engine's C# grammar is canopy-labs/tree-sitter-c-sharp
+    # bc21c68 (upstream 0.23.5 plus one scanner fix): after an escaped `{{` in
+    # an interpolated string the next `{` opens a hole, so `$"{{{x}}}"` reads
+    # `x` as an expression instead of string text. C# moved, so its Gate 1
+    # grammar moves with it to `tree-sitter-c-sharp==0.23.5+canopy.1` (see
+    # that entry). TypeScript's rev did not move, so `+canopy.3` stays.
+    "polyglot-piranha==0.34.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -360,12 +530,26 @@ dependencies = [
     # with this grammar over the real file, and the host-language checks judge
     # a derived code view under Ruby's profile. See `syntax.py`'s `code_view`.
     "tree-sitter-embedded-template==0.25.0",
-    # C#. Pinned to the exact grammar version the fork's polyglot-piranha
-    # bundles (verified: `strings` on the built wheel and this PyPI package's
-    # own version both read 0.23.5; still 0.23.5 in 0.8.0) — Gate 1 must see
-    # the SAME node shapes the engine rewrites against, or its checks silently
-    # stop matching.
-    "tree-sitter-c-sharp==0.23.5",
+    # C#. NOT a PyPI release, and pinned EXACTLY for the same reason as
+    # tree-sitter-typescript above: Gate 1 must see the SAME node shapes the
+    # engine rewrites against, or its checks silently stop matching.
+    # polyglot-piranha bundles upstream 0.23.5 plus ONE external-scanner patch,
+    # and this wheel is cut from the same commit the engine pins
+    # (canopy-labs/tree-sitter-c-sharp bc21c68):
+    #
+    #   bc21c68  an escaped `{{` left the scanner's brace count at its limit,
+    #            so the `{` straight after it could not open a hole:
+    #            `$"{{{x}}}"` read `{x}` as string content. With a
+    #            string literal in the hole stock 0.23.5 ERRORS; without one it
+    #            is no error at all, just a hole whose expression nothing can
+    #            see -- a flag read or a key const inside it included.
+    #
+    # Same local-segment discipline as the TypeScript pin: PyPI forbids local
+    # versions, so this resolves only from wheels/, and the segment must move
+    # whenever the engine's pinned commit does. The test
+    # `test_the_csharp_grammar_matches_the_engines_view_of_escaped_braces`
+    # fails if the stock grammar is ever installed instead.
+    "tree-sitter-c-sharp==0.23.5+canopy.1",
     # Dart. The ONE grammar here that is NOT the version the engine bundles,
     # and the gap is a whole restructuring rather than a skew: the engine pins
     # `tree-sitter-dart 0.2.0` (a conventional `call_expression` /

@@ -20,9 +20,11 @@
 # `test_the_mirror_ships_every_build_input_and_nothing_that_names_the_monorepo`,
 # so the list and its guard cannot disagree.
 
-# The action surface a customer sees.
+# The action surface a customer sees. CHANGELOG.md is also a build input:
+# the release reads the version's section as its notes, and refuses without one.
 action.yml
 README.md
+CHANGELOG.md
 LICENSE
 
 # Build inputs. The Dockerfile COPYs pyproject.toml, README.md, LICENSE and

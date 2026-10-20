@@ -89,12 +89,12 @@ query = """(
      (property_declaration
        (modifiers (property_modifier) @const_modifier)
        (variable_declaration (identifier) @variable_name)
-       (string_literal (string_content) @flag_name)) @declaration)
+       (string_literal . (string_content) @flag_name .)) @declaration)
    (class_body
      (property_declaration
        (modifiers (property_modifier) @const_modifier)
        (variable_declaration (identifier) @variable_name)
-       (string_literal (string_content) @flag_name)) @declaration)] @scope
+       (string_literal . (string_content) @flag_name .)) @declaration)] @scope
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
 )"""

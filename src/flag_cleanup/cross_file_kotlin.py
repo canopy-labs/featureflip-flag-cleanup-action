@@ -1513,6 +1513,153 @@ def enum_dynamic_uses(
     return [unique[k] for k in sorted(unique)]
 
 
+def _taken_as_value(node: Node, decl: xk.KeyDeclaration, members: frozenset[str]) -> bool:
+    """Whether this ``identifier`` naming ``decl``'s owner hands the object
+    holding it on as a value: returned, passed, stored, or used as the
+    receiver of anything but one of its own members (``javaClass``,
+    ``let``, ``?.``). A Kotlin object is a value, and so is a class's
+    companion, spelled ``Owner`` or ``Owner.Companion``. A type position,
+    a constructor call, a binding, a callable reference (``Owner::class`` is
+    the class literal's) and ``Owner.<member>`` are not.
+    """
+    value = node
+    parent = value.parent
+    if parent is not None and parent.type == "navigation_expression":
+        parts = _parts(parent)
+        if len(parts) == 2 and parts[1].id == value.id:
+            # `app.Owner` names it only as the whole qualified name.
+            if re.sub(r"\s", "", parent.text.decode("utf-8", "replace")) != f"{decl.module}.{decl.owner}":
+                return False
+            value = parent
+    if _is_binding(node):
+        return False
+    through_companion = False
+    while True:
+        parent = value.parent
+        if parent is None:
+            return True
+        if parent.type == "navigation_expression":
+            parts = _parts(parent)
+            if not parts or parts[0].id != value.id:
+                return True
+            if _operator(parent) == "::":
+                return False
+            member = _text(parts[1]) if len(parts) == 2 and parts[1].type == "identifier" else None
+            if _operator(parent) != "." or member is None:
+                return True
+            if not through_companion and decl.companion is not None and member == decl.companion:
+                value, through_companion = parent, True
+                continue
+            return member not in members
+        if parent.type in _NOT_A_VALUE:
+            return False
+        if parent.type == "call_expression":
+            return not (_parts(parent) and _parts(parent)[0].id == value.id)
+        return True
+
+
+def _handed_to_a_double(literal: Node) -> bool:
+    """Whether ``Owner::class`` (or ``Owner::class.java``) is the first argument
+    of a call that never reads its static fields
+    (:data:`~flag_cleanup.cross_file_java.NOT_REFLECTING`), or any argument of
+    such an annotation (:data:`~flag_cleanup.cross_file_java.NOT_REFLECTING_ANNOTATIONS`)."""
+    from flag_cleanup import cross_file_java
+
+    value = literal
+    parent = value.parent
+    if parent is not None and parent.type == "navigation_expression":
+        parts = _parts(parent)
+        if len(parts) == 2 and parts[0].id == value.id and _text(parts[1]) == "java":
+            value = parent
+    # `@Import(A::class, Gate::class)`, `@MockkBean(value = [Gate::class])`:
+    # any argument of such an annotation, named or in an array.
+    inner = value.parent if value.parent is not None and value.parent.type == "collection_literal" else value
+    argument = inner.parent
+    arguments = argument.parent if argument is not None and argument.type == "value_argument" else None
+    invocation = arguments.parent if arguments is not None else None
+    if (
+        invocation is not None and invocation.type == "constructor_invocation"
+        and invocation.parent is not None and invocation.parent.type == "annotation"
+    ):
+        named = next((c for c in _parts(invocation) if c.type == "user_type"), None)
+        return named is not None and _last_name(named) in cross_file_java.NOT_REFLECTING_ANNOTATIONS
+    argument = value.parent
+    if argument is None or argument.type != "value_argument" or [c.id for c in _parts(argument)] != [value.id]:
+        return False
+    arguments = argument.parent
+    if arguments is None or arguments.type != "value_arguments" or _parts(arguments)[0].id != argument.id:
+        return False
+    call = arguments.parent
+    if call is None or call.type != "call_expression" or not _parts(call):
+        return False
+    return kotlin_sentinel._method_name(_parts(call)[0]) in cross_file_java.NOT_REFLECTING
+
+
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``path`` that takes a
+    key constant's owner whole, from which reflection reads every constant it
+    holds: ``Owner::class`` (qualified, or through an import alias, and not
+    handed to a test double or a logger, :func:`_handed_to_a_double`) or a
+    string naming the class (``Class.forName("app.Owner")``), of the owner
+    or of a type that may extend it (:class:`~flag_cleanup.cross_file_java.OwnerReach`),
+    and a Kotlin object or companion holding one handed on as a value
+    (:func:`_taken_as_value`) other than to a test double. A file whose parse has errors refuses each
+    owner it spells, at its first line.
+    """
+    from flag_cleanup import cross_file_java
+
+    reach = cross_file_java.owner_reach(constants, repo_dir)
+    if not reach:
+        return []
+    root = _parse(source)
+    if root.has_error:
+        return [(holder, xk.Refusal(path, 1, xk.UNSUPPORTED_FORM, "")) for holder in sorted(reach.spelled(source))]
+    renames = _renames(root)
+    # A Kotlin owner is an object, or a class whose companion holds the constant.
+    values: dict[str, list[xk.KeyDeclaration]] = {}
+    for decl in constants:
+        if decl.kind == xk.CONSTANT and decl.owner is not None and decl.path.endswith(".kt"):
+            values.setdefault(decl.owner, []).append(decl)
+    found: set[tuple[str, xk.Refusal]] = set()
+    for node in _walk(root):
+        held: set[str] = set()
+        if node.type == "navigation_expression":
+            parts = _parts(node)
+            if len(parts) == 2 and _operator(node) == "::" and _text(parts[1]) == "class" and not _handed_to_a_double(node):
+                name = _last_name(parts[0])
+                held |= reach.by_name(renames.get(name, name)) if name is not None else set()
+        elif (
+            node.type == "callable_reference" and node.children and node.children[-1].type == "class"
+            and not _handed_to_a_double(node)
+        ):
+            receiver = next((c for c in _parts(node) if c.type != "class"), None)
+            name = _last_name(receiver) if receiver is not None else None
+            held |= reach.by_name(renames.get(name, name)) if name is not None else set()
+        elif node.type == "string_literal":
+            parts = _parts(node)
+            if parts and all(c.type == "string_content" for c in parts):
+                held |= reach.by_string("".join(_text(c) for c in parts).replace("\\$", "$"))
+        elif node.type == "identifier" and values and not _in_header(node):
+            name = _text(node)
+            for decl in values.get(renames.get(name, name), ()):
+                # `mockkObject(Owner)` replaces its functions, never reads a field.
+                if _taken_as_value(node, decl, reach.kotlin_members(decl)) and not _handed_to_a_double(node):
+                    held.add(decl.path)
+        for holder in held:
+            found.add((holder, xk.refusal(path, node, xk.UNSUPPORTED_FORM, source)))
+    return sorted(found, key=lambda hit: (hit[0], hit[1].line, hit[1].text))
+
+
+def constant_module_pattern(constants: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
+    """Java's (:func:`flag_cleanup.cross_file_java.constant_module_pattern`):
+    an import alias spells the owner in its import, so its file is found too."""
+    from flag_cleanup import cross_file_java
+
+    return cross_file_java.constant_module_pattern(constants, repo_dir)
+
+
 xk.register(
     "kt",
     xk.Profile(
@@ -1524,5 +1671,9 @@ xk.register(
         reaches=frozenset({"java", "groovy", "scala"}),
         entry_findings=entry_findings,
         enum_dynamic_uses=enum_dynamic_uses,
+        # Reflection over the owner, or a Kotlin object handed on, reaches
+        # every constant without spelling one.
+        constant_escapes=constant_escapes,
+        constant_module_pattern=constant_module_pattern,
     ),
 )

@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import functools
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -115,6 +115,13 @@ class Family:
     #: could not be read): ``members`` may then miss what that base declares,
     #: so a member name is no evidence of a type.
     sibling_bases_external: bool = True
+    #: Whether a lookup of the member by name can tell a deleted member from
+    #: an attribute-less one only by its attributes: no deleted declaration
+    #: carries an attribute or is ``virtual``/``abstract``/``override``/
+    #: ``new``, no type up a family class's chain declares the name (or is
+    #: unknown), and nothing derives from a family class. See
+    #: :func:`_attribute_only`.
+    attributes_unobservable: bool = False
 
 
 def _full(namespace: str, name: str) -> str:
@@ -168,7 +175,76 @@ def family_of(repo_dir: str, wrapper, index) -> Family:
         extension_blocks=declares_extension_blocks(repo_dir),
         dynamic_anywhere=spells_dynamic(repo_dir),
         sibling_bases_external=_sibling_bases_external(repo_dir, wrapper.siblings),
+        attributes_unobservable=_attributes_unobservable(wrapper, checkout, full),
     )
+
+
+#: Modifiers under which a deleted member's lookup may differ from an
+#: attribute-less member's: another declaration of the name is in play.
+_HIDING = frozenset({"virtual", "abstract", "override", "new", "extern", "partial"})
+
+
+def _attributes_unobservable(wrapper, checkout, full: frozenset[str]) -> bool:
+    """See :attr:`Family.attributes_unobservable`. Anything unreadable, a
+    partial type, a base outside the repository and a name an unparsed file
+    may declare all answer no."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    spans = [(wrapper.path, wrapper.start)]
+    if wrapper.interface is not None:
+        spans.append((wrapper.interface.path, wrapper.interface.start))
+    spans += [(s.path, s.start) for s in wrapper.siblings]
+    for path, start in spans:
+        source = wc._read(path)
+        if source is None:
+            return False
+        declarations = [
+            n
+            for n in cross_file_keys.walk(wc.parse(source))
+            if n.type in ("property_declaration", "method_declaration")
+            and n.start_byte <= start < n.end_byte
+            and (wc._name_of(n) or "").removeprefix("@") == wrapper.name
+        ]
+        if len(declarations) != 1:
+            return False
+        declaration = declarations[0]
+        if wc._child(declaration, "attribute_list") is not None or xcs._modifiers(declaration) & _HIDING:
+            return False
+    family_types = {
+        name for name in full if any(i.full == name for i in checkout.by_full.get(name, ()))
+    }
+    classes = [
+        full_name
+        for full_name in family_types
+        if not (wrapper.interface is not None and full_name == f"{wrapper.interface.package}.{wrapper.interface.name}".lstrip("."))
+    ]
+    simple = {c.rsplit(".", 1)[-1] for c in classes}
+    if any(checkout.spelled_where_unparsed(name) for name in simple):
+        return False  # an unparsed file may declare a type deriving from one
+    for infos in checkout.by_last.values():
+        for info in infos:
+            if info.full not in family_types and set(info.supertypes) & simple:
+                return False  # derives from a family class
+    for full_name in classes:
+        pending = [s for info in checkout.by_full.get(full_name, ()) for s in info.supertypes]
+        if any(info.partial for info in checkout.by_full.get(full_name, ())):
+            return False
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            infos = checkout.by_last.get(name, ())
+            if not infos or checkout.spelled_where_unparsed(name):
+                return False  # a base this cannot read may declare the name
+            for info in infos:
+                if info.full in family_types:
+                    continue
+                if wrapper.name in info.members or info.partial:
+                    return False
+                pending.extend(info.supertypes)
+    return True
 
 
 def _sibling_bases_external(repo_dir: str, siblings) -> bool:
@@ -1155,26 +1231,47 @@ _ROUTE_IN_ERROR = re.compile(
 )
 _STRING_LITERALS = frozenset({"string_literal", "verbatim_string_literal", "raw_string_literal"})
 #: repo_dir -> the C# files (resolved) holding a by-name route whose name is
-#: not a string literal; see :func:`computed_name_route`.
-_ROUTES: dict[str, tuple[str, ...]] = {}
+#: not a string literal, each with the types its every such route is bound
+#: to, or None when one may reach any type; see :func:`computed_name_route`.
+_ROUTES: dict[str, dict[str, frozenset[str] | None]] = {}
+#: repo_dir -> the C# files (resolved) whose only computed-name routes are
+#: lookups tested for an attribute alone (:func:`_attribute_only`).
+_ATTRIBUTE_ROUTES: dict[str, tuple[str, ...]] = {}
 #: In :data:`_ROUTES`: a route that may reach every project.
 _ANY_PROJECT = ""
 #: ``(repo_dir, family)`` -> :func:`computed_name_route`'s answer.
 _ROUTED: dict[tuple[str, "Family"], bool] = {}
 
 
-def _literal_name(call: Node | None, route: str) -> bool:
-    """Whether a call passes ``route``'s NAME argument as a plain string
-    literal: the one named by a parameter name it may take, else the one
-    at its position among the positional arguments. A literal anywhere else
-    (a format, a binder flag) says nothing; a name that cannot be placed --
-    no argument list, too few arguments, an unknown named one -- is
-    computed."""
+def nameof_value(node: Node | None) -> str | None:
+    """The constant a ``nameof(...)`` expression is, the last simple name of
+    its argument (``nameof(A.B<T>)`` is ``"B"``); None for anything else,
+    ``@nameof(...)`` included, which is always a call."""
+    if node is None or node.type != "invocation_expression":
+        return None
+    function = node.child_by_field_name("function")
+    arguments = node.child_by_field_name("arguments")
+    if function is None or function.type != "identifier" or xcs._text(function) != "nameof" or arguments is None:
+        return None
+    listed = [a for a in arguments.named_children if a.type == "argument"]
+    if len(listed) != 1 or len(listed[0].named_children) != 1:
+        return None
+    value = listed[0].named_children[0]
+    if value.type not in ("identifier", "generic_name", "member_access_expression", "qualified_name"):
+        return None
+    return xcs._last_name(value) or None
+
+
+def _name_value(call: Node | None, route: str) -> Node | None:
+    """The value a call passes as ``route``'s NAME argument: the one named by
+    a parameter name it may take, else the one at its position among the
+    positional arguments. None when it cannot be placed: no argument list,
+    too few arguments, an unknown named one."""
     arguments = call.child_by_field_name("arguments") if call is not None else None
     if arguments is None:
-        return False
+        return None
     position, names = _NAME_ARGUMENT[route]
-    positional: list[Node] = []
+    positional: list[Node | None] = []
     for argument in arguments.named_children:
         if argument.type != "argument":
             continue
@@ -1183,13 +1280,359 @@ def _literal_name(call: Node | None, route: str) -> bool:
         value = values[-1] if values else None
         if label is not None:
             if xcs._text(label).removeprefix("@") in names:
-                return value is not None and value.type in _STRING_LITERALS
+                return value
             continue
         positional.append(value)
-    if len(positional) <= position:
+    return positional[position] if len(positional) > position else None
+
+
+def _constant(value: Node | None, nameof: bool = True) -> bool:
+    """A plain string literal or, with ``nameof``, a ``nameof(...)``."""
+    return value is not None and (value.type in _STRING_LITERALS or (nameof and nameof_value(value) is not None))
+
+
+def _literal_name(call: Node | None, route: str, nameof: bool = True, repo_dir: str | None = None) -> bool:
+    """Whether a call passes ``route``'s NAME argument (:func:`_name_value`)
+    as a constant (:func:`_constant`), judged afterwards like a literal (see
+    :func:`string_mentions`), or as a parameter that can hold nothing else
+    (:func:`name_sources`). A literal anywhere else (a format, a binder
+    flag) says nothing; a name that cannot be placed is computed."""
+    value = _name_value(call, route)
+    if _constant(value, nameof):
+        return True
+    return value is not None and name_sources(value, nameof, repo_dir) is not None
+
+
+#: Method modifiers under which a caller may be out of sight.
+_CALLED_FROM_ANYWHERE = frozenset(
+    {"partial", "extern", "abstract", "public", "internal", "protected", "virtual", "override"}
+)
+_THEORY_ATTRIBUTES = frozenset({"Theory", "InlineData"})
+#: A binding the parameter's name may also have in its method.
+_BINDING_PARENTS = frozenset(
+    {
+        "variable_declarator", "parameter", "foreach_statement", "tuple_pattern", "declaration_expression",
+        "declaration_pattern", "catch_declaration", "single_variable_designation", "local_function_statement",
+        "from_clause", "let_clause", "join_clause", "join_into_clause", "query_continuation", "group_clause",
+        "lambda_expression", "anonymous_method_expression", "parenthesized_variable_designation", "var_pattern",
+        "recursive_pattern", "labeled_statement", "type_parameter", "using_statement", "fixed_statement",
+    }
+)
+
+
+#: Binding constructs whose bound identifiers carry no field name.
+_UNNAMED_BINDINGS = frozenset(
+    {
+        "tuple_pattern", "lambda_expression", "parenthesized_variable_designation", "from_clause", "let_clause",
+        "join_clause", "join_into_clause", "query_continuation", "group_clause", "var_pattern",
+        "recursive_pattern", "anonymous_method_expression", "labeled_statement", "single_variable_designation",
+    }
+)
+
+
+def _only_binding(scope: Node, name: str, site: Node) -> bool:
+    """Whether ``site`` is the one place in ``scope`` that binds ``name``:
+    any other identifier of the name a binding construct holds directly is
+    another binding, which the name might mean instead."""
+    for node in cross_file_keys.walk(scope):
+        if node.type == "implicit_parameter" and xcs._text(node).removeprefix("@") == name:
+            return False
+        if node.type != "identifier" or node.id == site.id or xcs._text(node).removeprefix("@") != name:
+            continue
+        parent = node.parent
+        if parent is None or parent.type not in _BINDING_PARENTS:
+            continue
+        field = xcs._field(parent, node)
+        if field in ("name", "left") or (field is None and parent.type in _UNNAMED_BINDINGS):
+            return False
+    return True
+
+
+def _written(scope: Node, name: str) -> bool:
+    """Whether anything in ``scope`` may write ``name``, erring toward yes:
+    any mention on the left of an assignment (a deconstruction's tuple
+    included), an increment, a ``ref`` alias of it, or passing it by
+    ``ref``, ``out`` or ``in``."""
+    for node in cross_file_keys.walk(scope):
+        if node.type != "identifier" or xcs._text(node).removeprefix("@") != name:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if parent.type in ("prefix_unary_expression", "postfix_unary_expression", "ref_expression"):
+            return True
+        if parent.type == "argument" and any(c.type in ("ref", "out", "in") for c in parent.children):
+            return True
+        child, above = node, parent
+        while above is not None and above.id != scope.id:
+            if above.type == "assignment_expression" and xcs._field(above, child) == "left":
+                return True
+            child, above = above, above.parent
+    return False
+
+
+def _attribute_names(declaration: Node) -> list[str]:
+    return [
+        (xcs._last_name(a.child_by_field_name("name")) or "").removesuffix("Attribute")
+        for c in declaration.children
+        if c.type == "attribute_list"
+        for a in c.named_children
+        if a.type == "attribute"
+    ]
+
+
+def name_sources(name: Node, nameof: bool = True, repo_dir: str | None = None, depth: int = 0) -> list[Node] | None:
+    """The values a route's NAME can hold when it is a parameter of its
+    method that nothing writes and nothing else in the method binds, and
+    every value passed to it is a constant (:func:`_constant`): each one, or
+    None when the NAME is anything else.
+
+    Values are passed only by the calls in its file of a ``private`` method
+    reached no other way (no method group, qualified call, overload or
+    string spelling its name; no attribute; its type not ``partial``), or by
+    the ``[InlineData]`` rows of an xunit ``[Theory]`` nothing calls: with
+    ``repo_dir``, no other mention of its name in the checkout. Without it,
+    that is not checked, which only widens the answer.
+
+    So may a ``foreach`` variable over an array of constants, written in
+    place or held by a local nothing writes, passes or returns; and a value
+    passed may itself be any of these."""
+    if name.type != "identifier" or depth > 2:
+        return None
+    looped = _looped_constants(name, nameof)
+    if looped is not None:
+        return looped
+    parameter = xcs._text(name).removeprefix("@")
+    method = name.parent
+    while method is not None and method.type != "method_declaration":
+        method = method.parent
+    listed = method.child_by_field_name("parameters") if method is not None else None
+    method_name = method.child_by_field_name("name") if method is not None else None
+    if listed is None or method_name is None or any(c.type not in ("parameter", "comment") for c in listed.named_children):
+        return None
+    parameters = [p for p in listed.named_children if p.type == "parameter"]
+    names = [xcs._text(n).removeprefix("@") if (n := p.child_by_field_name("name")) is not None else "" for p in parameters]
+    index = next(
+        (
+            i
+            for i, p in enumerate(parameters)
+            if (n := p.child_by_field_name("name")) is not None and xcs._text(n).removeprefix("@") == parameter
+        ),
+        None,
+    )
+    if index is None:
+        return None
+    declared = parameters[index]
+    if any(c.type in ("modifier", "attribute_list") for c in declared.children):
+        return None
+    if not _only_binding(method, parameter, declared.child_by_field_name("name")) or _written(method, parameter):
+        return None
+    root = method
+    while root.parent is not None:
+        root = root.parent
+    called = xcs._text(method_name).removeprefix("@")
+    word = re.compile(rf"(?<![\w@]){re.escape(called)}(?![\w])")
+    attributes = _attribute_names(method)
+    sources: list[Node] = []
+    if "Theory" in attributes and set(attributes) <= _THEORY_ATTRIBUTES:
+        for row in (a for c in method.children if c.type == "attribute_list" for a in c.named_children):
+            if (xcs._last_name(row.child_by_field_name("name")) or "").removesuffix("Attribute") != "InlineData":
+                continue
+            listed_values = next((c for c in row.named_children if c.type == "attribute_argument_list"), None)
+            values = [a for a in listed_values.named_children if a.type == "attribute_argument"] if listed_values else []
+            if len(values) != len(parameters) or any(len(v.named_children) != 1 for v in values):
+                return None  # a named argument, or a row xunit cannot bind
+            value = values[index].named_children[0]
+            if not _constant(value, nameof):
+                return None
+            sources.append(value)
+        if repo_dir is not None:
+            mentioning = cross_file_keys.mention_files(repo_dir, [called], exclude=())
+            if len(mentioning) != 1 or len(word.findall(xcs._text(root))) != 1:
+                return None
+        return sources
+    words = xcs._modifiers(method)
+    owner = method.parent.parent if method.parent is not None else None
+    if (
+        attributes
+        or "private" not in words
+        or words & _CALLED_FROM_ANYWHERE
+        or owner is None
+        or "partial" in xcs._modifiers(owner)
+    ):
+        return None
+    for node in cross_file_keys.walk(root):
+        if node.type in _STRING_LITERALS and word.search(xcs._text(node)):
+            return None  # reflection may call it
+        if node.type != "identifier" or node.id == method_name.id or xcs._text(node).removeprefix("@") != called:
+            continue
+        callee = node.parent if node.parent is not None and node.parent.type == "generic_name" else node
+        call = callee.parent
+        if call is None or call.type != "invocation_expression" or xcs._field(call, callee) != "function":
+            return None
+        value = _argument_for(call, parameter, index, names)
+        if value is False:
+            return None
+        if value is None:
+            # Nothing passed: the default, which is a constant or nothing.
+            after = [c for c in declared.named_children if c.start_byte >= declared.child_by_field_name("name").end_byte]
+            value = after[0] if len(after) == 1 else None
+        if _constant(value, nameof):
+            sources.append(value)
+            continue
+        passed = name_sources(value, nameof, repo_dir, depth + 1) if value is not None else None
+        if passed is None:
+            return None
+        sources.extend(passed)
+    return sources
+
+
+def _binding_loop(name: Node, variables: Callable[[Node], list[Node]]) -> tuple[Node, Node] | None:
+    """``(foreach, the identifier it binds)`` for the nearest ``foreach``
+    whose BODY holds ``name`` and whose ``variables(left)`` bind its name,
+    when nothing inside that loop binds the name again. A use in the loop's
+    ``in`` expression is outside the loop's scope."""
+    variable = xcs._text(name).removeprefix("@")
+    child, loop = name, name.parent
+    while loop is not None:
+        if loop.type == "foreach_statement" and xcs._field(loop, child) == "body":
+            left = loop.child_by_field_name("left")
+            site = next(
+                (n for n in variables(left) if xcs._text(n).removeprefix("@") == variable), None
+            ) if left is not None else None
+            if site is not None:
+                return (loop, site) if _only_binding(loop, variable, site) else None
+        child, loop = loop, loop.parent
+    return None
+
+
+def _looped_constants(name: Node, nameof: bool) -> list[Node] | None:
+    """The elements a ``foreach`` variable ``name`` takes, when it iterates
+    an array (written in place, or a local nothing writes, passes or
+    returns) of constants and nothing else in its method binds the name."""
+    found = _binding_loop(name, lambda left: [left] if left.type == "identifier" else [])
+    method = found[0] if found is not None else None
+    while method is not None and method.type not in ("method_declaration", "local_function_statement", "constructor_declaration"):
+        method = method.parent
+    if found is None or method is None:
+        return None
+    collection = found[0].child_by_field_name("right")
+    if collection is not None and collection.type == "identifier":
+        collection = _read_only_local(collection, method)
+    if collection is None or collection.type not in ("implicit_array_creation_expression", "array_creation_expression"):
+        return None
+    initializer = next((c for c in collection.named_children if c.type == "initializer_expression"), None)
+    elements = list(initializer.named_children) if initializer is not None else []
+    if not elements or not all(_constant(e, nameof) for e in elements):
+        return None
+    return elements
+
+
+def _argument_for(call: Node, parameter: str, index: int, names: list[str]) -> Node | None | bool:
+    """The value a call passes to ``parameter`` (by name, or in its place
+    ``index``), None when it passes none, or False when its argument list
+    cannot be read: a positional argument after a named one out of its
+    place cannot be mapped to a parameter."""
+    arguments = call.child_by_field_name("arguments")
+    if arguments is None:
         return False
-    value = positional[position]
-    return value is not None and value.type in _STRING_LITERALS
+    listed = [a for a in arguments.named_children if a.type != "comment"]
+    if any(a.type != "argument" for a in listed):
+        return False
+    reordered = False
+    for place, argument in enumerate(listed):
+        label = argument.child_by_field_name("name")
+        values = [c for c in argument.named_children if label is None or c.id != label.id]
+        value = values[-1] if values else None
+        if label is not None:
+            spelled = xcs._text(label).removeprefix("@")
+            if spelled == parameter:
+                return value
+            reordered |= place >= len(names) or names[place] != spelled
+            continue
+        if reordered:
+            return False
+        if place == index:
+            return value
+    return None
+
+
+#: By-name words that reach a member without a NAME argument to judge: a
+#: lookup that enumerates members (and is filtered by a string compared
+#: with ``.Name``), one this does not place a NAME for (``FindMembers`` with
+#: ``Type.FilterName``, ``TypeInfo``'s declared lookups, an expression
+#: tree's ``Field`` or ``Call``), a descriptor type, and ``GetType()``,
+#: whose ``Type`` may go on to any by-name API.
+_UNNAMED_ROUTE = re.compile(
+    r"\bGetType\s*\("
+    r"|\bGet(?:Runtime)?(?:Properties|Methods|Fields|Members)\b"
+    r"|\bGetRuntime(?:Method|Field)\b"
+    r"|\bFindMembers\b|\bFilterName\b"
+    r"|\bGetDeclared\w*|\bDeclared(?:Properties|Methods|Fields|Members|Events|NestedTypes|Constructors)\b"
+    r"|\bExpression\s*\.\s*(?:Field|Call|Property|PropertyOrField|MakeMemberAccess)\b"
+    r"|\bTypeDescriptor\b|\bPropertyDescriptor\b"
+)
+#: A lookup that matches a name ignoring case (``BindingFlags.IgnoreCase``,
+#: ``StringComparison.OrdinalIgnoreCase``, ...), or by a prefix
+#: (``GetMember`` takes ``"IsX*"``): a string reaches a member no
+#: case-sensitive word of its name matches.
+_LOOSE_NAME = re.compile(r"IgnoreCase\b|\"\w*\*\"")
+
+
+def loose_names(source: str) -> bool:
+    """Whether a file may look a member up ignoring case or by a prefix."""
+    return _LOOSE_NAME.search(source) is not None
+
+
+#: repo_dir -> the C# files (resolved) that may look a member up ignoring
+#: case or by a prefix (:func:`loose_names`), or cannot be read.
+_LOOSE: dict[str, tuple[str, ...]] = {}
+
+
+def loose_files(repo_dir: str) -> tuple[str, ...]:
+    """Every C# file of the checkout, ignored ones included, whose strings
+    may name a member in another case or by a prefix: its strings are judged
+    even where it never spells the name. Read once per ``repo_dir``."""
+    if repo_dir not in _LOOSE:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        found: list[str] = []
+        for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+            if f.path.name.endswith(".cs") and (text := wc._read(f.resolved)) is not None and loose_names(text):
+                found.append(f.resolved)
+        _LOOSE[repo_dir] = tuple(found)
+    return _LOOSE[repo_dir]
+
+
+def route_names(root: Node, source: str) -> list[Node] | None:
+    """The NAME argument of every call in a parsed file whose callee is
+    spelled like a by-name route (``GetProperty``, ``Expression.Property``,
+    ``DataBinder.Eval``, ``Binding``, ...), whatever its receiver, which
+    only over-counts. None when a string of the file may reach a member by
+    name some other way: the file does not parse, or spells a route of
+    :data:`_UNNAMED_ROUTE`.
+
+    Asked only where no route anywhere the family can be takes a computed
+    name: every NAME there is a literal or a ``nameof``, so no other string
+    of the file can flow into one."""
+    if root.has_error or _UNNAMED_ROUTE.search(source):
+        return None
+    found: list[Node] = []
+    for node in cross_file_keys.walk(root):
+        if node.type == "invocation_expression":
+            function = node.child_by_field_name("function")
+            callee = xcs._last_name(function) if function is not None else ""
+        elif node.type == "object_creation_expression":
+            created = node.child_by_field_name("type")
+            callee = (xcs._simple_name(created) or "") if created is not None else ""
+        else:
+            continue
+        value = _name_value(node, callee) if callee in _NAME_ARGUMENT else None
+        if value is not None:
+            # A parameter's constants are the route's NAME, wherever passed.
+            found.extend(name_sources(value) or [value])
+    return found
 
 
 def _route_directive(node: Node) -> bool:
@@ -1204,14 +1647,282 @@ def _route_directive(node: Node) -> bool:
     return using.target.rsplit(".", 1)[-1] in _ROUTE_TYPES
 
 
-def _computed_route(root: Node) -> bool:
+_TYPE_NAMES = frozenset({"identifier", "qualified_name", "generic_name", "alias_qualified_name", "predefined_type"})
+#: Members of a local collection that only read it.
+_READ_ONLY_MEMBERS = frozenset({"Count", "Length"})
+
+
+def _typeof_type(node: Node | None) -> str | None:
+    """The type a ``typeof(...)`` names, as written, when it is a plain
+    (possibly qualified or generic) type name that no enclosing generic
+    declaration's type parameter can be."""
+    if node is None or node.type != "typeof_expression":
+        return None
+    type_node = node.child_by_field_name("type")
+    if type_node is None or type_node.type not in _TYPE_NAMES:
+        return None
+    spelled = set(_WORD.findall(xcs._text(type_node)))
+    scope = node.parent
+    while scope is not None:
+        # A method's or an interface's list is a field; a class's, struct's
+        # or record's is an unnamed child.
+        parameters = scope.child_by_field_name("type_parameters") or next(
+            (c for c in scope.children if c.type == "type_parameter_list"), None
+        )
+        if parameters is not None and spelled & {
+            xcs._text(n) for t in parameters.named_children if (n := t.child_by_field_name("name")) is not None
+        }:
+            return None
+        scope = scope.parent
+    return xcs._text(type_node)
+
+
+def _receiver_types(access: Node | None, repo_dir: str | None) -> frozenset[str] | None:
+    """The types whose ``Type`` alone a name-taking call's receiver can be:
+    a ``typeof(C)``, or a ``foreach`` variable over a local ``Dictionary<K,
+    Type>`` (deconstructed, its value) or array built only of ``typeof`` expressions,
+    which nothing writes, passes or returns. None for anything else.
+
+    ``Type.GetProperty`` and the like on ``C`` see ``C``'s members and its
+    base classes', never an interface's: a family member is reached only
+    through a ``C`` that is, or leads to, a family type."""
+    if access is None or access.type != "member_access_expression":
+        return None
+    receiver = access.child_by_field_name("expression")
+    single = _typeof_type(receiver)
+    if single is not None:
+        return frozenset({single})
+    if receiver is None or receiver.type != "identifier":
+        return None
+    def variables(left: Node) -> list[Node]:
+        if left.type == "identifier":
+            return [left]
+        return [n for n in left.named_children if n.type == "identifier"] if left.type == "tuple_pattern" else []
+
+    found = _binding_loop(receiver, variables)
+    method = found[0] if found is not None else None
+    while method is not None and method.type not in ("method_declaration", "local_function_statement", "constructor_declaration"):
+        method = method.parent
+    if found is None or method is None:
+        return None
+    loop, site = found
+    names = variables(loop.child_by_field_name("left"))
+    if len(names) not in (1, 2):
+        return None
+    collection = loop.child_by_field_name("right")
+    if collection is not None and collection.type == "identifier":
+        collection = _read_only_local(collection, method)
+    return _typeof_elements(collection, len(names), names.index(site), repo_dir)
+
+
+def _read_only_local(name: Node, method: Node) -> Node | None:
+    """The initializer of the local ``name`` reads, when it is a local of
+    ``method`` that nothing else binds, and every other mention of it only
+    reads a :data:`_READ_ONLY_MEMBERS` member or is iterated by a
+    ``foreach``."""
+    local = xcs._text(name).removeprefix("@")
+    declarator = None
+    for node in cross_file_keys.walk(method):
+        if node.type != "identifier" or xcs._text(node).removeprefix("@") != local or node.id == name.id:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "variable_declarator" and xcs._field(parent, node) == "name":
+            if declarator is not None:
+                return None
+            declarator = parent
+            continue
+        if parent is not None and parent.type == "foreach_statement" and xcs._field(parent, node) == "right":
+            continue  # iterated again
+        if (
+            parent is not None
+            and parent.type == "member_access_expression"
+            and xcs._field(parent, node) == "expression"
+            and xcs._text(parent.child_by_field_name("name")) in _READ_ONLY_MEMBERS
+            and not (
+                parent.parent is not None
+                and parent.parent.type in ("invocation_expression", "assignment_expression")
+                and xcs._field(parent.parent, parent) in ("function", "left")
+            )
+        ):
+            continue
+        return None  # written, passed, returned or used some other way
+    if declarator is None or not _only_binding(method, local, declarator.child_by_field_name("name")):
+        return None
+    values = [c for c in declarator.named_children if c.id != declarator.child_by_field_name("name").id]
+    return values[0] if len(values) == 1 else None
+
+
+def _typeof_elements(collection: Node | None, arity: int, position: int, repo_dir: str | None) -> frozenset[str] | None:
+    """The types of a collection built only of ``typeof`` expressions, read by a
+    ``foreach`` of ``arity`` variables at ``position``: an array's elements
+    (one variable), or a ``Dictionary``'s values (deconstructed, the second
+    of two)."""
+    if collection is None:
+        return None
+    initializer = collection.child_by_field_name("initializer") or next(
+        (c for c in collection.named_children if c.type == "initializer_expression"), None
+    )
+    if initializer is None:
+        return None
+    if collection.type in ("implicit_array_creation_expression", "array_creation_expression"):
+        if arity != 1:
+            return None
+        elements = list(initializer.named_children)
+    elif collection.type == "object_creation_expression":
+        created = collection.child_by_field_name("type")
+        generic = created.child_by_field_name("name") if created is not None and created.type == "qualified_name" else created
+        arguments = next((c for c in generic.named_children if c.type == "type_argument_list"), None) if generic else None
+        if (
+            generic is None
+            or generic.type != "generic_name"
+            or xcs._simple_name(generic) != "Dictionary"
+            or arguments is None
+            or len(arguments.named_children) != 2
+            or (arity, position) != (2, 1)
+            or repo_dir is None
+            or xcs.csharp_index(repo_dir).may_declare("Dictionary")
+            or any(c.type == "argument_list" and c.named_children for c in collection.children)
+        ):
+            return None
+        elements = []
+        for entry in initializer.named_children:
+            if entry.type == "assignment_expression" and (left := entry.child_by_field_name("left")) is not None and (
+                left.type == "element_binding_expression"
+            ):
+                elements.append(entry.child_by_field_name("right"))
+            elif entry.type == "initializer_expression" and len(entry.named_children) == 2:
+                elements.append(entry.named_children[1])
+            else:
+                return None
+    else:
+        return None
+    types = [_typeof_type(e) for e in elements]
+    if not types or None in types:
+        return None
+    return frozenset(t for t in types if t is not None)
+
+
+#: Lookups of one property by name, whose result is that property or null.
+#: Not ``GetMethod`` or ``GetField``: an auto-property's accessors and
+#: backing field carry attributes the compiler adds (``[CompilerGenerated]``),
+#: and an accessor may carry its own, none of which the property's
+#: declaration shows.
+_SINGLE_LOOKUPS = frozenset({"GetProperty", "GetRuntimeProperty"})
+
+
+def _operator(node: Node) -> str:
+    return next((xcs._text(c) for c in node.children if not c.is_named), "")
+
+
+def _attribute_test(receiver: Node) -> bool:
+    """Whether ``receiver`` (a lookup's result) is only asked, through
+    ``?.``, whether it carries an attribute, so that a missing member and an
+    attribute-less one answer alike: ``r?.GetCustomAttribute<T>()``
+    compared with ``null``, or ``r?.IsDefined(typeof(T))`` compared with
+    ``true`` or defaulted with ``?? false``."""
+    access = receiver.parent
+    if access is None or access.type != "conditional_access_expression" or xcs._field(access, receiver) != "condition":
+        return False
+    bindings = [c for c in access.named_children if c.id != receiver.id]
+    call = access.parent
+    if (
+        len(bindings) != 1
+        or bindings[0].type != "member_binding_expression"
+        or call is None
+        or call.type != "invocation_expression"
+        or xcs._field(call, access) != "function"
+    ):
+        return False
+    method = bindings[0].child_by_field_name("name")
+    arguments = [a for a in call.child_by_field_name("arguments").named_children if a.type == "argument"]
+    values = [a.named_children[-1] if a.named_children else None for a in arguments]
+    if any(a.child_by_field_name("name") is not None for a in arguments):
+        return False
+    test = call.parent
+    if test is None:
+        return False
+
+    def compared_with(literal: str) -> bool:
+        if test.type == "binary_expression" and _operator(test) in ("==", "!="):
+            other = test.child_by_field_name("right" if xcs._field(test, call) == "left" else "left")
+            return other is not None and xcs._text(other) == literal
+        if test.type == "is_pattern_expression" and xcs._field(test, call) == "expression":
+            pattern = test.child_by_field_name("pattern")
+            if pattern is not None and pattern.type == "negated_pattern" and pattern.named_children:
+                pattern = pattern.named_children[0]
+            return pattern is not None and pattern.type == "constant_pattern" and xcs._text(pattern) == literal
+        return False
+
+    if method is not None and method.type == "generic_name" and xcs._simple_name(method) == "GetCustomAttribute":
+        type_arguments = next((c for c in method.named_children if c.type == "type_argument_list"), None)
+        return (
+            type_arguments is not None
+            and len(type_arguments.named_children) == 1
+            and all(v is not None and v.type == "boolean_literal" for v in values)
+            and len(values) <= 1
+            and compared_with("null")
+        )
+    if method is not None and method.type == "identifier" and xcs._text(method) == "IsDefined":
+        if not values or values[0] is None or values[0].type != "typeof_expression" or len(values) > 2:
+            return False
+        if len(values) == 2 and (values[1] is None or values[1].type != "boolean_literal"):
+            return False
+        if test.type == "binary_expression" and _operator(test) == "??" and xcs._field(test, call) == "left":
+            right = test.child_by_field_name("right")
+            return right is not None and xcs._text(right) == "false"
+        return compared_with("true")
+    return False
+
+
+def _attribute_only(call: Node) -> bool:
+    """Whether a single-member lookup's result is used only by
+    :func:`_attribute_test`: directly, or held by a local of its method each
+    of whose mentions is (so it is never written, passed or returned)."""
+    if _attribute_test(call):
+        return True
+    declarator = call.parent
+    if declarator is None or declarator.type != "variable_declarator":
+        return False
+    name = declarator.child_by_field_name("name")
+    values = [c for c in declarator.named_children if name is None or c.id != name.id]
+    method = declarator.parent
+    while method is not None and method.type not in ("method_declaration", "local_function_statement", "constructor_declaration", "accessor_declaration"):
+        method = method.parent
+    if name is None or values != [call] or method is None:
+        return False
+    local = xcs._text(name).removeprefix("@")
+    uses = [
+        n
+        for n in cross_file_keys.walk(method)
+        if n.type == "identifier" and n.id != name.id and xcs._text(n).removeprefix("@") == local
+    ]
+    return bool(uses) and all(_attribute_test(n) for n in uses)
+
+
+def _computed_route(
+    root: Node,
+    nameof: bool = True,
+    repo_dir: str | None = None,
+    bounds: set[str] | None = None,
+    attribute_only: list[Node] | None = None,
+) -> bool:
     """Whether a parsed file holds a by-name route whose name is computed:
     any use of a name-taking method that is not a call passing its name as
     a literal (a method group counts); ``Expression.Property`` or
     ``PropertyOrField``, a ``DataBinder`` member or ``new Binding(...)``
     likewise; any use of a descriptor lookup type; an alias or ``using
     static`` of a route type; or a route spelled where the file does not
-    parse."""
+    parse. ``nameof``: a ``nameof(...)`` name is a literal.
+
+    With ``bounds``, a name-taking call whose receiver can only be the
+    ``Type`` of some types (:func:`_receiver_types`) is not one: each of
+    those types is added to ``bounds`` instead, for the caller to judge
+    against a family. ``repo_dir`` lets a parameter name be proven
+    (:func:`name_sources`) and a collection's type be checked.
+
+    With ``attribute_only``, a property lookup whose result is only tested
+    for an attribute (:func:`_attribute_only`) is not one either: it is
+    added there instead, for the caller to judge against a family."""
     from flag_cleanup import wrapper_csharp as wc
 
     for node in cross_file_keys.walk(root):
@@ -1225,7 +1936,11 @@ def _computed_route(root: Node) -> bool:
             continue
         if node.type == "object_creation_expression":
             created = node.child_by_field_name("type")
-            if created is not None and xcs._simple_name(created) == "Binding" and not _literal_name(node, "Binding"):
+            if (
+                created is not None
+                and xcs._simple_name(created) == "Binding"
+                and not _literal_name(node, "Binding", nameof, repo_dir)
+            ):
                 return True
             continue
         if node.type != "identifier":
@@ -1246,12 +1961,20 @@ def _computed_route(root: Node) -> bool:
         if call is not None and xcs._field(call, target) != "function":
             call = None
         if name in _NAME_TAKING:
-            if not _literal_name(call, name):
-                return True
+            if not _literal_name(call, name, nameof, repo_dir):
+                types = _receiver_types(access, repo_dir) if bounds is not None and call is not None else None
+                if types is not None:
+                    bounds.update(types)
+                elif attribute_only is not None and call is not None and name in _SINGLE_LOOKUPS and _attribute_only(call):
+                    attribute_only.append(call)
+                else:
+                    return True
         elif name in ("Property", "PropertyOrField") and access is not None:
             receiver = access.child_by_field_name("expression")
             spelled = wc._text(receiver) if receiver is not None else ""
-            if (spelled == "Expression" or spelled.endswith(".Expression")) and not _literal_name(call, name):
+            if (spelled == "Expression" or spelled.endswith(".Expression")) and not _literal_name(
+                call, name, nameof, repo_dir
+            ):
                 return True
         elif name == "DataBinder":
             # `DataBinder.M(...)` or `System.Web.UI.DataBinder.M(...)`.
@@ -1268,7 +1991,7 @@ def _computed_route(root: Node) -> bool:
                 method not in ("Eval", "GetPropertyValue")
                 or outer is None
                 or outer.type != "invocation_expression"
-                or not _literal_name(outer, method)
+                or not _literal_name(outer, method, nameof, repo_dir)
             ):
                 return True
     return False
@@ -1290,34 +2013,103 @@ _NAMED_DECLARATIONS = frozenset(
 )
 
 
-def _route_files(repo_dir: str) -> tuple[str, ...]:
+def _route_files(repo_dir: str) -> dict[str, frozenset[str] | None]:
     """Every C# file of the checkout, ignored ones included, holding a
-    computed-name route; an unreadable one counts. Read once per
-    ``repo_dir``, like the scan."""
+    computed-name route, with the types its routes are bound to (None: any
+    type, see :func:`_computed_route`); an unreadable one counts as any.
+    Read once per ``repo_dir``, like the scan."""
     if repo_dir not in _ROUTES:
         from flag_cleanup import source_index
         from flag_cleanup import wrapper_csharp as wc
 
-        found: list[str] = []
+        found: dict[str, frozenset[str] | None] = {}
+        attributed: list[str] = []
+        #: What each file's routes are when ``nameof`` is not the operator,
+        #: where that differs.
+        by_nameof: dict[str, frozenset[str] | None] = {}
         for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
             if not f.path.name.endswith(".cs"):
                 continue
             text = wc._read(f.resolved)
             if text is None:
-                found.append(f.resolved)
-            elif _ROUTE_TEXT.search(text) and _computed_route(wc.parse(text)):
-                found.append(f.resolved)
+                found[f.resolved] = None
+            elif _ROUTE_TEXT.search(text):
+                root = wc.parse(text)
+                bounds: set[str] = set()
+                tested: list[Node] = []
+                if _computed_route(root, repo_dir=repo_dir, bounds=bounds, attribute_only=tested):
+                    found[f.resolved] = None
+                    continue
+                if bounds:
+                    found[f.resolved] = frozenset(bounds)
+                loose: set[str] = set()
+                if _computed_route(root, nameof=False, repo_dir=repo_dir, bounds=loose, attribute_only=tested):
+                    by_nameof[f.resolved] = None
+                elif loose != bounds:
+                    by_nameof[f.resolved] = frozenset(loose)
+                if tested:
+                    attributed.append(f.resolved)
+        if by_nameof and declares_nameof(repo_dir):
+            found.update(by_nameof)
+        _ATTRIBUTE_ROUTES[repo_dir] = tuple(p for p in attributed if p not in found)
         # A project `<Using>` item is a `global using` for its project's
         # files. One in a `.props`/`.targets` file may reach any project, as
         # may an item this cannot read.
         items, readable = xcs.msbuild_usings(repo_dir)
         if not readable:
-            found.append(_ANY_PROJECT)
+            found[_ANY_PROJECT] = None
         for item in items:
             if item.kind in ("alias", "static") and (item.target or "").rsplit(".", 1)[-1] in _ROUTE_TYPES:
-                found.append(item.path if item.path.endswith(".csproj") else _ANY_PROJECT)
-        _ROUTES[repo_dir] = tuple(found)
+                found[item.path if item.path.endswith(".csproj") else _ANY_PROJECT] = None
+        _ROUTES[repo_dir] = found
     return _ROUTES[repo_dir]
+
+
+_NAMEOF_WORD = re.compile(r"@?\bnameof\b")
+#: repo_dir -> whether something of the checkout may be named ``nameof``.
+_NAMEOF: dict[str, bool] = {}
+
+
+def declares_nameof(repo_dir: str) -> bool:
+    """Whether a C# file of the checkout may declare something named
+    ``nameof`` (a method, a local, a delegate-typed field): ``nameof(x)``
+    then calls it wherever it is in scope, and is no constant. Every
+    identifier ``nameof`` must be the callee of an invocation, written
+    without ``@``; a file that cannot be read, or that spells the word where
+    it does not parse, may declare one. Cached per ``repo_dir``, like the
+    scan."""
+    if repo_dir not in _NAMEOF:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        declared = False
+        for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+            if not f.path.name.endswith(".cs"):
+                continue
+            text = wc._read(f.resolved)
+            if text is None:
+                declared = True
+                break
+            if _NAMEOF_WORD.search(text) is None:
+                continue
+            for node in cross_file_keys.walk(wc.parse(text)):
+                if node.type == "ERROR" or node.is_missing:
+                    if _NAMEOF_WORD.search(wc._text(node)):
+                        declared = True
+                elif node.type == "identifier" and wc._text(node) in ("nameof", "@nameof"):
+                    parent = node.parent
+                    declared |= (
+                        wc._text(node) != "nameof"
+                        or parent is None
+                        or parent.type != "invocation_expression"
+                        or xcs._field(parent, node) != "function"
+                    )
+                if declared:
+                    break
+            if declared:
+                break
+        _NAMEOF[repo_dir] = declared
+    return _NAMEOF[repo_dir]
 
 
 def computed_name_route(repo_dir: str, family: Family) -> bool:
@@ -1327,10 +2119,24 @@ def computed_name_route(repo_dir: str, family: Family) -> bool:
     another part of a ``partial`` type)."""
     key = (repo_dir, family)
     if key not in _ROUTED:
+        routes = _route_files(repo_dir)
+        attributed = () if family.attributes_unobservable else _ATTRIBUTE_ROUTES.get(repo_dir, ())
         _ROUTED[key] = any(
-            path == _ANY_PROJECT or reaches(repo_dir, path, family) for path in _route_files(repo_dir)
-        )
+            (path == _ANY_PROJECT or reaches(repo_dir, path, family)) and not _bounded_away(bounds, family)
+            for path, bounds in routes.items()
+        ) or any(reaches(repo_dir, path, family) for path in attributed)
     return _ROUTED[key]
+
+
+def _bounded_away(bounds: frozenset[str] | None, family: Family) -> bool:
+    """Whether routes bound to these types cannot reach a family member: no
+    type spells a family or tainting name (one that is, derives from, or
+    leads to a family type), and every name that could is known."""
+    return (
+        bounds is not None
+        and not family.opaque
+        and not any(_spells(t, family.simple_names | family.tainting) for t in bounds)
+    )
 
 
 def reset_cache() -> None:
@@ -1338,7 +2144,10 @@ def reset_cache() -> None:
     _GRAPHS.clear()
     _SCANS.clear()
     _ROUTES.clear()
+    _ATTRIBUTE_ROUTES.clear()
     _ROUTED.clear()
+    _NAMEOF.clear()
+    _LOOSE.clear()
 
 
 def _enclosing(path: str, projects: frozenset[Path]) -> list[Path]:

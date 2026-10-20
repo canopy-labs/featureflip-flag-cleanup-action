@@ -12,6 +12,13 @@ A trait's constant is never offered: PHP rejects ``Trait::NAME``, so no read
 of one could be proven, and the in-file rules already handle one that no
 other file mentions.
 
+A class constant can also be read without its name being spelled, from the
+class taken whole: ``Keys::class`` handed to reflection or ``constant()``, a
+dynamic fetch ``Keys::{$n}``, or the class named in a string. Any such use, of
+the owner or of a class proven to inherit from it, keeps every constant it
+owns (:func:`constant_escapes`), and so does a template that builds a
+constant's name from the class's (:func:`template_escapes`).
+
 A mention in another file is proven in two shapes, only as the whole first
 argument of a flag read:
 
@@ -688,6 +695,23 @@ class _Index:
                 pending.extend(info.parents)
         return False
 
+    def inherits(self, fqn: str, owner: str) -> bool:
+        """Whether the class ``fqn`` is ``owner`` or provably inherits from it
+        through repository classes: the strict counterpart of :meth:`reaches`,
+        which fails open on an ancestor outside the index."""
+        pending: list[str | None] = [fqn]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == owner:
+                return True
+            if current is None or current in seen:
+                continue
+            seen.add(current)
+            for info in self.by_fqn.get(current, ()):
+                pending.extend(info.parents)
+        return False
+
     def unrelated(self, fqn: str, owner: str) -> bool:
         """Whether ``fqn`` is surely a repository class that is not the owner
         and does not inherit from it: ``fqn::NAME`` is then its own constant."""
@@ -1174,6 +1198,496 @@ def enum_dynamic_uses(
     return sorted(set(notes), key=lambda n: (n.line, n.entry))
 
 
+# --- a class reached whole --------------------------------------------------------
+
+#: A class name as a string spells it, lowercased: names and backslashes.
+_CLASS_TEXT = re.compile(r"[a-z_\x80-￿][a-z0-9_\x80-￿]*(?:\\[a-z_\x80-￿][a-z0-9_\x80-￿]*)*")
+
+
+#: The string-like nodes, and the child holding the body where it is not the node.
+_STRINGS = {"string": None, "encapsed_string": None, "heredoc": "heredoc_body", "nowdoc": "nowdoc_body"}
+#: The children of a string body that are its static text.
+_STATIC = frozenset({"string_content", "escape_sequence", "nowdoc_string"})
+#: A double-quoted or heredoc escape: one character, octal, hex or a code point.
+_ESCAPE = re.compile(r'\\(?:([nrtvef\\$"])|([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u\{([0-9A-Fa-f]+)\})')
+#: An escape that can stand for a letter of a name.
+_NUMERIC_ESCAPE = re.compile(r"\\(?:[0-7]|x[0-9A-Fa-f]|u\{)")
+_SIMPLE = {"n": b"\n", "r": b"\r", "t": b"\t", "v": b"\v", "e": b"\x1b", "f": b"\f", "\\": b"\\", "$": b"$", '"': b'"'}
+
+
+def _unescaped(raw: str, quoted: bool) -> str:
+    """``raw`` with PHP's double-quoted escapes decoded, as the run-time
+    string's bytes read as UTF-8. ``\\"`` is an escape only in a quoted
+    string, not in a heredoc."""
+    out = bytearray()
+    at = 0
+    for hit in _ESCAPE.finditer(raw):
+        simple, octal, hexa, point = hit.groups()
+        out += raw[at:hit.start()].encode("utf-8", "surrogatepass")
+        at = hit.end()
+        if simple is not None:
+            out += _SIMPLE[simple] if quoted or simple != '"' else hit.group().encode()
+        elif octal is not None:
+            out.append(int(octal, 8) & 0xFF)
+        elif hexa is not None:
+            out.append(int(hexa, 16))
+        elif int(point, 16) <= 0x10FFFF:
+            out += chr(int(point, 16)).encode("utf-8", "surrogatepass")
+        else:
+            out += hit.group().encode()  # a compile error in PHP; kept as written
+    out += raw[at:].encode("utf-8", "surrogatepass")
+    return out.decode("utf-8", "replace")
+
+
+def _string_text(node: Node) -> tuple[str, bool] | None:
+    """A string's run-time text, without a leading backslash, and whether
+    that is all of it: an interpolated string or heredoc gives its text up to
+    the first interpolation. A heredoc or nowdoc is stripped of the
+    whitespace around it, its closing marker's indentation included. None for
+    anything that is not a string.
+
+    The static text is decoded from the source, not from the grammar's
+    ``escape_sequence`` children: a heredoc's ``\\\\`` arrives as plain
+    ``string_content``. A ``b`` prefix (``b'...'``) is outside the body."""
+    if node.type not in _STRINGS:
+        return None
+    body = node
+    if _STRINGS[node.type] is not None:
+        body = next((c for c in node.named_children if c.type == _STRINGS[node.type]), None)
+        if body is None:
+            return "", True  # an empty heredoc
+    start = end = None
+    whole = True
+    for child in body.children:
+        if child.type in _STATIC:
+            start = child.start_byte if start is None else start
+            end = child.end_byte
+        elif child.type not in ('"', "'"):
+            whole = False
+            break
+    raw = "" if start is None else body.text[start - body.start_byte : end - body.start_byte].decode()
+    if node.type == "string":
+        text = re.sub(r"\\([\\'])", r"\1", raw)
+    elif node.type == "nowdoc":
+        text = raw
+    else:
+        text = _unescaped(raw, node.type == "encapsed_string")
+    if node.type in ("heredoc", "nowdoc"):
+        text = text.strip() if whole else text.lstrip()
+    return text.lstrip("\\"), whole
+
+
+def _lexical_class(node: Node) -> Node | None:
+    """The class-like (or anonymous class) whose body ``node`` is in, through
+    closures: their ``self`` is still the class they are written in."""
+    current = node.parent
+    while current is not None:
+        if current.type in _CLASS_LIKES or current.type == "anonymous_class":
+            return current
+        current = current.parent
+    return None
+
+
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``path`` that takes the
+    class owning one of ``constants`` as a whole, from which any of its
+    constants can be read by a computed name.
+
+    A class is taken whole by ``Owner::class``, a dynamic fetch
+    (``Owner::{$n}``), or a string naming it (``'App\\Flags\\Keys'``, or
+    ``'App\\Flags\\Keys::'`` to be completed at run time): reflection,
+    ``constant()`` and ``$cls::{$n}`` all start from one. So is a class that
+    inherits the constants, a subclass or an implementer, through its name or
+    its own scope (``static::class``, ``$this::class``, ``__CLASS__``,
+    ``get_called_class()``, ``get_class($this)``, ``get_parent_class()``,
+    ``static::{$n}`` or ``'static::'``). ``static``, ``$this`` and a trait's ``self`` count for every
+    class that may stand for them. Only an inheritance the class index proves
+    counts: one through a class outside it is not followed.
+
+    A string counts when it is the class's qualified name, or a name in the
+    global namespace written with a capital (``'keys'`` is an array key far
+    more often than a class), or the class and ``::`` with anything but one of
+    its constants' whole names after it (``'Keys::NEW_' . $x``). A string
+    spelling the whole name of the key constant is ``references``' to refuse.
+
+    A namespace constant has no class to take, and is reached by a name built
+    from its namespace instead: a string that is a proper prefix of its
+    qualified name and holds a backslash (``'App\\Flags\\' . $n``,
+    ``"App\\Flags\\$n"``, ``'App\\' . $a``, ``'App\\Flags\\NEW_' . $x``),
+    ``__NAMESPACE__`` in that namespace, and ``get_defined_constants()``,
+    which lists every user constant. That last one keeps every owner-less
+    constant offered, so in the in-file-only check, where each arrives without
+    its owner, it keeps a class constant too.
+
+    Inline HTML, where a Blade view's code lives
+    (``{{ constant(\\Ns\\Owner::class . '::' . $n) }}``), is matched by text
+    (:func:`_text_fetches`).
+    """
+    owners: dict[str, set[str]] = defaultdict(set)
+    #: Qualified name, lowercased, of each namespace (or global) constant.
+    spaces: dict[str, set[str]] = defaultdict(set)
+    namespaces: dict[str, set[str]] = defaultdict(set)
+    for decl in constants:
+        if decl.kind != xk.CONSTANT:
+            continue
+        if decl.owner is not None:
+            owners[_fqn(decl)].add(decl.path)
+        else:
+            spaces[_join(decl.module, [decl.name])].add(decl.path)
+            namespaces[decl.module.lower()].add(decl.path)
+    if not owners and not spaces:
+        return []
+    root = syntax._parse(source, "php")
+    sections, imports = _sections(root), _imports(root)
+    built: list[_Index] = []
+
+    def index() -> _Index:
+        if not built:
+            built.append(php_index(repo_dir))
+        return built[0]
+
+    def reaching(fqn: str | None) -> set[str]:
+        """The declaring files whose owner the class ``fqn`` is or inherits from."""
+        if fqn is None:
+            return set()
+        held = set(owners.get(fqn, ()))
+        if fqn in index().by_fqn:
+            for owner, paths in owners.items():
+                if owner != fqn and index().inherits(fqn, owner):
+                    held |= paths
+        return held
+
+    heirs: dict[str, set[str]] = {}
+    relatives: dict[tuple[int, str], set[str]] = {}
+
+    def relative(node: Node, keyword: str) -> set[str]:
+        """What ``self``, ``static`` or ``parent`` at ``node`` may reach."""
+        cls = _lexical_class(node)
+        if cls is None:
+            return set()
+        if (cls.id, keyword) not in relatives:
+            relatives[(cls.id, keyword)] = _relative(cls, keyword)
+        return relatives[(cls.id, keyword)]
+
+    def _relative(cls: Node, keyword: str) -> set[str]:
+        if cls.type == "anonymous_class" or keyword == "parent":
+            # An anonymous class has no name to reach it by but its parents'.
+            parents = [
+                _resolve_class(sections, imports, n)
+                for clause in cls.named_children
+                if clause.type in ("base_clause", "class_interface_clause")
+                and (cls.type == "anonymous_class" or clause.type == "base_clause")
+                for n in clause.named_children
+                if n.type in _CLASS_NAMES
+            ]
+            return set().union(*(reaching(p) for p in parents))
+        name = cls.child_by_field_name("name")
+        section = _section_at(sections, cls.start_byte)
+        if name is None or section is None:
+            return set()
+        here = _join(section.namespace, [_text(name)])
+        held = reaching(here)
+        if keyword == "static" or cls.type == "trait_declaration":
+            # Whichever class the call was made on, or uses the trait.
+            if here not in heirs:
+                heirs[here] = set().union(
+                    *(
+                        reaching(candidate)
+                        for candidate in index().by_fqn
+                        if candidate != here and index().inherits(candidate, here)
+                    )
+                )
+            held |= heirs[here]
+        return held
+
+    def instance_of(created: Node | None) -> set[str]:
+        """What an instance of the class ``created`` names may reach."""
+        if created is None:
+            return set()
+        keyword = _text(created).lower()
+        if created.type == "name" and keyword in ("self", "static", "parent"):
+            return relative(created, keyword)
+        if created.type in _CLASS_NAMES:
+            return reaching(_resolve_class(sections, imports, created))
+        return set()
+
+    def known(fqn: str) -> set[str]:
+        """The constant names the class ``fqn`` and the owners hold."""
+        names = {n for info in index().by_fqn.get(fqn, ()) for n in info.constants}
+        for owner in owners:
+            names |= {n for info in index().by_fqn.get(owner, ()) for n in info.constants}
+        return names
+
+    found: set[tuple[str, xk.Refusal]] = set()
+    # Inline HTML, a Blade view's text included, is no PHP this grammar reads.
+    inline: list[tuple[str, int]] = []
+    for node in xk.walk(root):
+        held: set[str] = set()
+        if node.type == "text":
+            inline.append((_text(node), node.start_point[0]))
+        elif node.type == "class_constant_access_expression" and len(node.named_children) == 2:
+            scope, member = node.named_children
+            if member.named_children or _text(member).lower() == "class":
+                if scope.type == "relative_scope":
+                    held = relative(scope, _text(scope).lower())
+                elif scope.type == "variable_name" and _text(scope) == "$this":
+                    held = relative(scope, "static")
+                elif scope.type in _CLASS_NAMES:
+                    held = reaching(_resolve_class(sections, imports, scope))
+        elif node.type in _STRINGS:
+            text = _string_text(node)
+            written, whole = text if text is not None else ("", True)
+            spelled, separator, rest = written.partition("::")
+            head = spelled.lower()
+            relative_head = head in ("self", "static", "parent")
+            if not owners or not _CLASS_TEXT.fullmatch(head):
+                pass
+            elif separator:
+                # `Keys::` with the rest built at run time; `Keys::OTHER` reads OTHER.
+                held = relative(node, head) if relative_head else reaching(head)
+                if held and whole and rest and rest in known(head):
+                    held = set()
+            elif whole and not relative_head and ("\\" in head or spelled[:1].isupper()):
+                held = reaching(head)
+            prefix = written.lower()
+            if "\\" in prefix:
+                # Completed at run time into a namespace constant's name.
+                for full, paths in spaces.items():
+                    if full != prefix and full.startswith(prefix):
+                        held = held | paths
+        elif node.type == "name" and _text(node).upper() == "__CLASS__" and _position(node) == "constant":
+            held = relative(node, "self")
+        elif node.type == "name" and _text(node).upper() == "__NAMESPACE__" and _position(node) == "constant":
+            section = _section_at(sections, node.start_byte)
+            held = set(namespaces.get(section.namespace, ())) if section is not None else set()
+        elif node.type == "function_call_expression":
+            written = _segments(node.child_by_field_name("function"))
+            callee = written[1][-1].lower() if written is not None and len(written[1]) == 1 else ""
+            arguments = _arguments(node)
+            if callee == "get_called_class" or (
+                callee == "get_class" and len(arguments) == 1 and arguments[0] is not None
+                and _text(arguments[0]) == "$this"
+            ):
+                held = relative(node, "static")
+            elif callee == "get_defined_constants":
+                held = set().union(*spaces.values()) if spaces else set()
+            elif callee == "get_class" and not arguments:
+                held = relative(node, "self")
+            elif callee == "get_parent_class" and not arguments:
+                held = relative(node, "parent")
+            elif (
+                callee == "get_parent_class" and len(arguments) == 1 and arguments[0] is not None
+                and _text(arguments[0]) == "$this"
+            ):
+                # The run-time class's parent: an ancestor of it, or this class's own.
+                held = relative(node, "static") | relative(node, "parent")
+        elif node.type in ("object_creation_expression", "named_type"):
+            # An instance: `new Keys()`, `new static()`, or a type receiving one.
+            held = instance_of(next(iter(node.named_children), None))
+        elif node.type == "variable_name" and _text(node) == "$this" and not _used_in_place(node):
+            # The instance handed on: `register($this)`, `return $this`.
+            held = relative(node, "static")
+        for holder in held:
+            found.add((holder, xk.refusal(path, node, xk.UNSUPPORTED_FORM, source)))
+    found |= _text_fetches(path, source, inline, owners, index)
+    return sorted(found, key=lambda hit: (hit[0], hit[1].line, hit[1].text))
+
+
+#: A class name in text, as written: qualified or not, with the backslashes in
+#: runs, since a quoted string doubles them (Twig's ``'App\\\\Flags\\\\Keys'``).
+_TEXT_CLASS = r"(?:[^\W\d]\w*\\+)*[^\W\d]\w*"
+#: A class named in text, ending in ``::``.
+_TEXT_FETCH = re.compile(r"(?<![\w\\$])\\*(%s)\s*::\s*" % _TEXT_CLASS)
+#: A quoted string that is a class name and nothing else (``'App\\Flags\\Keys'``).
+_TEXT_QUOTED = re.compile(r"""(['"])\\*(%s)\1""" % _TEXT_CLASS)
+#: An import naming a class under another name: PHP's ``use Ns\Owner as K``
+#: (in a Blade ``@php`` block) and Blade's ``@use('Ns\Owner', 'K')``.
+_TEXT_ALIAS = re.compile(
+    r"""\buse\s+\\?(%s)\s+as\s+([^\W\d]\w*)|@use\s*\(\s*['"]\\*(%s)['"]\s*,\s*['"]([^\W\d]\w*)['"]"""
+    % (_TEXT_CLASS, _TEXT_CLASS),
+    re.IGNORECASE,
+)
+#: Blade's ``@use(`` in front of a quoted class name: an import, not a use.
+_TEXT_IMPORT = re.compile(r"@use\s*\(\s*$", re.IGNORECASE)
+_MEMBER = re.compile(r"[^\W\d]\w*")
+_CALL = re.compile(r"\s*\(")
+#: After a whole name, a string closed and joined to more: Twig's ``~``, PHP's ``.``.
+_JOINED = re.compile(r"""['"]\s*(?:~|\.(?!\.))""")
+
+
+def _text_name(written: str) -> str:
+    """A class name as text spells it, lowercased, backslash runs collapsed."""
+    return re.sub(r"\\+", r"\\", written).lower()
+
+
+def _text_fetches(
+    path: str,
+    source: str,
+    chunks: list[tuple[str, int]],
+    owners: dict[str, set[str]],
+    index,
+) -> set[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``chunks`` (text and the
+    line it starts on, 0-based) where a class owning one of the constants, or
+    one proven to inherit them, is taken whole: ``Owner::class``,
+    ``Owner::{...}``, ``Owner::`` followed by anything but one of the
+    constants' whole names, a static property (``Owner::$x``, outside a
+    double-quoted string) or a method call (``Owner::all()``), or a quoted
+    string that is the class's qualified name (``'Ns\\\\Owner' ~ '::' ~ name``,
+    ``new ReflectionClass('Ns\\Owner')``), or a global class's name written with
+    a capital. ``constant('Ns\\\\Owner::' ~ name)`` in Twig builds the name at
+    run time.
+
+    Matched by text, never parsed: a template is never rewritten, so a wrong
+    guess keeps one constant and names the line. A qualified name before
+    ``::`` counts when it is, or ends with, the class's qualified name; a bare
+    one by its short name, in any case, or by an alias an import in the text
+    gives it.
+    """
+    if not owners:
+        return set()
+    state: dict[str, object] = {}
+
+    def setup() -> tuple[dict[str, set[str]], set[str]]:
+        if not state:
+            built = index()
+            reach: dict[str, set[str]] = {owner: set(paths) for owner, paths in owners.items()}
+            for fqn in built.by_fqn:
+                for owner, paths in owners.items():
+                    if fqn != owner and built.inherits(fqn, owner):
+                        reach.setdefault(fqn, set()).update(paths)
+            state["reach"] = reach
+            state["known"] = {
+                n for fqn in reach for info in built.by_fqn.get(fqn, ()) for n in info.constants
+            }
+        return state["reach"], state["known"]
+
+    shorts = {fqn.rsplit("\\", 1)[-1] for fqn in owners}
+
+    def held_by(name: str, aliases: dict[str, set[str]]) -> set[str]:
+        reach, _known = setup()
+        held = set(aliases.get(name, ()))
+        for fqn, paths in reach.items():
+            if fqn == name or fqn.endswith("\\" + name) or (
+                "\\" not in name and fqn.rsplit("\\", 1)[-1] == name
+            ):
+                held |= paths
+        return held
+
+    def exactly(name: str, written: str) -> set[str]:
+        """The class a quoted string names whole: a qualified name, or a
+        global one with a capital (``'keys'`` is an array key)."""
+        reach, _known = setup()
+        if "\\" not in name and not written.lstrip("\\")[:1].isupper():
+            return set()
+        return set(reach.get(name.lstrip("\\"), ()))
+
+    lines = source.split("\n")
+    found: set[tuple[str, xk.Refusal]] = set()
+
+    def refuse(held: set[str], text: str, first: int, at: int) -> None:
+        line = first + text.count("\n", 0, at)
+        quoted = lines[line].strip() if line < len(lines) else ""
+        for holder in held:
+            found.add((holder, xk.Refusal(path, line + 1, xk.UNSUPPORTED_FORM, quoted)))
+
+    for text, first in chunks:
+        if "::" not in text and "\\" not in text and not any(s in text.lower() for s in shorts):
+            continue
+        aliases: dict[str, set[str]] = defaultdict(set)
+        for hit in _TEXT_ALIAS.finditer(text):
+            target = _text_name(hit.group(1) or hit.group(3)).lstrip("\\")
+            alias = (hit.group(2) or hit.group(4)).lower()
+            held = held_by(target, {}) if "\\" in target else set(setup()[0].get(target, ()))
+            if held:
+                aliases[alias] |= held
+        for hit in _TEXT_QUOTED.finditer(text):
+            if _TEXT_IMPORT.search(text, max(0, hit.start() - 40), hit.start()):
+                continue  # `@use('Ns\Owner')` imports it, as `use Ns\Owner;` does
+            held = exactly(_text_name(hit.group(2)), hit.group(2))
+            if held:
+                refuse(held, text, first, hit.start())
+        for hit in _TEXT_FETCH.finditer(text):
+            name = _text_name(hit.group(1))
+            held = held_by(name, aliases)
+            if not held:
+                continue
+            at = hit.end()
+            if text.startswith("$", at):
+                # `"Ns\\Owner::$name"` interpolates; `Owner::$x` outside a
+                # double-quoted string is a static property.
+                opened = text.rfind("\n", 0, hit.start()) + 1
+                if text.count('"', opened, hit.start()) % 2 == 0:
+                    continue
+            member = _MEMBER.match(text, at)
+            if member is not None and member.group().lower() != "class":
+                if _CALL.match(text, member.end()):
+                    continue  # a static method call
+                if member.group() in setup()[1] and not _JOINED.match(text, member.end()):
+                    continue  # that constant alone: a reader's to judge
+            refuse(held, text, first, hit.start())
+    return found
+
+
+def template_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """:func:`constant_escapes` for a file this tool does not parse (a Twig,
+    Latte or Smarty template), by its text alone (:func:`_text_fetches`)."""
+    owners: dict[str, set[str]] = defaultdict(set)
+    for decl in constants:
+        if decl.kind == xk.CONSTANT and decl.owner is not None:
+            owners[_fqn(decl)].add(decl.path)
+    found = _text_fetches(path, source, [(source, 0)], owners, lambda: php_index(repo_dir))
+    return sorted(found, key=lambda hit: (hit[0], hit[1].line, hit[1].text))
+
+
+def _used_in_place(this: Node) -> bool:
+    """Whether ``$this`` is only the object of a member access or the scope
+    of a static one (``$this->x``, ``$this->f()``, ``$this::NAME``), which
+    hands the instance to nothing."""
+    parent = this.parent
+    if parent is None:
+        return False
+    for field in ("object", "scope"):
+        held = parent.child_by_field_name(field)
+        if held is not None and held.id == this.id:
+            return True
+    return parent.type == "class_constant_access_expression" and parent.named_children[0].id == this.id
+
+
+def constant_module_pattern(constants: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
+    """The short name, in any case, of every repository class that can take a
+    class owning one of ``constants`` whole: the owner, every class that
+    inherits from it, and every ancestor of one of those (whose ``static`` may
+    be it). A file spelling none of them cannot name such a class. For a
+    namespace constant, its namespace's first segment, ``__NAMESPACE__`` and
+    ``get_defined_constants``."""
+    index = php_index(repo_dir)
+    owners = {_fqn(d) for d in constants if d.kind == xk.CONSTANT and d.owner is not None}
+    heirs = owners | {fqn for fqn in index.by_fqn if any(index.inherits(fqn, o) for o in owners)}
+    related = set(heirs)
+    pending = list(heirs)
+    while pending:
+        for info in index.by_fqn.get(pending.pop(), ()):
+            for parent in info.parents:
+                if parent is not None and parent in index.by_fqn and parent not in related:
+                    related.add(parent)
+                    pending.append(parent)
+    names = {fqn.rsplit("\\", 1)[-1] for fqn in related}
+    # A namespace constant's name is built from its namespace, whose first
+    # segment a prefix holding a backslash spells; or from `__NAMESPACE__`,
+    # or listed by `get_defined_constants()`.
+    loose = [d for d in constants if d.kind == xk.CONSTANT and d.owner is None]
+    if loose:
+        names |= {d.module.split("\\", 1)[0] for d in loose if d.module} | {"__NAMESPACE__", "get_defined_constants"}
+    # Or a numeric escape, which can spell any of them (`"\x4Beys"`):
+    # :func:`constant_escapes` decodes it.
+    return re.compile(f"(?i:{xk.mention_pattern(names).pattern})|{_NUMERIC_ESCAPE.pattern}")
+
+
 xk.register(
     "php",
     xk.Profile(
@@ -1185,5 +1699,9 @@ xk.register(
         reaches=frozenset({"php_guest"}),
         entry_findings=entry_findings,
         enum_dynamic_uses=enum_dynamic_uses,
+        # A class can be taken whole (`Keys::class`, `Keys::{$n}`, its name in
+        # a string): reflection reaches every constant without spelling one.
+        constant_escapes=constant_escapes,
+        constant_module_pattern=constant_module_pattern,
     ),
 )

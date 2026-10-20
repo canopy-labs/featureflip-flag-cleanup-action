@@ -33,13 +33,13 @@ and neither can be closed with a Piranha rule:
    Measured: rooted at the ``else_if_clause`` a rule fires and can rewrite that
    clause; rooted at the ``if_statement`` it fires only when it replaces the
    whole ``if_statement``, which a variable-length chain cannot be templated
-   from. This is the same rewrite ``python_fold`` performs for ``elif True:``.
+   from. The engine's Python built-ins make the same rewrite for ``elif True:``.
 
 Both are handled here by one chain walk, because they are the same problem
 under two spellings of a body — ``:`` versus ``{`` — and splitting them would
 have meant two walks that must agree.
 
-Unlike ``python_fold`` this never re-indents. PHP's blocks are delimited, so
+This never re-indents. PHP's blocks are delimited, so
 indentation is decorative and a fold that leaves a body at its old column is
 cosmetic rather than wrong; #2694 tracks formatting for every language at once.
 What this DOES tidy is tag balance: a deletion that would leave ``<?php ?>``
@@ -77,9 +77,10 @@ _PARSER = Parser(_LANGUAGE)
 _MAX_ROUNDS = 200
 
 #: The two body spellings this module can finish. A braceless single-statement
-#: body (``if ($x) foo();``) is neither, and is deliberately left to Gate 1:
-#: promoting one means deciding what its parent position can hold, which is the
-#: splice hazard recorded in CLAUDE.md, and no measured shape produces it.
+#: body (``if ($x) foo();``) is neither, and is deliberately not folded here:
+#: that fold is the engine's (a whole statement replaced by a whole statement,
+#: so the parent position is never asked to hold anything new), and whatever
+#: the engine leaves standing is Gate 1's.
 _COLON, _BRACE = "colon_block", "compound_statement"
 
 #: Whitespace a deletion may absorb at its seam. Deliberately not `\r` or `\n`:
@@ -90,8 +91,8 @@ _HORIZONTAL = (b" ", b"\t")
 def fold_literal_conditions(before: str, after: str) -> str:
     """Fold every ``if``/``elseif`` the transform left with a literal condition.
 
-    Nothing happens if ``before`` already had one, exactly as in
-    ``python_fold``: ``if (true):`` is real code — a permanently-enabled toggle,
+    Nothing happens if ``before`` already had one: ``if (true):`` is real
+    code — a permanently-enabled toggle,
     a branch somebody commented out by hand — and once the file contains one
     this cannot tell the customer's from the fold's. Rewriting theirs would be
     an edit the flag removal never justified, so the whole file is left to
@@ -130,7 +131,7 @@ def _fold_once(source: str) -> str | None:
     root = _PARSER.parse(data).root_node
     tags = _PhpTags(root)
     for node in _iter(root):
-        if node.type != "if_statement":
+        if node.type != "if_statement" or _under_dangling_else(node):
             continue
         chain = _chain(node)
         if chain is not None:
@@ -138,6 +139,42 @@ def _fold_once(source: str) -> str | None:
             if rewritten is not None:
                 return rewritten
     return None
+
+
+#: Brace-less bodies that leave an ``if`` under them open to a later ``else``.
+#: A ``do`` closes its body with ``while (…);``, so it ends the chain.
+_DANGLING_BODIES = frozenset(
+    {"if_statement", "foreach_statement", "for_statement", "while_statement", "declare_statement"}
+)
+
+
+def _under_dangling_else(node: Node) -> bool:
+    """Whether ``node`` is, or sits under, an ``if`` whose else may not be its own.
+
+    PHP gives an ``else`` to the innermost open ``if``; the grammar gives it to
+    an outer one. In ``if ($a) if (<read>) { … } else …;``, and equally with
+    brace-less ``foreach``/``for``/``while``/``declare`` bodies (or more
+    ``if``s) between the two at any depth, the inner ``if`` therefore reads as
+    alternative-free, and folding it moves the ``else`` onto the outer one: a
+    branch that ran when the read was false now runs on the outer condition.
+    Measured with php 8.2. Wherever the grammar hangs the ``else``, it hangs it
+    on an ``if`` whose body is one of :data:`_DANGLING_BODIES`, so nothing at or
+    under such an ``if`` is folded; the engine declines the same set. That also
+    declines an ``else`` that really is the outer ``if``'s, which only leaves a
+    literal for Gate 1.
+    """
+    current: Node | None = node
+    while current is not None:
+        if current.type == "if_statement":
+            body = current.child_by_field_name("body")
+            if (
+                body is not None
+                and body.type in _DANGLING_BODIES
+                and current.child_by_field_name("alternative") is not None
+            ):
+                return True
+        current = current.parent
+    return False
 
 
 def _iter(node: Node):
@@ -458,189 +495,3 @@ class _PhpTags:
         while position < len(data) and data[position : position + 1].isspace():
             position += 1
         return self._closes.get(position)
-
-
-# ===========================================================================
-# `switch (true) { case <read>: … }` -- PHP's multi-way guard  (#2692)
-# ===========================================================================
-#
-# The same construct as Go's tagless switch and Ruby's subject-less `case`, and
-# the third language to need it folded here. PHP has no subject-less form, so
-# the idiom is `switch (true)`: each `case` value is compared against `true`, so
-# each is evaluated as a condition and the first truthy one wins.
-#
-# The engine's built-ins fold the `if` family only, so the read was left as
-# `case false:` — and, like Ruby's and unlike Go's, it was SHIPPED rather than
-# refused: `syntax.py`'s PHP residue entry covered `if_statement`,
-# `else_if_clause` and `match_conditional_expression`, but not `case_statement`.
-# Both halves are fixed together, here and there.
-#
-# --- PHP IS THE DANGEROUS ONE OF THE THREE, AND IT NEEDS NO KEYWORD ---------
-#
-# Go falls through only on an explicit `fallthrough`, which is a token to look
-# for. Ruby cannot fall through at all. **PHP falls through by DEFAULT**, so an
-# arm above the flag's can run into it with nothing in the source saying so.
-# Measured, deleting the dead arm below an arm that does not terminate:
-#
-#     a=true   original=["A","B"]   deleted=["A","D"]   WRONG
-#
-# So the precondition here is stronger than Go's: every arm but the last must
-# END in a terminator, which is what makes the switch behave like the other two
-# languages' and makes each arm an independent edit. Anything else is declined
-# and left to the residue entry.
-#
-# `throw` and `die()` both parse as a plain `expression_statement`, exactly like
-# `$x = 1`, so they are NOT counted as terminators — an arm ending in one is
-# refused rather than folded. Conservative in the safe direction: it costs a
-# cleanup, never correctness.
-#
-# --- WHY THIS NEVER SPLICES ------------------------------------------------
-#
-# Go's fold collapses a leading always-true arm to its body. Here the body
-# typically ends in `break;`, which outside a switch or loop is a fatal error,
-# so lifting it out would ship code PHP refuses to run. Promoting the arm to
-# `default:` keeps every `break` inside a switch and is correct in every
-# position, so it is the only true-treatment rewrite.
-
-#: Statement node types that end an arm unambiguously. `expression_statement`
-#: is deliberately absent -- see the header above.
-_PHP_TERMINATORS = frozenset(
-    {
-        "break_statement",
-        "return_statement",
-        "continue_statement",
-        "goto_statement",
-        "exit_statement",
-    }
-)
-
-_PHP_ARMS = frozenset({"case_statement", "default_statement"})
-
-
-def fold_literal_cases(before: str, after: str) -> str:
-    """Fold every ``switch (true)`` arm the transform left with a literal value."""
-    if after == before or _literal_case_values(before):
-        return after
-    for _ in range(_MAX_ROUNDS):
-        rewritten = _fold_case_once(after)
-        if rewritten is None:
-            return after
-        after = rewritten
-    return after
-
-
-def _literal_case_values(source: str) -> int:
-    root = _PARSER.parse(source.encode("utf-8")).root_node
-    return sum(
-        1
-        for switch in _iter(root)
-        if _is_true_switch(switch)
-        for arm in _arms(switch)
-        if _case_literal(arm) is not None
-    )
-
-
-def _is_true_switch(node: Node) -> bool:
-    """A ``switch (true) { … }``, the only shape whose cases are conditions.
-
-    An ordinary ``switch ($value)`` compares values and is never touched. The
-    alternative ``switch (…): … endswitch;`` syntax has no ``switch_block`` and
-    so is declined by :func:`_arms` rather than mis-folded.
-    """
-    if node.type != "switch_statement":
-        return False
-    condition = node.child_by_field_name("condition")
-    if condition is None or condition.type != "parenthesized_expression":
-        return False
-    inner = [c for c in condition.named_children]
-    return (
-        len(inner) == 1
-        and inner[0].type == "boolean"
-        and inner[0].text.decode("utf-8").lower() == "true"
-    )
-
-
-def _arms(switch: Node) -> list[Node]:
-    body = switch.child_by_field_name("body")
-    if body is None or body.type != "switch_block":
-        return []
-    return [child for child in body.named_children if child.type in _PHP_ARMS]
-
-
-def _case_literal(arm: Node) -> bool | None:
-    """``True``/``False`` if this arm's case value is a boolean literal."""
-    if arm.type != "case_statement":
-        return None
-    value = arm.child_by_field_name("value")
-    if value is None or value.type != "boolean":
-        return None
-    text = value.text.decode("utf-8").lower()
-    return True if text == "true" else False if text == "false" else None
-
-
-def _arm_terminates(arm: Node) -> bool:
-    value = arm.child_by_field_name("value")
-    statements = [
-        child
-        for child in arm.named_children
-        if value is None or child.id != value.id
-    ]
-    return bool(statements) and statements[-1].type in _PHP_TERMINATORS
-
-
-def _no_implicit_fallthrough(arms: list[Node]) -> bool:
-    """Every arm but the last ends in a terminator.
-
-    The last arm needs none: there is nothing after it to fall into.
-    """
-    return all(_arm_terminates(arm) for arm in arms[:-1])
-
-
-def _fold_case_once(source: str) -> str | None:
-    data = source.encode("utf-8")
-    root = _PARSER.parse(data).root_node
-    for switch in _iter(root):
-        if not _is_true_switch(switch):
-            continue
-        arms = _arms(switch)
-        if not arms or not _no_implicit_fallthrough(arms):
-            continue
-        for index, arm in enumerate(arms):
-            verdict = _case_literal(arm)
-            if verdict is None:
-                continue
-            if verdict is False:
-                return _cut_case_arm(data, arm)
-            if any(other.type == "default_statement" for other in arms[:index]):
-                continue
-            return _promote_case_to_default(data, arm, arms, index)
-    return None
-
-
-def _cut_case_arm(data: bytes, arm: Node) -> str:
-    """Remove an arm that can never match, along with the line it opened on."""
-    source = data.decode("utf-8")
-    start = source.rfind("\n", 0, arm.start_byte) + 1
-    end = arm.end_byte
-    if source[end : end + 1] == "\n":
-        end += 1
-    return source[:start] + source[end:]
-
-
-def _promote_case_to_default(
-    data: bytes, arm: Node, arms: list[Node], index: int
-) -> str:
-    """Make ``arm`` the ``default:`` and drop every arm below it."""
-    colon = next((c for c in arm.children if not c.is_named and c.text == b":"), None)
-    if colon is None:  # pragma: no cover - `case <value> :` always carries one
-        return None
-    source = data.decode("utf-8")
-    promoted = source[: arm.start_byte] + "default:"
-    if index == len(arms) - 1:
-        return promoted + source[colon.end_byte :]
-    return (
-        promoted
-        + source[colon.end_byte : arm.end_byte]
-        + "\n"
-        + source[arms[-1].end_byte :].lstrip("\n")
-    )

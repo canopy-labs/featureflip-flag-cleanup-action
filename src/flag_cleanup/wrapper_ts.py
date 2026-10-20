@@ -17,8 +17,9 @@ constant):
 
 A JavaScript wrapper's own declaration file (``flags.d.ts`` beside
 ``flags.js``) describes it rather than competing with it: its callers are
-inlined, and the wrapper stays with the declaration, which nothing here
-rewrites (``declaration-file``).
+inlined, and the declarations describing it go with the wrapper. When the
+run may not rewrite that file, or one of them shares its statement with
+another declaration, the wrapper stays with them (``declaration-file``).
 
 ``getBooleanValue`` is never a wrapper body: the form the rules fold is
 awaited, which a wrapper would return as a promise, and the synchronous form
@@ -38,7 +39,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tree_sitter import Node
@@ -371,6 +372,10 @@ def discover(path: str, source: str, is_read: Callable[[Node], bool]) -> list[wi
                     end=member.end_byte, static=True, kind="method",
                 )
             )
+    declarations = cross_file_ts.declaration_file(path)
+    if found and declarations is not None and Path(declarations).is_file():
+        resolved = ts_scope._resolved(declarations)
+        found = [replace(w, declaration_file=resolved) for w in found]
     return found
 
 
@@ -907,15 +912,22 @@ def _blanked(text: str, spans: list[tuple[int, int]]) -> str:
 
 def module_escapes(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, str]]:
     """``(path, line, text)`` of each use that hands the wrapper's module on as
-    an object (:func:`cross_file_ts.module_escapes`): ``table[gate](u)`` after
-    ``const table = flags as any`` calls the wrapper by a name no scan sees.
+    an object (:func:`handed_on`): ``table[gate](u)`` after ``const table =
+    flags as any`` calls the wrapper by a name no scan sees."""
+    return handed_on(repo_dir, wrapper.path)
+
+
+def handed_on(repo_dir: str, module_path: str) -> list[tuple[str, int, str]]:
+    """``(path, line, text)`` of each use that hands the module at
+    ``module_path`` on as an object (:func:`cross_file_ts.module_escapes`),
+    which can then reach any of its exports by a name computed at run time.
 
     A barrel's ``export * from`` the module is followed rather than refused:
     the barrel joins the modules judged, so a namespace of it handed on
     escapes in turn. A file that cannot be read escapes at its first line."""
     from flag_cleanup import source_index
 
-    module = str(Path(wrapper.path).resolve())
+    module = str(Path(module_path).resolve())
     modules: set[str] = set()
     frontier = {module}
     texts: dict[str, str | None] = {}
@@ -1159,7 +1171,8 @@ def describes(node: Node, wrapper: wi.Wrapper) -> bool:
     wrapper's: a top-level ``function f(...): boolean;`` or ``const f: ...``
     for a function; for a member, a member of the name in the top-level
     ``class Owner { ... }`` or in the type ``const owner: { ... }`` is written
-    with. Its name only names the wrapper, and the file is never rewritten."""
+    with. Its name only names the wrapper, and it goes with the wrapper
+    (:func:`without_descriptions`)."""
     declared = _member_name(node)
     if declared is None or not _is_name(declared, wrapper.name):
         return False
@@ -1185,6 +1198,124 @@ def describes(node: Node, wrapper: wi.Wrapper) -> bool:
         and declarator.parent is not None
         and _declared_at_top(declarator.parent)
     )
+
+
+def describing_name(node: Node, wrapper: wi.Wrapper) -> bool:
+    """Whether ``node`` is the name of a declaration that :func:`describes`
+    the wrapper."""
+    parent = node.parent
+    return parent is not None and _member_name(parent) == node and describes(parent, wrapper)
+
+
+def descriptions(root: Node, wrapper: wi.Wrapper) -> list[Node] | None:
+    """What deleting the declarations that :func:`describes` the wrapper
+    deletes: the whole top-level statement of a function signature (every
+    overload) or a ``declare const``, else the member. ``None`` when a
+    ``declare const`` declares something else as well, which would go with it."""
+    found: list[Node] = []
+    for node in cross_file_keys.walk(root):
+        if not describes(node, wrapper):
+            continue
+        if node.type == "variable_declarator":
+            # `lexical_declaration` for `const`/`let`, `variable_declaration` for `var`.
+            node = node.parent
+            if sum(c.type == "variable_declarator" for c in node.named_children) != 1:
+                return None
+        if node.type in ("function_signature", "lexical_declaration", "variable_declaration"):
+            while node.parent is not None and node.parent.type in _DECLARATION_WRAPPERS:
+                node = node.parent
+        found.append(node)
+    return found
+
+
+#: A comment that speaks for the file rather than for the declaration under
+#: it: a triple-slash directive (``/// <reference types="node" />``), a
+#: ``@ts-`` pragma or a lint directive.
+_FILE_COMMENT = re.compile(r"^(?:///|(?://|/\*+)\s*(?:@ts-|eslint|tslint|prettier-ignore))")
+
+
+def _description_start(node: Node, data: bytes) -> int:
+    """Where deleting ``node`` starts: back over the comments touching it,
+    stopping at one that speaks for the file (:data:`_FILE_COMMENT`)."""
+    start = node.start_byte
+    previous = node.prev_sibling
+    while (
+        previous is not None
+        and previous.type == "comment"
+        and data[previous.end_byte : start].count(b"\n") == 1
+        and not data[previous.end_byte : start].strip()
+        and not _FILE_COMMENT.match(_text(previous))
+    ):
+        start = previous.start_byte
+        previous = previous.prev_sibling
+    return start
+
+
+def _description_end(node: Node) -> int:
+    """Where deleting ``node`` ends: :func:`member_end`, or past a comment
+    after a statement on its line, which would otherwise be left on a line of
+    its own."""
+    end = member_end(node)
+    after = node.next_sibling
+    if (
+        end == node.end_byte
+        and after is not None
+        and after.type == "comment"
+        and after.start_point[0] == node.end_point[0]
+    ):
+        end = after.end_byte
+    return end
+
+
+def without_descriptions(wrapper: wi.Wrapper) -> tuple[str, str] | None:
+    """``(before, after)`` for the wrapper's own declaration file with the
+    declarations that :func:`describes` it deleted, each with its own
+    comments (:func:`_description_start`, :func:`_description_end`); ``None``
+    when one cannot be deleted alone (:func:`descriptions`).
+
+    A file left with no top-level ``import`` or ``export``, having had one,
+    would turn into a global script, and every ``import "./flags"`` would stop
+    type-checking. The first statement deleted becomes ``export {};`` instead,
+    as the stranded-import pass does for a file's last import."""
+    from flag_cleanup import unused
+
+    path = wrapper.declaration_file
+    source = None if path is None else _read(path)
+    if source is None:
+        return None
+    root = ts_scope.parse(source, path)
+    nodes = descriptions(root, wrapper)
+    if nodes is None:
+        return None
+    data = source.encode("utf-8")
+    spans = sorted(
+        ((_description_start(n, data), _description_end(n), n) for n in nodes),
+        key=lambda span: span[0],
+    )
+
+    def delete(marker: tuple[int, int, Node] | None = None) -> str:
+        # Last first, so every offset still to be used is where it was.
+        text = source
+        for span in reversed(spans):
+            start, end, _ = span
+            if span is marker:
+                raw = text.encode("utf-8")
+                text = (raw[:start] + unused.MODULE_MARKER.encode("utf-8") + raw[end:]).decode("utf-8")
+                continue
+            body = data[start:end].decode("utf-8", "replace")
+            text = unused._delete_method(text, unused.Candidate(wrapper.name, start, end, "method", body))
+        return text
+
+    def module(text: str) -> bool:
+        return any(c.type in unused._MODULE_EVIDENCE for c in ts_scope.parse(text, path).children)
+
+    after = delete()
+    if not module(source) or module(after):
+        return source, after
+    # Only a top-level statement's deletion can take the last marker away;
+    # if none was one, something unforeseen did, and the wrapper stays.
+    first = next((s for s in spans if s[2].parent is not None and s[2].parent.type == "program"), None)
+    return None if first is None else (source, delete(first))
 
 
 def _local(node: Node) -> bool:
@@ -1607,7 +1738,8 @@ def _mockito_call(node: Node, name: str) -> bool:
 
 def _stub_receivers(root: Node, name: str) -> list[Node]:
     """The receiver of every stub-shaped mention of ``name``: a spy's first
-    argument, the object of ``x.name.mockReturnValue(...)``, and the mock in
+    argument (its member a string or a plain template, as the stub pass reads
+    both), the object of ``x.name.mockReturnValue(...)``, and the mock in
     ts-mockito's ``when(x.name(...))``/``verify(x.name(...))``."""
     found: list[Node] = []
     for node in cross_file_keys.walk(root):
@@ -1615,7 +1747,7 @@ def _stub_receivers(root: Node, name: str) -> list[Node]:
             continue
         callee = mock_stubs.ts_callee(node)
         args = mock_stubs.ts_arguments(node)
-        if callee in _SPIES and len(args) == 2 and cross_file_ts._string_value(args[1]) == name:
+        if callee in _SPIES and len(args) == 2 and cross_file_ts._literal(args[1]) == name:
             found.append(args[0])
             continue
         if callee in _MOCKITO and len(args) == 1 and args[0].type == "call_expression":
@@ -1640,8 +1772,9 @@ def _stub_receivers(root: Node, name: str) -> list[Node]:
 def _mock_of(node: Node, file: ts_scope.File, files: ts_scope.Files) -> ts_scope.TypeRef | None:
     """The class ``const m = mock<C>()`` (jest-mock-extended) or ``const m =
     mock(C)`` (ts-mockito) makes a mock of, when ``mock`` is imported from one
-    of those libraries."""
-    bound = file.binding(_text(node))
+    of those libraries. ``node`` is resolved by scope, so a test may declare
+    its own ``m`` beside another test's."""
+    bound = file.binding_of(node)
     declarator = None if bound is None else bound.parent
     if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("name") != bound:
         return None
@@ -1727,11 +1860,14 @@ def stub_targets(wrapper: wi.Wrapper, index: Index) -> dict[str, mock_stubs.Stub
         file = files.file(path, text)
         if file is None:
             continue
-        receivers = frozenset(
-            _collapsed(node)
-            for node in _stub_receivers(file.root, wrapper.name)
-            if _proven_receiver(node, wrapper, file, files)
-        )
+        # The stub pass matches a receiver by its spelling, so a spelling is
+        # kept only when every stub receiver written that way is proven: one
+        # test's mock `m` must not resolve a stub on another test's `m`.
+        proven: dict[str, bool] = {}
+        for node in _stub_receivers(file.root, wrapper.name):
+            spelling = _collapsed(node)
+            proven[spelling] = proven.get(spelling, True) and _proven_receiver(node, wrapper, file, files)
+        receivers = frozenset(spelling for spelling, ok in proven.items() if ok)
         modules: set[str] = set()
         if wrapper.kind == "function" and _home_reason(wrapper, files) is None:
             for call in _module_mock_calls(file.root):
@@ -1946,11 +2082,12 @@ def _settles(
         s for s in block.named_children
         if s.start_byte > declaration.start_byte and _kept_stub(s, name, library or "", wrapper, treatment, file, arity)
     ]
-    # `File.binding` (through `_mock_of`) proved this the file's one binding
-    # of the name, so every identifier spelling it is a use of this mock.
+    # `File.binding_of` (through `_mock_of`) proved this the one binding of
+    # the name inside its block, and a `const` is seen nowhere else, so every
+    # identifier there spelling it is a use of this mock.
     uses = sorted(
         (
-            n for n in cross_file_keys.walk(file.root)
+            n for n in cross_file_keys.walk(block)
             if n.type in ("identifier", "shorthand_property_identifier") and _text(n) == name and n != bound
         ),
         key=lambda n: n.start_byte,
@@ -2331,7 +2468,9 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         if node.type != "identifier" and _text(node) != wrapper.name:
             continue  # an alias is only ever an identifier
         parent = node.parent
-        if described and parent is not None and _member_name(parent) == node and describes(parent, wrapper):
+        if described and describing_name(node, wrapper):
+            # Not a refusal on its own: the proof lets it go with the wrapper
+            # when the run may rewrite the file.
             found.append(wi.Occurrence(path, wi.line_of(node), wi.text_of(parent), None, wi.DECLARATION_FILE))
             continue
         if parent is not None and parent.type == "import_specifier":
@@ -2385,5 +2524,7 @@ for _language, _extensions in _FAMILY:
             stub_targets=stub_targets,
             settled_mocks=settled_mocks,
             test_title=lambda path, source, node: _stubs(path, source) and _test_title(node),
+            describes=describing_name,
+            without_descriptions=without_descriptions,
         )
     )

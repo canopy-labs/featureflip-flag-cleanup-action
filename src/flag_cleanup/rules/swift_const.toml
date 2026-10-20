@@ -84,42 +84,42 @@ enclosing_node = """(
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])
+       . (line_string_literal . (_) @flag_name .) .)])
    (class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])
+       . (line_string_literal . (_) @flag_name .) .)])
    (enum_class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])
+       . (line_string_literal . (_) @flag_name .) .)])
    (statements
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])] @scope
+       . (line_string_literal . (_) @flag_name .) .)])] @scope
   (#eq? @binding "let")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -160,42 +160,42 @@ enclosing_node = """(
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])
+       . (line_string_literal . (_) @flag_name .) .)])
    (class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])
+       . (line_string_literal . (_) @flag_name .) .)])
    (enum_class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])
+       . (line_string_literal . (_) @flag_name .) .)])
    (statements
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @decl_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)])] @scope
+       . (line_string_literal . (_) @flag_name .) .)])] @scope
   (#eq? @binding "let")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
@@ -223,42 +223,42 @@ query = """(
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)] @declaration)
+       . (line_string_literal . (_) @flag_name .) .)] @declaration)
    (class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)] @declaration)
+       . (line_string_literal . (_) @flag_name .) .)] @declaration)
    (enum_class_body
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)] @declaration)
+       . (line_string_literal . (_) @flag_name .) .)] @declaration)
    (statements
      [(property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
-       . (line_string_literal (_) @flag_name) .)
+       . (line_string_literal . (_) @flag_name .) .)
       (property_declaration
        (value_binding_pattern) @binding
        . (pattern (simple_identifier) @variable_name)
        . (type_annotation)
-       . (line_string_literal (_) @flag_name) .)] @declaration)] @scope
+       . (line_string_literal . (_) @flag_name .) .)] @declaration)] @scope
   (#eq? @binding "let")
   (#eq? @flag_name "@stale_flag_name")
 )"""

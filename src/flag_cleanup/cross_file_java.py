@@ -45,6 +45,8 @@ mean another type's member of the same name.
 
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 
 from tree_sitter import Node
@@ -451,6 +453,8 @@ class _TypeInfo:
     supertypes: tuple[str, ...]
     #: Declared at the top of its file, so ``package.Name`` names it.
     top_level: bool = False
+    #: Its own methods' names: ``Owner.describe()`` reads none of its fields.
+    methods: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -523,6 +527,11 @@ def _types_of(text: str) -> tuple[list[tuple[str, _TypeInfo]], bool]:
         if name is None:
             continue
         fields, member_types = _members(body) if body is not None else (set(), set())
+        methods = {
+            _text(n)
+            for member in (body.named_children if body is not None else ())
+            if member.type == "method_declaration" and (n := member.child_by_field_name("name")) is not None
+        }
         types.append(
             (
                 _text(name),
@@ -532,6 +541,7 @@ def _types_of(text: str) -> tuple[list[tuple[str, _TypeInfo]], bool]:
                     frozenset(member_types),
                     tuple(_supertypes(node)),
                     node.parent is not None and node.parent.type == "program",
+                    frozenset(methods),
                 ),
             )
         )
@@ -756,6 +766,258 @@ class _JvmTypes:
         if cross_file_kotlin._kotlin_index(self._repo_dir).may_declare_name(name):
             return False
         return not self.reaches([name], owner)
+
+
+#: A string that can be a class's binary name: ``app.Keys``, ``app.Keys$Companion``.
+_BINARY_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\$[\w$]*)?")
+
+#: Calls that take a class as their first argument and never read its static
+#: fields: test doubles (Mockito, Spock, MockK) and loggers. A gate class read
+#: in its own file is mocked in nearly every test of its callers, and a class
+#: literal counted there would withhold the gate's whole file. Name-keyed on
+#: purpose, like the mocking DSL: a call missing from this list only keeps a
+#: declaration, and a call of one of these names that walks static fields
+#: would be a strange thing to write.
+NOT_REFLECTING = frozenset({
+    "mock", "spy", "any", "isA", "forClass", "getLogger", "getLog",
+    "Mock", "Stub", "Spy", "GroovyMock", "GroovyStub", "GroovySpy",
+    "mockk", "mockkClass", "mockkObject", "mockkStatic", "spyk",
+})
+
+#: Annotations that take classes and never read their static fields, for the
+#: same reason: Spring's ``@Import`` registers a class as a bean, and its test
+#: doubles (``@MockBean``, springmockk's ``@MockkBean``) replace one. Any
+#: class argument counts, not only the first (``@Import({A.class, B.class})``).
+NOT_REFLECTING_ANNOTATIONS = frozenset({
+    "Import", "MockBean", "SpyBean", "MockitoBean", "MockitoSpyBean", "MockkBean", "SpykBean",
+})
+
+
+#: What a class literal can be asked for without its fields being read: its
+#: name, which a logger takes as its category (``getLogger(Gate.class.getName())``).
+_NAME_ONLY = frozenset({"getName", "getSimpleName", "getCanonicalName"})
+
+
+def _handed_to_a_double(literal: Node) -> bool:
+    """Whether a class literal, or its name (:data:`_NAME_ONLY`), is the first
+    argument of a :data:`NOT_REFLECTING` call, or the literal an argument of a
+    :data:`NOT_REFLECTING_ANNOTATIONS` annotation."""
+    # `@Import(Gate.class)`, `@Import({A.class, Gate.class})`, `types = Gate.class`.
+    holder = literal.parent
+    if holder is not None and holder.type == "element_value_array_initializer":
+        holder = holder.parent
+    if holder is not None and holder.type == "element_value_pair":
+        holder = holder.parent
+    annotation = holder.parent if holder is not None and holder.type == "annotation_argument_list" else None
+    if annotation is not None and annotation.type == "annotation":
+        name = annotation.child_by_field_name("name")
+        return name is not None and _text(name).rsplit(".", 1)[-1] in NOT_REFLECTING_ANNOTATIONS
+    named = literal.parent
+    if (
+        named is not None
+        and named.type == "method_invocation"
+        and (receiver := named.child_by_field_name("object")) is not None
+        and receiver.id == literal.id
+        and (method := named.child_by_field_name("name")) is not None
+        and _text(method) in _NAME_ONLY
+    ):
+        literal = named  # `getLogger(Gate.class.getName())`
+    arguments = literal.parent
+    if arguments is None or arguments.type != "argument_list" or not arguments.named_children:
+        return False
+    call = arguments.parent
+    name = call.child_by_field_name("name") if call is not None and call.type == "method_invocation" else None
+    return arguments.named_children[0].id == literal.id and name is not None and _text(name) in NOT_REFLECTING
+
+
+class OwnerReach:
+    """Which declaring files a class taken whole reaches, asked by its name.
+
+    A Java or Kotlin key constant is a static field of its owner (a Kotlin
+    companion's ``const val`` is one of the class holding it), so reflection
+    over the owner lists it without spelling it: a class literal,
+    ``Class.forName("app.Keys")``. So does reflection over a type extending
+    the owner, since ``getFields()`` lists a superclass's public static fields
+    too. Shared by the Java, Kotlin, Groovy and Scala judges, which each find
+    the class names in their own syntax. Get one with :func:`owner_reach`.
+
+    Every answer is worked out once from :meth:`names`, the downward closure
+    of the owners: a question per string or class literal that walked the
+    indexes would re-list the checkout each time, and a repository has far
+    more strings than owners.
+    """
+
+    def __init__(self, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str):
+        self._repo_dir = repo_dir
+        #: owner's simple name -> declaring files
+        self.owners: dict[str, set[str]] = defaultdict(set)
+        self._qualified: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for decl in constants:
+            if decl.kind == xk.CONSTANT and decl.owner is not None:
+                self.owners[decl.owner].add(decl.path)
+                self._qualified[(decl.module, decl.owner)].add(decl.path)
+        self._types = _JvmTypes(repo_dir)
+        self._by_name: dict[str, frozenset[str]] = {}
+        self._by_string: dict[str, frozenset[str]] = {}
+        self._names: dict[str, set[str]] | None = None
+        self._incomplete: bool | None = None
+        self._members: dict[tuple[str, str], frozenset[str]] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self.owners)
+
+    def names(self) -> dict[str, set[str]]:
+        """Every simple name that can stand for an owner: the owner, and each
+        repository type in any JVM language that may extend it (see
+        :func:`flag_cleanup.cross_file_jvm_guest.heirs`), with the declaring
+        files it reaches."""
+        if self._names is None:
+            from flag_cleanup import cross_file_jvm_guest
+
+            self._names = defaultdict(set)
+            for owner, paths in self.owners.items():
+                for name in cross_file_jvm_guest.heirs(self._repo_dir, owner):
+                    self._names[name] |= paths
+        return self._names
+
+    def incomplete(self) -> bool:
+        """Whether an index could not read a file, which may declare a type
+        extending an owner that :meth:`names` therefore misses."""
+        if self._incomplete is None:
+            from flag_cleanup import cross_file_jvm_guest
+
+            _supers, _values, incomplete = self._types._get()
+            self._incomplete = incomplete or cross_file_jvm_guest._guest_index(self._repo_dir)[1]
+        return self._incomplete
+
+    def by_name(self, simple: str) -> frozenset[str]:
+        """The declaring files whose owner a class of this simple name is, or
+        may extend. Matched by name, not proven: a wrong match only keeps a
+        declaration. With an index incomplete, a name outside :meth:`names` is
+        walked up through what is known, failing closed."""
+        if simple not in self._by_name:
+            held = set(self.names().get(simple, ()))
+            if not held and self.incomplete():
+                for owner, paths in self.owners.items():
+                    if self._types.reaches([simple], owner):
+                        held |= paths
+            self._by_name[simple] = frozenset(held)
+        return self._by_name[simple]
+
+    def by_string(self, text: str) -> frozenset[str]:
+        """The declaring files a string naming a class can reach once loaded
+        (``Class.forName``): the owner's binary name, or a nested class of it
+        (``app.Keys$Companion``), or a top-level repository type that may
+        extend it. A bare ``Keys`` names a class only in the default package."""
+        if text not in self._by_string:
+            held: set[str] = set()
+            if _BINARY_NAME.fullmatch(text):
+                package, _, simple = text.split("$", 1)[0].rpartition(".")
+                held |= self._qualified.get((package, simple), set())
+                if (simple in self.names() or self.incomplete()) and self._types.top_level_type(simple, package):
+                    held |= self.by_name(simple)
+            self._by_string[text] = frozenset(held)
+        return self._by_string[text]
+
+    def kotlin_members(self, decl: xk.KeyDeclaration) -> frozenset[str]:
+        """What ``Owner.<member>`` reads off a Kotlin owner without handing
+        it on: every name the owner's body declares, companion members
+        included, as the Kotlin index records them."""
+        key = (decl.module, decl.owner or "")
+        if key not in self._members:
+            from flag_cleanup import cross_file_kotlin
+
+            self._members[key] = frozenset(
+                n
+                for info in cross_file_kotlin._kotlin_index(self._repo_dir).by_name.get(key[1], ())
+                if info.package == key[0]
+                for n in info.names
+            )
+        return self._members[key]
+
+    def spelled(self, source: str) -> frozenset[str]:
+        """The declaring files ``source`` spells a name standing for the owner of."""
+        return frozenset(
+            path
+            for name, paths in self.names().items()
+            if xk.mention_pattern([name]).search(source)
+            for path in paths
+        )
+
+
+#: Built once per resolution and asked of every file it scans. Keyed on the
+#: constants, so a run asks for a handful of entries.
+_REACHES: dict[tuple[tuple[xk.KeyDeclaration, ...], str], OwnerReach] = {}
+
+
+def owner_reach(constants: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> OwnerReach:
+    key = (constants, repo_dir)
+    if key not in _REACHES:
+        if len(_REACHES) > 16:
+            _REACHES.clear()
+        _REACHES[key] = OwnerReach(constants, repo_dir)
+    return _REACHES[key]
+
+
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``path`` that takes a
+    key constant's owner whole, from which reflection reads every constant it
+    holds: a class literal (``RuntimeKeys.class``, ``app.RuntimeKeys.class``)
+    not handed to a test double or a logger (:data:`NOT_REFLECTING`), or a
+    string naming the class (``Class.forName("app.RuntimeKeys")``), of the
+    owner or of a type that may extend it (:class:`OwnerReach`); and a
+    Kotlin object or companion holding one (``RuntimeKeys.INSTANCE``,
+    ``Flags.Companion``) used as anything but the receiver of one of its own
+    members (``.getClass()`` counts). A file whose parse has errors refuses
+    each owner it spells, at its first line.
+    """
+    reach = owner_reach(constants, repo_dir)
+    if not reach:
+        return []
+    root = syntax._parse(source, "java")
+    if root.has_error:
+        return [(holder, xk.Refusal(path, 1, xk.UNSUPPORTED_FORM, "")) for holder in sorted(reach.spelled(source))]
+    # A Kotlin object is `Owner.INSTANCE` to Java, a companion `Owner.Companion`.
+    objects: dict[tuple[str, str], list[xk.KeyDeclaration]] = defaultdict(list)
+    for decl in constants:
+        if decl.kind == xk.CONSTANT and decl.owner is not None and decl.path.endswith(".kt"):
+            objects[(decl.owner, decl.companion or "INSTANCE")].append(decl)
+    found: set[tuple[str, xk.Refusal]] = set()
+    for node in _walk(root):
+        held: frozenset[str] = frozenset()
+        if node.type == "field_access" and objects:
+            obj, field = node.child_by_field_name("object"), node.child_by_field_name("field")
+            name = _simple_type_name(obj) if obj is not None else None
+            decls = objects.get((name, _text(field)), []) if name is not None and field is not None else []
+            parent = node.parent
+            member = None
+            if (
+                parent is not None
+                and parent.type in ("field_access", "method_invocation")
+                and (inner := parent.child_by_field_name("object")) is not None
+                and inner.id == node.id
+            ):
+                named = parent.child_by_field_name("field" if parent.type == "field_access" else "name")
+                member = _text(named) if named is not None else ""
+            held = frozenset(d.path for d in decls if member is None or member not in reach.kotlin_members(d))
+        elif node.type == "class_literal" and node.named_children and not _handed_to_a_double(node):
+            name = _simple_type_name(node.named_children[0])
+            held = reach.by_name(name) if name is not None else held
+        elif node.type == "string_literal":
+            parts = node.named_children
+            if len(parts) == 1 and parts[0].type == "string_fragment":
+                held = reach.by_string(_text(parts[0]))
+        for holder in held:
+            found.add((holder, xk.refusal(path, node, xk.UNSUPPORTED_FORM, source)))
+    return sorted(found, key=lambda hit: (hit[0], hit[1].line, hit[1].text))
+
+
+def constant_module_pattern(constants: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
+    """Every simple name that can stand for a constant's owner: a file
+    spelling none of them cannot take one whole by its name."""
+    return xk.mention_pattern(owner_reach(constants, repo_dir).names())
 
 
 def _read_call(arg: Node, accessors: frozenset[str]) -> bool:
@@ -1151,5 +1413,8 @@ xk.register(
         reaches=frozenset({"kt", "groovy", "scala"}),
         entry_findings=entry_findings,
         enum_dynamic_uses=enum_dynamic_uses,
+        # Reflection over the owner reaches every constant without spelling one.
+        constant_escapes=constant_escapes,
+        constant_module_pattern=constant_module_pattern,
     ),
 )

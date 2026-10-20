@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch the forked wheels this tool pins into wheels/.
 
-TWO packages here exist only as GitHub-release wheels, and for the SAME
+THREE packages here exist only as GitHub-release wheels, and for the SAME
 underlying reason -- each is a canopy-labs fork whose PyPI name belongs to
 upstream:
 
@@ -16,6 +16,11 @@ upstream:
   re-partitions across an edit and the stranded-keyword and ASI-fusion checks
   read the shift as damage, refusing a correct rewrite. A Gate 1 refusal is
   flag-wide, so one such file abandons the whole flag on every run.
+* **tree-sitter-c-sharp**, Gate 1's C# grammar, for the same reason. PyPI has
+  stock 0.23.5; the engine bundles 0.23.5 plus one external-scanner patch, so
+  in `$"{{{x}}}"` the hole after the escaped `{{` is an expression for the
+  engine and string text for the stock grammar -- an ERROR when the hole holds
+  a string literal, and a silently different tree when it does not.
 
 Every `pip install` of this tool therefore needs `--find-links wheels`, and
 every Docker build bind-mounts the same directory; this script is the one
@@ -23,15 +28,16 @@ thing that fills it.
 
 Each release tag is derived from pyproject.toml's own pin, so bumping a pin IS
 bumping what gets fetched -- there is no second version literal to keep in
-sync. The grammar's pin carries a PEP 440 LOCAL version (`0.23.2+canopy.3`),
-which is what makes it unambiguous: PyPI forbids local versions, so that pin
-can never be satisfied silently by upstream's identically-numbered 0.23.2.
+sync. Each grammar's pin carries a PEP 440 LOCAL version (`0.23.2+canopy.3`,
+`0.23.5+canopy.1`), which is what makes it unambiguous: PyPI forbids local
+versions, so such a pin can never be satisfied silently by upstream's
+identically-numbered release.
 
 Auth: PIRANHA_WHEEL_TOKEN (in CI: a repo-read fine-grained PAT on the fork,
 stored as BOTH an Actions secret and a Dependabot secret -- a
 Dependabot-triggered run reads only the Dependabot store), falling back to
 `gh auth token` for local runs. The piranha fork is private, so a token is
-required even though the grammar fork is public. stdlib-only on purpose: this
+required even though the grammar forks are public. stdlib-only on purpose: this
 has to run before any pip install can.
 """
 from __future__ import annotations
@@ -109,6 +115,14 @@ _WHEEL_SOURCES = (
         #: starts `manylinux_`. The engine's wheels above are maturin-built and
         #: really do start `manylinux_2_28`, which is why the two differ.
         pattern=r"^tree_sitter_typescript-{version}-cp39-abi3-manylinux.*\.whl$",
+    ),
+    #: abi3 like the TypeScript grammar, but tagged `cp310`: the C# grammar's
+    #: setup.py floors its abi3 tag at 3.10 (upstream's own PyPI wheels read
+    #: the same), where TypeScript's floors at 3.9. Still one wheel per arch.
+    _WheelSource(
+        distribution="tree-sitter-c-sharp",
+        repo="canopy-labs/tree-sitter-c-sharp",
+        pattern=r"^tree_sitter_c_sharp-{version}-cp310-abi3-manylinux.*\.whl$",
     ),
 )
 

@@ -60,10 +60,30 @@ class PullRequestEventError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class MergedPullRequest:
-    """A pull request that actually merged."""
+    """A pull request that actually merged.
+
+    The fields after ``head_ref`` are read but not judged, the same split as
+    :class:`DeploymentEvent`: whether this merge authorizes an archive needs
+    the Action's configured base branch, which this module has no business
+    knowing, so :mod:`flag_cleanup.archive` applies the policy. Each one
+    degrades to ``""`` when the payload omits it, and an empty value is never
+    evidence of anything.
+
+    ``head_repository`` is the repository the branch lives in. It differs from
+    ``repository`` for a pull request opened from a FORK, whose branch name is
+    whatever its author chose — so a fork's ``featureflip/remove-flag/<key>``
+    branch names a flag nobody here asked to remove. ``base_ref`` is the
+    branch the pull request merged INTO, and ``default_branch`` the
+    repository's own default branch, which stands in for an unset
+    ``base-branch``.
+    """
 
     number: int
     head_ref: str
+    head_repository: str = ""
+    repository: str = ""
+    base_ref: str = ""
+    default_branch: str = ""
 
 
 def merged_pull_request(env: Mapping[str, str] | None = None) -> MergedPullRequest | None:
@@ -112,11 +132,38 @@ def merged_pull_request(env: Mapping[str, str] | None = None) -> MergedPullReque
             "branch it merged from cannot be identified"
         )
 
+    base = pull_request.get("base")
+    base = base if isinstance(base, dict) else {}
+    base_repo = base.get("repo")
+    base_repo = base_repo if isinstance(base_repo, dict) else {}
+    head_repo = head.get("repo")
+    head_repo = head_repo if isinstance(head_repo, dict) else {}
+    repository = payload.get("repository")
+    repository = repository if isinstance(repository, dict) else {}
+
     number = pull_request.get("number")
     return MergedPullRequest(
         number=number if isinstance(number, int) else 0,
         head_ref=head_ref,
+        # `head.repo` is null once a fork is deleted, which reads as "" and so
+        # never as this repository.
+        head_repository=_text(head_repo.get("full_name")),
+        repository=(
+            _text(base_repo.get("full_name"))
+            or _text(repository.get("full_name"))
+            or (env.get("GITHUB_REPOSITORY") or "").strip()
+        ),
+        base_ref=_text(base.get("ref")),
+        default_branch=(
+            _text(base_repo.get("default_branch"))
+            or _text(repository.get("default_branch"))
+        ),
     )
+
+
+def _text(value: object) -> str:
+    """A payload string field, stripped, or ``""`` for anything else."""
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _event_payload(env: Mapping[str, str]) -> object:

@@ -22,7 +22,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, wrapper_java, wrapper_kotlin
+from flag_cleanup import cross_file_keys, jvm_publishing, wrapper_java, wrapper_kotlin
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.cross_file_jvm_guest import GUEST_EXTENSIONS
 
@@ -131,10 +131,19 @@ class Index:
     #: property (``flags.enabled`` for ``getEnabled()``), which never spells
     #: the method's name.
     synthetic: list[tuple[str, int, str]] = field(default_factory=list)
+    #: ``(path, line, text)``: a getter method's JavaBeans property (``enableX``
+    #: for ``isEnableX()`` or ``getEnableX()``) spelled where a template or an
+    #: expression language reads it: a file nothing here parses, or a string
+    #: literal (SpEL in ``@PreAuthorize("@flags.enableX")``). Neither spells
+    #: the method's name.
+    bean_reads: list[tuple[str, int, str]] = field(default_factory=list)
+    #: The directory the run was configured with: publication is asked of
+    #: the checkout holding it.
+    repo_dir: str = ""
 
     @classmethod
     def build(cls, repo_dir: str, wrapper: wi.Wrapper) -> Index:
-        index = cls()
+        index = cls(repo_dir=repo_dir)
         try:
             source = _exact(wrapper.path)
         except (OSError, UnicodeDecodeError):
@@ -167,6 +176,9 @@ class Index:
             index._add(path, text, words)
         if wrapper.language == "java":
             index.synthetic = _kotlin_property_reads(repo_dir, wrapper.name)
+        prop = bean_property(wrapper, source)
+        if prop is not None:
+            index.bean_reads = _bean_reads(repo_dir, prop)
         if wrapper.language == "kt" and wrapper.kind == "property":
             index.synthetic = jvm_getter_calls(repo_dir, wrapper.name)
         return index
@@ -249,13 +261,15 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
             # A superclass in the repository declares the name: an override.
             return None, wi.OVERRIDABLE
         if (
-            interface.public
+            (interface.public and (not index.repo_dir or jvm_publishing.published(interface.path, index.repo_dir)))
             or interface.functional
             or interface.supertypes
             or index.implementations.get(supertype, 0) != 1
         ):
-            # A lambda can implement a functional interface anywhere, and an
-            # inherited member can make one functional, so neither is counted.
+            # A public interface in a module that may be published can be
+            # implemented anywhere. A lambda can implement a functional
+            # interface anywhere, and an inherited member can make one
+            # functional, so neither is counted.
             return None, wi.INTERFACE_PUBLISHED
         start, end = declared_in(interface)[wrapper.name]
         member = replace(
@@ -299,6 +313,56 @@ def getter_names(prop: str) -> tuple[str, ...]:
     if re.fullmatch(r"is[A-Z]\w*", prop):
         return (prop, f"get{cap}")
     return (f"get{cap}",)
+
+
+def bean_property(wrapper: wi.Wrapper, source: str) -> str | None:
+    """The JavaBeans property a getter method is read as, or None.
+
+    ``isEnableX()`` and ``getEnableX()`` are both read as ``enableX`` by an
+    expression language (Thymeleaf, JSP EL, SpEL), and ``getURL()`` as
+    ``URL``, as ``java.beans.Introspector`` names it. Only an instance method
+    with no parameter is one."""
+    match = re.fullmatch(r"(?:get|is)([A-Z][\w$]*)", wrapper.name)
+    if wrapper.kind != "method" or wrapper.static or match is None:
+        return None
+    kotlin = wrapper.language == "kt"
+    root = wrapper_kotlin.parse(source) if kotlin else wrapper_java.parse(source)
+    for node in cross_file_keys.walk(root):
+        if node.start_byte == wrapper.start and node.type in ("function_declaration", "method_declaration"):
+            params = (
+                wrapper_kotlin._child(node, "function_value_parameters")
+                if kotlin
+                else node.child_by_field_name("parameters")
+            )
+            if params is None or any(c.type.endswith("parameter") for c in params.named_children):
+                return None
+            rest = match.group(1)
+            return rest if rest[1:2].isupper() else rest[0].lower() + rest[1:]
+    return None
+
+
+def _bean_reads(repo_dir: str, prop: str) -> list[tuple[str, int, str]]:
+    """Every line where a template or an expression language can read the
+    property ``prop``: a line spelling it in a file nothing here parses, or a
+    string literal spelling it in a Java or Kotlin file."""
+    found: list[tuple[str, int, str]] = []
+    for path in cross_file_keys.mention_files(repo_dir, [prop], exclude=()):
+        if path.endswith(FOREIGN_EXTENSIONS):
+            continue
+        if path.endswith(PARSED_EXTENSIONS):
+            found += [(path, line, text) for line, text in wi._string_mentions(path, prop)]
+            continue
+        text = _read_text(path)
+        if text is None:
+            found.append((path, 1, ""))
+            continue
+        word = _word(prop)
+        found += [
+            (path, number, " ".join(line.split()))
+            for number, line in enumerate(text.splitlines(), start=1)
+            if word.search(line)
+        ]
+    return found
 
 
 def _property_name(node: Node) -> str | None:

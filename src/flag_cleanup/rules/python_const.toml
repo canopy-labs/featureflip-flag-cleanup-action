@@ -57,7 +57,8 @@
 # which, as in Ruby, nothing catches until the line executes.
 #
 # An f-string or a concatenation of adjacent literals is not a resolvable key
-# and is excluded on the gate side; neither binds a lone `string_content` here.
+# and is excluded on the gate side; the delimiter anchors keep either from
+# binding `@flag_name` here, even when one of its literal chunks is the key.
 #
 # Holes: @stale_flag_name (the flag key), @treated ("True" | "False" — Python's
 # literals are capitalised, which `piranha_runner._LANGUAGES` supplies).
@@ -86,7 +87,7 @@ enclosing_node = """(
     (expression_statement
       (assignment
         left: (identifier) @decl_name
-        right: (string (string_content) @flag_name)))) @scope
+        right: (string (string_start) . (string_content) @flag_name . (string_end))))) @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -117,7 +118,7 @@ enclosing_node = """(
     (expression_statement
       (assignment
         left: (identifier) @decl_name
-        right: (string (string_content) @flag_name)))) @scope
+        right: (string (string_start) . (string_content) @flag_name . (string_end))))) @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -143,7 +144,7 @@ enclosing_node = """(
     (expression_statement
       (assignment
         left: (identifier) @decl_name
-        right: (string (string_content) @flag_name)))) @scope
+        right: (string (string_start) . (string_content) @flag_name . (string_end))))) @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -155,7 +156,7 @@ query = """(
     (expression_statement
       (assignment
         left: (identifier) @variable_name
-        right: (string (string_content) @flag_name))) @declaration) @scope
+        right: (string (string_start) . (string_content) @flag_name . (string_end)))) @declaration) @scope
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "declaration"

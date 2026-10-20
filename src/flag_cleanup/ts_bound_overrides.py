@@ -93,6 +93,11 @@ class Result:
     #: parameter of a named function — what :func:`drop_unread_parameters`
     #: takes. The text alone is no identity: two helpers can share it.
     parameters: tuple[tuple[str, str], ...] = ()
+    #: ``(label, "Class(parameter)")`` for each unread binding that is a whole
+    #: parameter of a named class's constructor: the identity the plain
+    #: constructor-parameter pass reports it under (see
+    #: :func:`flag_cleanup.ts_unread_members.unread_constructor_parameters`).
+    constructor_parameters: tuple[tuple[str, str], ...] = ()
 
 
 def delete_bound_entries(source: str, language: str, flag_key: str) -> Result:
@@ -118,6 +123,7 @@ def delete_bound_entries(source: str, language: str, flag_key: str) -> Result:
     entries: list[tuple[int, str]] = []
     unread: list[tuple[int, str]] = []
     parameters: list[tuple[str, str]] = []
+    constructor_parameters: list[tuple[str, str]] = []
     for binding, pairs in by_binder.values():
         if not _only_these_use(binding, pairs, data, flag_key):
             continue
@@ -136,6 +142,9 @@ def delete_bound_entries(source: str, language: str, flag_key: str) -> Result:
                 name = _function_name(binding.scope, data)
                 if name is not None:
                     parameters.append((name, label))
+                owner = _constructor_class(binding.scope, data)
+                if owner is not None:
+                    constructor_parameters.append((label, f"{owner}({binding.name})"))
 
     if not spans:
         return Result(source)
@@ -146,6 +155,7 @@ def delete_bound_entries(source: str, language: str, flag_key: str) -> Result:
         tuple(text for _, text in sorted(entries)),
         tuple(text for _, text in sorted(unread)),
         tuple(parameters),
+        tuple(constructor_parameters),
     )
 
 
@@ -520,6 +530,17 @@ def _droppable(parameter: Node, root: Node, data: bytes) -> tuple[int, int] | No
     ):
         return None
     return start, end
+
+
+def _constructor_class(function: Node, data: bytes) -> str | None:
+    """The name of the class whose constructor ``function`` is, if it is one."""
+    name = function.child_by_field_name("name") if function.type == "method_definition" else None
+    body = function.parent
+    cls = body.parent if body is not None and body.type == "class_body" else None
+    class_name = cls.child_by_field_name("name") if cls is not None else None
+    if name is None or _text(name, data) != "constructor" or class_name is None:
+        return None
+    return _text(class_name, data)
 
 
 def _function_name(function: Node, data: bytes) -> str | None:

@@ -176,8 +176,12 @@ change flag state for real users.
 
 **It needs `GITHUB_TOKEN`, with `pull-requests: read`.** It runs on a schedule,
 so no pull request is handed to it; it asks GitHub — once per live flag —
-whether that flag's removal branch ever produced a *merged* pull request. It
-never writes anything to your repository, and needs no `actions/checkout`.
+whether that flag's removal branch ever produced a pull request *merged into the
+base branch*. A removal retargeted to some other branch and merged there does
+not count, since the base branch still reads the flag. The base branch is your
+`base-branch` input, or the repository's default branch when that is unset — so
+if your cleanup workflow sets `base-branch`, set the same value here. It never
+writes anything to your repository, and needs no `actions/checkout`.
 
 **Evidence of a merge is what authorises each archive.** A removal pull request
 you closed *without* merging is a removal you declined, and reads to this mode
@@ -446,14 +450,16 @@ For reference while you migrate, the mode:
   encodes reversibly when it opens the pull request — nothing is parsed out of
   the title or body;
 * reports `[not-a-removal-branch]` for a pull request this Action did not open
-  and `[not-merged]` for one closed without merging, both exit `0` — declining
-  a removal never archives anything;
+  — including any pull request from a fork, whatever its branch is called —
+  and `[not-merged]` for one closed without merging or merged into a branch
+  other than the base branch (`base-branch`, or the repository's default
+  branch), all exit `0` — declining a removal never archives anything;
 * needs no `actions/checkout` and no `permissions:` block. Passing
   `GITHUB_TOKEN` with `pull-requests: read` is optional, and only lets a
   `FLAG_HAS_DEPENDENTS` refusal be reported as `[deferred]` when every
   dependent's removal has merged too;
-* reads only `api-token`, `org`, `project` and `api-url`, and ignores
-  `dry-run`.
+* reads only `api-token`, `org`, `project`, `api-url` and `base-branch`, and
+  ignores `dry-run`.
 
 ### Re-run a removal from a comment
 
@@ -495,7 +501,10 @@ jobs:
 Two commands, both left as a comment on the pull request itself. The mention
 must be followed by whitespace or the end of the line — `@featureflip-cleanuprerun`,
 with no space, is not a command, and neither is `@featureflip-cleanup rerun`
-buried in a longer sentence; it must stand alone on its own line.
+buried in a longer sentence; it must stand alone on its own line. A command
+inside a code block (fenced, or indented four spaces) or an HTML comment does
+not fire either, so a comment can show someone how to ask for one without
+asking.
 
 - **`@featureflip-cleanup rerun`** regenerates the removal from the pull
   request's own base branch and force-pushes it over the pull request's
@@ -609,6 +618,34 @@ with an exit code:
   transformed, committed or pushed, so nothing has been modified when this
   happens, and the reply on the pull request names the offending path.
 
+### On CircleCI
+
+The same image ships as a CircleCI orb,
+[`featureflip/flag-cleanup`](https://circleci.com/developer/orbs/orb/featureflip/flag-cleanup),
+built from [`orb/orb.yml`](orb/orb.yml) in this repository. The repository
+still has to be hosted on GitHub, because the pull requests are opened there.
+
+```yaml
+version: 2.1
+orbs:
+  featureflip: featureflip/flag-cleanup@1
+workflows:
+  flag-cleanup:
+    jobs:
+      - featureflip/cleanup:
+          context: featureflip
+          org: my-org
+          project: my-project
+          dry-run: true
+```
+
+Put `FEATUREFLIP_API_TOKEN` and a `GITHUB_TOKEN` that can push branches and
+open pull requests in that context, then add a scheduled trigger for the
+workflow in the project settings. Its parameters are the inputs below, under
+the same names, and it offers two modes: `remove` and `archive-sweep`. `archive-on-merge`,
+`archive-on-deploy` and `pr-command` read a GitHub Actions event payload, which
+a CircleCI pipeline does not have.
+
 ### Inputs
 
 Every input is bridged into the container as the environment variable named
@@ -622,7 +659,7 @@ entries dropped.
 | `api-token` | `FEATUREFLIP_API_TOKEN` | *(required)* | Your Featureflip API token. |
 | `org` | `FEATUREFLIP_ORG` | *(required)* | Featureflip organization slug. |
 | `project` | `FEATUREFLIP_PROJECT` | *(required)* | Featureflip project slug. |
-| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-sweep` archives the flags whose removal has merged, on a schedule, and reads only `deployed-refs`, `api-url` and `dry-run` from the inputs below — read [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed) before using it, because merging is not deploying. `archive-on-deploy` archives the outstanding flags a successful deployment shipped, and reads only `deployment-environment`, `api-url` and `dry-run` from the inputs below — see [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `archive-on-merge` is deprecated — see [Deprecated: archive on merge](#deprecated-archive-on-merge). |
+| `mode` | `FEATUREFLIP_MODE` | `remove` | `remove` opens removal pull requests. `archive-sweep` archives the flags whose removal has merged, on a schedule, and reads only `deployed-refs`, `base-branch`, `api-url` and `dry-run` from the inputs below — read [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed) before using it, because merging is not deploying. `archive-on-deploy` archives the outstanding flags a successful deployment shipped, and reads only `deployment-environment`, `base-branch`, `api-url` and `dry-run` from the inputs below — see [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands). `pr-command` re-runs the removal for the flag whose pull request a comment was left on — see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `archive-on-merge` is deprecated — see [Deprecated: archive on merge](#deprecated-archive-on-merge). |
 | `deployment-environment` | `FEATUREFLIP_DEPLOYMENT_ENVIRONMENT` | `production` | `archive-on-deploy` only. Matched case-insensitively against the payload's `deployment.environment`; a deployment to anything else archives nothing and says so. |
 | `deployed-refs` | `FEATUREFLIP_DEPLOYED_REFS` | *(none)* | `archive-sweep` only. Tags, branches or commit shas that stand for what is deployed, one per line or comma-separated. When set, a flag is archived only once its removal is contained in every one of them. See [Only archive what is deployed](#only-archive-what-is-deployed). |
 | `api-url` | `FEATUREFLIP_API_URL` | `https://api.featureflip.io` | Override only for a staging/self-hosted instance. |
@@ -633,7 +670,7 @@ entries dropped.
 | `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript and JavaScript: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function or TypeScript or JavaScript function or class method whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
-| `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. |
+| `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. In the archive modes, the only branch a removal's merge counts on: give them the same value as the cleanup workflow. |
 | `pr-labels` | `FEATUREFLIP_PR_LABELS` | *(none)* | Comma-separated. A label that fails to apply is logged as a warning and does not fail the PR. **May create labels** — see below. |
 | `max-prs` | `FEATUREFLIP_MAX_PRS` | `10` | Most pull requests one run may propose (`0` = no limit). See "How much one run can do" below. |
 | `dry-run` | `FEATUREFLIP_DRY_RUN` | `false` | See "Dry run" below for `remove` mode; `archive-sweep`, `archive-on-deploy` and `pr-command` honour it too, each differently — see [Archive the flag once the removal is deployed](#archive-the-flag-once-the-removal-is-deployed), [Archive when the deploy actually lands](#archive-when-the-deploy-actually-lands) and [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). |
@@ -748,6 +785,8 @@ identically — `[unsafe-key]`, `[piranha-error]` and `[unsafe-rewrite]` all
 appear with the same label and the same exit code. That is what makes the dry
 run worth reading: it cannot approve a flag that the next real run turns down.
 `[blocked]` is too, though a dry run never puts an open pull request on hold.
+So is `[duplicate]`: a flag the platform lists twice in one run is previewed
+once and counted once against `max-prs`, as a real run proposes it once.
 Only `[pr-opened]` is unreachable.
 
 A `[dry-run]` line with no diff under it says why: either no file in the
@@ -820,8 +859,9 @@ would claim it had.
     too long once escaped), or holds characters the rewrite rules cannot search
     for safely (anything outside `A-Z a-z 0-9 - _`; see "Flag keys" below).
     Rename the flag, or add the key to `ignore`.
-  - `[piranha-error]` — the transform engine aborted on its own syntax
-    self-check. Nothing was written. Please report it.
+  - `[piranha-error]` — the transform engine rejected its own rewrite (its
+    syntax self-check, or its check for a reserved word left where a name
+    belongs). Nothing was written. Please report it.
   - `[unsafe-rewrite]` — the rewrite of one or more files did not survive the
     post-transform checks, so it was rolled back **along with every other
     file for that flag** (a half-removed flag is worse than an unremoved one).
@@ -845,9 +885,17 @@ would claim it had.
     reported as a config error rather than a traceback from deep inside the
     transform engine;
   - `api-url` is not an absolute `http(s)` URL, or its port is not a number in
-    `0-65535`. `api.featureflip.io` without a scheme is the common case; both
-    are refused here rather than failing on the first request, where they would
+    `0-65535`, or it holds a character or host name no request can be built
+    from (a tab, a control character, a malformed internationalised domain).
+    `api.featureflip.io` without a scheme is the common case; all of these are
+    refused here rather than failing on the first request, where they would
     arrive as an HTTP-client traceback;
+  - `api-url` carries `user:password@` credentials. Requests authenticate with
+    `api-token` in the `Authorization` header, which URL credentials would
+    replace, so the token would never be sent;
+  - `api-token` contains whitespace, a control character or a non-ASCII
+    character — most often a secret holding a second line. The value is not
+    printed;
   - a configured directory is not inside a git work tree, or doesn't exist;
   - the checkout carries commits the base branch does not (see "Which branch
     PRs target" above) — typically a `pull_request` trigger's merge commit;
@@ -1165,8 +1213,17 @@ C# differs from Java and Kotlin in three places:
   verbatim identifier (`f.@IsCheckoutEnabled`).
 
 A Razor view, a XAML file or a Web Forms page mentioning the name is
-`unparsed-mention`, as is a doc comment whose `cref` names it, since deleting
-the member would leave a broken reference. A VB or F# file mentioning it is
+`unparsed-mention`. A doc comment whose `cref` names the member of the
+interface, the wrapper's class or another implementation (written
+`<see cref="IFlags.IsX"/>` or `<seealso cref="IFlags.IsX"/>`, or
+unqualified inside one of those types) does not keep the wrapper: when the
+wrapper goes, it becomes `<c>IFlags.IsX</c>`, and the pull request lists
+each one so the prose around it can be checked. A `cref` naming another
+type's own member of that name is not the wrapper's. Any other `cref` naming
+it keeps the wrapper (`unparsed-mention`), since deleting the member would
+leave a broken reference: an `<inheritdoc>`, a `<see>` with content, another
+tag, an ID string (`P:Ns.T.IsX`), or a type that cannot be told apart from
+another of the same name. A VB or F# file mentioning it is
 `other-language`. A class in one of those files that implements the interface
 (`@implements`, `Implements`, `interface … with`) counts as an
 implementation.
@@ -1310,9 +1367,16 @@ JavaScript wrapper's own declaration file: `flags.d.ts` beside `flags.js`
 wrapper (a function signature, or the member in the class or the object
 type of the owner's name) describes the wrapper instead of competing with
 it, and an import of `./flags` reaches `flags.js`, the file that runs. The
-callers are inlined, and the wrapper is kept with its declaration
-(`declaration-file`): this tool does not edit a hand-written declaration
-file, so delete the two together. A
+callers are inlined, and the declaration goes with the wrapper: every
+overload of a function signature, a `declare const` of the name, or the
+member, each with its doc comment. If that leaves the declaration file with
+no `import` or `export`, the first deleted statement becomes `export {};` so
+the file stays a module rather than turning into a global script. The
+wrapper is kept with its declaration (`declaration-file`) in two cases:
+when the declaration shares a `declare const` with another name, and when a
+TypeScript run of the same removal also edits the declaration file (it
+holds the flag key, or names a constant or a wrapper that run removes), since a
+file edited by two runs would depend on their order. A
 `module.exports = { newCheckout }` in the wrapper's own file is the wrapper
 itself, not a second declaration. It still keeps the wrapper. Its callers in
 that file are inlined, and those in other files are `import-unresolved` (see
@@ -1430,7 +1494,10 @@ resolved when all of these hold:
   (a helper that may call `mockReset`), putting it in an object, an array or
   a JSX attribute, or using it inside a function declaration (which may run
   before the stub) does not count;
-- its name is declared only once in the file, and the file never calls
+- nothing else inside that callback binds its name. Other tests may declare
+  their own `m`, and each one is judged on its own;
+- every stub of the wrapper on a receiver of that name, anywhere in the
+  file, is on a mock the run has identified, and the file never calls
   `resetAllMocks` or `restoreAllMocks`.
 
 The stub is then deleted and the mock is kept. A test that stubs the removed
@@ -1438,9 +1505,9 @@ value is deleted along with its mock. Every other class mock still refuses
 the wrapper. That includes `createMock<Flags>()`,
 `sinon.createStubInstance(Flags)` and the others listed below, a
 `mockReturnValueOnce` stub, a ts-mockito stub that matches particular
-argument values, and a mock declared at the top of the file or in a
-`describe` body: a runner's `resetMocks` setting can wipe that stub before
-each test.
+argument values, a mock declared with `let` and assigned in a `beforeEach`,
+and a mock declared at the top of the file or in a `describe` body: a
+runner's `resetMocks` setting can wipe that stub before each test.
 
 A test title that spells the wrapper's name is not a stub. That means a
 string that is the first argument of `describe`, `it` or `test` (including
@@ -1538,8 +1605,9 @@ own, and may register the method with a framework that calls it by name.
 A `private` field or constructor parameter property that only the folded
 calls read is left unread, which under `noUnusedLocals` is error TS6138 or
 TS6133. A constructor parameter property is removed with every caller's
-argument when every caller can be found; anything else is named in a warning.
-See "Supported JS/TS flag-read shapes".
+argument when every caller can be found, and a field when its initializer can
+do no work; anything else is named in a warning. See "Supported JS/TS
+flag-read shapes".
 
 A method qualifies when its whole body is one read of the flag being removed
 (`= read`, `{ return read }`, `{ return read; }`), and:
@@ -1560,12 +1628,60 @@ A method qualifies when its whole body is one read of the flag being removed
 - if it implements an interface method, that interface is declared in the
   repository, has exactly one implementation there (Groovy and Scala classes
   count), is not public (Java package-private, Kotlin `internal` or
-  `private`, or for C# see above), extends no other interface, and is not functional: a lambda can
+  `private`) or sits in a module that cannot be published (see below; for C#
+  see above), extends no other interface, and is not functional: a lambda can
   implement an interface with one abstract method (or a Kotlin
   `fun interface`) anywhere, so its implementations cannot be counted. Code
   outside the repository can implement a public interface, and inlining would
   override it. In C#, other implementations may exist when each one's member
   is inert, described below.
+
+A public Java or Kotlin interface qualifies only when nothing can publish its
+module, judged from what the repository shows:
+
+- Gradle: every plugin applied by the settings file, by the build file of the
+  project and of each project above it (a moved project included), and by
+  any build file that configures other projects
+  (`rootProject.subprojects {}`, `configure(…)`, `project(":x") { … }`) is one known to publish
+  nothing (Gradle's `java`, `java-library`, `application` and the like, the
+  Kotlin JVM plugins, Spring Boot, Jib, Shadow, common linters). A plugin
+  from a version catalog is looked up in `gradle/libs.versions.toml`. Any
+  other plugin, a convention plugin included, publishes. So does any build
+  script that spells `publish` (`maven-publish`, `publishing {}`,
+  `mavenPublishing {}`; a build scan's `publishing.onlyIf` does not count),
+  `uploadArchives`, a `signing {}` block or `jreleaser`, an `apply from:`,
+  an `apply {}` block naming a plugin or a script, or `buildSrc` or an
+  included build that registers one of the known plugin ids itself.
+- Maven: the `pom.xml` and every parent up the chain is in the repository at
+  the version asked for, or the parent is `spring-boot-starter-parent`, and
+  none has
+  `<distributionManagement>`, an `altDeploymentRepository`, a build
+  extension, a DTD, or a plugin outside a known set (compiler, surefire,
+  jar, shade, Spring Boot and so on; `exec` and `antrun` are not in it).
+  Nor does any `.mvn/extensions.xml` or `.mvn/maven.config` between the
+  module and the repository root.
+- No script in the repository deploys it. A `mvn … deploy` step (also
+  `mvnw`, `mvnd`, or a variable such as `$(MVN)`) publishes the modules its
+  `-pl` names (all of them without one) in the reactor its `-f` names,
+  matched by path suffix (a YAML `run: >` is read as the one command it
+  folds into). Every module is published by a Gradle
+  `--init-script`/`-I`, an `init.d/` directory, `jreleaser`, the JFrog CLI
+  (`jf mvn`, `jf gradle`, a `.jfrog/` directory) or a Jenkins Artifactory
+  step, an `altDeploymentRepository` in any script or XML file (a
+  `settings.xml` included), a `deploy:deploy-file`, or a Maven command whose
+  goals are a variable.
+- No published module depends on it (`project(":x")`, `projects.x`, or a
+  Maven dependency or unpacked `artifactItem` naming its artifactId), since
+  it ships with that module. A published module that compiles sources from
+  outside its own directory (`srcDir("../shared")`, build-helper's
+  `add-source`) publishes every module.
+
+A file under no build file, or under a `settings.gradle` whose projects
+cannot be listed (`includeFlat`, a computed `include`), is published. Two
+cases are not seen: JitPack, which builds any public repository without
+configuration, and a deploy configured only outside the repository (a
+runner's `settings.xml`, an init script in its Gradle user home). If yours
+works that way, read the deletion in the diff.
 
 In C#, an interface's other implementations do not block the wrapper when
 each one's member is inert. Callers then get the flag's value whichever
@@ -1621,7 +1737,8 @@ A call is folded only when its file proves the receiver is that method's class:
 - in C#, `var x = services.GetRequiredService<IFeatureFlags>()` (and
   `GetService`, `GetRequiredKeyedService`, `GetKeyedService`), when
   `Microsoft.Extensions.DependencyInjection` is in scope and no type of yours
-  declares a method of one of those names;
+  declares a method of one of those names (a C# file that does not parse
+  counts as declaring any name it spells);
 - `this.field` of such a field;
 - the class's name, for a `static` method or a member of an `object` or
   companion object;
@@ -1658,10 +1775,49 @@ spells one of them (as above), or spells a lookup by name: `GetType()`,
 `GetRuntime…` forms), `InvokeMember`, `TypeDescriptor`, `PropertyDescriptor`,
 `DataBinder`, `new Binding(…)`, `Expression.Property` or
 `Expression.PropertyOrField`. When any such file passes one of those lookups a
-name that is not a string literal, uses `TypeDescriptor` or
-`PropertyDescriptor` at all, or aliases one of those types, a string spelling
-the name counts in every file that can reference the types. `nameof`
-is not a lookup. Other by-name APIs (Dynamic LINQ strings, a JSON path,
+name that is neither a string literal nor a `nameof(…)`, uses `TypeDescriptor`
+or `PropertyDescriptor` at all, or aliases one of those types, a string
+spelling the name counts in every file that can reference the types. `nameof`
+is not a lookup, but a `nameof(…)` ending in the name counts wherever a string
+spelling it would (unless something in your code is itself named `nameof`, in
+which case `nameof(…)` passed to a lookup is not taken as a constant). In a
+file that spells none of the types, while no lookup anywhere takes a computed
+name, only a string or `nameof` passed as a lookup's name counts, unless the
+file also spells `GetType()`, a lookup that lists members (`GetProperties`,
+`GetMembers`, `DeclaredProperties`, ...), `GetRuntimeMethod`,
+`GetRuntimeField`, `FindMembers`, `Type.FilterName`, a `GetDeclared…` lookup,
+`Expression.Field`, `Call`, `Property` or `PropertyOrField`, `TypeDescriptor`
+or `PropertyDescriptor`, or does not parse. A C# file that spells
+`IgnoreCase` (`BindingFlags.IgnoreCase`, `StringComparison.OrdinalIgnoreCase`,
+...) or holds a prefix pattern such as `"IsX*"` (as `GetMember` takes)
+counts every string naming the member in any case, or by such a prefix, even
+where it never spells the name itself. A string spelling an accessor's name
+(`"get_IsX"`, `"set_IsX"`) or the backing field's (`"<IsX>k__BackingField"`)
+names the member too.
+
+A lookup's name also counts as a constant when it can hold nothing else: a
+parameter nothing in its method writes or binds again, of a `private` method
+every call to which (in its file, with no method group, qualified call,
+overload or string naming the method) passes a constant, or of an xunit
+`[Theory]` fed only `[InlineData]` constants and called from nowhere; or a
+`foreach` variable over an array of constants, written in place or held by a
+local nothing writes, passes or returns. Those constants then count where the
+lookup's own would. A lookup on `typeof(C)`, or on a `foreach` variable over
+such a local `Dictionary<K, Type>` (its values) or array of `typeof(…)`, takes
+any name without counting, when no `C` is, derives from or otherwise leads to
+the types (a member of a class does not see an interface's members).
+
+A `GetProperty` or `GetRuntimeProperty` with a computed name does not make
+strings count when its result is only asked whether it carries an attribute:
+`p?.GetCustomAttribute<T>()` compared with `null`, or `p?.IsDefined(typeof(T))`
+compared with `true` or defaulted with `?? false`, directly or through a local
+used only that way. A deleted property and one with no attribute answer
+alike, so this holds only when no deleted declaration (the member, the
+interface's, another implementation's) has an attribute or is `virtual`,
+`abstract`, `override` or `new`, nothing derives from the classes, and no base
+of theirs declares the name or lies outside your code. (`GetMethod` and
+`GetField` are not taken: an auto-property's accessors and backing field carry
+attributes the compiler adds.) Other by-name APIs (Dynamic LINQ strings, a JSON path,
 `Activator`, your own reflection helpers) are not seen, and neither is
 reflection that finds the type by scanning assemblies. Files in other
 languages (VB and F# apart, which are `other-language`) and documentation are
@@ -1699,7 +1855,9 @@ In C#, Moq's `Setup`, `SetupGet`, `Verify` and `VerifyGet` of the member
 value the flag keeps serving goes, and a test stubbing the value being removed
 goes whole. The mock
 must be declared with that type, or created as `new Mock<IFeatureFlags>(…)`,
-and every binding of its name in the file must be one. In a test project, a
+and every binding of its name in the file must be one. No type of yours may
+be named `Mock` or `Substitute`, and a C# file that does not parse counts as
+declaring any name it spells. In a test project, a
 private test helper's `bool` parameter that only chooses a stub's value
 (`Returns(enabled)`) is pinned the same way, when every call in the file
 passes a literal or relies on a literal default. The stub, the parameter and
@@ -1714,7 +1872,11 @@ A test that reads the member through a receiver typed as another
 implementation (`var config = new ConfigFlags(o); … config.IsCheckoutEnabled`)
 is deleted with that implementation. That needs the wrapper to complete, the
 test to be in a test project, the receiver to be a plain name or `this.name`,
-and every binding of that name in the file to be typed as the implementation.
+every read of the member through that name in the test to be through the
+implementation, and every binding of the name the test can see (its own
+locals, parameters and patterns, and its class's members) to be typed as the
+implementation. The same name may mean something else in another test. A
+test whose name another method in the file shares is not deleted.
 A wrapper that ends partial keeps all its stubs and these tests as they were.
 If every mention was proven but the deletion still keeps the wrapper (its own
 read was not folded, a mention is left, or another implementation's member
@@ -1759,7 +1921,7 @@ is reported as **partial** rather than **complete**:
 | --- | --- |
 | `name-not-unique` | The method, its class or the interface method is declared more than once. In TypeScript and JavaScript, any function, method, class field, parameter property, object key, module-level binding or enum member of the name counts, a committed build output included, and so does any string literal equal to it. |
 | `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare, or an object literal used other than as a member's receiver (`Object.keys(flags)`, a spread, `flags[k]`, passed or re-exported). |
-| `interface-published` | The interface it implements is public, or has another implementation. In C#, an implementation in a Razor, Web Forms, VB or F# file, or an interface extending it, counts; any other implementation must be inert instead (see `sibling-not-inert`). |
+| `interface-published` | The interface it implements is public and its module may be published, or has another implementation. In C#, an implementation in a Razor, Web Forms, VB or F# file, or an interface extending it, counts; any other implementation must be inert instead (see `sibling-not-inert`). |
 | `interface-structural` | A Go interface declares a method of the same name, or the wrapper is an exported Go method, which may satisfy an interface outside the repository. Or a TypeScript interface or type literal declares a property or method of the same name. |
 | `receiver-unproven` | Nothing in the file ties the receiver to the method's class. In TypeScript and JavaScript, also a use that hands a function wrapper's module on as an object (see above). |
 | `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
@@ -1768,8 +1930,8 @@ is reported as **partial** rather than **complete**:
 | `unremovable-local` | Go only: folding the call would leave a local unused that the cleanup does not remove (see above), and Go does not build with an unused local. |
 | `nil-receiver` | Go only: the call reaches a value-receiver method through a pointer that may be nil, so it panics there, and folding it would remove the panic. |
 | `other-language` | The call is in a Groovy or Scala file, in a Java file calling a Kotlin method (or the reverse), in Java, Groovy or Scala naming a Kotlin getter (`getEnableX`), or in Kotlin reading a Java getter as a property (`flags.enabled`), or a VB or F# file naming a C# wrapper. |
-| `unparsed-mention` | The name appears in a string (reflection, SpEL), a template, a layout, a Razor view, a C# `cref`, a `//go:linkname` comment, the name of a Go `Example` test, or another file this tool does not parse. Also a Go call in an external test package that declares a named `Example`. |
-| `declaration-file` | TypeScript and JavaScript: the wrapper is a JavaScript function or member that its own hand-written declaration file declares (`flags.d.ts` beside `flags.js`). Its callers are inlined, and the wrapper stays with its declaration, for you to delete together. |
+| `unparsed-mention` | The name appears in a string (reflection, SpEL), a template, a layout, a Razor view, a C# `cref`, a `//go:linkname` comment, the name of a Go `Example` test, or another file this tool does not parse. Also a Go call in an external test package that declares a named `Example`. For a Java or Kotlin getter method with no parameters (`isEnableX()` or `getEnableX()`), the bean property name a template or SpEL reads it by (`enableX`) counts too, in a string or in a file this tool does not parse. |
+| `declaration-file` | TypeScript and JavaScript: the wrapper is a JavaScript function or member that its own hand-written declaration file declares (`flags.d.ts` beside `flags.js`), and that declaration cannot go with it: it shares a `declare const` with another name, or a TypeScript run of the same removal also edits the file. Its callers are inlined, and the wrapper stays with its declaration, for you to delete together. |
 | `not-folded` | The read inside the method was not folded, because its file could not be processed. |
 | `test-double` | A stub of the method this run could not resolve. In TypeScript and JavaScript, one stub of the wrapper that cannot be resolved, or any stub of a wrapper with a call that is not inlined, refuses it before a caller is inlined, and none of its stubs is edited. So does a stub of its whole class, a stub of an object it cannot rule out, an auto-mocking test bed or runner config, or a module mock of a target that does not resolve to a file or a declared package. |
 | `sibling-not-inert` | Another implementation of the interface returns the value being removed, calls something, is `virtual`, is shared with another interface, or is otherwise not inert (C#). Reported at that implementation. |
@@ -1787,6 +1949,77 @@ For the same reason, if your repository is a published library, read the
 deletion of a public method in the diff before merging. Set
 `inline-wrappers: false` to fold only inside such methods, as earlier versions
 did.
+
+**What a complete C# gate leaves behind is removed too.** Once a C#
+wrapper with an interface is complete, its member is gone everywhere, but the
+interface, the wrapper class and each inert implementation are left empty,
+and so are their dependency-injection registrations and the constructor
+parameters that take the interface. These are removed as well, all together
+or not at all:
+
+- the interface, the wrapper class and every inert implementation, and a file
+  that declares nothing else;
+- each registration statement that names only those types
+  (`services.AddScoped<ICheckoutGate, FeatureflipCheckoutGate>();`, the
+  `TryAdd`, keyed, `typeof(…)` and `Replace(ServiceDescriptor.…)` forms, or a
+  factory building one from resolved services). An `if` or `else` arm left
+  empty is named in the pull request;
+- in each class that takes the interface in its one explicit constructor,
+  the parameter, the private field it was stored in, the statement that stored
+  it, and the argument every caller passes. A constructor whose only parameter
+  that was, written `=> _gate = gate;`, is deleted, and C# supplies the
+  parameterless one;
+- in test projects, each `Mock<T>` or `Substitute.For<T>()` of these types
+  that is only passed to such a constructor, each test that only builds one of
+  them and asserts a literal, and a test class those leave empty;
+- a `<see cref="…"/>` naming one of them becomes `<c>…</c>`;
+- the options class an inert implementation read (`_options.Enabled`), with the
+  statement binding it to a section (`services.Configure<GateOptions>(
+  configuration.GetSection("Gate"))`, `AddOptions<T>().Bind(…)` or
+  `.BindConfiguration(…)`), or, when the class holds other settings, only that
+  property; and the `Gate:Enabled` key in each `appsettings*.json` of a project
+  that loads the binding. The edit keeps the file's comments and commas;
+- each `using` of a namespace these deletions leave empty.
+
+Every mention of each deleted type is looked for by text in every file of the
+repository (build output under `bin` and `obj` aside). Each must be one of the
+above, or a comment or Markdown text, which is listed in the pull request and
+left as it is. Anything else keeps all of it as it was: a string naming the
+type, a configuration or Razor file naming it, a use not listed above, an
+assembly scan whose filter could include the types, a public constructor in a
+project that may be packed, a project `<Using>` of an emptied namespace. The
+pull request then says what kept it, and the flag is still removed. When only
+the options class or its configuration cannot be followed (the key set as an
+environment variable or in a chart, a string reading the section, a binder
+setting that rejects unknown keys), that part stays and the rest goes.
+
+Two results to know about:
+
+- a `using` of an emptied namespace is deleted on the assumption that no
+  assembly outside the repository declares types in your own namespace;
+- the SDK client the wrapper class received is no longer created through it.
+  If nothing else asks the container for it, it is created later, or not at
+  all.
+
+What still keeps it, by design, until it can be proven:
+
+- a constructor taking the interface is kept, with everything else, when its
+  class is also named in `typeof(…)` (a test attribute included), built with
+  a target-typed `new(…)` anywhere that has the same number of arguments, or
+  has a second constructor;
+- a binding whose configuration is not provably the root (a local, a
+  `GetSection(…)` result, a parameter some caller passes something other
+  than a host's `Configuration`) keeps the options class and its keys;
+- a setting of an options class shared with other settings is kept when a
+  value of the class is passed on, returned, serialised or reflected over;
+- an emptied test class with a base class, an attribute or another part, or
+  one named elsewhere, is kept, emptied;
+- a file is deleted only when nothing but namespaces, comments and its own
+  `using`s would remain; an `[assembly: …]` attribute, a `global using` or an
+  `extern alias` keeps it;
+- build output under `bin` and `obj` is not searched for mentions, and a
+  comment that named a deleted type is listed, not rewritten, so its prose
+  may be stale.
 
 **A gate that takes no key and is not inlined is reported, not rewritten.**
 That is every such gate outside Kotlin, Java, C#, Go, TypeScript and
@@ -2144,12 +2377,12 @@ behaviour above: the declaration is left in place and nothing is deleted.
 
 | Language | Read forms resolved |
 | --- | --- |
-| C# | A `const string` in a class, struct, record or interface, including one nested in another type (`FeatureFlags.Checkout.NAME`, spelled from the outermost type). `Owner.NAME`, with `Owner`'s namespace enclosing the reader or imported by a `using` in the file, in the enclosing namespace block, as a `global using`, or as a `<Using>` item in a project file; `Alias.NAME` under `using Alias = Ns.Owner;` at file level (or `global using`, or a project `<Using Alias="...">`); bare `NAME` under `using static Ns.Owner;` at file level. The read is the first argument of a `BoolVariation(...)` call, of an awaited `GetBooleanValueAsync(...)`, or of an accessor you named. A read spelled with its namespace (`Ns.Owner.NAME`, `global::Ns.Owner.NAME`), a `partial` owner, and a constant declared `static readonly` are left alone, and the declaration is kept |
-| Dart | A top-level `const` or `final`, or a `static const`/`static final` member of a class, mixin or extension type. Bare `NAME` through an `import` of the declaring file (a relative URI or `package:` of the reader's own package), `show` and `hide` honoured; `p.NAME` through `import '...' as p`; `Owner.NAME` and `p.Owner.NAME` for a member. The read is the first argument of a non-null-aware `boolVariation(...)` call or of an accessor you named. A read through a re-exporting library, a conditional or deferred import, another package of the repository, a typedef, or from a `part` file is left alone, and the declaration is kept. An import the fold leaves unused is removed, and a `show` naming the deleted constant is trimmed |
+| C# | A `const string` in a class, struct, record or interface, including one nested in another type (`FeatureFlags.Checkout.NAME`, spelled from the outermost type). `Owner.NAME`, with `Owner`'s namespace enclosing the reader or imported by a `using` in the file, in the enclosing namespace block, as a `global using`, or as a `<Using>` item in a project file; `Alias.NAME` under `using Alias = Ns.Owner;` at file level (or `global using`, or a project `<Using Alias="...">`); bare `NAME` under `using static Ns.Owner;` at file level. The read is the first argument of a `BoolVariation(...)` call, of an awaited `GetBooleanValueAsync(...)`, or of an accessor you named. A read spelled with its namespace (`Ns.Owner.NAME`, `global::Ns.Owner.NAME`), a `partial` owner, and a constant declared `static readonly` are left alone, and the declaration is kept. A type taken whole keeps every key constant it owns, since reflection reaches a constant without spelling it: `typeof(Owner)` (but not as a logging category, `GetLogger(typeof(Owner))`, `ForContext(typeof(Owner))`, `CreateLogger(typeof(Owner))`), `nameof(Owner)`, `Owner` as a type argument (`All<Owner>()`, but not a logger's or an equality contract's: `ILogger<Owner>`, `Logger<Owner>`, `CreateLogger<Owner>()`, `ForContext<Owner>()`, `IEquatable<Owner>`, `IComparable<Owner>`), or a string holding its qualified name (`Type.GetType("Ns.Owner")`, `"Ns.Owner, Assembly"`, `"Ns.Outer+Owner"`) or exactly its simple name (`t.Name == "Owner"`), in any file, the owner's own included, each refused as `unsupported-form`. The same holds for an outer type of a nested owner, a repository type deriving from the owner, and, except in a string, an alias of either. Types are matched by name, so a same-named type in another namespace keeps the declaration too. In a Razor view, XAML, VB, F# or other .NET file the Action does not parse, any spelling of one of those types not followed by a member access (`typeof(Owner)`, `GetType(Owner)`, `typeof<Owner>`, `{x:Type local:Owner}`, `"Ns.Owner"`) keeps it the same way; `Owner.OTHER` there reads only `OTHER`. Not seen: a name assembled from parts (`"Ns." + name`), escapes in the string, `GetType()` on an instance, a scan of every type (`assembly.GetTypes()`), and a derived type outside the checkout |
+| Dart | A top-level `const` or `final`, or a `static const`/`static final` member of a class, mixin or extension type. Bare `NAME` through an `import` of the declaring file (a relative URI or `package:` of the reader's own package), `show` and `hide` honoured; `p.NAME` through `import '...' as p`; `Owner.NAME` and `p.Owner.NAME` for a member. The read is the first argument of a non-null-aware `boolVariation(...)` call or of an accessor you named. A read through a re-exporting library, a conditional or deferred import, another package of the repository, a typedef, or from a `part` file is left alone, and the declaration is kept. A file that imports or exports `dart:mirrors`, the declaring file included, keeps every key constant of the run, refused as `unsupported-form`: `reflectClass(Owner).declarations`, a library's top-level constants through any class of it, and `currentMirrorSystem().libraries` all reach a constant without spelling it. An import the fold leaves unused is removed, and a `show` naming the deleted constant is trimmed |
 | Java | `Owner.NAME`, with `Owner` in the same package or imported (`import pkg.Owner;`, `import pkg.*;`); bare `NAME` under `import static pkg.Owner.NAME;` or `import static pkg.Owner.*;`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named |
 | Kotlin | `Owner.NAME` for a `const val` in a top-level `object`, or in the `companion object` of a top-level class (`Owner` is the class; `Owner.Companion.NAME`, or `Owner.Keys.NAME` for a companion named `Keys`, works too), with `Owner` imported or in the same package; bare `NAME` (or its `as` alias) under `import pkg.Owner.NAME`, `import pkg.Owner.Companion.NAME` or `import pkg.NAME`, or in the same package for a top-level `const val`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named. A subclass of the class can read a companion's constant without naming it, so a constant read that way is kept |
-| TypeScript / TSX / JavaScript | an `export const` read through `import { NAME }` (or `as`), `import * as ns` (`ns.NAME`), `const ns = require(...)`, or `const { NAME } = require(...)`. Relative specifiers, and `paths` (against its `baseUrl`) from the nearest `tsconfig.json` or `jsconfig.json`, are followed; a bare specifier that only `baseUrl` would resolve is not. The read is the first argument of a non-optional `boolVariation(...)` or `useFeatureFlag(...)`, an awaited `getBooleanValue(...)`, or an accessor you named |
-| PHP | A single-element `const` in a class, interface or enum declared at the top of a file or namespace block and not `private` (typed or not), or a namespace-level `const`. `Owner::NAME` with `Owner` imported (`use Ns\Owner;`, `use Ns\Owner as Alias;`, `use Ns\{Owner, ...};`), in the reader's namespace, fully qualified (`\Ns\Owner::NAME`), qualified through an imported namespace, or `namespace\`-relative; class names match in any case. Bare `NAME` under `use const Ns\NAME;` or in the constant's own namespace (a global constant only from a file with no namespace). The read is the whole first argument of a `boolVariation(...)` method or function call, or of an accessor you named. Left alone, and the declaration kept: a read through a subclass, an implementer, a `class_alias`, or `self::`/`static::`/`parent::` that may reach it (inside a closure, always), a `use const ... as Alias`, a qualified constant name (`\Ns\NAME`), a named argument, a read inside string interpolation, the name in a string (`constant('...')`), a heredoc or a docblock annotation, a Blade view, a Twig, Latte or Smarty template or Symfony YAML/XML or Nette configuration that spells it, and a file holding PHP under another suffix (`.theme`, `.install`, `.profile`, `.engine`, `.ctp`, `.php7`). A trait's constant is never resolved across files. A file under a Composer `vendor/` directory (beside a `composer.json`) is never rewritten; it keeps the declaration only when it names the owner itself, and it competes only when it parses |
+| TypeScript / TSX / JavaScript | an `export const` read through `import { NAME }` (or `as`), `import * as ns` (`ns.NAME`), `const ns = require(...)`, or `const { NAME } = require(...)`. Relative specifiers, and `paths` (against its `baseUrl`) from the nearest `tsconfig.json` or `jsconfig.json`, written there or inherited through `extends`, are followed; a bare specifier that only `baseUrl` would resolve is not. The read is the first argument of a non-optional `boolVariation(...)` or `useFeatureFlag(...)`, an awaited `getBooleanValue(...)`, or an accessor you named |
+| PHP | A single-element `const` in a class, interface or enum declared at the top of a file or namespace block and not `private` (typed or not), or a namespace-level `const`. `Owner::NAME` with `Owner` imported (`use Ns\Owner;`, `use Ns\Owner as Alias;`, `use Ns\{Owner, ...};`), in the reader's namespace, fully qualified (`\Ns\Owner::NAME`), qualified through an imported namespace, or `namespace\`-relative; class names match in any case. Bare `NAME` under `use const Ns\NAME;` or in the constant's own namespace (a global constant only from a file with no namespace). The read is the whole first argument of a `boolVariation(...)` method or function call, or of an accessor you named. Left alone, and the declaration kept: a read through a subclass, an implementer, a `class_alias`, or `self::`/`static::`/`parent::` that may reach it (inside a closure, always), a `use const ... as Alias`, a qualified constant name (`\Ns\NAME`), a named argument, a read inside string interpolation, the name in a string (`constant('...')`), a heredoc or a docblock annotation, a Blade view, a Twig, Latte, Smarty or Volt template or Symfony YAML/XML or Nette configuration that spells it, and a file holding PHP under another suffix (`.theme`, `.install`, `.profile`, `.engine`, `.ctp`, `.php7`). A trait's constant is never resolved across files. A file under a Composer `vendor/` directory (beside a `composer.json`) is never rewritten; it keeps the declaration only when it names the owner itself, and it competes only when it parses. A class taken whole keeps every key constant it owns, since reflection, `constant()` with a computed name and `$cls::{$n}` all reach a constant without spelling it: `Owner::class`, a dynamic fetch (`Owner::{$n}`) or a string naming the class (`'Ns\Owner'`, `'Ns\Owner::' . $n`, `'Ns\Owner::NEW_' . $x`, `"Ns\\Owner::$n"`, the same in a heredoc or nowdoc or with a `b` prefix, and with double-quoted escapes such as `\x4B` decoded; a class in the global namespace only when the string starts with a capital, `'Owner'`, or holds `::`) in any PHP file, the class's own included, and the same for a class proven to inherit the constants (`Sub::class`) and, inside the class or one of those, `static::class`, `self::class`, `$this::class`, `__CLASS__`, `get_called_class()`, `get_class($this)`, `get_parent_class()`, `static::{$n}` or `'static::'`, each refused as `unsupported-form`. `static`, `$this` and a trait's `self` count for every class that may stand for them, a base class's `static` included. A string holding one of the class's constants' whole names after `::` reads that constant alone. An instance reaches every constant too (`new \ReflectionObject($k)`, `get_class($k)`, `$k::{$n}`), and where it goes is not followed, so creating one (`new Owner()`, `new static()`), a parameter, property or return type naming the class (which a container autowires), and `$this` handed on or returned inside such a class each keep the declaration. A service that declares its own flag constants and is constructed or injected therefore keeps them. A namespace constant is kept the same way when its name is built at run time: a string that starts its qualified name and holds a backslash (`'Ns\\' . $n`, `"Ns\\$n"`, `'Ns\\NEW_' . $x`), `__NAMESPACE__` inside that namespace, and `get_defined_constants()`, which lists every user constant and so keeps every namespace and global key constant of the run. A Twig, Latte, Smarty or Volt template, a Blade view, a file holding PHP under another suffix, or Symfony configuration with a constant marker keeps every key constant of the class too, refused as `unsupported-form`, when its text holds the class's name followed by `::` and anything but one of its constants' whole names, a static property or a method call (`constant('Ns\\Owner::' ~ name)`, `constant(\Ns\Owner::class . '::' . $name)`, `Owner::{$n}`, `"Ns\\Owner::$n"`), or a quoted string that is the class's qualified name (`'Ns\\Owner' ~ '::' ~ name`, `new ReflectionClass('Ns\Owner')`). It is matched by text, a bare class name by its short name or by an alias the text imports it as (`use Ns\Owner as K`, `@use('Ns\Owner', 'K')`), and the file is never rewritten. Not seen: a template under a plain `.html` suffix (Craft CMS), an inheritance through a class outside the checkout or under Composer's `vendor/`, and a class name assembled from parts |
 | Python | a module-level `NAME = "key"` (annotated, `NAME: str = "key"`, and a plain f-string with nothing to fill in count too), read through `from pkg.keys import NAME` (or `as K`), a relative form (`from .keys import NAME`), `import pkg.keys` (`pkg.keys.NAME`), `import pkg.keys as k` (`k.NAME`) or `from pkg import keys` (`keys.NAME`, `as` alias included). An absolute import is resolved when exactly one file in the checkout ends in `pkg/keys.py` or `pkg/keys/__init__.py`; with two, as in a repository holding two services that each have a `pkg` package, the read is refused. The read is the first argument of `variation(...)` with a `True`/`False` default (positional or `default=`), of `get_boolean_value(...)`, or of an accessor you named. Only an import at the top of the module counts |
 | Swift | A top-level `let`, or a `static let` in a struct, class, enum, actor, or an extension of one declared in the same module, including nested types (`Flags.Checkout.NAME`, spelled from the outermost type). The module of each file is read from `Package.swift` targets and committed Xcode projects (classic file lists and Xcode 16 synchronized folders). Within a module, a static is read as `Owner.NAME` and a top-level `let` as bare `NAME`, with no import; a static is never resolved as a bare `NAME`. From another module, after `import Module` with the constant `public` (or `package` within one Swift package, or `internal` under `@testable import`). The read is the first argument of a non-optional-chained `boolVariation(...)` call or of an accessor you named, negated or not. Left alone, and the declaration kept: a bare `NAME` of a static constant read inside its owner, an extension of the owner, or a type that inherits from it (write `Owner.NAME`), a constant carrying an attribute (`@MainActor`, a property wrapper), a `private` or `fileprivate` constant or owner, one inside `#if`, an owner with an inheritance or conformance clause, a module-qualified read (`Module.Owner.NAME`), an implicit member (`.NAME`), a read through a typealias, a subclass or `self`/`Self`, a read inside an extension of a type that has a generic parameter of the owner's name, or of a nested type whose outer type is generic, a read inside an extension whose extended type the tool cannot name (a generic specialisation such as `extension Array<Int>`), a read inside an extension written through a typealias, or in a type whose supertype or protocol is spelled through a typealias, a dotted owner one of whose intermediate types is also redeclared by an extension (an extension adding `typealias Checkout = …`), a bare read inside a type whose supertype or protocol is declared outside the repository, or inside an extension constrained `where Self:` to such a type (a SwiftUI `View`, say: qualify it as `Owner.NAME`), an owner given a member of the same name by an extension written through a typealias (`extension K`, or a dotted spelling with a typealias anywhere in it, such as `extension NS.Keys`), a constant or read whose name is written in backticks, an import inside `#if` or of one declaration (`import struct Module.Owner`), an `import` of a module name that two packages or projects in the repository share, a second imported module that declares the same name or re-exports another, and any file whose module cannot be read (a manifest that computes its targets or lists `sources:`/`exclude:`, a file in no target). One case is still resolved and can differ: a qualified read (`Owner.NAME`) inside a type whose superclass or protocol comes from outside the repository, inside an extension of a type declared outside the repository (`extension UIViewController`), or inside an extension constrained `where Self:` to one. If that outside type declares, or an extension of it declares, a nested type, typealias or generic parameter with the owner's name, Swift reads that one, and the fold uses this repository's value. Bare reads in such types are left alone |
 
@@ -2165,6 +2398,117 @@ reads a key constant declared in a file of another type. A Kotlin file reading
 a Java constant, or the reverse, is refused as `other-language` in the same
 way.
 
+A TypeScript or JavaScript key constant is also kept when any file hands the
+module that declares it on as an object. Code holding that object can reach
+the constant without spelling its name (`Object.values(K)`, `K[name]`), so
+deleting it would change what that code sees and still compile. This applies
+to a namespace import or `require` of the module used as anything but
+`ns.<name>` or a type, and so to it being cast, passed, spread, indexed or
+re-exported. It also applies to `export * as`, a dynamic `import()`,
+`import m = require(...)`, and a glob loader that can load the file. A
+specifier reaches the module however it is spelled, through a `paths` alias
+too, and a Vue, Svelte or Astro component or an MDX document counts. Each
+such use is reported as `unsupported-form`. Such a component or document is
+never rewritten, so one that spells the constant's name anywhere, an import
+of it included, keeps the declaration the same way. The constant's proven
+reads are still folded; only the declaration stays. An `export * from` the
+module (a barrel) is followed rather than refused, so a namespace of the
+barrel handed on keeps the declaration too.
+
+A Ruby key constant is not resolved across files, so its declaration is kept
+whenever another file in the checkout holding Ruby could read it, and Ruby can
+read a constant without spelling its name. That is a `.rb`, `.rake` or `.erb`
+file, a view (`.jbuilder`, `.jb`, `.builder`, `.rabl`, `.arb`, `.axlsx`,
+`.prawn`, `.rhtml`, `.haml`, `.slim`), a project file (`Rakefile`, `Gemfile`,
+`Guardfile`, `Capfile`, `Thorfile`, `Vagrantfile`, `Podfile`, `Fastfile`,
+`Appfile`, `Dangerfile`, `Brewfile`, `Berksfile`, `Steepfile`, `config.ru`, a
+`.gemspec`, `.podspec`, `.gemfile`, `.thor` or `.rbw` file), or a file with no
+suffix whose first line runs it with Ruby (`#!/usr/bin/env ruby`, as in
+`bin/`). HAML and Slim are not parsed, so a template keeps the declaration
+whenever it names the constant or the owner. The declaration is
+kept when another file spells the constant together with its owner, or with a
+class that inherits it: one that subclasses the owner or includes, extends or
+prepends it, at any depth, including a `Struct.new do ... end` or
+`Class.new do ... end` block assigned to a constant (`Sub::FLAG_KEY`). It is
+also kept when another file reaches the owner, or such a class, as a whole:
+
+* reflection on it, such as `Gate.const_get(name)`, `Gate.constants`,
+  `Gate.const_defined?(name)`, `Gate.send(:const_get, name)`,
+  `Gate.class_eval`, or the same through an instance
+  (`Gate.new.class.const_get(name)`). A lookup of a literal name, such as
+  `Gate.const_get(:OTHER)`, reads that name only and keeps nothing;
+* the owner handed on as a value: passed (`register(Gate)`), assigned, put
+  in an array, interpolated, or turned into something that is still the owner
+  or names it (`name`, `to_s`, `dup`, `tap`, `ancestors`, `method`);
+* a string or symbol that a lookup can complete: the owner's whole name
+  (`"Gate"`, `:Gate`, `"#{ns}::Gate"`), `Gate::` followed by an interpolation,
+  a format directive or an appended string (`"Gate::#{name}"`,
+  `"Gate::" + name`, `%W[Gate::#{name}]`), or any mention in a string handed to
+  `eval`, `class_eval`, `module_eval` or `instance_eval`;
+* the owner reopened (`class Gate`, `class << Gate`, or a class inheriting
+  it) with `constants`, `const_get`, `ancestors`, `class_eval` or
+  `self.class.constants` inside, or with the class's own `self` handed on
+  (an instance's `self` is not);
+* a file that does not parse and names the owner.
+
+The file declaring the constant is asked the same: an owner listing its own
+constants (`def self.all = constants`, `const_get(name)` in its body,
+`self.class.constants`, or `Gate.constants` after it) keeps them.
+
+A top-level constant has no owner, and `const_get` finds one from any class,
+so a `const_get` or `constantize` of a computed name anywhere keeps it, and
+so does `Object.constants`. Each of these is logged with the file and line
+that reaches the owner. These keep nothing: comparing the owner
+(`x.is_a?(Gate)`, `when Gate`), rescuing it, calling its own methods
+(`Gate.new`, `Gate.enabled?`, `Gate.send(:enabled?)`), handing on an instance
+of it, a spec or double of it (`RSpec.describe Gate`, `allow(Gate)`,
+`class_double("Gate")`), and `class_name: "Gate"`. Not inspected: Ruby in
+a file under a suffix or name not listed above, a lookup whose owner name
+arrives from data (a YAML file, an environment variable) or through a
+computed `send`, reflection
+through a relative of the owner (`descendants`, `subclasses`, `superclass`,
+`module_parent`), and an owner reached through a class outside the
+checkout.
+
+A Java or Kotlin key constant is also kept when any file takes its owner
+whole. A key constant is a static field of its owner (a companion's `const
+val` is one of the class around it), so reflection over the class lists it
+without spelling its name, and deleting it would change what that code sees
+and still compile. This applies to a class literal (`RuntimeKeys.class`,
+`RuntimeKeys::class`, qualified or through an import alias), to a string
+holding the class's binary name (`Class.forName("app.RuntimeKeys")`, or
+`"app.RuntimeKeys$Companion"`), and to the same for any repository class that
+may extend the owner, since `getFields()` lists a superclass's public static
+fields too, in any file, the owner's own included (`Keys.class.getFields()`
+inside `Keys`). For a Kotlin `object`, or a class whose companion holds the
+constant, it also applies to the object handed on as a value (`fun dump(): Any
+= RuntimeKeys`, `RuntimeKeys.Companion`, or `RuntimeKeys.INSTANCE` from Java)
+or used as the receiver of anything but one of its own members
+(`RuntimeKeys.javaClass`, `RuntimeKeys.let { }`, and from Java
+`RuntimeKeys.INSTANCE.getClass()`). A
+file in any of the four JVM languages counts. Each such use is reported as
+`unsupported-form`; the constant's proven reads in other files are still
+folded and only the declaration stays (a read inside the owner's own file stays
+with it). A class literal is matched by the class's name, so one handed to
+your own code (`FlagRegistry.register(CheckoutGate.class)`) counts. One that is
+the first argument of a test double or a logger does not, because those never
+read a class's static fields: `mock`, `spy`, `any`, `isA`, `forClass`,
+`getLogger`, `getLog`, Spock's `Mock`, `Stub`, `Spy` and their `Groovy`
+variants, and MockK's `mockk`, `mockkClass`, `mockkObject`, `mockkStatic` and
+`spyk` (so `mockkObject(CheckoutGate)` does not count as handing the object
+on either). In Java, the class's name handed to one of those counts no more
+than the literal does (`Logger.getLogger(CheckoutGate.class.getName())`, or
+`getSimpleName()`, `getCanonicalName()`). Neither does a class named in Spring's `@Import`, which registers
+it as a bean, or in a Spring test double's annotation (`@MockBean`, `@SpyBean`,
+`@MockitoBean`, `@MockitoSpyBean`, springmockk's `@MockkBean` and `@SpykBean`),
+as any of their arguments (`@Import({Other.class, CheckoutGate.class})`,
+`types = CheckoutGate.class`). An annotation of your own still counts. Not
+seen: an instance of the owner handed on (`new
+RuntimeKeys().getClass()`), a class name assembled from parts, reflection
+inside the owner or a class extending it through `getClass()` or
+`this::class`, and the facade class of a Kotlin top-level constant
+(`Class.forName("app.KeysKt")`).
+
 Groovy (`.groovy`, `.gvy`, `.gy`, `.gsh`, `.gradle`, and `.gsp` views) and
 Scala (`.scala`, `.sc`, and `.scala.html`, `.scala.txt` and `.scala.xml`
 templates) files can read a Java or Kotlin constant too, and this tool neither
@@ -2174,7 +2518,16 @@ alias, reads the name bare (a static import or an inherited constant), or
 qualifies it with anything other than a class the repository declares, the
 file imports or shares a package with, and never uses as a variable. A Spock spec reading `CheckoutGate.FLAG_KEY`
 keeps `CheckoutGate`'s constant; one reading `SearchGate.FLAG_KEY` from an
-unrelated class does not.
+unrelated class does not. Read the same way, any other mention of the owner's
+name, or of a class that may extend it, keeps every key constant it holds
+unless it declares, extends or constructs that class, names it as a type
+(`RuntimeKeys keys = Mock()`, `go(RuntimeKeys keys)`, Scala's `keys:
+RuntimeKeys`), reads one of its members (`RuntimeKeys.OTHER`,
+`RuntimeKeys.describe()`), or hands it to a test double (`Mock(RuntimeKeys)`,
+ScalaMock's `mock[RuntimeKeys]`): `RuntimeKeys.fields`, a Groovy map value
+(`[gate: RuntimeKeys]`),
+`classOf[RuntimeKeys]` and the class handed on all count, refused as
+`unsupported-form`.
 
 A C# constant can be read from files this tool does not rewrite either: a
 Razor view (`.cshtml`, `.razor`), a XAML binding (`{x:Static local:Owner.NAME}`
@@ -2245,9 +2598,9 @@ same name beside the declaring module refuses every form, `from pkg.keys import
 NAME` included.
 
 Some Python routes to a constant are not inspected: a module reached only
-through `sys.modules` or an import path built at run time; a constant's name
-built at run time in a file that never spells it (`setattr(pkg.keys, "NA" +
-"ME", ...)`, `pkg.keys.__dict__.update(...)`); another module, or
+through `sys.modules` by a computed name, or by an import path built at run
+time or named in a string by anything but its whole dotted name
+(`import_module(".keys", "pkg")`, `import_module("keys")`); another module, or
 a function called later from code the Action does not read, that assigns a
 package's submodule attribute at import time; an override module kept out of
 version control (a git-ignored `local_settings.py` that assigns
@@ -2262,6 +2615,34 @@ in any Python file of the checkout, a docstring and a
 `mock.patch("pkg.keys.NAME")` included; `globals`, `vars`, `locals`, `exec`,
 `eval`, `sys.modules` or `importlib.import_module` or `__import__` in a
 reading file; and a star import beside a bare name.
+
+A Python module is a value, so a file can reach every constant in it without
+spelling one. Any Python file of the checkout that binds the declaring module,
+or a package holding it (`import pkg.keys`, `import pkg.keys as k`, `from pkg
+import keys`, `import pkg` or `import pkg as p` and then `p.keys`, `from pkg
+import *`, which binds a loaded submodule), and uses it as anything but a
+member read (`k.OTHER`, `pkg.keys.OTHER`) keeps every key constant of that
+module: handed on (`register(keys)`, `register(pkg)`), stored, iterated,
+passed to `getattr(k, name)`, `getattr(pkg, "keys")`, `setattr`, `vars(k)` or
+`dir(k)`, or read through a dunder such as `k.__dict__`. Each is refused as
+`not-a-read`, as the same use is in a file that spells the name, however the
+chain is written (split over lines, continued with `\`, a comment inside it).
+That includes a test patching the module (`monkeypatch.setattr(keys, ...)`,
+`patch.object(keys, ...)`). Such an import in a class body, which makes the
+module a class attribute, is refused as `unsupported-form`. A star import of
+the declaring module (`from pkg.keys import *`, or `from . import *` beside a
+declaring `__init__.py`) is refused as `import-unresolved`, since it puts
+every constant into a namespace the Action does not follow, and a string
+whose whole text is the module's dotted name
+(`importlib.import_module("pkg.keys")`, `sys.modules["pkg.keys"]`,
+`logging.getLogger("pkg.keys")`) as `unsupported-form`. A member read keeps
+nothing. Such a file also counts as naming the module's constants when the
+in-file rules alone would otherwise decide them (see below). A file is read
+for this only when its text names the module (`keys`, or the package for an
+`__init__.py`), so a package handed on by a file that never names the module
+and a namespace package (one without an `__init__.py`) are not seen. The
+declaring module is asked too: one that imports and hands on itself keeps its
+constants.
 
 A Python constant can be given another value after its declaration, so the
 declaring file is held to more than the in-file rules above before any read
@@ -2281,7 +2662,8 @@ kept with every read of it. Some of these findings cannot change the value
 inside the file itself: a `def` of a dunder (a `__repr__` method, a module
 `__getattr__`) and a `getattr` of a literal name, which reads an attribute.
 When those are a file's only findings and no other file in the checkout, in
-any language, spells one of its key constants, nothing elsewhere reads them,
+any language, spells one of its key constants or reaches the module whole,
+nothing elsewhere reads them,
 so the file is left to the in-file rules alone and a read inside it folds as
 it would if no other file existed. Everything else, including a second
 binding, a star import, `exec`, `globals()` or a computed `getattr`, keeps
@@ -2481,7 +2863,8 @@ place wherever the markup spells it, hyphenated too (`:feature-flags` for
 module (`{#await import("./flags")}`) or holds a specifier that could name the
 file (`from "./flags"`). Other text in the markup does not count. A file whose
 scripts cannot be told apart from its markup leaves the entries in place
-wherever it mentions the enum or its file.
+wherever it mentions the enum or its file. An MDX document has no script
+block, so only the imports and loads it holds count there, as in markup.
 The reads that could be resolved are still folded.
 
 A key held in an enum in any other language, or in a form outside the table,
@@ -2530,7 +2913,7 @@ reason:
 | `not-a-read` | the name is used for something other than a flag read: a log line, a map entry, a callable reference (`Owner::NAME`), a TypeScript type-only import, an import left with no read to remove, or a TypeScript enum taken as a value off a namespace import of its file (`use(ns.Flags)`) |
 | `rebound` | the reading file binds the same name itself, or an in-repository supertype supplies a member of that name (in Swift, also an enclosing type, an extension of it, or an extension of a protocol it conforms to, declaring a member or generic parameter of the read's first name); or a Python declaring file binds its constant a second time |
 | `other-language` | the constant is mentioned, in a way that can reach it, from a file in another JVM language (Java reading a Kotlin constant, Kotlin reading a Java one, or a Groovy or Scala file reading either), from a Razor, XAML, VB or F# file reading a C# constant, from a Twig, Latte or Smarty template or Symfony YAML or XML configuration reading a PHP constant or enum case, or a read of it that would be resolved sits in another file type of the family than the declaration (a `.tsx` or `.js` file reading a `.ts` constant) and is not rewritten with it: its language is not configured, or another run rewrites the file |
-| `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum (outside Swift), a Swift implicit member (`.X`) or a Swift read in a module holding an extension of the enum that declares a member named like the accessor, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries); a Python import of the declaring module nested in a function or a `try`, or a sole-name import whose private alias is already used in the file (or sits beside a submodule of that name in a package `__init__.py` reader), or a relative one through a package `__init__.py` that is not plain, or one whose line cannot take a comment; a Python declaring file with a star import or a route to its own namespace; a Swift file whose module cannot be read from `Package.swift` or an Xcode project |
+| `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum (outside Swift), a Swift implicit member (`.X`) or a Swift read in a module holding an extension of the enum that declares a member named like the accessor, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries); any use that hands a TypeScript key constant's module on as an object (see Declared in another file); any use that takes a Java or Kotlin key constant's owner whole, by reflection or as a value (see Declared in another file); a Python import of the declaring module nested in a function or a `try`, or a sole-name import whose private alias is already used in the file (or sits beside a submodule of that name in a package `__init__.py` reader), or a relative one through a package `__init__.py` that is not plain, or one whose line cannot take a comment; a Python declaring file with a star import or a route to its own namespace; a Swift file whose module cannot be read from `Package.swift` or an Xcode project |
 | `declaration-kept` | Python only: a read of the constant that would have been folded, left as it is because another refusal listed beside it keeps the declaration it reads. A Python constant can be reassigned, so a kept declaration keeps every read of it (see the note on partial close-out above). For an enum entry, a read left because its file also reads a kept constant, or because an escape listed beside it can change the member's value (see Enum entries) |
 | `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name, a PHP enum that is not string-backed (pure or `int`), a PHP case whose value is not the key as a plain string (concatenated, interpolated or a constant expression), a PHP enum file that does not parse, a Python enum whose class is nested, has another base, a metaclass, a decorator other than `@unique`, a `value`, `name` or `label` method or one whose name starts with `_` (`__init__`, `__new__`), `_ignore_`, or a member valued by code, a Python enum its own module hands to other code, a Python member whose value is not the key as a plain string, or a Python enum file with a star import or a route to its own namespace, a Dart enum with more than one constructor (a factory or a second generative one), a field with an initializer or assigned twice, an argument that is not the key as a plain string (interpolated or concatenated), the key at a position the constructor does not store, type arguments on the entry, no public accessor of the field, a private enum or entry, a Dart enum in a part or in a file that does not parse, or a Swift case whose enum (or a type around it) is `private`, `fileprivate`, attributed or inside `#if`, or has a type around it with a supertype, or sits in a file whose module cannot be read or that does not parse, whose clause declares another case or associated values, whose raw type is not `String` (a typealias of it included), whose raw value is not the key as a plain single-line string, whose enum conforms to a protocol outside the list above or may pick up another `rawValue` (any extension in the repository declaring one counts), or could gain members from an attached macro: on an attributed extension anywhere in the repository that extends the enum, a typealias or protocol the repository declares, a type the enum's clause names, `RawRepresentable`, `Encodable`, `Decodable` or a protocol on the list above, or on a member of the enum or of such an extension carrying an attribute outside the built-in list above, or whose switch property is `static`, `private`, `fileprivate`, attributed, inside `#if`, has a setter, is declared in an extension, or has an arm with a binding, `where`, `_` or a name that is not a case of the enum |
 | `enum-dynamic` | not a refusal: a Dart, Java, Kotlin, PHP, Python or Swift use of the whole enum that can reach the entry without naming it. Listed so it can be checked before the flag is archived |
@@ -2549,9 +2932,14 @@ still treated as proven:
 * a supertype or receiver declared outside the repository (a library base class,
   the receiver of a library lambda), whose members could shadow an imported name;
 * bundler aliases and build configs other than `tsconfig.json` and
-  `jsconfig.json` (a webpack or Vite `resolve.alias`, say). A config that
-  `extends` another, or two files a specifier could mean, is not resolved at all
-  and the mention is refused.
+  `jsconfig.json` (a webpack or Vite `resolve.alias`, say). A config is read
+  with the `paths` and `baseUrl` it inherits from a config it extends by
+  relative path, the way the compiler reads them. A specifier is not resolved
+  at all, and the mention is refused, when two files could be meant, or when
+  the nearest config, or one it extends, cannot be read for certain: it
+  extends a package (such as a `@tsconfig/*` preset) or a file outside the
+  repository, uses `references`, sets `paths` or `baseUrl` to `null`, sets
+  `moduleSuffixes`, repeats a key, or does not parse.
 
 ## Tests that mock the flag read
 
@@ -2688,7 +3076,10 @@ that exits the loop keeps what follows reachable, and nothing after it is
 touched. Hoisted declarations are the exception, since code above them can
 still use them: a stranded `function` declaration stays, and a stranded
 `var last = x;` becomes `var last;`, losing only the initialiser that could
-never run. A stranded destructuring `var` refuses the flag.
+never run. A stranded destructuring `var` refuses the flag, and so does a dead
+`if` branch that declares a `var`: the name is hoisted to the function and may
+be read after the `if`, so the branch is not deleted, and the `if` left
+testing a literal is refused rather than shipped.
 
 A loop condition the fold makes constant is finished the way your lint
 expects, because `no-constant-condition` rejects every constant loop except
@@ -2700,11 +3091,12 @@ expects, because `no-constant-condition` rejects every constant loop except
   is replaced by its initialiser (nothing for a `let` or `const` whose values
   cannot run code, the declaration for a `var`, the expression for an
   assignment), and `do { … } while (<read>);` is replaced by its body, which
-  runs once either way. The body keeps its braces when it declares a `let`,
-  `const`, class or function. Each loop removed is listed in the pull request
-  body.
+  runs once either way. The body keeps its braces when anything in it is scoped
+  to the block: a `let`, `const`, class, function or `using`, even inside a
+  callback. Each loop removed is listed in the pull request body.
 
-A `do` whose body has a `break` or `continue` belonging to it, a `for` whose
+A `do` whose body has an unlabelled `break` or `continue` (even one that belongs
+to a loop inside it) or a comment outside its braces, a `for` whose
 `let` or `const` initialiser runs code, and a loop that is not directly in a
 block (an unbraced `if` body, a labelled loop, a `switch` arm) are not
 rewritten, and the flag is **refused** instead of opening a pull request your
@@ -2715,8 +3107,9 @@ Two leftovers are removed without a mention, since nothing of yours goes with
 them: a label whose last `break label` or `continue label` the fold removed
 (`no-unused-labels`, and TypeScript's TS7028), and a `static { … }` block the
 fold emptied (`no-empty-static-block`). `<read> ?? fallback` folds to the
-literal, since a boolean is never nullish. A file that already had an unused
-label or an empty static block keeps them all.
+literal, since a boolean is never nullish. Your own empty static blocks are
+kept, and so are your own unused labels, except one directly around code the
+fold changed.
 
 A local variable left with no remaining use after a fold is cleaned up the same
 way an import is — except one level inside a `const Component = () => { ... }`
@@ -2762,9 +3155,55 @@ loading it provably does nothing: that file, and every module it loads in turn,
 only declares types, functions, classes and constants built from literals. A
 module of flag-key constants is the usual case. If anything in that graph calls
 a function, builds an object with `new`, uses a decorator, loads a package or
-cannot be found, the bare import stays. A value `import client = require("./ff")` whose last use was
-folded is left as it is, because no single spelling keeps its load under every
-compiler setting. ESLint's `no-unused-vars` will report it.
+cannot be found, the bare import stays.
+
+The Featureflip JavaScript SDKs are the one exception to "loads a package".
+`@featureflip/js`, `@featureflip/node`, `@featureflip/browser`,
+`@featureflip/react` and `@featureflip/react/testing` do nothing when they load,
+in every published version, so a stranded import of one of them is deleted
+outright, and a repository module that loads one can still count as inert. Only
+those five specifiers count. Any other `@featureflip/` package keeps its bare
+import. The name is trusted only when it can mean nothing but the published
+package, so the bare import stays when:
+
+- a `tsconfig*.json` or `jsconfig*.json` in the importing file's directory or
+  any directory above it has a `paths` pattern that fits the name, or a
+  `baseUrl` with a file that answers it, either written there or inherited
+  through `extends`. A config extended by relative path is read the way the
+  compiler reads it. The bare import also stays when a config, or one it
+  extends, cannot be read for certain: it extends a package (such as a
+  `@tsconfig/*` preset) or a file outside the repository, uses `references`,
+  sets `paths` or `baseUrl` to `null`, sets `moduleSuffixes`, repeats a key, or
+  does not parse;
+- a file such as `@featureflip/react.ts` sits in the importing file's directory
+  or any directory above it, where the compiler's classic module resolution
+  looks;
+- anything in the repository can put other code under the name of any of the
+  four SDK packages, since they load each other (`@featureflip/node` loads
+  `@featureflip/js`, `@featureflip/react` loads `@featureflip/browser`). That
+  means a `package.json` that is one of them (a workspace member or a vendored
+  copy), depends on one with anything but a registry version (`file:`, `npm:`,
+  `link:`, `workspace:`, a Git URL, a `.tgz`), or names one anywhere else, such
+  as `overrides`, `resolutions` or a Jest mapper. It also means a
+  patch-package patch for one, a committed `node_modules` holding the
+  `@featureflip` scope, or a bundler, Babel, Jest, Deno or pnpm config or an
+  HTML page that mentions one;
+- a directory in the repository is a symlink to somewhere outside it, or a
+  file the check needs cannot be read.
+
+An alias written anywhere else, such as a build script, is not seen.
+
+CommonJS gets the same treatment. A stranded `const client = require("./ff")`
+or `const { client } = require("./ff")` whose module qualifies is deleted rather
+than kept as `require("./ff");`. Two shapes keep the `require` line even then:
+an array pattern (`const [client] = require("./ff")`), which runs the exports
+object's iterator, and any file that defines its own `require` or uses the name
+other than to call it.
+
+A value `import client = require("./ff")` whose last use was folded is deleted
+when its module qualifies. Otherwise it is left as it is, because no single
+spelling keeps its load under every compiler setting, and ESLint's
+`no-unused-vars` will report it.
 
 When a deleted statement was the file's last `import` or `export`, it becomes
 `export {};` instead. An `import` or `export` is what makes a file a module, and
@@ -2781,10 +3220,14 @@ TS6133 for a field, method or accessor. ESLint's recommended
 A constructor parameter property is removed, together with the argument every
 caller passes for it, when every mention of the class in the repository's
 TypeScript and JavaScript can be accounted for: `new Svc(…)`, a subclass's
-`super(…)`, a type annotation, an import or export, or `instanceof`. Each
+`super(…)`, a type annotation, an import or export, or `instanceof`. A named
+subclass with no constructor of its own (`class Child extends Svc {}`)
+inherits Svc's, so every mention of `Child` must be accounted for the same
+way, and its `new Child(…)` calls lose the same argument. Each
 argument removed must be a literal, a name, `this` or a property access, so
 deleting it cannot skip work, and a local that only fed it is cleaned up
-like any other the fold strands.
+like any other the fold strands. A `//` comment at the end of a removed
+argument's or parameter's own line goes with it. Every other comment stays.
 The parameter stays, and is named in a warning of its own, when any of these
 holds:
 
@@ -2794,20 +3237,79 @@ holds:
   value (`useClass: Svc`, `[Svc]`, `typeof Svc`, `<Svc />`, `new this()`);
 - a call spreads its arguments or passes one that may do work
   (`new Svc(createClient(), log)`);
-- a subclass has no constructor of its own;
+- a subclass with no constructor of its own is a class expression
+  (`const Child = class extends Svc {}`), or any of these holds for it;
+- the class, or a subclass that inherits its constructor, reaches it through
+  `this.constructor` or uses `this` in a static member (`const C = this;
+  new C(…)`), where `this` is the class itself;
 - the constructor is overloaded, or still reads the parameter by its bare name;
 - a file that uses the class does not import it from the file that declares
   it (a package's class of the same name, or one re-exported through another
   module);
-- a `.vue`, `.svelte` or `.astro` component mentions it;
+- a `.vue`, `.svelte` or `.astro` component, an `.mdx` document, or an
+  `.html` or `.htm` page,
+  mentions it (a page whose only script is `<script src="dist/app.js">` does
+  not);
+- a file holds the string `'Svc'` and constructs something through a computed
+  expression (`new m['Svc'](…)`, `new (registry.get('Svc'))(…)`,
+  `Reflect.construct`);
 - a caller lies outside the directory being cleaned;
 - a file that mentions the class is ignored by git, or does not parse.
 
-If the class is exported, code outside this repository may construct it too,
-so the pull request lists it under "Constructor signature changed".
+A class constructed through a name the repository never spells, such as
+`new m[key](…)` with `key` computed at run time, cannot be seen. If your code
+does that, add the flag to `ignore` or check the pull request's callers
+yourself: the argument such a call passes would shift by one. The same holds
+for inline script in a server-side template (ERB, PHP, Jinja, a Razor view),
+which is not read either.
 
-Fields, methods and accessors always stay, since a field's initializer may do
-work, and the pull request names each one so you can remove it. A member that
+A `private` or `#` field is removed when deleting it cannot skip any work:
+
+- it has no initializer, or an inert one: a literal, a name, a property access
+  such as `Defaults.retries`, or an array or object literal made of those
+  (`#enabled = false`, `private items: Item[] = []`);
+- nothing writes it except, at most, one statement of the constructor's own
+  body, `this.flags = flags;`, whose right side is a constructor parameter or
+  a literal. That statement is deleted with the field.
+
+When that statement was the only thing reading the parameter, the parameter is
+removed too, with the argument every caller passes for it, under every
+condition listed above for a parameter property. If a caller cannot be proven,
+the field stays and is named in the warning, rather than leaving a parameter
+nothing reads. A `/** … */` comment directly above the field, a
+`@ts-expect-error`, `@ts-ignore` or `eslint-disable-next-line` comment above
+it, and a comment on its own line go with it. The pull request lists each field it removed.
+
+The field stays, and is named in the warning, when its initializer may do
+work (`= new Client()`, `= createClient()`, `= this.client`, a template with
+`${…}`), when it is decorated, `declare` or `accessor`, when something other
+than that one constructor statement assigns it, or when deleting it or that
+statement would let the code above continue into the code below (a field or
+statement with no `;` followed by one starting with `[`, `(` or `*`). A
+parameter that is itself a property (`readonly flags`, `public flags`) is never
+removed this way; only the assignment goes. A `private` field also stays when any
+file indexes something with its name as a string (`svc['enabled']`), a
+component's or HTML page's inline script included, since
+`private` is checked only by `tsc`. A `#` field cannot be reached that way.
+Code that reaches a `private` field through `any` (`(svc as any).enabled`) or
+lists an instance's own properties (`Object.keys(svc)`, `{ ...svc }`,
+`JSON.stringify(svc)`) cannot be seen, and stops seeing the field.
+
+If the class is exported, code outside this repository may construct it too,
+so the pull request lists it under "Constructor signature changed", along with
+each exported subclass that inherits its constructor.
+
+A plain constructor parameter (`constructor(c: Client)`, not a property) can
+be left unused as well, which `tsc` reports as TS6133 when `noUnusedParameters`
+is on. The usual case is a subclass that only passed it on: `super(c, l)` loses
+`c` once the base class's parameter is removed. Such a parameter is removed the
+same way, with the argument each of its callers passes, and so on down a chain
+of subclasses. It stays, and is named in a warning of its own, under any
+condition listed above for a parameter property, or when it has a default
+value, since a caller that leaves the argument out runs that default.
+
+Any other member stays, and the pull request names each one so you can remove
+it. A member that
 was already unread before the fold is not listed, and neither is a `protected`
 or `public` one, which code elsewhere may still read. A member assigned with
 `this.client = c` but never read counts as unread, as it does for `tsc`.
@@ -2903,7 +3405,8 @@ receiver (the shape a DI-injected client produces), or as a bare
 `if`/`else if`/`else`, `!` negation, `&&`/`||` expressions, ternaries and
 switch-expression arms, and via a local `bool useNew = client.BoolVariation(…);`,
 which is inlined and its declaration removed. A local that is later
-**reassigned** is left standing, and `VariationDetail<T>(…)` — a different name
+**reassigned**, passed as an `out` or `ref` argument or written by a
+deconstruction is left standing as `bool useNew = true;`, and `VariationDetail<T>(…)` — a different name
 under exact comparison — is never matched.
 
 The key may be a **`const string`** rather than a literal at the call site —
@@ -2921,7 +3424,10 @@ hoisted to a constant](#the-key-hoisted-to-a-constant). For C# specifically the
 constant must be `const` — `static readonly` may be assigned in a static
 constructor, so its value cannot be read off the declaration — and an un-awaited
 `GetBooleanValueAsync` reading the const counts as an other reference, which
-withholds the whole file.
+withholds the whole file. A key constant in a type declared in the same file as
+its reader may be read through that type (`Flags.NewCheckout`), when the type is
+not nested and not generic, sits in the reader's namespace, and nothing else in
+the file declares that name.
 
 The OpenFeature .NET provider (`Featureflip.OpenFeature`) is matched as
 `await client.GetBooleanValueAsync("KEY", default, context)`, and — as in
@@ -2964,7 +3470,10 @@ attribute or annotation, with no other method of the same name in the file,
 and named nowhere else in the file — a string counts, since reflection names a
 method by string. A private method the file already had no use for is left
 alone. Fields and constructors are never touched, so a client field the gate
-no longer reads stays, along with the constructor that sets it.
+no longer reads stays, along with the constructor that sets it. In C# that
+also means a method stays when deleting it would leave a field of the file
+that the compiler warns about, an error under `TreatWarningsAsErrors`: one only
+the method assigned (CS0649), or one only the method read (CS0169, CS0414).
 
 A primary-constructor parameter is the one place that costs a build. When
 every read of `client` in `class Svc(IClient client)` was a flag read the fold
@@ -2973,16 +3482,30 @@ an error under `TreatWarningsAsErrors`.
 
 The parameter is removed, together with the argument every caller passes for
 it, when every mention of the type in the repository's C# can be accounted
-for: `new Svc(…)`, a derived type's `: Svc(…)` or `: base(…)`, the type's own
+for: `new Svc(…)`, a derived type's `: Svc(…)` or `: base(…)` (a derived
+constructor without one, or the one C# supplies to a derived type that
+declares none, calls `base()` with no arguments, which has nothing to
+remove), the type's own
 `: this(…)`, a type position, `nameof(Svc)`, or a generic type argument such
 as `services.AddScoped<Svc>()` (the container resolves constructor parameters
-by type, not position). Each argument removed must be a literal, a name, `this`,
-`default` or a member access. The parameter stays, and is named in a warning
+by type, not position). A caller's argument for the parameter is found by
+position, or by name when the call names it (`new Svc(log: l, client: c)`),
+and a call that leaves a defaulted parameter out has nothing to remove. Each
+argument removed must be a literal, a name, `this`, `default` or a member
+access. A `//` comment at the end of a removed argument's or parameter's own
+line goes with it. The parameter stays, and is named in a warning
 of its own so you can remove it or suppress the warning, when any of these
 holds:
 
-- a call passes named arguments, or an argument that may do work;
+- a call passes an argument that may do work, names an argument no parameter
+  of the primary constructor has, or passes a positional argument after a
+  named one out of its position;
 - `typeof(Svc)` or `ActivatorUtilities` can construct it positionally;
+- a file holds a string naming the type (`"App.Svc"`, `"App.Svc, App"`) and
+  calls `Activator.CreateInstance` or `GetType("…")`;
+- it is an attribute class applied as `[Foo(…)]` or `[FooAttribute(…)]`;
+- an XML-doc `cref` names its constructor (`<see cref="Svc(IClient)"/>`),
+  which is CS1574 once the signature changes;
 - a target-typed `new(…)` anywhere in the repository passes a number of
   arguments the constructor could take;
 - a Razor, `.cshtml` or other non-C# .NET file mentions it, or a `using`
@@ -2997,7 +3520,24 @@ holds:
 - a caller lies outside the directory being cleaned;
 - the parameter has an attribute (`[FromKeyedServices]`) or a modifier, or the
   type is generic;
-- a derived type has no constructor of its own.
+- the type declares another constructor that takes parameters (a call may be
+  bound to it rather than to the primary constructor), or every parameter the
+  primary constructor keeps is optional (it has a default value or an
+  attribute, which may be `[Optional]`) while the type declares a
+  parameterless one or is a `struct`, so that a call left with no arguments
+  (`new Svc()`) could reach a different constructor than before;
+- a derived type is `partial`, so its constructors may be in another file.
+
+Removing the argument a derived type passes in `: Svc(c, l)` can leave that
+type's own parameter `c` unread, which is CS9113 again. That parameter is
+removed the same way, with the argument each of its own callers passes, and so
+on down a chain of derived types. When its callers cannot be proven, it is
+named in the warning instead.
+
+A type constructed from a name the repository's C# never spells, such as one
+read from configuration and passed to `Type.GetType`, cannot be seen, and
+`Activator.CreateInstance` then throws `MissingMethodException` at run time.
+If your code does that, add the flag to `ignore`.
 
 If the type is `public`, code outside this repository may construct it too, so
 the pull request lists it under "Constructor signature changed". A parameter
@@ -3033,8 +3573,20 @@ children: [
 ]
 ```
 
+A collection-`for` whose element is such an `if`
+(`[for (final i in xs) if (<read>) i]`) folds too. Served true, the `for` keeps
+its element. Served false, the whole `for` goes, since a `for` with no element
+does not parse, but only where dropping the loop cannot change anything: a
+plain `for`-`in` over a parameter of the enclosing function declared `List` or
+`Set`, in a literal whose element type the source states. Anywhere else the
+flag is refused.
+
 A local bound to the read is inlined and its declaration removed; one that is
-later **reassigned** is left standing. `stringVariation` / `numberVariation` /
+later **reassigned** is left standing. A short-form string template that reads
+it is rewritten with the other reads, as the braced literal:
+`'enabled=$enabled'` becomes `'enabled=${true}'`. One followed directly by an
+escaped dollar sign (`'$enabled\$'`) keeps the local, as its literal.
+`stringVariation` / `numberVariation` /
 `jsonVariation` are never matched — the method name is the only type signal
 Dart's untyped call site carries, and it is compared exactly.
 
@@ -3118,8 +3670,12 @@ Both quote styles and `%q()` are matched; the receiver may be anything
 They fold in `if`/`elsif`/`else`, `unless`, `!` negation, `&&`/`||`
 expressions, ternaries, the `x if cond` / `x unless cond` modifier forms, and
 via a local `use_new = client.bool_variation(…)`, which is inlined and its
-binding removed. A local that is later **reassigned** is left standing, and
-`string_variation` / `number_variation` / `json_variation` are never matched —
+binding removed. A local that is written more than once (`x = true if admin`,
+`x ||= y`), whose reads reach past the branch or block that writes it, or that
+is an instance variable (`@x`, visible to the object's other methods) is left
+standing as `x = true`. A write used as a **value** (`if (x = <read>)`,
+`x = <read> or log(…)`, a method's last statement) is replaced by its value, so
+the expression keeps what it evaluated to. `string_variation` / `number_variation` / `json_variation` are never matched —
 Ruby is untyped, so the method name is the only type signal a call site
 carries, and it is compared exactly.
 
@@ -3150,13 +3706,34 @@ truthy non-`true` `x`.
 Indentation after a fold can be off by a level. Ruby blocks are `end`-delimited
 so this is cosmetic, and `rubocop -a` normalises it.
 
+A dead `if`, `unless` (the modifier forms `x if <read>` and `x unless <read>`
+included), subject-less `case` or `while` that was the **last
+statement of a method or block** becomes `nil` rather than disappearing. That
+statement is what the method returns, and `nil` is what it returned before;
+deleting it would hand the return value to the statement above. At the top of
+a file, in a class body, an `ensure` clause or a loop body, where that value is
+never used, it is deleted.
+
+An `if` or `unless` used as a **value** (`x = if …`, an argument, an array or
+hash element) folds only when the branch it keeps is one simple expression: a
+literal, a name, a collection, or a call with no arguments or with
+parenthesised ones. Otherwise the run **refuses** the file and exits 1 naming
+it, rather than ship an `if true` with the flag key already gone. The refused
+shapes are several statements kept as a value or behind an inline `then`
+(`if <read> then a; b end`), a call whose arguments have no parentheses
+(`foo(if <read> then bar 1 end, 2)` would become `foo(bar 1, 2)`, which Ruby
+reads as `foo(bar(1, 2))`), and a dead branch in an argument. Fix those by
+hand, or add the key to `ignore`.
+
 A local that only the removed branch read is cleaned up too. RuboCop's default
 `Lint/UselessAssignment` fails on it, and `ruby -w` warns. In a method, a local
 holding a literal (a number, `nil`, `true`, `false`, a string without
 interpolation, a symbol, or an array, hash or range of those) is deleted,
 along with a comment on the same line. One that calls something keeps the
-call: `flow = LegacyFlow.new(ctx)` becomes `LegacyFlow.new(ctx)`. Some locals
-are left alone:
+call: `flow = LegacyFlow.new(ctx)` becomes `LegacyFlow.new(ctx)`. A local
+nothing read even before, whose name the removed branch spelled as a method or
+a hash key (`obj.retries`, `g(retries: 1)`), is cleaned up the same way. Some
+locals are left alone:
 
 * a method's last statement holding a literal, since that value is what the
   method returns, including before a `rescue`, `else` or `ensure` (a call is
@@ -3194,7 +3771,9 @@ it is, across separate tags:
 ```
 
 Removing the flag keeps the surviving arm's markup exactly as it was, and
-leaves a blank line where each tag line stood.
+leaves a blank line where each tag line stood. A tag written with trim markers
+takes what they trimmed with it (the newline after `-%>`, the indentation
+before `<%-`), so a `.text.erb` template renders exactly as before.
 
 Three things are specific to templates:
 
@@ -3218,8 +3797,12 @@ still standing and the flag key already gone. Fix it by hand, or add the key to
 `client.boolVariation("KEY", default)` (android SDK), in `if`/`else if`/`else`,
 `!` negation, an `if`/`else` used as an expression, and via a `val` bound to
 the read — which is inlined and its declaration removed. A class property is
-inlined and removed only when it is `private`; any other property keeps its
-declaration as the literal (see "What is deliberately NOT rewritten").
+inlined and removed only when it is `private` (read bare or as `this.name`);
+any other property keeps its declaration as the literal (see "What is
+deliberately NOT rewritten"). An `if` used as an expression whose surviving
+branch holds more than one statement is **refused**, since its last statement
+is the value and splicing the branch flat would change it; a surviving branch
+that is an unbraced loop body keeps its braces.
 
 Two shapes are deliberately left alone: a **safe call**
 (`client?.boolVariation(…)`, whose type is `Boolean?` rather than `Boolean`, so
@@ -3233,6 +3816,13 @@ in scope. If the same name is also a lambda parameter, a `for` variable or a
 literal, but the binding and the `if` reading it are left in place. The cost is
 one uncleaned `val useLegacy = true`, which is the conservative half of the
 same trade Gate 2 makes for TypeScript and C#.
+
+A short-form string template that reads an inlined `val` is rewritten with the
+other reads, as the braced literal: `"$ok yes"` becomes `"${true} yes"`, in a
+raw string too. A `val` whose name is in backticks is not inlined and keeps its
+literal. A `when` whose subject is the read
+(`when (<read>) { true -> … false -> … }`) is refused: the read becomes a
+literal and the `when` around it is left standing.
 
 An override map emptied by this cleanup becomes `mutableMapOf()`; add the type
 arguments if inference needed the entry.
@@ -3375,7 +3965,17 @@ reports "no changes" with nothing saying why.
 Reads fold in `if`/`else if`/`else`, `!` negation, `&&`/`||` expressions, a
 `return`, an argument position, a struct-literal field, and inside a function
 literal or `defer`. A short variable declaration bound to the read —
-`useNew := client.BoolVariation(…)` — is inlined and removed.
+`useNew := client.BoolVariation(…)` — is inlined and removed. When the same
+function also spells that name for something other than a read of it (a
+`range` variable, an `if` initializer, a function literal's parameter, a later
+`n, useNew := …`, an assignment, a struct literal key, or `&useNew`), the local
+is not inlined: `useNew := true` is left standing with its reads, which is
+valid Go and the same program. One shape is **refused** instead, and the run
+exits 1 naming the file: a read of an outer `useNew` (a package-level variable,
+say) **above** the local's declaration, which inlining would rewrite too.
+Rename one of them and the next run cleans the file. A read bound beside
+another name (`a, useNew := load(), <read>`) leaves the other binding as it
+was: `a := load()`.
 
 `var useNew = client.BoolVariation(…)` is **not** inlined: the read is replaced
 and `var useNew = true` is left standing with the `if` that reads it. That is
@@ -3396,7 +3996,10 @@ call**, so `newClient().BoolVariation("KEY", ctx, false)` and
 composite literal argument (`Context{User: "u"}`) is fine — Go has no
 constructors — but `<-ready` is not, because receiving from a channel is a side
 effect written without a call. This works with the key hoisted to a `const`
-too, at package level or inside the function.
+too, at package level or inside the function. The read as the call a `go` or
+`defer` statement runs (`go client.BoolVariation("KEY", ctx, false)`) is
+discarded just the same and is deleted under the same rule; `go true` would
+not build.
 
 **Three shapes refuse the whole flag** rather than rewrite it, and the run
 exits 1 naming the file. Two are in [What is deliberately NOT
@@ -3432,16 +4035,33 @@ to discard the value, so whatever it called still runs. A local declared with
 declared by a statement header leaves the header instead: `for _, v := range us`
 becomes `for range us`, `for i, v := range us` becomes `for i := range us`,
 `case v, ok := <-ch:` becomes `case _, ok := <-ch:`, and `switch v := x.(type)`
-becomes `switch x.(type)`. Some declarations are not
-removed at all: several names declared together with values (`a, b := f()`,
-`var a, b = x, y`), a local inside a function literal, and a local in a
-function that shares its name with another function in the same file. If a
-fold leaves one of those unused, Go reports it.
+becomes `switch x.(type)`. Two names declared together go the same way when
+the fold strands both: `a, b := 3, load()` becomes `_ = load()`, and
+`var a, b = 1, 9` goes. So does a local whose name something else in its
+function also spells, such as a function literal's parameter, a local of the
+same name in another block, or a struct literal key like `Opts{retries: 1}`.
+Some declarations are not removed at all: two names when one of them is still
+read, three or more names declared together, a `:=` that also redeclares an
+existing name, several names on one spec inside a `var ( … )` group, and a
+local whose name is also a struct literal key whose type cannot be resolved
+in the file. If a fold leaves one of those declared and unused,
+no pull request is opened for the flag: it is refused as `[unsafe-rewrite]`,
+and the output names the file, the local and the function it is in. Remove or
+use that declaration by hand (or add the key to `ignore`) and the next run
+cleans the flag.
+
+A label whose last `break`, `continue` or `goto` the fold removed is removed
+too, since Go rejects an unused label; the statement it labelled stays where it
+was.
 
 Fold output itself is `gofmt`-clean, including a multi-statement branch, and so
 is what a removed import or declaration leaves behind (no blank line just inside
 `import (`, no two blank lines in a row, no blank lines at the end of the file),
-so a repo gating on `gofmt -l` will not flag the pull request over the fold.
+so a repo gating on `gofmt -l` will not flag the pull request over the fold. A
+comment on a removed import's line goes with it, and so does the comment heading
+a section of imports when that import was the section's only one. A comment at
+the end of a removed local's line goes with the local, and a comment on its own
+line above the local stays.
 
 **A flag-keyed map entry is the one exception, and only when `gofmt` aligned
 it.** `gofmt` pads a multi-line map literal's values into a column sized by its
@@ -3478,7 +4098,24 @@ Reads fold in `if`/`elseif`/`else` — including the two-word `else if`, which
 leaves no residue — `!` negation, `&&`/`||` and their `and`/`or` spellings,
 ternaries, `??`, a `return`, and a `<?= … ?>` short echo. A local bound to the
 read is inlined and its binding removed; one that is later **reassigned** is
-left standing.
+left standing. PHP's logical operators always yield a bool, so where one folds
+away in a value position (`return $x && <read>`, an array element, an
+assignment) the operand it keeps is cast: `return (bool) $x;`. In a condition,
+where only truthiness counts, it is left bare.
+
+An `if` without braces folds the same way, so `if (!<read>) return 1;` becomes
+`return 1;` or goes. A `match` folds where the read is a condition: an arm of
+`match (true) { <read> => …, default => … }` becomes that arm's value or goes,
+a `match` left with only its `default` becomes the default's value, and a
+`match` on the read itself becomes the arm the value selects. A value that sits
+inside a larger expression keeps its parentheses, so
+`match (true) { <read> => $a + 1, default => 0 } * 3` becomes `($a + 1) * 3`.
+Two shapes refuse the flag instead. One is an arm that lists a call before the
+literal (`audit(), true => …`), since picking the arm would skip the call. The
+other is a dangling `else`: in `if ($a) if (<read>) { … } else { … }`,
+including one behind a brace-less `foreach`, `for` or `while`, PHP gives the
+`else` to the inner `if`, and folding that `if` away would hand it to the outer
+one.
 
 Unlike Java and Go, a read that is **a whole statement** does not refuse the
 flag here — `true;` is a legal PHP no-op, so it is left standing rather than
@@ -3567,7 +4204,10 @@ inlined, so `let useLegacy = client.boolVariation(…)` becomes
 `let useLegacy = true` and the `if useLegacy` reading it stays. The flag key is
 gone, which is what makes the flag removable, but you are left with a line or
 two to tidy by hand. That is a limit of the transform engine's Swift cleanup,
-not a safety refusal.
+not a safety refusal. A `var` bound to the read is left the same way when it
+is later assigned something other than a literal, has a method called on it
+(`useLegacy.toggle()`) or is passed `inout` (`&useLegacy`): it keeps its
+declaration, `var useLegacy = true`.
 
 A read used as a `while` condition: served false, the loop can never run, so
 it is removed and listed in the pull request body, as in every language (see
@@ -3702,6 +4342,7 @@ means no PR.
 | **Your own wrapper** around the SDK (`useFlag("KEY")`, `isOn("KEY")`) | no change at all — the callee name must be one of the shapes above. This is the common case in real codebases, and it means the Action may report `no-changes` for a flag your code reads everywhere. Call the SDK directly at the read site, or add the key to `ignore` so it stops being reported |
 | Any other call that happens to take the key as its first argument (`trackEvent("KEY")`, `api.deleteFlag("KEY")`) | no change at all — same rule. These are not flag reads and rewriting one would delete a real call |
 | Key is not a string literal (`boolVariation(keyVar, …)`) | no change at all — **unless** `keyVar` is a constant declared in the same file, which is resolved and removed (see [The key hoisted to a constant](#the-key-hoisted-to-a-constant)) |
+| A key literal that only **starts or ends** with the key — interpolated (`f"KEY{env}"`, `"KEY$env"`, `"KEY\(env)"`) or split by an escape (`"KEY\x2dv2"`) | no change at all — its value at run time is a different key, so it reads a different flag. The same holds for a key constant initialised that way |
 | A C# `const string` key that is **also** read by anything other than a flag read | no change at all — not even the read is folded. Deleting the declaration would strand the other reference, and folding without deleting would leave a `const` the next run reports as a live reference forever |
 | A C# `const string` key whose name is **bound again** anywhere in the file | no change at all — a shadowing binding means a reference may resolve to the other one, and the key could be read off the wrong declaration |
 | A key held in a REASSIGNABLE binding (C# `static readonly`, a JS `let`, a Kotlin `var`, a non-`final` Java field) | no change at all — its value cannot be read off the declaration, so the flag it names is not knowable |
@@ -3709,7 +4350,7 @@ means no PR.
 | A C# read inside an **expression tree** (`mock.Setup(c => c.BoolVariation("KEY", …))`) | no change to the read — the lambda *describes* the call instead of performing it, so the text of the read is the payload a mocking library reads at run time. This one is not detected by naming `Setup`/`Verify`: the tell is that the read's receiver is the lambda's own parameter, so any library taking an `Expression<>` is covered, while a genuine `Func<>` lambda (`list.Where(x => flags.BoolVariation("KEY", …))`, reading off a captured client) is still rewritten. If the key is a `const`, the whole const path is withheld for that file — the mock setup is a live reference to the declaration. Once the run has folded a real read of the key, a `Setup` returning a literal and a `Verify` are resolved first, before this applies (see "Tests that mock the flag read") |
 | A read handed to a **mocking DSL** that takes the call itself — `when(<read>).thenReturn(…)` (Mockito, mockito-kotlin, `package:mockito`, ts-mockito), `given(<read>).willReturn(…)` (BDDMockito), `every { <read> } returns …` (MockK), or `when(() => <read>)` / `verify(() => <read>)` (`package:mocktail`) | when the run folds a real read and the stub returns a literal, **resolved first**: the stub or its whole test is deleted (see "Tests that mock the flag read"). Otherwise **the whole flag is refused**, and the run exits 1 naming the file. These libraries stub by *performing* the call and capturing the invocation it registers, so the text of the read is the payload — the same property that makes the C# row above untouchable. Folding it leaves `when(true).thenReturn(true)`, which **compiles**: the stub silently stops stubbing, and the flag key is gone from the file so no later run looks again. Unlike C#, there is nothing structural to key on — no lambda exists, because the call is real — so the guard is a short list of stubbing entry points by name. mocktail's `() => <read>` form is the exception to the first point: the lambda is there but only wraps the call. Delete or rewrite those lines yourself, scope the run with `directories` to exclude your tests, or add the key to `ignore` |
 | A **Go read inside a gomock expectation** (`m.EXPECT().BoolVariation("KEY", ctx, false).Return(true)`) | resolved first in the same way as the row above, when it can be. Otherwise **the whole flag is refused**, and the run exits 1 naming the file. Same shape as the row above, caught a different way: the fold leaves `true.Return(true)`, and because Go's `bool` is a builtin with no method set, a selector on a boolean literal is broken Go *by construction* — so this one needs no list of library names. Before this was refused it shipped, and the customer's build was what reported it |
-| A **Java field or Kotlin property** bound to the read that is not `private` (`public final boolean enabled = <read>`, a bare `val enabled = <read>`) | read replaced, **declaration kept** → `public final boolean enabled = true;` / `val enabled = true`. Other files read it (`checkout.enabled`), and they do not contain the flag key, so this tool never sees them. Removing the field would break files it never parsed. A `private` one is inlined and removed. In Java that holds only for a top-level class: a `private` field of a nested, local or anonymous class is kept the same way, because the enclosing class can read it (`settings.on`). Delete the field yourself once its readers are gone |
+| A **Java field or Kotlin property** bound to the read that is not `private` (`public final boolean enabled = <read>`, a bare `val enabled = <read>`) | read replaced, **declaration kept** → `public final boolean enabled = true;` / `val enabled = true`. Other files read it (`checkout.enabled`), and they do not contain the flag key, so this tool never sees them. Removing the field would break files it never parsed. A `private` one is inlined and removed, read bare or as `this.name`; one also read through another receiver (`other.name`), which may be another instance, keeps its declaration. In Java that holds only for a top-level class: a `private` field of a nested, local or anonymous class is kept the same way, because the enclosing class can read it (`settings.on`). Delete the field yourself once its readers are gone |
 | `export const on = <read>` | read replaced, **declaration kept** → `export const on = true;`. An exported binding is module public API, and the modules importing it do not contain the flag key, so they are never in the candidate set — this tool cannot see them, let alone update them. Removing the binding would break files it never parsed. Delete it yourself once the importers are gone |
 | An **un-awaited** OpenFeature read (`client.getBooleanValue("KEY", …)`, `client.GetBooleanValueAsync("KEY", …)`) | no change at all — the value is a `Promise<boolean>`/`Task<bool>`, not a boolean. Await it at the read site and it is rewritten |
 | The **two-value** form of an OpenFeature Go read (`enabled, err := client.BooleanValue(ctx, "KEY", …)`) | no change at all — it returns `(bool, error)`, so standing a literal in its place would leave `enabled, err := true`, which does not compile. The single-value `client.Boolean(ctx, "KEY", …)` is rewritten; switch the read to that form if you want it folded |
@@ -3728,9 +4369,11 @@ means no PR.
 | A **Java, Go or C# read that is a whole statement** and holds no other call — a warm-up call made for the SDK's exposure event, `client.boolVariation("KEY", ctx, false);` | **the whole statement is deleted.** Its value is discarded by definition, so there is nothing to fold it into and nothing to lose. Any receiver works, including a static import with no receiver and a field chain; the argument list may hold names and literals (and, in Go, composite literals, which have no constructors to run). The key may be a literal or hoisted to a constant — see the row below. In C# the awaited OpenFeature read is covered too, while an un-awaited one is left alone; in Go the OpenFeature `client.Boolean(ctx, "KEY", …)` read and in Java the OpenFeature `client.getBooleanValue("KEY", …)` read are covered the same way. A project's own wrapper named in `accessors` is covered the same way, whether the key is a **literal** or hoisted to a constant |
 | A discarded read whose **key is hoisted to a constant** (`client.boolVariation(FLAG_KEY, ctx, false);`) | **the whole statement is deleted**, and the declaration with it, exactly as for a literal key. The constant may be declared at file scope or local to the method, and must meet the same four conditions as any other hoisted key — see [The key hoisted to a constant](#the-key-hoisted-to-a-constant). A statement holding another call is refused here too: the row above applies unchanged, because the safety rule does not depend on how the key is spelled |
 | A **PHP template written in the alternative syntax** (`<?php if (<read>): ?> … <?php else: ?> … <?php endif; ?>`) | **rewritten**, markup and all: the arm that runs stays, the guard and the dead arm go, and a `<?php … ?>` pair left bracketing nothing goes with them. The rendered HTML keeps the same markup; only insignificant whitespace around the removed lines moves, because the whole `<?php … ?>` line is taken rather than an empty tag pair left behind. `elseif` chains are handled in the same way, in any position |
-| A **multi-way guard** — Go's tagless `switch { case <read>: … }`, Ruby's subject-less `case` / `when <read>`, Kotlin's subject-less `when { <read> -> … }`, or `switch (true) { case <read>: … }` in PHP, TypeScript and JavaScript | **rewritten.** Each arm is a condition and the first true one wins, so this is an `if`/`else if` chain by another spelling. Where the flag serves **false** the dead arm is removed, in any position. Where it serves **true**, an arm with nothing live above it collapses the whole statement to its body (Go and Ruby), and an arm with a live arm above it becomes the terminal `default:` / `else`, taking the arms below it — they sit behind a guard that now always passes. Kotlin collapses only where that cannot change meaning — an expression body in a slot that takes any expression, or a braced body in statement position that declares nothing — and otherwise takes the `else` form, which also keeps a `when` used as a value exhaustive. PHP, TypeScript and JavaScript always take the `default:` form, because a body ending in `break;` is a syntax error outside a switch, or silently becomes a loop's `break` inside one. A switch on a **value** (`switch ($v)`, `case v`, `when (v)`, `switch (v)`) is untouched: there the arms compare values rather than act as guards. In TypeScript and JavaScript, a switch whose **subject is the read** (`switch (<read>) { case true: … case false: … }`) is finished the same way: the arm matching the value served becomes the `default:`, and an arm that can never match is removed, which TypeScript requires (`case true:` under `switch (false)` is error TS2678) |
-| A multi-way guard the fold **cannot** finish | **the whole flag is refused**, and the run exits 1 naming the file. In Go: a `fallthrough` anywhere in the switch, a `break` in a body that would be lifted out of it, or a `switch v := f(); {` initializer whose binding the arms use. In Ruby: a `when` listing several patterns (`when <read>, isAdmin(ctx)`), where a literal among alternatives is not the whole condition. In PHP: an arm before the flag's that does not end in `break`/`return`/`continue`/`goto`/`exit`, because PHP falls through **by default** and that arm runs into the flag's with nothing in the source saying so — an arm ending in `throw` or `die()` counts as not terminating, since the grammar cannot tell either from an assignment. In TypeScript and JavaScript: the same fall-through rule, except that `throw` does count as terminating (it is its own statement there), as does a braced arm body ending in a jump. In Kotlin: an arm listing several conditions (`isAdmin(ctx), <read> ->`). In Kotlin, TypeScript and JavaScript: a dead arm sharing its line with another arm |
+| A **multi-way guard** — Go's tagless `switch { case <read>: … }`, Ruby's subject-less `case` / `when <read>`, Kotlin's subject-less `when { <read> -> … }`, or `switch (true) { case <read>: … }` in PHP, TypeScript and JavaScript | **rewritten.** Each arm is a condition and the first true one wins, so this is an `if`/`else if` chain by another spelling. Where the flag serves **false** the dead arm is removed, in any position. Where it serves **true**, an arm with nothing live above it collapses the whole statement to its body (Go and Ruby), and an arm with a live arm above it becomes the terminal `default:` / `else`, taking the arms below it — they sit behind a guard that now always passes. Kotlin collapses only where that cannot change meaning — an expression body in a slot that takes any expression, or a braced body in statement position that declares nothing — and otherwise takes the `else` form, which also keeps a `when` used as a value exhaustive. Ruby collapses a `case` used as a value (`x = case … end`) only when that arm is a single simple expression (a name, literal, call or collection); a longer body there is refused, because spliced in place it would assign only its first statement. PHP, TypeScript and JavaScript always take the `default:` form, because a body ending in `break;` is a syntax error outside a switch, or silently becomes a loop's `break` inside one. A switch on a **value** (`switch ($v)`, `case v`, `when (v)`, `switch (v)`) is untouched: there the arms compare values rather than act as guards. In TypeScript and JavaScript, a switch whose **subject is the read** (`switch (<read>) { case true: … case false: … }`) is finished the same way: the arm matching the value served becomes the `default:`, and an arm that can never match is removed, which TypeScript requires (`case true:` under `switch (false)` is error TS2678) |
+| A multi-way guard the fold **cannot** finish | **the whole flag is refused**, and the run exits 1 naming the file. In Go: a `fallthrough` anywhere in the switch, a `break` in a body that would be lifted out of it, or a `switch v := f(); {` initializer whose binding the arms use. In Ruby: a `when` listing several patterns (`when <read>, isAdmin(ctx)`), where a literal among alternatives is not the whole condition. In PHP: an arm before the flag's that does not end in `break`/`return`/`continue`/`goto`/`exit`, because PHP falls through **by default** and that arm runs into the flag's with nothing in the source saying so — an arm ending in `throw` or `die()` counts as not terminating, since the grammar cannot tell either from an assignment. In TypeScript and JavaScript: the same fall-through rule, except that `throw` does count as terminating (it is its own statement there), as does a braced arm body ending in a jump. In Kotlin: an arm listing several conditions (`isAdmin(ctx), <read> ->`), or a `when` whose only arm is dead and which is not a statement of a block — a lambda's last statement is its value. In TypeScript and JavaScript: a dead arm sharing its line with another arm |
+| A switch or match whose **subject is the read** in Go, Python, Ruby or Swift (`switch <read> {`, `match <read>:`, `case <read>`, including Ruby's pattern-matching `case <read> in …`), a tagless Go `case` listing the read beside other conditions (`case n == 3, <read>:`), or a Dart read with a null-aware default (`<read> ?? fallback`) | **the whole flag is refused**, and the run exits 1 naming the file. The fold would leave the switch testing a literal (`switch true {`, `match True:`, `case true`), an arm that always matches, or `true ?? fallback`, which `dart analyze` reports as dead code. The program would behave the same, but the dead arms would stay with the flag key gone from the file, so no later run could finish the job. TypeScript and JavaScript finish a switch on the read (see the multi-way guard row above) |
 | A PHP **`elseif` that is not last in its chain**, where the flag serves **true** | **rewritten**: the clause becomes the chain's `else`, and every branch after it is deleted. That is not tidying — those branches sit behind a guard that now always passes, so they are unreachable, and leaving them would keep an `else` in front of them, which does not parse. Both spellings (`elseif` and `else if`) behave the same. Where the flag serves **false** the dead branch is removed, in any position |
+| A **pattern guard** in Java or C# — `case String s when <read> ->`, `{ IsVip: true } when <read> => …` | Where the flag serves **false** the arm is removed when another arm follows it (a Java arrow rule or a C# switch-expression arm). Where it serves **true**, both compilers read `when true` as no guard at all, so the pattern now covers every value a later case with the same or a narrower pattern would match, and that case no longer compiles. A later case with the very same pattern, guarded or not, could never run, so it is deleted (a Java arrow rule or a C# switch-expression arm). The flag is **refused** when any other case besides the catch-all (`default`, `_`) still follows a guard served true, and in Java when a `case … when <read>:` label (colon form) is left with either literal, since `javac` rejects a constant guard there |
 | A PHP read **inside string interpolation** (`"mode={$client->boolVariation('KEY', $ctx, false)}"`, or the same in a heredoc) | **no change** to that read: PHP's `{$...}` needs a variable after the brace, so a literal cannot take the call's place, and folding it would print the text `{true}`. Other reads in the file are still rewritten, the pull request reports the file as still mentioning the flag, and a key constant that read uses is kept |
 | A **Python read bound to a name outside a function** (`use_legacy = <read>` at module or class level) | **the whole flag is refused**. Inside a function the binding is removed and its references replaced with the literal; at module or class level that name is public API, and the modules importing it do not contain the flag key, so they are never in the candidate set — this tool cannot see them, let alone update them. Leaving `use_legacy = True` standing would be permanent, since the flag key is gone from the file. Move the read inside the function that uses it, fix it by hand, or add the key to `ignore` |
 
@@ -3742,13 +4385,16 @@ means no PR.
   Three different things put a file on that list, and only the first is a
   language-coverage problem:
 
-  1. the file's extension is outside the configured `languages`, so nothing
-     looked at it. With every language enabled there is **nothing on this list
-     by default** — every extension this Action knows a flag read can live in is
-     claimed by a language it supports — but it fires whenever you NARROW
-     `languages`, which is the case it exists for: set `languages: ts` in a
-     repository whose ERB templates also read the flag and the caveat names
-     those `.erb` files;
+  1. no configured language rewrites the file, so nothing looked at it. This
+     fires whenever you NARROW `languages`: set `languages: ts` in a repository
+     whose ERB templates also read the flag and the caveat names those `.erb`
+     files. With every language enabled it fires for one family only: Ruby that
+     no language rewrites, in a view (`.haml`, `.slim`, `.jbuilder`, `.jb`,
+     `.builder`, `.rabl`, `.arb`, `.axlsx`, `.prawn`, `.rhtml`), a project file
+     (every name and suffix listed for Ruby key constants above, such as
+     `Rakefile`, `Gemfile` or `config.ru`) or a script with no suffix and a Ruby shebang
+     (`bin/backfill`). A flag read there is not rewritten, so remove it by
+     hand;
   2. the engine could not parse the file, so it was quarantined (see the
      grammar gap further down);
   3. **the mention is not a flag read and not a flag-keyed entry.** The rules
@@ -3860,14 +4506,22 @@ means no PR.
   `eslint:recommended` in JavaScript and TypeScript. The toolchain itself
   proves they can never run, so removing them cannot change behaviour; the
   alternative is a pull request that cannot go green. Each one is listed
-  verbatim in the PR body, since it is still code you wrote. A file that
+  verbatim in the PR body, since it is still code you wrote. That includes the
+  statement after a `try` whose body now always exits (unless a `catch` block
+  can fall through) and, in Java, what follows a folded `yield`. A file that
   *already* contained unreachable code is left alone entirely — there the tool
   cannot tell its own strands from yours. In C#, Go, Kotlin, PHP and Swift
   the statements after a folded `return` are removed as part of the fold
   itself (C# and Kotlin would otherwise warn about them, which fails a build
   that treats warnings as errors). Those removals show in the diff like the
-  rest of the fold, but are not listed separately in the PR body. Python and
-  Ruby leave them in place.
+  rest of the fold, but are not listed separately in the PR body. A C# local
+  function declared after the `return` stays, since it is in scope for its
+  whole block and the code that runs may call it. Go goes further, so that
+  `go vet` has nothing to report: what follows a folded `return`, `break`,
+  `continue` or `goto` is removed in a block and in a `case`, `default` or
+  `select` clause (stopping at a label), and so is what follows a `switch`
+  whose clauses, a `default` among them, all return. Python and Ruby leave
+  them in place.
 * **A loop the fold makes dead is deleted in every language, and the PR says
   which.** A flag read as a loop condition, served false, leaves
   `while (false) { … }` (Go's `for false { … }`, Ruby's `until true`), a loop
@@ -3875,16 +4529,19 @@ means no PR.
   above. Left standing, because each runs or matters: a `do … while (false)`,
   `repeat … while false` or Ruby `begin … end while false` (the body runs
   once); a labelled loop (in C# and Go a `goto` can target the label); a loop
-  that is not directly in a block, such as an unbraced `if` body or (outside
-  Ruby, where an empty `when` is valid) a `switch` arm; a Python
-  `while False: … else: …` (the `else` runs); and a `for` loop with an
-  initialiser, which still runs (Java refuses that flag instead; see its
-  section). TypeScript and JavaScript go further, because their lint rejects
-  each of these: a `do … while (false)` becomes its body, a `for` becomes its
+  that is not directly in a block, such as an unbraced `if` body or, in some
+  languages, a `switch` arm; a Python `while False: … else: …` (the `else` runs); and a `for` loop
+  with an initialiser, which still runs (Java refuses that flag instead; see
+  its section). Java and Dart reject any dead loop, so there it never stands:
+  a labelled one goes with its label, one that was the body of an unbraced
+  `if`, `else` or loop becomes `{}`, and one that was a Dart `case`'s only
+  statement becomes `break;`, since an empty case would run the next one.
+  TypeScript and JavaScript go further, because their lint rejects each of
+  these: a `do … while (false)` becomes its body, a `for` becomes its
   initialiser, and what cannot be finished is refused (see the TypeScript
-  section). A Python loop that was its block's only statement
-  becomes `pass`. As with unreachable statements, a file that already
-  contained a dead loop is left alone.
+  section). A Python loop that was its block's only statement becomes `pass`.
+  A dead loop you wrote yourself in the same block as the one the flag made
+  dead is removed with it.
 * **A parameter the fold leaves unused is not removed, and
   `eslint:recommended` reports it.** Where the flag read was a function's only
   use of one of its parameters — `function typed(ctx) { const on =
@@ -3947,7 +4604,11 @@ means no PR.
   (`accessor x = 1`), `satisfies`, `const` type parameters and `using`
   declarations were all on this list and are now parsed cleanly. Before
   quarantining existed, one such file anywhere made every flag in the
-  repository permanently unproposable.
+  repository permanently unproposable. Quarantine covers only files the engine
+  cannot *read*. Any other engine abort comes after it read the file — its
+  syntax self-check or another check rejecting the rewrite it produced — so the
+  source is fine and the rewrite is not, and the whole flag reports
+  `[piranha-error]` and exits `1`, naming that file.
 * **A Go `vendor/` tree is never rewritten.** It is third-party source the
   toolchain owns: `go mod vendor` regenerates it, so a cleanup committed there
   is reverted on the next sync while `go build -mod=vendor` complains in
@@ -3993,8 +4654,9 @@ means no PR.
   would be silent and permanent: the flag key is gone from the file afterwards,
   so every later run would report the flag clean. Fix it by hand or add the key
   to `ignore`. (Multi-statement branches and `elif` promotion used to be
-  refused outright for the same reason and no longer are — like this inlining,
-  they are finished after the engine has run, where the whole file is in hand.)
+  refused outright for the same reason and no longer are: the engine folds
+  them and re-indents what it moves. This inlining is what still runs after
+  the engine, because it needs the whole file in hand.)
 * **Python cleanup can leave extra blank lines at the deletion site.** Removing
   a module-level guard leaves the blank lines that were above and below it, so
   up to four in a row (`E303`). This is deliberate: the engine's blank-line

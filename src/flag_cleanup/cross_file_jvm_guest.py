@@ -152,10 +152,22 @@ def _reach(repo_dir: str, owner: str) -> _Reach | None:
     """What may stand for ``owner``, or None when an index is incomplete."""
     from flag_cleanup import cross_file_java
 
-    supers, values, incomplete = cross_file_java._JvmTypes(repo_dir)._get()
+    _supers, values, incomplete = cross_file_java._JvmTypes(repo_dir)._get()
     guests, guests_incomplete = _guest_index(repo_dir)
     if incomplete or guests_incomplete:
         return None
+    return _Reach(heirs(repo_dir, owner), frozenset(values), guests)
+
+
+def heirs(repo_dir: str, owner: str) -> frozenset[str]:
+    """``owner`` and the simple name of every repository type that may extend
+    it, followed through Java, Kotlin, Groovy and Scala together. What an
+    index could not read is left out: a caller that must fail closed asks
+    whether one was incomplete."""
+    from flag_cleanup import cross_file_java
+
+    supers, _values, _incomplete = cross_file_java._JvmTypes(repo_dir)._get()
+    guests, _guests_incomplete = _guest_index(repo_dir)
     reaching = {owner}
     changed = True
     while changed:
@@ -168,7 +180,7 @@ def _reach(repo_dir: str, owner: str) -> _Reach | None:
             if guest.tokens & reaching and not guest.types <= reaching:
                 reaching |= guest.types
                 changed = True
-    return _Reach(frozenset(reaching), frozenset(values), guests)
+    return frozenset(reaching)
 
 
 def _used_as_variable(source: str, name: str) -> bool:
@@ -311,6 +323,108 @@ def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:
     return {(package, name) for name in _TYPE_DECL.findall(code)}
 
 
+#: A string or a comment, whichever starts first: a ``//`` or ``/*`` inside a
+#: string (``'http://x'``, ``"lib/*"``) is the string's.
+_STRING_OR_COMMENT = re.compile(
+    r'(?P<string>"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\')|//[^\n]*|/\*.*?\*/', re.S
+)
+_WORD_BEFORE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*$")
+_MEMBER_AFTER = re.compile(r"[ \t]*\??\.[ \t]*([A-Za-z_][A-Za-z0-9_]*)")
+#: ``Mock(`` (or ScalaMock's ``mock[``) right before a class, and ``)``, ``]``
+#: or ``,`` (``.class`` allowed) after it.
+_CALL_BEFORE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*[(\[][ \t]*$")
+#: A type position: ``Keys gate = Mock()``, ``go(Keys gate)``, Scala ``x: Keys``.
+#: The class is named, not taken, and a variable of it holds an instance. The
+#: ``:`` form is Scala's only: in Groovy ``[gate: Keys]`` hands the class on.
+_DECLARES_AFTER = re.compile(r"[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[=,);:]")
+_TYPE_BEFORE = re.compile(r"[A-Za-z0-9_)\]][ \t]*:[ \t]*$")
+_ARGUMENT_AFTER = re.compile(r"[ \t]*(?:\.[ \t]*class[ \t]*)?[,)\]]")
+#: Words before a type's name that only declare the type, name it as a
+#: supertype (whose subtype is then judged in turn), or construct one.
+_NOT_TAKEN = frozenset({
+    "class", "interface", "trait", "enum", "object", "record", "extends", "implements", "with", "new",
+})
+
+
+def _members(repo_dir: str, name: str) -> frozenset[str]:
+    """What ``name.<member>`` can read from a Java or Kotlin type of that
+    name without reaching its other fields: a field, a nested type, a method
+    or a Kotlin member. Empty for a Groovy or Scala type, which is not read."""
+    from flag_cleanup import cross_file_java, cross_file_kotlin
+
+    members: set[str] = set()
+    for info in cross_file_java._type_index(repo_dir).by_name.get(name, ()):
+        members |= info.fields | info.member_types | info.methods
+    for kotlin_info in cross_file_kotlin._kotlin_index(repo_dir).by_name.get(name, ()):
+        members |= kotlin_info.names
+    return frozenset(members)
+
+
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``path`` that may take a
+    Java or Kotlin key constant's owner whole, read by tokens as every guest
+    mention is: the owner's name, or that of any type that may extend it,
+    anywhere outside a comment or an import (``Keys.class``, ``Keys.fields``,
+    ``classOf[Keys]``, ``Keys`` handed on, a GString reading it) unless it is
+    declared, extended or constructed there, sits in a type position
+    (``Keys gate = Mock()``, ``x: Keys``), is the first argument of a test
+    double or a logger (``Mock(Keys)``, see
+    :data:`~flag_cleanup.cross_file_java.NOT_REFLECTING`), or is followed by
+    ``.<member>`` of a Java or Kotlin type of that name; and a string holding the class's
+    binary name (``Class.forName("app.Keys")``). Fails closed: a member list
+    an index could not read whole is taken to be empty.
+    """
+    from flag_cleanup import cross_file_java
+
+    reach = cross_file_java.owner_reach(constants, repo_dir)
+    if not reach:
+        return []
+    names = {d.name for d in constants}
+    scala = path.endswith(GUEST_EXTENSIONS["scala"])
+    # Comments blanked in place, so offsets still give lines; strings kept,
+    # since a GString can read the class.
+    code = _STRING_OR_COMMENT.sub(
+        lambda m: m.group(0) if m.group("string") else re.sub(r"[^\n]", " ", m.group(0)), source
+    )
+    found: set[tuple[str, xk.Refusal]] = set()
+
+    def add(holders, offset: int) -> None:
+        line, text = _first_line(source, offset)
+        for holder in holders:
+            found.add((holder, xk.Refusal(path, line, xk.UNSUPPORTED_FORM, text)))
+
+    for match in _STRING_OR_COMMENT.finditer(code):
+        if match.group("string"):
+            add(reach.by_string(match.group(0)[1:-1]), match.start())
+    for name, holders in reach.names().items():
+        members = _members(repo_dir, name) - names
+        for match in _token(name).finditer(code):
+            line_start = code.rfind("\n", 0, match.start()) + 1
+            if re.match(r"[ \t]*(?:import|package)\b", code[line_start:]):
+                continue
+            before = _WORD_BEFORE.search(code, line_start, match.start())
+            if before is not None and before.group(1) in _NOT_TAKEN:
+                continue
+            call = _CALL_BEFORE.search(code, line_start, match.start())
+            if (
+                call is not None
+                and call.group(1) in cross_file_java.NOT_REFLECTING | cross_file_java.NOT_REFLECTING_ANNOTATIONS
+                and _ARGUMENT_AFTER.match(code, match.end())
+            ):
+                continue  # `Mock(Keys)`, `mock(Keys.class)`, `@Import(Keys)`
+            if _DECLARES_AFTER.match(code, match.end()) or (
+                scala and _TYPE_BEFORE.search(code, line_start, match.start())
+            ):
+                continue  # a type position
+            after = _MEMBER_AFTER.match(code, match.end())
+            if after is not None and (after.group(1) in members or after.group(1) in names):
+                continue  # a member read, or a mention `references` judges
+            add(holders, match.start())
+    return sorted(found, key=lambda hit: (hit[0], hit[1].line, hit[1].text))
+
+
 for _language in GUEST_EXTENSIONS:
     xk.register(
         _language,
@@ -320,5 +434,6 @@ for _language in GUEST_EXTENSIONS:
             references=references,
             declared_names=declared_names,
             declared_classifiers=declared_classifiers,
+            constant_escapes=constant_escapes,
         ),
     )

@@ -554,10 +554,32 @@ def _pull_request_lookup(gh: GitHubApi, repo: str, branch: str) -> dict | None:
             "there are none",
         )
 
-    pulls = response.json()
-    if not isinstance(pulls, list) or not pulls:
+    pulls = _pull_list(
+        response,
+        f"could not read the pull requests listed for {branch}; refusing to "
+        "assume there are none",
+    )
+    if not pulls:
         return None
     return pulls[0] if isinstance(pulls[0], dict) else {}
+
+
+def _pull_list(response: httpx.Response, message: str) -> list:
+    """A 200 pull-request list's body, or a :class:`GitHubApiError`.
+
+    A 200 is not proof of an answer: a proxy's HTML page or a JSON object in
+    place of the list arrives with the same status. Read as an empty list,
+    either would say "provably none" — enough to delete a branch whose pull
+    request it closes, or to drop a merged removal from the archive backlog
+    for good — when the truth is that nothing was learned.
+    """
+    try:
+        pulls = response.json()
+    except ValueError:
+        pulls = None
+    if not isinstance(pulls, list):
+        _raise_api_error(response, message)
+    return pulls
 
 
 def existing_pull_request(gh: GitHubApi, repo: str, branch: str) -> str | None:
@@ -606,15 +628,20 @@ class MergedRemoval:
     merge_commit_sha: str = ""
 
 
-def merged_removal(gh: GitHubApi, repo: str, branch: str) -> MergedRemoval | None:
-    """The merged pull request opened from ``branch``, or ``None``.
+def merged_removal(
+    gh: GitHubApi, repo: str, branch: str, *, base: str
+) -> MergedRemoval | None:
+    """The pull request opened from ``branch`` and merged into ``base``, or ``None``.
 
-    ``None`` covers two situations the caller must treat identically: no pull
-    request was ever opened from this branch, and one was opened and CLOSED
-    WITHOUT MERGING. The second is a customer declining the removal, and
-    archiving a flag whose removal was rejected is the single worst thing
-    archive mode can do (``pr_event``). Evidence of a merge is what authorizes
-    the archive, so its absence can only ever mean "leave the flag alone".
+    ``None`` covers three situations the caller must treat identically: no pull
+    request was ever opened from this branch, one was opened and CLOSED
+    WITHOUT MERGING, and one merged into some branch other than ``base``. The
+    second is a customer declining the removal, and archiving a flag whose
+    removal was rejected is the single worst thing archive mode can do
+    (``pr_event``). The third is a removal retargeted to a spike or feature
+    branch and merged there: the base branch still reads the flag. Evidence of
+    a merge INTO THE BASE is what authorizes the archive, so its absence can
+    only ever mean "leave the flag alone".
 
     Distinct from :func:`existing_pull_request`, which asks the neighbouring
     question — *has this flag been proposed at all* — and therefore counts a
@@ -656,12 +683,11 @@ def merged_removal(gh: GitHubApi, repo: str, branch: str) -> MergedRemoval | Non
             "removal never merged",
         )
 
-    try:
-        pulls = response.json()
-    except ValueError:
-        pulls = None
-    if not isinstance(pulls, list):
-        return None
+    pulls = _pull_list(
+        response,
+        f"could not read the pull requests listed for {branch}; refusing to "
+        "assume its removal never merged",
+    )
 
     for pull in pulls:
         if not isinstance(pull, dict):
@@ -671,6 +697,9 @@ def merged_removal(gh: GitHubApi, repo: str, branch: str) -> MergedRemoval | Non
         # single-pull-request endpoint returns. Reading `merged` here would be
         # `None` for every entry and the sweep would find nothing, forever.
         if not pull.get("merged_at"):
+            continue
+        pull_base = pull.get("base")
+        if not isinstance(pull_base, dict) or pull_base.get("ref") != base:
             continue
         number = pull.get("number")
         # `merge_commit_sha` is the commit the merge produced ON THE BASE

@@ -41,7 +41,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from xml.etree import ElementTree
@@ -427,6 +427,21 @@ class Index:
                 index.foreign.append(path)
             elif re.search(rf"(?<![\w$]){re.escape(wrapper.name)}(?![\w$])", text, fold):
                 index.unparsed.append(path)
+        # A string may name the member in another case, or by a prefix,
+        # where a lookup reads it so (`string_mentions`).
+        from flag_cleanup import csharp_family
+
+        known = set(index.parsed)
+        index.parsed += [p for p in csharp_family.loose_files(repo_dir) if p not in known]
+        # A file spelling only an accessor's name (`"get_IsX"`), which no
+        # word match of the member's name finds.
+        accessors = [f"get_{wrapper.name}", f"set_{wrapper.name}"]
+        known = set(index.parsed)
+        index.parsed += [
+            p
+            for p in cross_file_keys.mention_files(repo_dir, accessors, exclude=())
+            if p.endswith(EXTENSIONS) and p not in known
+        ]
         return index
 
     def _add(self, path: str, text: str, words: set[str]) -> None:
@@ -1590,7 +1605,9 @@ def _locator_ok(at: Node, reader: xcs._Reader) -> bool:
     """Whether a ``GetRequiredService<T>()`` here can only be the DI lookup:
     its namespace is in scope, and no repository type declares a method of
     one of those names."""
-    if reader.index.incomplete or not _namespace_in_scope(at, reader, _DI_NAMESPACE):
+    if any(reader.index.spelled_where_unparsed(n) for n in _LOCATORS):
+        return False
+    if not _namespace_in_scope(at, reader, _DI_NAMESPACE):
         return False
     return not any(
         _LOCATORS & info.members for infos in reader.index.by_last.values() for info in infos
@@ -1602,7 +1619,9 @@ def _substitute_ok(at: Node, reader: xcs._Reader, readers: _Readers) -> bool:
     namespace is in scope, no repository type named ``Substitute`` has a
     member ``For``, no alias is named ``Substitute``, and no local, parameter
     or member shadows the name at a ``Substitute.For`` receiver."""
-    if reader.index.incomplete or not _namespace_in_scope(at, reader, _SUBSTITUTE_NAMESPACE):
+    if reader.index.spelled_where_unparsed("Substitute") or not _namespace_in_scope(
+        at, reader, _SUBSTITUTE_NAMESPACE
+    ):
         return False
     if any("For" in info.members for info in reader.index.by_last.get("Substitute", ())):
         return False
@@ -1893,7 +1912,7 @@ def _moq_mock(access: Node, name: str, readers: _Readers, path: str) -> tuple[st
 
 def _moq_argument(node: Node, at: Node, reader: xcs._Reader | None) -> Node | None:
     """``T`` when declared type ``node`` can only be Moq's ``Mock<T>`` at ``at``."""
-    if reader is None or reader.index.incomplete or reader.index.by_last.get("Mock"):
+    if reader is None or reader.index.may_declare("Mock"):
         return None
     if node.type == "qualified_name":
         qualifier = node.child_by_field_name("qualifier")
@@ -2076,19 +2095,110 @@ def _in_nameof(at: Node) -> bool:
     return False
 
 
-def _cref_mentions(root: Node, name: str) -> list[Node]:
-    """Comments whose ``cref`` names a member called ``name``: deleting the
-    member would leave a broken reference (CS1574)."""
-    found: list[Node] = []
+#: A self-closing ``<see>`` or ``<seealso>`` whose only attribute is
+#: ``cref``: the one shape rewritten to ``<c>…</c>`` when its member goes.
+_SEE = re.compile(r"""<(?:see|seealso)\s+cref\s*=\s*(["'])([^"'<>]*)\1\s*/>""")
+#: A cref target judged here: a dotted name, a method's empty parameter list
+#: allowed. An ID string (``P:Ns.T.M``), generics and ``global::`` are not.
+_CREF_TARGET = re.compile(r"@?[^\W\d]\w*(?:\.@?[^\W\d]\w*)*(?:\(\))?")
+
+
+def _documents_a_type(comment: Node) -> bool:
+    """Whether a doc comment documents a type (whose own members its crefs
+    see first), or nothing this can tell."""
+    node = comment.next_named_sibling
+    while node is not None and node.type == "comment":
+        node = node.next_named_sibling
+    return node is None or node.type in _TYPES
+
+
+def _cref_owner(target: str, at: Node, wrapper: wi.Wrapper, index: Index) -> str | None:
+    """What a cref naming a member called the wrapper's name refers to:
+    ``"family"`` when its type is the interface, the wrapper's class or a
+    sibling (for an unqualified one, the type its comment sits in); a
+    ``"foreign"`` member when every type of its qualifier's name declares
+    the member itself (or, unqualified, the enclosing type does), which
+    hides any inherited one; ``None`` when this cannot tell."""
+    family = index.family
+    if family is None or _CREF_TARGET.fullmatch(target) is None:
+        return None
+    if "(" in target and wrapper.kind == "property":
+        return None
+    parts = [p.removeprefix("@") for p in target.split("(", 1)[0].split(".")]
+    if len(parts) == 1:
+        scope = None if _documents_a_type(at) else _enclosing_type(at)
+        if scope is None:
+            return None
+        if _is_family_type(scope, family):
+            return "family"
+        return "foreign" if _member_binding(scope, wrapper.name) is not None else None
+    qualifier = parts[-2]
+    checkout = xcs.csharp_index(index.repo_dir)
+    infos = checkout.by_last.get(qualifier, ())
+    if qualifier in {n.removeprefix("@") for n in family.simple_names}:
+        # Another repository type of the name may be the one meant.
+        return "family" if all(info.full in family.full_names for info in infos) else None
+    if checkout.incomplete or not infos:
+        return None
+    return "foreign" if all(wrapper.name in info.members and not info.partial for info in infos) else None
+
+
+def _crefs(root: Node, wrapper: wi.Wrapper, index: Index) -> list[tuple[Node, str | None]]:
+    """Each comment whose ``cref`` names a member called the wrapper's name,
+    with its text once every reference there to a family member is plain
+    ``<c>`` text; ``None`` when one of them cannot be rewritten (an
+    ``<inheritdoc>``, a ``<see>`` with content, any other tag) or may bind
+    to the member through a type this cannot tell. Deleting the member would
+    leave that one a broken reference (CS1574). A comment whose every such
+    reference names another type's own member is left out."""
+    found: list[tuple[Node, str | None]] = []
     for node in cross_file_keys.walk(root):
         if node.type != "comment":
             continue
-        for match in xcs._CREF.finditer(_text(node)):
-            target = match.group(1).split("(", 1)[0]
-            if target.rsplit(".", 1)[-1] == name:
-                found.append(node)
-                break
+        text = _text(node)
+        pieces: list[tuple[int, int, str]] = []
+        mentioned = keep = False
+        for match in xcs._CREF.finditer(text):
+            target = match.group(1)
+            if target.split("(", 1)[0].rsplit(".", 1)[-1] != wrapper.name:
+                continue
+            mentioned = True
+            owner = _cref_owner(target, node, wrapper, index)
+            if owner == "foreign":
+                continue
+            tag = next(
+                (m for m in _SEE.finditer(text) if m.start() <= match.start() and match.end() <= m.end()), None
+            )
+            if owner == "family" and tag is not None:
+                pieces.append((tag.start(), tag.end(), f"<c>{target}</c>"))
+            else:
+                keep = True
+        if not mentioned:
+            continue
+        if keep:
+            found.append((node, None))
+        elif pieces:
+            for start, end, replacement in sorted(pieces, reverse=True):
+                text = text[:start] + replacement + text[end:]
+            found.append((node, text))
     return found
+
+
+def doc_references(path: str, wrapper: wi.Wrapper, index: Index) -> list[wi.Reference]:
+    """The doc comments of a file whose crefs to the member are rewritten to
+    plain text when it goes (:func:`_crefs`), where a family value may be."""
+    from flag_cleanup import csharp_family
+
+    source = _read(path)
+    if source is None or "cref" not in source:
+        return []
+    root = parse(source)
+    family = index.family
+    if family is not None and (
+        not csharp_family.reaches(index.repo_dir, path, family) or csharp_family.family_free(source, root, family)
+    ):
+        return []
+    return [wi.Reference(path, wi.line_of(n), _text(n), after) for n, after in _crefs(root, wrapper, index) if after]
 
 
 def names_only(node: Node, kind: str = "method") -> bool:
@@ -2701,14 +2811,17 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         targets.add(f"{interface.package}.{interface.name}" if interface.package else interface.name)
     found: list[wi.Occurrence] = [
         wi.Occurrence(path, wi.line_of(c), wi.text_of(c), None, wi.UNPARSED_MENTION)
-        for c in _cref_mentions(root, wrapper.name)
+        for c, after in _crefs(root, wrapper, index)
+        if after is None
     ]
     found += _knob_leftovers(path, source, root, reader, readers, wrapper, index)
     test_project: list[bool] = []
-    #: receiver name -> reads of the member through it, and how many of those
-    #: were proven sibling reads.
+    #: receiver name -> reads of the member through it in the file; per test
+    #: method, and how many of those were proven sibling reads.
     mentions: dict[str, int] = defaultdict(int)
-    sibling_reads: dict[str, int] = defaultdict(int)
+    scoped_mentions: dict[tuple[str | None, str], int] = defaultdict(int)
+    sibling_reads: dict[tuple[str | None, str], int] = defaultdict(int)
+    methods = _methods_by_name(root)
 
     def sibling_read(access: Node, line: int, name: str | None) -> wi.Occurrence:
         """A read through a receiver typed as a sibling, whose member goes
@@ -2718,10 +2831,12 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         if not test_project:
             test_project.append(_test_project(path, index.repo_dir) is True)
         in_test = test_project[0] and _enclosing_test_method(access, data)
+        scope = _method_scope(access, methods)
         if name is not None:
-            sibling_reads[name] += 1
+            sibling_reads[(scope, name)] += 1
         return wi.Occurrence(
-            path, line, wi.text_of(access.parent or access), None, wi.SIBLING_RECEIVER, name, in_test
+            path, line, wi.text_of(access.parent or access), None, wi.SIBLING_RECEIVER, name, in_test,
+            scope=scope,
         )
 
     # A verbatim identifier (`f.@IsXEnabled`) is the same name; it is not
@@ -2739,6 +2854,7 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         for spelled_receiver in (_receiver_name(node), _moq_call_receiver(node)):
             if spelled_receiver is not None:
                 mentions[spelled_receiver] += 1
+                scoped_mentions[(_method_scope(node, methods), spelled_receiver)] += 1
         if _in_pattern_path(node):
             # `{ A.Name: … }` matches a member PATH of the tested value: no
             # receiver in it is bound where it is written.
@@ -2878,13 +2994,18 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         suffix = "()" if wrapper.kind == "property" and reason is None else ""
         found.append(wi.Occurrence(path, line, wi.text_of(shown), span, reason, name, double, suffix))
     # The test-double pass deletes a test by the receiver's NAME, so a name
-    # counts only where it means the sibling everywhere in the file: every
-    # read of the member through it is a sibling read, and every binding of
-    # it is typed as a sibling. Otherwise the read stays, reported.
+    # counts only where it means the sibling everywhere in its test method:
+    # every read of the member through it there is a sibling read, and every
+    # binding it may have there -- the method's own, and its classes'
+    # members' -- is typed as a sibling. A local cannot shadow another in an
+    # enclosing scope, so the read binds to one of those. Otherwise the read
+    # stays, reported.
     proven = {
-        name
-        for name, count in sibling_reads.items()
-        if count == mentions[name] and _bound_only_as_sibling(root, name, reader, readers, family)
+        (scope, name)
+        for (scope, name), count in sibling_reads.items()
+        if scope is not None
+        and count == scoped_mentions[(scope, name)]
+        and _bound_only_as_sibling(_scope_nodes(methods[scope]), name, reader, readers, family)
     }
     # The same for a mock's or substitute's name, which the test-double pass
     # also matches by name: every read through it is proven the wrapper's,
@@ -2900,10 +3021,10 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         if count == mentions[name] and _bound_only_as_mock(root, name, reader, readers, targets)
     }
     found = [
-        replace(o, receiver=None)
+        replace(o, receiver=None, scope=None)
         if o.receiver is not None
         and (
-            (o.reason == wi.SIBLING_RECEIVER and o.receiver not in proven)
+            (o.reason == wi.SIBLING_RECEIVER and (o.scope, o.receiver) not in proven)
             or (o.in_test_double and o.reason in (None, wi.ARGUMENT_HAS_CALL) and o.receiver not in mocks)
         )
         else o
@@ -2954,13 +3075,61 @@ _UNTYPED_BINDINGS = frozenset(
 )
 
 
-def _bound_only_as_sibling(root: Node, name: str, reader: xcs._Reader, readers: _Readers, family) -> bool:
-    """Whether every binding of ``name`` in the file is declared with a type
-    that resolves to a sibling (:func:`_bound_only_as`)."""
+def _methods_by_name(root: Node) -> dict[str, Node]:
+    """The file's methods whose name no other method of the file shares: a
+    test is told apart by its name alone."""
+    counts: dict[str, list[Node]] = defaultdict(list)
+    for node in cross_file_keys.walk(root):
+        if node.type == "method_declaration" and (name := _name_of(node)) is not None:
+            counts[name].append(node)
+    return {name: nodes[0] for name, nodes in counts.items() if len(nodes) == 1}
+
+
+def _method_scope(at: Node, methods: dict[str, Node]) -> str | None:
+    """The name of the method ``at`` sits in (through lambdas and local
+    functions), when no other method of the file has it."""
+    node = at.parent
+    while node is not None and node.type != "method_declaration":
+        node = node.parent
+    name = _name_of(node) if node is not None else None
+    return name if name is not None and name in methods and methods[name].id == node.id else None
+
+
+def _scope_nodes(method: Node) -> Iterator[Node]:
+    """Every node where a simple name read in ``method`` may be bound: the
+    method itself, and the member-level bindings of each type around it
+    (field, event and property names, other members' names, primary
+    constructor and record parameters), but not what other members bind
+    inside them."""
+    yield from cross_file_keys.walk(method)
+    scope = method.parent
+    while scope is not None:
+        if scope.type in _TYPES:
+            parameters = _child(scope, "parameter_list")
+            if parameters is not None:
+                yield from cross_file_keys.walk(parameters)
+            body = scope.child_by_field_name("body")
+            for member in body.named_children if body is not None else ():
+                if member.type in ("field_declaration", "event_field_declaration"):
+                    declaration = _child(member, "variable_declaration")
+                    for declarator in declaration.named_children if declaration is not None else ():
+                        name = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+                        if name is not None:
+                            yield name
+                elif (name := member.child_by_field_name("name")) is not None:
+                    yield name
+        scope = scope.parent
+
+
+def _bound_only_as_sibling(
+    nodes: Iterable[Node], name: str, reader: xcs._Reader, readers: _Readers, family
+) -> bool:
+    """Whether every binding of ``name`` among ``nodes`` is declared with a
+    type that resolves to a sibling (:func:`_bound_only_as`)."""
     if family is None:
         return False
     siblings = family.sibling_full_names
-    return _bound_only_as(root, name, readers, lambda t, at: _type_full(t, reader) in siblings)
+    return _bound_only_as(nodes, name, readers, lambda t, at: _type_full(t, reader) in siblings)
 
 
 def _bound_only_as_mock(root: Node, name: str, reader: xcs._Reader, readers: _Readers, targets: set[str]) -> bool:
@@ -2974,11 +3143,11 @@ def _bound_only_as_mock(root: Node, name: str, reader: xcs._Reader, readers: _Re
         argument = _moq_argument(type_node, at, reader)
         return argument is not None and _resolves(argument, reader, targets) is None
 
-    return _bound_only_as(root, name, readers, mock)
+    return _bound_only_as(cross_file_keys.walk(root), name, readers, mock)
 
 
-def _bound_only_as(root: Node, name: str, readers: _Readers, accept: Callable[[Node, Node], bool]) -> bool:
-    """Whether every binding of ``name`` in the file -- a field, local,
+def _bound_only_as(nodes: Iterable[Node], name: str, readers: _Readers, accept: Callable[[Node, Node], bool]) -> bool:
+    """Whether every binding of ``name`` among ``nodes`` -- a field, local,
     parameter, property, pattern, ``out var``, ``foreach`` or ``catch``
     variable -- is declared with a type ``accept`` takes. A lambda
     parameter, a query variable, a deconstruction or any other binding whose
@@ -2993,7 +3162,7 @@ def _bound_only_as(root: Node, name: str, readers: _Readers, accept: Callable[[N
             and accept(type_node, at)
         )
 
-    for node in cross_file_keys.walk(root):
+    for node in nodes:
         if node.type not in ("identifier", "implicit_parameter") or _text(node).removeprefix("@") != bare:
             continue
         if node.type == "implicit_parameter":
@@ -3232,7 +3401,7 @@ def knob_receivers(
         name
         for name in names
         if all(s.fake is not None and s.sets_knob for s in settings if s.receiver == name)
-        and _bound_only_as(root, name, readers, lambda t, at: _type_full(t, reader) in members)
+        and _bound_only_as(cross_file_keys.walk(root), name, readers, lambda t, at: _type_full(t, reader) in members)
     )
 
 
@@ -3350,6 +3519,62 @@ def mention_counts(index: Index, path: str, kind: str) -> bool:
     return _BY_NAME.search(source) is not None or not csharp_family.family_free(source, parse(source), family)
 
 
+def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
+    """The strings of a parsed C# file that may name the member, where
+    :func:`mention_counts` counts the file's strings at all.
+
+    A ``nameof(...)`` whose constant is the name is one: it is a string
+    literal written another way. In a family-free file, while no route
+    anywhere the family can be takes a computed name, only a by-name
+    route's own NAME argument counts
+    (:func:`~flag_cleanup.csharp_family.route_names`): no other string can
+    then flow into a route, and a string a by-name API this does not know
+    takes is the same known limit as in a file spelling no route."""
+    from flag_cleanup import csharp_family
+
+    if not mention_counts(index, path, "string"):
+        return []
+    source = _read(path)
+    if source is None:
+        return []
+    root = parse(source)
+    prefix = r"\$?" if wrapper.kind == "property" else ""
+    # A lookup ignoring case or by a prefix: any spelling counts, and so
+    # does a prefix pattern the name matches, in every string of the file.
+    loose = csharp_family.loose_names(source)
+    # An accessor's name (`get_IsX`, `set_IsX`) is the member's too; a
+    # backing field's (`<IsX>k__BackingField`) is spelled as a word already.
+    word = re.compile(
+        rf"(?<![\w$])(?:{prefix}|get_|set_){re.escape(wrapper.name)}(?![\w$])", re.IGNORECASE if loose else 0
+    )
+
+    def prefix_of_name(node: Node) -> bool:
+        text = _plain_string(node)
+        return loose and text is not None and text.endswith("*") and wrapper.name.lower().startswith(text[:-1].lower())
+
+    found = [
+        node
+        for node in cross_file_keys.walk(root)
+        if (node.type in _STRINGS and (word.search(_text(node)) or prefix_of_name(node)))
+        or (csharp_family.nameof_value(node) or "").lower() == wrapper.name.lower() and (
+            loose or csharp_family.nameof_value(node) == wrapper.name
+        )
+    ]
+    family = index.family
+    if (
+        found
+        and not loose
+        and family is not None
+        and not csharp_family.computed_name_route(index.repo_dir, family)
+        and csharp_family.family_free(source, root, family)
+    ):
+        names = csharp_family.route_names(root, source)
+        if names is not None:
+            spans = {(n.start_byte, n.end_byte) for n in names}
+            found = [n for n in found if (n.start_byte, n.end_byte) in spans]
+    return [(wi.line_of(n), wi.text_of(n)) for n in found]
+
+
 def leftovers(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, str]]:
     """Every mention still in the repository that may be the member, read
     fresh, by the same verdicts as :func:`occurrences` and
@@ -3374,8 +3599,7 @@ def leftovers(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, str]]:
         if source is None:
             found.append((path, 1, ""))
             continue
-        if mention_counts(index, path, "string"):
-            found += [(path, n, t) for n, t in wi._string_mentions(path, wrapper.name, wrapper.kind == "property")]
+        found += [(path, n, t) for n, t in string_mentions(index, path, wrapper)]
         found += [(o.path, o.line, o.text) for o in occurrences(path, source, wrapper, index)]
     return found
 
@@ -3395,6 +3619,8 @@ wi.register(
         names_only=names_only,
         members=members,
         mention_counts=mention_counts,
+        string_mentions=string_mentions,
         leftovers=leftovers,
+        doc_references=doc_references,
     )
 )

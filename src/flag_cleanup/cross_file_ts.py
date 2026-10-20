@@ -68,12 +68,13 @@ merging can supply the name from another file), and a file whose parse has
 errors.
 
 Specifiers resolve as the TypeScript compiler resolves them for relative paths
-and for ``paths`` in the nearest ``tsconfig.json``/``jsconfig.json``. Where the
-compiler and a runtime could disagree -- two candidate files, a React Native
-platform file or a ``.json`` beside the specifier or the answer (``keys.ios.ts``
-beside ``keys/index.ts``, ``keys.json``), a directory with its own
-``package.json``, a config that ``extends`` another -- the specifier
-does not resolve, and the mention is refused. A bare package specifier never
+and for ``paths`` in the nearest ``tsconfig.json``/``jsconfig.json``, written
+there or inherited through a relative ``extends``. Where the compiler and a
+runtime could disagree -- two candidate files, a React Native platform file or
+a ``.json`` beside the specifier or the answer (``keys.ios.ts`` beside
+``keys/index.ts``, ``keys.json``), a directory with its own ``package.json``, a
+config that extends a package or cannot otherwise be read for certain -- the
+specifier does not resolve, and the mention is refused. A bare package specifier never
 resolves to a file in the repository.
 """
 
@@ -507,12 +508,99 @@ def _strip_jsonc(text: str) -> str:
     return _TRAILING_COMMA.sub(lambda m: m.group(1) or m.group(2), text)
 
 
-def _config(reader_dir: Path, stop: Path) -> tuple[Path, dict[str, list[str]]] | None:
-    """(base directory for `paths`, `paths`) of the nearest config, or None.
+@dataclass(frozen=True)
+class _Options:
+    """The module-resolution options a config compiles with, read through its
+    ``extends`` chain (:func:`_options`)."""
 
-    Raises :class:`_Unknown` when the nearest config cannot be read for
-    certain: unparseable, inheriting from another (`extends`), or two configs
-    side by side.
+    #: The ``paths`` in force, each target as the directory it resolves from
+    #: and the rest as written, which may hold the ``*``.
+    paths: dict[str, list[tuple[Path, str]]]
+    #: The explicit ``baseUrl`` in force, as a directory; None when no config
+    #: in the chain sets one.
+    base_url: Path | None
+
+    def targets(self, specifier: str) -> list[str] | None:
+        """The paths of the pattern the compiler picks for ``specifier``,
+        substituted; None when no pattern fits."""
+        fit = _fit(specifier, self.paths)
+        if fit is None:
+            return None
+        pattern, star = fit
+        return [str(origin / rest.replace("*", star)) for origin, rest in self.paths[pattern]]
+
+
+def _options(config: Path, stop: Path, strict: bool = True) -> _Options:
+    """``config``'s ``paths`` and ``baseUrl``, as the compiler reads them.
+
+    Each is the value of the nearest config in the ``extends`` chain that sets
+    it (:func:`_inheriting`). ``baseUrl`` resolves from the config that
+    declares it. A ``paths`` target resolves from the ``baseUrl`` in force, or
+    else from the config that declares ``paths``. A ``${configDir}`` at the
+    start of either is ``config``'s own directory. Raises :class:`_Unknown`
+    for whatever :func:`_inheriting` and :func:`_in_force` refuse, for a
+    ``paths`` that is not a map of string lists, for a misspelt
+    ``${configDir}``, and for any ``moduleSuffixes`` but ``[""]``, under which
+    ``keys.mobile.ts`` can answer ``@/keys``.
+
+    Not ``strict``, it reads what a config MAY alias, for the questions that
+    may only over-attribute a specifier to a file (:func:`_alias_keys`,
+    :func:`_enum_escapes`): ``references``, ``moduleSuffixes``, a repeated key
+    and U+2028/U+2029 are read past rather than refused. A refusal there would
+    hide an alias, and with it a use of the file, which fails open.
+    """
+    try:
+        chain = _inheriting(config, stop, (), strict)
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError) as error:
+        # RuntimeError: a symlink loop, from `Path.resolve`.
+        raise _Unknown(str(config)) from error
+    paths, paths_in = _in_force(chain, "paths", {})
+    if not isinstance(paths, dict):
+        raise _Unknown(str(paths_in))
+    for targets in paths.values():
+        if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+            raise _Unknown(str(paths_in))
+    suffixes, suffixes_in = _in_force(chain, "moduleSuffixes", [""])
+    if strict and suffixes != [""]:
+        raise _Unknown(str(suffixes_in))
+    written, base_in = _in_force(chain, "baseUrl", None)
+    base_url = None
+    if base_in is not None:
+        if not isinstance(written, str):
+            raise _Unknown(str(base_in))
+        base_url = _option_path(written, base_in.parent, config, base_in)
+    origin = base_url if base_url is not None else paths_in.parent if paths_in is not None else config.parent
+    resolved = {key: [_target(target, origin, config, paths_in) for target in targets] for key, targets in paths.items()}
+    return _Options(resolved, base_url)
+
+
+def _target(value: str, origin: Path, config: Path, declared_in: Path | None) -> tuple[Path, str]:
+    """The directory path option ``value`` resolves from, and the rest of it:
+    ``origin``, or, after a leading ``${configDir}``, ``config``'s directory.
+    A misspelt template raises :class:`_Unknown`: the compiler tests for it
+    ignoring case and replaces it only as written, so it would resolve from a
+    third place."""
+    rest = value[len(_CONFIG_DIR) :] if value.startswith(_CONFIG_DIR) else None
+    if _CONFIG_DIR.lower() in (value if rest is None else rest).lower():
+        raise _Unknown(str(declared_in))
+    if rest is None:
+        return origin, value
+    # The compiler replaces the template with `./` and resolves that from the
+    # config compiled with, wherever the option is written.
+    return config.parent, f"./{rest}"
+
+
+def _option_path(value: str, origin: Path, config: Path, declared_in: Path | None) -> Path:
+    """The directory path option ``value`` names (see :func:`_target`)."""
+    directory, rest = _target(value, origin, config, declared_in)
+    return directory / rest
+
+
+def _config(reader_dir: Path, stop: Path, strict: bool = True) -> _Options | None:
+    """The options of the nearest config, or None when there is none.
+
+    Raises :class:`_Unknown` when it cannot be read for certain (see
+    :func:`_options`), or when two configs sit side by side.
     """
     current = reader_dir
     while True:
@@ -520,34 +608,20 @@ def _config(reader_dir: Path, stop: Path) -> tuple[Path, dict[str, list[str]]] |
         if len(present) > 1:
             raise _Unknown(str(current))
         if present:
-            try:
-                data = json.loads(_strip_jsonc(present[0].read_text(encoding="utf-8")))
-            except (OSError, UnicodeDecodeError, ValueError) as error:
-                raise _Unknown(str(present[0])) from error
-            if not isinstance(data, dict) or "extends" in data:
-                raise _Unknown(str(present[0]))
-            options = data.get("compilerOptions", {})
-            if not isinstance(options, dict):
-                raise _Unknown(str(present[0]))
-            paths = options.get("paths", {})
-            base_url = options.get("baseUrl", ".")
-            if not isinstance(paths, dict) or not isinstance(base_url, str):
-                raise _Unknown(str(present[0]))
-            for targets in paths.values():
-                if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
-                    raise _Unknown(str(present[0]))
-            return current / base_url, paths
+            return _options(present[0], stop, strict)
         if current == stop or current.parent == current:
             return None
         current = current.parent
 
 
-def _alias(specifier: str, paths: dict[str, list[str]]) -> list[str] | None:
-    """The substituted targets of the pattern the compiler picks, or None."""
-    if specifier in paths:
-        return list(paths[specifier])
+def _fit(specifier: str, patterns: Iterable[str]) -> tuple[str, str] | None:
+    """The ``paths`` pattern the compiler picks for ``specifier``, with what
+    its ``*`` stands for; None when none fits."""
+    patterns = list(patterns)
+    if specifier in patterns:
+        return specifier, ""
     best: tuple[int, str, str] | None = None
-    for pattern in paths:
+    for pattern in patterns:
         if pattern.count("*") != 1:
             continue
         prefix, suffix = pattern.split("*")
@@ -558,10 +632,7 @@ def _alias(specifier: str, paths: dict[str, list[str]]) -> list[str] | None:
             and (best is None or len(prefix) > best[0])
         ):
             best = (len(prefix), pattern, specifier[len(prefix) : len(specifier) - len(suffix)])
-    if best is None:
-        return None
-    _, pattern, star = best
-    return [target.replace("*", star) for target in paths[pattern]]
+    return None if best is None else (best[1], best[2])
 
 
 def _resolve(
@@ -570,6 +641,7 @@ def _resolve(
     stop: Path,
     beside_declarations: bool = False,
     base_url: Callable[[str, str], bool] | None = None,
+    strict: bool = True,
 ) -> str | None:
     reader_dir = Path(reader_path).parent
     try:
@@ -578,44 +650,25 @@ def _resolve(
             return hits[0] if hits else None
         if specifier.startswith("/") or not specifier:
             return None
-        config = _config(reader_dir, stop)
-        if config is None:
+        options = _config(reader_dir, stop, strict)
+        if options is None:
             return None
-        base, paths = config
-        targets = _alias(specifier, paths)
+        targets = options.targets(specifier)
         for target in targets or ():
-            hits = _candidates(os.path.normpath(base / target), beside_declarations)
+            hits = _candidates(os.path.normpath(target), beside_declarations)
             if hits:
                 return hits[0]
-        if targets is None and base_url is not None:
+        if targets is None and base_url is not None and options.base_url is not None:
             # No `paths` pattern fits, so the compiler tries the specifier
             # under an explicit `baseUrl` before any package. Where a pattern
             # fits and names nothing, it is left there: which of the two the
             # compiler falls back to is not worth betting a rewrite on.
-            explicit = _explicit_base_url(reader_dir, stop)
-            if explicit is not None:
-                hits = _candidates(os.path.normpath(explicit / specifier), beside_declarations)
-                if hits and base_url(reader_path, specifier):
-                    return hits[0]
+            hits = _candidates(os.path.normpath(options.base_url / specifier), beside_declarations)
+            if hits and base_url(reader_path, specifier):
+                return hits[0]
     except _Unknown:
         return None
     return None
-
-
-def _explicit_base_url(reader_dir: Path, stop: Path) -> Path | None:
-    """The ``baseUrl`` the nearest config writes, as a directory; ``None``
-    when it writes none. Only called once :func:`_config` read that config
-    without raising."""
-    current = reader_dir
-    while True:
-        present = [current / name for name in _CONFIG_NAMES if (current / name).is_file()]
-        if present:
-            data = json.loads(_strip_jsonc(present[0].read_text(encoding="utf-8")))
-            written = data.get("compilerOptions", {}).get("baseUrl")
-            return current / written if isinstance(written, str) else None
-        if current == stop or current.parent == current:
-            return None
-        current = current.parent
 
 
 def _stop_for(repo_dir: str) -> Path:
@@ -637,7 +690,11 @@ def resolve_specifier(
     ``None`` for a package, for anything the compiler and a runtime could read
     differently, and for anything that does not exist. The nearest
     ``tsconfig.json``/``jsconfig.json`` is looked for up to the root of the git
-    checkout holding ``repo_dir``.
+    checkout holding ``repo_dir``, and read with the options it inherits
+    through ``extends`` (:func:`_options`). A bare specifier resolves only
+    through ``paths`` (or an explicit ``baseUrl``, below), which both module
+    resolution modes try first, so classic resolution's directory walk never
+    changes an answer given here.
 
     Two readings are off unless asked for, since the key-constant
     resolution's candidate scans (:func:`enum_module_pattern`) do not account
@@ -649,6 +706,146 @@ def resolve_specifier(
     package, which only the caller can rule out.
     """
     return _resolve(reader_path, specifier, _stop_for(repo_dir), beside_declarations, base_url)
+
+
+#: Every config a project can compile with, not only the two names
+#: :func:`_config` looks for: `tsc -p tsconfig.app.json` is a Vite default.
+_ANY_CONFIG = re.compile(r"^[tj]sconfig.*\.jsonc?$", re.IGNORECASE)
+
+
+def names_package(reader_path: str, specifier: str, repo_dir: str) -> bool:
+    """Whether no compiler config can read bare ``specifier`` as anything but
+    a package.
+
+    Which config compiles a file is not decidable here (a solution config's
+    ``references``, a ``tsconfig.app.json`` beside the ``tsconfig.json``, a
+    nested config that may or may not be the one in use), so EVERY
+    ``tsconfig*.json`` and ``jsconfig*.json`` from the reader's directory up to
+    the checkout root is asked, with the options it inherits through
+    ``extends`` (:func:`_inheriting`). False when any of them has a ``paths``
+    pattern that fits the specifier, whether or not it names a file, or a file
+    under its ``baseUrl`` that answers it, and when any of them, or any config
+    it extends, cannot be read for certain: unparseable, delegating
+    (``references``) to another, or extending a package or a file outside the
+    checkout. Also False when a file answers the name in the reader's
+    directory or one above it, which is where classic module resolution looks.
+    """
+    if not specifier or specifier.startswith((".", "/", "#")):
+        return False
+    current = Path(reader_path).parent
+    stop = _stop_for(repo_dir)
+    try:
+        while True:
+            if _candidates(os.path.normpath(current / specifier)):
+                return False
+            for config in sorted(current.iterdir()):
+                if _ANY_CONFIG.match(config.name) and config.is_file() and _answers(config, specifier, stop):
+                    return False
+            if current == stop or current.parent == current:
+                return True
+            current = current.parent
+    except (_Unknown, OSError, UnicodeDecodeError, ValueError):
+        return False
+
+
+def _answers(config: Path, specifier: str, stop: Path) -> bool:
+    """Whether ``config`` can read ``specifier`` as a file; raises
+    :class:`_Unknown` when that cannot be told."""
+    options = _options(config, stop)
+    if options.targets(specifier) is not None:
+        return True
+    return options.base_url is not None and bool(_candidates(os.path.normpath(options.base_url / specifier)))
+
+
+#: The template TypeScript 5.5 replaces, at the start of a path option, with
+#: the directory of the config a project is compiled with.
+_CONFIG_DIR = "${configDir}"
+
+#: How many configs deep an ``extends`` chain is followed before it counts as
+#: unreadable.
+_EXTENDS_DEPTH = 16
+
+
+def _inheriting(config: Path, stop: Path, below: tuple[Path, ...], strict: bool = True) -> list[tuple[Path, dict]]:
+    """``config``'s ``compilerOptions`` and those of every config it
+    ``extends``, nearest first: the first that sets an option sets it.
+
+    An array ``extends`` merges left to right, so its last entry comes first.
+    Raises :class:`_Unknown` when any config in the chain cannot be read for
+    certain, delegates (``references``), or extends what :func:`_extended`
+    cannot follow, and on a cycle or a chain deeper than
+    :data:`_EXTENDS_DEPTH`. ``below`` is the chain that led here, so a base
+    two configs share is not taken for a cycle. Not ``strict``,
+    ``references``, a repeated key and U+2028/U+2029 are read past (see
+    :func:`_options`).
+    """
+    identity = config.resolve()
+    if identity in below or len(below) >= _EXTENDS_DEPTH:
+        raise _Unknown(str(config))
+    text = config.read_text(encoding="utf-8")
+    if strict and ("\u2028" in text or "\u2029" in text):
+        # The compiler ends a line comment there; `_strip_jsonc` does not.
+        raise _Unknown(str(config))
+    data = json.loads(_strip_jsonc(text), object_pairs_hook=_no_repeats if strict else None)
+    if not isinstance(data, dict) or (strict and "references" in data):
+        raise _Unknown(str(config))
+    options = data.get("compilerOptions", {})
+    extends = data.get("extends", [])
+    if isinstance(extends, str):
+        extends = [extends]
+    if (
+        not isinstance(options, dict)
+        or not isinstance(extends, list)
+        or not all(isinstance(e, str) for e in extends)
+    ):
+        raise _Unknown(str(config))
+    chain = [(config, options)]
+    for name in reversed(extends):
+        chain.extend(_inheriting(_extended(config, name, stop), stop, (*below, identity), strict))
+    return chain
+
+
+def _no_repeats(pairs: list[tuple[str, object]]) -> dict:
+    """A JSON object, refusing a repeated key: the compiler merges two
+    ``compilerOptions`` objects where a JSON reader keeps the last."""
+    data = dict(pairs)
+    if len(data) != len(pairs):
+        raise _Unknown("a repeated key")
+    return data
+
+
+def _extended(config: Path, name: str, stop: Path) -> Path:
+    """The config file ``config``'s ``extends`` entry ``name`` names.
+
+    Only a relative path is followed, as the compiler reads it: from
+    ``config``'s directory, with ``.json`` added when the name as written is
+    not a file and does not end in it. Anything else is a package, which lives
+    in a ``node_modules`` the checkout does not hold, or an absolute path; both
+    raise :class:`_Unknown`, as does a file that is missing or outside the
+    checkout.
+    """
+    spec = name.replace("\\", "/")
+    if not spec.startswith(("./", "../")):
+        raise _Unknown(name)
+    target = Path(os.path.normpath(config.parent / spec))
+    if not target.is_file() and not spec.endswith(".json"):
+        target = target.with_name(f"{target.name}.json")
+    if not target.is_file() or not target.resolve().is_relative_to(stop):
+        raise _Unknown(name)
+    return target
+
+
+def _in_force(chain: list[tuple[Path, dict]], option: str, default: object) -> tuple[object, Path | None]:
+    """The value of ``option`` the first config in ``chain`` to set it gives,
+    with that config; ``default`` and None when none sets it. An option set to
+    ``null`` raises :class:`_Unknown`: whether that clears an inherited value or
+    leaves it in force is not worth betting a deletion on."""
+    for config, options in chain:
+        if option in options:
+            if options[option] is None:
+                raise _Unknown(str(config))
+            return options[option], config
+    return default, None
 
 
 # --- what the reader binds --------------------------------------------------------
@@ -2258,22 +2455,18 @@ def _stem(path: str) -> str:
     return name[: len(name) - len(ext)] if ext else Path(name).stem
 
 
-def _alias_keys(config: Path) -> list[str]:
-    """The ``paths`` patterns of ``config``; none when it cannot resolve anything.
+def _alias_keys(config: Path, stop: Path) -> list[str]:
+    """The ``paths`` patterns in force for ``config``, its own or inherited
+    through ``extends``; none when it cannot resolve anything.
 
-    A config the resolver refuses to read (unparseable, or one that
-    ``extends`` another) resolves no alias at all, so its patterns cannot
-    lead a specifier to a file.
+    Read by :func:`_options`, not ``strict``: every alias the resolver
+    follows is here, and so is every alias :func:`_enum_escapes` may see
+    in a config the resolver refuses.
     """
     try:
-        data = json.loads(_strip_jsonc(config.read_text(encoding="utf-8")))
-    except (OSError, UnicodeDecodeError, ValueError):
+        return list(_options(config, stop, strict=False).paths)
+    except _Unknown:
         return []
-    if not isinstance(data, dict) or "extends" in data:
-        return []
-    options = data.get("compilerOptions", {})
-    paths = options.get("paths", {}) if isinstance(options, dict) else {}
-    return [key for key in paths if isinstance(key, str)] if isinstance(paths, dict) else []
 
 
 def enum_module_pattern(entries: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
@@ -2329,7 +2522,7 @@ def enum_module_pattern(entries: tuple[xk.KeyDeclaration, ...], repo_dir: str) -
             config = directory / name
             if not config.is_file():
                 continue
-            for key in _alias_keys(config):
+            for key in _alias_keys(config, stop):
                 prefix = key.split("*", 1)[0]
                 if not prefix:
                     return re.compile("")
@@ -2420,7 +2613,7 @@ def _enum_escapes(
         return []
     stop = _stop_for(repo_dir)
     resolved: dict[str, str | None] = {}
-    aliases: list[dict[str, list[str]] | None] = []
+    aliases: list[_Options | None] = []
 
     def module_named(spec: str | None) -> str | None:
         if not spec or "\n" in spec:
@@ -2431,14 +2624,15 @@ def _enum_escapes(
             else:
                 # Every string is asked, so the nearest config is read once:
                 # without a `paths` pattern that fits, nothing else resolves.
+                # Read leniently: a use is only ever over-attributed here, and
+                # an alias the fold refuses to follow still reaches the file.
                 if not aliases:
                     try:
-                        config = _config(Path(path).parent, stop)
+                        aliases.append(_config(Path(path).parent, stop, strict=False))
                     except _Unknown:
-                        config = None
-                    aliases.append(config[1] if config is not None else None)
-                fits = aliases[0] is not None and _alias(spec, aliases[0]) is not None
-                resolved[spec] = _resolve(path, spec, stop) if fits else None
+                        aliases.append(None)
+                fits = aliases[0] is not None and aliases[0].targets(spec) is not None
+                resolved[spec] = _resolve(path, spec, stop, strict=False) if fits else None
         module = resolved[spec]
         return module if module in by_module else None
 
@@ -3052,6 +3246,22 @@ def module_escapes(
     return found
 
 
+def constant_module_escapes(path: str, repo_dir: str) -> list[xk.Refusal]:
+    """Each use that hands the module declaring a key constant at ``path`` on
+    as an object, ``unsupported-form``: a namespace import or ``require`` of
+    it used as anything but ``ns.<export>`` or a type, any re-export of it but
+    a barrel's ``export * from`` (followed instead), a dynamic ``import()``,
+    ``import m = require(...)``, and every loader that can load it, found
+    through any specifier that can name it. Judged as a function wrapper's
+    module is (see :func:`flag_cleanup.wrapper_ts.handed_on`)."""
+    from flag_cleanup import wrapper_ts
+
+    return [
+        xk.Refusal(where, line, xk.UNSUPPORTED_FORM, text)
+        for where, line, text in wrapper_ts.handed_on(repo_dir, path)
+    ]
+
+
 def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:
     """Empty: a TS/JS key constant has no owner, so no owner can compete."""
     return set()
@@ -3069,6 +3279,7 @@ _PROFILE = xk.Profile(
     enum_unparsed_suffixes=source_index.COMPONENT_SUFFIXES,
     enum_unparsed_match=component_match,
     enum_unparsed_escapes=component_escapes,
+    module_escapes=constant_module_escapes,
 )
 for _language_name in ("ts", "tsx", "js"):
     xk.register(_language_name, _PROFILE)

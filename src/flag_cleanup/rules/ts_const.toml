@@ -115,14 +115,14 @@ enclosing_node = """(
        value: (call_expression
          function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                     (identifier) @sdk_fn]
-         arguments: (arguments . (string (string_fragment) @flag_name)))) .))
+         arguments: (arguments . (string . (string_fragment) @flag_name .)))) .))
    (program
      (lexical_declaration kind: "const" . (variable_declarator
        name: (identifier) @decl_name
        value: (call_expression
          function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                     (identifier) @sdk_fn]
-         arguments: (arguments . (string (string_fragment) @flag_name)))) .))] @scope
+         arguments: (arguments . (string . (string_fragment) @flag_name .)))) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@identifier")
 )"""
@@ -200,14 +200,14 @@ query = """(
       value: (call_expression
         function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                    (identifier) @sdk_fn]
-        arguments: (arguments . (string (string_fragment) @flag_name)))) .) @declaration)
+        arguments: (arguments . (string . (string_fragment) @flag_name .)))) .) @declaration)
    (program
     (lexical_declaration kind: "const" . (variable_declarator
       name: (identifier) @variable_name
       value: (call_expression
         function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                    (identifier) @sdk_fn]
-        arguments: (arguments . (string (string_fragment) @flag_name)))) .) @declaration)] @scope
+        arguments: (arguments . (string . (string_fragment) @flag_name .)))) .) @declaration)] @scope
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "declaration"
@@ -342,16 +342,16 @@ enclosing_node = """(
      [(lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string (string_fragment) @flag_name)) .)
+            value: (string . (string_fragment) @flag_name .)) .)
       (export_statement declaration: (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string (string_fragment) @flag_name)) .))])
+            value: (string . (string_fragment) @flag_name .)) .))])
    (statement_block
      (lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
-           value: (string (string_fragment) @flag_name)) .))] @scope
+           value: (string . (string_fragment) @flag_name .)) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -383,16 +383,16 @@ enclosing_node = """(
      [(lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string (string_fragment) @flag_name)) .)
+            value: (string . (string_fragment) @flag_name .)) .)
       (export_statement declaration: (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string (string_fragment) @flag_name)) .))])
+            value: (string . (string_fragment) @flag_name .)) .))])
    (statement_block
      (lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
-           value: (string (string_fragment) @flag_name)) .))] @scope
+           value: (string . (string_fragment) @flag_name .)) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -426,16 +426,16 @@ enclosing_node = """(
      [(lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string (string_fragment) @flag_name)) .)
+            value: (string . (string_fragment) @flag_name .)) .)
       (export_statement declaration: (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string (string_fragment) @flag_name)) .))])
+            value: (string . (string_fragment) @flag_name .)) .))])
    (statement_block
      (lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
-           value: (string (string_fragment) @flag_name)) .))] @scope
+           value: (string . (string_fragment) @flag_name .)) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -457,16 +457,16 @@ query = """(
      [(lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @variable_name
-            value: (string (string_fragment) @flag_name)) .) @declaration
+            value: (string . (string_fragment) @flag_name .)) .) @declaration
       (export_statement declaration: (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @variable_name
-            value: (string (string_fragment) @flag_name)) .)) @declaration])
+            value: (string . (string_fragment) @flag_name .)) .)) @declaration])
    (statement_block
      (lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @variable_name
-           value: (string (string_fragment) @flag_name)) .) @declaration)] @scope
+           value: (string . (string_fragment) @flag_name .)) .) @declaration)] @scope
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "declaration"

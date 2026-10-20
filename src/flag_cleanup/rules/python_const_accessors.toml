@@ -80,7 +80,7 @@ enclosing_node = """(
     (expression_statement
       (assignment
         left: (identifier) @decl_name
-        right: (string (string_content) @flag_name)))) @scope
+        right: (string (string_start) . (string_content) @flag_name . (string_end))))) @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""

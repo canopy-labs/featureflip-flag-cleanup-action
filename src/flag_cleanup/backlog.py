@@ -71,6 +71,7 @@ from flag_cleanup.github_ops import (
     GitHubEnv,
     UnsafeFlagKeyError,
     commit_is_contained,
+    default_branch,
     merged_removal,
     removal_branch,
     short_ref,
@@ -144,8 +145,13 @@ def outstanding_archives(
 
     Order follows :meth:`FeatureflipClient.unarchived_flag_keys`, so two runs
     over an unchanged project report in the same order and diff cleanly.
+
+    Only a merge into the base branch counts — ``base-branch`` when set, the
+    branch ``remove`` mode would have targeted, and otherwise the repository's
+    default branch, looked up once and only when there is a flag to ask about.
     """
     outstanding: list[OutstandingArchive] = []
+    base = config.base_branch.strip()
     for key in client.unarchived_flag_keys(config.org, config.project):
         try:
             branch = removal_branch(key)
@@ -158,7 +164,9 @@ def outstanding_archives(
             logger.debug("flag %s has no representable removal branch: %s", key, exc)
             continue
 
-        merged = merged_removal(gh, repo, branch)
+        if not base:
+            base = default_branch(gh, repo)
+        merged = merged_removal(gh, repo, branch, base=base)
         if merged is None:
             continue
 
@@ -382,14 +390,18 @@ def archive_outstanding(
 
     **Dependents are attempted before their prerequisites**, without knowing
     the graph up front: a flag refused for a dependent that is still waiting
-    its turn in this run goes to the back of the queue, once. So when traffic
-    has drained, one run archives both rather than taking two days.
+    its turn in this run goes to the back of the queue, and goes back again
+    for as long as something has been archived since its last turn. So when
+    traffic has drained, one run archives a whole chain rather than one link
+    per day, and a run that stops making progress still ends.
     """
     merged = set(merged_removals) if merged_removals is not None else {
         candidate.key for candidate in candidates
     }
     queue = deque(candidates)
-    requeued: set[str] = set()
+    # Each requeued key -> how many archives had landed when it was requeued.
+    requeued: dict[str, int] = {}
+    archived = 0
     results: list[ArchiveResult] = []
     while queue:
         candidate = queue.popleft()
@@ -425,13 +437,14 @@ def archive_outstanding(
             continue
         except FlagHasDependentsError as exc:
             waiting = {queued.key for queued in queue}
-            if candidate.key not in requeued and any(
+            if requeued.get(candidate.key, -1) < archived and any(
                 dependent in waiting for dependent in exc.dependents
             ):
                 # A dependent has not had its turn yet. Archive it first, then
-                # come back — once, so a cycle the platform should never allow
+                # come back — but only if an archive has landed since this
+                # flag's last turn, so a cycle the platform should never allow
                 # still cannot loop here.
-                requeued.add(candidate.key)
+                requeued[candidate.key] = archived
                 queue.append(candidate)
                 continue
             if all(dependent in merged for dependent in exc.dependents):
@@ -488,6 +501,7 @@ def archive_outstanding(
             continue
 
         logger.info("archived outstanding flag %s (%s)", candidate.key, opened)
+        archived += 1
         results.append(
             ArchiveResult(
                 action_taken="archived",

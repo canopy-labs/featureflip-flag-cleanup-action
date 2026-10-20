@@ -26,7 +26,8 @@ verbatim off the shipped contract, not a guess.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+import re
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -131,17 +132,80 @@ class FlagHasDependentsError(FeatureflipApiError):
         self.dependents = dependents
 
 
+#: What a token must look like to travel in an ``Authorization`` header:
+#: printable ASCII, no whitespace. Anything else fails inside the HTTP layer
+#: with a message that quotes the whole header value — the token with it.
+_SENDABLE_TOKEN_RE = re.compile(r"\A[\x21-\x7e]+\Z")
+
+
+def token_is_sendable(token: str) -> bool:
+    """Whether ``token`` can be sent as ``Authorization: Bearer <token>``.
+
+    Checked BEFORE any request, because the failure otherwise is
+    ``LocalProtocolError: Illegal header value b'Bearer <token>'``: the bytes
+    repr escapes a newline, so a two-line secret lands whole on the first line
+    of the message, and every path that reports a failure — the log, the
+    traceback, a pull request comment where log masking does not apply —
+    prints it. A caller that refuses must not echo the value either.
+    """
+    return _SENDABLE_TOKEN_RE.match(token) is not None
+
+
+class _BearerAuth(httpx.Auth):
+    """``Authorization: Bearer <token>`` as the client's auth, not a header.
+
+    A per-request header is not enough: when the base URL carries
+    ``user:password@`` and no auth is configured, httpx builds ``BasicAuth``
+    from the userinfo, and that OVERWRITES an explicit ``Authorization``
+    header. The token was then never sent, every call was refused, and the
+    error blamed the token. Configured auth takes precedence over userinfo.
+    """
+
+    def __init__(self, token: str) -> None:
+        self._header = f"Bearer {token}"
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = self._header
+        yield request
+
+
+def _redirect_detail(response: httpx.Response) -> str:
+    """Name a 3xx and where it points, or ``""`` when ``response`` is not one.
+
+    httpx does not follow redirects and does not count a 3xx as an error, so
+    without this an ``http://`` api-url that redirects to https surfaced as "a
+    200 whose body is not JSON" — nowhere near the fix. Not followed here
+    either: the fix is the configured URL, and saying so beats quietly paying
+    a round trip on every request. The target goes through
+    :func:`without_userinfo` like every other URL this module prints.
+    """
+    if not 300 <= response.status_code < 400:
+        return ""
+    location = response.headers.get("Location")
+    where = f" to {without_userinfo(location)}" if location else ""
+    return (
+        f" That is a redirect{where}, which this Action does not follow: set "
+        "FEATUREFLIP_API_URL to the address the API is actually served from."
+    )
+
+
 def _raise_for_status_without_credentials(response: httpx.Response) -> None:
     """``raise_for_status`` with the URL's userinfo stripped from the message.
 
     Also turns the most likely first-run failure — a wrong or expired
     ``FEATUREFLIP_API_TOKEN`` — into a sentence that says so, rather than a
-    bare httpx traceback.
+    bare httpx traceback, and a 3xx into a redirect report rather than a
+    complaint about the body.
     """
+    safe_url = without_userinfo(str(response.request.url))
+    redirect = _redirect_detail(response)
+    if redirect:
+        raise FeatureflipApiError(
+            f"Featureflip API returned {response.status_code} for {safe_url}.{redirect}"
+        )
     if not response.is_error:
         return
 
-    safe_url = without_userinfo(str(response.request.url))
     if response.status_code in (401, 403):
         hint = (
             " Check FEATUREFLIP_API_TOKEN is a current token with access to "
@@ -405,8 +469,17 @@ class FeatureflipClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self._api_token = api_token
-        self._client = httpx.Client(base_url=api_url.rstrip("/"), transport=transport)
+        if not token_is_sendable(api_token):
+            # The value is deliberately not in the message: see
+            # `token_is_sendable`.
+            raise FeatureflipApiError(
+                "FEATUREFLIP_API_TOKEN contains whitespace, a control character or "
+                "a non-ASCII character, so it cannot be sent in an Authorization "
+                "header. The value is not shown."
+            )
+        self._client = httpx.Client(
+            base_url=api_url.rstrip("/"), transport=transport, auth=_BearerAuth(api_token)
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -425,14 +498,13 @@ class FeatureflipClient:
         against and why each stops the walk rather than raising. ``endpoint``
         names the route in those warnings.
         """
-        headers = {"Authorization": f"Bearer {self._api_token}"}
         cursor: str | None = None
         seen_cursors: set[str] = set()
         for _ in range(MAX_PAGES):
             query = dict(params)
             if cursor is not None:
                 query["cursor"] = cursor
-            response = self._client.get(path, params=query, headers=headers)
+            response = self._client.get(path, params=query)
             _raise_for_status_without_credentials(response)
             try:
                 payload = response.json()
@@ -505,51 +577,52 @@ class FeatureflipClient:
         path = _REMOVAL_CANDIDATES_PATH.format(
             org=quote(org, safe=""), project=quote(project, safe="")
         )
-        for payload in self._pages(path, {"staleness": staleness}, "removal-candidates"):
-            for item in payload.get("items") or []:
-                yield Candidate(
-                    key=_require_str(item, "key"),
-                    reason=_require_str(item, "reason"),
-                    treatment=_require_bool(item.get("treatment"), item.get("key")),
-                    status=_require_str(item, "status"),
-                    blocked_by=_require_str_list(item, "blockedBy"),
-                )
+        for item in self._page_items(path, {"staleness": staleness}, "removal-candidates"):
+            yield Candidate(
+                key=_require_str(item, "key"),
+                reason=_require_str(item, "reason"),
+                treatment=_require_bool(item.get("treatment"), item.get("key")),
+                status=_require_str(item, "status"),
+                blocked_by=_require_str_list(item, "blockedBy"),
+            )
 
-    def _flag_items(self, org: str, project: str, params: dict[str, str]) -> Iterator[dict]:
-        """Yield each item from the flags list endpoint, page shapes validated.
+    def _page_items(self, path: str, params: dict[str, str], endpoint: str) -> Iterator[dict]:
+        """Yield each item from a paged list endpoint, page shapes validated.
 
         A page without ``items`` is refused rather than read as empty: the
-        silent alternative is a project that appears to have no flags, which
-        for :meth:`flag_keys` turns the registry prong off for every flag with
-        no warning, and for :meth:`unarchived_flag_keys` reads as "the backlog
-        is empty" — the exact false clean bill of health that mode exists to
-        stop giving.
+        silent alternative is an empty answer nobody can tell from a real one.
+        For :meth:`removal_candidates` that is "0 candidates, nothing to do"
+        and a green run; for :meth:`flag_keys` it turns the registry prong off
+        for every flag with no warning, and for :meth:`unarchived_flag_keys`
+        it reads as "the backlog is empty" — the exact false clean bill of
+        health that mode exists to stop giving. ``"items": null`` is the one
+        empty reading kept, because the contract declares the field nullable.
 
         EVERY malformed page shape is refused as :class:`FeatureflipApiError`,
         and that type is the whole point. ``orchestrate.fetch_known_flag_keys``
         catches ``FeatureflipApiError``/``httpx.HTTPError`` and degrades to an
         empty sibling list — the run continues, the registry prong switches
-        itself off, the caveat says so. Anything else escapes and ABORTS the
-        run, which is a far worse outcome for a page this Action only ever uses
-        as optional evidence: a non-JSON body used to raise
-        ``json.JSONDecodeError`` (guarded in :meth:`_pages`), ``"items": 5``
-        ``TypeError`` from iterating an int, and ``"items": ["x"]``
-        ``AttributeError`` from ``_require_str``'s ``item.get``.
+        itself off, the caveat says so — and ``__main__`` renders it as one
+        sentence and exit 1. Anything else escapes as a traceback: a non-JSON
+        body used to raise ``json.JSONDecodeError`` (guarded in
+        :meth:`_pages`), ``"items": 5`` ``TypeError`` from iterating an int,
+        and ``"items": ["x"]`` ``AttributeError`` from ``_require_str``'s
+        ``item.get``.
         """
-        path = _FLAGS_PATH.format(org=quote(org, safe=""), project=quote(project, safe=""))
-        for payload in self._pages(path, params, "flags"):
+        for payload in self._pages(path, params, endpoint):
             if not isinstance(payload, dict) or "items" not in payload:
                 raise FeatureflipApiError(
-                    "flags returned a page without `items`. The endpoint contract "
-                    "this Action is built against is frozen, so a response that "
-                    "does not match it is refused rather than guessed at"
+                    f"{endpoint} returned a page without `items`. The endpoint "
+                    "contract this Action is built against is frozen, so a "
+                    "response that does not match it is refused rather than "
+                    "guessed at"
                 )
             items = payload["items"]
             if items is None:
                 continue
             if not isinstance(items, list):
                 raise FeatureflipApiError(
-                    f"flags returned an `items` that is not a list ({items!r}). "
+                    f"{endpoint} returned an `items` that is not a list ({items!r}). "
                     "The endpoint contract this Action is built against is "
                     "frozen, so a response that does not match it is refused "
                     "rather than guessed at"
@@ -557,12 +630,17 @@ class FeatureflipClient:
             for item in items:
                 if not isinstance(item, dict):
                     raise FeatureflipApiError(
-                        f"flags returned an `items` entry that is not an object "
+                        f"{endpoint} returned an `items` entry that is not an object "
                         f"({item!r}). The endpoint contract this Action is built "
                         "against is frozen, so a response that does not match it "
                         "is refused rather than guessed at"
                     )
                 yield item
+
+    def _flag_items(self, org: str, project: str, params: dict[str, str]) -> Iterator[dict]:
+        """Yield each item from the flags list endpoint; see :meth:`_page_items`."""
+        path = _FLAGS_PATH.format(org=quote(org, safe=""), project=quote(project, safe=""))
+        return self._page_items(path, params, "flags")
 
     def flag_keys(self, org: str, project: str) -> frozenset[str]:
         """Every flag key in the project, live AND archived.
@@ -664,9 +742,7 @@ class FeatureflipClient:
             # 404 against a resource nobody asked for.
             flag=quote(key, safe=""),
         )
-        response = self._client.post(
-            path, headers={"Authorization": f"Bearer {self._api_token}"}
-        )
+        response = self._client.post(path)
         if response.status_code == 204:
             return
 
@@ -710,7 +786,8 @@ class FeatureflipClient:
                 raise FlagHasDependentsError(message, key=key, dependents=dependents)
             raise FeatureflipApiError(message)
         raise FeatureflipApiError(
-            f"Featureflip API returned {response.status_code} for {safe_url}.{suffix}"
+            f"Featureflip API returned {response.status_code} for {safe_url}."
+            f"{_redirect_detail(response)}{suffix}"
         )
 
     def set_removal_pr(self, org: str, project: str, key: str, url: str) -> None:
@@ -727,11 +804,7 @@ class FeatureflipClient:
             project=quote(project, safe=""),
             flag=quote(key, safe=""),
         )
-        response = self._client.put(
-            path,
-            headers={"Authorization": f"Bearer {self._api_token}"},
-            json={"url": url},
-        )
+        response = self._client.put(path, json={"url": url})
         if response.status_code == 204:
             return
 
@@ -746,5 +819,6 @@ class FeatureflipClient:
             )
         safe_url = without_userinfo(str(response.request.url))
         raise FeatureflipApiError(
-            f"Featureflip API returned {response.status_code} for {safe_url}.{suffix}"
+            f"Featureflip API returned {response.status_code} for {safe_url}."
+            f"{_redirect_detail(response)}{suffix}"
         )

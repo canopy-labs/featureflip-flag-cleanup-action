@@ -151,6 +151,49 @@ def references(
     return [], refused
 
 
+#: A member access after a name: ``FeatureKeys.Other`` reads ``Other`` alone.
+_MEMBER_AFTER = r"(?!\s*\.\s*[^\W\d])"
+
+
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each spelling in ``path`` of a type that
+    takes the owner of one of ``constants`` whole, from which reflection reads
+    any constant without spelling one: the owner, a type of its chain, a
+    repository type deriving from it, or a global or project alias of one
+    (:func:`cross_file_csharp.whole_owner_names`).
+
+    Judged by tokens, as :func:`references` is: any spelling not followed by a
+    member access counts (``typeof(FeatureKeys)``, VB's
+    ``GetType(FeatureKeys)``, F#'s ``typeof<FeatureKeys>``, XAML's
+    ``{x:Type local:FeatureKeys}``, ``"Shop.Flags.FeatureKeys"``), so a file
+    that only reads another constant (``FeatureKeys.Other``) does not. A
+    comment or an unrelated type of the same name counts too: the cost is a
+    declaration kept. VB is matched in any case."""
+    from flag_cleanup import cross_file_csharp
+
+    names = cross_file_csharp.whole_owner_names(constants, repo_dir)
+    if not names:
+        return []
+    flags = re.IGNORECASE if path.lower().endswith(CASE_INSENSITIVE_SUFFIXES) else 0
+    pattern = re.compile(xk.mention_pattern(names).pattern + _MEMBER_AFTER, flags)
+    folded: dict[str, set[str]] = names
+    if flags:
+        folded = {}
+        for name, held in names.items():
+            folded.setdefault(name.lower(), set()).update(held)
+    lines = source.splitlines()
+    found: set[tuple[str, xk.Refusal]] = set()
+    for hit in pattern.finditer(source):
+        line = source.count("\n", 0, hit.start()) + 1
+        text = lines[line - 1].strip() if line <= len(lines) else ""
+        spelled = hit.group(0).lower() if flags else hit.group(0)
+        for holder in folded.get(spelled, ()):
+            found.add((holder, xk.Refusal(path, line, xk.UNSUPPORTED_FORM, text)))
+    return sorted(found, key=lambda h: (h[0], h[1].line))
+
+
 def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaration]:
     return []
 
@@ -171,5 +214,7 @@ xk.register(
         references=references,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
+        # Asked by the C# profile for the guest files it reaches.
+        constant_escapes=constant_escapes,
     ),
 )

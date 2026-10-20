@@ -223,14 +223,39 @@ class Profile:
     enum_module_pattern: (
         Callable[[tuple[KeyDeclaration, ...], str], re.Pattern[str]] | None
     ) = None
-    #: Suffixes of files that can use an enum's file but that no profile
-    #: reads as a whole (TypeScript's: Vue, Svelte and Astro components), from
+    #: ``(path, source, constants, repo_dir)``: for a language whose module or
+    #: owner is a value a file can hand on or reflect over (Python's module,
+    #: a PHP, Java or Kotlin class), ``(declaring file, refusal)`` at each
+    #: place in ``path`` that reaches the file declaring one of ``constants``
+    #: as a whole, where a constant can be read without its name being
+    #: spelled. Each keeps every declaration of that file. Asked of every file
+    #: of the family the scan finds, including one that spells no constant's
+    #: name, which is never asked :attr:`references` about it, and of every
+    #: file a :attr:`reaches` language's profile judges, through that
+    #: profile's own hook (a Kotlin file reflecting over a Java owner). The
+    #: declaring file is asked too, about its own constants as well: an owner
+    #: reflecting over itself (``self::class`` in the owner,
+    #: ``Keys.class.getFields()`` inside ``Keys``) spells none of them.
+    constant_escapes: (
+        Callable[[str, str, tuple[KeyDeclaration, ...], str], list[tuple[str, Refusal]]] | None
+    ) = None
+    #: ``(constants, repo_dir)``: what a file's text holds when it can reach
+    #: the file declaring one of ``constants`` as a whole, however it spells
+    #: the import. Set with :attr:`constant_escapes`.
+    constant_module_pattern: (
+        Callable[[tuple[KeyDeclaration, ...], str], re.Pattern[str]] | None
+    ) = None
+    #: Suffixes of files that can use an enum's file or a constant but that
+    #: no profile reads as a whole (TypeScript's: Vue, Svelte and Astro
+    #: components and MDX documents), from
     #: :data:`~flag_cleanup.source_index.COMPONENT_SUFFIXES`. Listed for the
     #: escape scan alone and never transformed. Such a file whose text names
     #: an enum, or that :attr:`enum_module_pattern` finds for the enum's
     #: file, refuses every entry of that enum, unread, wherever
     #: :attr:`enum_unparsed_match` counts the text, and wherever
     #: :attr:`enum_unparsed_escapes` finds an escape in the code it can read.
+    #: One whose text spells a constant's name anywhere keeps that
+    #: constant's declaration, ``unsupported-form`` at the first such line.
     enum_unparsed_suffixes: frozenset[str] = frozenset()
     #: ``(path, source, patterns)``: the offset of the first place in such a
     #: file where one of ``patterns`` can mean a use, or None. Unset, any
@@ -275,6 +300,16 @@ class Profile:
     #: findings set aside as :attr:`Resolution.home_findings` instead of
     #: keeping the file.
     home_constant_names: Callable[[str, str, str], set[str]] | None = None
+    #: ``(path, repo_dir)``: for a language whose module is a value a file
+    #: can hand on whole (TypeScript's), a refusal at each use, anywhere,
+    #: that hands the module declaring a constant at ``path`` on as an
+    #: object. That object reaches the constant by a name no scan sees
+    #: (``Object.values(K)``, ``K[name]``), so each keeps every constant the
+    #: file declares. Its readers still fold. None for a language whose
+    #: constants are reached only by name. Unlike :attr:`constant_escapes`,
+    #: which judges one file at a time, this walks the checkout itself, so it
+    #: can follow a module through others that re-export it (a TS barrel).
+    module_escapes: Callable[[str, str], list[Refusal]] | None = None
 
 
 class DeclarationsUnreadable(Exception):
@@ -651,7 +686,7 @@ def resolve(
             entry_refusals.extend(found)
             if profile.home_constant_names is not None and any(not r.entry for r in found):
                 findings_in[resolved] = profile.home_constant_names(resolved, source, flag_key)
-    home = _unnamed_elsewhere(repo_dir, findings_in)
+    home = _unnamed_elsewhere(repo_dir, findings_in, profile)
     home_findings = tuple(r for r in entry_refusals if r.path in home and not r.entry)
     entry_refusals = [r for r in entry_refusals if r not in home_findings]
     # A constant finding at its own declaration keeps that file, when kept
@@ -729,7 +764,12 @@ def resolve(
         if escapes_of and profile.enum_module_pattern is not None
         else None
     )
-    unparsed = profile.enum_unparsed_suffixes if escapes_of else frozenset()
+    # Or a constant's module, without spelling the constant: `use(keys)`.
+    constants_of = tuple(d for d in unique if d.kind == CONSTANT) if profile.constant_escapes else ()
+    if constants_of and profile.constant_module_pattern is not None:
+        whole = profile.constant_module_pattern(constants_of, repo_dir)
+        also = whole if also is None else re.compile(f"(?:{also.pattern})|(?:{whole.pattern})")
+    unparsed = profile.enum_unparsed_suffixes
     # Ignored build output included: a competing declaration there still
     # decides which constant a tracked reader gets. Its own mentions are
     # skipped below.
@@ -757,9 +797,24 @@ def resolve(
     )
     spells_a_name = mention_pattern(names | judged_owners)
     spells_a_name_folded = re.compile(spells_a_name.pattern, re.IGNORECASE)
+    live_constants = [d for d in live if d.kind == CONSTANT]
+    spells_a_constant = mention_pattern({d.name for d in live_constants})
     for path, source in sources.items():
         if unparsed and Path(path).suffix in unparsed:
-            continue  # never rewritten: the escape scan below refuses a read in it
+            # Never rewritten, and never read by `references`: a constant it
+            # spells, in its code or its markup (an auto-import binds one
+            # unwritten), is a read no fold reaches. The escape scan below
+            # refuses an enum's.
+            if live_constants and path not in ignored:
+                hit = spells_a_constant.search(source) if source is not None else None
+                if source is None:
+                    refusals.append(Refusal(path, 1, UNSUPPORTED_FORM, ""))
+                    blocked |= {d.path for d in live_constants}
+                elif hit is not None:
+                    line = source.count("\n", 0, hit.start()) + 1
+                    refusals.append(Refusal(path, line, UNSUPPORTED_FORM, source.split("\n")[line - 1].strip()))
+                    blocked |= spelled_in(source, path)
+            continue
         spells = spells_a_name_folded if _case_insensitive(path) else spells_a_name
         if source is not None and not spells.search(source):
             continue
@@ -812,6 +867,28 @@ def resolve(
         if refused:
             refusals.extend(refused)
             blocked |= spelled_in(source, path)
+    constants = tuple(d for d in live if d.kind == CONSTANT)
+    if constants and profile.constant_escapes is not None:
+        for path, source in sorted(sources.items()):
+            escapes = _escape_hook(profile, path, family_extensions)
+            if source is None or path in ignored or escapes is None:
+                continue
+            # The declaring file included: an owner that reflects over itself
+            # (`self::class`, `Keys.class.getFields()`) spells no constant's
+            # name, so the in-file check never sees it.
+            for holder, escape in escapes(path, source, constants, repo_dir):
+                blocked.add(holder)
+                if escape not in refusals:
+                    refusals.append(escape)
+    if constants and profile.module_escapes is not None:
+        # A refusal a reader already gave on the same line is this escape.
+        refused_at = {(r.path, r.line) for r in refusals if not r.entry}
+        for path in sorted({d.path for d in constants}):
+            for escape in profile.module_escapes(path, repo_dir):
+                blocked.add(path)
+                if (escape.path, escape.line) not in refused_at:
+                    refused_at.add((escape.path, escape.line))
+                    refusals.append(escape)
     notes: list[Refusal] = []
     entries = tuple(d for d in live if d.kind == ENUM_ENTRY)
     if entries and profile.enum_escapes is not None:
@@ -872,8 +949,11 @@ def resolve(
     )
 
 
-def _unnamed_elsewhere(repo_dir: str, names_by_file: dict[str, set[str]]) -> set[str]:
-    """The files of ``names_by_file`` whose names no other file spells.
+def _unnamed_elsewhere(
+    repo_dir: str, names_by_file: dict[str, set[str]], profile: Profile | None = None
+) -> set[str]:
+    """The files of ``names_by_file`` whose names no other file spells, and
+    that no other file reaches whole (:attr:`Profile.constant_escapes`).
 
     Any other file in the checkout counts, in any language, ignored ones
     included, and so does one that cannot be read: a file counted here when
@@ -895,6 +975,26 @@ def _unnamed_elsewhere(repo_dir: str, names_by_file: dict[str, set[str]]) -> set
             hit != path and (text is None or token.search(text)) for hit, text in spelled.items()
         ):
             home.add(path)
+    if home and profile is not None and profile.constant_escapes is not None:
+        # `use(keys)` reads every constant of `keys` spelling none. A profile
+        # with constant escapes keys a module by its file.
+        held = tuple(
+            KeyDeclaration(path, name, None, path) for path in sorted(home) for name in sorted(names_by_file[path])
+        )
+        family = tuple(ext for lang in profile.language_family for ext in _extensions(lang))
+        whole = profile.constant_module_pattern(held, repo_dir) if profile.constant_module_pattern else None
+        for hit in mention_files(repo_dir, (), exclude=(), with_ignored=True, also=whole) if whole else ():
+            visible = tuple(d for d in held if d.path != hit and d.path in home)
+            escapes = _escape_hook(profile, hit, family)
+            if escapes is None or not visible:
+                continue
+            text = spelled.get(hit)
+            if text is None:
+                try:
+                    text = Path(hit).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue  # unreadable: the name scan above already found it
+            home -= {holder for holder, _ in escapes(hit, text, visible, repo_dir)}
     return home
 
 
@@ -1078,6 +1178,17 @@ def report_uncovered(
         deletable=resolution.deletable - blocked,
         blocked=frozenset(blocked),
     )
+
+
+def _escape_hook(profile: Profile, path: str, family: tuple[str, ...]):
+    """The :attr:`Profile.constant_escapes` that judges ``path`` for
+    ``profile``'s constants: its own for a file of its family, else that of the
+    guest profile reaching ``path`` (a Razor view or a VB file for C#, a Twig
+    template for PHP), if any."""
+    if path.endswith(family):
+        return profile.constant_escapes
+    guest = _reaching_profile(profile, path)
+    return guest.constant_escapes if guest is not None else None
 
 
 def _reaching_profile(profile: Profile, path: str) -> Profile | None:

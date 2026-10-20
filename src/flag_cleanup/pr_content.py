@@ -166,7 +166,9 @@ REPORTED_BINDING_KINDS = frozenset(
         "module marker",
         "unread parameter",
         "unread member",
+        "unread constructor parameter",
         "removed parameter",
+        "removed member",
         "changed constructor",
         "kept argument local",
         "unread binding",
@@ -288,8 +290,8 @@ def _removed_constructor_lines(
     lines = [
         f"> **{count} {noun} removed.** Every read of "
         f"{'it' if count == 1 else 'them'} was a flag read this pull request "
-        "removed, so the parameter and the argument each caller passed for it "
-        "were deleted:",
+        "removed, or an assignment to a private field removed with it, so the "
+        "parameter and the argument each caller passed for it were deleted:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -308,6 +310,29 @@ def _removed_constructor_lines(
             "",
         ]
     return lines
+
+
+def _removed_member_lines(removed: list[tuple[str, str]]) -> list[str]:
+    """The note naming each private field this pull request removed, or nothing.
+
+    Not a warning: nothing the deletion skipped could do work. See
+    :mod:`~flag_cleanup.ts_field_removal`.
+    """
+    if not removed:
+        return []
+    count = len(removed)
+    noun = "private field was" if count == 1 else "private fields were"
+    return [
+        f"> **{count} {noun} removed.** Every read of "
+        f"{'it' if count == 1 else 'them'} was a flag read this pull request "
+        "removed, and nothing its deletion skips can do work: its initializer, "
+        "if any, is a literal, a name or a property access, and the only thing "
+        "writing it was a constructor statement, deleted with it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
 
 
 def _kept_argument_local_lines(kept: list[tuple[str, str]]) -> list[str]:
@@ -340,8 +365,8 @@ def _unread_member_lines(unread: list[tuple[str, str]]) -> list[str]:
 
     The TypeScript family's counterpart of :func:`_unread_parameter_lines`,
     and next to it for the same reason: under ``noUnusedLocals`` it fails
-    ``tsc``. See :mod:`~flag_cleanup.ts_unread_members` for why it is not
-    removed.
+    ``tsc``. See :mod:`~flag_cleanup.ts_field_removal` and
+    :mod:`~flag_cleanup.ctor_param_ts` for when one is removed instead.
     """
     if not unread:
         return []
@@ -356,8 +381,42 @@ def _unread_member_lines(unread: list[tuple[str, str]]) -> list[str]:
         f"{'It was' if count == 1 else 'They were'} left in place because "
         "removing a constructor parameter property changes the constructor "
         "that every `new` and every dependency-injection registration of the "
-        "class calls, and a field's initializer may do work. Remove "
+        "class calls, and not every caller could be proven, or because a "
+        "field's initializer may do work or something other than a "
+        "constructor parameter assigns it. Remove "
         f"{'it' if count == 1 else 'each'}, with any argument callers pass for "
+        "it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_constructor_parameter_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each plain TypeScript or JavaScript constructor
+    parameter this pull request left unread, or nothing.
+
+    Usually a subclass's: its ``super(…)`` passed the parameter on, and lost
+    that argument when the base class's parameter was removed. Next to the
+    private members for the same reason, though it fails ``tsc`` only under
+    ``noUnusedParameters``. See :func:`flag_cleanup.ctor_param_ts.plan_parameter`
+    for when one is removed instead.
+    """
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "parameter is" if count == 1 else "parameters are"
+    return [
+        f"> **⚠️ {count} constructor {noun} no longer read.** Every read was "
+        "removed by this pull request: a flag read, or the argument a "
+        "`super(…)` call passed on to a parameter removed from the base class. "
+        "With `noUnusedParameters` on, `tsc` now reports it (TS6133), and "
+        "ESLint's `no-unused-vars` does when it is the last parameter. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        "removing a parameter changes the constructor that every `new` of the "
+        "class calls, and not every caller could be proven. Remove "
+        f"{'it' if count == 1 else 'each'}, with the argument callers pass for "
         "it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
@@ -491,7 +550,9 @@ def pr_body(
     ``"unread parameter"`` entries, which name a C# parameter left in place
     that the build may now reject (see :func:`_unread_parameter_lines`), its
     ``"unread member"`` entries, the TypeScript family's counterpart (see
-    :func:`_unread_member_lines`), and the family's ``"unread binding"`` and
+    :func:`_unread_member_lines`), its ``"unread constructor parameter"``
+    entries, a plain parameter the family's run left unused (see
+    :func:`_unread_constructor_parameter_lines`), and the family's ``"unread binding"`` and
     ``"emptied override"`` entries (see :func:`_unread_binding_lines` and
     :func:`_emptied_override_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
 
@@ -740,8 +801,14 @@ def pr_body(
     unread_members = [
         (path, text) for path, kind, text in bindings if kind == "unread member"
     ]
+    unread_constructor_parameters = [
+        (path, text) for path, kind, text in bindings if kind == "unread constructor parameter"
+    ]
     removed_parameters = [
         (path, text) for path, kind, text in bindings if kind == "removed parameter"
+    ]
+    removed_members = [
+        (path, text) for path, kind, text in bindings if kind == "removed member"
     ]
     changed_constructors = [
         (path, text) for path, kind, text in bindings if kind == "changed constructor"
@@ -758,6 +825,8 @@ def pr_body(
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
     lines += _unread_member_lines(unread_members)
+    lines += _unread_constructor_parameter_lines(unread_constructor_parameters)
+    lines += _removed_member_lines(removed_members)
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_binding_lines(unread_bindings)
@@ -1049,8 +1118,10 @@ def pr_body(
 #: Not refusals: what became of a keyless wrapper (see `wrapper_inline`).
 _WRAPPER_STATUSES = ("complete", "partial")
 #: Not refusals either: a sibling implementation deleted with a complete
-#: wrapper. Grouped with the refusals, and told apart from them on rendering.
-_WRAPPER_NOTES = ("sibling",)
+#: wrapper, a doc comment's reference to it rewritten to plain text, and what
+#: the C# residue pass did with what the family left behind. Grouped with
+#: the refusals, and told apart from them on rendering.
+_WRAPPER_NOTES = ("sibling", "doc-reference", "residue", "residue-kept", "residue-prose")
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER)
 
@@ -1097,7 +1168,7 @@ def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list
     if inlined:
         partial = sum(1 for status, _ in inlined.values() if status[2] == "partial")
         siblings = any(
-            r[2] in _WRAPPER_NOTES
+            r[2] == "sibling"
             for status, rows in inlined.values()
             if status[2] == "complete"
             for r in rows
@@ -1128,9 +1199,7 @@ def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list
                     f"> - {_md_code(label)} ({_md_code(f'{path}:{line}')}) — complete: "
                     "every caller folded, and the member deleted."
                 )
-                if notes:
-                    lines.append(">   Sibling implementations, each deleted with it:")
-                    lines += [f">   - {_md_code(f'{p}:{n}')} — {_one_line(t)}" for p, n, _, t, _ in notes]
+                lines += _residue_lines(notes)
                 continue
             lines.append(
                 f"> - {_md_code(label)} ({_md_code(f'{path}:{line}')}) — partial: kept, "
@@ -1170,6 +1239,46 @@ def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list
     return lines
 
 
+def _residue_lines(notes: list[tuple[str, int, str, str, str]]) -> list[str]:
+    """A complete wrapper's notes: its siblings, the doc comments rewritten
+    to plain text, then what the family left behind, removed or kept, and
+    the prose still naming what went."""
+    lines: list[str] = []
+
+    def listed(rows: list) -> list[str]:
+        out = [f">   - {_md_code(f'{p}:{n}')} — {_one_line(t)}" for p, n, _, t, _ in rows[:20]]
+        return out + ([f">   - ...and {len(rows) - 20} more"] if len(rows) > 20 else [])
+
+    siblings = [r for r in notes if r[2] == "sibling"]
+    if siblings:
+        lines.append(">   Sibling implementations, each deleted with it:")
+        lines += listed(siblings)
+    documented = [r for r in notes if r[2] == "doc-reference"]
+    if documented:
+        lines.append(">   Doc comments that referred to it, now plain text (check the prose around each still holds):")
+        lines += [f">   - {_md_code(f'{p}:{n}')} — {_md_code(_one_line(t))}" for p, n, _, t, _ in documented]
+    removed = [r for r in notes if r[2] == "residue"]
+    if removed:
+        lines.append(
+            ">   What the family left behind, removed with it (a `changed constructor` "
+            "can no longer be called with the argument it dropped):"
+        )
+        lines += listed(removed)
+    kept = [r for r in notes if r[2] == "residue-kept"]
+    if kept:
+        lines.append(
+            ">   What the family left behind was kept (the empty interface, the "
+            "member-less classes, their registrations and the constructor "
+            "parameters taking the interface build as they are), because:"
+        )
+        lines += [f">   - {_md_code(f'{p}:{n}')} — {_one_line(t)}" for p, n, _, t, _ in kept]
+    prose = [r for r in notes if r[2] == "residue-prose"]
+    if prose:
+        lines.append(">   Comments and documents still naming a type this deleted (the prose may be stale):")
+        lines += listed(prose)
+    return lines
+
+
 def note_wrapper_findings(findings: tuple[tuple[str, int, str, str, str], ...]) -> None:
     """Log what became of each keyless wrapper, one line each.
 
@@ -1188,13 +1297,26 @@ def note_wrapper_findings(findings: tuple[tuple[str, int, str, str, str], ...]) 
                 "%s: not inlined (%s) at %s:%d", label, first[2], first[0], first[1]
             )
         elif status[2] == "complete":
+            siblings = [r for r in notes if r[2] == "sibling"]
+            documented = [r for r in notes if r[2] == "doc-reference"]
             logger.warning(
-                "%s: complete — inlined at its call sites and deleted%s",
+                "%s: complete — inlined at its call sites and deleted%s%s",
                 label,
-                (" (siblings: " + "; ".join(f"{p}:{n} {_one_line(t)}" for p, n, _, t, _ in notes) + ")")
-                if notes
+                (" (siblings: " + "; ".join(f"{p}:{n} {_one_line(t)}" for p, n, _, t, _ in siblings) + ")")
+                if siblings
+                else "",
+                (" (doc comments now plain text: " + "; ".join(f"{p}:{n}" for p, n, _, _, _ in documented) + ")")
+                if documented
                 else "",
             )
+            removed = [r for r in notes if r[2] == "residue"]
+            if removed:
+                logger.warning(
+                    "%s: residue removed: %s", label,
+                    "; ".join(f"{p}:{n} {_one_line(t)}" for p, n, _, t, _ in removed),
+                )
+            for p, n, _, t, _ in (r for r in notes if r[2] == "residue-kept"):
+                logger.warning("%s: residue kept at %s:%d: %s", label, p, n, _one_line(t))
         else:
             logger.warning(
                 "%s: partial — kept; remaining callers: %s",

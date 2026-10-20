@@ -21,8 +21,9 @@ in its temporal dead zone in a cycle), and any operator that can call
 
 A load the module makes in turn is followed: every non-type import and every
 ``export … from``. A package specifier cannot be read without
-``node_modules``, which the checkout does not have, so it is never inert, and
-neither is a specifier the resolver cannot pin to one file, a declaration file
+``node_modules``, which the checkout does not have, so it is never inert,
+except for the Featureflip SDKs in :data:`SIDE_EFFECT_FREE_PACKAGES`. Neither
+is a specifier the resolver cannot pin to one file, a declaration file
 (the runtime loads a different file), a file outside the checkout, or a file
 that does not parse.
 
@@ -34,6 +35,9 @@ proposes.
 
 from __future__ import annotations
 
+import json
+import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -43,6 +47,49 @@ from tree_sitter import Language, Node, Parser
 from flag_cleanup import cross_file_ts
 
 _DECLARATION_FILES = (".d.ts", ".d.mts", ".d.cts")
+
+#: The Featureflip SDK specifiers whose load does nothing: every file each one
+#: exports, under every published version and every ``exports`` condition, adds
+#: no global, patches no built-in, schedules no timer and registers no
+#: listener when it loads. Their publisher makes that claim, so it needs no
+#: ``node_modules`` to check. Named one by one, never matched by the
+#: ``@featureflip/`` scope, so a package that does work when it loads is never
+#: deleted by default. Each is trusted only where it can be nothing but the
+#: published package: no compiler config can read it as a file
+#: (:func:`cross_file_ts.names_package`), and nothing in the checkout installs,
+#: patches or aliases something else under its name (:func:`_substituted`).
+SIDE_EFFECT_FREE_PACKAGES = frozenset({
+    "@featureflip/js",
+    "@featureflip/node",
+    "@featureflip/browser",
+    "@featureflip/react",
+    "@featureflip/react/testing",
+})
+
+#: The manifest fields where naming a package only says which published
+#: version to install, as long as the version spells a registry range.
+_DEPENDENCY_FIELDS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+
+#: The packages behind :data:`SIDE_EFFECT_FREE_PACKAGES`. They load each
+#: other (`node` loads `js`, `react` loads `browser`), so a substitute for any
+#: one of them reaches a load of another.
+_SDK_PACKAGES = frozenset("/".join(s.split("/")[:2]) for s in SIDE_EFFECT_FREE_PACKAGES)
+
+#: A registry range or tag: version characters only, so no protocol or path
+#: (`file:`, `npm:other@1`, `link:`, `workspace:`, `patch:`, `user/repo`, a
+#: URL) and no local tarball (`shim.tgz`), each of which installs something
+#: other than the published package under its name.
+_REGISTRY_RANGE = re.compile(r"^(?!.*\.(tgz|tar|tar\.gz)$)[\w.\-^~<>=|*+ ]*$", re.IGNORECASE)
+
+#: Files where a tool can alias a module name (`resolve.alias`,
+#: `moduleNameMapper`, a Babel module resolver, an import map, a pnpm hook).
+#: Matched loosely on purpose: a false match only keeps a bare import.
+_TOOL_CONFIG = re.compile(
+    r"((^|[^a-z])config|webpack|vite|rollup|babel|jest|vitest|esbuild|tsup|parcel|metro|craco"
+    r"|pnpmfile|deno|import.?map|swcrc)[^/]*\.([cm]?[jt]sx?|jsonc?)$"
+    r"|^\.(babelrc|swcrc)|\.html?$",
+    re.IGNORECASE,
+)
 
 #: Top-level statements that declare and run nothing, checked no further.
 _DECLARES_ONLY = frozenset({
@@ -120,14 +167,21 @@ def is_inert(reader_path: str, specifier: str, repo_dir: str) -> bool:
     seen: set[str] = set()
     try:
         _check_load(reader_path, specifier, repo_dir, stop, seen)
-    except (_NotInert, RecursionError):
+    except (_NotInert, RecursionError, OSError):
         # Recursion follows the data (an operand chain, an import chain), and
-        # generated code can outrun it. Unproven, so the bare import stays.
+        # generated code can outrun it; a directory may not be readable.
+        # Unproven, so the bare import stays.
         return False
     return True
 
 
 def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: set[str]) -> None:
+    if (
+        specifier in SIDE_EFFECT_FREE_PACKAGES
+        and cross_file_ts.names_package(reader, specifier, repo_dir)
+        and not _substituted(str(stop))
+    ):
+        return
     target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir)
     if target is None or target.endswith(_DECLARATION_FILES):
         raise _NotInert
@@ -146,6 +200,80 @@ def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: se
         raise _NotInert
     for loaded in _module_loads(root):
         _check_load(str(resolved), loaded, repo_dir, stop, seen)
+
+
+@lru_cache(maxsize=None)
+def _substituted(root: str) -> bool:
+    """Whether anything in the checkout can make an SDK package load
+    something other than what its publisher shipped.
+
+    Every ``package.json`` is read, since a hoisted workspace dependency can
+    serve a file in another package. One counts when it IS an SDK package (a
+    workspace member, a vendored copy, the package's own repository), when it
+    depends on one with anything but a registry range, or when it names one
+    anywhere else (``overrides``, ``resolutions``, ``browser``, ``alias``,
+    ``patchedDependencies``, a ``jest`` mapper). So does a patch-package patch
+    for one, a tool config or HTML page that mentions one at all, a
+    ``node_modules`` committed with the ``@featureflip`` scope in it, and a
+    directory symlinked to somewhere outside the checkout, which the walk
+    does not follow. Anything unreadable counts too. Aliases written in other
+    files, such as a build script, are not seen.
+    """
+    names = [package.encode() for package in _SDK_PACKAGES]
+    patches = tuple(package.replace("/", "+") + "+" for package in _SDK_PACKAGES)
+    top = Path(root).resolve()
+
+    def refuse(error: OSError) -> None:
+        raise error
+
+    try:
+        for directory, subdirectories, files in os.walk(root, onerror=refuse):
+            if "node_modules" in subdirectories and os.path.lexists(
+                os.path.join(directory, "node_modules", "@featureflip")
+            ):
+                return True
+            subdirectories[:] = [d for d in subdirectories if d not in {"node_modules", ".git"}]
+            for name in subdirectories:
+                path = os.path.join(directory, name)
+                if os.path.islink(path) and not Path(path).resolve().is_relative_to(top):
+                    return True
+            for name in files:
+                path = os.path.join(directory, name)
+                if name.startswith(patches):
+                    return True
+                if name == "package.json":
+                    if _manifest_substitutes(path):
+                        return True
+                elif _TOOL_CONFIG.search(name):
+                    with open(path, "rb") as config:
+                        text = config.read()
+                    if any(package in text for package in names):
+                        return True
+    except OSError:
+        return True
+    return False
+
+
+def _manifest_substitutes(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as manifest:
+            data = json.load(manifest)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return True
+    if not isinstance(data, dict) or data.get("name") in _SDK_PACKAGES:
+        return True
+    rest = dict(data)
+    for field in _DEPENDENCY_FIELDS:
+        dependencies = rest.get(field)
+        if not isinstance(dependencies, dict):
+            continue
+        for package in _SDK_PACKAGES & dependencies.keys():
+            spec = dependencies[package]
+            if not isinstance(spec, str) or not _REGISTRY_RANGE.match(spec):
+                return True
+        rest[field] = {k: v for k, v in dependencies.items() if k not in _SDK_PACKAGES}
+    text = json.dumps(rest, ensure_ascii=False)
+    return any(package in text for package in _SDK_PACKAGES)
 
 
 def _declaring_script(root: Node) -> bool:

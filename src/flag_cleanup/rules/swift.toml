@@ -85,7 +85,7 @@ query = """(
      (prefix_expression (simple_identifier) @sdk_fn)]
     (call_suffix
       (value_arguments
-        . (value_argument (line_string_literal (_) @flag_name))))
+        . (value_argument (line_string_literal . (_) @flag_name .))))
   ) @call
   (#eq? @sdk_fn "boolVariation")
   (#not-match? @receiver_chain "[?]")
@@ -123,7 +123,7 @@ query = """(
      (simple_identifier) @sdk_fn]
     (call_suffix
       (value_arguments
-        . (value_argument (line_string_literal (_) @flag_name))))
+        . (value_argument (line_string_literal . (_) @flag_name .))))
   ) @call
   (#eq? @sdk_fn "boolVariation")
   (#not-match? @receiver_chain "[?]")
@@ -238,7 +238,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal (_) @flag_name)) .)
+          (line_string_literal . (_) @flag_name .)) .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)
     . value: (_)
@@ -285,8 +285,8 @@ not_contains = [
 # The annotation is captured and re-emitted rather than dropped. It can only
 # ever be `Bool` (it annotates the wrapped value, and `FeatureFlag.wrappedValue`
 # is `Bool`), so dropping it would be type-safe — but it would also be an
-# unrelated edit in someone else's diff, which is the thing this tool spends
-# `delete_consecutive_new_lines` and a whole reindent pass avoiding.
+# unrelated edit in someone else's diff, which this tool goes to some lengths
+# to avoid.
 [[rules]]
 name = "replace_property_wrapper_read_with_boolean_literal_annotated"
 query = """(
@@ -294,7 +294,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal (_) @flag_name)) .)
+          (line_string_literal . (_) @flag_name .)) .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)
     . (type_annotation) @annotation
@@ -328,7 +328,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal (_) @flag_name))
+          (line_string_literal . (_) @flag_name .))
       . (visibility_modifier) @vis .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)
@@ -358,7 +358,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal (_) @flag_name))
+          (line_string_literal . (_) @flag_name .))
       . (visibility_modifier) @vis .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)

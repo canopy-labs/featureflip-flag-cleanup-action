@@ -1234,6 +1234,38 @@ def enum_dynamic_uses(path, source, entries, repo_dir) -> list[xk.Refusal]:
     return notes
 
 
+#: A ``dart:mirrors`` URI as an import or export spells it.
+_MIRRORS = re.compile(r"""(['"])dart:mirrors\1""")
+
+
+def constant_escapes(path, source, constants, repo_dir) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` for every declaring file of ``constants``
+    when ``path`` imports or exports ``dart:mirrors``.
+
+    A mirror reaches a constant without spelling it, and not only through its
+    owner: ``reflectClass(FeatureKeys).declarations``, a library's top-level
+    constants through any class of it (``reflectClass(C).owner``), and every
+    loaded library through ``currentMirrorSystem().libraries``. Which
+    libraries a mirrors program loads is not decided here, so its file keeps
+    every key constant of the run (``unsupported-form``). Matched on the text,
+    so it holds in a file that does not parse, and a mention in a comment
+    only keeps a declaration. Mirrors exist on the Dart VM alone, so a
+    Flutter or AOT-compiled package never has one."""
+    hit = _MIRRORS.search(source)
+    if hit is None:
+        return []
+    line = source.count("\n", 0, hit.start())
+    text = source.splitlines()[line].strip()
+    refusal = xk.Refusal(path, line + 1, xk.UNSUPPORTED_FORM, text)
+    return [(holder, refusal) for holder in sorted({d.path for d in constants})]
+
+
+def constant_module_pattern(constants, repo_dir) -> re.Pattern[str]:
+    """What a file's text holds when :func:`constant_escapes` can find
+    something in it: the ``dart:mirrors`` URI."""
+    return _MIRRORS
+
+
 def rewrite_stranded_imports(path, content, declarations, references, repo_dir) -> str:
     """``content`` with each import a proven read went through trimmed or cut.
 
@@ -1331,5 +1363,8 @@ xk.register(
         enum_dynamic_uses=enum_dynamic_uses,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
+        # `dart:mirrors` reaches a constant without spelling it.
+        constant_escapes=constant_escapes,
+        constant_module_pattern=constant_module_pattern,
     ),
 )

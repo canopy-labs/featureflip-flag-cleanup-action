@@ -1,8 +1,11 @@
 """Keep basic-auth credentials out of anything a human or a log will see.
 
-``api-url`` explicitly supports self-hosted instances, so a URL carrying
-``user:password@`` userinfo is a normal thing for a customer to configure. That
-value then has three ways out of this tool, and each one leaked at some point:
+``api-url`` explicitly supports self-hosted instances, and ``user:password@``
+userinfo is an easy thing for a customer to put in one. ``Config`` refuses it
+(it would replace the token's ``Authorization`` header), but the client is
+handed URLs by other callers too, and the refusal itself has to print the value.
+A URL carrying userinfo has three ways out of this tool, and each one leaked at
+some point:
 
 * the pull-request body (world-readable on a public repository);
 * httpx's INFO request log, which prints the full URL — silenced in ``__main__``;

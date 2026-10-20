@@ -411,6 +411,19 @@ def _exports_directly(root: Node, name: str) -> bool:
     return direct == 1
 
 
+def _lexical_block(bound: Node) -> Node | None:
+    """The block a ``let``/``const`` binding is scoped to, when ``bound`` is
+    the name of one declared directly in a statement block."""
+    declarator = bound.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("name") != bound:
+        return None
+    declaration = declarator.parent
+    if declaration is None or declaration.type != "lexical_declaration" or text(declaration.children[0]) not in ("let", "const"):
+        return None
+    block = declaration.parent
+    return block if block is not None and block.type == "statement_block" else None
+
+
 def _via_require(node: Node | None) -> bool:
     """Whether a binding node is made by ``require`` rather than ``import``."""
     current = None if node is None else node.parent
@@ -449,6 +462,34 @@ class File:
         """The file's one binding of ``name``; ``None`` for none or several."""
         found = bindings(self.root, name)
         return found[0] if len(found) == 1 else None
+
+    def binding_of(self, use: Node) -> Node | None:
+        """The binding a use of a name means: the file's one binding of it, or
+        a ``let``/``const`` declared directly in the innermost block around
+        ``use`` that declares the name, when nothing else inside that block
+        binds the name and no ``with`` sits between them. ``None`` when that
+        cannot be told."""
+        found = bindings(self.root, text(use))
+        if len(found) == 1:
+            return found[0]
+        around = [
+            (block, bound)
+            for bound in found
+            if (block := _lexical_block(bound)) is not None
+            and block.start_byte <= use.start_byte
+            and use.end_byte <= block.end_byte
+        ]
+        if not around:
+            return None
+        # Blocks that all hold the use nest, so the innermost starts last.
+        block, bound = max(around, key=lambda pair: pair[0].start_byte)
+        inside = [b for b in found if block.start_byte <= b.start_byte and b.end_byte <= block.end_byte]
+        node = use.parent
+        while node is not None and node != block:
+            if node.type == "with_statement":
+                return None
+            node = node.parent
+        return bound if inside == [bound] else None
 
     def import_of(self, name: str) -> Import | None:
         """The import binding ``name``, when it is the file's only binding of it."""

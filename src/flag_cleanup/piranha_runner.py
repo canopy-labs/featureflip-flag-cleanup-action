@@ -12,17 +12,16 @@ files: ``rules.toml`` (the ``[[rules]]``) and ``edges.toml`` (the ``[[edges]]``
 that wire the seed rule to the cleanup cascade). Piranha will NOT read
 ``[[edges]]`` out of ``rules.toml`` — they must be a separate file.
 
-Piranha ships built-in feature-flag *cleanup* rules only for
-go/java/kt/ruby/scala/swift/cs — there are NONE for TypeScript/JavaScript or
-Python. So for those two this tool carries the whole cascade itself (fold
-``if (true/false)``, simplify boolean expressions, drop dead statements)
-alongside the seed rules, while Java/Go/Swift/C# need only a seed rule and get
-the rest from the engine — C# needs LESS than Java: its built-ins already
-carry the trailing-else-if-false fix java.toml has to hand-roll as a second
-rule (see rules/csharp.toml). That asymmetry is the single biggest thing to
-know before editing this directory: **TypeScript is the worst case, not the
-representative one**, and a new language is usually a much smaller job than
-``ts.toml`` makes it look.
+The engine ships built-in feature-flag *cleanup* rules for every language this
+tool supports (C#, Dart, Go, Java, Kotlin, PHP, Python, Ruby, Swift and
+TypeScript/TSX, which share one rule base). So a language's ``<base>.toml``
+carries mainly SEED rules that replace the read with a boolean literal, and the
+engine's cascade does the rest (fold ``if``, simplify boolean expressions, drop
+dead statements). A rule here with the same name as a
+built-in REPLACES it, so never copy a built-in in order to adjust it: the copy
+shadows the engine's rule, and a fix made on either side stops reaching the
+other. What a language carries beyond its seeds (const, entries, JSX) is either
+flag policy or a gap the engine does not cover yet.
 
 Rule files live as per-language flat files under ``rules/``:
 
@@ -84,14 +83,20 @@ from polyglot_piranha import PiranhaArguments, execute_piranha
 
 from flag_cleanup import (
     contradicting,
+    csharp_residue,
     ctor_param_removal,
     cross_file_dart,
     cross_file_keys,
     cross_file_kotlin,
     cross_file_php,
     cross_file_python,
+    file_deletion,
+    go_dead_code,
+    go_inline,
+    go_stranded,
     kotlin_sentinel,
     mock_stubs,
+    ruby_owner_reach,
     source_index,
     ts_bound_overrides,
     ts_dead_code,
@@ -102,21 +107,9 @@ from flag_cleanup import (
     wrapper_inline,
 )
 from flag_cleanup.kotlin_sentinel import Rewrite
-from flag_cleanup.go_fold import fold_literal_cases as fold_go_literal_cases
-from flag_cleanup.ruby_fold import fold_literal_whens as fold_ruby_literal_whens
-from flag_cleanup.kotlin_fold import fold_literal_whens as fold_kotlin_literal_whens
-from flag_cleanup.ts_switch_fold import fold_switch_true
-from flag_cleanup.php_fold import (
-    fold_literal_cases as fold_php_literal_cases,
-    fold_literal_conditions as fold_php_literal_conditions,
-)
-from flag_cleanup.python_fold import (
-    fold_literal_conditions,
-    inline_literal_bindings,
-    marker_for,
-)
+from flag_cleanup.php_fold import fold_literal_conditions as fold_php_literal_conditions
+from flag_cleanup.python_fold import inline_literal_bindings, marker_for
 from flag_cleanup.key_const_visibility import VisibleKeyConst
-from flag_cleanup.reindent import reindent_spliced_lines
 from flag_cleanup.syntax import (
     collapse_introduced_carriage_returns,
     collapse_introduced_double_spaces,
@@ -124,14 +117,15 @@ from flag_cleanup.syntax import (
     externally_visible_key_consts,
     remove_dead_loops,
     remove_unreachable_statements,
+    unreachable_is_fatal,
     source_is_unreadable,
     strip_introduced_trailing_whitespace,
     refusal_reason,
 )
 from flag_cleanup.primary_constructor import unread_parameters
-from flag_cleanup.ts_unread_members import unread_members
+from flag_cleanup.ts_unread_members import unread_constructor_parameters, unread_members
 from flag_cleanup.ts_syntax import strip_dangling_type_separators
-from flag_cleanup.unused import MODULE_MARKER, remove_stranded_bindings
+from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_bindings
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +147,19 @@ class PiranhaTransformError(RuntimeError):
     can log it — a rule that trips the self-check is a rule bug, not a
     "nothing matched".
     """
+
+
+#: How the engine words its refusal to rewrite a file it cannot parse in the
+#: first place ("Failed to parse … will not rewrite a file it cannot read").
+#: That is the ONE abort that is a property of the customer's source. Every
+#: other abort — the post-rewrite "Produced syntactically incorrect source
+#: code" self-check, a refusal to write a reserved word into a name position,
+#: anything a later engine adds — fires after the engine read the file fine,
+#: so it is a defect in the rewrite. :func:`_quarantine_and_retry` quarantines
+#: only an abort carrying this phrase. Matched positively, rather than by
+#: listing the others, so an abort nobody has seen yet stops the flag instead
+#: of shipping a partial removal.
+_UNREADABLE_INPUT = "will not rewrite a file it cannot read"
 
 
 class UnsafeRewriteError(RuntimeError):
@@ -294,15 +301,6 @@ class _Language:
     extensions: tuple[str, ...]
     true_literal: str = "true"
     false_literal: str = "false"
-    #: Whether this language's grammar has JSX nodes, which decides whether
-    #: ``rules/<base>_jsx.toml`` is appended to its rule set. NOT derivable from
-    #: ``rule_base``: `ts`, `tsx` and `js` all share `rules/ts.toml` and do not
-    #: share a grammar, and a query naming `jsx_expression` under the plain
-    #: `typescript` grammar is a COMPILE error, not an unmatched query — the
-    #: engine panics before reading a file, so one misplaced rule aborts every
-    #: `.ts` run. A language with no `_jsx.toml` beside its base can set this
-    #: freely; the file is only loaded if it exists.
-    parses_jsx: bool = False
     #: How the customer-facing surfaces spell this language — README's
     #: "Supported languages" sentence and `action.yml`'s own description.
     #: Keyword-only and DEFAULTLESS on purpose: it is the forcing function that
@@ -325,7 +323,7 @@ _LANGUAGES: dict[str, _Language] = {
     "ts": _Language(
         "typescript", "ts", (".ts", ".mts", ".cts"), display_name="TypeScript"
     ),
-    "tsx": _Language("tsx", "ts", (".tsx",), parses_jsx=True, display_name="TSX"),
+    "tsx": _Language("tsx", "ts", (".tsx",), display_name="TSX"),
     # JavaScript reuses the TS cascade WHOLESALE — no rules of its own. The
     # engine's `javascript` arm parses with the TSX grammar (piranha#25), which
     # is the same grammar `tsx` above uses, so every node shape `rules/ts.toml`
@@ -341,7 +339,6 @@ _LANGUAGES: dict[str, _Language] = {
         "javascript",
         "ts",
         (".js", ".jsx", ".mjs", ".cjs"),
-        parses_jsx=True,
         display_name="JavaScript",
     ),
     "java": _Language("java", "java", (".java",), display_name="Java"),
@@ -647,7 +644,11 @@ def candidate_files(
     configured sibling of the family (a ``.tsx`` caller of a ``.ts`` wrapper) is
     included too, under the exclusions above: it must not hold the key, nor
     mention a constant or a candidate wrapper another configured member
-    declares. ``accessors`` is needed for that judgement and nothing else.
+    declares. ``accessors`` is needed for that judgement and nothing else. A
+    JavaScript file's own declaration file (``flags.d.ts`` beside
+    ``flags.js``) naming a candidate is admitted under the same exclusions,
+    whether or not a TypeScript run is configured: the close-out deletes the
+    declarations there that describe a wrapper it deletes.
 
     Raises ``ValueError`` for an unsupported ``language``, exactly like
     :func:`run_piranha`.
@@ -676,9 +677,15 @@ def candidate_files(
     resolved_root = root.resolve()
     siblings = sorted(set(wrapper_inline.profile(language).siblings) & set(languages))
     sibling_extensions = tuple(ext for sibling in siblings for ext in _LANGUAGES[sibling].extensions)
+    described = _declaration_files(found)
     extra: list[str] = []
     for mention in cross_file_keys.mention_files(repo_dir, names, exclude=found):
-        sibling = bool(sibling_extensions) and mention.endswith(sibling_extensions)
+        # A JavaScript wrapper's own `.d.ts`, whose declarations of it go with
+        # it, whether or not a TypeScript run is configured. Admitted like a
+        # sibling caller, under the same exclusions.
+        sibling = (bool(sibling_extensions) and mention.endswith(sibling_extensions)) or (
+            str(Path(mention).resolve()) in described
+        )
         if not (sibling or mention.endswith(spec.extensions)):
             continue
         if not cross_file_keys.within(Path(mention), resolved_root):
@@ -696,6 +703,15 @@ def candidate_files(
             mention = str(root / os.path.relpath(mention, resolved_root))
         extra.append(mention)
     return found + sorted(set(extra) - set(found))
+
+
+def _declaration_files(paths: Iterable[str]) -> frozenset[str]:
+    """The hand-written declaration files (``flags.d.ts`` beside ``flags.js``)
+    of ``paths`` that exist, resolved."""
+    from flag_cleanup import cross_file_ts
+
+    found = (cross_file_ts.declaration_file(path) for path in paths)
+    return frozenset(str(Path(d).resolve()) for d in found if d is not None and Path(d).is_file())
 
 
 def _claimed(
@@ -839,16 +855,6 @@ def _grammar_of(path: str, language: str) -> str:
         if path.endswith(_LANGUAGES[sibling].extensions):
             return sibling
     return language
-
-
-def _jsx_rule_files(spec: _Language) -> tuple[Path | None, Path | None]:
-    """``(rules, edges)`` of the JSX rules ``spec``'s grammar takes, if any."""
-    if not spec.parses_jsx:
-        return None, None
-    return (
-        RULES_DIR / f"{spec.rule_base}_jsx.toml",
-        RULES_DIR / f"{spec.rule_base}_jsx_edges.toml",
-    )
 
 
 def _language_spec(language: str) -> _Language:
@@ -1031,6 +1037,193 @@ def _flag_keyed_entries(
     return tuple(entries), paths
 
 
+#: The engine's built-in rules that delete a loop its own fold made dead
+#: (``while (false)``, Go's ``for false``, Ruby's ``until true``, the TS
+#: family's ``for (…; false; …)``) across every language's cascade, or unwrap
+#: one whose body runs once (the TS family's ``do … while (false)``). A Ruby
+#: loop that was a body's last statement becomes ``nil`` instead, keeping the
+#: body's value, and is listed all the same. Each
+#: firing is listed with the stranded statements, as the deletion was when this
+#: side made it: behaviour-neutral, but the loop was the customer's code.
+_ENGINE_DEAD_LOOP_RULES = frozenset(
+    {
+        "delete_while_false",
+        "delete_while_false_before_statement",
+        "delete_while_false_at_end_to_nil",
+        "delete_for_false",
+        "delete_first_while_false",
+        "delete_while_false_after_statement",
+        "replace_sole_while_false_with_pass",
+        "delete_for_false_without_initializer",
+        "delete_for_false_with_inert_lexical_initializer",
+        "replace_for_false_with_var_initializer",
+        "replace_for_false_with_expression_initializer",
+        "unwrap_do_false_splice",
+        "unwrap_do_false_keep_block",
+    }
+)
+
+
+#: The engine's built-in rules that delete a statement its own fold left
+#: unreachable: Java's and Dart's code after a folded ``return``, and the TS
+#: family's after a ``return``/``throw``/``break``/``continue`` (a ``var x = v``
+#: there keeps ``var x;``, and is listed as it was). Listed only in a file whose
+#: language rejects unreachable code (:func:`~flag_cleanup.syntax.unreachable_is_fatal`),
+#: the languages the pull request's sentence names, exactly as
+#: :func:`~flag_cleanup.syntax.remove_unreachable_statements` was scoped when
+#: this side made every such deletion itself. Elsewhere the engine deletes the
+#: same tail (C#, Kotlin, PHP, …) and the code would have compiled either way.
+_ENGINE_UNREACHABLE_RULES = frozenset(
+    {
+        "delete_all_statements_after_return",
+        "delete_all_statements_after_returning_block",
+        "delete_unreachable_statement",
+        "strip_unreachable_typed_var_initializer",
+        "strip_unreachable_var_initializer",
+    }
+)
+
+
+#: The engine's Go rules that delete a local bound to the folded read and
+#: write its value for the local's name (``replace_identifier_with_value``,
+#: ``replace_identifier_with_nil``): the capture names whose identifiers go.
+#: The ``split_*`` pair drops the folded name from a two-name declaration
+#: (``on, n := true, load()`` becomes ``n := load()``) and inlines it the same way.
+_GO_INLINE_RULES = {
+    "delete_variable_declaration": ("variable_name",),
+    "delete_variable_declaration_with_nil": ("variable_name", "err"),
+    "split_short_var_declaration_literal_first": ("variable_name",),
+    "split_short_var_declaration_literal_last": ("variable_name",),
+}
+
+
+def _engine_inlined(summaries) -> dict[str, frozenset[str]]:
+    """``{path: names}`` for each Go local the engine inlined, by rule name.
+
+    Read off the engine's summaries under the same constraint as
+    :func:`_engine_stranded`. See :mod:`flag_cleanup.go_inline`.
+    """
+    inlined: dict[str, frozenset[str]] = {}
+    for summary in summaries:
+        names = {
+            edit.p_match.matches[capture]
+            for edit in getattr(summary, "rewrites", ())
+            for capture in _GO_INLINE_RULES.get(edit.matched_rule, ())
+            if capture in edit.p_match.matches
+        }
+        if names:
+            inlined[summary.path] = frozenset(names)
+    return inlined
+
+
+def _engine_stranded(summaries, language: str, repo_dir: str) -> tuple[tuple[str, str], ...]:
+    """``((relative_path, text), …)`` for each dead loop or unreachable statement the engine deleted.
+
+    Read off the engine's summaries by rule name, so under the same constraint
+    as :func:`_flag_keyed_entries`: before any text pass replaces a changed
+    summary with a plain :class:`Rewrite`. The engine's match range is the
+    deleted node plus the whitespace in front of it, which is stripped.
+    """
+    return tuple(
+        (os.path.relpath(summary.path, repo_dir), edit.p_match.matched_string.strip())
+        for summary in summaries
+        for edit in getattr(summary, "rewrites", ())
+        if edit.matched_rule in _ENGINE_DEAD_LOOP_RULES
+        or (
+            edit.matched_rule in _ENGINE_UNREACHABLE_RULES
+            and unreachable_is_fatal(_grammar_of(summary.path, language))
+        )
+    )
+
+
+#: The engine's built-in rules that delete an import its own fold stranded,
+#: each mapped to the capture the pull request names it by. Never the match: a
+#: spec's match also holds the comments and blank lines it took (``spec``), and
+#: the ``*_solo`` pair's starts at the declaration before it (``decl``).
+_ENGINE_STRANDED_IMPORT_RULES = {
+    "delete_stranded_import_aliased": "spec",
+    "delete_stranded_import_unaliased": "spec",
+    "delete_stranded_import_aliased_solo": "decl",
+    "delete_stranded_import_unaliased_solo": "decl",
+}
+
+
+#: The engine's built-in rules that delete a local its own fold stranded,
+#: discard it to ``_ = v``, or drop its name from a ``range``, receive or
+#: type-switch header. The ``*_pair`` rules do the same for a two-name
+#: declaration and report the whole of it (``x, y := 3, load()``). Each is
+#: mapped to the capture the pull request names it by. Never the match: a
+#: deleted declaration's match also takes the comment after it on its line,
+#: and a name dropped from a ``var`` list spans the name kept beside it. The
+#: two Ruby rules delete an ``x = v`` assignment, or keep ``v`` alone when it
+#: is a call, and are named by the assignment (``a``), since a deleted line's
+#: match also holds the comment after it. The two Dart rules delete an inert
+#: local, or keep a call's value as a bare statement (``final x = call();``
+#: becomes ``call();``), and are named by the whole declaration (``decl``).
+_ENGINE_STRANDED_LOCAL_RULES = {
+    "delete_stranded_short_var": "decl",
+    "blank_stranded_short_var": "decl",
+    "delete_stranded_var_declaration": "decl",
+    "blank_stranded_var_declaration": "decl",
+    "blank_stranded_typed_var_declaration": "decl",
+    "delete_stranded_short_var_pair": "decl",
+    "blank_stranded_short_var_pair": "decl",
+    "blank_stranded_short_var_pair_first": "decl",
+    "blank_stranded_short_var_pair_last": "decl",
+    "delete_stranded_var_pair": "decl",
+    "blank_stranded_var_pair": "decl",
+    "blank_stranded_var_pair_first": "decl",
+    "blank_stranded_var_pair_last": "decl",
+    "blank_stranded_typed_var_pair": "decl",
+    "blank_stranded_typed_var_pair_first": "decl",
+    "blank_stranded_typed_var_pair_last": "decl",
+    "delete_stranded_var_block": "decl",
+    "delete_stranded_var_spec_in_block": "spec",
+    "delete_stranded_var_name_first": "n",
+    "delete_stranded_var_name_later": "n",
+    "stranded_range_last": "left",
+    "stranded_range_blank_first": "whole",
+    "stranded_range_first": "n",
+    "stranded_range_only": "whole",
+    "stranded_receive_last": "left",
+    "stranded_receive_blank_first": "whole",
+    "stranded_receive_first": "n",
+    "stranded_receive_only": "whole",
+    "stranded_type_switch_alias": "alias",
+    "stranded_if_init": "init",
+    "stranded_switch_init": "init",
+    "delete_stranded_ruby_local": "a",
+    "discard_stranded_ruby_local": "a",
+    "delete_stranded_dart_local": "decl",
+    "discard_stranded_dart_local": "decl",
+}
+
+
+def _engine_bindings(summaries, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
+    """``((relative_path, kind, text), …)`` for each import or local the engine
+    removed because its own fold stranded it.
+
+    The same record :func:`_remove_stranded_bindings` makes for one this side
+    removes, so the pull request names it either way. Read off the engine's
+    summaries by rule name, under the same constraint as
+    :func:`_engine_stranded`.
+    """
+    found = []
+    for summary in summaries:
+        relative = os.path.relpath(summary.path, repo_dir)
+        for edit in getattr(summary, "rewrites", ()):
+            for kind, rules in (
+                ("import", _ENGINE_STRANDED_IMPORT_RULES),
+                ("variable", _ENGINE_STRANDED_LOCAL_RULES),
+            ):
+                capture = rules.get(edit.matched_rule)
+                if capture is not None:
+                    match = edit.p_match
+                    text = match.matches.get(capture) or match.matched_string
+                    found.append((relative, kind, text.strip()))
+    return tuple(found)
+
+
 @dataclass(frozen=True, slots=True)
 class TransformOutcome:
     """What one ``(repo_dir, language, flag)`` transform produced.
@@ -1080,7 +1273,9 @@ class TransformOutcome:
     #: :mod:`~flag_cleanup.primary_constructor`. The TypeScript family's
     #: counterpart is kind ``"unread member"`` with ``Class.member`` as text: a
     #: ``private`` or ``#`` member the fold left unread, TS6133/TS6138 under
-    #: ``noUnusedLocals``. See :mod:`~flag_cleanup.ts_unread_members`. The
+    #: ``noUnusedLocals``. See :mod:`~flag_cleanup.ts_unread_members`, which
+    #: also finds a plain constructor parameter left unused, kind ``"unread
+    #: constructor parameter"`` with ``Class(parameter)`` as text. The
     #: family adds two more kinds that name something KEPT, both reported and
     #: never edited:
     #: ``"unread binding"`` (the parameter or local an override deleted by
@@ -1219,7 +1414,7 @@ def transform_flag(
     # One listing of the checkout for every scan this transform makes, and for
     # the retry: nothing here adds or removes a file. Inside a run's scope,
     # the run's listing.
-    with source_index.run_scope():
+    with source_index.run_scope(), source_index.forgetting():
         try:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
@@ -1401,18 +1596,9 @@ def _transform_flag(
     if not rules_file.exists():
         raise FileNotFoundError(f"missing Piranha rules file: {rules_file}")
 
-    # Grammar-scoped, not base-scoped. Appended rather than merged into
-    # `{base}.toml` because languages sharing a rule base do not share a
-    # grammar, and a rule whose query names a node the grammar lacks aborts the
-    # ENGINE, not just that rule — see `_Language.parses_jsx`. Resolved after
-    # the accessor generation below deliberately leaves `rules_file` alone:
-    # these rules are reached by edges and match no flag key, so nothing in them
-    # varies with the accessors.
-    jsx_rules_file, jsx_edges_file = _jsx_rule_files(spec)
-
     # Flag-keyed ENTRY rules (registry lines, override properties, object-type
-    # members) — the residue a read-anchored rule cannot see. Appended like the
-    # JSX file; every rule in it is a seed, so order relative to the base file
+    # members) — the residue a read-anchored rule cannot see. Appended to the
+    # base file; every rule in it is a seed, so order relative to the base file
     # is irrelevant. Absent for a language that has none yet: Swift and Java
     # wait on the fork shipping `replace_node_end`, because their map entries
     # cannot be deleted along with their separator in one edit.
@@ -1577,8 +1763,6 @@ def _transform_flag(
         rules_file=rules_file,
         const_rules_file=const_rules_file,
         edges_file=edges_file,
-        jsx_rules_file=jsx_rules_file,
-        jsx_edges_file=jsx_edges_file,
         entries_rules_file=entries_rules_file,
         substitutions=substitutions,
         argument_flags=argument_flags,
@@ -1652,8 +1836,13 @@ def _transform_flag(
         # carries the rule name each edit came from. Inside this statement
         # rather than after it because the Python pass below replaces
         # summaries with `Rewrite`s of its own, and the entries its rounds
-        # report have to be accumulated as they are produced.
+        # report have to be accumulated as they are produced. The dead loops
+        # and unreachable statements the engine deleted are read the same way,
+        # for the same reason.
         entries, entry_paths = _flag_keyed_entries(summaries, repo_dir)
+        engine_stranded = list(_engine_stranded(summaries, language, repo_dir))
+        engine_inlined = _engine_inlined(summaries)
+        engine_bindings = _engine_bindings(summaries, repo_dir)
 
         # Python and the TypeScript family. Resolve a local the fold left bound
         # to a literal and hand the result back to the engine, so the literal
@@ -1671,6 +1860,7 @@ def _transform_flag(
                 repo_dir=repo_dir,
                 entries=entries,
                 entry_paths=entry_paths,
+                dead_loops=engine_stranded,
             )
     finally:
         # Every engine invocation — the first pass, the quarantine retry, and
@@ -1703,33 +1893,10 @@ def _transform_flag(
     if language == "php":
         summaries = _fold_php_literals(summaries)
 
-    # Go only, and in the same window as PHP's and for the same reason: the
-    # engine folds the `if` family, so a tagless `switch { case <read>: … }`
-    # keeps a dead arm the built-ins cannot reach. BEFORE the whitespace tidy —
-    # deleting an arm leaves the line it sat on holding only its indent, and the
-    # tidy is what clears that. See :mod:`flag_cleanup.go_fold` for why no
-    # Piranha rule can finish this one.
-    if language == "go":
-        summaries = _fold_go_literals(summaries)
-
-    # Ruby's subject-less `case` is the same construct as Go's tagless switch,
-    # and had the same gap — except Ruby carried no residue entry, so the dead
-    # arm SHIPPED rather than being refused. See :mod:`flag_cleanup.ruby_fold`.
-    if language == "ruby":
-        summaries = _fold_ruby_literals(summaries)
-
-    # Kotlin's subject-less `when { <read> -> … }` is the same construct again,
-    # and Kotlin carried no residue entry for it either, so the dead arm
-    # shipped. AFTER the sentinel rebase above, so the "before" the fold
-    # compares against is the customer's bytes rather than the sentinel-ified
-    # ones. See :mod:`flag_cleanup.kotlin_fold`.
+    # The import a proven Kotlin reader bound the constant's name with names a
+    # declaration this run deletes once its last read is folded. BEFORE the
+    # whitespace tidy and Gate 1, like every other text pass.
     if language == "kt":
-        summaries = _apply_literal_fold(
-            summaries, lambda before, after, _path: fold_kotlin_literal_whens(before, after)
-        )
-        # The import a proven Kotlin reader bound the constant's name with
-        # names a declaration this run deletes once its last read is folded.
-        # BEFORE the whitespace tidy and Gate 1, like every other text pass.
         summaries = _drop_stranded_key_imports(summaries, resolution)
 
     # The from-import a proven Python reader bound a key constant with, once
@@ -1748,17 +1915,6 @@ def _transform_flag(
     # :func:`cross_file_dart.rewrite_stranded_imports`.
     if language == "dart":
         summaries = _rewrite_dart_key_imports(summaries, resolution, repo_dir)
-
-    # `switch (true) { case <read>: … }` -- the TypeScript family's spelling of
-    # the same guard, with PHP's default fall-through. See
-    # :mod:`flag_cleanup.ts_switch_fold`.
-    if language in ("ts", "tsx", "js"):
-        summaries = _apply_literal_fold(
-            summaries,
-            lambda before, after, path: fold_switch_true(
-                before, after, _grammar_of(path, language)
-            ),
-        )
 
     # Replace each configured gate on this flag with the children it rendered.
     # Before the whitespace tidy and the stranded-binding pass: the gate's own
@@ -1802,7 +1958,7 @@ def _transform_flag(
     # calls too), so this sees only what they left; before the restore below,
     # so a test file still naming the key as data is put back with these
     # deletions undone too. See :mod:`flag_cleanup.ts_bound_overrides`.
-    summaries, bound_entries, unread_bindings, unread_parameters = _delete_bound_entries(
+    summaries, bound_entries, unread_bindings, unread_parameters, bound_constructors = _delete_bound_entries(
         summaries,
         [p for p in paths if p not in unprocessable],
         language,
@@ -1851,33 +2007,26 @@ def _transform_flag(
     # between a branch that compiles and one that does not, which is what this
     # used to refuse over.
     summaries, stranded = _remove_stranded_statements(summaries, language, repo_dir)
+    stranded = tuple(engine_stranded) + stranded
 
     # Delete the imports and locals the fold stranded, in the same window and
     # for the same reason: Gate 1 must judge, and the customer must see, the
     # bytes that stay on disk. In Go both shapes are compile errors, so this is
     # the difference between a branch that builds and one that does not.
     summaries, bindings = _remove_stranded_bindings(summaries, language, repo_dir)
+    bindings = engine_bindings + bindings
 
-    # Python only, and the same window again. The engine cannot re-indent, so
-    # `python.toml` folds only single-simple-statement branches and leaves the
-    # rest standing as `if True:` — which Gate 1 then refuses. This finishes
-    # those folds where the whole file is in hand.
+    # Python only, and the same window again: the fallback for a file whose
+    # marker the engine did not consume. The binding is inlined with the bare
+    # literal, which no engine pass will fold, so a condition it exposes stays
+    # standing and the residue gate refuses the file rather than shipping it
+    # half-done.
     if language == "python":
-        summaries = _fold_python_literals(summaries)
-
-    # Give the spliced lines back the indentation the engine dropped. LAST of
-    # the text passes and still inside the same window, because it reads the
-    # bytes every earlier pass produced: a fold the Python pass performed, or a
-    # statement the stranded-statement pass deleted, is part of the shift this
-    # has to measure. See :mod:`flag_cleanup.reindent` for the three artefact
-    # shapes and why the INPUT is what holds the answer to all of them.
-    summaries = _reindent_folds(summaries, language, doubles)
+        summaries = _inline_python_literals(summaries)
 
     # Delete each keyless wrapper nothing calls any more, and its interface
-    # member. AFTER the reindent pass, for the reason the stranded-method pass
-    # below is: a deleted whole member reads to it as a folded header, and it
-    # shifts the next member's body out a level. Before that pass, which
-    # removes the imports and private helpers the deletion strands.
+    # member. Before the stranded-method pass below, which removes the imports
+    # and private helpers the deletion strands.
     summaries, wrapper_rows = wrapper_inline.close_out(
         wrappers, repo_dir, summaries, unprocessable, Rewrite, treatment=treatment
     )
@@ -1886,21 +2035,40 @@ def _transform_flag(
     # describe a member that stays: refuse the flag rather than ship them.
     _refuse_wrappers_kept_at_close_out(wrappers, wrapper_rows, doubles, summaries, language, flag_key)
 
-    # Private methods the fold stranded, AFTER the reindent pass and still
-    # before Gate 1. Whole-line deletions need no reindenting, and run earlier
-    # one sitting beside a fold threw off the indentation the reindent pass gave
-    # the folded line. A second call into the same pass rather than a new one:
-    # deleting a method can strand an import, and that pass owns imports.
+    # What a complete C# family left behind: the empty interface, the
+    # member-less classes, their registrations and the constructor parameters
+    # that still take the interface. One transaction per family; a proof that
+    # fails keeps all of it and is reported, never refused. Before the
+    # stranded-method pass, which removes what these deletions strand, and
+    # before Gate 1, which judges every file this rewrites.
+    if language == "csharp":
+        summaries, residue_rows = csharp_residue.remove(
+            wrappers,
+            wrapper_rows,
+            summaries,
+            repo_dir,
+            Rewrite,
+            engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+        )
+        wrapper_rows = wrapper_rows + residue_rows
+    # The passes below parse and rewrite what is on disk: a file this run
+    # deleted is not handed to them (one that wrote back the empty text it
+    # was given would re-create the file), and rejoins the rest for Gate 1
+    # and the diff. See :mod:`flag_cleanup.file_deletion`.
+    summaries, deleted_files = file_deletion.split(summaries)
+
+    # Private methods the fold stranded, still before Gate 1. A second call
+    # into the same pass rather than a new one: deleting a method can strand an
+    # import, and that pass owns imports.
     summaries, method_bindings = _remove_stranded_bindings(
         summaries, language, repo_dir, include_methods=True
     )
     bindings = bindings + method_bindings
 
-    # The labels and `static {}` blocks the fold and the passes above left with
-    # nothing to do, which the customer's lint rejects. After the reindent pass,
-    # which reads either edit as a folded header and shifts what follows it.
-    if language in _TS_GRAMMARS:
-        summaries = _remove_ts_orphans(summaries, language)
+    # The labels the fold and the passes above left with nothing to jump to
+    # them, which the customer's lint rejects (and Go's compiler).
+    if language in _TS_GRAMMARS or language == "go":
+        summaries = _remove_orphans(summaries, language)
 
     # C# primary-constructor parameters the fold left unread: CS9113, an error
     # under TreatWarningsAsErrors — see `primary_constructor`. After the method
@@ -1908,22 +2076,33 @@ def _transform_flag(
     # parameter. The TypeScript family's counterpart: a `private` or `#` member
     # the fold left unread is TS6133/TS6138 under `noUnusedLocals` — see
     # `ts_unread_members`. After the method pass for the same reason.
-    unread_constructor = _unread_primary_parameters(
-        summaries, language, repo_dir
-    ) + _unread_private_members(summaries, language, repo_dir)
+    unread_constructor = _unread_constructor_rows(summaries, language, repo_dir)
     # Remove the constructor parameters among them whose every caller can be
     # proven, with each caller's argument; the rest stay reported. Still before
     # Gate 1, which must judge the callers this rewrites too.
     summaries, unread_constructor, removed_constructor = (
         _remove_unread_constructor_parameters(summaries, language, unread_constructor, repo_dir)
     )
-    bindings = bindings + unread_constructor + removed_constructor
     # A `const` left unread is deleted by the stranded-binding pass above like
     # any other local; only what is still on disk is reported as unread.
     on_disk = {os.path.relpath(s.path, repo_dir): s.content for s in summaries}
     unread_bindings = tuple(
         b for b in unread_bindings if b[2] in on_disk.get(b[0], b[2])
     )
+    # A constructor parameter whose last read was a deleted override is named
+    # once: as an unread binding, with its cause, while it stays; not at all
+    # once the pass above removed it. Matched by class and parameter, since
+    # the binding's text alone can belong to another function in the file.
+    removed = {(path, label) for path, kind, label in removed_constructor if kind == "removed parameter"}
+    gone = {(path, text) for path, text, owner in bound_constructors if (path, owner) in removed}
+    unread_bindings = tuple(b for b in unread_bindings if (b[0], b[2]) not in gone)
+    bound = {(path, owner) for path, _, owner in bound_constructors}
+    unread_constructor = tuple(
+        row
+        for row in unread_constructor
+        if row[1] != "unread constructor parameter" or (row[0], row[2]) not in bound
+    )
+    bindings = bindings + unread_constructor + removed_constructor
     bindings = bindings + dropped_parameters + unread_bindings
 
     # The override literals the entry deletions left empty (`flags={{}}`).
@@ -1946,9 +2125,15 @@ def _transform_flag(
     # its deletions are deliberate and self-checked (see
     # `mock_stubs.resolve`), and the differential checks below would read a
     # deleted test as a fold that lost something.
+    summaries = summaries + deleted_files
     changed = [s for s in summaries if s.original_content != s.content]
     reasons: dict[str, str] = {}
     for s in changed:
+        # A deleted file has no text left to judge: the pass that deleted it
+        # proved every use of what it held was removed with it, and its own
+        # postcondition re-read every file it touched.
+        if file_deletion.deleted(s):
+            continue
         reason = refusal_reason(
             _gate_baseline(doubles, s.path, s.original_content),
             s.content,
@@ -1958,6 +2143,19 @@ def _transform_flag(
         # pre-pass marked. It parses, so Gate 1's checks are blind to it, and
         # it would ship an identifier that does not compile and that no
         # customer can interpret. Refuse — never diff.
+        # The engine inlines a Go local bound to the read without asking which
+        # declaration each same-named identifier belongs to. Asked of the
+        # customer's source, where the names are still there to resolve.
+        if reason is None and _grammar_of(s.path, language) == "go":
+            reason = go_inline.refusal_reason(
+                s.original_content, engine_inlined.get(s.path, ())
+            )
+        # A local the fold stranded that neither the engine nor the stranded-
+        # binding pass could remove: Go rejects it as `declared and not used`.
+        # Asked of the bytes that stay on disk, against the customer's source,
+        # so whatever edit stranded it (the fold, a wrapper, a test double).
+        if reason is None and _grammar_of(s.path, language) == "go":
+            reason = go_stranded.refusal_reason(s.original_content, s.content)
         if reason is None and prepass is not None and prepass.survived(s.path, s.content):
             reason = "the engine left an internal marker in place of a flag read"
         # The same hazard from the other end of the run: a marker
@@ -2429,23 +2627,27 @@ def _delete_bound_entries(
     tuple[tuple[str, str], ...],
     tuple[tuple[str, str, str], ...],
     dict[str, frozenset[tuple[str, str]]],
+    frozenset[tuple[str, str, str]],
 ]:
     """Delete each override entry valued at a name bound to a boolean.
 
     Returns the summaries, the deleted entries as ``(path, text)`` for
     ``TransformOutcome.entries``, ``(path, "unread binding", text)`` for
-    each binding those deletions left unread, and per path the
-    ``(function name, parameter)`` identity of each unread whole parameter. Asked of every candidate file,
+    each binding those deletions left unread, per path the
+    ``(function name, parameter)`` identity of each unread whole parameter,
+    and ``(path, text, "Class(parameter)")`` for each one that is a
+    constructor's. Asked of every candidate file,
     adding a summary for one the engine did not touch, as
     :func:`_unwrap_gates` does. TypeScript family only.
     """
     if not ts_tests.covers(language):
-        return summaries, (), (), {}
+        return summaries, (), (), {}, frozenset()
     by_path = {summary.path: summary for summary in summaries}
     result = list(summaries)
     entries: list[tuple[str, str]] = []
     unread: list[tuple[str, str, str]] = []
     parameters: dict[str, frozenset[tuple[str, str]]] = {}
+    constructors: set[tuple[str, str, str]] = set()
     for path in paths:
         summary = by_path.get(path)
         try:
@@ -2474,7 +2676,8 @@ def _delete_bound_entries(
         unread.extend((relative, "unread binding", text) for text in outcome.unread)
         if outcome.parameters:
             parameters[relative] = frozenset(outcome.parameters)
-    return result, tuple(entries), tuple(unread), parameters
+        constructors.update((relative, text, owner) for text, owner in outcome.constructor_parameters)
+    return result, tuple(entries), tuple(unread), parameters, frozenset(constructors)
 
 
 def _drop_unread_parameters(
@@ -3049,13 +3252,7 @@ def _execute_each_grammar(
     for grammar, members in by_grammar.items():
         overrides: dict[str, object] = {}
         if grammar != language:
-            spec = _LANGUAGES[grammar]
-            jsx_rules_file, jsx_edges_file = _jsx_rule_files(spec)
-            overrides = {
-                "piranha_language": spec.piranha_id,
-                "jsx_rules_file": jsx_rules_file,
-                "jsx_edges_file": jsx_edges_file,
-            }
+            overrides = {"piranha_language": _LANGUAGES[grammar].piranha_id}
         collected.extend(_execute(paths=members, **{**kwargs, **overrides}))
 
 
@@ -3182,6 +3379,13 @@ def _quarantine_and_retry(
     unsupported extension, while a Gate 1 refusal is "our rules produced
     something bad for a file we did understand", and that one must never become a
     partial removal.
+
+    Nor is every abort the first kind. Only the engine's refusal to read a file
+    (:data:`_UNREADABLE_INPUT`) is; any other abort — its post-rewrite syntax
+    self-check, its reserved-word check — is the second kind raised from inside
+    the engine: it read the file, rewrote it, and rejected what it wrote. A
+    probe that ends that way stops the whole flag, exactly as a Gate 1 refusal
+    does.
     """
     readers = frozenset(reader_paths)
     regained_set = frozenset(regained)
@@ -3218,7 +3422,22 @@ def _quarantine_and_retry(
         probe: list = []
         try:
             run_groups(collected=probe, **one)
-        except PiranhaTransformError:
+        except PiranhaTransformError as abort:
+            if _UNREADABLE_INPUT not in str(abort):
+                # The engine READ this file — it refuses one it cannot, with
+                # that message, before any rule runs — and then rejected its
+                # own rewrite of it. That is a defect in the rewrite, not in
+                # the source, so it gets the Gate 1 treatment: the whole flag
+                # stops. Quarantining it would offer the other files as a
+                # partial removal (or, with nothing else to rewrite, a clean
+                # "no changes") and blame a grammar that read the file fine.
+                # Chained to the engine's own panic, as `_execute` chains it.
+                raise PiranhaTransformError(
+                    f"the transform engine rewrote {path} while removing "
+                    f"{flag_key!r} and then refused its own result. The file "
+                    "parses; the rewrite of it is wrong, so nothing was "
+                    f"written for this flag. Engine message: {abort}"
+                ) from (abort.__cause__ or abort)
             unprocessable.append(path)
         else:
             survivors.append(path)
@@ -3442,6 +3661,10 @@ def _collapse_carriage_returns(summaries, language: str, entry_paths: set[str]) 
     reaches the shape only once `strip_dangling_type_separators` has cut the
     dangling `;`: the engine hands over `{\r;\r\n`, which no `\r\r\n` rule
     can see. Running before that pass would fix the first and miss the second.
+
+    Since engine 0.33.0 the engine keeps a file that was CRLF throughout CRLF
+    through its own deletions and folds, so on such a file the first residue
+    no longer arrives. The pass stays as defence in depth, and for the second.
     """
     tidied = []
     for summary in summaries:
@@ -3484,81 +3707,21 @@ def _strip_type_separators(summaries, language: str, entry_paths: set[str]) -> l
 
 
 def _fold_php_literals(summaries) -> list:
-    """Finish the two folds the engine's PHP cascade cannot reach.
+    """Finish the literal conditions the engine's PHP cascade cannot reach.
 
     One pass rather than the Python path's two: PHP has no binding to inline —
     the built-ins already do that — so the only thing left is the literal
     condition. See :mod:`flag_cleanup.php_fold` for which two shapes those are
-    and why neither is expressible as a rule.
+    and why neither is expressible as a rule. The engine folds the
+    ``switch (true)`` multi-way guard itself.
     """
     folded = []
     for summary in summaries:
         if summary.original_content == summary.content:
             folded.append(summary)
             continue
-        # Two folds, both PHP's: the `if`/`elseif` family and the
-        # `switch (true)` multi-way guard (#2692). Independent shapes, so the
-        # order between them does not matter — but both must run before Gate 1.
-        result = fold_php_literal_cases(
-            summary.original_content,
-            fold_php_literal_conditions(summary.original_content, summary.content),
-        )
-        if result == summary.content:
-            folded.append(summary)
-            continue
-        Path(summary.path).write_text(result, encoding="utf-8")
-        folded.append(Rewrite(summary.path, summary.original_content, result))
-    return folded
-
-
-def _fold_go_literals(summaries) -> list:
-    """Finish the tagless-switch folds the engine's Go cascade cannot reach.
-
-    One pass, like PHP's: Go has no binding to inline — the built-ins already
-    do that — so the only thing left is the literal `case` arm.
-    """
-    folded = []
-    for summary in summaries:
-        if summary.original_content == summary.content:
-            folded.append(summary)
-            continue
-        result = fold_go_literal_cases(summary.original_content, summary.content)
-        if result == summary.content:
-            folded.append(summary)
-            continue
-        Path(summary.path).write_text(result, encoding="utf-8")
-        folded.append(Rewrite(summary.path, summary.original_content, result))
-    return folded
-
-
-def _fold_ruby_literals(summaries) -> list:
-    """Finish the subject-less `case` folds the engine's Ruby cascade leaves."""
-    folded = []
-    for summary in summaries:
-        if summary.original_content == summary.content:
-            folded.append(summary)
-            continue
-        result = fold_ruby_literal_whens(summary.original_content, summary.content)
-        if result == summary.content:
-            folded.append(summary)
-            continue
-        Path(summary.path).write_text(result, encoding="utf-8")
-        folded.append(Rewrite(summary.path, summary.original_content, result))
-    return folded
-
-
-def _apply_literal_fold(summaries, fold) -> list:
-    """Run a ``(before, after, path) -> after`` post-engine fold over every summary.
-
-    Writes the result back, because the PR path commits from the working tree
-    and Gate 1 must judge the bytes that stay on disk.
-    """
-    folded = []
-    for summary in summaries:
-        if summary.original_content == summary.content:
-            folded.append(summary)
-            continue
-        result = fold(summary.original_content, summary.content, summary.path)
+        # Before Gate 1, like every text pass.
+        result = fold_php_literal_conditions(summary.original_content, summary.content)
         if result == summary.content:
             folded.append(summary)
             continue
@@ -3609,6 +3772,7 @@ def _inline_bound_reads(
     repo_dir: str,
     entries: tuple[tuple[str, str], ...],
     entry_paths: set[str],
+    dead_loops: list[tuple[str, str]] | None = None,
 ):
     """Resolve reads the fold left bound to a local, through the engine (#3029).
 
@@ -3662,7 +3826,10 @@ def _inline_bound_reads(
       returns for a changed file is a plain `Rewrite`, which carries no rule
       names. In practice a later round finds none — the first pass has already
       taken the registry lines — but reading them here costs nothing and does
-      not depend on that staying true.
+      not depend on that staying true. ``dead_loops``, when given, is extended
+      the same way with :func:`_engine_stranded`, and there a later round
+      matters: ``while use:`` over a bound read only becomes ``while False:``
+      once this pass has inlined it.
     """
     const_group = set(with_const)
     originals = {s.path: s.original_content for s in summaries}
@@ -3735,60 +3902,32 @@ def _inline_bound_reads(
                 continue
             current[path] = Rewrite(path, originals[path], content)
 
+        # After the unwind above, not with the entries: a loop the engine
+        # deleted in a file this round put back is still on disk.
+        if dead_loops is not None:
+            dead_loops.extend(
+                _engine_stranded(
+                    [s for s in produced if s.path not in declined], language, repo_dir
+                )
+            )
+
     return list(current.values()), entries, entry_paths
 
 
-def _fold_python_literals(summaries) -> list:
-    """Finish the folds the engine could not re-indent, and write them back.
-
-    Two passes, and the ORDER is the point rather than an implementation
-    detail: inlining a name the transform bound to a literal is what turns
-    `if use_legacy:` into `if True:`, which is the only thing the condition
-    folder can act on. Reversed, the folder would find nothing and the file
-    would still reach the residue gate half-done.
-    """
+def _inline_python_literals(summaries) -> list:
+    """Inline, with the bare literal, a read still bound to a name, and write it back."""
     folded = []
     for summary in summaries:
         if summary.original_content == summary.content:
             folded.append(summary)
             continue
-        result = fold_literal_conditions(
-            summary.original_content,
-            inline_literal_bindings(summary.original_content, summary.content),
-        )
+        result = inline_literal_bindings(summary.original_content, summary.content)
         if result == summary.content:
             folded.append(summary)
             continue
         Path(summary.path).write_text(result, encoding="utf-8")
         folded.append(Rewrite(summary.path, summary.original_content, result))
     return folded
-
-
-def _reindent_folds(summaries, language: str, doubles: list[mock_stubs.Prepass] | None = None) -> list:
-    """Re-emit every changed summary with the fold's indentation restored.
-
-    Same passthrough shape as :func:`_tidy_trailing_whitespace`: a file whose
-    lines the engine placed correctly is handed back untouched rather than
-    copied.
-
-    A file the test-double pass edited is measured from that pass's output,
-    as Gate 1 judges it: the pass's whole-line deletions are not a fold, and
-    measured from the customer's text they read as a splice whose lines
-    moved, so the lines after them were re-indented wrongly.
-    """
-    reindented = []
-    for summary in summaries:
-        baseline = _gate_baseline(doubles, summary.path, summary.original_content)
-        if baseline == summary.content:
-            reindented.append(summary)
-            continue
-        result = reindent_spliced_lines(baseline, summary.content, _grammar_of(summary.path, language))
-        if result == summary.content:
-            reindented.append(summary)
-            continue
-        Path(summary.path).write_text(result, encoding="utf-8")
-        reindented.append(Rewrite(summary.path, summary.original_content, result))
-    return reindented
 
 
 def _remove_stranded_statements(
@@ -3809,12 +3948,13 @@ def _remove_stranded_statements(
         cleaned, removed = remove_unreachable_statements(
             summary.original_content, summary.content, grammar
         )
-        # Dead loops in the languages that pass does not cover, reported in the
-        # same list: both are code that could never run, and the customer wrote it.
+        # The engine deletes the loops its fold made dead and reports them by
+        # rule name (`_engine_stranded`). What it declines and this side can
+        # still finish goes in the same list: Swift's loop under a comment...
         cleaned, dead = remove_dead_loops(summary.original_content, cleaned, grammar)
         removed = removed + dead
-        # The TypeScript family's dead `for` and `do`, which that pass leaves:
-        # each has a part that runs. See :mod:`flag_cleanup.ts_dead_code`.
+        # ...and the TypeScript family's `for` it declined: its initialiser
+        # runs. See :mod:`flag_cleanup.ts_dead_code`.
         if grammar in _TS_GRAMMARS:
             cleaned, dead = ts_dead_code.remove_dead_loops(
                 summary.original_content, cleaned, grammar
@@ -3836,15 +3976,19 @@ def _remove_stranded_statements(
 _TS_GRAMMARS = frozenset({"ts", "tsx", "js"})
 
 
-def _remove_ts_orphans(summaries, language: str) -> list:
-    """:func:`flag_cleanup.ts_dead_code.remove_orphans` over each changed file."""
+def _remove_orphans(summaries, language: str) -> list:
+    """:func:`flag_cleanup.ts_dead_code.remove_orphans` (or Go's
+    :func:`flag_cleanup.go_dead_code.remove_orphans`) over each changed file."""
     cleaned = []
     for summary in summaries:
         grammar = _grammar_of(summary.path, language)
-        if summary.original_content == summary.content or grammar not in _TS_GRAMMARS:
+        if summary.original_content == summary.content or grammar not in _TS_GRAMMARS | {"go"}:
             cleaned.append(summary)
             continue
-        result = ts_dead_code.remove_orphans(summary.original_content, summary.content, grammar)
+        if grammar == "go":
+            result = go_dead_code.remove_orphans(summary.original_content, summary.content)
+        else:
+            result = ts_dead_code.remove_orphans(summary.original_content, summary.content, grammar)
         if result == summary.content:
             cleaned.append(summary)
             continue
@@ -3933,6 +4077,42 @@ def _unread_private_members(
     return tuple(found)
 
 
+def _unread_plain_constructor_parameters(
+    summaries, language: str, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """``(path, "unread constructor parameter", label)`` for each plain
+    TypeScript or JavaScript constructor parameter the run left unread.
+    Nothing is written."""
+    found: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content:
+            continue
+        grammar = _grammar_of(summary.path, language)
+        if grammar not in ("ts", "tsx", "js"):
+            continue
+        relative = os.path.relpath(summary.path, repo_dir)
+        found.extend(
+            (relative, "unread constructor parameter", label)
+            for label in unread_constructor_parameters(
+                summary.original_content, summary.content, grammar
+            )
+        )
+    return tuple(found)
+
+
+def _unread_constructor_rows(
+    summaries, language: str, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """Every row the removal pass below may act on: C# primary-constructor
+    parameters, TypeScript and JavaScript private members, and plain
+    TypeScript and JavaScript constructor parameters, each left unread."""
+    return (
+        _unread_primary_parameters(summaries, language, repo_dir)
+        + _unread_private_members(summaries, language, repo_dir)
+        + _unread_plain_constructor_parameters(summaries, language, repo_dir)
+    )
+
+
 def _remove_unread_constructor_parameters(
     summaries, language: str, unread: tuple[tuple[str, str, str], ...], repo_dir: str
 ) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[tuple[str, str, str], ...]]:
@@ -3941,29 +4121,57 @@ def _remove_unread_constructor_parameters(
 
     Returns the summaries, the unread rows still unread, and the rows naming
     what went, plus anything the deletions stranded. JavaScript has no
-    parameter properties, so a ``js`` run has nothing to remove.
+    parameter properties, but it has ``#`` fields.
+
+    A deleted argument can be the last read of a parameter of the type that
+    passed it: ``class Passing(IClient c) : Svc(c)`` leaves ``c`` unread once
+    ``Svc`` loses ``client``, which is CS9113 again. Whatever the removal left
+    unread is offered to the same pass, round after round until a round
+    strands nothing, so it goes with its own callers or is reported like any
+    other. Each row is offered once, and each round that rewrites deletes a
+    parameter, so this ends.
     """
-    if language not in ("ts", "tsx", "csharp") or not unread:
+    if language not in ("ts", "tsx", "js", "csharp") or not unread:
         return summaries, unread, ()
-    result = ctor_param_removal.remove(
-        summaries,
-        language,
-        unread,
-        repo_dir,
-        engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
-    )
-    if not result.rewritten:
-        return summaries, result.unread, ()
+    offered = set(unread)
+    pending = unread
+    still: tuple[tuple[str, str, str], ...] = ()
+    rows: tuple[tuple[str, str, str], ...] = ()
+    names: tuple[tuple[str, str], ...] = ()
+    rewritten: set[str] = set()
+    while pending:
+        result = ctor_param_removal.remove(
+            summaries,
+            language,
+            pending,
+            repo_dir,
+            engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+        )
+        still += result.unread
+        if not result.rewritten:
+            break
+        summaries = result.summaries
+        rewritten |= result.rewritten
+        rows += result.rows
+        names += result.argument_names
+        pending = tuple(
+            row
+            for row in _unread_constructor_rows(summaries, language, repo_dir)
+            if row not in offered
+        )
+        offered.update(pending)
+    if not rewritten:
+        return summaries, still, ()
     # A deleted argument can strand the local it named, and a deleted
     # parameter the import of its type: the same pass, over these files only.
-    touched = [s for s in result.summaries if s.path in result.rewritten]
+    touched = [s for s in summaries if s.path in rewritten]
     cleaned, stranded = _remove_stranded_bindings(touched, language, repo_dir)
     by_path = {s.path: s for s in cleaned}
-    summaries = [by_path.get(s.path, s) for s in result.summaries]
+    summaries = [by_path.get(s.path, s) for s in summaries]
     kept = ctor_param_removal.kept_argument_locals(
-        summaries, result.argument_names, language, repo_dir
+        summaries, tuple(dict.fromkeys(names)), language, repo_dir
     )
-    return summaries, result.unread, result.rows + stranded + kept
+    return summaries, still, tuple(dict.fromkeys(rows)) + stranded + kept
 
 
 def _settle_test_doubles(
@@ -4078,7 +4286,7 @@ def checkout_root(repo_dir: str) -> str:
 _OUTSIDE_A_CHECKOUT: set[str] = set()
 
 
-def _source_index(repo_dir: str) -> dict[Path, str]:
+def _source_index(repo_dir: str, language: str | None = None) -> dict[Path, str]:
     """Every readable source file in ``repo_dir``'s checkout (resolved path -> text).
 
     The whole checkout, not just ``repo_dir``: a reader outside the configured
@@ -4089,13 +4297,24 @@ def _source_index(repo_dir: str) -> dict[Path, str]:
     a .js file). The files are :mod:`~flag_cleanup.source_index`'s listing; the
     text is read here, because a pass earlier in the same flag may have
     rewritten it.
+
+    For Ruby and ERB it also holds the Ruby no language here claims: views
+    (``.jbuilder``, ``.haml``, ``.slim``), project files (``Rakefile``,
+    ``Gemfile``, ``config.ru``) and scripts with a Ruby shebang (``bin/setup``),
+    any of which can read a Ruby constant. No other language's index lists them.
     """
+    suffixes: frozenset[str] = KNOWN_EXTENSIONS
+    if language in ruby_owner_reach.LANGUAGES:
+        suffixes |= source_index.RUBY_SUFFIXES | source_index.NO_SUFFIX
     index: dict[Path, str] = {}
-    for source in source_index.files(repo_dir, KNOWN_EXTENSIONS):
+    for source in source_index.files(repo_dir, suffixes):
         try:
-            index[Path(source.resolved)] = source.path.read_text(encoding="utf-8")
+            text = source.path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        if not source.path.suffix and not ruby_owner_reach.is_ruby(source.path, text):
+            continue  # a `Makefile`, a `LICENSE`, a shell script
+        index[Path(source.resolved)] = text
     return index
 
 
@@ -4109,6 +4328,7 @@ def _referenced_elsewhere(
     index: dict[Path, str],
     declaring_path: str,
     consts: tuple[VisibleKeyConst, ...],
+    language: str | None = None,
 ) -> list[str]:
     """Other source files that could be reading one of ``consts``.
 
@@ -4118,10 +4338,28 @@ def _referenced_elsewhere(
     run will remove once the readers are resolved. A reader has to mention the
     constant's name and, for a type member, the owning type's name too; an
     unexported Go name is only readable from the declaring directory.
+
+    A Ruby reader need not spell either: it can reach the owner whole and read
+    the constant by a computed name (``Gate.const_get(n)``), or spell the
+    constant through a class that inherits it (``Sub::NAME``). Both are
+    :mod:`~flag_cleanup.ruby_owner_reach`'s to find, and each hit is logged
+    with the line that reaches the owner. That one includes the declaring file:
+    an owner listing its own constants (``def self.all = constants``) keeps
+    them, so the declaring file can be among the paths returned.
     """
     declaring = Path(declaring_path).resolve()
+    ruby = language in ruby_owner_reach.LANGUAGES
+    families: dict[str, frozenset[str]] = {}
+    if ruby:
+        for owner in sorted({c.owner for c in consts if c.owner}):
+            families[owner] = ruby_owner_reach.family(index, owner)
     patterns = [
-        (c, _token(c.name), _token(c.owner) if c.owner else None) for c in consts
+        (
+            c,
+            _token(c.name),
+            cross_file_keys.mention_pattern(families.get(c.owner, (c.owner,))) if c.owner else None,
+        )
+        for c in consts
     ]
     hits: list[str] = []
     for path, text in index.items():
@@ -4130,9 +4368,26 @@ def _referenced_elsewhere(
         for const, name_re, owner_re in patterns:
             if const.same_directory_only and path.parent != declaring.parent:
                 continue
-            if name_re.search(text) and (owner_re is None or owner_re.search(text)):
+            # A template that is not parsed cannot show whose constant a name
+            # it spells is, so the name alone keeps it.
+            if name_re.search(text) and (
+                owner_re is None or owner_re.search(text) or (ruby and ruby_owner_reach.unparsed(path))
+            ):
                 hits.append(str(path))
                 break
+    if ruby:
+        for owner in sorted({c.owner for c in consts}, key=lambda o: o or ""):
+            for path, line, form in ruby_owner_reach.reaching(index, owner, families):
+                logger.info(
+                    "%s:%d reaches %s whole (%s), so it can read key constant %s",
+                    path,
+                    line,
+                    owner or "the top level",
+                    form,
+                    ", ".join(c.name for c in consts if c.owner == owner),
+                )
+                if str(path) not in hits:
+                    hits.append(str(path))
     return hits
 
 
@@ -4173,11 +4428,11 @@ def _partition_by_const_safety(
             consts = externally_visible_key_consts(source, language, flag_key)
             if consts:
                 if index is None:
-                    index = _source_index(repo_dir)
-                elsewhere = _referenced_elsewhere(index, path, consts)
+                    index = _source_index(repo_dir, language)
+                elsewhere = _referenced_elsewhere(index, path, consts, language)
                 if elsewhere:
                     logger.info(
-                        "%s: key constant %s is referenced from %d other file(s), "
+                        "%s: key constant %s is referenced from %d file(s), "
                         "so its declaration is kept",
                         path,
                         ", ".join(c.name for c in consts),
@@ -4242,8 +4497,6 @@ def _execute(
     argument_flags: dict[str, object],
     flag_key: str,
     repo_dir: str,
-    jsx_rules_file: Path | None = None,
-    jsx_edges_file: Path | None = None,
     entries_rules_file: Path | None = None,
 ):
     """Run Piranha over ``paths``, optionally with the const rules prepended.
@@ -4253,27 +4506,18 @@ def _execute(
     PREPENDED because seed rules fire in declaration order and they must see the
     initialiser before the generic rule rewrites it.
 
-    The JSX rules are APPENDED, and order genuinely does not matter for them:
-    every one is ``is_seed_rule = false`` and reachable only through an edge, so
-    declaration order — which decides nothing but seed precedence — never
-    applies. They are separated from the base file by grammar rather than by
-    rule base; see :attr:`_Language.parses_jsx`. The entry rules are appended
-    for the same reason and with the same indifference to order: every one is
-    a seed rule that matches on its own.
+    The entry rules are APPENDED, and order does not matter for them: every one
+    is a seed rule that matches on its own.
     """
     with tempfile.TemporaryDirectory(prefix="ff-piranha-cfg-") as cfg_dir:
         cfg = Path(cfg_dir)
         rules = rules_file.read_text(encoding="utf-8")
         if const_rules_file is not None and const_rules_file.exists():
             rules = const_rules_file.read_text(encoding="utf-8") + "\n" + rules
-        if jsx_rules_file is not None and jsx_rules_file.exists():
-            rules = rules + "\n" + jsx_rules_file.read_text(encoding="utf-8")
         if entries_rules_file is not None and entries_rules_file.exists():
             rules = rules + "\n" + entries_rules_file.read_text(encoding="utf-8")
         (cfg / "rules.toml").write_text(rules, encoding="utf-8")
         edges = edges_file.read_text(encoding="utf-8") if edges_file.exists() else ""
-        if jsx_edges_file is not None and jsx_edges_file.exists():
-            edges = edges + "\n" + jsx_edges_file.read_text(encoding="utf-8")
         if edges:
             (cfg / "edges.toml").write_text(edges, encoding="utf-8")
 
@@ -4283,6 +4527,15 @@ def _execute(
             substitutions=substitutions,
             path_to_configurations=str(cfg),
             dry_run=False,  # rewrite files in place
+            # The engine deletes a file whose text becomes exactly empty unless
+            # told not to. A removal that empties a file leaves it in place,
+            # empty, as it always has: the file set a run commits and rolls
+            # back is the one it started with.
+            delete_file_if_empty=False,
+            # Go only: the name each unaliased import is guessed to bind, so
+            # the engine can delete one its own fold stranded. See
+            # :func:`~flag_cleanup.unused.go_import_facts`.
+            **({"file_facts": _go_file_facts(paths)} if piranha_language == "go" else {}),
             **argument_flags,
         )
         try:
@@ -4301,6 +4554,22 @@ def _execute(
             raise PiranhaTransformError(
                 f"Piranha aborted while removing {flag_key!r} from {repo_dir}: {exc}"
             ) from exc
+
+
+def _go_file_facts(paths: list[str]) -> dict[str, list[dict[str, str]]]:
+    """:func:`~flag_cleanup.unused.go_import_facts` for each Go file in ``paths``, by absolute path."""
+    facts = {}
+    for path in paths:
+        if not path.endswith(".go"):
+            continue
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        found = go_import_facts(source)
+        if found:
+            facts[os.path.abspath(path)] = found
+    return facts
 
 
 def _summaries_to_diff(summaries, repo_dir: str) -> str:
@@ -4322,18 +4591,26 @@ def _summaries_to_diff(summaries, repo_dir: str) -> str:
     for summary in sorted(summaries, key=lambda s: s.path):
         before = summary.original_content
         after = summary.content
-        if before == after:
+        gone = file_deletion.deleted(summary)
+        if before == after and not gone:
             continue
         try:
             rel = str(Path(summary.path).relative_to(root))
         except ValueError:
             rel = summary.path
-        diff = difflib.unified_diff(
-            _lines(before),
-            _lines(after),
-            fromfile=f"a/{rel}",
-            tofile=f"b/{rel}",
+        # A deleted file is spelled the way git spells one: its new side is
+        # /dev/null. An empty file has no hunk, so its headers stand alone.
+        tofile = "/dev/null" if gone else f"b/{rel}"
+        diff = list(
+            difflib.unified_diff(
+                _lines(before),
+                _lines(after),
+                fromfile=f"a/{rel}",
+                tofile=tofile,
+            )
         )
+        if not diff:
+            diff = [f"--- a/{rel}\n", f"+++ {tofile}\n"]
         chunks.append("".join(_terminated(diff)))
     return "".join(chunks)
 

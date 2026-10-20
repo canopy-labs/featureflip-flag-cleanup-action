@@ -107,9 +107,9 @@ OUTSIDE_RUN = "outside-run"
 #: an expression language), a template, a layout, a config file.
 UNPARSED_MENTION = "unparsed-mention"
 #: A JavaScript wrapper's own declaration file (``flags.d.ts`` beside
-#: ``flags.js``) declares it. Its callers are inlined, but the declaration is
-#: hand-written and outside what this run rewrites, so the wrapper stays
-#: with it.
+#: ``flags.js``) declares it, and that declaration cannot go with it: the file
+#: is outside what this run rewrites, or the declaration shares its statement
+#: with another. Its callers are inlined, and the wrapper stays with it.
 DECLARATION_FILE = "declaration-file"
 #: The read inside the wrapper was not folded in this run (its file could not
 #: be processed), so the wrapper stays as it was.
@@ -144,6 +144,17 @@ PARTIAL = "partial"
 #: An inert sibling whose member went with a complete wrapper: what it
 #: returned, and the value its callers now see.
 SIBLING = "sibling"
+#: A doc comment's reference to the member of a complete wrapper, rewritten
+#: to plain text: what it says now, for the reviewer to check the prose.
+DOC_REFERENCE = "doc-reference"
+#: What a complete C# family left behind and the residue pass removed: a
+#: declaration, a registration, a constructor parameter or field, a file.
+#: See :mod:`flag_cleanup.csharp_residue`.
+RESIDUE = "residue"
+#: The family's residue was kept, and the first reason why.
+RESIDUE_KEPT = "residue-kept"
+#: A comment or document that still names a type the residue pass deleted.
+RESIDUE_PROSE = "residue-prose"
 
 
 @dataclass(frozen=True)
@@ -217,6 +228,10 @@ class Wrapper:
     arity: tuple[int, int | None] | None = None
     #: A ``private`` Kotlin top-level function, visible in its own file only.
     private: bool = False
+    #: A JavaScript wrapper's own declaration file (``flags.d.ts`` beside
+    #: ``flags.js``), resolved, when it has one. Its declarations of the
+    #: wrapper describe it, and go with it.
+    declaration_file: str | None = None
 
     @property
     def label(self) -> str:
@@ -244,6 +259,20 @@ class Occurrence:
     #: Written after the sentinel: ``"()"`` for a property read, which has
     #: no call of its own for the seed rules to match.
     suffix: str = ""
+    #: C#: for a ``sibling-receiver`` read whose receiver is proven, the
+    #: test method it was proven in, which the test-double pass deletes.
+    scope: str | None = None
+
+
+@dataclass(frozen=True)
+class Reference:
+    """A comment that refers to a wrapper's member, rewritten when the
+    member goes: ``before`` is the comment as it is, ``after`` as it will be."""
+
+    path: str
+    line: int
+    before: str
+    after: str
 
 
 @dataclass(frozen=True)
@@ -279,6 +308,8 @@ class WrapperPlan:
     findings: list[Finding] = field(default_factory=list)
     #: Labels of the qualified wrappers with no refusal at all.
     complete: frozenset[str] = frozenset()
+    #: label -> the doc comments to rewrite when that wrapper goes.
+    references: dict[str, tuple[Reference, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -340,9 +371,17 @@ class Profile:
     #: a string literal of a parsed file; ``"unparsed"``, a file nothing here
     #: parses) can be the wrapper's member; ``None``: every one can.
     mention_counts: Callable[[wrapper_jvm.Index, str, str], bool] | None = None
+    #: ``(index, path, wrapper)`` -> the strings of a parsed file that can be
+    #: the member, the profile's own judgement; ``None``: every string
+    #: literal spelling its name, where ``mention_counts`` counts strings.
+    string_mentions: Callable[[wrapper_jvm.Index, str, Wrapper], list[tuple[int, str]]] | None = None
     #: ``(repo_dir, wrapper)`` -> every remaining mention after the fold, the
     #: profile's own judgement; ``None`` for the shared scan.
     leftovers: Callable[[str, Wrapper], list[tuple[str, int, str]]] | None = None
+    #: ``(path, wrapper, index)`` -> the doc comments of a parsed file that
+    #: refer to the member and are rewritten when it goes, instead of keeping
+    #: it; ``None`` where none is.
+    doc_references: Callable[[str, Wrapper, Any], list[Reference]] | None = None
     #: ``(wrapper, index)`` -> resolved path -> where a test may stub the
     #: wrapper there, for the test-double pass that runs before the proof;
     #: ``None`` for languages whose doubles are found per call
@@ -357,6 +396,14 @@ class Profile:
     #: title, which a test runner consumes and so never names a member;
     #: ``None`` where no string is exempt.
     test_title: Callable[[str, str, Node], bool] | None = None
+    #: ``(identifier, wrapper)`` -> whether the identifier names a declaration
+    #: in :attr:`Wrapper.declaration_file` that describes the wrapper, which
+    #: the close-out deletes with it; ``None`` where there is no such file.
+    describes: Callable[[Node, Wrapper], bool] | None = None
+    #: ``(wrapper)`` -> ``(before, after)`` for :attr:`Wrapper.declaration_file`
+    #: with the declarations describing the wrapper deleted, or ``None`` when
+    #: one cannot be deleted alone.
+    without_descriptions: Callable[[Wrapper], tuple[str, str] | None] | None = None
 
 
 _PROFILES: dict[str, Profile] = {}
@@ -574,41 +621,56 @@ def stub_receivers(
 
 def sibling_receivers(
     language: str, qualified: list[tuple[Wrapper, wrapper_jvm.Index]]
-) -> dict[str, frozenset[str]]:
-    """path -> receivers typed as a sibling there, read inside a test method.
+) -> dict[str, frozenset[tuple[str, str]]]:
+    """Resolved path -> ``(test method, receiver)`` proven typed as a sibling
+    in that test method of a test project.
 
     For the test-double pass, which deletes a test reading the member through
-    one: the sibling's member goes with the wrapper. Keyed by file, since a
-    name proves nothing outside the file whose binding was proven.
+    one: the sibling's member goes with the wrapper. Keyed by file and test
+    method, since a name proves nothing outside the method whose bindings
+    (its own, and its class's) were proven.
 
     That pass matches a read of ANY of the run's wrappers through the name,
     so a name stays only where every wrapper read through it in the file
     proved it too (the profile drops a name it cannot prove for the whole
-    file).
+    method).
     """
-    found: dict[str, set[str]] = {}
-    proven: dict[tuple[str, str], set[str]] = {}
+    found: dict[str, set[tuple[str, str]]] = {}
+    proven: dict[tuple[str, str], set[tuple[str, str]]] = {}
     for wrapper, index in qualified:
         for path in index.parsed:
             same, occurrences = _occurrences_in(language, path, wrapper, index)
             if not same:
                 continue
             for o in occurrences:
-                if o.reason == SIBLING_RECEIVER and o.in_test_double and o.receiver:
-                    found.setdefault(path, set()).add(o.receiver)
-                    proven.setdefault((wrapper.label, path), set()).add(o.receiver)
-    from flag_cleanup import mock_stubs
+                if o.reason == SIBLING_RECEIVER and o.in_test_double and o.receiver and o.scope:
+                    found.setdefault(path, set()).add((o.scope, o.receiver))
+                    proven.setdefault((wrapper.label, path), set()).add((o.scope, o.receiver))
+    from flag_cleanup import cross_file_keys, mock_stubs
 
-    result: dict[str, frozenset[str]] = {}
-    for path, names in found.items():
+    result: dict[str, frozenset[tuple[str, str]]] = {}
+    for path, pairs in found.items():
         source = _read(path) or ""
+        root = _parse_for(path, source)
+        # The text of each test named here; a test of a name the file
+        # repeats (which the profile never proves) is the whole file.
+        methods: dict[str, list[str]] = {}
+        for node in cross_file_keys.walk(root) if root is not None else ():
+            name = node.child_by_field_name("name") if node.type == "method_declaration" else None
+            if name is not None:
+                methods.setdefault(name.text.decode("utf-8", "replace"), []).append(
+                    node.text.decode("utf-8", "replace")
+                )
         kept = frozenset(
-            name
-            for name in names
+            pair
+            for pair in pairs
             if all(
-                name in proven.get((wrapper.label, path), ())
-                # Deciding what STAYS: any spelling counts, qualified or not.
-                or not mock_stubs.csharp_receiver_read({name}, {wrapper.name}, reads_only=False).search(source)
+                pair in proven.get((wrapper.label, path), ())
+                # Deciding what STAYS: any spelling in the test counts,
+                # qualified or not.
+                or not mock_stubs.csharp_receiver_read({pair[1]}, {wrapper.name}, reads_only=False).search(
+                    methods[pair[0]][0] if len(methods.get(pair[0], ())) == 1 else source
+                )
                 for wrapper, _ in qualified
             )
         )
@@ -734,6 +796,11 @@ def prove_all(
             Finding(path, line, OTHER_LANGUAGE, text, wrapper.label)
             for path, line, text in index.synthetic
         ]
+        # A Java or Kotlin getter read as a bean property by a template or SpEL.
+        refused += [
+            Finding(path, line, UNPARSED_MENTION, text, wrapper.label)
+            for path, line, text in getattr(index, "bean_reads", ())
+        ]
         # A module object handed on can call the wrapper by a computed name
         # (TypeScript and JavaScript only).
         refused += [
@@ -750,19 +817,34 @@ def prove_all(
                     wrapper.label,
                 )
             )
+        # The wrapper's own declaration file describes it: those declarations
+        # go with it at close-out, when this run may rewrite the file and
+        # each one can be deleted alone. Otherwise each is a refusal.
+        described = (
+            wrapper.declaration_file is not None
+            and lang is not None
+            and lang.without_descriptions is not None
+            and rewritable(wrapper.declaration_file)
+            and lang.without_descriptions(wrapper) is not None
+        )
         marks: list[tuple[str, kotlin_sentinel.Span, str | None]] = []
+        references: list[Reference] = []
         for path in index.parsed:
-            if counts is None or counts(index, path, "string"):
-                refused += [
-                    Finding(path, line, UNPARSED_MENTION, text, wrapper.label)
-                    for line, text in _string_mentions(path, wrapper.name, wrapper.kind == "property")
-                ]
+            if lang is not None and lang.string_mentions is not None:
+                strings = lang.string_mentions(index, path, wrapper)
+            elif counts is None or counts(index, path, "string"):
+                strings = _string_mentions(path, wrapper.name, wrapper.kind == "property")
+            else:
+                strings = []
+            refused += [Finding(path, line, UNPARSED_MENTION, text, wrapper.label) for line, text in strings]
             same, occurrences = _occurrences_in(language, path, wrapper, index)
             for o in occurrences:
                 if not same:
                     reason = OTHER_LANGUAGE
                 elif o.in_test_double:
                     reason = TEST_DOUBLE
+                elif o.reason == DECLARATION_FILE and described:
+                    continue
                 elif o.reason is not None:
                     reason = o.reason
                 elif not rewritable(path):
@@ -772,6 +854,14 @@ def prove_all(
                     marks.append((path, span, o.receiver))
                     continue
                 refused.append(Finding(path, o.line, reason, o.text, wrapper.label))
+            if same and lang is not None and lang.doc_references is not None:
+                for reference in lang.doc_references(path, wrapper, index):
+                    if rewritable(path):
+                        references.append(reference)
+                    else:
+                        refused.append(
+                            Finding(path, reference.line, OUTSIDE_RUN, _one_line(reference.before), wrapper.label)
+                        )
         if not marks and not refused:
             # Nothing mentions it at all: there is no caller to inline, and a
             # member with no caller in the repository may still be called from
@@ -787,6 +877,8 @@ def prove_all(
         if reason_kept:
             refused.insert(0, Finding(wrapper.path, wrapper.line, reason_kept, wrapper.label, wrapper.label))
         kept.append(wrapper)
+        if references:
+            plan.references[wrapper.label] = tuple(references)
         for path, span, receiver in marks:
             plan.spans.setdefault(path, []).append(span)
             if receiver:
@@ -964,12 +1056,15 @@ def _leftovers(
             for line, text in _string_mentions(path, wrapper.name, wrapper.kind == "property")
         ]
         data = source.encode("utf-8")
+        described = lang.describes is not None and str(Path(path).resolve()) == wrapper.declaration_file
         for node in cross_file_keys.walk(root):
             if (
                 node.type in lang.mention_types
                 # C#'s verbatim `@Name` is the same name.
                 and node.text.decode("utf-8", "replace").removeprefix("@") == wrapper.name
                 and not _declaration_name(node, wrapper.kind, path)
+                # Deleted with the wrapper.
+                and not (described and lang.describes(node, wrapper))
                 and not (
                     wrapper.kind == "function"
                     and path in removable
@@ -1049,22 +1144,96 @@ def _without_spans(path: str, spans: list[tuple[int, int]], name: str) -> tuple[
     return source, after
 
 
-def _current_span(sibling: Sibling, summaries: list) -> tuple[int, int] | None:
+def _current_span(
+    sibling: Sibling, summaries: list, written: dict[str, tuple[str, str]] | None = None
+) -> tuple[int, int] | None:
     """The sibling member's span in its file as it is now. A file this run
-    rewrote has moved: the member is found again by its own bytes, which
-    must still occur exactly once; ``None`` otherwise."""
+    rewrote has moved, and so has one whose doc comments close-out has just
+    rewritten (``written``: path -> (before, after)): the member is found
+    again by its own bytes, which must still occur exactly once; ``None``
+    otherwise."""
     summary = next(
         (s for s in summaries if str(Path(s.path).resolve()) == sibling.path and s.original_content != s.content),
         None,
     )
-    if summary is None:
+    rewritten = (written or {}).get(sibling.path)
+    if summary is None and rewritten is None:
         return sibling.start, sibling.end
-    member = summary.original_content.encode("utf-8")[sibling.start : sibling.end]
-    current = summary.content.encode("utf-8")
+    original = summary.original_content if summary is not None else rewritten[0]
+    member = original.encode("utf-8")[sibling.start : sibling.end]
+    current = (rewritten[1] if rewritten is not None else summary.content).encode("utf-8")
     if not member or current.count(member) != 1:
         return None
     start = current.index(member)
     return start, start + len(member)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _rewrite_references(
+    references: Iterable[Reference],
+) -> tuple[dict[str, tuple[str, str]], list[tuple[str, int, str]], list[Reference]]:
+    """Rewrite each reference in its file as it is now, written to disk:
+    ``(path -> (before, after), (path, line, comment) rewritten, references
+    not found)``. A comment is found by its own text, which must occur in
+    the file exactly as often as it is to be rewritten there; when any is
+    not, nothing is written."""
+    by_path: dict[str, list[Reference]] = {}
+    for reference in references:
+        by_path.setdefault(reference.path, []).append(reference)
+    planned: dict[str, tuple[str, str]] = {}
+    rows: list[tuple[str, int, str]] = []
+    unfound: list[Reference] = []
+    for path, listed in sorted(by_path.items()):
+        before = _read(path)
+        if before is None:
+            unfound += listed
+            continue
+        after = before
+        for text in sorted({r.before for r in listed}):
+            wanted = [r for r in listed if r.before == text]
+            replacement = wanted[0].after
+            if not text or after.count(text) != len(wanted) or any(r.after != replacement for r in wanted):
+                unfound += wanted
+                continue
+            at = 0
+            while (at := after.find(text, at)) != -1:
+                after = after[:at] + replacement + after[at + len(text) :]
+                rows.append((path, after.count("\n", 0, at) + 1, _one_line(replacement)))
+                at += len(replacement)
+        planned[path] = (before, after)
+    if unfound:
+        return {}, [], unfound
+    from flag_cleanup import mock_stubs
+
+    for path, (_, after) in planned.items():
+        mock_stubs._write_exact(path, after)
+    return planned, sorted(rows), []
+
+
+def _where_they_ended_up(
+    documented: list[tuple[str, int, str]], changed: dict[str, tuple[str, str]]
+) -> list[tuple[str, int, str]]:
+    """Each rewritten comment at its line once the members are deleted; one
+    a deleted member took with it is not reported. Found by its text, in
+    order of appearance; a count that does not match keeps the lines as
+    they were before the deletions."""
+    by_path: dict[str, list[tuple[str, int, str]]] = {}
+    for row in documented:
+        by_path.setdefault(row[0], []).append(row)
+    moved: list[tuple[str, int, str]] = []
+    for path, rows in by_path.items():
+        final = changed[path][1] if path in changed else (_read(path) or "")
+        lines = final.splitlines()
+        for text in dict.fromkeys(t for _, _, t in rows):
+            wanted = [r for r in rows if r[2] == text]
+            found = [i for i, line in enumerate(lines, 1) if text in " ".join(line.split())]
+            if not found:
+                continue  # deleted with a member
+            moved += [(path, n, text) for n in found] if len(found) == len(wanted) else wanted
+    return sorted(moved)
 
 
 def close_out(
@@ -1081,7 +1250,8 @@ def close_out(
     call, so every one was marked and folded -- its own read was folded (its
     file was rewritten, and not left unprocessed), and a fresh re-scan of the
     repository finds its name nowhere else. Its interface member goes with it,
-    since an implementation cannot be removed from under one, and so does
+    since an implementation cannot be removed from under one, as do the
+    declarations in its own declaration file that describe it, and so does
     every inert sibling's member, each reported as a ``sibling`` row with
     what it returned and the ``treatment`` value its callers now see. Anything
     short of that keeps them all, and the wrapper is ``partial``; so does a
@@ -1120,6 +1290,11 @@ def close_out(
             )
             removable = rewritten if wrapper.kind == "function" else frozenset()
             leftovers = _leftovers(repo_dir, wrapper, removable)
+            # Each doc comment referring to the member is rewritten first, so
+            # the edits below read the files as they will be written.
+            written, documented, unfound = (
+                ({}, [], []) if leftovers else _rewrite_references(plan.references.get(wrapper.label, ()))
+            )
             if leftovers:
                 logger.warning(
                     "keyless wrapper %s still has %d mention(s) after its callers were "
@@ -1129,6 +1304,11 @@ def close_out(
                     Finding(path, line, RECEIVER_UNPROVEN, text, wrapper.label)
                     for path, line, text in leftovers
                 ]
+            elif unfound:
+                # The run changed a comment it was to rewrite.
+                extra += [
+                    Finding(r.path, r.line, UNPARSED_MENTION, _one_line(r.before), wrapper.label) for r in unfound
+                ]
             else:
                 together = wrapper.interface is not None and wrapper.interface.path == wrapper.path
                 edits = [(wrapper.path, _without_member(wrapper.path, wrapper.name, 2 if together else 1))]
@@ -1136,9 +1316,14 @@ def close_out(
                     edits.append(
                         (wrapper.interface.path, _without_member(wrapper.interface.path, wrapper.name))
                     )
+                lang = profile(wrapper.language)
+                if wrapper.declaration_file is not None and lang.without_descriptions is not None:
+                    described = lang.without_descriptions(wrapper)
+                    if described is None or described[0] != described[1]:
+                        edits.append((wrapper.declaration_file, described))
                 by_path: dict[str, list[tuple[int, int] | None]] = {}
                 for sibling in wrapper.siblings:
-                    by_path.setdefault(sibling.path, []).append(_current_span(sibling, summaries))
+                    by_path.setdefault(sibling.path, []).append(_current_span(sibling, summaries, written))
                 held = {wrapper.path} | ({wrapper.interface.path} if wrapper.interface is not None else set())
                 moved: list[Finding] = []
                 for sibling_path, spans in sorted(by_path.items()):
@@ -1167,6 +1352,10 @@ def close_out(
                                 raw = raw[:start] + raw[end:]
                             edits.append((path, (before, raw.decode("utf-8"))))
                 if not all(edit is not None for _, edit in edits):
+                    from flag_cleanup import mock_stubs
+
+                    for path, (before, _) in written.items():
+                        mock_stubs._write_exact(path, before)
                     # A sibling member this run moved out of reach, or one
                     # in a file another edit holds, is named at the sibling;
                     # anything else is a second declaration of the name
@@ -1181,7 +1370,11 @@ def close_out(
                 else:
                     from flag_cleanup import mock_stubs
 
-                    for path, (before, after) in edits:
+                    changed = {path: edit for path, edit in edits}
+                    for path, (before, after) in written.items():
+                        # Read for the edit after the comments were rewritten.
+                        changed[path] = (before, changed[path][1] if path in changed else after)
+                    for path, (before, after) in changed.items():
                         mock_stubs._write_exact(path, after)
                         at = next(
                             (i for i, s in enumerate(summaries) if str(Path(s.path).resolve()) == path),
@@ -1197,6 +1390,10 @@ def close_out(
                     extra += [
                         Finding(s.path, s.line, SIBLING, _sibling_note(s, wrapper.name, value), wrapper.label)
                         for s in wrapper.siblings
+                    ]
+                    extra += [
+                        Finding(p, n, DOC_REFERENCE, t, wrapper.label)
+                        for p, n, t in _where_they_ended_up(documented, changed)
                     ]
         statuses.append(Finding(wrapper.path, wrapper.line, status, wrapper.label, wrapper.label))
     return summaries, statuses + list(plan.findings) + extra

@@ -52,13 +52,21 @@
 
 # --- <obj>.variation("KEY", ctx, <bool literal>) -> @treated
 #
-# The key is matched through `(string (string_content) @flag_name)`.
+# The key is matched through
+# `(string (string_start) . (string_content) @flag_name . (string_end))`.
 # `string_content` is the node holding the text WITHOUT its quotes, and it must
 # be reached that way because `#eq?` cannot be handed a value containing a `"`:
 # `(#eq? @flag_name "\"KEY\"")` fails with *Wrong number of arguments to #eq?
 # predicate. Expected 2, got 4* — the query parser does not honour the escape,
 # it splits on the raw quote. Verified both ways: the right key matches, a
 # different key does not.
+#
+# The content is ANCHORED between the two delimiters, which are named nodes in
+# this grammar, so the comparison is against the whole key. Unanchored, an
+# f-string matched on its first or last literal chunk: `f"old-checkout{env}"`
+# is `string_start`, `string_content "old-checkout"`, an interpolation and
+# `string_end`, and it reads a DIFFERENT flag. Every rule below, and the
+# accessor and key-constant rules, spell the key the same way.
 #
 # THE ANCHORS ARE LOAD-BEARING, not tidiness. `variation`'s signature is
 # `(key, context, default, track=True)`, so a bare "there is a boolean
@@ -85,7 +93,7 @@ query = """(
     function: [(attribute attribute: (identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (string (string_content) @flag_name)
+      . (string (string_start) . (string_content) @flag_name . (string_end))
       . (_)
       . [(true) (false)])
   ) @call
@@ -116,7 +124,7 @@ query = """(
     function: [(attribute attribute: (identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (string (string_content) @flag_name)
+      . (string (string_start) . (string_content) @flag_name . (string_end))
       (keyword_argument
         name: (identifier) @kw
         value: [(true) (false)]))
@@ -156,7 +164,7 @@ query = """(
     function: [(attribute attribute: (identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (argument_list
-      . (string (string_content) @flag_name))
+      . (string (string_start) . (string_content) @flag_name . (string_end)))
   ) @call
   (#eq? @sdk_fn "get_boolean_value")
   (#eq? @flag_name "@stale_flag_name")
@@ -257,5 +265,6 @@ holes = ["marker"]
 # boolean-literal type evidence), the const-propagation rules and their
 # bound-exactly-once pre-flight (the TS/Python families have no
 # `scope_config.toml` in the engine), and the post-passes in `python_fold.py` /
-# `reindent.py` / `syntax.py` — the engine re-parses its output but never
-# type-checks it, and cannot re-indent at all.
+# `syntax.py` — the engine re-parses its output but never type-checks it, and
+# resolving a read bound to a name needs the whole file. The multi-statement
+# folds are the engine's: its built-ins re-indent what they splice.

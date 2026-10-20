@@ -5,8 +5,8 @@
 # simplification, the `if` fold and the statement cleanup all come from the
 # engine's own `cleanup_rules/ts`, reached over the edges in ts_edges.toml —
 # which name GROUPS, not rules, so the engine's rules answer them. (Piranha
-# reads [[edges]] from edges.toml, never from this file.) The JSX cleanup in
-# ts_jsx.toml is the exception: it has no engine counterpart and stays here.
+# reads [[edges]] from edges.toml, never from this file.) That includes the
+# JSX container cleanup, which the engine loads for the TSX grammar only.
 #
 # It did carry the whole cascade, because upstream Piranha ships none for TS/JS
 # (only go/java/kt/ruby/scala/swift). That stopped being true at piranha#35,
@@ -173,7 +173,7 @@ query = """(
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (arguments
-      . (string (string_fragment) @flag_name))
+      . (string . (string_fragment) @flag_name .))
   ) @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @flag_name "@stale_flag_name")
@@ -208,7 +208,7 @@ query = """(
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (arguments
-      . (string (string_fragment) @flag_name))
+      . (string . (string_fragment) @flag_name .))
   ) @call
   (#eq? @sdk_fn "useFeatureFlag")
   (#eq? @flag_name "@stale_flag_name")
@@ -281,7 +281,7 @@ query = """(
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                  (identifier) @sdk_fn]
       arguments: (arguments
-        . (string (string_fragment) @flag_name)))
+        . (string . (string_fragment) @flag_name .)))
   ) @await
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @flag_name "@stale_flag_name")
@@ -369,7 +369,7 @@ query = """(
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
                (identifier) @sdk_fn]
     arguments: (arguments
-      . (string (string_fragment) @flag_name))) @call
+      . (string . (string_fragment) @flag_name .))) @call
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -527,8 +527,9 @@ holes = ["treated", "sentinel"]
 # even though the engine declares identical edges — edges MERGE rather than
 # collide, so a local copy adds a guarantee instead of hiding one, and it keeps
 # the contract the seed rules above depend on visible at the point of use.
-# `ts_jsx_edges.toml` is not a copy of anything: it wires `jsx_cleanup`, which
-# the engine does not have.
+# The JSX cleanup's edges are NOT copied there: `jsx_cleanup` has rules only
+# under the TSX grammar, and this file is shared with `.ts`, whose grammar has
+# no JSX nodes at all.
 #
 # The ts/tsx/js fixture cases in `tests/test_piranha_rules.py` are what holds
 # this together. They exercise the whole cascade end to end, so an engine bump
@@ -536,11 +537,11 @@ holes = ["treated", "sentinel"]
 # in a customer's repository. `test_declares_no_cleanup_rules` stops the
 # duplicate being reintroduced by hand.
 #
-# Four things stay downstream and are NOT candidates to follow the rules up:
+# Three things stay downstream and are NOT candidates to follow the rules up:
 # the seed rules above (they encode these SDKs' call shapes and their
-# boolean-literal type evidence), the JSX cleanup in `ts_jsx.toml`, the
-# const-propagation rules in `ts_const.toml` and their Gate 2 shadow check (the
-# TS/Python families have no `scope_config.toml` in the engine), and the safety
+# boolean-literal type evidence), the const-propagation rules in
+# `ts_const.toml` and their Gate 2 shadow check (the TS/Python families have no
+# `scope_config.toml` in the engine), and the safety
 # gates in `flag_cleanup.ts_syntax` — the engine re-parses its own output, but
 # against a DIFFERENT and older bundled grammar than the one Gate 1 judges the
 # rewrite with, and it never compares the rewrite to the original parse.

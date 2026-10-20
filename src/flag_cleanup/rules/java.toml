@@ -129,7 +129,7 @@ query = """(
   (expression_statement
     (method_invocation
       name: (identifier) @sdk_fn
-      arguments: (argument_list . (string_literal (string_fragment) @flag_name)))) @statement
+      arguments: (argument_list . (string_literal . (string_fragment) @flag_name .)))) @statement
   (#eq? @sdk_fn "boolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -175,7 +175,7 @@ name = "replace_boolvariation_read_with_boolean_literal"
 query = """(
   (method_invocation
     name: (identifier) @sdk_fn
-    arguments: (argument_list . (string_literal (string_fragment) @flag_name))
+    arguments: (argument_list . (string_literal . (string_fragment) @flag_name .))
   ) @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @flag_name "@stale_flag_name")
@@ -226,7 +226,7 @@ query = """(
   (expression_statement
     (method_invocation
       name: (identifier) @sdk_fn
-      arguments: (argument_list . (string_literal (string_fragment) @flag_name)))) @statement
+      arguments: (argument_list . (string_literal . (string_fragment) @flag_name .)))) @statement
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -259,7 +259,7 @@ name = "replace_openfeature_boolean_read_with_boolean_literal"
 query = """(
   (method_invocation
     name: (identifier) @sdk_fn
-    arguments: (argument_list . (string_literal (string_fragment) @flag_name))
+    arguments: (argument_list . (string_literal . (string_fragment) @flag_name .))
   ) @call
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @flag_name "@stale_flag_name")

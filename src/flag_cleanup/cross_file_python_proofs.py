@@ -4,6 +4,7 @@ in another file are reads the const rules remove (see
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -188,6 +189,19 @@ def _is_dunder(attribute: Node) -> bool:
     )
 
 
+def _dotted(node: Node) -> str | None:
+    """``a.b.c`` for a chain of names however it is written -- split over
+    lines, continued with a backslash, a comment inside it -- and None for
+    anything else. The chain's text would hold all of those."""
+    if node.type == "identifier":
+        return _text(node)
+    if node.type == "attribute":
+        head = _dotted(node.child_by_field_name("object"))
+        name = node.child_by_field_name("attribute")
+        return None if head is None or name is None else f"{head}.{_text(name)}"
+    return None
+
+
 def _head_use(node: Node, binding: _Binding, twins: frozenset[int] = frozenset()) -> str | None:
     """None when a token of a qualified binding's head cannot hand the module on.
 
@@ -219,7 +233,7 @@ def _head_use(node: Node, binding: _Binding, twins: frozenset[int] = frozenset()
     depth = 1
     while True:
         prefix = ".".join(owner_parts[:depth])
-        if _text(current).replace(" ", "") != prefix:
+        if _dotted(current) != prefix:
             # Left the owner's path. A dunder there (`a.__dict__`) is the
             # namespace the owner lives in, handed out.
             return xk.NOT_A_READ if _is_dunder(current) else None
@@ -413,6 +427,167 @@ def references(
                 unique.append(refusal)
         return [], unique
     return reads, refused
+
+
+def _module_word(decl_path: str) -> str:
+    """The last segment of the module a declaring file is: its stem, or its
+    package's name for an ``__init__.py``. Every import of it spells this."""
+    file = Path(decl_path)
+    return file.parent.name if file.name == "__init__.py" else file.stem
+
+
+def constant_module_pattern(declarations: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
+    """What a file's text holds when it can bind a declaring file whole: the
+    module's last segment, which ``import pkg.keys``, ``from pkg import keys``
+    and ``import_module("pkg.keys")`` all spell, or a relative star import,
+    which can bind a package ``__init__.py``'s names spelling nothing."""
+    words = xk.mention_pattern({_module_word(d.path) for d in declarations}).pattern
+    return re.compile(rf"{words}|\bfrom\s+\.+\s*import\s+\*")
+
+
+#: A whole dotted module name in a string, as an import-by-name spells it.
+_DOTTED = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
+def constant_escapes(
+    path: str, source: str, declarations: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``path`` that reaches a
+    declaring file as a whole, where any constant of it can be read without
+    its name being spelled.
+
+    That is a binding of the module, or of a package holding it
+    (:func:`_package_bindings`), used as anything but a member chain that
+    ends in or passes ``m.<member>`` -- handed on, stored, iterated,
+    ``getattr(m, name)``, ``m.__dict__`` -- judged exactly as
+    :func:`references` judges it in a file that spells the name
+    (:func:`_head_use`, ``not-a-read``); such a binding in a class body,
+    which hands the module on as the class's attribute (``unsupported-form``);
+    a star import of the module (``import-unresolved``), which puts every
+    constant into a namespace this run does not follow; and a string that is
+    the module's whole dotted name, which ``importlib.import_module`` or
+    ``sys.modules`` loads (``unsupported-form``). A file that does not parse
+    refuses every declaring file whose module it names.
+    """
+    root = _parse(source)
+    by_file: dict[str, xk.KeyDeclaration] = {}
+    for decl in declarations:
+        by_file.setdefault(decl.path, decl)
+    found: list[tuple[str, xk.Refusal]] = []
+
+    def add(declaring: str, refusal: xk.Refusal) -> None:
+        if (declaring, refusal) not in found:
+            found.append((declaring, refusal))
+
+    if root.has_error or _decoded_otherwise(source):
+        for declaring in by_file:
+            if xk.mention_pattern([_module_word(declaring)]).search(source):
+                add(declaring, xk.Refusal(path, 1, xk.UNSUPPORTED_FORM, ""))
+        return found
+    # One walk: a file with many bindings is judged in linear time.
+    names: dict[str, list[Node]] = {}
+    strings: list[Node] = []
+    stars: list[tuple[Node, Node]] = []
+    for node in _walk(root):
+        if node.type == "identifier" and not _not_a_mention(node):
+            names.setdefault(_text(node), []).append(node)
+        elif node.type == "string_content" and _DOTTED.fullmatch(_text(node)):
+            strings.append(node)
+        elif node.type == "import_from_statement":
+            star = next((c for c in node.named_children if c.type == "wildcard_import"), None)
+            if star is not None:
+                stars.append((node, star))
+    for declaring, decl in by_file.items():
+        qualified = [b for b in _bindings(root, path, repo_dir, decl) if b.kind == "qualified"]
+        qualified += _package_bindings(root, path, repo_dir, decl)
+        judged: set[tuple[str, str | None]] = set()
+        for binding in qualified:
+            if _in_class_body(binding.statement):
+                add(declaring, _refusal(path, binding.statement, xk.UNSUPPORTED_FORM, source))
+            key = (binding.local, binding.owner)
+            if key in judged:
+                continue
+            judged.add(key)
+            twins = frozenset(b.name_node.id for b in qualified if (b.local, b.owner) == key)
+            for node in names.get(binding.owner.split(".")[0], ()):
+                # A rebinding of the name hands nothing on; a use after it is
+                # judged at that use.
+                if _head_use(node, binding, twins) == xk.NOT_A_READ:
+                    add(declaring, _refusal(path, node, xk.NOT_A_READ, source))
+        for statement, star in stars:
+            source_node = statement.child_by_field_name("module_name")
+            if source_node is not None and declaring in _resolve(repo_dir, path, _module_of(source_node)):
+                add(declaring, _refusal(path, star, xk.IMPORT_UNRESOLVED, source))
+        for node in strings:
+            if declaring in _resolve(repo_dir, path, _Module(0, tuple(_text(node).split(".")))):
+                add(declaring, _refusal(path, node, xk.UNSUPPORTED_FORM, source))
+    return found
+
+
+def _in_class_body(statement: Node) -> bool:
+    """Whether an import binds a class attribute: its nearest scope is a class."""
+    current = statement.parent
+    while current is not None:
+        if current.type == "function_definition":
+            return False
+        if current.type == "class_definition":
+            return True
+        current = current.parent
+    return False
+
+
+def _package_bindings(root: Node, path: str, repo_dir: str, decl: xk.KeyDeclaration) -> list[_Binding]:
+    """Bindings of a package that holds ``decl``'s file, which reach the
+    module as the package's attribute once anything loads it: ``import app``
+    or ``import app as a`` (``app.keys``, ``a.keys``), ``from app import
+    sub`` for ``app/sub/keys.py``, and ``from app import *``, which binds a
+    loaded submodule ``keys`` itself. :func:`_bindings` sees none of them,
+    since each resolves to a package's ``__init__.py``. Which module the
+    owner means is what is being asked, so none is ambiguous."""
+    target = Path(decl.path)
+    found: list[_Binding] = []
+
+    def held(module: _Module) -> tuple[str, ...] | None:
+        """The segments from ``module``, a package, down to ``decl``'s file."""
+        for init in _resolve(repo_dir, path, module):
+            package = Path(init)
+            if package.name != "__init__.py" or init == decl.path or package.parent not in target.parents:
+                continue
+            rel = target.relative_to(package.parent).with_suffix("").parts
+            rel = rel[:-1] if rel[-1] == "__init__" else rel
+            if rel and decl.path in _resolve(repo_dir, path, _Module(module.level, (*module.parts, *rel))):
+                return rel
+        return None
+
+    for statement in _walk(root):
+        if statement.type == "import_statement":
+            for entry, local in _import_bound_names(statement):
+                dotted = entry.child_by_field_name("name") if entry.type == "aliased_import" else entry
+                spelled = _module_of(dotted)
+                # `import a.b` binds the package `a`; `import a.b as x`, `a.b`.
+                bound = spelled if entry.type == "aliased_import" else _Module(0, spelled.parts[:1])
+                rel = held(bound)
+                if rel is not None:
+                    owner = ".".join((local, *rel))
+                    found.append(_Binding(statement, entry, "qualified", local, owner, bound, False))
+        elif statement.type == "import_from_statement":
+            source_node = statement.child_by_field_name("module_name")
+            if source_node is None:
+                continue
+            module = _module_of(source_node)
+            if any(c.type == "wildcard_import" for c in statement.named_children):
+                rel = held(module)
+                if rel is not None:
+                    star = next(c for c in statement.named_children if c.type == "wildcard_import")
+                    found.append(_Binding(statement, star, "qualified", rel[0], ".".join(rel), module, False))
+                continue
+            for entry, local in _import_bound_names(statement):
+                bound = _Module(module.level, (*module.parts, _imported_name(entry)))
+                rel = held(bound)
+                if rel is not None:
+                    owner = ".".join((local, *rel))
+                    found.append(_Binding(statement, entry, "qualified", local, owner, bound, False))
+    return found
 
 
 def _raw(node: Node) -> str:

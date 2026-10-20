@@ -40,6 +40,7 @@ contributes can still shadow a name.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -384,6 +385,26 @@ class _Share:
     types: tuple[_TypeInfo, ...]
     namespaces: frozenset[str]
     global_usings: tuple[_Using, ...]
+    #: For a file that does not parse whole, every word it spells, the only
+    #: names it can declare anything under; ``None`` when an escape sequence
+    #: may spell any. Empty for a file that parses.
+    unparsed_words: frozenset[str] | None = frozenset()
+
+
+_WORDS = re.compile(r"\w+")
+#: A Unicode escape: an identifier may spell any letter with one.
+_ESCAPE = re.compile(r"\\[uU][0-9A-Fa-f]{4}")
+
+
+def _spelled_words(text: str) -> frozenset[str] | None:
+    """Every identifier-like word of ``text``, with the formatting characters
+    the compiler drops from an identifier (a soft hyphen inside a name) taken
+    out first; ``None`` when it holds an escape sequence."""
+    if _ESCAPE.search(text):
+        return None
+    if not text.isascii():
+        text = "".join(c for c in text if unicodedata.category(c) != "Cf")
+    return frozenset(_WORDS.findall(text))
 
 
 def _simple_name(node: Node) -> str | None:
@@ -440,7 +461,8 @@ def _share(text: str) -> tuple[_Share, bool]:
     global_usings = tuple(
         u for c in _walk(root) if c.type == "using_directive" for u in (_using(c),) if u.is_global
     )
-    return _Share(types, frozenset(namespaces), global_usings), not root.has_error
+    words = _spelled_words(text) if root.has_error else frozenset()
+    return _Share(types, frozenset(namespaces), global_usings, words), not root.has_error
 
 
 @dataclass(frozen=True)
@@ -452,6 +474,24 @@ class _Index:
     global_usings: tuple[_Using, ...]
     #: A ``.cs`` file could not be read or parsed whole: it may declare anything.
     incomplete: bool
+    #: The words of each file that does not parse whole (see
+    #: :attr:`_Share.unparsed_words`).
+    unparsed_words: tuple[frozenset[str] | None, ...] = ()
+    #: A ``.cs`` file could not be read at all.
+    unreadable: bool = True
+
+    def may_declare(self, name: str) -> bool:
+        """Whether some file may declare a type, member or alias called
+        ``name``: the index holds a type of that name, a file could not be
+        read, or a file that does not parse whole spells the name. Narrower
+        than :attr:`incomplete`, and as sound: a declaration is written under
+        a name its file spells."""
+        return bool(self.by_last.get(name)) or self.spelled_where_unparsed(name)
+
+    def spelled_where_unparsed(self, name: str) -> bool:
+        """Whether a file that could not be read, or does not parse whole,
+        may spell ``name``."""
+        return self.unreadable or any(words is None or name in words for words in self.unparsed_words)
 
     def reaches(self, names: Iterable[str], owner_last: str) -> bool:
         """Whether a type of one of these simple names may be, or extend, the
@@ -487,7 +527,7 @@ class _Index:
         return frozenset(found)
 
 
-def _combine(shares: list[tuple[str, _Share]], incomplete: bool, _unreadable: bool) -> _Index:
+def _combine(shares: list[tuple[str, _Share]], incomplete: bool, unreadable: bool) -> _Index:
     by_qualified: dict[tuple[str, str], list[_TypeInfo]] = {}
     by_full: dict[str, list[_TypeInfo]] = {}
     by_last: dict[str, list[_TypeInfo]] = {}
@@ -508,6 +548,8 @@ def _combine(shares: list[tuple[str, _Share]], incomplete: bool, _unreadable: bo
         frozenset(namespaces),
         tuple(global_usings),
         incomplete,
+        tuple(share.unparsed_words for _, share in shares if share.unparsed_words != frozenset()),
+        unreadable,
     )
 
 
@@ -1100,6 +1142,237 @@ def references(
     return reads, refused
 
 
+# --- the owner taken whole ----------------------------------------------------
+
+#: Literal nodes whose text can name a type for ``Type.GetType`` or a
+#: ``Type.Name`` comparison.
+_STRINGS = frozenset(
+    {"string_literal", "verbatim_string_literal", "raw_string_literal", "interpolated_string_expression"}
+)
+_STRING_PARTS = frozenset({"string_literal_content", "raw_string_content", "string_content", "escape_sequence"})
+
+#: Generics whose type argument reads none of the type's fields: a logging
+#: category (``ILogger<Owner>``, ``Logger<Owner>``,
+#: ``factory.CreateLogger<Owner>()``, Serilog's ``Log.ForContext<Owner>()``)
+#: or an equality or ordering contract (``IEquatable<Owner>``). A class names
+#: itself in one of these in nearly every service, so none takes a type whole.
+_NOT_REFLECTING_GENERICS = frozenset(
+    {"ILogger", "Logger", "CreateLogger", "ForContext", "IEquatable", "IComparable"}
+)
+
+#: Calls whose ``typeof(Owner)`` argument is a logging category, for the same
+#: reason: log4net's ``LogManager.GetLogger(typeof(Owner))``, Serilog's
+#: ``ForContext(typeof(Owner))``, ``factory.CreateLogger(typeof(Owner))``.
+_NOT_REFLECTING_CALLS = frozenset({"GetLogger", "ForContext", "CreateLogger"})
+
+
+def _logger_category(node: Node) -> bool:
+    """Whether a ``typeof`` expression is an argument of a
+    :data:`_NOT_REFLECTING_CALLS` call."""
+    argument = node.parent
+    arguments = argument.parent if argument is not None and argument.type == "argument" else None
+    call = arguments.parent if arguments is not None and arguments.type == "argument_list" else None
+    if call is None or call.type != "invocation_expression":
+        return False
+    function = call.child_by_field_name("function")
+    if function is not None and function.type == "member_access_expression":
+        function = function.child_by_field_name("name")
+    return function is not None and _text(function).split("<", 1)[0] in _NOT_REFLECTING_CALLS
+
+#: Per index, every type by the simple name of each type it lists as a base.
+_HEIRS: dict[int, tuple[_Index, dict[str, tuple[_TypeInfo, ...]]]] = {}
+
+
+def _heirs(index: _Index, owner_last: str) -> list[_TypeInfo]:
+    """Every repository type the index proves derives from a type named
+    ``owner_last``, through any number of bases it can see.
+
+    A strict walk, unlike :meth:`_Index.reaches`, which answers yes for every
+    name once one file fails to parse: that would make every repository type
+    an heir of every owner.
+    """
+    cached = _HEIRS.get(id(index))
+    if cached is None or cached[0] is not index:
+        children: dict[str, list[_TypeInfo]] = {}
+        for infos in index.by_last.values():
+            for info in infos:
+                for base in set(info.supertypes):
+                    children.setdefault(base, []).append(info)
+        _HEIRS.clear()
+        cached = _HEIRS[id(index)] = (index, {k: tuple(v) for k, v in children.items()})
+    children_of = cached[1]
+    found: list[_TypeInfo] = []
+    seen = {owner_last}
+    pending = [owner_last]
+    while pending:
+        for info in children_of.get(pending.pop(), ()):
+            found.append(info)
+            if info.last not in seen:
+                seen.add(info.last)
+                pending.append(info.last)
+    return found
+
+
+def _whole_names(
+    constants: Iterable[xk.KeyDeclaration], repo_dir: str
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """``(by simple name, by qualified name)``: the declaring files whose owner
+    a type of that name takes whole.
+
+    That is every type of the owner chain (an outer type reaches a nested one
+    through ``GetNestedTypes()``) and every repository type deriving from the
+    owner (``GetFields`` with ``FlattenHierarchy`` lists a base's constants).
+    Names are matched without resolving them, so a same-named type elsewhere
+    counts too: the cost is a declaration kept.
+    """
+    index = csharp_index(repo_dir)
+    by_name: dict[str, set[str]] = {}
+    by_full: dict[str, set[str]] = {}
+    for decl in constants:
+        if decl.kind != xk.CONSTANT or decl.owner is None:
+            continue
+        chain = decl.owner.split(".")
+        for end in range(1, len(chain) + 1):
+            by_name.setdefault(chain[end - 1], set()).add(decl.path)
+            by_full.setdefault(".".join(filter(None, [decl.module, *chain[:end]])), set()).add(decl.path)
+        for info in _heirs(index, chain[-1]):
+            by_name.setdefault(info.last, set()).add(decl.path)
+            by_full.setdefault(info.full, set()).add(decl.path)
+    return by_name, by_full
+
+
+def _with_aliases(
+    usings: Iterable[_Using], by_name: dict[str, set[str]], by_full: dict[str, set[str]]
+) -> dict[str, set[str]]:
+    """``by_name`` plus each alias of one of its types, holding that type's
+    declaring files. An alias whose target is not plain dotted names (a
+    generic, an extern alias) may stand for any of them."""
+    every = set().union(*by_name.values())
+    spelled = {name: set(held) for name, held in by_name.items()}
+    for using in usings:
+        if using.kind != "alias" or not using.alias:
+            continue
+        if using.target is None:
+            held = every
+        else:
+            held = by_full.get(using.target) or by_name.get(using.target.rsplit(".", 1)[-1], set())
+        if held:
+            spelled.setdefault(using.alias, set()).update(held)
+    return spelled
+
+
+def _project_aliases(repo_dir: str) -> tuple[_Using, ...]:
+    """Every ``global using`` and project ``<Using>`` item, wherever it applies."""
+    project, _readable = msbuild_usings(repo_dir)
+    return csharp_index(repo_dir).global_usings + project
+
+
+def _string_text(node: Node) -> str:
+    """The literal text of a string, with each hole of an interpolated one as NUL."""
+    if node.type == "verbatim_string_literal":
+        return _text(node)[2:-1].replace('""', '"')
+    return "".join(
+        _text(c) if c.type in _STRING_PARTS else "\0" if c.type == "interpolation" else ""
+        for c in node.children
+    )
+
+
+def _last_name(node: Node | None) -> str:
+    """The simple name a type or a name expression ends in, or ``""``."""
+    if node is not None and node.type == "member_access_expression":
+        node = node.child_by_field_name("name")
+    # `@Owner` is `Owner`: a verbatim identifier.
+    return ((_simple_name(node) if node is not None else None) or "").removeprefix("@")
+
+
+def _alternation(names: Iterable[str]) -> str:
+    return "|".join(map(re.escape, sorted(names, key=lambda n: (-len(n), n))))
+
+
+def constant_escapes(
+    path: str, source: str, constants: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[tuple[str, xk.Refusal]]:
+    """``(declaring file, refusal)`` at each place in ``path`` that takes the
+    type owning one of ``constants`` as a whole, from which reflection reads
+    any of its constants without spelling one.
+
+    A type is taken whole by ``typeof(Owner)`` (except as a logging
+    category, :data:`_NOT_REFLECTING_CALLS`), by ``nameof(Owner)`` (half of
+    a name assembled for ``Type.GetType``), as a type argument (a helper
+    reflecting over ``typeof(T)``) other than a logger's or an equality
+    contract's (:data:`_NOT_REFLECTING_GENERICS`), or by a string holding its qualified name
+    (``"Ns.Owner"``, ``"Ns.Owner, Assembly"``, ``"Ns.Outer+Owner"``) or being
+    exactly its simple name (``t.Name == "Owner"``). Each counts for every
+    type :func:`_whole_names` lists, and the first three for an alias of one
+    too: a string cannot name a type through an alias.
+    """
+    by_name, by_full = _whole_names(constants, repo_dir)
+    if not by_name:
+        return []
+    root = syntax._parse(source, "csharp")
+    file_usings = tuple(_using(n) for n in _walk(root) if n.type == "using_directive")
+    spelled = _with_aliases(_project_aliases(repo_dir) + file_usings, by_name, by_full)
+    mention = xk.mention_pattern(by_name)
+    dotted = [full for full in by_full if "." in full]
+    qualified = re.compile(rf"(?<![\w.])(?:{_alternation(dotted)})(?!\w)") if dotted else None
+    simple = re.compile(rf"\s*(?P<name>{_alternation(by_name)})(?:[+,`].*)?\s*", re.DOTALL)
+    found: set[tuple[str, xk.Refusal]] = set()
+    for node in _walk(root):
+        held: set[str] = set()
+        if node.type == "typeof_expression":
+            if _logger_category(node):
+                continue
+            held = spelled.get(_last_name(next(iter(node.named_children), None)), set())
+        elif node.type == "type_argument_list":
+            generic = node.parent.named_children[0] if node.parent is not None else None
+            if generic is not None and _text(generic) in _NOT_REFLECTING_GENERICS:
+                continue
+            held = set().union(*(spelled.get(_last_name(t), set()) for t in node.named_children))
+        elif node.type == "invocation_expression":
+            function = node.child_by_field_name("function")
+            arguments = node.child_by_field_name("arguments")
+            argument = (
+                arguments.named_children[0]
+                if arguments is not None and len(arguments.named_children) == 1
+                else None
+            )
+            if (
+                function is not None
+                and _text(function) == "nameof"
+                and argument is not None
+                and argument.named_children
+            ):
+                held = spelled.get(_last_name(argument.named_children[-1]), set())
+        elif node.type in _STRINGS:
+            text = _string_text(node)
+            if mention.search(text) is None:
+                continue
+            # Reflection writes a nested type `Outer+Inner`; the index, `Outer.Inner`.
+            for match in qualified.finditer(text.replace("+", ".")) if qualified is not None else ():
+                held |= by_full[match.group(0)]
+            if (whole := simple.fullmatch(text)) is not None:
+                held |= by_name[whole.group("name")]
+        for holder in held:
+            found.add((holder, xk.refusal(path, node, xk.UNSUPPORTED_FORM, source)))
+    return sorted(found, key=lambda hit: (hit[0], hit[1].line, hit[1].text))
+
+
+def whole_owner_names(constants: Iterable[xk.KeyDeclaration], repo_dir: str) -> dict[str, set[str]]:
+    """Every simple name through which a file can take the owner of one of
+    ``constants`` whole (:func:`_whole_names`, plus a global or project alias
+    of one), with the declaring files each reaches."""
+    by_name, by_full = _whole_names(constants, repo_dir)
+    return _with_aliases(_project_aliases(repo_dir), by_name, by_full)
+
+
+def constant_module_pattern(constants: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
+    """Every name through which a file can take the owner of one of
+    ``constants`` whole, a global or project alias included. A file spelling
+    none of them cannot: a string naming the owner spells its simple name, and
+    a file-level alias the target's."""
+    return xk.mention_pattern(whole_owner_names(constants, repo_dir))
+
+
 xk.register(
     "csharp",
     xk.Profile(
@@ -1109,5 +1382,9 @@ xk.register(
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
         reaches=frozenset({"dotnet_guest"}),
+        # A type can be taken whole (`typeof(Owner)`, its name in a string):
+        # reflection reaches every constant without spelling one.
+        constant_escapes=constant_escapes,
+        constant_module_pattern=constant_module_pattern,
     ),
 )

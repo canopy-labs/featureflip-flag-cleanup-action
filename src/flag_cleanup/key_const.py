@@ -408,8 +408,22 @@ def _csharp_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bo
 
     A name in ``accessors`` is matched like `BoolVariation` -- plain, not
     awaited-only -- because that is the shape its clone takes.
+
+    The key may also be spelled ``Owner.NAME`` when the owner is declared in
+    this file (:func:`_csharp_qualified_by_owner`), which the rules match too.
     """
-    invocation = _first_argument_of(identifier, "argument", "argument_list")
+    argument = identifier
+    parent = identifier.parent
+    if (
+        parent is not None
+        and parent.type == "member_access_expression"
+        and (name := parent.child_by_field_name("name")) is not None
+        and name.id == identifier.id
+    ):
+        if not _csharp_qualified_by_owner(parent):
+            return False
+        argument = parent
+    invocation = _first_argument_of(argument, "argument", "argument_list")
     if invocation is None or invocation.type != "invocation_expression":
         return False
     function = invocation.child_by_field_name("function")
@@ -429,6 +443,104 @@ def _csharp_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bo
         parent = invocation.parent
         return parent is not None and parent.type == "await_expression"
     return not _csharp_is_mock_expression_read(invocation)
+
+
+#: Types whose body can declare a ``const`` field.
+_CSHARP_OWNER_TYPES = frozenset(
+    {
+        "class_declaration",
+        "struct_declaration",
+        "interface_declaration",
+        "record_declaration",
+        "record_struct_declaration",
+    }
+)
+#: Every C# declaration that can introduce a type's simple name.
+_CSHARP_TYPE_DECLARATIONS = _CSHARP_OWNER_TYPES | {"enum_declaration", "delegate_declaration"}
+
+
+def _csharp_namespace_of(node: Node) -> int | None:
+    """The id of the nearest block ``namespace`` around ``node``, or None.
+
+    A file-scoped namespace is a sibling of the types, not their ancestor, and
+    a file holding one can hold no block namespace, so None stands for it too.
+    """
+    current = node.parent
+    while current is not None:
+        if current.type == "namespace_declaration":
+            return current.id
+        current = current.parent
+    return None
+
+
+def _csharp_qualified_by_owner(access: Node) -> bool:
+    """Whether ``access`` (``Owner.NAME``) names the constant declared here.
+
+    Only when ``Owner`` cannot mean anything else at the read: written as
+    exactly ``Owner.NAME``; ``Owner`` the one non-generic, top-level type of
+    that name in the file, in the read's own namespace (a type in the
+    enclosing namespace is found before any ``using``); that type's body
+    declaring a field ``NAME`` (bound exactly once in the file, so the key
+    constant); and nothing else in the file -- a member, a nested type, a
+    local, a parameter, an alias -- spelling a declaration of ``Owner``,
+    which C# would find first. A member of that name inherited from a type
+    in another file is not visible from here.
+    """
+    owner_node = access.child_by_field_name("expression")
+    member = access.child_by_field_name("name")
+    if owner_node is None or member is None or owner_node.type != "identifier":
+        return False
+    owner = owner_node.text.decode("utf-8")
+    if access.text.decode("utf-8") != f"{owner}.{member.text.decode('utf-8')}":
+        return False
+    root = access
+    while root.parent is not None:
+        root = root.parent
+    declared = []
+    for node in _walk(root):
+        if node.type != "identifier" or node.text != owner_node.text:
+            continue
+        holder = node.parent
+        if holder is None:
+            continue
+        if holder.type == "type_parameter":
+            return False
+        name = holder.child_by_field_name("name")
+        if name is None or name.id != node.id:
+            continue
+        if holder.type not in _CSHARP_TYPE_DECLARATIONS:
+            return False  # a member, local, parameter or alias named the same
+        declared.append(holder)
+    if len(declared) != 1:
+        return False
+    owner_type = declared[0]
+    container = owner_type.parent
+    if owner_type.type not in _CSHARP_OWNER_TYPES or container is None:
+        return False
+    if any(c.type == "type_parameter_list" for c in owner_type.children):
+        return False
+    top_level = container.type == "compilation_unit" or (
+        container.type == "declaration_list"
+        and container.parent is not None
+        and container.parent.type == "namespace_declaration"
+    )
+    if not top_level or _csharp_namespace_of(owner_type) != _csharp_namespace_of(access):
+        return False
+    body = owner_type.child_by_field_name("body")
+    if body is None:
+        return False
+    wanted = member.text
+    for field in body.named_children:
+        if field.type != "field_declaration":
+            continue
+        for declaration in field.named_children:
+            if declaration.type != "variable_declaration":
+                continue
+            for declarator in declaration.named_children:
+                name = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+                if name is not None and name.text == wanted:
+                    return True
+    return False
 
 
 def _csharp_is_binding(node: Node) -> bool:

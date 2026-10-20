@@ -10,11 +10,12 @@ Angular or NestJS service that injects a flags client only to call it is the
 usual shape.
 
 This module only finds the member. A field's initializer, or the constructor
-statement that assigns it, may do work, so a field is always just named in the
-pull request. A parameter property changes the constructor every
-``new Svc(…)`` and every dependency-injection registration calls, so it is
-removed only when :mod:`flag_cleanup.ctor_param_removal` can prove every one
-of those callers; otherwise it is named too.
+statement that assigns it, may do work, so a field is removed only when
+:mod:`flag_cleanup.ts_field_removal` proves neither does. A parameter property
+changes the constructor every ``new Svc(…)`` and every dependency-injection
+registration calls, so it is removed only when
+:mod:`flag_cleanup.ctor_param_removal` can prove every one of those callers.
+Anything else is named in the pull request.
 
 The same differential as :mod:`flag_cleanup.primary_constructor` decides it:
 **a member is reported only if it was read BEFORE the fold and is read nowhere
@@ -31,6 +32,14 @@ names the parameter, and ``tsc`` still reports the property (measured).
 A class with no name is skipped, and so is a class name declared twice in one
 file, or a member name declared twice in one class (a getter and setter, an
 overload set): the pairing would be a guess.
+
+:func:`unread_constructor_parameters` asks the same differential of a PLAIN constructor
+parameter, ``constructor(c: Client)``, which is a local of the constructor and
+not a property: TS6133 under ``noUnusedParameters``, and ESLint's
+``no-unused-vars`` when it is the last one. Its reads are bare names inside
+the constructor. The usual way the run strands one is not a fold but a
+removal: a subclass whose ``super(c, l)`` loses the argument ``c`` once the
+base class's parameter goes.
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ from collections.abc import Iterator
 
 from tree_sitter import Node
 
+from flag_cleanup import ctor_param_ts, ts_scope
 from flag_cleanup.unused import _parse
 
 _CLASSES = frozenset({"class_declaration", "abstract_class_declaration", "class"})
@@ -55,6 +65,8 @@ _NAMES = frozenset(
 )
 
 _PARAMETERS = frozenset({"required_parameter", "optional_parameter"})
+#: Any of these makes a constructor parameter a property (`readonly flags`).
+_PROPERTY_MODIFIERS = frozenset({"accessibility_modifier", "readonly", "override_modifier"})
 
 
 def _walk(node: Node) -> Iterator[Node]:
@@ -180,6 +192,77 @@ def unread_members(before: str, after: str, grammar: str) -> list[str]:
         return []
     return [
         f"{class_name}.{name}"
+        for (class_name, name), reads in new.items()
+        if reads == 0 and old.get((class_name, name), 0) > 0
+    ]
+
+
+def _parameters(source: str, grammar: str) -> dict[tuple[str, str], int] | None:
+    """``(class, parameter) -> reads`` for each plain parameter of a named
+    class's one constructor in ``source``. ``None`` when the file does not parse."""
+    root = _parse(source, grammar)
+    if root.has_error:
+        return None
+    found: dict[tuple[str, str], int] = {}
+    seen: set[str] = set()
+    duplicated: set[str] = set()
+    for declaration in _walk(root):
+        if declaration.type not in _CLASSES:
+            continue
+        name_node = declaration.child_by_field_name("name")
+        body = declaration.child_by_field_name("body")
+        if name_node is None or body is None:
+            continue
+        class_name = name_node.text.decode("utf-8", "replace")
+        if class_name in seen:
+            duplicated.add(class_name)
+        seen.add(class_name)
+        ctors = ctor_param_ts._constructors(body)
+        if len(ctors) != 1 or ctors[0].type != "method_definition":
+            continue  # none, or an overload set: which signature is unclear
+        parameters = ctors[0].child_by_field_name("parameters")
+        for parameter in parameters.named_children if parameters else ():
+            pattern = parameter.child_by_field_name("pattern")
+            if (
+                parameter.type not in _PARAMETERS
+                or pattern is None
+                or pattern.type != "identifier"
+                or any(c.type in _PROPERTY_MODIFIERS for c in parameter.children)
+            ):
+                continue
+            name = pattern.text.decode("utf-8", "replace")
+            if any(b != pattern for b in ts_scope.bindings(ctors[0], name)):
+                # Another binding of the name inside the constructor (a
+                # callback's parameter, a local, an assignment): which reads
+                # are the parameter's is a scope question this does not ask.
+                continue
+            found[(class_name, name)] = sum(
+                1
+                for node in _walk(ctors[0])
+                # `eval` can read any local by name, so it counts as a read.
+                if node.type in ("identifier", "shorthand_property_identifier")
+                and (node.text == pattern.text or node.text == b"eval")
+                and node != pattern
+            )
+    return {key: value for key, value in found.items() if key[0] not in duplicated}
+
+
+def unread_constructor_parameters(before: str, after: str, grammar: str) -> list[str]:
+    """Each plain constructor parameter read in ``before`` and not in ``after``.
+
+    Returned as ``Class(parameter)`` (``D(c)``), in the order they appear in
+    ``after``. Any spelling of the name in the constructor counts as a read,
+    and so does ``eval``. A parameter whose name the constructor binds a
+    second time, anywhere, is skipped on both sides: counting the shadowing
+    binding's reads BEFORE the run would blame a parameter the customer had
+    already left unread. Either mistake costs a missed note.
+    """
+    old = _parameters(before, grammar)
+    new = _parameters(after, grammar)
+    if old is None or new is None:
+        return []
+    return [
+        f"{class_name}({name})"
         for (class_name, name), reads in new.items()
         if reads == 0 and old.get((class_name, name), 0) > 0
     ]
