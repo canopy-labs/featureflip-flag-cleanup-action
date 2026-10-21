@@ -1143,7 +1143,10 @@ def _engine_stranded(summaries, language: str, repo_dir: str) -> tuple[tuple[str
 #: PHP rule deletes a one-clause ``use`` declaration and is named by the whole
 #: of it (``decl``), since a deleted line's match also holds the comment after it.
 #: The Java and Kotlin rules delete one import declaration and are named by the
-#: whole of it (``decl``) for the same reason.
+#: whole of it (``decl``) for the same reason. The two TypeScript/JavaScript
+#: rules remove one named specifier of an ``import { … }`` group and are named
+#: by it (``spec``): each rewrites a span that also covers a neighbouring
+#: specifier and writes that neighbour back, so the match holds two.
 _ENGINE_STRANDED_IMPORT_RULES = {
     "delete_stranded_import_aliased": "spec",
     "delete_stranded_import_unaliased": "spec",
@@ -1152,6 +1155,8 @@ _ENGINE_STRANDED_IMPORT_RULES = {
     "delete_stranded_php_import": "decl",
     "delete_stranded_java_import": "decl",
     "delete_stranded_kotlin_import": "decl",
+    "delete_stranded_ts_import_specifier": "spec",
+    "delete_stranded_ts_import_specifier_last": "spec",
 }
 
 
@@ -1170,7 +1175,8 @@ _ENGINE_STRANDED_IMPORT_RULES = {
 #: The one Python rule deletes an ``x = <literal>`` statement, and the one PHP
 #: rule a ``$x = <literal>;`` statement; each is named by the statement
 #: (``decl``), since a deleted line's match also holds the comment after it.
-#: The one Swift, Java and Kotlin rules each delete a literal local's whole
+#: The one Swift, Java, Kotlin and C# rules and the two TypeScript/JavaScript
+#: rules (``const``/``let`` and ``var``) each delete a literal local's whole
 #: declaration and are named by it (``decl``), for the same reason.
 _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_short_var": "decl",
@@ -1213,6 +1219,9 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_swift_local": "decl",
     "delete_stranded_java_local": "decl",
     "delete_stranded_kotlin_local": "decl",
+    "delete_stranded_csharp_local": "decl",
+    "delete_stranded_ts_local": "decl",
+    "delete_stranded_ts_var": "decl",
 }
 
 

@@ -7,6 +7,28 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.10.0
+
+### Behaviour changes
+
+- **TypeScript and JavaScript:** when a loop like `for (var i = 0; <flag>; i++)`
+  is removed, the `var i = 0;` kept in its place is removed too if nothing
+  else reads `i`. It used to be left behind.
+- **TypeScript and JavaScript:** in a file that holds JSX, a named import the
+  fold left unused is kept when another name in the same braces stays
+  (`import { h, other } from "preact"`). With the classic JSX runtime every
+  element calls its factory, such as Preact's `h`, without spelling it, so
+  removing it broke the elements left behind. In a file that calls `eval`, no
+  import is removed, since `eval` can read any of them by a string.
+- **TypeScript and JavaScript:** in a file that holds JSX, the import of the
+  JSX factory is kept even when it is the only name in its statement, such
+  as `import React from "react"` or `import { h } from "preact"`. The factory
+  is the `jsxFactory` or `jsxFragmentFactory` your `tsconfig.json` or
+  `jsconfig.json` sets, or else `React` (and `h` and `Fragment` in a file that
+  imports from `preact`), along with any name a `@jsx` or `@jsxFrag` comment
+  gives. It used to be removed once the cleanup took out its last written
+  use, which broke every JSX element left in the file.
+
 ## 1.9.0
 
 ### Behaviour changes

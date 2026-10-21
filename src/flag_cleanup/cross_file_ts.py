@@ -757,6 +757,85 @@ def _answers(config: Path, specifier: str, stop: Path) -> bool:
     return options.base_url is not None and bool(_candidates(os.path.normpath(options.base_url / specifier)))
 
 
+#: The options naming what a classic-runtime JSX element and fragment call.
+JSX_FACTORY_OPTIONS = ("jsxFactory", "jsxFragmentFactory")
+
+
+def jsx_factories(reader_path: str, repo_dir: str) -> dict[str, frozenset[str | None]]:
+    """Each of :data:`JSX_FACTORY_OPTIONS`, as the configs nearest
+    ``reader_path`` set it, read through their ``extends`` chains.
+
+    The nearest configs are every ``tsconfig*.json`` and ``jsconfig*.json`` in
+    the first directory holding one, from the reader's up to the checkout
+    root: which of them compiles the file is not decidable here (see
+    :func:`names_package`). ``None`` among the values stands for the compiler's
+    default. It is there when no config is found, when one leaves the option
+    unset or sets it to anything but a string, and when one or a config it
+    extends cannot be read: the caller keeps an import for every name in the
+    answer, so an answer too wide costs a missed tidy and one too narrow
+    breaks the build.
+    """
+    values: dict[str, set[str | None]] = {option: set() for option in JSX_FACTORY_OPTIONS}
+    try:
+        current = Path(reader_path).resolve().parent
+        stop = _stop_for(repo_dir)
+        while True:
+            configs = sorted(c for c in current.iterdir() if _ANY_CONFIG.match(c.name) and c.is_file())
+            if configs or current == stop or current.parent == current:
+                break
+            current = current.parent
+    except (OSError, RuntimeError):
+        # RuntimeError: a symlink loop, from `Path.resolve`. A config that
+        # cannot be looked for may be the nearest, so none farther is used.
+        return {option: frozenset({None}) for option in JSX_FACTORY_OPTIONS}
+    for config in configs:
+        chain = _loose_chain(config, stop, ())
+        for option in JSX_FACTORY_OPTIONS:
+            for options in chain:
+                if options is None:
+                    # An unreadable link could set it: its default stands in,
+                    # and what a later link sets is read on as well.
+                    values[option].add(None)
+                    continue
+                if option in options:
+                    value = options[option]
+                    values[option].add(value if isinstance(value, str) else None)
+                    break
+            else:
+                values[option].add(None)
+    return {option: frozenset(found or {None}) for option, found in values.items()}
+
+
+def _loose_chain(config: Path, stop: Path, below: tuple[Path, ...]) -> list[dict | None]:
+    """``config``'s ``compilerOptions`` and those of every config it
+    ``extends``, nearest first as :func:`_inheriting` orders them, with None
+    standing for each link that cannot be read or followed (a package, a
+    missing file, a cycle) rather than failing the whole chain."""
+    try:
+        identity = config.resolve()
+        if identity in below or len(below) >= _EXTENDS_DEPTH:
+            return [None]
+        data = json.loads(_strip_jsonc(config.read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+        return [None]
+    if not isinstance(data, dict):
+        return [None]
+    options = data.get("compilerOptions", {})
+    extends = data.get("extends", [])
+    if isinstance(extends, str):
+        extends = [extends]
+    chain: list[dict | None] = [options if isinstance(options, dict) else None]
+    if not isinstance(extends, list):
+        return [*chain, None]
+    for name in reversed(extends):
+        try:
+            extended = _extended(config, name, stop) if isinstance(name, str) else None
+        except (_Unknown, OSError, RuntimeError):
+            extended = None
+        chain.extend([None] if extended is None else _loose_chain(extended, stop, (*below, identity)))
+    return chain
+
+
 #: The template TypeScript 5.5 replaces, at the start of a path option, with
 #: the directory of the config a project is compiled with.
 _CONFIG_DIR = "${configDir}"

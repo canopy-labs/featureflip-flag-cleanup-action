@@ -113,7 +113,7 @@ import tree_sitter_swift
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import dart_namespace, inert_load
+from flag_cleanup import cross_file_ts, dart_namespace, inert_load
 
 #: ``js`` maps to the TSX grammar deliberately, for the same reason
 #: ``ts_syntax._parser`` does: the engine rewrote with it, and JSX in a ``.js``
@@ -515,7 +515,11 @@ def _java_import_candidates(root: Node, source_bytes: bytes) -> list[Candidate]:
 
 
 def _ts_import_candidates(
-    root: Node, source_bytes: bytes, before: Node | None
+    root: Node,
+    source_bytes: bytes,
+    before: Node | None,
+    guarded: bool = True,
+    configured: Callable[[], dict[str, frozenset[str | None]]] | None = None,
 ) -> list[Candidate]:
     """Every binding an `import_statement` introduces, at specifier granularity.
 
@@ -594,7 +598,33 @@ def _ts_import_candidates(
     does anything, and deletes the statement if it provably does not. That
     question reads files, so it is asked only of a statement this pass is
     acting on, never of every import while candidates are being listed.
+
+    Since engine 0.37.0 the engine removes a named specifier its own fold
+    stranded when its group keeps another, so this branch is the backstop for
+    what the engine withholds and remains the only place a whole statement,
+    a default or namespace import or a group's last specifier goes.
+
+    Two guards the engine applies to its own specifier removal hold here too.
+    A direct ``eval`` reads any binding by a string, so a file spelling
+    ``eval`` offers no import at all. A classic-runtime JSX element calls its
+    factory (Preact's ``h``) without naming it, so once a fold removes the
+    last spelled ``h(...)``, ``import { h, other }`` still feeds every
+    element. In a file holding JSX, found by text (``</`` or ``/>``, since
+    the ``typescript`` grammar has no JSX node to look for; a string or
+    comment holding either only withholds), a named specifier whose group
+    keeps another is therefore not offered. A group's last specifier, a
+    default and a namespace import still are: that is how a component drops
+    the hook import its fold stranded, and withholding them would leave an
+    unused import in every automatic-runtime file. Except where it binds the
+    factory itself, which :func:`_jsx_factories` names: ``import React from
+    "react"`` or a lone ``import { h } from "preact"`` feeds the elements
+    just the same. ``configured`` reads the factory options of the file's
+    compiler config (:func:`~flag_cleanup.cross_file_ts.jsx_factories`), and
+    is asked only for a file holding JSX.
     """
+    if guarded and _spells_eval(root):
+        return []
+    holds_jsx = guarded and (b"</" in source_bytes or b"/>" in source_bytes)
     candidates = []
     for node in _walk(root):
         if node.type != "import_statement":
@@ -694,6 +724,8 @@ def _ts_import_candidates(
                 emptied = (
                     (node if solo else child) if len(specifiers) == 1 else None
                 )
+                if holds_jsx and emptied is None:
+                    continue
                 for specifier in specifiers:
                     alias = specifier.child_by_field_name("alias")
                     local = alias if alias is not None else specifier.child_by_field_name("name")
@@ -709,7 +741,66 @@ def _ts_import_candidates(
                             loads,
                         )
                     )
+    if holds_jsx:
+        factories = _jsx_factories(root, configured)
+        candidates = [c for c in candidates if c.name not in factories]
     return candidates
+
+
+#: A ``@jsx`` or ``@jsxFrag`` pragma, with the root identifier of the name it
+#: gives (``dom`` of ``dom.create``).
+_JSX_PRAGMA = re.compile(r"@(jsx|jsxFrag)\s+([A-Za-z_$][\w$]*)")
+
+#: The pragma that adds to each config option, per
+#: :data:`~flag_cleanup.cross_file_ts.JSX_FACTORY_OPTIONS`.
+_JSX_PRAGMAS = {"jsxFactory": "jsx", "jsxFragmentFactory": "jsxFrag"}
+
+
+def _jsx_factories(
+    root: Node, configured: Callable[[], dict[str, frozenset[str | None]]] | None
+) -> frozenset[str]:
+    """The names a classic-runtime JSX element or fragment in this file calls
+    without spelling them, by the root identifier of a dotted name.
+
+    For the element and for the fragment alike, what the compiler config
+    sets (``jsxFactory`` / ``jsxFragmentFactory``), else the default:
+    ``React``, and also ``h`` and ``Fragment`` in a file importing from
+    ``preact``, whose build setups often name them outside any tsconfig. The
+    name a ``@jsx`` / ``@jsxFrag`` pragma gives is added rather than put in
+    their place: Babel takes the pragma from any comment and TypeScript only
+    from the file's leading ones, so a mention in prose cannot be told from
+    one, and a name kept in error costs only a missed tidy. (A comment's
+    mention already counts as a reference, so the pragma is belt and braces.)
+    Under the automatic runtime none of these is called, and keeping the
+    import costs a missed tidy too.
+    """
+    pragmas: dict[str, set[str]] = {}
+    preact = False
+    for node in _walk(root):
+        if node.type == "comment":
+            for match in _JSX_PRAGMA.finditer(node.text.decode("utf-8", "replace")):
+                pragmas.setdefault(match.group(1), set()).add(match.group(2))
+        elif node.type == "import_statement":
+            specifier = _specifier(node)
+            preact |= specifier is not None and (
+                specifier == "preact" or specifier.startswith("preact/")
+            )
+    defaults = {"React", "h", "Fragment"} if preact else {"React"}
+    config = configured() if configured is not None else {}
+    names: set[str] = set()
+    for option, pragma in _JSX_PRAGMAS.items():
+        names |= pragmas.get(pragma, set())
+        for value in config.get(option, frozenset({None})):
+            names |= defaults if value is None else {value.split(".", 1)[0].strip()}
+    return frozenset(names)
+
+
+def _spells_eval(root: Node) -> bool:
+    """Whether a TS-family file names ``eval``, which can read any binding by
+    a string. See :func:`_ts_import_candidates`."""
+    return any(
+        node.type == "identifier" and node.text == b"eval" for node in _walk(root)
+    )
 
 
 def _specifier(statement: Node) -> str | None:
@@ -1223,13 +1314,19 @@ def _import_candidates(
     language: str,
     before: Node | None = None,
     resolve: Callable[[str], dart_namespace.Namespace | None] | None = None,
+    guarded: bool = True,
+    configured: Callable[[], dict[str, frozenset[str | None]]] | None = None,
 ) -> list[Candidate]:
     """Every import binding in ``source`` whose usage this pass can decide.
 
     ``before`` is the parsed original file, which the TS family asks whether a
     stranded statement's module was ever loaded (see ``_loaded_before``).
     ``resolve`` reads the library a Dart import names (see
-    ``_dart_import_candidates``).
+    ``_dart_import_candidates``). ``guarded=False`` lifts the TS family's
+    JSX and ``eval`` file guards, for sizing a budget only: another edit can
+    delete the text a guard read, and the bindings it held back then count.
+    ``configured`` reads the file's JSX factory options for the JSX guard (see
+    ``_ts_import_candidates``).
     """
     source_bytes = source.encode("utf-8")
     root = _parse(source, language)
@@ -1252,7 +1349,7 @@ def _import_candidates(
         # `import Combine` is what makes `publisher.sink { … }` resolve.
         return []
     if language in {"ts", "tsx", "js"}:
-        return _ts_import_candidates(root, source_bytes, before)
+        return _ts_import_candidates(root, source_bytes, before, guarded, configured)
     if language == "csharp":
         return _csharp_import_candidates(root, source_bytes)
     return []
@@ -1863,6 +1960,12 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
     Directly in the PROGRAM, not merely outside a function: a declaration in
     a top-level ``if`` block is scoped to that block, and claiming the file
     for it would be describing a wider scope than it has. It stays out.
+
+    Since engine 0.37.0 the engine removes the C# and TS/TSX/JS literal
+    locals its own fold stranded in a block first, so those two branches are
+    the backstop: they act on what the engine withholds (a non-literal value,
+    a named C# type, a TS module's top level, a TS declaration with a comment
+    on its line) and on strands this side's own edits make.
     """
     declaration_type, name_field, value_field = _VARIABLE_DECLARATIONS[language]
     source_bytes = source.encode("utf-8")
@@ -4798,11 +4901,16 @@ def remove_stranded_bindings(
         if language in {"ts", "tsx", "js"} and path is not None and root is not None
         else None
     )
+    configured = (
+        lru_cache(maxsize=None)(partial(cross_file_ts.jsx_factories, path, root))
+        if language in {"ts", "tsx", "js"} and path is not None and root is not None
+        else None
+    )
     removed: list[Candidate] = []
     current = after
     original = _parse(before, language)
     budget = (
-        len(_import_candidates(after, language, original, resolve))
+        len(_import_candidates(after, language, original, resolve, guarded=False))
         + len(_variable_candidates(after, language))
         + len(methods(after, language))
         + 1
@@ -4813,7 +4921,7 @@ def remove_stranded_bindings(
         for candidate in (
             _variable_candidates(current, language)
             + methods(current, language)
-            + _import_candidates(current, language, original, resolve)
+            + _import_candidates(current, language, original, resolve, configured=configured)
         ):
             if candidate.kind == "private method":
                 before_count = _method_references(before, candidate.name, language)

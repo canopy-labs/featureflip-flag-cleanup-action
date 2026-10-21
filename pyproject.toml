@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.9.0"
+version = "1.10.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -449,7 +449,17 @@ dependencies = [
     # The five rule names are in `_ENGINE_STRANDED_LOCAL_RULES` and
     # `_ENGINE_STRANDED_IMPORT_RULES`, and `unused.py`'s three branches stay
     # as the backstop. No grammar rev moved, so `+canopy.3` stays.
-    "polyglot-piranha==0.36.0",
+    #
+    # 0.37.0. C#'s and TypeScript/TSX/JavaScript's engines delete the locals
+    # their own fold stranded: C# a `var`/predefined-type `x = <literal>;` in
+    # a block, TS/JS a `const`/`let`/`var x = <literal>` in a block. TS/JS
+    # also deletes one named import specifier the file no longer spells, but
+    # never a group's last one, and never in a file holding `</` or `/>` or
+    # spelling `eval`. The five rule names are in
+    # `_ENGINE_STRANDED_LOCAL_RULES` and `_ENGINE_STRANDED_IMPORT_RULES`, and
+    # `unused.py`'s C# and TS branches stay as the backstop. No grammar rev
+    # moved, so `+canopy.3` stays.
+    "polyglot-piranha==0.37.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
