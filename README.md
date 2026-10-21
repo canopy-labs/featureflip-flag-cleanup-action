@@ -667,7 +667,7 @@ entries dropped.
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`). See [Wrapping the SDK](#wrapping-the-sdk). |
-| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart and PHP: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, Dart function, method or getter, or PHP function or class method whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
+| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart, PHP, Ruby and Swift: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, Dart function, method or getter, PHP function or class method, Ruby method, or Swift function, method or computed property whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. In the archive modes, the only branch a removal's merge counts on: give them the same value as the cleanup workflow. |
@@ -1066,7 +1066,7 @@ wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
 key is not at the call site and no name will make it matchable. Those reads are
 reported as unremoved rather than guessed at.
 
-**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart and PHP.**
+**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart, PHP, Ruby and Swift.**
 A flag is often read once, inside a method, and checked everywhere else through
 that method:
 
@@ -1740,7 +1740,10 @@ a cascade, a `late`, nullable or `dynamic` declaration, a prefixed type
 (`p.Flags`), a constructor parameter, a method torn off without a call, a
 call with type arguments, a mention inside a string, a symbol (`#newCheckout`)
 a statement label, a record field or any other place that is not an
-expression, and every call in a library with `part` files or in a part.
+expression, a call made only for its value that is the whole body of a
+braceless `if`, `else`, `for`, `while` or `do`, a labelled statement or the
+only statement of a `case` (deleting it would hand its place to the next
+statement), and every call in a library with `part` files or in a part.
 
 A class anything in the repository extends, implements or mixes in, that is
 `abstract`, `sealed`, `interface` or a `mixin class`, or that itself has an
@@ -1849,6 +1852,157 @@ or theme (a `Plugin Name:` or `Theme Name:` header). An instance method of such 
 package's class is not inlined at all (`interface-published`) unless the
 class is `final` or the method `private`, since another package may extend
 the class and pass its own method into your code.
+
+In Ruby, a wrapper is a method of a `class` or `module`: an instance method,
+a `def self.` class method, or a module function (a `def` after a bare
+`module_function`), with plain parameters (or optional ones with a literal
+default), whose whole body is one read, written as a body, an endless
+`def … =` or a `return`:
+
+```ruby
+class Flags
+  def new_checkout?
+    @client.bool_variation("old-checkout", {}, false)
+  end
+
+  def self.on?(user) = CLIENT.bool_variation("old-checkout", { key: user }, false)
+
+  def banner
+    new_checkout? ? "new" : "old"
+  end
+end
+
+# elsewhere
+return :off unless Flags.on?(user)
+```
+
+The read is `bool_variation` (or one of your `accessors`) with the key first,
+as a literal or a constant in the same file, or OpenFeature's
+`fetch_boolean_value(flag_key: …)`. Ruby is untyped and almost anything can be
+redefined at run time, so very little is proven:
+
+- the method's name must be defined once across the repository's Ruby (`.rb`,
+  `.rake`, a `Rakefile`, a `.gemspec`, a `.jbuilder`, a Sorbet `.rbi` …), and its class or
+  module's name declared once: a class reopened in another file keeps its
+  wrappers (`name-not-unique`);
+- an instance method of a class that nothing in the repository subclasses
+  is called bare (`new_checkout?`) or through `self` inside an instance
+  method of that class, never inside a block or a lambda (whatever receives
+  the block may `instance_exec` it, even a `select`), and never from a
+  module's instance methods (they run on whatever includes the module); a
+  bare name without `?` or `!` that a local or a parameter of the enclosing
+  method also binds is a read of that local, not a call;
+- a class method or a module function is called through its class or
+  module's name (`Flags.on?`, `Admin::Flags.on?`, `::Flags.on?`), which must
+  resolve to it through the caller's nesting, or bare or through `self`
+  inside one of the owner's own `def self.` methods (for a class, one nothing
+  subclasses).
+
+The call's value must be used: a condition, an operand of `!`, `&&` or `||`,
+the right side of an assignment, an argument, a `return`, or the last
+expression of a method or a block. Everything else is left alone: a call as
+a statement of its own, `&.`, `Flags::on?`, a receiver Ruby does not
+spell as the owner (`@flags.new_checkout?`, `flags.new_checkout?`), a call
+inside string interpolation, a call with a block, a call with an argument
+that is not a literal, a constant, an instance variable or a local (in Ruby
+`user.id` and `current_user` are calls, which inlining would drop), a call
+whose number of arguments the method does not take, and every call in a file
+that does not parse.
+
+Any symbol or string spelling the method's name, anywhere in the
+repository's Ruby, keeps the wrapper and its callers (`unparsed-mention`):
+`attr_reader :new_checkout?`, `define_method(:new_checkout?)`,
+`alias_method`, `delegate`, `helper_method`, `send("new_checkout?")`,
+`respond_to?(:new_checkout?)`, a `new_checkout?:` hash key, or a
+`class_eval` heredoc can each define, call or rename it by name. An RSpec,
+Minitest or Mocha stub of the method or double of the class
+(`allow(flags).to receive(:new_checkout?)`, `instance_double(Flags)`,
+`stub_const("Flags", …)`, `Flags.stubs(:on?)`) keeps them as `test-double`.
+A class or module that defines or inherits `method_missing` or
+`respond_to_missing?`, prepends a module, defines methods from computed
+names (`define_method(name)`), has an `inherited` or `included` hook, or is
+reopened through `class_eval`,
+`class << Flags` or a refinement keeps its wrappers (`overridable`). A call
+through a computed name (`send(name)`) cannot be seen. A method under a
+Sorbet `sig` keeps its callers inlined and is itself kept (`annotated`). An
+ERB, HAML or Slim template, an RBS signature, or any other file, naming the method keeps it
+too, with its Ruby callers still inlined (`other-language` for ERB,
+`unparsed-mention` otherwise). In a gem (a `.gemspec` beside or above the
+wrapper), another repository may subclass the class and override the method,
+so an instance method is not inlined at all (`interface-published`), only a
+class method's calls through the class's name are, and a public one is never
+deleted (`published`).
+
+In Swift, a wrapper is a function declared at the top of a file, or a method
+or computed property of a top-level `struct`, `enum` or `class`, static or
+not, declared to return `Bool` (not `Bool?`), with no `async`, `throws`,
+generic parameter or default argument, whose whole body is `{ read }` or
+`{ return read }`:
+
+```swift
+final class Flags {
+    let client: FeatureflipClient
+
+    var newCheckout: Bool { client.boolVariation("old-checkout", default: false) }
+}
+
+// elsewhere
+if flags.newCheckout { … }
+```
+
+The read is `boolVariation` (or one of your `accessors`) with the key first,
+as a literal, a constant in the same file, or a constant of another file the
+run proved names it, and not negated or optional-chained. Swift looks a bare
+name up in the enclosing scopes and the enclosing types' members (inherited
+ones too) before the module's top-level names, and a member through its
+receiver's static type, so:
+
+- the wrapper's name must be bound once across the repository's Swift files,
+  counting every declaration, protocol requirement, enum case, parameter,
+  local, closure parameter or capture, loop, `case let`, `if let`/`guard
+  let`/`while let` binding and `set`/`willSet`/`didSet` parameter, so that
+  nothing can hide or overload it;
+- every call must be in the wrapper's own module (the SwiftPM target or Xcode
+  target that compiles its file; a checkout with no build file is one module);
+- a function is called bare, outside any type with an inheritance clause,
+  any extension and any type an extension anywhere in the repository extends
+  (which may add a conformance whose protocol brings a member of that name);
+- a static member is called through its type's name, outside those same
+  types, or bare or through `Self` inside its own type;
+- an instance member is called bare or through `self` inside its type,
+  through `self.flags` where `flags` is a stored property of the enclosing
+  type written as `let flags: Flags` (or initialised with `Flags(…)`), or
+  through a name whose nearest binding (a parameter, a closure parameter with
+  a type, a local or a stored property of the enclosing type) is written that
+  way, and every binding of which in the file is. Not `Flags!` or `Flags?`,
+  and not a computed or `lazy` property, whose getter the inlining would
+  drop.
+
+A computed property is read with no call (`flags.newCheckout`); a method or
+function is called. Everything else is left alone: `flags?.newCheckout`,
+`flags!.newCheckout`, an optional or untyped binding, `Flags.shared`, a call
+through another module, a name used without being called, a call whose value
+is dropped or used as an object, `!!`, a call with a trailing closure or an
+argument that is not a name, a member access or a literal, and every call in
+a file that does not parse. A key path (`\.newCheckout`, `\Flags.newCheckout`),
+a `#selector`, or a string whose text names the member (`"newCheckout"`,
+`"newCheckout:"`) keeps it (`unparsed-mention`), as does its name in any
+other source file this tool reads. Objective-C, storyboards and plists are not
+read, which is why an `@objc` member is never a wrapper.
+
+A type with an inheritance clause, its own or an extension's, keeps its
+wrappers (`overridable`): a protocol it conforms to may call the member
+through an existential, and deleting it would break the conformance. So does
+an `open` class, a class anything in the repository subclasses, and a member
+that is `open`, `class`, `override` or `dynamic`; a subclass, or another type
+conforming to the same protocol, in a test target (`Tests`, `Mocks`, `Fakes`)
+keeps them as `test-double`. A wrapper with any attribute (`@objc`,
+`@available`, `@MainActor`) is not inlined at all (`annotated`). Members of an
+extension, a protocol or an actor, and declarations between `#if` and
+`#endif`, are not treated as wrappers. A `public` wrapper (of a `public` type,
+for a member) is never deleted (`published`), unless the nearest
+`Package.swift` declares no `.library` product: an Xcode framework or a pod
+ships public API with no manifest this tool can read.
 
 A method qualifies when its whole body is one read of the flag being removed
 (`= read`, `{ return read }`, `{ return read; }`), and:
@@ -2195,7 +2349,7 @@ is reported as **partial** rather than **complete**:
 | `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare, or an object literal used other than as a member's receiver (`Object.keys(flags)`, a spread, `flags[k]`, passed or re-exported). |
 | `interface-published` | The interface it implements is public and its module may be published, or has another implementation. In C#, an implementation in a Razor, Web Forms, VB or F# file, or an interface extending it, counts; any other implementation must be inert instead (see `sibling-not-inert`). |
 | `interface-structural` | A Go interface declares a method of the same name, or the wrapper is an exported Go method, which may satisfy an interface outside the repository. Or a TypeScript interface or type literal declares a property or method of the same name. |
-| `published` | Dart and PHP only: a public wrapper in a package's `lib/` whose `pubspec.yaml` does not say `publish_to: none`, or a public or protected PHP wrapper of a Composer package whose `composer.json` does not say `"type": "project"`, which another package may call. Its callers are inlined and it is kept. |
+| `published` | Dart, PHP, Ruby and Swift only: a public wrapper in a package's `lib/` whose `pubspec.yaml` does not say `publish_to: none`, a public or protected PHP wrapper of a Composer package whose `composer.json` does not say `"type": "project"`, a public Ruby class method of a gem (a `.gemspec` beside or above it), or a `public` Swift wrapper not under a `Package.swift` that declares no `.library` product, which another package may call. Its callers are inlined and it is kept. |
 | `receiver-unproven` | Nothing in the file ties the receiver to the method's class. In TypeScript and JavaScript, also a use that hands a function wrapper's module on as an object (see above). |
 | `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
 | `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module, or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). |
@@ -2342,9 +2496,10 @@ What still keeps it, by design, until it can be proven:
 - a file is deleted only when nothing but namespaces, comments and its own
   `using`s would remain; an `[assembly: …]` attribute, a `global using` or an
   `extern alias` keeps it;
-- build output under `bin` and `obj` is not searched for mentions, and a
-  comment that named a deleted type is listed, not rewritten, so its prose
-  may be stale.
+- build output under `bin` and `obj` is not searched for mentions. A
+  comment that named only a deleted type goes (see "the mention is not a
+  flag read" under the caveats for what "only" means); one that says more is
+  listed, not rewritten, so its prose may be stale.
 
 **A gate that takes no key and is not inlined is reported, not rewritten.**
 That is every such gate outside Kotlin, Java, C#, Go, TypeScript,
@@ -3980,11 +4135,24 @@ unread, which `dart analyze` reports as `unused_field`. It is deleted, with
 the `///` comment above it (and any `//` line between the two) and a comment
 on its own line, when nothing else in its library reads or assigns it and its
 initializer cannot do work: there is none, it is a literal, a `const`
-expression or a collection literal built of those, it calls a `const`
-constructor with constant arguments (`final _client = FeatureClient();` where
-`FeatureClient` declares `const FeatureClient();` in the same file or in a
-file of the repository it imports), or the field is `late` or `static`, whose
-initializer only runs when the field is first read.
+expression or a collection literal built of those, it calls with constant
+arguments a constructor that only builds the object
+(`final _client = FeatureClient();` where `FeatureClient`, declared in the
+same file or in a file of the repository it imports, has a
+`const FeatureClient();` with no `assert`, or a `FeatureClient();` or `FeatureClient() {}` with
+no initializer list, in a class with no `extends` or `with` clause and no
+field initializer that may do work), or the field is `late` or `static`, whose
+initializer only runs when the field is first read. So a field holding a
+keyless wrapper class built that way (`final _flags = Flags();`) is deleted
+once the wrappers it was read for are.
+
+When the field was the last use of a name an import brings, the import goes
+too: one of a library in the repository when nothing else it brings is
+spelled, not even a member of an extension it declares (otherwise the field
+is kept), and one of another package (`package:featureflip/featureflip.dart`) only when
+it has no prefix and a single `show` list whose every name goes with the
+field. What any other import of another package brings, its extensions
+included, cannot be read, so that field is kept.
 
 When a constructor sets it, that goes too:
 
@@ -4024,18 +4192,22 @@ The field is kept, and named in the pull request body, when:
 * a constructor sets it from something other than a parameter or a literal,
   sets it through a named `this._client` parameter, or is a factory;
 * an argument that would be deleted is anything but a literal, a `const`
-  object, a parameter of the function around the call, or a top-level `const`
-  of the file (`Svc(FeatureClient())` and `Svc(widget.client)` may do work, a
-  getter may too, and a local would be left unused), or is the last use of an
-  import or a private declaration;
+  object, a call with constant arguments of a constructor that only builds
+  the object (as for an initializer, below), a parameter of the function
+  around the call, or a top-level `const` of the file (`Svc(widget.client)`
+  may run a getter, `Svc(FeatureClient(config))` reads a variable that may be
+  initialised on first use, and a local would be left unused), or is the last
+  use of an import or a private declaration;
 * something else assigns it, or its initializer may do work
-  (`final _client = FeatureClient();` without a `const` constructor,
-  `Foo.instance`, `'$x'`);
+  (`final _client = FeatureClient();` whose constructor has a body,
+  an initializer list or a superclass, `Foo.instance`, `'$x'`);
 * it carries an annotation, is `external` or `abstract`, shares a declaration
   with another field, or shares its name with a getter, setter or method;
-* its type or initializer is the last use of an import or of a private class,
-  function or variable (`Timer? _timer;` as the only `Timer` in a file that
-  imports `dart:async`), since deleting it would leave that unused instead;
+* its type or initializer is the last use of an import that cannot go with
+  it (`Timer? _timer;` as the only `Timer` in a file that imports
+  `dart:async`, or `final FeatureClient _client;` under a plain
+  `import 'package:featureflip/featureflip.dart';`) or of a private class,
+  function or variable, since deleting it would leave that unused instead;
 * its library has `part` files, since another part may read it.
 
 A local whose name is one of Dart's **built-in identifiers** — `on`, `show`,
@@ -4827,9 +4999,30 @@ means no PR.
   that "Tests that mock the flag read" could not resolve) comes first, naming each such line, because it is the one entry that can turn
   the pull request red: an assertion beside it about what the flag returned may
   now fail. A file that names the flag **only in comments** comes last, as
-  prose to update rather than code that can break. Both are positive verdicts
-  reached by parsing the file; anything this cannot decide stays in the generic
-  list.
+  prose to update rather than code that can break, with each comment line
+  that names it. Both are positive verdicts reached by parsing the file;
+  anything this cannot decide stays in the generic list. Such a file is not
+  counted as still referencing the flag in the run's log either: it is
+  printed as a note, line by line.
+
+  **A comment that names only the flag is removed** rather than listed, in
+  every language. "Only" is decided by words: once the flag's key (and, for a
+  C# gate family, the name of a type the run deleted, with any `.Member` read
+  off it) is taken out, what is left must be words like `the`, `by`, `gated`,
+  `behind`, `flag`, `enabled`, `remove once rolled out`. One other word keeps
+  the comment and lists it, so a licence header, a `TODO` naming other work
+  (`TODO(PAY-12): …`) or a sentence that also explains something else is
+  never touched. The unit is a comment, or one line of one when that line is
+  a sentence of its own; a line in the middle of a sentence stays with it. A
+  comment after code on the same line goes with the spaces before it; one
+  with code after it on its line stays. A doc comment (`///`, `/**`) loses
+  such lines but is never removed whole, since it documents something that
+  survives. Text inside a string or a docstring is not a comment and is not
+  touched. Nothing is removed while any file of that language and directory
+  still names the key outside a comment, because then the flag is still in
+  use there and the comment may still be true. Each removed comment is listed
+  in the pull request, and every rewrite is checked by parsing the file again:
+  its code must be exactly what it was, or the file is left alone.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift

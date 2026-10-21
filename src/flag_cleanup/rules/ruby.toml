@@ -218,3 +218,30 @@ replace = ""
 # and so falls between the captures. Gate 1 cannot see a lost comment, because a
 # comment is not syntax. (PHP closes the same gap locally only because its chain
 # is FLAT, so its clause's siblings are untouched.)
+
+# --- @sentinel() — a call to a keyless wrapper, proven and marked before the engine
+#
+# Reached ONLY through the wrapper pass (`wrapper_inline`), as the rules of
+# this name in php.toml and dart.toml are. The pass proves that a call such as
+# `new_checkout?`, `self.new_checkout?(user)` or `Flags.on?` reaches a method
+# whose whole body is a read of this flag, and replaces the WHOLE call
+# (receiver, arguments and all) with the run's sentinel called with no
+# arguments: `__ff_cleanup_<hash>()`, a receiverless call. Which calls are this
+# flag's was decided there, call by call, so this rule checks nothing but the
+# sentinel. A sentinel left behind is a refusal, never a diff
+# (`SentinelPrePass.survived`).
+#
+# The hole is `sentinel`, not `stale_flag_name`: a call-site file names no key,
+# and the engine skips a file holding none of a seed's hole values. There is no
+# discarded-statement rule: the last expression of a Ruby body is its value, so
+# the wrapper pass only marks a call whose value is used.
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (call . method: (identifier) @sdk_fn arguments: (argument_list)) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]

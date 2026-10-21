@@ -7,6 +7,80 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.13.0
+
+### New
+
+- **Every language:** a comment that names only the removed flag (or, in C#,
+  only a type the run deleted) is removed, so the pull request no longer
+  leaves `// Gated by the new-checkout flag.` behind for you to delete. A
+  comment that also says anything else is kept and listed line by line, and
+  the run's log reports it as a note rather than as a file that "still
+  references" the flag. Licence headers, `TODO`s naming other work, doc
+  comments as a whole, and text inside strings are never touched. See
+  README's caveats for how "only" is decided.
+- **Dart:** more unread private fields are deleted instead of being named in
+  the pull request:
+  - a field built by a constructor that only builds the object, a
+    `FeatureClient();` or `FeatureClient() {}` with no initializer list in a
+    class with no `extends` or `with` clause and no field initializer that
+    may do work. That includes a keyless wrapper class
+    (`final _flags = Flags();`) once its wrappers are deleted. Before, only a
+    `const` constructor counted;
+  - a field set by a constructor whose callers build the argument that way
+    (`Svc(FeatureClient())`): the argument goes with the parameter;
+  - a field that was the last use of an import: one of a library in the
+    repository goes when nothing else it brings is used, and one of another
+    package goes too when it has no prefix and one `show` list whose every
+    name goes with the field
+    (`import 'package:featureflip/featureflip.dart' show FeatureflipClient;`).
+    A plain import of another package still keeps the field, since what it
+    brings, extensions included, cannot be read.
+- **Ruby:** a keyless wrapper is inlined at its callers and deleted once none
+  is left, as in the other languages. It is a method of a class or module (an
+  instance method, a `def self.` class method or a module function) whose
+  whole body is one read of the flag
+  (`def new_checkout? = @client.bool_variation("old-checkout", {}, false)`).
+  A call is inlined only where its file proves it reaches that method: bare
+  or through `self` inside the class's own methods, or through the class's
+  name for a class method, with its value used and its arguments plain
+  values. Because Ruby can define and call a method by name, a symbol or a
+  string spelling the method anywhere keeps it, as do a test double, a class
+  reopened in another file, `method_missing`, `prepend` and methods defined
+  from computed names. A gem's instance methods are not inlined, and its
+  public class methods are kept. Calls from ERB templates are not inlined
+  yet; one keeps the wrapper. See README's "Wrapping the SDK".
+- **Ruby:** Capistrano `.cap` tasks, Sorbet `.rbi` files and RBS `.rbs`
+  signatures now count as Ruby files that can name a key constant or a
+  wrapper, so a mention there keeps it.
+- **Swift:** a keyless wrapper is inlined at its callers and deleted once none
+  is left, as in the other languages. It is a function, or a method or
+  computed property of a struct, enum or class, declared to return `Bool`,
+  whose whole body is one read of the flag
+  (`var newCheckout: Bool { client.boolVariation("old-checkout", default: false) }`).
+  A call is inlined only where its file proves it reaches that declaration,
+  in the wrapper's own module: a bare call of a function, the type's name or
+  `Self` for a static member, and `self`, or a parameter, local or property
+  written with the type as its type, for an instance member. A type with an
+  inheritance clause, a subclassed or `open` class, and a member that is
+  `open`, `class`, `override`, `dynamic` or has an attribute keep their
+  wrappers, as do a key path, a `#selector` and a string naming the member. A
+  `public` wrapper is kept unless its `Package.swift` declares no library
+  product. See README's
+  "Wrapping the SDK" for what is left alone, and why.
+
+### Fixed
+
+- **Dart:** a keyless wrapper called for nothing but its value, as the only
+  statement of a braceless body (`if (c) flags.legacyCheckout;`, an `else`, a
+  `for`, `while` or `do` loop), behind a label, or as the only statement of a
+  `case`, is no longer deleted. Deleting it handed the body to the next
+  statement, which then ran under the condition. The call is now kept and
+  named in the pull request, and so is the wrapper.
+- **Dart:** a private field whose type was named only in an import's `show`
+  list is no longer deleted on the strength of that entry, which left the
+  import unused (`unused_import`) when it came from another package.
+
 ## 1.12.0
 
 ### New

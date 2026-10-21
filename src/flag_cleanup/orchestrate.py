@@ -122,12 +122,13 @@ from flag_cleanup.pr_content import (
     without_inlined,
     note_deleted_tests,
     note_kept,
+    note_removed_comments,
     note_removed_entries,
     note_rewritten_build_output,
     pr_body,
     pr_title,
 )
-from flag_cleanup.residue import classify as classify_residue, live_references
+from flag_cleanup.residue import Residue, classify as classify_residue, live_references
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,11 @@ class FlagResult:
     action_taken: str
     pr_url: str = ""
     unprocessed_files: tuple[str, ...] = ()
+    #: ``(path, line, text)`` for each comment line still naming the flag,
+    #: kept because it also says something else. Its file is not in
+    #: ``unprocessed_files``: the run read it and decided, and the reviewer's
+    #: job there is to reword a sentence, not to finish a removal.
+    kept_comments: tuple[tuple[str, int, str], ...] = ()
     #: Files whose rewrite Gate 1 refused (``unsafe-rewrite`` only). On the
     #: result rather than only in a log line for the same reason
     #: ``unprocessed_files`` is: it is the one thing the customer can act on,
@@ -707,6 +713,7 @@ def _process_candidate(
     unprocessed: tuple[str, ...] = ()
     wrappers: tuple[ConstantWrapper, ...] = ()
     enum_held: tuple[tuple[str, str], ...] = ()
+    sorted_residue = Residue()
     with piranha_transform(candidate, config, ledger, known_flag_keys) as (
         diff,
         transform_error,
@@ -731,9 +738,8 @@ def _process_candidate(
         # preview a real run would have contradicted the real run's own body.
         if transform_error is None:
             unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-            enum_held = classify_residue(
-                unprocessed, candidate.key, config.accessors
-            ).enum_held
+            sorted_residue = classify_residue(unprocessed, candidate.key, config.accessors)
+            enum_held = sorted_residue.enum_held
             wrappers = without_inlined(
                 find_constant_wrappers(diff, config.directories), wrapper_findings
             )
@@ -741,7 +747,8 @@ def _process_candidate(
     if transform_error is not None:
         return _refusal_result(candidate, transform_error)
 
-    _warn_on_unprocessed_references(config, candidate.key, unprocessed)
+    _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
+    note_removed_comments(_bindings)
     note_wrapper_findings(wrapper_findings)
     note_family_doubles(test_doubles)
     note_constant_wrappers(wrappers)
@@ -759,7 +766,8 @@ def _process_candidate(
         candidate.status,
         diff,
         "dry-run",
-        unprocessed_files=unprocessed,
+        unprocessed_files=_not_comment_only(unprocessed, sorted_residue),
+        kept_comments=sorted_residue.comment_lines,
     )
 
 
@@ -845,6 +853,7 @@ def _process_candidate_for_pr(
     enum_findings: tuple[tuple[str, int, str, str], ...] = ()
     wrapper_findings: tuple[tuple[str, int, str, str, str], ...] = ()
     enum_held: tuple[tuple[str, str], ...] = ()
+    sorted_residue = Residue()
     refused: tuple[str, ...] = ()
     reasons: tuple[tuple[str, str], ...] = ()
     snapshot: git_ops.WorktreeSnapshot | None = None
@@ -892,9 +901,10 @@ def _process_candidate_for_pr(
                 logger.info("no changes for %s: opening no PR", candidate.key)
                 action = "no-changes"
                 unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-                enum_held = classify_residue(
+                sorted_residue = classify_residue(
                     unprocessed, candidate.key, config.accessors
-                ).enum_held
+                )
+                enum_held = sorted_residue.enum_held
             else:
                 # Computed BEFORE the PR is opened so the body can carry the
                 # caveat. A PR titled "remove flag X" whose repo still reads X
@@ -903,6 +913,7 @@ def _process_candidate_for_pr(
                 # Sorted while the rewrite is still on disk, for the same
                 # reason `unprocessed` is computed here.
                 residue = classify_residue(unprocessed, candidate.key, config.accessors)
+                sorted_residue = residue
                 enum_held = residue.enum_held
                 # Same window, same reason: the members it reads are only
                 # constants while the rewrite is on disk.
@@ -1092,7 +1103,8 @@ def _process_candidate_for_pr(
                     raise
 
     if action in {"pr-opened", "no-changes"}:
-        _warn_on_unprocessed_references(config, candidate.key, unprocessed)
+        _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
+        note_removed_comments(bindings)
         # Logged on BOTH outcomes, not only alongside a pull request, because
         # `no-changes` is the one where the body cannot say it: a repository
         # whose only mention of the flag is an override pinning it to the
@@ -1117,6 +1129,7 @@ def _process_candidate_for_pr(
         # cannot act on. `FlagResult` documents the field as populated only
         # where the transform ran AND a claim was made; this keeps that true.
         unprocessed = ()
+        sorted_residue = Residue()
 
     return FlagResult(
         candidate.key,
@@ -1125,7 +1138,8 @@ def _process_candidate_for_pr(
         diff,
         action,
         pr_url,
-        unprocessed_files=unprocessed,
+        unprocessed_files=_not_comment_only(unprocessed, sorted_residue),
+        kept_comments=sorted_residue.comment_lines,
         refused_files=refused,
         refusal_reasons=reasons,
     )
@@ -1974,9 +1988,32 @@ def all_unprocessed(
     return tuple(seen.values())
 
 
+def _not_comment_only(unprocessed: tuple[str, ...], sorted_out: Residue) -> tuple[str, ...]:
+    """``unprocessed`` without the files whose every mention is a kept comment."""
+    prose = set(sorted_out.comment_only)
+    return tuple(path for path in unprocessed if path not in prose)
+
+
 def _warn_on_unprocessed_references(
-    config: Config, flag_key: str, unprocessed: tuple[str, ...]
+    config: Config,
+    flag_key: str,
+    unprocessed: tuple[str, ...],
+    sorted_out: Residue = Residue(),
 ) -> None:
+    # A file whose every mention is in a comment is not unprocessed: the run
+    # read it, deleted each comment that named only the flag, and kept the
+    # rest because they say something else. Those are logged as what they
+    # are, line by line, as the pull request lists them. A test title is not
+    # judged that way, so it stays below.
+    if sorted_out.comment_lines:
+        logger.info(
+            "%d comment line(s) still name flag %r and were kept, because each "
+            "also says something else — reword them by hand: %s",
+            len(sorted_out.comment_lines),
+            flag_key,
+            "; ".join(f"{path}:{line}: {text}" for path, line, text in sorted_out.comment_lines),
+        )
+    unprocessed = _not_comment_only(unprocessed, sorted_out)
     if unprocessed:
         # Deliberately does NOT name a single cause. The list has three sources
         # — an extension no configured language covers, a file the engine could

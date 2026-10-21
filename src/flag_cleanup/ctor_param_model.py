@@ -39,13 +39,15 @@ _BLOCK = re.compile(r"^# ctor: (parameter|classic|argument)\n", re.MULTILINE)
 #: has no `;` of its own: the engine deletes a member and the line break before
 #: it, but not the `;` after it. A statement becomes the sentinel and a `;`.
 #: A Dart constructor parameter becomes the sentinel, a parameter that is a
-#: bare name, and a Dart initializer-list entry an entry setting it.
+#: bare name, a Dart initializer-list entry an entry setting it, and a Dart
+#: import directive an import with that prefix.
 FORMS = {
     "argument": "{}",
     "member": "{}(){{}}",
     "statement": "{};",
     "parameter": "{}",
     "initializer": "{} = 0",
+    "import": "import 'dart:core' as {};",
 }
 
 #: The same for C#, plus a whole type declaration and a ``using`` directive.

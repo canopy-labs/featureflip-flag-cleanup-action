@@ -860,8 +860,15 @@ def _dry_run_caveats(
     `remove`-mode dry) run over the same code.
     """
     notes: list[str] = []
+    # A file naming the flag only in kept comments is counted as what it is.
+    unprocessed = tuple(path for path in unprocessed if path not in set(residue.comment_only))
     if unprocessed:
         notes.append(f"{len(unprocessed)} file(s) would still reference this flag")
+    if residue.comment_lines:
+        notes.append(
+            f"{len(residue.comment_lines)} comment line(s) would still name this flag, "
+            "each also saying something else"
+        )
     if stranded:
         notes.append(f"{len(stranded)} unreachable statement(s) would be deleted")
     unread = sum(1 for _, kind, _ in bindings if kind == "unread parameter")
@@ -872,11 +879,12 @@ def _dry_run_caveats(
     dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
     removed_ctor = sum(1 for _, kind, _ in bindings if kind == "removed parameter")
     removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
+    removed_comments = sum(1 for _, kind, _ in bindings if kind == "removed comment")
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     cleaned = (
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
-        - removed_ctor - removed_members - changed_ctor - kept_locals
+        - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments
     )
     if cleaned:
         notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
@@ -889,6 +897,8 @@ def _dry_run_caveats(
         )
     if removed_members:
         notes.append(f"{removed_members} private field(s) would be removed")
+    if removed_comments:
+        notes.append(f"{removed_comments} comment(s) naming only this flag would be removed")
     if kept_locals:
         notes.append(
             f"{kept_locals} local(s) would be left unread after their argument was removed"

@@ -29,8 +29,8 @@ deletion skips could do work, and nothing else in the library spells it:
   longer happens. Any other field's runs when the object is built, so it must
   be absent or constant: a literal, a ``const`` expression, a collection
   literal built of those (``final _retries = 3;``, ``final _ids = <int>[];``),
-  or a call of a ``const`` constructor with constant arguments
-  (``final _client = FeatureClient();``, see
+  or a call, with constant arguments, of a ``const`` constructor or of one
+  that runs no code of its own (``final _client = FeatureClient();``, see
   :func:`flag_cleanup.ctor_param_dart.const_construction`). ``make()``,
   ``Foo.bar`` (a getter, or a static whose initializer runs on first access)
   and ``'$x'`` (a ``toString()``) may do work.
@@ -40,7 +40,11 @@ deletion skips could do work, and nothing else in the library spells it:
   ``dart:core``'s common types: otherwise deleting it would leave an import,
   a private class or a private function unused, which ``dart analyze``
   reports in turn. The same holds for what else goes from the file: a
-  parameter's type and default, an argument.
+  parameter's type and default, an argument. A name an import brings is the
+  exception when the import can go too: one of a library in the checkout is
+  judged by the stranded-binding pass that runs next, and an unprefixed
+  ``show`` import of any other library goes with the field when every name
+  it shows does (see :func:`_import_strand`).
 - **one library, one declaration.** A file with a ``part`` or ``part of``
   directive is refused: another part may read the field. So is a class
   declared twice in its file, a field declared beside others
@@ -59,12 +63,12 @@ field; a ``//`` comment above them may head a group, and stays.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import ctor_param_dart
+from flag_cleanup import ctor_param_dart, dart_namespace
 from flag_cleanup.ctor_param_model import IDENT, Refusal, Removal, Site
 from flag_cleanup.unused import _parse
 
@@ -397,12 +401,88 @@ def _own_declarations(root: Node, name: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _import_strand(
+    root: Node,
+    name: str,
+    stranded: dict[str, list[Node]],
+    kept: set[str],
+    resolve: Callable[[str], object | None],
+) -> list[tuple[int, int]] | None:
+    """What deleting the last spelling of ``name``, a name an import brings,
+    takes with it: ``[]`` when an import of a library in the checkout
+    brings it and the stranded-binding pass that runs after this one will
+    either delete that import or find it still used; the spans of the
+    directives to delete with the field; ``None`` when no import provably
+    brings it, or one that does may still bring something else. ``kept`` is
+    every name spelled outside what this removal deletes and the file's
+    directives, other private fields included.
+
+    That pass offers an import with no combinator, only ``hide`` ones, or one
+    ``show``, and keeps one while any extension member of its library is
+    spelled, a call of it or not; so an import of the checkout that brings
+    nothing else spelled is accepted only when no such member is.
+
+    The library of a ``package:`` or ``dart:`` import outside the checkout
+    cannot be read, so what it brings is known only when the import is
+    unprefixed and has one ``show`` list: then it brings those names and
+    nothing else, not even an extension it does not show. It goes when every
+    name it shows goes with the field, each spelled only as a type there,
+    which an extension never is. Any other import of such a library might be
+    what brings the name, or something an extension call needs, so it keeps
+    the field unless an import above already accounts for the name."""
+    if name.startswith("_"):
+        return None
+    known = False
+    deleted: list[tuple[int, int]] = []
+    for spec in (n for n in _walk(root) if n.type == "import_specification"):
+        directive = spec.parent.parent if spec.parent is not None else None
+        if directive is None or directive.type != "import_or_export" or any(c.type == "as" for c in spec.children):
+            continue  # a prefix brings no bare name
+        combinators = [c for c in spec.children if c.type == "combinator"]
+        listed = [{_text(x) for x in c.named_children if x.type == "identifier"} for c in combinators]
+        kinds = [c.children[0].type if c.children else "" for c in combinators]
+        if any(k == "show" and name not in names for k, names in zip(kinds, listed)) or any(
+            k == "hide" and name in names for k, names in zip(kinds, listed)
+        ):
+            continue
+        uri = dart_namespace.uri_of(spec)
+        namespace = None if uri is None else resolve(uri)
+        if namespace is not None:
+            if name not in namespace.names:
+                continue
+            if kinds not in ([], ["show"]) and set(kinds) != {"hide"}:
+                return None  # the stranded-binding pass never offers it
+            brought = set(listed[0]) if kinds == ["show"] else set(namespace.names).difference(*listed)
+            if not brought & kept and set(namespace.members) & kept:
+                return None
+            known = True
+            continue
+        if kinds != ["show"]:
+            continue  # cannot be read: may bring the name, or may not
+        if not all(
+            shown in stranded and shown not in kept and all(n.type == "type_identifier" for n in stranded[shown])
+            for shown in listed[0]
+        ):
+            return None
+        known = True
+        deleted.append((directive.start_byte, directive.end_byte))
+    return deleted if known else None
+
+
 def _stranded(
-    root: Node, declaration: Node, field: Node, spans: list[tuple[int, int]], skip: set[str]
-) -> str | None:
+    root: Node,
+    declaration: Node,
+    field: Node,
+    spans: list[tuple[int, int]],
+    skip: set[str],
+    resolve: Callable[[str], object | None],
+) -> str | list[tuple[int, int]]:
     """A name that ``declaration``, or what else goes in ``spans``, spells and
-    that nothing outside the file's private field declarations and ``spans``
-    does, or ``None``. ``spans`` starts with the declaration's; ``skip`` holds
+    that nothing outside the file's private field declarations, its import
+    and export directives and ``spans`` does, unless an import brings it
+    and goes with it or is left to the stranded-binding pass (see
+    :func:`_import_strand`); else the spans of the import directives to
+    delete with it. ``spans`` starts with the declaration's; ``skip`` holds
     the names whose every spelling goes with them (the field, a parameter
     that goes)."""
     fields = [
@@ -413,7 +493,9 @@ def _stranded(
         for member, names in _fields(body)
         if any(_text(n).startswith("_") for n in names)
     ]
-    fields += spans
+    # A `show` or `hide` entry names what a library brings; it uses nothing.
+    directives = [(n.start_byte, n.end_byte) for n in root.named_children if n.type == "import_or_export"]
+    fields += spans + directives
 
     def elsewhere(name: str) -> bool:
         skipped = fields + (_own_declarations(root, name) if name.startswith("_") else [])
@@ -427,6 +509,7 @@ def _stranded(
     spelled = list(_walk(declaration)) + [
         n for n in _walk(root) if any(start <= n.start_byte < end for start, end in spans[1:])
     ]
+    stranded: dict[str, list[Node]] = {}
     for node in spelled:
         if node.type not in _SPELLINGS or node == field or node.parent is None:
             continue
@@ -440,8 +523,20 @@ def _stranded(
             continue  # a named argument's name, `#sym`, `.member`: none names a top-level declaration
         name = _text(node)
         if name not in _CORE and name not in skip and not elsewhere(name):
+            stranded.setdefault(name, []).append(node)
+    kept = {
+        _text(node)
+        for node in _walk(root)
+        if node.type in _SPELLINGS
+        and not any(start <= node.start_byte < end for start, end in spans + directives)
+    }
+    imports: list[tuple[int, int]] = []
+    for name in stranded:
+        deleted = _import_strand(root, name, stranded, kept, resolve)
+        if deleted is None:
             return name
-    return None
+        imports += deleted
+    return sorted(set(imports))
 
 
 def _find(root: Node, class_name: str) -> list[Node]:
@@ -531,7 +626,9 @@ def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal
         names[0],
         [(s.start, s.end) for s in sites if str(Path(s.path).resolve()) == here],
         {field} | ({parameter} if parameter else set()),
+        dart_namespace.resolver(path, repo_dir),
     )
-    if stranded is not None:
+    if isinstance(stranded, str):
         return Refusal(label, f"deleting it would leave `{stranded}` unused")
+    sites += [Site(path, start, end, "import") for start, end in stranded]
     return Removal(path, class_name, parameter, label, -1, tuple(sites), False, field)

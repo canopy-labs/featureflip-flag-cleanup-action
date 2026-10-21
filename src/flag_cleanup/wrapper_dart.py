@@ -40,7 +40,10 @@ same name. So:
 A class that anything in the repository extends, implements or mixes in,
 an abstract, sealed, interface or mixin class, and a member marked
 ``@override`` are refused; a mock or fake implementing the class refuses its
-wrappers as ``test-double``. A library with ``part`` files, and a part, is
+wrappers as ``test-double``. A call made only for its value is deleted with
+its statement, so one that is a braceless body, a labelled statement or a
+case's only statement is refused: the next statement would take its place.
+A library with ``part`` files, and a part, is
 left alone. Members of an extension, mixin, enum or extension type are not
 wrappers here: their reads are folded where they are, as before. A public
 wrapper of a package that may be published is never deleted (``published``),
@@ -880,6 +883,27 @@ def _expression_head(node: Node) -> bool:
     return False
 
 
+#: Statement lists a statement can be deleted from.
+_STATEMENT_LISTS = frozenset({"block", "switch_statement_case", "switch_statement_default"})
+
+
+def _discard_moves_code(statement: Node) -> bool:
+    """Whether deleting ``statement``, as the seed rules delete a discarded
+    call, would change what the code around it does: a braceless ``if``,
+    ``else`` or loop body would take the next statement, a label would move
+    to it, and a case left with no statement shares the next case's body."""
+    parent = statement.parent
+    if parent is None or parent.type not in _STATEMENT_LISTS:
+        return True
+    if parent.type == "block":
+        return False
+    colon = next((c for c in parent.children if c.type == ":"), None)
+    return not any(
+        c.is_named and c != statement and "comment" not in c.type and colon is not None and c.start_byte > colon.start_byte
+        for c in parent.children
+    )
+
+
 def _occurrence(path: str, node: Node, text_node: Node, reason: str | None, span=None, suffix: str = "", data=b"") -> wi.Occurrence:
     return wi.Occurrence(
         path,
@@ -920,6 +944,8 @@ def _judge(path: str, node: Node, root: Node, data: bytes, wrapper: wi.Wrapper, 
     called = after is not None and after.type == "selector" and any(c.type == "argument_part" for c in after.children)
     if (wrapper.kind == "property" and called) or (wrapper.kind != "property" and arguments is None):
         # A getter's value called, a method torn off, or type arguments.
+        return _occurrence(path, node, shown, wi.RECEIVER_UNPROVEN)
+    if container is not None and container.type == "expression_statement" and _discard_moves_code(container):
         return _occurrence(path, node, shown, wi.RECEIVER_UNPROVEN)
     if _has_parts(root):
         # A part shares its library's imports, and the stranded-import

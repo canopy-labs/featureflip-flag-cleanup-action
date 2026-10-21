@@ -45,10 +45,12 @@ changes, or a parameter that goes (a code generator or an injector may
 construct it), a class name declared twice, and a file that does not parse.
 
 Each argument that goes must do no work when skipped, and strand nothing: a
-literal built of literals, a ``const`` object, or a bare name that is a
-parameter of a function around the call or a top-level ``const`` of the file
-(a getter or a lazily initialised variable may do work, and a local left
-unread is ``unused_local_variable``). Every name it spells must be spelled
+literal built of literals, a ``const`` object, a call with constant
+arguments of a constructor that builds the object and does nothing else
+(:func:`const_construction`), or a bare name that is a parameter of a
+function around the call or a top-level ``const`` of the file (a getter, a
+property such as ``widget.client`` or a lazily initialised variable may do
+work, and a local left unread is ``unused_local_variable``). Every name it spells must be spelled
 elsewhere in its file too. A
 positional argument is found by its index among the positional ones, a named
 one by its label. A call that passes fewer positional arguments than the index
@@ -694,9 +696,12 @@ def _inert_name(argument: Node, name: str, root: Node) -> bool:
     )
 
 
-def _argument_site(path: str, arguments: Node, how: tuple[str, int | str]) -> Site | None | str:
+def _argument_site(path: str, arguments: Node, how: tuple[str, int | str], repo_dir: str) -> Site | None | str:
     """The site of the argument a call passes for a dropped parameter,
-    ``None`` when it passes none, or why it cannot go."""
+    ``None`` when it passes none, or why it cannot go. A literal, a constant,
+    a parameter, or a call of a constructor that builds the object and does
+    nothing else (see :func:`const_construction`) can go; anything else may
+    do work the call would no longer do."""
     kind, key = how
     items = [c for c in arguments.named_children if c.type in ("argument", "named_argument")]
     if kind == "positional":
@@ -722,7 +727,11 @@ def _argument_site(path: str, arguments: Node, how: tuple[str, int | str]) -> Si
         value = [c for c in item.named_children if c.type != "label"]
     value = [c for c in value if c.type != "comment"]
     where = _where(path, item)
-    if not _literal(value) and not (len(value) == 1 and value[0].type == "const_object_expression"):
+    if (
+        not _literal(value)
+        and not (len(value) == 1 and value[0].type == "const_object_expression")
+        and not const_construction(path, _root(item), value, repo_dir)
+    ):
         if len(value) != 1 or value[0].type != "identifier":
             return f"{where}: an argument that may do work ({' '.join(_text(item).split())[:60]})"
         if not _inert_name(item, _text(value[0]), _root(item)):
@@ -803,7 +812,7 @@ def plan_callers(
     for call_path, ctor, arguments in scan.calls:
         if ctor not in dropped:
             continue
-        site = _argument_site(call_path, arguments, dropped[ctor])
+        site = _argument_site(call_path, arguments, dropped[ctor], repo_dir)
         if isinstance(site, str):
             return site
         if site is not None:
@@ -850,7 +859,7 @@ def _stranded_by_arguments(path: str, root: Node, sites: list[Site]) -> str | No
     return None
 
 
-# --- an initializer that calls a `const` constructor ----------------------------
+# --- a construction that does nothing but build the object --------------------
 
 
 def _const_arguments(arguments: Node) -> bool:
@@ -865,10 +874,61 @@ def _const_arguments(arguments: Node) -> bool:
     return True
 
 
+def _does_nothing(signature: Node, member: Node) -> bool:
+    """Whether the generative constructor ``signature`` runs no code of its
+    own: a ``const`` one with no ``assert`` (which runs when it is called
+    without ``const``), or one with no initializer list or redirection, no
+    ``super.`` parameter, not ``external``, and a body that is ``;`` or
+    ``{}``."""
+    if signature.type == "constant_constructor_signature":
+        # Constant otherwise, but called without `const` its asserts run.
+        return not any(n.type == "assertion" for n in _walk(member))
+    if signature.type != "constructor_signature":
+        return False
+    if [c for c in member.named_children if "comment" not in c.type] != [signature]:
+        return False  # an initializer list, a redirection
+    if any(c.type == "external" for c in member.children):
+        return False
+    if any(c.type == "super_formal_parameter" for p, _ in _parameters(signature) for c in p.named_children):
+        return False
+    if member.type == "method_signature":
+        body = member.next_named_sibling
+        block = body.named_children[0] if body is not None and body.type == "function_body" and body.named_children else None
+        return block is not None and block.type == "block" and not [
+            c for c in block.named_children if "comment" not in c.type
+        ]
+    return True
+
+
+def _fields_do_nothing(body: Node) -> bool:
+    """Whether building an instance runs no field initializer that may do
+    work. A ``late`` field's runs on first read and a ``static`` one's on
+    first access, neither at construction."""
+    from flag_cleanup.dart_field_removal import _DECLARATOR_LISTS, _DECLARATORS, _inert
+
+    for member in body.named_children:
+        if member.type != "declaration" or {"late", "static"} & {c.type for c in member.children}:
+            continue
+        for listing in (c for c in member.named_children if c.type in _DECLARATOR_LISTS):
+            for declarator in (d for d in listing.named_children if d.type in _DECLARATORS):
+                value: list[Node] = []
+                after = False
+                for part in declarator.children:
+                    if after and part.is_named and "comment" not in part.type:
+                        value.append(part)
+                    after = after or part.type == "="
+                if value and not _inert(value):
+                    return False
+    return True
+
+
 def _has_const_constructor(root: Node, class_name: str, name: str) -> bool | None:
     """Whether ``root`` declares a concrete class ``class_name`` whose
-    constructor ``name`` is a ``const`` generative one; ``None`` when it
-    declares no such class."""
+    constructor ``name`` builds the object and does nothing else: a
+    ``const`` generative one with no ``assert``, or one that runs no code of its own in a class
+    with no superclass or mixin (whose constructors would run too) and no
+    field initializer that may do work. ``None`` when it declares no such
+    class."""
     for cls in (n for n in root.named_children if n.type == "class_definition"):
         label = next((c for c in cls.named_children if c.type == "identifier"), None)
         if label is None or _text(label) != class_name:
@@ -876,9 +936,14 @@ def _has_const_constructor(root: Node, class_name: str, name: str) -> bool | Non
         body = next((c for c in cls.named_children if c.type == "class_body"), None)
         if body is None or any(c.type == "abstract" for c in cls.children):
             return False
-        return any(
-            s.type == "constant_constructor_signature" and _constructor_name(s) == name
-            for s, _ in constructors(body)
+        found = [(s, m) for s, m in constructors(body) if _constructor_name(s) == name]
+        if len(found) == 1 and found[0][0].type == "constant_constructor_signature":
+            return _does_nothing(*found[0])
+        return (
+            len(found) == 1
+            and _does_nothing(*found[0])
+            and not any(c.type == "superclass" for c in cls.named_children)
+            and _fields_do_nothing(body)
         )
     return None
 
@@ -916,11 +981,14 @@ def _imported(path: str, root: Node, class_name: str, repo_dir: str) -> Node | N
 
 
 def const_construction(path: str, root: Node, nodes: list[Node], repo_dir: str) -> bool:
-    """Whether the initializer ``nodes`` (a postfix chain) calls a ``const``
-    constructor with constant arguments, so it builds a value and does
-    nothing else: ``FeatureClient()`` where ``FeatureClient`` has a
-    ``const FeatureClient();``. The class must be declared in the file, or
-    in the one checkout file an import brings it in from."""
+    """Whether the expression ``nodes`` (a postfix chain) calls, with
+    constant arguments, a constructor that builds a value and does nothing
+    else (see :func:`_has_const_constructor`): ``FeatureClient()`` where
+    ``FeatureClient`` has a ``const FeatureClient();`` or a plain
+    ``FeatureClient();``. The class must be declared in the file, or in the
+    one checkout file an import brings it in from, and nothing else in the
+    file may be named like it (a local or a member would be called
+    instead)."""
     if len(nodes) == 1 and nodes[0].type == "new_expression":
         node = nodes[0]
         label = next((c for c in node.named_children if c.type == "type_identifier"), None)
@@ -944,6 +1012,17 @@ def const_construction(path: str, root: Node, nodes: list[Node], repo_dir: str) 
         return False
     name = "" if name == "new" else name
     if not _const_arguments(arguments):
+        return False
+    from flag_cleanup.wrapper_dart import binds
+
+    if any(
+        n.type == "identifier"
+        and _text(n) == class_name
+        and n.parent is not None
+        and n.parent.type not in ("class_definition", *_CONSTRUCTORS)
+        and binds(n)
+        for n in _walk(root)
+    ):
         return False
     local = _has_const_constructor(root, class_name, name)
     if local is not None:

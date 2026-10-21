@@ -52,6 +52,7 @@ from flag_cleanup.ctor_param_model import (
     mark,
     render_rules,
     tidy,
+    tidy_lines,
 )
 from flag_cleanup.kotlin_sentinel import Rewrite
 from flag_cleanup.unused import _parse
@@ -232,6 +233,9 @@ def remove(
         for key in files:
             engine_out = Path(key).read_bytes()
             tidied = tidy(marked[key], engine_out, named_groups=language == "dart")
+            if any(m[2] == "import" for m in marks.get(key, ())):
+                # A deleted first import leaves the blank line after it.
+                tidied = tidy_lines(marked[key], tidied)
             if b"\r" in tidied:
                 tidied = syntax.collapse_introduced_carriage_returns(
                     _decode(marked[key]), _decode(tidied), _grammar(key, language)

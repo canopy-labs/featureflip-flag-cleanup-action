@@ -44,7 +44,8 @@ like lives in one profile per language (:mod:`flag_cleanup.wrapper_kotlin`,
 :mod:`flag_cleanup.wrapper_java`, :mod:`flag_cleanup.wrapper_csharp`,
 :mod:`flag_cleanup.wrapper_go`, :mod:`flag_cleanup.wrapper_ts`,
 :mod:`flag_cleanup.wrapper_python`,
-:mod:`flag_cleanup.wrapper_dart`, :mod:`flag_cleanup.wrapper_php`), with
+:mod:`flag_cleanup.wrapper_dart`, :mod:`flag_cleanup.wrapper_php`,
+:mod:`flag_cleanup.wrapper_ruby`, :mod:`flag_cleanup.wrapper_swift`), with
 the facts both JVM languages share in :mod:`flag_cleanup.wrapper_jvm`. A
 profile that brings its own repository index and qualification says so; one
 that does not is judged by the JVM ones.
@@ -80,7 +81,7 @@ INTERFACE_PUBLISHED = "interface-published"
 INTERFACE_STRUCTURAL = "interface-structural"
 #: A public member of a package that may be published, which code outside the
 #: repository may call: its callers are inlined, and it is never deleted. Only
-#: Dart and PHP produce it.
+#: Dart, PHP, Ruby and Swift produce it.
 PUBLISHED = "published"
 #: Nothing in the file ties the call's receiver to the wrapper. Also a use
 #: handing a TypeScript or JavaScript function wrapper's module on as an
@@ -234,8 +235,9 @@ class Wrapper:
     siblings: tuple[Sibling, ...] = ()
     #: Simple names of the annotations on the declaration.
     annotations: tuple[str, ...] = ()
-    #: ``method``, ``property`` (a Kotlin getter, read with no call) or
-    #: ``function`` (a Kotlin top-level function; ``owner`` is its file facade).
+    #: ``method``, ``property`` (a Kotlin getter, read with no call),
+    #: ``function`` (a Kotlin top-level function; ``owner`` is its file facade)
+    #: or ``singleton`` (a Ruby ``def self.`` class method).
     kind: str = "method"
     #: A Kotlin top-level function's ``(required, max)`` argument counts, ``max``
     #: being ``None`` for a ``vararg``; ``None`` when not a function.
@@ -434,7 +436,7 @@ def register(profile: Profile) -> None:
 
 def profile(language: str) -> Profile | None:
     """The language's profile, or ``None`` for a language not covered yet."""
-    from flag_cleanup import wrapper_csharp, wrapper_dart, wrapper_go, wrapper_java, wrapper_kotlin, wrapper_php, wrapper_python, wrapper_ts  # noqa: F401 - registration
+    from flag_cleanup import wrapper_csharp, wrapper_dart, wrapper_go, wrapper_java, wrapper_kotlin, wrapper_php, wrapper_python, wrapper_ruby, wrapper_swift, wrapper_ts  # noqa: F401 - registration
 
     return _PROFILES.get(language)
 

@@ -173,6 +173,7 @@ REPORTED_BINDING_KINDS = frozenset(
         "kept argument local",
         "unread binding",
         "emptied override",
+        "removed comment",
     }
 )
 
@@ -347,8 +348,9 @@ def _removed_dart_field_lines(removed: list[tuple[str, str]]) -> list[str]:
         f"{'it' if count == 1 else 'them'} was a flag read this pull request "
         "removed, so `dart analyze` would report `unused_field`, and nothing its "
         "deletion skips can do work: its initializer, if any, is constant, "
-        "calls a `const` constructor, or never runs because the field is "
-        "`late` or `static`. A constructor parameter that only set it went "
+        "calls a constructor that only builds the object, or never runs "
+        "because the field is `late` or `static`. A constructor parameter "
+        "that only set it went "
         "too, with the argument every caller in the repository passed for it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
@@ -519,6 +521,25 @@ def _emptied_override_lines(emptied: list[tuple[str, str]]) -> list[str]:
         "go too:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in emptied[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _removed_comment_lines(removed: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each comment deleted because it described nothing
+    but what this pull request removes, or nothing."""
+    if not removed:
+        return []
+    count = len(removed)
+    noun = "comment was" if count == 1 else "comments were"
+    return [
+        f"> **{count} {noun} removed.** Each named only this flag (or a type "
+        "this pull request deletes) and said nothing else, so it described "
+        "code that is gone. A comment that also says something else is kept "
+        "and listed below:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -738,12 +759,26 @@ def pr_body(
         ]
     if residue.comment_only:
         shown = residue.comment_only[:20]
+        # Each file with the lines naming the flag, so the reviewer reads the
+        # sentence to fix here rather than searching for it.
+        named: dict[str, list[tuple[int, str]]] = {}
+        for path, line, text in residue.comment_lines:
+            named.setdefault(path, []).append((line, text))
         lines += [
             f"> **ℹ️ {len(residue.comment_only)} file(s) mention this flag only "
             "in comments.** Nothing there can break, but prose describing the "
-            "flag may now describe behaviour that is gone:",
+            "flag may now describe behaviour that is gone. Each of these "
+            "comments also says something else, so it was kept for you to "
+            "reword:",
             ">",
-            *[f"> - {_md_code(path)}" for path in shown],
+            *[
+                item
+                for path in shown
+                for item in (
+                    f"> - {_md_code(path)}",
+                    *[f">   - line {line}: {_md_code(text)}" for line, text in named.get(path, [])[:5]],
+                )
+            ],
             *(
                 [f"> - ...and {len(residue.comment_only) - len(shown)} more"]
                 if len(residue.comment_only) > len(shown)
@@ -871,6 +906,9 @@ def pr_body(
     emptied = [
         (path, text) for path, kind, text in bindings if kind == "emptied override"
     ]
+    removed_comments = [
+        (path, text) for path, kind, text in bindings if kind == "removed comment"
+    ]
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
     lines += _unread_member_lines([m for m in unread_members if not m[0].endswith(".dart")])
@@ -882,6 +920,7 @@ def pr_body(
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_binding_lines(unread_bindings)
     lines += _emptied_override_lines(emptied)
+    lines += _removed_comment_lines(removed_comments)
     lines += _bare_import_lines(bare_imports)
     lines += _marked_import_lines(marked_imports)
     lines += _module_marker_lines(module_markers)
@@ -1498,6 +1537,18 @@ def note_rewritten_build_output(diff: str) -> tuple[str, ...]:
             ", ".join(generated),
         )
     return generated
+
+
+def note_removed_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the comments this run deleted for naming only the flag; the dry
+    run's only outlet besides the diff."""
+    removed = [(path, text) for path, kind, text in bindings if kind == "removed comment"]
+    if removed:
+        logger.info(
+            "%d comment(s) naming only this flag removed: %s",
+            len(removed),
+            "; ".join(f"{path}: {text}" for path, text in removed),
+        )
 
 
 def note_removed_entries(entries: tuple[tuple[str, str], ...]) -> None:

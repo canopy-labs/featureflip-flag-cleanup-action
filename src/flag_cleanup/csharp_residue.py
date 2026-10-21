@@ -163,6 +163,9 @@ class Residue:
     config: dict[str, str] = field(default_factory=dict)
     #: A tier that was kept while the rest went (the options class, K7).
     kept: list[Kept] = field(default_factory=list)
+    #: Simple names of every type the transaction deletes, for the comment
+    #: pass that runs after it.
+    names: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -1695,8 +1698,10 @@ def prove(
             options = None
     if usings is None:
         usings = _emptied_namespaces(family_deleted, residue, repo_dir)
+    residue.names = {t.name for t in targets}
     if options is not None:
         options.merge(residue)
+        residue.names |= {full.rsplit(".", 1)[-1] for full, _ in options.deleted}
     for path, start, end, line in usings:
         residue.spans.setdefault(path, []).append((start, end, "using"))
         residue.rows.append((path, line, "using of a namespace the run empties"))
@@ -1999,12 +2004,14 @@ def remove(
     rewrite: Callable,
     engine: Callable[[list[str], str], object],
     flag_key: str | None = None,
-) -> tuple[list, list[wi.Finding]]:
+) -> tuple[list, list[wi.Finding], frozenset[str]]:
     """Remove the residue of every complete C# wrapper with an interface in
-    ``plan``, by ``statuses`` (close-out's rows). Returns the summaries and
-    the rows to report: what went, prose left naming it, or why it stays."""
+    ``plan``, by ``statuses`` (close-out's rows). Returns the summaries, the
+    rows to report (what went, prose left naming it, or why it stays) and the
+    simple names of the types deleted."""
     complete = {f.wrapper for f in statuses if f.reason == wi.COMPLETE}
     rows: list[wi.Finding] = []
+    names: set[str] = set()
     for wrapper in plan.wrappers:
         if wrapper.language != "csharp" or wrapper.interface is None or wrapper.label not in complete:
             continue
@@ -2012,6 +2019,7 @@ def remove(
             originals = {str(Path(s.path).resolve()): s.original_content for s in summaries}
             residue = prove(wrapper, repo_dir, originals, flag_key)
             summaries = apply(residue, summaries, repo_dir, rewrite, engine)
+            names |= residue.names
         except Kept as kept:
             logger.info("keeping the residue of %s: %s", wrapper.label, kept)
             path = kept.path or wrapper.path
@@ -2038,7 +2046,7 @@ def remove(
             wi.Finding(_rel(path, repo_dir), line, wi.RESIDUE_PROSE, text, wrapper.label)
             for path, line, text in dict.fromkeys(residue.prose)
         ]
-    return summaries, rows
+    return summaries, rows, frozenset(names)
 
 
 # --- test doubles and construct-only tests (K5) -------------------------------

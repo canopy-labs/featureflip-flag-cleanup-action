@@ -55,7 +55,7 @@ LANGUAGES = frozenset({"ruby", "erb"})
 
 #: Templates holding Ruby that no grammar here reads. One is never parsed: it
 #: reaches every owner it names, and reads every constant it names.
-UNPARSED_SUFFIXES = (".haml", ".slim")
+UNPARSED_SUFFIXES = (".haml", ".slim", ".rbs")
 
 #: Templates read through ERB's code view.
 _ERB_SUFFIXES = (".erb", ".rhtml")

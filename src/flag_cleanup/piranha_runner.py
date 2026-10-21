@@ -92,13 +92,16 @@ from flag_cleanup import (
     cross_file_php,
     cross_file_python,
     file_deletion,
+    git_ops,
     go_dead_code,
     go_inline,
     go_stranded,
     kotlin_sentinel,
     mock_stubs,
+    residue,
     ruby_owner_reach,
     source_index,
+    stale_comments,
     ts_bound_overrides,
     ts_dead_code,
     ts_fold,
@@ -1663,7 +1666,8 @@ def _transform_flag(
         # engine. See `_inline_bound_reads`.
         "marker": marker_for(flag_key),
     }
-    # The sentinel rules of Java, C#, Go, Dart, PHP and the TS family name the hole
+    # The sentinel rules of Java, C#, Go, Dart, PHP, Ruby (ERB shares its rules),
+    # Swift and the TS family name the hole
     # whether or not this run marks a wrapper call, and a hole no substitution
     # supplies aborts the engine. Kotlin's is supplied by its pre-pass, which
     # always exists.
@@ -2070,8 +2074,9 @@ def _transform_flag(
     # fails keeps all of it and is reported, never refused. Before the
     # stranded-method pass, which removes what these deletions strand, and
     # before Gate 1, which judges every file this rewrites.
+    family_names: frozenset[str] = frozenset()
     if language == "csharp":
-        summaries, residue_rows = csharp_residue.remove(
+        summaries, residue_rows, family_names = csharp_residue.remove(
             wrappers,
             wrapper_rows,
             summaries,
@@ -2139,6 +2144,22 @@ def _transform_flag(
     # Reported, never edited: whether the prop carrying one can go depends on
     # a type declared elsewhere. Last, so it reads the bytes that stay on disk.
     bindings = bindings + _emptied_overrides(summaries, language, flag_key, repo_dir)
+
+    # The comments left describing nothing but what this run removed: the
+    # flag, or a C# family type it deleted. Last of the edits, so it judges
+    # the bytes that stay on disk; before Gate 1, which judges its output too.
+    summaries, comment_rows, wrapper_rows = _remove_stale_comments(
+        summaries,
+        paths,
+        unprocessable,
+        {s.path for s in deleted_files},
+        language,
+        flag_key,
+        family_names,
+        wrapper_rows,
+        repo_dir,
+    )
+    bindings = bindings + comment_rows
 
     # GATE 1 — if the transform broke any file, discard ALL of it. A partial
     # rewrite is not an option: the flag would look half-removed, and a diff
@@ -2758,6 +2779,105 @@ def _drop_unread_parameters(
         else:
             remaining.append(row)
     return result, tuple(remaining), tuple(dropped)
+
+
+def _remove_stale_comments(
+    summaries,
+    paths: list[str],
+    unprocessable: Iterable[str],
+    deleted: set[str],
+    language: str,
+    flag_key: str,
+    family_names: frozenset[str],
+    wrapper_rows: list,
+    repo_dir: str,
+) -> tuple[list, tuple[tuple[str, str, str], ...], list]:
+    """Delete each comment that only described the flag or a deleted family
+    type, with a ``(path, "removed comment", text)`` row for each. See
+    :mod:`flag_cleanup.stale_comments`.
+
+    Only once nothing in this pass still reads the flag: while a file names
+    the key outside a comment (a read the rules could not rewrite, a test
+    still handing it over as data, a file the engine could not parse), the
+    flag is still in use here and a comment describing it may still be true.
+    The family names come only from a family the run deleted whole, so those
+    are gone by construction. A file the residue named as prose is examined
+    too, and its rows are renumbered or dropped to match.
+    """
+    if unprocessable:
+        return summaries, (), wrapper_rows
+    by_path = {s.path: s for s in summaries}
+
+    def text_of(path: str) -> str | None:
+        if path in by_path:
+            return by_path[path].content
+        try:
+            with open(path, encoding="utf-8", newline="") as handle:
+                return handle.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    files = [p for p in paths if p not in deleted]
+    for path in files:
+        text = text_of(path)
+        if text is None or residue.live_mention(path, text, flag_key):
+            return summaries, (), wrapper_rows
+    if family_names:
+        known = {str(Path(p).resolve()) for p in files} | {str(Path(p).resolve()) for p in deleted}
+        root = Path(repo_dir).resolve()
+        for row in wrapper_rows:
+            if (
+                row.reason == wrapper_inline.RESIDUE_PROSE
+                and row.path.endswith(".cs")
+                and row.path not in known
+                # Only inside the directory this pass was configured for.
+                and Path(row.path).resolve().is_relative_to(root)
+            ):
+                known.add(row.path)
+                text = text_of(row.path)
+                if text is not None and not residue.live_mention(row.path, text, flag_key):
+                    files.append(row.path)
+    names = stale_comments.names_pattern(flag_key, family_names)
+    result = list(summaries)
+    rows: list[tuple[str, str, str]] = []
+    shifts: dict[str, object] = {}
+    for path in files:
+        grammar = _grammar_of(path, language)
+        if grammar == "erb" or not path.endswith(_LANGUAGES[grammar].extensions):
+            continue
+        before = text_of(path)
+        if before is None:
+            continue
+        after, removals = stale_comments.rewrite(before, grammar, names)
+        if not removals:
+            continue
+        git_ops.before_writing([path])
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(after)
+        summary = by_path.get(path)
+        rewrite = Rewrite(path, summary.original_content if summary else before, after)
+        if summary is None:
+            result.append(rewrite)
+        else:
+            result[result.index(summary)] = rewrite
+        relative = os.path.relpath(path, repo_dir)
+        rows.extend((relative, "removed comment", r.text) for r in removals)
+        shifts[str(Path(path).resolve())] = (after, removals)
+    if shifts:
+        # The residue's prose rows are found again by their text: a row
+        # whose comment went is dropped, and the rest are pointed at the line
+        # their text is on now.
+        moved = []
+        for row in wrapper_rows:
+            edited = shifts.get(row.path) if row.reason == wrapper_inline.RESIDUE_PROSE else None
+            if edited is None:
+                moved.append(row)
+                continue
+            line = stale_comments.follow(row.text, *edited)
+            if line is not None:
+                moved.append(replace(row, line=line) if line else row)
+        wrapper_rows = moved
+    return result, tuple(rows), wrapper_rows
 
 
 def _emptied_overrides(
@@ -3581,7 +3701,7 @@ def _accessor_templates_for(rules_file: Path) -> str | None:
 
 
 #: The languages whose pre-pass exists only to mark keyless-wrapper calls.
-_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart", "php"})
+_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart", "php", "ruby", "erb", "swift"})
 
 
 def _sentinel_prepass(
@@ -3596,11 +3716,11 @@ def _sentinel_prepass(
 
     Kotlin always has one, and it is a workaround for a specific engine
     limitation rather than a general stage — see
-    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go, Dart, PHP and the TS family have one only when
+    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go, Dart, PHP, Ruby, Swift and the TS family have one only when
     there are keyless-wrapper calls to mark (``wrapper_spans``, see
     :mod:`flag_cleanup.wrapper_inline`): it marks those and nothing else, and
     the sentinel rules in ``rules/java.toml``, ``rules/csharp.toml``,
-    ``rules/go.toml``, ``rules/dart.toml``, ``rules/php.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
+    ``rules/go.toml``, ``rules/dart.toml``, ``rules/php.toml``, ``rules/ruby.toml``, ``rules/swift.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
     has to care about it all ask the same question.
     """
     spans = dict(wrapper_spans or {})

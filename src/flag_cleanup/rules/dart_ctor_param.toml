@@ -13,6 +13,8 @@
 #   call argument (a named one with its label) became the bare name;
 # - an initializer-list entry became `<name> = 0`, and the whole list, its
 #   `:` included, when it was the list's only entry.
+# - an import directive the field was the last use of became
+#   `import 'dart:core' as <name>;`.
 #
 # No holes and no edges: every rule is a seed that matches on its own.
 
@@ -88,5 +90,16 @@ query = """(
   (#eq? @name "__CTOR_SENTINEL__")
 )"""
 replace_node = "initializers"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_import"
+query = """(
+  (import_or_export (library_import (import_specification (identifier) @name))) @import
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "import"
 replace = ""
 is_seed_rule = true

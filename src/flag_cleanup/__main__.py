@@ -607,6 +607,15 @@ def _report(results: list[FlagResult], *, dry_run: bool) -> None:
                 f"    warning: {len(result.unprocessed_files)} file(s) still "
                 f"mention this flag: {', '.join(result.unprocessed_files)}"
             )
+        if result.kept_comments:
+            # Not a warning: the run read these and kept each because it says
+            # something besides the flag. They are a sentence to reword.
+            named = "; ".join(f"{path}:{line}" for path, line, _ in result.kept_comments)
+            print(
+                f"    note: {len(result.kept_comments)} comment line(s) still name "
+                "this flag and also say something else, so they were kept for "
+                f"you to reword: {named}"
+            )
         if result.refused_files:
             # Same reasoning, one step stronger: this flag produced NOTHING,
             # and these files are the reason. Without the list the customer
@@ -653,7 +662,7 @@ def _report(results: list[FlagResult], *, dry_run: bool) -> None:
             where = (
                 "the files above mention this flag, but nothing in them can be "
                 "rewritten"
-                if result.unprocessed_files
+                if result.unprocessed_files or result.kept_comments
                 else "no file in the configured directories mentions this flag"
             )
             print(f"    no changes: {where}, so a real run opens no pull request")

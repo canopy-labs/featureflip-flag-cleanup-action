@@ -379,3 +379,58 @@ not_contains = [
 """((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "_@prop_name"))""",
 """((simple_identifier) @wrapper_ref (#eq? @wrapper_ref "$@prop_name"))""",
 ]
+
+
+# ===========================================================================
+# 4. @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
+# ===========================================================================
+# Reached ONLY through the wrapper pass (`wrapper_inline`), as the rules of
+# these names in dart.toml and go.toml are. The pass proves that a call such as
+# `flags.newCheckout(u)`, a computed property read `flags.newCheckout` or a
+# free function's `newCheckout()` reaches a declaration whose whole body is a
+# read of this flag, and replaces the callee (receiver included) with the run's
+# sentinel identifier: `__ff_cleanup_<hash>(u)` (a property read gets `()`
+# appended, so it is a call too). Which calls are this flag's was decided
+# there, call by call, so these rules check nothing but the sentinel. A
+# sentinel left behind is a refusal, never a diff (`SentinelPrePass.survived`).
+#
+# Holes name `sentinel` and not `stale_flag_name`: a call-site file names no
+# key, and the engine skips a file holding none of a seed's hole values.
+#
+# The same matched pair as section 1, for the same grammar defect: `!s()`
+# parses as `(!s)()`, so the bang is inside `@call` and the negated rule must
+# put it back. `!!s()` matches neither, and the wrapper pass never marks one.
+# There is no discarded-statement rule: the pass refuses a call whose value is
+# dropped, since a bare `true` is a warning in Swift.
+
+# --- !@sentinel(…) -> !@treated
+[[rules]]
+name = "replace_negated_sentinel_read_with_negated_literal"
+query = """(
+  (call_expression
+    (prefix_expression (simple_identifier) @sdk_fn)
+    (call_suffix)
+  ) @call
+  (#eq? @sdk_fn "@sentinel")
+  (#match? @call "^![^!]")
+)"""
+replace_node = "call"
+replace = "!@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]
+
+# --- @sentinel(…) -> @treated
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (call_expression
+    (simple_identifier) @sdk_fn
+    (call_suffix)
+  ) @call
+  (#eq? @sdk_fn "@sentinel")
+  (#not-match? @call "^!")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]

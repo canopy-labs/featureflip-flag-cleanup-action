@@ -70,11 +70,17 @@ class Residue:
     #: TypeScript-family files every mention of the flag in which sits in a
     #: test's title or a comment, with at least one in a title.
     title_only: tuple[str, ...] = ()
+    #: ``(path, line, text)`` for each comment line naming the flag in a
+    #: ``comment_only`` file: the prose the run kept because it says
+    #: something besides the flag (see :mod:`flag_cleanup.stale_comments`).
+    comment_lines: tuple[tuple[str, int, str], ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
-    """The key as a whole token: not inside a longer key or identifier."""
-    return re.compile(rf"(?<![\w.-]){re.escape(flag_key)}(?![\w.-])")
+    """The key as a whole token: not inside a longer key or identifier. A
+    full stop after it ends a sentence; one with a word after it is a
+    member read."""
+    return re.compile(rf"(?<![\w.-]){re.escape(flag_key)}(?![\w-])(?!\.\w)")
 
 
 def _comment_only(
@@ -98,6 +104,23 @@ def _comment_only(
             continue
         stack.extend(node.children)
     return in_comments > 0
+
+
+def _comment_lines(root: Node, source: str, mention: re.Pattern[str]) -> list[tuple[int, str]]:
+    """``(line, text)`` for each source line where a comment names the key."""
+    lines = source.split("\n")
+    found: dict[int, str] = {}
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if "comment" in node.type:
+            text = node.text.decode("utf-8", "replace")
+            for match in mention.finditer(text):
+                row = node.start_point[0] + text.count("\n", 0, match.start())
+                found.setdefault(row + 1, lines[row].strip() if row < len(lines) else "")
+            continue
+        stack.extend(node.children)
+    return sorted(found.items())
 
 
 #: The grammars whose tests carry a title :mod:`flag_cleanup.ts_tests` can read.
@@ -260,6 +283,7 @@ def classify(
     comment_only: list[str] = []
     title_only: list[str] = []
     enum_held: list[tuple[str, str]] = []
+    comment_lines: list[tuple[str, int, str]] = []
     for path in paths:
         language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
         if language is None:
@@ -277,6 +301,7 @@ def classify(
         root = _parse(source, language)
         if _comment_only(root, mention):
             comment_only.append(path)
+            comment_lines.extend((path, line, text) for line, text in _comment_lines(root, source, mention))
             continue
         if _title_only(root, source, mention, language):
             title_only.append(path)
@@ -285,8 +310,27 @@ def classify(
         if held is not None:
             enum_held.append((path, held))
     return Residue(
-        tuple(stubbed), tuple(comment_only), tuple(enum_held), tuple(title_only)
+        tuple(stubbed), tuple(comment_only), tuple(enum_held), tuple(title_only), tuple(comment_lines)
     )
+
+
+def live_mention(path: str, source: str, flag_key: str) -> bool:
+    """Whether ``source`` (the text of ``path``) names ``flag_key`` other than
+    in a comment or, in the TypeScript family, a test title. One file's
+    answer to :func:`live_references`, for text that is not on disk yet."""
+    mention = _mention(flag_key)
+    if not mention.search(source):
+        return False
+    language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
+    if language is None:
+        return True
+    root = _parse(source, language)
+    inert = (
+        ts_tests.title_nodes(root, source.encode("utf-8"))
+        if ts_tests.covers(language)
+        else frozenset()
+    )
+    return not _comment_only(root, mention, inert)
 
 
 def live_references(paths: tuple[str, ...], flag_key: str) -> tuple[str, ...]:

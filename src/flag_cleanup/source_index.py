@@ -84,13 +84,15 @@ PAGE_SUFFIXES = frozenset({".html", ".htm"})
 #: (``.jbuilder``, ``.jb``, ``.builder``, ``.rabl``, ``.arb``, ``.axlsx`` and
 #: ``.prawn`` are Ruby; ``.haml``, ``.slim`` and ``.rhtml`` hold it inside a
 #: template) and project files (``config.ru``, a ``.gemspec``, ``.podspec`` or
-#: Appraisal ``.gemfile``, a ``.thor`` or ``.rbw`` script). Listed only for a
+#: Appraisal ``.gemfile``, a ``.thor``, ``.rbw`` or Capistrano ``.cap`` script)
+#: and type signatures (Sorbet ``.rbi``, RBS ``.rbs``). Listed only for a
 #: caller that asks for them by suffix, as above: the Ruby key-constant checks.
 RUBY_SUFFIXES = frozenset(
     {
         ".jbuilder", ".jb", ".builder", ".rabl", ".arb", ".axlsx", ".prawn",
         ".haml", ".slim", ".rhtml",
-        ".gemspec", ".podspec", ".gemfile", ".ru", ".thor", ".rbw",
+        ".gemspec", ".podspec", ".gemfile", ".ru", ".thor", ".rbw", ".cap",
+        ".rbi", ".rbs",
     }
 )
 #: Files with no suffix at all: a ``Rakefile``, a ``Gemfile``, a script under
