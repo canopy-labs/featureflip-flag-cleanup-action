@@ -132,10 +132,13 @@ class Target:
     end: int
     line: int
     kind: str
+    #: ``Outer.Name`` for a type nested in another; ``None`` at top level.
+    chain: str | None = None
 
     @property
     def full(self) -> str:
-        return f"{self.namespace}.{self.name}" if self.namespace else self.name
+        name = self.chain or self.name
+        return f"{self.namespace}.{name}" if self.namespace else name
 
 
 @dataclass
@@ -278,12 +281,19 @@ def _inert_constructor(member: Node, fields: set[str]) -> bool:
     return True
 
 
-def _member_less(declaration: Node, kind: str) -> str | None:
+def _member_less(declaration: Node, kind: str, knob: str | None = None) -> str | None:
     """Why ``declaration`` still holds something, or ``None`` when all it
     declares is private fields and inert constructors (or, for the
-    interface, nothing)."""
+    interface, nothing). A test fake's ``knob`` -- the field or
+    auto-property its tests chose the member's value with -- goes with it:
+    nothing can set it without a value of the fake's type, and every such
+    value spells the type, which the core rule then accounts for."""
     body = declaration.child_by_field_name("body")
-    members = [m for m in (body.named_children if body is not None else []) if m.type != "comment"]
+    members = [
+        m
+        for m in (body.named_children if body is not None else [])
+        if m.type != "comment" and not (knob is not None and _is_knob(m, knob))
+    ]
     if kind == "interface":
         return f"it still declares {_text(members[0]).split(chr(10))[0][:60]}" if members else None
     fields: set[str] = set()
@@ -317,16 +327,40 @@ def _member_less(declaration: Node, kind: str) -> str | None:
     return None
 
 
+def _is_knob(member: Node, knob: str) -> bool:
+    """Whether ``member`` is a test fake's knob ``knob``: a field declaring
+    only it, or an auto-property, with no attribute."""
+    if any(c.type == "attribute_list" for c in member.children):
+        return False
+    if member.type == "field_declaration":
+        declarators = [
+            d for v in member.named_children if v.type == "variable_declaration"
+            for d in v.named_children if d.type == "variable_declarator"
+        ]
+        return len(declarators) == 1 and ctor_param_csharp._declarator_name(declarators[0]) == knob
+    if member.type == "property_declaration":
+        name = member.child_by_field_name("name")
+        accessors = member.child_by_field_name("accessors")
+        return (
+            name is not None
+            and _text(name) == knob
+            and accessors is not None
+            and all(a.child_by_field_name("body") is None for a in accessors.named_children if a.type == "accessor_declaration")
+        )
+    return False
+
+
 def _targets(wrapper: wi.Wrapper, repo_dir: str) -> list[Target]:
-    """The family's types, each proven deletable on its own."""
-    wanted: list[tuple[str, str, str, str]] = []
+    """The family's types, each proven deletable on its own. A sibling
+    nested in another type is one only as a private test fake."""
+    wanted: list[tuple[str, str, str, str, wi.Sibling | None]] = []
     if wrapper.interface is not None:
-        wanted.append((wrapper.interface.name, wrapper.interface.package, wrapper.interface.path, "interface"))
-    wanted.append((wrapper.owner, wrapper.package, wrapper.path, "wrapper"))
-    wanted += [(s.owner, s.namespace, s.path, "sibling") for s in wrapper.siblings]
+        wanted.append((wrapper.interface.name, wrapper.interface.package, wrapper.interface.path, "interface", None))
+    wanted.append((wrapper.owner, wrapper.package, wrapper.path, "wrapper", None))
+    wanted += [(s.owner, s.namespace, s.path, "sibling", s) for s in wrapper.siblings]
     interface = wrapper.interface.name if wrapper.interface is not None else None
     targets: list[Target] = []
-    for name, namespace, path, kind in wanted:
+    for name, namespace, path, kind, sibling in wanted:
         path = str(Path(path).resolve())
         try:
             file = _read(path)
@@ -334,6 +368,7 @@ def _targets(wrapper: wi.Wrapper, repo_dir: str) -> list[Target]:
             raise Kept(_rel(path, repo_dir), 1, f"could not be read: {exc}") from exc
         if file.root.has_error:
             raise Kept(_rel(path, repo_dir), 1, "does not parse")
+        chain = (sibling.type_chain if sibling is not None else name).split(".")
         found = [
             n
             for n in _walk(file.root)
@@ -341,6 +376,7 @@ def _targets(wrapper: wi.Wrapper, repo_dir: str) -> list[Target]:
             and (cn := n.child_by_field_name("name")) is not None
             and _text(cn) == name
             and xcs._namespace_of(n) == namespace
+            and xcs._type_chain(n, strict=False) == chain
         ]
         if len(found) != 1:
             raise Kept(_rel(path, repo_dir), 1, f"{name} is declared {len(found)} times in its file")
@@ -352,7 +388,12 @@ def _targets(wrapper: wi.Wrapper, repo_dir: str) -> list[Target]:
             raise Kept(where, line, f"{name} is not a plain {expected.split('_')[0]}")
         from flag_cleanup import wrapper_csharp
 
-        if not wrapper_csharp._top_level(node):
+        if not wrapper_csharp._top_level(node) and not (
+            sibling is not None
+            and sibling.test
+            and sibling.chain is not None
+            and not _modifiers(node) & {"public", "internal", "protected", "file"}
+        ):
             raise Kept(where, line, f"{name} is nested in another type")
         if _modifiers(node) & {"partial", "static", "abstract"}:
             raise Kept(where, line, f"{name} is partial, static or abstract")
@@ -363,13 +404,15 @@ def _targets(wrapper: wi.Wrapper, repo_dir: str) -> list[Target]:
             raise Kept(where, line, f"{name} extends another interface")
         if kind != "interface" and (interface is None or bases != [interface]):
             raise Kept(where, line, f"{name}'s base list holds more than the family interface")
-        reason = _member_less(node, kind)
+        knob = sibling.knob if sibling is not None and sibling.test and not sibling.knob_primary else None
+        reason = _member_less(node, kind, knob)
         if reason is not None:
             raise Kept(where, line, f"{name}: {reason}")
         if wrapper_csharp.published(path, repo_dir):
             raise Kept(where, line, f"{name}'s project may be packed and used outside the repository")
         start, end = ctor_param_csharp.declaration_span(node, file.data[file.offset :])
-        targets.append(Target(name, namespace, path, start + file.offset, end + file.offset, line, kind))
+        nested = ".".join(chain) if len(chain) > 1 else None
+        targets.append(Target(name, namespace, path, start + file.offset, end + file.offset, line, kind, nested))
     return targets
 
 
@@ -430,6 +473,332 @@ def _whole_files(targets: list[Target], repo_dir: str) -> tuple[set[str], dict[s
     return whole, partial
 
 
+# --- a middleware the run left passing every request on (K8) -----------------
+
+_INVOKE_NAMES = frozenset({"Invoke", "InvokeAsync"})
+
+
+def _gate_calls(method: Node, gates: set[str], member: str) -> list[Node] | None:
+    """Every ``gate.<member>(…)`` call in ``method``, ``gate`` one of its
+    ``gates`` parameters; ``None`` when a gate parameter is read any other
+    way."""
+    calls: list[Node] = []
+    for node in _walk(method):
+        if node.type != "identifier" or _text(node) not in gates:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "parameter":
+            continue
+        call = parent.parent if parent is not None else None
+        if (
+            parent is None
+            or parent.type != "member_access_expression"
+            or parent.child_by_field_name("expression") != node
+            or (name := parent.child_by_field_name("name")) is None
+            or _text(name) != member
+            or call is None
+            or call.type != "invocation_expression"
+            or call.child_by_field_name("function") != parent
+        ):
+            return None
+        calls.append(call)
+    return calls
+
+
+def _invoke_method(declaration: Node) -> tuple[Node, Node, list[Node]] | None:
+    """``(method, body, its statements)`` of the one ``Invoke``/``InvokeAsync``
+    a conventional middleware class declares."""
+    body = declaration.child_by_field_name("body")
+    methods = [m for m in (body.named_children if body is not None else []) if m.type == "method_declaration"]
+    if len(methods) != 1:
+        return None
+    method = methods[0]
+    name = method.child_by_field_name("name")
+    block = method.child_by_field_name("body")
+    if name is None or _text(name) not in _INVOKE_NAMES or block is None or block.type != "block":
+        return None
+    return method, block, [c for c in block.named_children if c.type != "comment"]
+
+
+def _scaffolding(
+    statement: Node, read: Callable[[str], bool], calls_ok: Callable[[Node], bool]
+) -> list[Node] | None:
+    """The local declarations of ``statement`` when it is dead scaffolding:
+    a local declaration whose names nothing ``read``s and whose values only
+    compute, or an ``if`` with no ``else`` whose condition only computes
+    and whose body is all such statements, at least one. Every call in it
+    must pass ``calls_ok``. ``None`` otherwise."""
+    from flag_cleanup import wrapper_csharp
+
+    if not calls_ok(statement):
+        return None
+    if statement.type == "local_declaration_statement":
+        if any(not c.is_named and _text(c) in ("using", "await") for c in statement.children):
+            return None
+        declarators = _declarators(statement)
+        if not declarators or any(
+            (n := ctor_param_csharp._declarator_name(d)) is None or read(n) for d in declarators
+        ):
+            return None
+        if not wrapper_csharp._computes_only(statement, out_locals=True):
+            return None
+        return [statement]
+    if statement.type == "if_statement":
+        condition = statement.child_by_field_name("condition")
+        consequence = statement.child_by_field_name("consequence")
+        if statement.child_by_field_name("alternative") is not None or condition is None or consequence is None:
+            return None
+        if not wrapper_csharp._computes_only(condition, out_locals=True):
+            return None
+        inner = [c for c in consequence.named_children if c.type != "comment"] if consequence.type == "block" else [consequence]
+        found: list[Node] = []
+        for part in inner:
+            more = _scaffolding(part, read, calls_ok)
+            if more is None:
+                return None
+            found += more
+        return found or None
+    return None
+
+
+def _middleware(
+    path: str, declaration: Node, names: frozenset[str], member: str, original: str | None, repo_dir: str
+) -> str | None:
+    """Why the class ``declaration`` is not a middleware this run left doing
+    nothing, or ``None`` when it is one. It is when it is a plain top-level
+    class whose fields are private, whose one constructor only stores its
+    arguments (``RequestDelegate next`` among them), and whose one
+    ``Invoke``/``InvokeAsync(HttpContext context, <family types>…)`` now
+    ends ``await _next(context);`` after nothing but dead scaffolding
+    (:func:`_scaffolding`) -- AND, in the file as it was before this run,
+    every family parameter was only ever the receiver of a call of the
+    deleted member, every local of that scaffolding was read only inside
+    those calls' arguments, and every remaining ``if`` held such a call.
+    The scaffolding computed the gate's targeting values and its scope, and
+    goes with the gate, as the fold drops a flag read's arguments; what its
+    calls compute is not otherwise used."""
+    from flag_cleanup import wrapper_csharp
+
+    if declaration.type != "class_declaration" or not wrapper_csharp._top_level(declaration):
+        return "it is not a top-level class"
+    if _modifiers(declaration) & {"partial", "static", "abstract"} or any(
+        c.type in ("type_parameter_list", "attribute_list", "base_list") for c in declaration.children
+    ):
+        return "it is partial, static, abstract, generic, attributed or derived"
+    if wrapper_csharp.published(path, repo_dir):
+        return "its project may be packed and used outside the repository"
+    body = declaration.child_by_field_name("body")
+    members = [m for m in (body.named_children if body is not None else []) if m.type != "comment"]
+    fields: set[str] = set()
+    declared = [m for m in members if m.type == "field_declaration"]
+    for field in declared:
+        if _modifiers(field) & {"public", "protected", "internal"} or any(c.type == "attribute_list" for c in field.children):
+            return "it declares a field that is not private, or carries an attribute"
+        for declarator in _declarators(field):
+            value = _initial_value(declarator)
+            if value is not None and not ctor_param_csharp._inert(value):
+                return "a field is initialised by code that may run"
+            if (n := ctor_param_csharp._declarator_name(declarator)) is not None:
+                fields.add(n)
+    constructors = [m for m in members if m.type == "constructor_declaration"]
+    invoke = _invoke_method(declaration)
+    if len(constructors) != 1 or invoke is None or len(members) != len(declared) + 2:
+        return "it declares more than fields, one constructor and one Invoke method"
+    constructor = constructors[0]
+    if _modifiers(constructor) & {"static"} or not _inert_constructor(constructor, fields):
+        return "its constructor does more than store its arguments"
+    method, block, statements = invoke
+    if _modifiers(method) & {"static", "virtual", "override", "abstract", "extern", "partial"} or "public" not in _modifiers(method):
+        return "its Invoke method is not a plain public instance method"
+    returns = method.child_by_field_name("returns")
+    parameters = [p for p in method.child_by_field_name("parameters").named_children if p.type == "parameter"]
+    if returns is None or _text(returns) != "Task" or not parameters:
+        return "its Invoke method does not take an HttpContext and return a Task"
+    first = parameters[0]
+    if ctor_param_csharp._simple_type(first.child_by_field_name("type")) != "HttpContext":
+        return "its Invoke method does not take an HttpContext first"
+    gates = [p for p in parameters[1:]]
+    if not gates or any(ctor_param_csharp._simple_type(p.child_by_field_name("type")) not in names for p in gates):
+        return "its Invoke method takes more than the HttpContext and family types"
+    context = _text(first.child_by_field_name("name"))
+    gate_names = {_text(p.child_by_field_name("name")) for p in gates}
+    # The next delegate: a field stored from a `RequestDelegate` parameter.
+    params = constructor.child_by_field_name("parameters")
+    delegates = {
+        _text(p.child_by_field_name("name"))
+        for p in (params.named_children if params is not None else [])
+        if p.type == "parameter" and ctor_param_csharp._simple_type(p.child_by_field_name("type")) == "RequestDelegate"
+    }
+    stored = set()
+    for node in _walk(constructor):
+        if node.type == "assignment_expression":
+            left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+            if left is not None and left.type == "member_access_expression":
+                left = left.child_by_field_name("name")
+            if left is not None and right is not None and _text(right) in delegates:
+                stored.add(_text(left))
+    last = statements[-1] if statements else None
+    awaited = last.named_children[0] if last is not None and last.type == "expression_statement" and len(last.named_children) == 1 else None
+    call = awaited.named_children[0] if awaited is not None and awaited.type == "await_expression" and awaited.named_children else None
+    function = call.child_by_field_name("function") if call is not None and call.type == "invocation_expression" else None
+    if function is not None and function.type == "member_access_expression":
+        receiver = function.child_by_field_name("expression")
+        function = function.child_by_field_name("name") if receiver is not None and receiver.type in ("this", "this_expression") else None
+    arguments = call.child_by_field_name("arguments") if function is not None else None
+    if (
+        function is None
+        or _text(function) not in stored
+        or arguments is None
+        or [_text(a) for a in ctor_param_csharp._items(arguments)] != [context]
+    ):
+        return "its Invoke method does not end by awaiting the next delegate with the context"
+    if any(n.type == "identifier" and _text(n) in gate_names and n.parent is not None and n.parent.type != "parameter" for n in _walk(block)):
+        return "its Invoke method still reads a family parameter"
+    words = [n for n in _walk(block) if n.type == "identifier"]
+
+    def read(name: str) -> bool:
+        return sum(1 for n in words if _text(n) == name) > 1
+
+    # Every call the scaffolding makes is a library method's (no method of
+    # that name in the repository), on the request's context or a library
+    # type: what it computes is about the request, and nothing else here
+    # keeps state.
+    fields_and_locals = fields | {
+        ctor_param_csharp._declarator_name(d) for d in _walk(block) if d.type == "variable_declarator"
+    } | {
+        _text(n) for n in _walk(block)
+        if n.type == "identifier" and n.parent is not None
+        and (n.parent.type.endswith("_designation") or n.parent.type == "declaration_expression")
+    }
+    index = xcs.csharp_index(repo_dir)
+
+    def calls_ok(node: Node) -> bool:
+        # Called on a value, a method of that name of yours could only be
+        # an extension method; called through a library type's name, it is
+        # that type's.
+        invoked: set[str] = set()
+        for call in (n for n in _walk(node) if n.type == "invocation_expression"):
+            function = call.child_by_field_name("function")
+            if function is None or function.type != "member_access_expression":
+                return False
+            name = function.child_by_field_name("name")
+            if name is not None and name.type == "generic_name":
+                name = name.named_children[0]
+            if name is None:
+                return False
+            root = function.child_by_field_name("expression")
+            while root is not None and root.type in (
+                "member_access_expression", "invocation_expression", "element_access_expression",
+                "parenthesized_expression", "conditional_access_expression",
+            ):
+                root = root.child_by_field_name("function") if root.type == "invocation_expression" else (
+                    root.child_by_field_name("expression") or (root.named_children[0] if root.named_children else None)
+                )
+            if root is None or root.type not in ("identifier", "predefined_type"):
+                return False
+            word = _text(root)
+            if root.type == "identifier" and word != context and (word in fields_and_locals or index.by_last.get(word)):
+                return False
+            if root.type == "identifier" and word == context:
+                invoked.add(_text(name))
+        return not invoked or _repository_methods(
+            repo_dir, frozenset(invoked), vendored=("Microsoft.", "System."), extensions_only=True
+        ) is None
+
+    scaffolding: list[Node] = []
+    ifs: list[str] = []
+    for statement in statements[:-1]:
+        found = _scaffolding(statement, read, calls_ok)
+        if found is None:
+            return f"its Invoke method does more than pass the request on ({' '.join(_text(statement).split())[:60]})"
+        scaffolding += found
+        ifs += [" ".join(_text(n.child_by_field_name("condition")).split()) for n in _walk(statement) if n.type == "if_statement"]
+    # The evidence: before this run, that scaffolding fed the gate's check.
+    if original is None:
+        return "this run did not fold a call in it"
+    root = _parse(original.lstrip("\ufeff"), "csharp")
+    before = next(
+        (
+            n for n in _walk(root)
+            if n.type == "class_declaration"
+            and _text(n.child_by_field_name("name")) == _text(declaration.child_by_field_name("name"))
+            and xcs._namespace_of(n) == xcs._namespace_of(declaration)
+        ),
+        None,
+    )
+    old = _invoke_method(before) if before is not None else None
+    if old is None:
+        return "it cannot be found in the file as it was"
+    calls = _gate_calls(old[0], gate_names, member)
+    if not calls:
+        return f"before this run, it did not only call {member} on its family parameters"
+    inside = [c.child_by_field_name("arguments") for c in calls]
+    for declaration_statement in scaffolding:
+        for declarator in _declarators(declaration_statement):
+            name = ctor_param_csharp._declarator_name(declarator)
+            reads = [
+                n for n in _walk(old[1])
+                if n.type == "identifier" and _text(n) == name
+                and not (n.parent is not None and n.parent.type == "variable_declarator" and n.parent.child_by_field_name("name") == n)
+            ]
+            if not reads or any(not any(_within(r, a) for a in inside if a is not None) for r in reads):
+                return f"before this run, {name} was read outside the gate's call"
+    old_ifs = [
+        n for n in _walk(old[1])
+        if n.type == "if_statement" and any(_within(c, n) for c in calls)
+    ]
+    held = [" ".join(_text(n.child_by_field_name("condition")).split()) for n in old_ifs]
+    if any(condition not in held for condition in ifs):
+        return "before this run, an if it keeps did not hold the gate's call"
+    return None
+
+
+def _middlewares(
+    wrapper: wi.Wrapper, names: frozenset[str], repo_dir: str, originals: dict[str, str]
+) -> list[Target]:
+    """Each conventional middleware class that took a family type in its
+    ``Invoke`` method and that this run left passing every request on
+    (:func:`_middleware`), as a target: the class, its registrations and its
+    tests go with the family. One that is not stays, and so does the family
+    while it names a family type."""
+    word = _word(names)
+    found: list[Target] = []
+    for path in _text_files(repo_dir):
+        if path.suffix.lower() != ".cs":
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if word.search(data) is None or b"HttpContext" not in data or b"Invoke" not in data:
+            continue
+        resolved = str(path.resolve())
+        try:
+            file = _read(resolved)
+        except (OSError, UnicodeDecodeError):
+            continue
+        for declaration in (n for n in _walk(file.root) if n.type == "class_declaration"):
+            invoke = _invoke_method(declaration)
+            if invoke is None:
+                continue
+            parameters = invoke[0].child_by_field_name("parameters")
+            if not any(
+                p.type == "parameter" and ctor_param_csharp._simple_type(p.child_by_field_name("type")) in names
+                for p in (parameters.named_children if parameters is not None else [])
+            ):
+                continue
+            name = _text(declaration.child_by_field_name("name"))
+            reason = _middleware(resolved, declaration, names, wrapper.name, originals.get(resolved), repo_dir)
+            if reason is not None:
+                raise Kept(_rel(resolved, repo_dir), declaration.start_point[0] + 1, f"middleware {name}: {reason}")
+            start, end = ctor_param_csharp.declaration_span(declaration, file.data[file.offset :])
+            found.append(
+                Target(name, xcs._namespace_of(declaration), resolved, start + file.offset, end + file.offset,
+                       declaration.start_point[0] + 1, "middleware")
+            )
+    return found
+
+
 # --- every spelling in the checkout -------------------------------------------
 
 
@@ -472,11 +841,27 @@ def _binary(data: bytes) -> bool:
     return b"\0" in data[:8192]
 
 
+#: Source files of languages that no .NET build or host reads: outside a
+#: .NET project's directory, one spelling a family name is another tool's
+#: code (a test fixture, a generator's template text), not configuration.
+_FOREIGN_CODE = frozenset(
+    {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".java", ".kt", ".kts", ".rb", ".php",
+     ".swift", ".dart", ".rs"}
+)
+
+
+def _dotnet_directories(repo_dir: str) -> frozenset[Path]:
+    """Every directory of the checkout holding a C# project file."""
+    return xcs._project_dirs(source_index.checkout_root(repo_dir))
+
+
 def _scan(names: frozenset[str], repo_dir: str, residue: Residue) -> list[str]:
     """The C# files spelling any of ``names``. Every other file that does
-    is prose (reported) or keeps the family."""
+    is prose (reported) or keeps the family. Prose is Markdown, and the
+    source of another language outside every .NET project's directory."""
     word = _word(names)
     cs: list[str] = []
+    projects: frozenset[Path] | None = None
     for path in _text_files(repo_dir):
         try:
             data = path.read_bytes()
@@ -494,6 +879,12 @@ def _scan(names: frozenset[str], repo_dir: str, residue: Residue) -> list[str]:
                 residue.prose.append((spelled, line, _line_text(data, match.start())))
         elif path.name.lower().endswith(_GUESTS):
             raise Kept(_rel(spelled, repo_dir), _line(data, word.search(data).start()), "a .NET guest file names it")
+        elif suffix in _FOREIGN_CODE and not any(
+            parent in (projects := projects if projects is not None else _dotnet_directories(repo_dir))
+            for parent in Path(spelled).parents
+        ):
+            for match in word.finditer(data):
+                residue.prose.append((spelled, _line(data, match.start()), _line_text(data, match.start())))
         else:
             match = word.search(data)
             raise Kept(
@@ -587,16 +978,127 @@ def _within(node: Node, ancestor: Node | None) -> bool:
     return ancestor is not None and ancestor.start_byte <= node.start_byte and node.end_byte <= ancestor.end_byte
 
 
-def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str] | str | None:
+def _family_instance(value: Node | None, names: frozenset[str]) -> str | None:
+    """What a registration's instance argument is: ``"new"`` for ``new F()``
+    of a family type with no argument and no initializer (building it runs
+    no code but the fake's own, which goes), the field's name for a bare
+    ``X`` or ``this.X`` (deleted only with that field, see
+    :func:`_fake_fields`), else ``None``."""
+    if value is None:
+        return None
+    if value.type == "object_creation_expression":
+        arguments = value.child_by_field_name("arguments")
+        if (
+            ctor_param_csharp._simple_type(value.child_by_field_name("type")) in names
+            and value.child_by_field_name("initializer") is None
+            and (arguments is None or not ctor_param_csharp._items(arguments))
+        ):
+            return "new"
+        return None
+    if value.type == "member_access_expression":
+        receiver = value.child_by_field_name("expression")
+        if receiver is None or receiver.type not in ("this", "this_expression"):
+            return None
+        value = value.child_by_field_name("name")
+    return _text(value) if value is not None and value.type == "identifier" else None
+
+
+#: ``services.RemoveAll<T>()``, ``services.AddSingleton(instance)`` and the
+#: like, as a registration helper's body may spell them.
+_HELPER_CALLS = re.compile(r"(?:Try)?Add(?:Scoped|Singleton|Transient)|RemoveAll")
+
+
+def _registration_helper(invocation: Node) -> bool:
+    """Whether ``Helper<T>(services, instance)`` calls a private generic
+    method of the enclosing type whose body only registers: each statement
+    ``services.RemoveAll<T>()`` or ``services.AddX(instance)`` /
+    ``services.AddX<T>(instance)`` on its own two parameters. Calling it
+    with family types and a family instance registers nothing else."""
+    function = invocation.child_by_field_name("function")
+    if function is None or function.type != "generic_name":
+        return False
+    method_name = _text(function.named_children[0])
+    owner = _enclosing(invocation, ("class_declaration", "struct_declaration", "record_declaration"))
+    body = owner.child_by_field_name("body") if owner is not None else None
+    declared = [
+        m for m in (body.named_children if body is not None else [])
+        if (n := m.child_by_field_name("name")) is not None and _text(n) == method_name
+    ]
+    if owner is None or "partial" in _modifiers(owner) or len(declared) != 1:
+        return False
+    method = declared[0]
+    if method.type != "method_declaration" or _modifiers(method) & {"public", "internal", "protected", "virtual", "override", "abstract", "extern", "partial"}:
+        return False
+    if any(c.type == "attribute_list" for c in method.children):
+        return False
+    type_parameters = next((c for c in method.children if c.type == "type_parameter_list"), None)
+    parameters = method.child_by_field_name("parameters")
+    listed = [p for p in (parameters.named_children if parameters is not None else []) if p.type == "parameter"]
+    typed = [t for t in (type_parameters.named_children if type_parameters is not None else []) if t.type == "type_parameter"]
+    if len(typed) != 1 or len(listed) != 2:
+        return False
+    t_name = _text(typed[0]).strip()
+    services = listed[0].child_by_field_name("name")
+    instance = listed[1].child_by_field_name("name")
+    instance_type = listed[1].child_by_field_name("type")
+    if services is None or instance is None or instance_type is None or _text(instance_type) != t_name:
+        return False
+    block = method.child_by_field_name("body")
+    if block is None or block.type != "block":
+        return False
+    statements = [c for c in block.named_children if c.type != "comment"]
+    if not statements:
+        return False
+    for statement in statements:
+        call = statement.named_children[0] if statement.type == "expression_statement" and len(statement.named_children) == 1 else None
+        if call is None or call.type != "invocation_expression":
+            return False
+        receiver, name, generic = _call_name(call)
+        arguments = call.child_by_field_name("arguments")
+        items = ctor_param_csharp._items(arguments) if arguments is not None else []
+        if receiver is None or _text(receiver) != _text(services) or name is None or not _HELPER_CALLS.fullmatch(_text(name)):
+            return False
+        if generic is not None and [_text(t) for t in _type_arguments(generic)] != [t_name]:
+            return False
+        if _text(name) == "RemoveAll":
+            if generic is None or items:
+                return False
+        elif [_text(i) for i in items] != [_text(instance)]:
+            return False
+    return True
+
+
+def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str, str | None] | str | None:
     """The registration statement a spelling names a registered type in,
-    with its text, or why it is not one this pass may delete; ``None`` when
-    the spelling is not what a registration registers (it may still lie
-    inside something else this pass deletes)."""
+    with its text and the field it registers as the instance (which must go
+    too), or why it is not one this pass may delete; ``None`` when the
+    spelling is not what a registration registers (it may still lie inside
+    something else this pass deletes)."""
     statement = _statement_of(node)
     if statement is None or len(statement.named_children) != 1:
         return None
     invocation = statement.named_children[0]
     if invocation.type != "invocation_expression":
+        return None
+    function = invocation.child_by_field_name("function")
+    if function is not None and function.type == "generic_name":
+        # `Helper<I>(services, new Fake())`: a test host's own registration helper.
+        arguments = invocation.child_by_field_name("arguments")
+        values = [ctor_param_csharp._expression(a) for a in (ctor_param_csharp._items(arguments) if arguments is not None else [])]
+        text = " ".join(_text(statement).split())
+        if not _within(node, invocation):
+            return None
+        if (
+            all(ctor_param_csharp._simple_type(t) in names for t in _type_arguments(function))
+            and len(values) == 2
+            and values[0] is not None
+            and values[0].type == "identifier"
+            and (instance := _family_instance(values[1], names)) is not None
+            and statement.parent is not None
+            and statement.parent.type == "block"
+            and _registration_helper(invocation)
+        ):
+            return statement, text, None if instance == "new" else instance
         return None
     receiver, name, generic = _call_name(invocation)
     if name is None:
@@ -608,7 +1110,8 @@ def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str] | str |
     in_types = _within(node, generic)
     in_value = next((v for v in values if v is not None and _within(node, v)), None)
     replacing = method == "Replace" and generic is None
-    if not _REGISTRATIONS.fullmatch(method) and not replacing:
+    middleware = method == "UseMiddleware" and generic is not None and not items
+    if not _REGISTRATIONS.fullmatch(method) and not replacing and not middleware:
         return None
     if not in_types and in_value is None:
         return None
@@ -619,7 +1122,7 @@ def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str] | str |
     text = " ".join(_text(statement).split())
     if receiver is None or receiver.type != "identifier":
         return f"a registration this pass cannot read ({text[:60]})"
-    if statement.parent is None or statement.parent.type != "block":
+    if statement.parent is None or statement.parent.type not in ("block", "global_statement"):
         return f"a registration outside a block ({text[:60]})"
     if replacing:
         inner = values[0] if len(values) == 1 else None
@@ -636,7 +1139,7 @@ def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str] | str |
                 and inner_arguments is not None
                 and not ctor_param_csharp._items(inner_arguments)
             ):
-                return statement, text
+                return statement, text, None
         return f"a replacement this pass cannot read ({text[:60]})"
     if generic is not None:
         type_arguments = _type_arguments(generic)
@@ -646,16 +1149,19 @@ def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str] | str |
         rest = values[1:] if keyed else values
         if keyed and (not values or values[0] is None or not ctor_param_csharp._inert(values[0])):
             return f"a keyed registration whose key may do work ({text[:60]})"
+        instance = _family_instance(rest[0], names) if len(rest) == 1 and not keyed else None
+        if instance is not None:
+            return statement, text, None if instance == "new" else instance
         if len(rest) > 1 or (rest and (rest[0] is None or not _factory(rest[0], names))):
             return f"a registration with arguments this pass cannot read ({text[:60]})"
-        return statement, text
+        return statement, text, None
     if values and all(
         v is not None
         and v.type == "typeof_expression"
         and ctor_param_csharp._simple_type(next(iter(v.named_children), None)) in names
         for v in values
     ):
-        return statement, text
+        return statement, text, None
     return f"a registration this pass cannot read ({text[:60]})"
 
 
@@ -864,6 +1370,108 @@ def _spellings(file: _File, names: frozenset[str]) -> list[Node]:
     return [n for n in _walk(file.root) if n.type == "identifier" and _text(n) in names]
 
 
+def _fake_field(node: Node, names: frozenset[str]) -> tuple[Node, str] | None:
+    """``(field declaration, name)`` when the spelling ``node`` is the type
+    of a field declaring one variable, with no attribute, initialized by
+    nothing, ``new()`` or ``new F()`` (no argument, no initializer)."""
+    spelled = _type_position(node)
+    declaration = spelled.parent
+    if declaration is None or declaration.type != "variable_declaration" or declaration.child_by_field_name("type") != spelled:
+        return None
+    field = declaration.parent
+    if field is None or field.type != "field_declaration" or any(c.type == "attribute_list" for c in field.children):
+        return None
+    if _modifiers(field) & {"static", "const", "volatile"}:
+        return None
+    declarators = _declarators(declaration)
+    if len(declarators) != 1:
+        return None
+    name = ctor_param_csharp._declarator_name(declarators[0])
+    value = _initial_value(declarators[0])
+    if value is not None:
+        arguments = value.child_by_field_name("arguments") if value.type.endswith("object_creation_expression") else None
+        if value.type == "implicit_object_creation_expression":
+            if value.child_by_field_name("initializer") is not None or any(c.type == "initializer_expression" for c in value.children):
+                return None
+            if arguments is not None and ctor_param_csharp._items(arguments):
+                return None
+        elif _family_instance(value, names) != "new":
+            return None
+    return (field, name) if name is not None else None
+
+
+def _visible_in(field: Node) -> Node | None:
+    """The type declaration every use of ``field`` must lie in: its class
+    when it is private, else the type a private nested class of it is
+    nested in; ``None`` when code elsewhere may see it, or a type on the
+    way is ``partial`` (another part, in another file, may use it)."""
+    owner = _enclosing(field, _TYPE_DECLARATIONS)
+    if owner is None or "partial" in _modifiers(owner):
+        return None
+    if not _modifiers(field) & {"public", "internal", "protected"}:
+        return owner
+    from flag_cleanup import wrapper_csharp
+
+    if wrapper_csharp._top_level(owner) or _modifiers(owner) & {"public", "internal", "protected", "file"}:
+        return None
+    outer = _enclosing(owner, _TYPE_DECLARATIONS)
+    return outer if outer is not None and "partial" not in _modifiers(outer) else None
+
+
+def _fake_fields(
+    fields: list[tuple[str, Node, Node, str]], files: dict[str, _File], residue: Residue, repo_dir: str
+) -> dict[tuple[str, int], tuple[str, str]]:
+    """Delete each test project field holding a family type (see
+    :func:`_fake_field`) whose every use, where it can be seen
+    (:func:`_visible_in`), lies inside a span this pass deletes; a
+    ``<see cref="…"/>`` naming it becomes text. Returns ``(path, spelling
+    start) -> (path, field name)`` for each one deleted."""
+    from flag_cleanup import wrapper_csharp
+
+    gone: dict[tuple[str, int], tuple[str, str]] = {}
+    for path, node, field, name in fields:
+        file = files[path]
+        if wrapper_csharp._test_project(path, repo_dir) is not True:
+            continue
+        scope = _visible_in(field)
+        if scope is None:
+            continue
+        spans = [(s, e) for s, e, _ in residue.spans.get(path, [])]
+        declarator = _declarators(_child_of(field, "variable_declaration"))[0]
+        own = declarator.child_by_field_name("name")
+        uses = [n for n in _walk(scope) if n.type == "identifier" and _text(n) == name and n != own]
+        if any(not _inside(spans, n.start_byte + file.offset) for n in uses):
+            continue
+        rewrites: list[tuple[bytes, bytes]] = []
+        owner = _enclosing(field, _TYPE_DECLARATIONS)
+        owner_name = _text(owner.child_by_field_name("name")) if owner is not None else ""
+        targets = {name.encode(), f"{owner_name}.{name}".encode()}
+        clean = True
+        for comment in (n for n in _walk(scope) if n.type == "comment"):
+            for match in _CREF.finditer(comment.text):
+                if match.group(1) not in targets:
+                    continue
+                tag = next((m for m in _SEE.finditer(comment.text) if m.start() <= match.start() and match.end() <= m.end()), None)
+                if tag is None:
+                    clean = False
+                    break
+                rewrites.append((tag.group(0), b"<c>" + match.group(1) + b"</c>"))
+        if not clean:
+            continue
+        start, end = ctor_param_csharp.declaration_span(field, file.data[file.offset :])
+        residue.spans.setdefault(path, []).append((start + file.offset, end + file.offset, "member"))
+        residue.rows.append((path, field.start_point[0] + 1, f"field {owner_name}.{name}"))
+        for rewrite in dict.fromkeys(rewrites):
+            residue.rewrites.setdefault(path, []).append(rewrite)
+            residue.prose.append((path, field.start_point[0] + 1, f"{rewrite[0].decode()} is now {rewrite[1].decode()}"))
+        gone[(path, node.start_byte)] = (path, name)
+    return gone
+
+
+def _child_of(node: Node, kind: str) -> Node | None:
+    return next((c for c in node.named_children if c.type == kind), None)
+
+
 def _constructor_parameter(node: Node) -> tuple[Node, Node] | None:
     """``(class, parameter)`` when ``node`` is the type of an explicit
     constructor's parameter."""
@@ -883,10 +1491,15 @@ def _constructor_parameter(node: Node) -> tuple[Node, Node] | None:
     return declaration, parameter
 
 
-def prove(wrapper: wi.Wrapper, repo_dir: str) -> Residue:
+def prove(
+    wrapper: wi.Wrapper, repo_dir: str, originals: dict[str, str] | None = None, flag_key: str | None = None
+) -> Residue:
     """The residue of ``wrapper``'s family and everything that must go with
-    it, or :class:`Kept` naming the first thing that keeps it."""
+    it, or :class:`Kept` naming the first thing that keeps it. ``originals``
+    maps each file this run rewrote (resolved) to its text before the run;
+    ``flag_key`` is the flag being removed."""
     targets = _targets(wrapper, repo_dir)
+    targets += _middlewares(wrapper, frozenset(t.name for t in targets), repo_dir, originals or {})
     residue = Residue(wrapper.label, targets)
     names = frozenset(t.name for t in targets)
     fulls = frozenset(t.full for t in targets if t.namespace)
@@ -900,7 +1513,10 @@ def prove(wrapper: wi.Wrapper, repo_dir: str) -> Residue:
         for target in held:
             residue.spans.setdefault(path, []).append((target.start, target.end, "type"))
     for target in targets:
-        what = {"interface": "interface", "wrapper": "wrapper class", "sibling": "sibling class"}[target.kind]
+        what = {
+            "interface": "interface", "wrapper": "wrapper class", "sibling": "sibling class",
+            "middleware": "middleware class",
+        }[target.kind]
         residue.rows.append((target.path, target.line, f"{what} {target.name}"))
     for path in sorted(whole):
         residue.rows.append((path, 1, "file deleted: nothing else was declared in it"))
@@ -918,6 +1534,10 @@ def prove(wrapper: wi.Wrapper, repo_dir: str) -> Residue:
     mentions: list[_Mention] = []
     candidates: dict[tuple[str, str, str], Node] = {}
     statements: dict[tuple[str, int], tuple[Node, str]] = {}
+    #: ``(path, field name, statement)`` for each registration whose instance
+    #: is a field: it goes only with that field.
+    instances: list[tuple[str, str, Node]] = []
+    fields: list[tuple[str, Node, Node, str]] = []
     for path in cs_files:
         if path in whole:
             continue
@@ -936,8 +1556,14 @@ def prove(wrapper: wi.Wrapper, repo_dir: str) -> Residue:
             if isinstance(registration, str):
                 raise Kept(_rel(path, repo_dir), node.start_point[0] + 1, registration)
             if registration is not None:
-                statement, text = registration
+                statement, text, instance = registration
                 statements[(path, statement.start_byte)] = (statement, text)
+                if instance is not None:
+                    instances.append((path, instance, statement))
+                continue
+            held = _fake_field(node, names)
+            if held is not None:
+                fields.append((path, node, *held))
                 continue
             owner = _constructor_parameter(node)
             if owner is not None:
@@ -951,6 +1577,7 @@ def prove(wrapper: wi.Wrapper, repo_dir: str) -> Residue:
     for (path, _), (statement, text) in sorted(statements.items(), key=lambda kv: kv[0]):
         file = files[path]
         start, end = ctor_param_csharp.declaration_span(statement, file.data[file.offset :])
+        start = _owned_comments(statement, file.data[file.offset :], start, _word(names | ({flag_key} if flag_key else set())))
         residue.spans.setdefault(path, []).append((start + file.offset, end + file.offset, "statement"))
         residue.rows.append((path, statement.start_point[0] + 1, f"registration {text}"))
 
@@ -996,9 +1623,28 @@ def prove(wrapper: wi.Wrapper, repo_dir: str) -> Residue:
                     f"{removal.label} is passed to a base constructor whose parameter stays",
                 )
 
+    # A test host's field holding a fake, registered as the instance: it
+    # goes when every use of it is something this pass deletes.
+    gone = _fake_fields(fields, files, residue, repo_dir)
+    pending += [(path, node) for path, node, _, _ in fields if (path, node.start_byte) not in gone]
+    for path, field_name, statement in instances:
+        if not any(p == path and n == field_name for p, n in gone.values()):
+            raise Kept(
+                _rel(path, repo_dir), statement.start_point[0] + 1,
+                f"a registration of {field_name}, a field this pass keeps",
+            )
+
+    # The test classes of a deleted middleware go with it; what they spell
+    # needs nothing else.
+    middleware = frozenset(t.name for t in targets if t.kind == "middleware")
+    if middleware:
+        pending = _middleware_tests(pending, files, residue, middleware, repo_dir)
+
     # K5: the tests' doubles of the family and the tests that only build a
     # member of it, then any test class they leave empty.
     _test_doubles(pending, files, residue, names, fulls, repo_dir)
+    # A test class the test-double pass already emptied goes the same way.
+    _emptied_test_classes(residue, originals or {}, repo_dir)
 
     # The core rule: every spelling not yet accounted for lies inside a span
     # this pass deletes; a comment or a string inside one goes with it.
@@ -1352,6 +1998,7 @@ def remove(
     repo_dir: str,
     rewrite: Callable,
     engine: Callable[[list[str], str], object],
+    flag_key: str | None = None,
 ) -> tuple[list, list[wi.Finding]]:
     """Remove the residue of every complete C# wrapper with an interface in
     ``plan``, by ``statuses`` (close-out's rows). Returns the summaries and
@@ -1362,7 +2009,8 @@ def remove(
         if wrapper.language != "csharp" or wrapper.interface is None or wrapper.label not in complete:
             continue
         try:
-            residue = prove(wrapper, repo_dir)
+            originals = {str(Path(s.path).resolve()): s.original_content for s in summaries}
+            residue = prove(wrapper, repo_dir, originals, flag_key)
             summaries = apply(residue, summaries, repo_dir, rewrite, engine)
         except Kept as kept:
             logger.info("keeping the residue of %s: %s", wrapper.label, kept)
@@ -1755,17 +2403,206 @@ def _test_doubles(
                 residue.rows.append((path, 1, "file deleted: nothing else was declared in it"))
 
 
+def _middleware_tests(
+    pending: list[tuple[str, Node]],
+    files: dict[str, _File],
+    residue: Residue,
+    middleware: frozenset[str],
+    repo_dir: str,
+) -> list[tuple[str, Node]]:
+    """Delete each test class that tests a deleted middleware: a plain
+    top-level class of a test project, named nowhere else, at least one of
+    whose methods is a test and every test of which spells the middleware
+    or calls a method of the class declared to return one. Its file goes when nothing
+    else is declared in it. Returns the spellings still to account for."""
+    from flag_cleanup import wrapper_csharp
+
+    classes: dict[tuple[str, int], Node] = {}
+    for path, node in pending:
+        if _text(node) not in middleware or wrapper_csharp._test_project(path, repo_dir) is not True:
+            continue
+        owner = node
+        while owner is not None and not (owner.type == "class_declaration" and wrapper_csharp._top_level(owner)):
+            owner = owner.parent
+        if owner is not None:
+            classes[(path, owner.start_byte)] = owner
+    deleted: dict[str, list[tuple[int, int]]] = {}
+    for (path, _), declaration in sorted(classes.items(), key=lambda kv: kv[0]):
+        file = files[path]
+        if "partial" in _modifiers(declaration) or any(
+            c.type in ("base_list", "attribute_list", "type_parameter_list") for c in declaration.children
+        ):
+            continue
+        body = declaration.child_by_field_name("body")
+        methods = {
+            _text(m.child_by_field_name("name")): m
+            for m in (body.named_children if body is not None else [])
+            if m.type == "method_declaration"
+        }
+        # A helper builds the middleware when it is declared to return one.
+        spelling = {
+            name for name, m in methods.items()
+            if ctor_param_csharp._simple_type(m.child_by_field_name("returns")) in middleware
+        }
+        tests = [m for m in methods.values() if set(wrapper_csharp._attributes(m)) & {"Fact", "Theory"}]
+
+        def exercises(method: Node) -> bool:
+            if any(n.type == "identifier" and _text(n) in middleware for n in _walk(method)):
+                return True
+            return any(
+                n.type == "invocation_expression"
+                and (f := n.child_by_field_name("function")) is not None
+                and f.type == "identifier"
+                and _text(f) in spelling
+                for n in _walk(method)
+            )
+
+        if not tests or not all(exercises(t) for t in tests):
+            continue
+        start, end = ctor_param_csharp.declaration_span(declaration, file.data[file.offset :])
+        span = (start + file.offset, end + file.offset)
+        if _named_elsewhere(_text(declaration.child_by_field_name("name")), path, span, repo_dir):
+            continue
+        deleted.setdefault(path, []).append(span)
+        # A family type nested in it goes with it.
+        residue.spans[path] = [x for x in residue.spans.get(path, []) if not (span[0] <= x[0] and x[1] <= span[1])]
+        ignored = {f.resolved for f in source_index.files(repo_dir, (".cs",), with_ignored=True) if f.ignored}
+        if (
+            _reduces_to_nothing(file, deleted[path])
+            and path not in ignored
+            and Path(repo_dir).resolve() in Path(path).parents
+        ):
+            residue.delete.add(path)
+            residue.spans.pop(path, None)
+            residue.rows.append((path, 1, "file deleted: nothing else was declared in it"))
+        else:
+            residue.spans.setdefault(path, []).append((*span, "type"))
+        residue.rows.append(
+            (path, declaration.start_point[0] + 1, f"test class {_text(declaration.child_by_field_name('name'))} of a deleted middleware")
+        )
+    return [
+        (path, node)
+        for path, node in pending
+        if path not in residue.delete and not _inside(deleted.get(path, []), node.start_byte + files[path].offset)
+    ]
+
+
+def _owned_comments(statement: Node, data: bytes, start: int, about: re.Pattern[bytes]) -> int:
+    """``start`` moved up over a ``//`` comment block that belongs to
+    ``statement`` alone and is ``about`` what the run removes (it names the
+    flag or a deleted type): directly above it, with a blank line (or the
+    block's ``{``) above the comment and a blank line (or the block's ``}``)
+    below the statement. Any other comment is left: it may head a group."""
+    node = statement.parent if statement.parent is not None and statement.parent.type == "global_statement" else statement
+    comments: list[Node] = []
+    previous = node.prev_sibling
+    at = node.start_byte
+    while previous is not None and previous.type == "comment" and data[previous.end_byte : at].count(b"\n") == 1 and not data[previous.end_byte : at].strip():
+        if not previous.text.lstrip().startswith(b"//") or previous.text.lstrip().startswith(b"///"):
+            return start
+        comments.append(previous)
+        at = previous.start_byte
+        previous = previous.prev_sibling
+    if not comments or not any(about.search(c.text) for c in comments):
+        return start
+    above = data[: comments[-1].start_byte]
+    line_start = above.rfind(b"\n")
+    before = above[: line_start] if line_start != -1 else b""
+    previous_line = before[before.rfind(b"\n") + 1 :] if before else b""
+    if previous_line.strip() and not previous_line.strip().endswith(b"{"):
+        return start
+    after = data[node.end_byte :]
+    rest_of_line, _, following = after.partition(b"\n")
+    next_line = following.split(b"\n", 1)[0]
+    if rest_of_line.strip() or (next_line.strip() and not next_line.strip().startswith(b"}")):
+        return start
+    return min(start, comments[-1].start_byte)
+
+
+def _emptied_test_classes(residue: Residue, originals: dict[str, str], repo_dir: str) -> None:
+    """Delete each top-level class of a test project that this run left
+    with no member (its tests went with a stub or a sibling), as K5 does
+    for one it empties itself: not partial, no base, no attribute, named
+    nowhere else. Its file goes when nothing else is declared in it."""
+    from flag_cleanup import wrapper_csharp
+
+    ignored: set[str] | None = None
+    for path, original in sorted(originals.items()):
+        if not path.endswith(".cs") or path in residue.delete or not Path(path).is_file():
+            continue
+        if wrapper_csharp._test_project(path, repo_dir) is not True:
+            continue
+        try:
+            file = _read(path)
+        except (OSError, UnicodeDecodeError):
+            continue
+        before = _parse(original.lstrip("\ufeff"), "csharp")
+        spans = [(s, e) for s, e, _ in residue.spans.get(path, [])]
+        emptied: list[Node] = []
+        for declaration in (n for n in _walk(file.root) if n.type == "class_declaration"):
+            from flag_cleanup import wrapper_csharp as wc
+
+            body = declaration.child_by_field_name("body")
+            name = _text(declaration.child_by_field_name("name"))
+            if not wc._top_level(declaration) or _inside(spans, declaration.start_byte + file.offset):
+                continue
+            if any(m.type != "comment" for m in (body.named_children if body is not None else [])):
+                continue
+            if "partial" in _modifiers(declaration) or any(
+                c.type in ("base_list", "attribute_list", "type_parameter_list") for c in declaration.children
+            ):
+                continue
+            had = next(
+                (
+                    n for n in _walk(before)
+                    if n.type == "class_declaration" and _text(n.child_by_field_name("name")) == name
+                    and xcs._namespace_of(n) == xcs._namespace_of(declaration)
+                ),
+                None,
+            )
+            old_body = had.child_by_field_name("body") if had is not None else None
+            if old_body is None or not any(m.type != "comment" for m in old_body.named_children):
+                continue
+            own = ctor_param_csharp.declaration_span(declaration, file.data[file.offset :])
+            if _named_elsewhere(name, path, (own[0] + file.offset, own[1] + file.offset), repo_dir):
+                continue
+            emptied.append(declaration)
+        if not emptied:
+            continue
+        for declaration in emptied:
+            residue.rows.append((path, declaration.start_point[0] + 1, f"empty test class {_text(declaration.child_by_field_name('name'))}"))
+        cut = [
+            (s + file.offset, e + file.offset)
+            for s, e in (ctor_param_csharp.declaration_span(d, file.data[file.offset :]) for d in emptied)
+        ]
+        if ignored is None:
+            ignored = {f.resolved for f in source_index.files(repo_dir, (".cs",), with_ignored=True) if f.ignored}
+        if _reduces_to_nothing(file, spans + cut) and path not in ignored and Path(repo_dir).resolve() in Path(path).parents:
+            residue.delete.add(path)
+            residue.spans.pop(path, None)
+            residue.rows.append((path, 1, "file deleted: nothing else was declared in it"))
+        else:
+            residue.spans.setdefault(path, []).extend((s, e, "type") for s, e in cut)
+
+
 def _named_elsewhere(name: str, path: str, span: tuple[int, int], repo_dir: str) -> bool:
     """Whether any file spells ``name`` outside ``span`` of ``path``: a
-    fixture in ``IClassFixture<T>``, a ``typeof``, a doc reference."""
+    fixture in ``IClassFixture<T>``, a ``typeof``, a doc reference. Prose
+    does not count, as in :func:`_scan`: Markdown, and another language's
+    source outside every .NET project's directory."""
     word = _word(frozenset({name}))
+    projects: frozenset[Path] | None = None
     for file in _text_files(repo_dir):
         try:
             data = file.read_bytes()
         except OSError:
             return True
-        if _binary(data):
+        if _binary(data) or file.suffix.lower() in _PROSE_SUFFIXES:
             continue
+        if file.suffix.lower() in _FOREIGN_CODE and word.search(data) is not None:
+            projects = projects if projects is not None else _dotnet_directories(repo_dir)
+            if not any(parent in projects for parent in file.resolve().parents):
+                continue
         for match in word.finditer(data):
             if str(file.resolve()) != path or not (span[0] <= match.start() < span[1]):
                 return True
@@ -1944,9 +2781,12 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
     ``….Configuration``; a parameter declared ``IConfigurationRoot`` (or a
     configuration manager); or a parameter declared ``IConfiguration``,
     never reassigned or shadowed in its method, of a method every call of
-    which passes ``….Configuration`` for it (an ``IConfigurationSection``
+    which passes ``….Configuration`` for it, or a configuration it built
+    itself (``new ConfigurationBuilder()…Build()``, inline or in a local
+    never assigned again: a root of its own). An ``IConfigurationSection``
     is an ``IConfiguration`` too, so the declared type alone proves
-    nothing). Anything else, a local included, is not proven."""
+    nothing. Anything else, a local of the binder's own method included,
+    is not proven."""
 
     def _host(receiver: Node) -> bool:
         """Whether ``receiver`` is provably a host builder or context, whose
@@ -1960,6 +2800,9 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
             return False
         name = _text(receiver)
         scope = _enclosing(receiver, ("method_declaration", "constructor_declaration", "local_function_statement", "lambda_expression"))
+        if scope is None and _enclosing(receiver, ("global_statement",)) is not None:
+            # A top-level program: its statements are the scope.
+            scope = _enclosing(receiver, ("compilation_unit",))
         while scope is not None:
             if scope.type == "lambda_expression":
                 params = _lambda_parameters(scope)
@@ -1989,7 +2832,17 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
                 for parameter in ctor_param_csharp._parameters(parameters) if parameters is not None else []:
                     if (n := parameter.child_by_field_name("name")) is not None and _text(n) == name:
                         return _host_type(parameter.child_by_field_name("type"))
-                for declarator in (d for d in _walk(scope) if d.type == "variable_declarator"):
+                if scope.type == "compilation_unit":
+                    # Only the program's own top-level locals.
+                    declarators = [
+                        d
+                        for g in scope.named_children if g.type == "global_statement"
+                        for st in g.named_children if st.type == "local_declaration_statement"
+                        for d in _declarators(st)
+                    ]
+                else:
+                    declarators = [d for d in _walk(scope) if d.type == "variable_declarator"]
+                for declarator in declarators:
                     if ctor_param_csharp._declarator_name(declarator) != name:
                         continue
                     declaration = declarator.parent
@@ -2006,6 +2859,8 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
                         and (_text(factory).split(".")[-1], _text(made)) in _HOST_FACTORIES
                         and _framework_name(_text(factory).split(".")[-1], factory)
                     )
+            if scope.type == "compilation_unit":
+                break
             scope = _enclosing(scope, ("method_declaration", "constructor_declaration", "local_function_statement", "lambda_expression"))
         return False
 
@@ -2084,7 +2939,46 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
         return False
 
 
+    def _built(node: Node | None, method: Node | None) -> bool:
+        """``new ConfigurationBuilder()…Build()``: what ``Build()`` returns
+        is a root of its own (``IConfigurationRoot``). The builder may be a
+        local initialised by ``new ConfigurationBuilder()`` and never
+        assigned again; every call on the way is a framework one (no
+        repository method of its name)."""
+        if node is None or node.type != "invocation_expression":
+            return False
+        receiver, made, _ = _call_name(node)
+        arguments = node.child_by_field_name("arguments")
+        if receiver is None or made is None or _text(made) != "Build" or arguments is None or ctor_param_csharp._items(arguments):
+            return False
+        calls: set[str] = set()
+        while receiver is not None and receiver.type == "invocation_expression":
+            receiver, step, _ = _call_name(receiver)
+            if step is None:
+                return False
+            calls.add(_text(step))
+        if calls and _repository_methods(repo_dir, frozenset(calls)) is not None:
+            return False
+        if receiver is not None and receiver.type == "identifier" and method is not None:
+            name = _text(receiver)
+            declared = [d for d in _walk(method) if d.type == "variable_declarator" and ctor_param_csharp._declarator_name(d) == name]
+            assigned = any(
+                n.type == "assignment_expression" and (left := n.child_by_field_name("left")) is not None and _text(left) == name
+                for n in _walk(method)
+            )
+            if len(declared) != 1 or assigned:
+                return False
+            receiver = _initial_value(declared[0])
+        return (
+            receiver is not None
+            and receiver.type == "object_creation_expression"
+            and ctor_param_csharp._simple_type(receiver.child_by_field_name("type")) == "ConfigurationBuilder"
+            and _framework_name("ConfigurationBuilder", receiver)
+        )
+
     def rooted(node: Node, depth: int = 0) -> bool:
+        if node.type == "invocation_expression":
+            return depth > 0 and _built(node, _enclosing(node, ("method_declaration", "constructor_declaration", "local_function_statement")))
         if node.type == "member_access_expression":
             member = node.child_by_field_name("name")
             receiver = node.child_by_field_name("expression")
@@ -2100,6 +2994,15 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
         method = _enclosing(node, ("method_declaration", "constructor_declaration", "local_function_statement"))
         if method is None or _enclosing(node, ("lambda_expression", "anonymous_method_expression")) is not None:
             return False
+        if depth > 0:
+            # A caller's local holding a configuration it built itself.
+            declared = [d for d in _walk(method) if d.type == "variable_declarator" and ctor_param_csharp._declarator_name(d) == name]
+            assigned = any(
+                n.type == "assignment_expression" and (left := n.child_by_field_name("left")) is not None and _text(left) == name
+                for n in _walk(method)
+            )
+            if len(declared) == 1 and not assigned and _built(_initial_value(declared[0]), method):
+                return True
         for other in _walk(method):
             if other.type == "variable_declarator" and ctor_param_csharp._declarator_name(other) == name:
                 return False
@@ -2356,7 +3259,7 @@ def _config_keys(
     read by something this run does not delete."""
     from flag_cleanup import csharp_family
 
-    declared = _repository_methods(repo_dir, _BINDING_MEMBERS)
+    declared = _repository_methods(repo_dir, _BINDING_MEMBERS, _GENERIC_BINDERS)
     if declared is not None:
         raise Kept(
             declared[0], declared[1],
@@ -2460,12 +3363,32 @@ def _config_keys(
 
 #: Framework members the binding proof recognises by name.
 _BINDING_MEMBERS = frozenset({"Configure", "AddOptions", "Bind", "BindConfiguration", "GetSection"})
+#: The binders always called with the options class as a type argument.
+_GENERIC_BINDERS = frozenset({"Configure", "AddOptions"})
 
 
-def _repository_methods(repo_dir: str, names: frozenset[str]) -> tuple[str, int, str] | None:
+def _extension(method: Node) -> bool:
+    """Whether ``method``'s first parameter carries ``this``."""
+    parameters = method.child_by_field_name("parameters")
+    listed = ctor_param_csharp._parameters(parameters) if parameters is not None else []
+    return bool(listed) and any(c.type == "modifier" and _text(c) == "this" for c in listed[0].children)
+
+
+def _repository_methods(
+    repo_dir: str,
+    names: frozenset[str],
+    generic_only: frozenset[str] = frozenset(),
+    vendored: tuple[str, ...] = (),
+    extensions_only: bool = False,
+) -> tuple[str, int, str] | None:
     """``(path, line, name)`` of a method the repository declares under one
     of ``names``: an extension method of that name could be what a call
-    binds to instead of the framework's."""
+    binds to instead of the framework's. A method without type parameters
+    named in ``generic_only`` is not one: the calls asked about pass a type
+    argument there. A namespace starting with one of ``vendored`` is the
+    framework's own, copied or stubbed into the repository. With
+    ``extensions_only``, only an extension method counts: the calls asked
+    about are made on a value of a library type."""
     word = _word(names)
     for source in source_index.files(repo_dir, (".cs",), with_ignored=True):
         try:
@@ -2484,8 +3407,12 @@ def _repository_methods(repo_dir: str, names: frozenset[str]) -> tuple[str, int,
                 if name is None or _text(name) not in names:
                     continue
                 namespace = xcs._namespace_of(node)
-                if namespace in _FRAMEWORK_NAMESPACES or namespace.startswith("Microsoft.Extensions."):
+                if namespace in _FRAMEWORK_NAMESPACES or namespace.startswith(("Microsoft.Extensions.", *vendored)):
                     continue  # the framework's own, vendored or stubbed
+                if extensions_only and not _extension(node):
+                    continue
+                if _text(name) in generic_only and not any(c.type == "type_parameter_list" for c in node.children):
+                    continue  # `x.Name<T>(…)` binds only to a generic method
                 return (source.resolved, node.start_point[0] + 1, f"{_text(name)}(…)")
     return None
 
@@ -2628,6 +3555,8 @@ def _flows_only_into_reads(
                 and _text(member) in consts
             ):
                 continue  # `O.SectionName`: a constant, no value of the class
+            if _wrapped_into_a_judged_parameter(node, name, properties, repo_dir):
+                continue
             binding = _value_binding(node)
             if binding is None:
                 raise Kept(where, node.start_point[0] + 1, f"a value of {name} is used in a way this pass cannot follow")
@@ -2641,6 +3570,77 @@ def _flows_only_into_reads(
                         f"a value of {name} flows where the removed setting may be seen ({_text(use.parent)[:50]})",
                     )
 
+
+
+def _wrapped_into_a_judged_parameter(node: Node, name: str, properties: set[str], repo_dir: str) -> bool:
+    """``new T(Options.Create(new O { P = v }))``: a value of the options
+    class ``O`` built with no constructor argument, setting only its other
+    ``properties``, wrapped by ``Options.Create`` straight into the
+    argument of a checkout class's only constructor whose parameter there is
+    declared ``IOptions<O>``. That parameter spells ``O``, so where the value
+    goes from there is judged with the rest."""
+    spelled = _type_position(node)
+    creation = spelled.parent
+    if creation is None or creation.type != "object_creation_expression" or creation.child_by_field_name("type") != spelled:
+        return False
+    arguments = creation.child_by_field_name("arguments")
+    if arguments is not None and ctor_param_csharp._items(arguments):
+        return False
+    initializer = creation.child_by_field_name("initializer") or next(
+        (c for c in creation.children if c.type == "initializer_expression"), None
+    )
+    for item in initializer.named_children if initializer is not None else []:
+        left = item.child_by_field_name("left") if item.type == "assignment_expression" else None
+        if left is None or left.type != "identifier" or _text(left) not in properties:
+            return False
+    argument = creation.parent
+    wrap = argument.parent.parent if argument is not None and argument.type == "argument" and argument.parent is not None else None
+    if wrap is None or wrap.type != "invocation_expression":
+        return False
+    receiver, method, generic = _call_name(wrap)
+    wrap_arguments = wrap.child_by_field_name("arguments")
+    index = xcs.csharp_index(repo_dir)
+    if (
+        receiver is None
+        or _text(receiver) != "Options"
+        or method is None
+        or _text(method) != "Create"
+        or wrap_arguments is None
+        or len(ctor_param_csharp._items(wrap_arguments)) != 1
+        or any(info.namespace != "Microsoft.Extensions.Options" for info in index.by_last.get("Options", ()))
+    ):
+        return False
+    outer = wrap.parent
+    built = outer.parent.parent if outer is not None and outer.type == "argument" and outer.parent is not None else None
+    if built is None or built.type != "object_creation_expression" or outer.child_by_field_name("name") is not None:
+        return False
+    position = ctor_param_csharp._items(outer.parent).index(outer)
+    count = len(ctor_param_csharp._items(outer.parent))
+    simple = ctor_param_csharp._simple_type(built.child_by_field_name("type"))
+    infos = [i for i in index.by_last.get(simple or "", ()) if not i.generic]
+    if simple is None or len(infos) != 1:
+        return False
+    try:
+        declaring = _read(str(Path(infos[0].path).resolve()))
+    except (OSError, UnicodeDecodeError):
+        return False
+    declaration = next(
+        (n for n in _walk(declaring.root) if n.type == "class_declaration" and xcs._type_chain(n, strict=False) == infos[0].chain.split(".")),
+        None,
+    )
+    body = declaration.child_by_field_name("body") if declaration is not None else None
+    constructors = [m for m in (body.named_children if body is not None else []) if m.type == "constructor_declaration"]
+    if len(constructors) != 1 or any(c.type == "parameter_list" for c in declaration.children if c.type == "parameter_list"):
+        return False
+    listed = constructors[0].child_by_field_name("parameters")
+    parameters = [p for p in (listed.named_children if listed is not None else []) if p.type == "parameter"]
+    if len(parameters) != count:
+        return False
+    declared = parameters[position].child_by_field_name("type")
+    if declared is None or declared.type != "generic_name" or _text(declared.named_children[0]) != "IOptions":
+        return False
+    wrapped = _type_arguments(declared)
+    return len(wrapped) == 1 and ctor_param_csharp._simple_type(wrapped[0]) == name
 
 
 def _value_binding(node: Node) -> tuple[str, Node, bool] | None:

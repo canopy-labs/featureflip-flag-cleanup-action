@@ -219,7 +219,9 @@ def read_test(
 
 
 def _single_read(body: Node | None, is_read: Callable[[Node], bool]) -> bool:
-    """Whether ``body`` is ``=> <read>`` or ``{ return <read>; }``."""
+    """Whether ``body`` is ``=> <read>`` or ``{ return <read>; }``, the
+    ``return`` optionally after statements that only build the read's
+    evaluation context (:func:`_context_preamble`)."""
     if body is None:
         return False
     if body.type == "arrow_expression_clause":
@@ -228,10 +230,195 @@ def _single_read(body: Node | None, is_read: Callable[[Node], bool]) -> bool:
     if body.type != "block":
         return False
     statements = _named(body)
-    if len(statements) != 1 or statements[0].type != "return_statement":
+    if not statements or statements[-1].type != "return_statement":
         return False
-    returned = _named(statements[0])
-    return len(returned) == 1 and is_read(returned[0])
+    returned = _named(statements[-1])
+    return len(returned) == 1 and is_read(returned[0]) and _context_preamble(statements[:-1], returned[0])
+
+
+#: What a context-building statement's expressions may not hold: each one
+#: writes, waits, throws or hands code on, which is more than computing a
+#: value for the read.
+_PREAMBLE_FORBIDDEN = frozenset(
+    {
+        "assignment_expression", "postfix_unary_expression", "await_expression", "throw_expression",
+        "lambda_expression", "anonymous_method_expression", "declaration_expression", "ref_expression",
+        "query_expression", "stackalloc_expression", "implicit_stackalloc_expression",
+    }
+)
+_INCREMENTS = frozenset({"++", "--"})
+
+
+def _computes_only(node: Node, out_locals: bool = False) -> bool:
+    """Whether evaluating ``node`` writes nothing, waits for nothing and
+    throws nowhere it says so: it may call, and what a call returns is a
+    value of the context being built. No argument is passed ``ref``, ``out``
+    or ``in`` (each may write the variable it names), except, with
+    ``out_locals``, an ``out var x``, which writes only the fresh local it
+    declares."""
+    for part in cross_file_keys.walk(node):
+        if part.type == "argument" and any(not c.is_named and _text(c) in ("ref", "out", "in") for c in part.children):
+            fresh = any(c.type == "declaration_expression" for c in part.named_children)
+            if not (out_locals and fresh and any(not c.is_named and _text(c) == "out" for c in part.children)):
+                return False
+        if (
+            out_locals
+            and part.type == "declaration_expression"
+            and part.parent is not None
+            and part.parent.type == "argument"
+            and any(not c.is_named and _text(c) == "out" for c in part.parent.children)
+        ):
+            continue
+        if (
+            part.type == "assignment_expression"
+            and part.parent is not None
+            and part.parent.type == "initializer_expression"
+            and part.parent.parent is not None
+            and part.parent.parent.type in ("object_creation_expression", "implicit_object_creation_expression")
+        ):
+            continue  # `new T { P = v }` sets a member of the value being built
+        if part.type in _PREAMBLE_FORBIDDEN or part.type == "ERROR" or part.is_missing:
+            return False
+        if part.type == "prefix_unary_expression" and any(_text(c) in _INCREMENTS for c in part.children):
+            return False
+    return True
+
+
+def _context_preamble(statements: list[Node], read: Node) -> bool:
+    """Whether ``statements``, run before ``return <read>;``, only build
+    values the read alone consumes: the evaluation context the SDK targets
+    with. Each one declares a local, or calls a method on (or sets a member
+    of) such a local, optionally under an ``if`` whose condition only
+    computes; every local declared is read nowhere but in these statements
+    and the read's arguments. The fold already drops the read's arguments,
+    whatever they call, so deleting the member with these statements drops
+    the same kind of computation and nothing else.
+
+    No loop, ``try``, ``using``, local function, jump or ``else`` is
+    accepted, and a local's initializer only computes (:func:`_computes_only`).
+    A local that a statement changes must hold a value built right there
+    (``new …``): one read from elsewhere may be shared, and the change seen
+    by other code."""
+    if not statements:
+        return True
+    locals_: set[str] = set()
+    built: set[str] = set()
+
+    def mutates_local(statement: Node) -> bool:
+        if statement.type != "expression_statement" or len(_named(statement)) != 1:
+            return False
+        expression = _named(statement)[0]
+        if expression.type == "invocation_expression":
+            function = expression.child_by_field_name("function")
+            arguments = expression.child_by_field_name("arguments")
+            receiver = function.child_by_field_name("expression") if function is not None else None
+            return (
+                function is not None
+                and function.type == "member_access_expression"
+                and receiver is not None
+                and receiver.type == "identifier"
+                and _text(receiver) in built
+                and (arguments is None or _computes_only(arguments))
+            )
+        if expression.type == "assignment_expression":
+            left = expression.child_by_field_name("left")
+            right = expression.child_by_field_name("right")
+            operator = expression.child_by_field_name("operator")
+            receiver = left.child_by_field_name("expression") if left is not None else None
+            return (
+                operator is not None
+                and _text(operator) == "="
+                and left is not None
+                and left.type == "member_access_expression"
+                and receiver is not None
+                and receiver.type == "identifier"
+                and _text(receiver) in built
+                and right is not None
+                and _computes_only(right)
+            )
+        return False
+
+    for statement in statements:
+        if statement.type == "local_declaration_statement":
+            if any(not c.is_named and _text(c) in ("using", "await") for c in statement.children):
+                return False
+            if any(c.type == "modifier" for c in statement.children):
+                return False
+            declaration = _child(statement, "variable_declaration")
+            if declaration is None:
+                return False
+            for declarator in declaration.named_children:
+                if declarator.type != "variable_declarator":
+                    continue
+                name = _name_of(declarator)
+                if name is None:
+                    return False
+                values = [c for c in _named(declarator) if c.id != declarator.child_by_field_name("name").id]
+                if any(not _computes_only(v) for v in values):
+                    return False
+                locals_.add(name)
+                if len(values) == 1 and values[0].type in ("object_creation_expression", "implicit_object_creation_expression"):
+                    built.add(name)
+        elif statement.type == "if_statement":
+            condition = statement.child_by_field_name("condition")
+            consequence = statement.child_by_field_name("consequence")
+            if statement.child_by_field_name("alternative") is not None or condition is None or consequence is None:
+                return False
+            if not _computes_only(condition):
+                return False
+            inner = _named(consequence) if consequence.type == "block" else [consequence]
+            if not inner or not all(mutates_local(s) for s in inner):
+                return False
+        elif not mutates_local(statement):
+            return False
+    # Every local feeds only the context: it reaches the read's arguments,
+    # itself or through another local's initializer, and nothing outside
+    # these statements and those arguments reads it.
+    method = read.parent
+    while method is not None and method.type not in _WRAPPER_DECLARATIONS and method.type != "accessor_declaration":
+        method = method.parent
+    arguments = read.child_by_field_name("arguments")
+    if method is None or arguments is None:
+        return False
+    allowed = [*statements, arguments]
+    for node in cross_file_keys.walk(method):
+        if node.type == "identifier" and _text(node) in locals_:
+            if not any(a.start_byte <= node.start_byte < a.end_byte for a in allowed):
+                return False
+
+    def names_in(node: Node) -> set[str]:
+        return {_text(n) for n in cross_file_keys.walk(node) if n.type == "identifier"} & locals_
+
+    def receiver_of(statement: Node) -> str | None:
+        expression = _named(statement)[0]
+        target = expression.child_by_field_name("function" if expression.type == "invocation_expression" else "left")
+        receiver = target.child_by_field_name("expression") if target is not None else None
+        return _text(receiver) if receiver is not None else None
+
+    # What each local is computed from: its initializer, and every
+    # statement that changes it (with the condition guarding one).
+    sources: dict[str, set[str]] = {}
+    for statement in statements:
+        if statement.type == "local_declaration_statement":
+            declaration = _child(statement, "variable_declaration")
+            for declarator in declaration.named_children if declaration is not None else ():
+                if declarator.type == "variable_declarator" and (name := _name_of(declarator)) is not None:
+                    sources.setdefault(name, set()).update(names_in(declarator) - {name})
+            continue
+        guard = names_in(statement.child_by_field_name("condition")) if statement.type == "if_statement" else set()
+        consequence = statement.child_by_field_name("consequence") if statement.type == "if_statement" else None
+        inner = [statement] if consequence is None else (_named(consequence) if consequence.type == "block" else [consequence])
+        for part in inner:
+            changed = receiver_of(part)
+            if changed is not None:
+                sources.setdefault(changed, set()).update((names_in(part) | guard) - {changed})
+    feeding = names_in(arguments)
+    grown = True
+    while grown:
+        more = set().union(*(sources.get(n, set()) for n in feeding)) - feeding
+        grown = bool(more)
+        feeding |= more
+    return feeding >= locals_
 
 
 def _getter_body(prop: Node) -> Node | None:
@@ -612,6 +799,9 @@ def _type_full(type_node: Node, reader: xcs._Reader) -> str | None:
         node = node.named_children[0]
     if node.type == "identifier":
         name = _text(node)
+        nested = _nested_type_full(node, name, reader)
+        if nested is not None:
+            return nested or None
         if _type_shadowed(node, name, reader):
             return None
         resolved = reader.resolve(name, xcs._levels(node, reader.root, reader.unit_extra))
@@ -1216,7 +1406,7 @@ def _siblings(
             return refused(wi.INTERFACE_PUBLISHED)  # a derived interface
         words = xcs._modifiers(node)
         if (
-            "." in chain
+            ("." in chain and words & {"public", "internal", "protected", "file"})
             or words & {"abstract", "partial", "static"}
             or _child(node, "type_parameter_list") is not None
             or _extended(node, info.last, index.repo_dir)
@@ -1245,6 +1435,10 @@ def _siblings(
         # asserting the removed branch: refuse.
         if not in_project and _holds_test_attribute(reader.root):
             return refused(wi.SIBLING_NOT_INERT, members[0])
+        # A nested implementation is a private test fake, or refused: only
+        # its outer type can name it, and only a test project's may.
+        if "." in chain and not in_project:
+            return refused(wi.SIBLING_NOT_INERT)
         test = in_project
         inert = _inert_member(members[0], node, test, reader, readers, family)
         if inert is None:
@@ -1266,7 +1460,7 @@ def _siblings(
             wi.Sibling(
                 path, info.last, namespace, wi.line_of(members[0]),
                 members[0].start_byte, members[0].end_byte, returns, knob if test else None, test,
-                default, primary,
+                default, primary, chain if "." in chain else None,
             )
         )
     return tuple(found), None
@@ -1661,13 +1855,86 @@ def _creation_type(value: Node | None, factories: frozenset[str] = frozenset()) 
     return _UNTYPED
 
 
+def _deconstructed(declarator: Node) -> list[Node] | None:
+    """The identifiers (or ``_`` discards) of a flat ``var (a, b) = …``
+    declarator of a local declaration statement, else ``None``. Such a
+    local is scoped by its block like any other, unlike a pattern's."""
+    pattern = _named(declarator)[0] if _named(declarator) else None
+    declaration = declarator.parent
+    if (
+        pattern is None
+        or pattern.type != "tuple_pattern"
+        or declaration is None
+        or declaration.type != "variable_declaration"
+        or declaration.parent is None
+        or declaration.parent.type != "local_declaration_statement"
+    ):
+        return None
+    type_node = declaration.child_by_field_name("type")
+    parts = _named(pattern)
+    if type_node is None or type_node.type != "implicit_type" or any(p.type not in ("identifier", "discard") for p in parts):
+        return None
+    return parts
+
+
+def _deconstructed_type(declarator: Node, name: str, readers: _Readers | None, path: str | None) -> Node | str:
+    """The type ``var (…, name, …) = Helper(…)`` binds ``name`` to: the
+    element at its position of the tuple ``Helper`` is declared to return,
+    when ``Helper`` can only be one method -- declared once by the innermost
+    type around the call, no local or parameter of the name in scope, not
+    generic, and no base of the type or another part of it may declare the
+    name too. ``_UNTYPED`` otherwise."""
+    parts = _deconstructed(declarator)
+    values = [c for c in _named(declarator)[1:]]
+    if parts is None or readers is None or path is None or len(values) != 1:
+        return _UNTYPED
+    call = values[0]
+    function = call.child_by_field_name("function") if call.type == "invocation_expression" else None
+    if function is None or function.type != "identifier":
+        return _UNTYPED
+    method_name = _text(function)
+    if _binding(call, method_name, readers, path, locals_only=True) is not None:
+        return _UNTYPED
+    scope = call.parent
+    while scope is not None and scope.type not in _SCOPE_TYPES:
+        scope = scope.parent
+    if scope is None or _inherits(scope, method_name, readers, path):
+        return _UNTYPED
+    body = scope.child_by_field_name("body")
+    declared = [m for m in (body.named_children if body is not None else ()) if method_name in _member_names(m)]
+    if len(declared) != 1 or declared[0].type != "method_declaration":
+        return _UNTYPED
+    method = declared[0]
+    returns = method.child_by_field_name("returns")
+    if _child(method, "type_parameter_list") is not None or returns is None or returns.type != "tuple_type":
+        return _UNTYPED
+    elements = [c for c in _named(returns) if c.type == "tuple_element"]
+    if len(elements) != len(parts) or len(elements) != len(_named(returns)):
+        return _UNTYPED
+    for part, element in zip(parts, elements):
+        if part.type == "identifier" and _text(part) == name:
+            return element.child_by_field_name("type") or _UNTYPED
+    return _UNTYPED
+
+
 def _declarator_type(
-    declaration: Node, name: str, factories: frozenset[str] = frozenset()
+    declaration: Node,
+    name: str,
+    factories: frozenset[str] = frozenset(),
+    readers: _Readers | None = None,
+    path: str | None = None,
 ) -> Node | str | None:
-    """The type a ``variable_declaration`` binds ``name`` to, if it binds it."""
+    """The type a ``variable_declaration`` binds ``name`` to, if it binds it.
+    A deconstructing local (``var (a, b) = Helper()``) is typed only when
+    ``readers`` can tell what ``Helper`` returns."""
     type_node = declaration.child_by_field_name("type")
     for declarator in declaration.named_children:
-        if declarator.type != "variable_declarator" or _name_of(declarator) != name:
+        if declarator.type != "variable_declarator":
+            continue
+        parts = _deconstructed(declarator)
+        if parts is not None and any(p.type == "identifier" and _text(p) == name for p in parts):
+            return _deconstructed_type(declarator, name, readers, path)
+        if _name_of(declarator) != name:
             continue
         if type_node is None:
             return _UNTYPED
@@ -1759,6 +2026,8 @@ def _pattern_binds(at: Node, name: str) -> bool:
             if node.type != "identifier" or _text(node) != name or node.parent is None:
                 continue
             parent = node.parent
+            if parent.type == "tuple_pattern" and parent.parent is not None and _deconstructed(parent.parent) is not None:
+                continue  # a local, scoped by its block (see _declarator_type)
             if (
                 parent.type.endswith(("_pattern", "_designation"))
                 or parent.type in ("declaration_expression", "from_clause", "let_clause", "join_clause")
@@ -1785,7 +2054,12 @@ def _statements_in_scope(scope: Node) -> list[Node]:
 
 
 def _local_binding(
-    statements: list[Node], at: Node, name: str, factories: frozenset[str] = frozenset()
+    statements: list[Node],
+    at: Node,
+    name: str,
+    factories: frozenset[str] = frozenset(),
+    readers: _Readers | None = None,
+    path: str | None = None,
 ) -> Node | str | None:
     """What the locals and local functions among ``statements`` bind ``name``
     to at ``at``. A local declared after ``at`` cannot be read there, so only
@@ -1799,7 +2073,7 @@ def _local_binding(
         if statement.type == "local_declaration_statement" and statement.start_byte < at.start_byte:
             declaration = _child(statement, "variable_declaration")
             if declaration is not None:
-                found = _declarator_type(declaration, name, factories) or found
+                found = _declarator_type(declaration, name, factories, readers, path) or found
     return found
 
 
@@ -1826,7 +2100,7 @@ def _binding(
         found: Node | str | None = None
         if not class_only:
             if scope.type in ("block", "switch_section"):
-                found = _local_binding(_statements_in_scope(scope), at, name, readers.factories())
+                found = _local_binding(_statements_in_scope(scope), at, name, readers.factories(), readers, path)
             elif scope.type in ("lambda_expression", "anonymous_method_expression"):
                 # A lambda's parameter, typed or not, may be the parameter of
                 # an expression tree, where the call is the payload.
@@ -1970,6 +2244,35 @@ def _in_owner(at: Node, wrapper: wi.Wrapper, path: str) -> bool:
         and _top_level(scope)
         and scope.start_byte <= wrapper.start < scope.end_byte
     )
+
+
+def _nested_type_full(at: Node, name: str, reader: xcs._Reader) -> str | None:
+    """The full name of the type ``name`` at ``at`` means when that is a
+    type an enclosing type declares in its own body (C# finds it there
+    before any namespace): ``""`` when something nearer may claim the name
+    first (a type parameter, a base's member, another part of a type) or the
+    one claiming it is ambiguous or generic, and ``None`` when no enclosing
+    type declares it."""
+    if name in reader.part_members or xcs._has_markup_part(reader.path):
+        return ""
+    scope = at.parent
+    while scope is not None:
+        parameters = _child(scope, "type_parameter_list")
+        if parameters is not None and any(_text(p) == name for p in parameters.named_children):
+            return ""
+        if scope.type in _TYPES:
+            body = scope.child_by_field_name("body")
+            own = [m for m in (body.named_children if body is not None else ()) if m.type in _TYPES and _name_of(m) == name]
+            if own:
+                chain = xcs._type_chain(own[0], strict=False)
+                if len(own) != 1 or chain is None or _child(own[0], "type_parameter_list") is not None:
+                    return ""
+                return _full_name(xcs._namespace_of(own[0]), ".".join(chain))
+            supertypes = xcs._supertypes(scope)
+            if supertypes and name in reader.index.inherited_members(supertypes):
+                return ""
+        scope = scope.parent
+    return None
 
 
 def _type_shadowed(at: Node, name: str, reader: xcs._Reader) -> bool:
@@ -3061,6 +3364,7 @@ _TYPED_BINDINGS = {
     "declaration_expression": "type",
     "catch_declaration": "type",
     "foreach_statement": "type",
+    "tuple_element": "type",
 }
 #: Every other construct whose identifiers may introduce a binding: none of
 #: them is proven typed, so a name bound there is never proven a sibling.
@@ -3070,7 +3374,7 @@ _UNTYPED_BINDINGS = frozenset(
         "group_clause", "tuple_pattern", "recursive_pattern", "parenthesized_variable_designation",
         "var_pattern", "lambda_expression", "anonymous_method_expression", "local_function_statement",
         "method_declaration", "event_declaration", "enum_member_declaration", "using_statement",
-        "fixed_statement", "labeled_statement", "type_parameter", "tuple_element",
+        "fixed_statement", "labeled_statement", "type_parameter",
     }
 )
 
@@ -3129,7 +3433,7 @@ def _bound_only_as_sibling(
     if family is None:
         return False
     siblings = family.sibling_full_names
-    return _bound_only_as(nodes, name, readers, lambda t, at: _type_full(t, reader) in siblings)
+    return _bound_only_as(nodes, name, readers, lambda t, at: _type_full(t, reader) in siblings, reader.path)
 
 
 def _bound_only_as_mock(root: Node, name: str, reader: xcs._Reader, readers: _Readers, targets: set[str]) -> bool:
@@ -3143,15 +3447,24 @@ def _bound_only_as_mock(root: Node, name: str, reader: xcs._Reader, readers: _Re
         argument = _moq_argument(type_node, at, reader)
         return argument is not None and _resolves(argument, reader, targets) is None
 
-    return _bound_only_as(cross_file_keys.walk(root), name, readers, mock)
+    return _bound_only_as(cross_file_keys.walk(root), name, readers, mock, reader.path)
 
 
-def _bound_only_as(nodes: Iterable[Node], name: str, readers: _Readers, accept: Callable[[Node, Node], bool]) -> bool:
+def _bound_only_as(
+    nodes: Iterable[Node],
+    name: str,
+    readers: _Readers,
+    accept: Callable[[Node, Node], bool],
+    path: str | None = None,
+) -> bool:
     """Whether every binding of ``name`` among ``nodes`` -- a field, local,
     parameter, property, pattern, ``out var``, ``foreach`` or ``catch``
     variable -- is declared with a type ``accept`` takes. A lambda
-    parameter, a query variable, a deconstruction or any other binding whose
-    type is not written is not."""
+    parameter, a query variable or any other binding whose type is not
+    written is not. A local deconstructed from a helper's tuple (``var (a,
+    b) = Helper()``) is typed by the helper's declared return, given the
+    file's ``path``. A tuple type's element name binds nothing, and is
+    judged by its type like a binding, which can only refuse."""
     bare = name.removeprefix("@")
 
     def accepted(type_node, at: Node) -> bool:
@@ -3176,6 +3489,10 @@ def _bound_only_as(nodes: Iterable[Node], name: str, readers: _Readers, accept: 
             if declaration is None or declaration.type != "variable_declaration":
                 return False
             if not accepted(_declarator_type(declaration, _text(node), readers.factories()), node):
+                return False
+        elif parent.type == "tuple_pattern" and parent.parent is not None and _deconstructed(parent.parent) is not None:
+            declaration = parent.parent.parent
+            if not accepted(_declarator_type(declaration, _text(node), readers.factories(), readers, path), node):
                 return False
         elif parent.type in _TYPED_BINDINGS and field_name in ("name", "left"):
             if not accepted(parent.child_by_field_name(_TYPED_BINDINGS[parent.type]), node):
@@ -3207,7 +3524,7 @@ def fakes_of(wrappers: Iterable[wi.Wrapper]) -> dict[str, tuple[wi.Sibling, ...]
     for wrapper in wrappers:
         for s in wrapper.siblings:
             if s.test and s.knob:
-                found[_full_name(s.namespace, s.owner)].append(s)
+                found[_full_name(s.namespace, s.type_chain)].append(s)
     return {full: tuple(group) for full, group in found.items()}
 
 
@@ -3216,7 +3533,8 @@ class _Setting:
     """One place that sets, or may set, a test fake's knob."""
 
     node: Node
-    #: ``fake`` in ``fake.Knob = …`` or ``this.fake.Knob = …``.
+    #: ``fake`` in ``fake.Knob = …`` or ``this.fake.Knob = …``; ``host.Fake``
+    #: in ``host.Fake.Knob = …`` (see :func:`_member_holder`).
     receiver: str | None
     #: The ``bool`` literal set, when it is plainly one.
     value: str | None
@@ -3225,6 +3543,8 @@ class _Setting:
     fake: tuple[wi.Sibling, ...] | None
     #: The member written (``None`` for a primary constructor's argument).
     knob: str | None
+    #: For a ``host.Fake`` receiver: ``(host, the full name of its type)``.
+    holder: tuple[str, str] | None = None
 
     @property
     def sets_knob(self) -> bool:
@@ -3266,6 +3586,38 @@ def _plain_value(target: Node) -> str | None:
     return _text(right)
 
 
+def _member_holder(
+    receiver: Node, at: Node, reader: xcs._Reader, readers: _Readers, path: str
+) -> tuple[str, Node, xcs._Reader, str, str] | None:
+    """For a knob write's receiver ``host.Fake`` -- ``host`` a local,
+    parameter or member of the file whose declared type is a class, struct or
+    record of the checkout, and ``Fake`` a field or auto-property that type
+    declares itself -- ``(receiver text, Fake's declared type, the reader of
+    the file declaring it, host, host's type's full name)``. A member read
+    runs no code, so its declared type is the value's static type: the one
+    that decides whether the write sets a fake. ``None`` otherwise."""
+    inner = receiver.child_by_field_name("expression")
+    name = receiver.child_by_field_name("name")
+    if inner is None or name is None or inner.type != "identifier" or name.type != "identifier":
+        return None
+    host = _text(inner)
+    bound = _binding(at, host, readers, path)
+    if bound is None or isinstance(bound, str) or bound.type == "implicit_type":
+        return None
+    full = _type_full(bound, reader)
+    infos = xcs.csharp_index(readers.repo_dir).by_full.get(full or "", ())
+    if full is None or len(infos) != 1 or infos[0].generic or infos[0].partial:
+        return None
+    declaring = readers.get(infos[0].path)
+    node = _find_type_in(declaring.root, infos[0].namespace, infos[0].chain) if declaring is not None else None
+    if node is None or node.type not in _OWNERS:
+        return None
+    member = _own_state(node, _text(name).removeprefix("@"))
+    if member is None:
+        return None
+    return f"{host}.{_text(name)}", member, declaring, host, full
+
+
 def _typed_fake(
     type_node: Node | str | None, reader: xcs._Reader, fakes: dict[str, tuple[wi.Sibling, ...]]
 ) -> tuple[bool, tuple[wi.Sibling, ...] | None]:
@@ -3300,7 +3652,7 @@ def _knob_settings(
             if target is None:
                 continue
             receiver_node = _unwrap(node.child_by_field_name("expression"))
-            receiver, bound = None, None
+            receiver, bound, holder, typed_in = None, None, None, reader
             if receiver_node is not None and receiver_node.type == "identifier":
                 receiver = _text(receiver_node)
                 bound = _binding(node, receiver, readers, path)
@@ -3314,10 +3666,15 @@ def _knob_settings(
             ):
                 receiver = _text(field_name)
                 bound = _binding(node, receiver, readers, path, class_only=True)
-            known, fake = _typed_fake(bound, reader, fakes)
+            elif receiver_node is not None and receiver_node.type == "member_access_expression":
+                held = _member_holder(receiver_node, node, reader, readers, path)
+                if held is not None:
+                    receiver, bound, typed_in, host, host_full = held
+                    holder = (host, host_full)
+            known, fake = _typed_fake(bound, typed_in, fakes)
             if known and fake is None:
                 continue
-            found.append(_Setting(target, receiver, _plain_value(target), fake, knob))
+            found.append(_Setting(target, receiver, _plain_value(target), fake, knob, holder))
         elif node.type == "assignment_expression" and node.parent is not None and node.parent.type == "initializer_expression":
             left = node.child_by_field_name("left")
             knob = _text(left).removeprefix("@") if left is not None and left.type == "identifier" else None
@@ -3397,11 +3754,26 @@ def knob_receivers(
     root, reader, readers, settings = scan
     members = {f for f, group in fakes.items() if any(not s.knob_primary for s in group)}
     names = {s.receiver for s in settings if s.receiver is not None}
+
+    def bound(name: str) -> bool:
+        holders = {s.holder for s in settings if s.receiver == name}
+        if "." not in name:
+            return holders == {None} and _bound_only_as(
+                cross_file_keys.walk(root), name, readers, lambda t, at: _type_full(t, reader) in members, reader.path
+            )
+        # `host.Fake`: every binding of `host` in the file is the one type
+        # whose own member `Fake` is typed as a fake.
+        if len(holders) != 1 or None in holders:
+            return False
+        ((host, full),) = holders
+        return _bound_only_as(
+            cross_file_keys.walk(root), host, readers, lambda t, at: _type_full(t, reader) == full, reader.path
+        )
+
     return frozenset(
         name
         for name in names
-        if all(s.fake is not None and s.sets_knob for s in settings if s.receiver == name)
-        and _bound_only_as(cross_file_keys.walk(root), name, readers, lambda t, at: _type_full(t, reader) in members)
+        if all(s.fake is not None and s.sets_knob for s in settings if s.receiver == name) and bound(name)
     )
 
 
@@ -3548,9 +3920,12 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
         rf"(?<![\w$])(?:{prefix}|get_|set_){re.escape(wrapper.name)}(?![\w$])", re.IGNORECASE if loose else 0
     )
 
+    # A prefix pattern names a member only for a lookup that takes one.
+    patterns = loose and csharp_family.pattern_routes(index.repo_dir)
+
     def prefix_of_name(node: Node) -> bool:
         text = _plain_string(node)
-        return loose and text is not None and text.endswith("*") and wrapper.name.lower().startswith(text[:-1].lower())
+        return patterns and text is not None and text.endswith("*") and wrapper.name.lower().startswith(text[:-1].lower())
 
     found = [
         node
@@ -3575,7 +3950,7 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
     return [(wi.line_of(n), wi.text_of(n)) for n in found]
 
 
-def leftovers(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, str]]:
+def leftovers(repo_dir: str, wrapper: wi.Wrapper, removable: frozenset[str] = frozenset()) -> list[tuple[str, int, str]]:
     """Every mention still in the repository that may be the member, read
     fresh, by the same verdicts as :func:`occurrences` and
     :func:`mention_counts`: a mention proven to be another type's does not

@@ -85,6 +85,7 @@ from flag_cleanup import (
     contradicting,
     csharp_residue,
     ctor_param_removal,
+    dart_field_removal,
     cross_file_dart,
     cross_file_keys,
     cross_file_kotlin,
@@ -1301,7 +1302,9 @@ class TransformOutcome:
     #: ``private`` or ``#`` member the fold left unread, TS6133/TS6138 under
     #: ``noUnusedLocals``. See :mod:`~flag_cleanup.ts_unread_members`, which
     #: also finds a plain constructor parameter left unused, kind ``"unread
-    #: constructor parameter"`` with ``Class(parameter)`` as text. The
+    #: constructor parameter"`` with ``Class(parameter)`` as text. A Dart
+    #: private field the fold left unread (``unused_field``) is kind
+    #: ``"unread member"`` too; see :mod:`~flag_cleanup.dart_field_removal`. The
     #: family adds two more kinds that name something KEPT, both reported and
     #: never edited:
     #: ``"unread binding"`` (the parameter or local an override deleted by
@@ -1660,7 +1663,7 @@ def _transform_flag(
         # engine. See `_inline_bound_reads`.
         "marker": marker_for(flag_key),
     }
-    # The sentinel rules of Java, C#, Go and the TS family name the hole
+    # The sentinel rules of Java, C#, Go, Dart and the TS family name the hole
     # whether or not this run marks a wrapper call, and a hole no substitution
     # supplies aborts the engine. Kotlin's is supplied by its pre-pass, which
     # always exists.
@@ -2075,6 +2078,7 @@ def _transform_flag(
             repo_dir,
             Rewrite,
             engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+            flag_key=flag_key,
         )
         wrapper_rows = wrapper_rows + residue_rows
     # The passes below parse and rewrite what is on disk: a file this run
@@ -2391,6 +2395,11 @@ def _plan_wrappers(
             "knobs": frozenset(s.knob for s in going if not s.knob_primary) - staying_knobs,
             "sibling_owners": frozenset(
                 (s.owner, s.knob, s.knob_primary) for s in going if s.owner not in staying_owners
+            ),
+            "owner_defaults": frozenset(
+                (s.owner, (s.knob_default or "false") == "true")
+                for s in going
+                if s.owner not in staying_owners and not s.knob_primary
             ),
         }
 
@@ -3572,7 +3581,7 @@ def _accessor_templates_for(rules_file: Path) -> str | None:
 
 
 #: The languages whose pre-pass exists only to mark keyless-wrapper calls.
-_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js"})
+_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart"})
 
 
 def _sentinel_prepass(
@@ -3587,11 +3596,11 @@ def _sentinel_prepass(
 
     Kotlin always has one, and it is a workaround for a specific engine
     limitation rather than a general stage — see
-    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go and the TS family have one only when
+    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go, Dart and the TS family have one only when
     there are keyless-wrapper calls to mark (``wrapper_spans``, see
     :mod:`flag_cleanup.wrapper_inline`): it marks those and nothing else, and
     the sentinel rules in ``rules/java.toml``, ``rules/csharp.toml``,
-    ``rules/go.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
+    ``rules/go.toml``, ``rules/dart.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
     has to care about it all ask the same question.
     """
     spans = dict(wrapper_spans or {})
@@ -4087,19 +4096,21 @@ def _unread_private_members(
     summaries, language: str, repo_dir: str
 ) -> tuple[tuple[str, str, str], ...]:
     """``(path, "unread member", label)`` for each TypeScript or JavaScript
-    private member the fold left unread. Nothing is written."""
+    private member, and each Dart private field, the fold left unread.
+    Nothing is written."""
     found: list[tuple[str, str, str]] = []
     for summary in summaries:
         if summary.original_content == summary.content:
             continue
         grammar = _grammar_of(summary.path, language)
-        if grammar not in ("ts", "tsx", "js"):
+        if grammar == "dart":
+            labels = dart_field_removal.unread_fields(summary.original_content, summary.content)
+        elif grammar in ("ts", "tsx", "js"):
+            labels = unread_members(summary.original_content, summary.content, grammar)
+        else:
             continue
         relative = os.path.relpath(summary.path, repo_dir)
-        found.extend(
-            (relative, "unread member", label)
-            for label in unread_members(summary.original_content, summary.content, grammar)
-        )
+        found.extend((relative, "unread member", label) for label in labels)
     return tuple(found)
 
 
@@ -4157,7 +4168,7 @@ def _remove_unread_constructor_parameters(
     other. Each row is offered once, and each round that rewrites deletes a
     parameter, so this ends.
     """
-    if language not in ("ts", "tsx", "js", "csharp") or not unread:
+    if language not in ("ts", "tsx", "js", "csharp", "dart") or not unread:
         return summaries, unread, ()
     offered = set(unread)
     pending = unread

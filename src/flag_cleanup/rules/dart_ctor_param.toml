@@ -1,0 +1,23 @@
+# Private-field removal, rendered per run by `ctor_param_model.render_rules`.
+# Never loaded as shipped.
+#
+# Dart removes a field and never a constructor parameter, so the one block is
+# an `argument` block, rendered once with __CTOR_SENTINEL__: the caller has
+# already replaced every field to delete, and the `;` after it, with a method
+# of that name (`ctor_param_model.FORMS`), so deletion is by identity and the
+# engine's apply-until-no-match loop stops after the marked spans.
+#
+# No holes and no edges: the rule is a seed that matches on its own.
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_member"
+query = """(
+  (class_member
+    (method_declaration
+      signature: (method_signature (constructor_signature name: (identifier) @name)))) @member
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "member"
+replace = ""
+is_seed_rule = true

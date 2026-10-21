@@ -9,7 +9,8 @@ sentinel identifier and the engine deletes the sentinels and the parameter.
 A TypeScript or JavaScript private field (:mod:`flag_cleanup.ts_field_removal`)
 is marked the same way, with the constructor statement that assigns it, and
 takes the constructor parameter it was assigned from when nothing else reads
-that parameter.
+that parameter. A Dart private field (:mod:`flag_cleanup.dart_field_removal`)
+is marked the same way, on its own.
 Deleting by a marked identity rather than by position matters: the engine
 applies a rule until it stops matching, so a positional rule would also delete
 the argument that moves into the emptied slot.
@@ -34,6 +35,7 @@ from tree_sitter import Node
 from flag_cleanup import (
     ctor_param_csharp,
     ctor_param_ts,
+    dart_field_removal,
     git_ops,
     syntax,
     ts_field_removal,
@@ -57,7 +59,13 @@ logger = logging.getLogger(__name__)
 _ARGUMENT_LISTS = frozenset({"arguments", "argument_list"})
 #: The unread-row kinds each language's report passes write.
 _TS_KINDS = frozenset({"unread member", "unread constructor parameter"})
-_KINDS = {"ts": _TS_KINDS, "tsx": _TS_KINDS, "js": _TS_KINDS, "csharp": frozenset({"unread parameter"})}
+_KINDS = {
+    "ts": _TS_KINDS,
+    "tsx": _TS_KINDS,
+    "js": _TS_KINDS,
+    "csharp": frozenset({"unread parameter"}),
+    "dart": frozenset({"unread member"}),
+}
 
 Row = tuple[str, str, str]
 
@@ -90,7 +98,7 @@ def _walk(node: Node) -> Iterator[Node]:
 
 
 def _grammar(path: str, language: str) -> str:
-    return "csharp" if language == "csharp" else ts_scope.grammar(path)
+    return language if language in ("csharp", "dart") else ts_scope.grammar(path)
 
 
 def _decode(data: bytes) -> str:
@@ -125,6 +133,8 @@ def _plan(summary, kind: str, label: str, language: str, repo_dir: str) -> Remov
     try:
         if language == "csharp":
             return ctor_param_csharp.plan(summary.path, summary.content, label, repo_dir)
+        if language == "dart":
+            return dart_field_removal.plan(summary.path, summary.content, label, repo_dir)
         if kind == "unread constructor parameter":
             return ctor_param_ts.plan_parameter(summary.path, summary.content, label, repo_dir)
         outcome = ctor_param_ts.plan(summary.path, summary.content, label, repo_dir)
@@ -145,7 +155,7 @@ def remove(
     engine: Callable[[list[str], str], list],
 ) -> Result:
     """Remove every unread constructor parameter in ``unread`` whose callers
-    can all be proven, and every unread TypeScript or JavaScript field that
+    can all be proven, and every unread TypeScript, JavaScript or Dart field that
     can be, through ``engine(paths, rules_text)``."""
     unchanged = Result(summaries, tuple(unread), (), frozenset())
     kinds = _KINDS.get(language, frozenset())
@@ -197,7 +207,7 @@ def remove(
             key = _key(removal.declaring_path)
             parameters.setdefault(key, []).extend(_parameter_spans(before[key], removal, language))
     rules = render_rules(
-        "csharp" if language == "csharp" else "ts", [r for _, r in removals], sentinel
+        language if language in ("csharp", "dart") else "ts", [r for _, r in removals], sentinel
     )
     # The candidate scan never listed a caller: bring every file this pass
     # writes under the running transform's undo first.
@@ -228,7 +238,7 @@ def remove(
                     tidied = b"\xef\xbb\xbf" + tidied
             if tidied != engine_out:
                 Path(key).write_bytes(tidied)
-        failure = _postcondition(files, before, marks, removals, sentinel, language)
+        failure = _postcondition(files, marked, marks, removals, sentinel, language)
     except Exception as exc:  # noqa: BLE001 - any surprise means: put the bytes back
         for key, data in before.items():
             Path(key).write_bytes(data)
@@ -344,7 +354,7 @@ def _parameter_spans(data: bytes, removal: Removal, language: str) -> list[tuple
 
 def _postcondition(
     files: list[str],
-    before: dict[str, bytes],
+    marked: dict[str, bytes],
     marks: dict[str, list[tuple[int, int, str]]],
     removals: list[tuple[Row, Removal]],
     sentinel: str,
@@ -358,16 +368,20 @@ def _postcondition(
         grammar = _grammar(key, language)
         if _parse(_decode(after), grammar).has_error:
             return f"{key}: no longer parses"
-        # A parameter is not an argument, so only argument marks change the count.
+        # A parameter is not an argument, so only argument marks change the
+        # count. Counted on the marked text: a member mark already took the
+        # arguments inside it (a Dart field's `const Duration(seconds: 3)`).
         arguments = [m for m in marks.get(key, ()) if m[2] == "argument"]
-        expected = _arguments(before[key], grammar) - len(arguments)
+        expected = _arguments(marked[key], grammar) - len(arguments)
         if _arguments(after, grammar) != expected:
             return f"{key}: lost a different number of arguments than it had marks"
     for _, removal in removals:
         source = _decode(Path(removal.declaring_path).read_bytes())
         grammar = _grammar(removal.declaring_path, language)
-        if removal.field is not None and ts_field_removal.has_field(
-            source, grammar, removal.class_name, removal.field
+        if removal.field is not None and (
+            dart_field_removal.has_field(source, removal.class_name, removal.field)
+            if language == "dart"
+            else ts_field_removal.has_field(source, grammar, removal.class_name, removal.field)
         ):
             return f"{removal.declaring_path}: the field {removal.field} is still declared"
         if removal.param_name is None:

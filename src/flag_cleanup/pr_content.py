@@ -28,7 +28,7 @@ from flag_cleanup.cross_file_keys import (
     LEFT_COMPETING,
     NAME_NOT_UNIQUE,
 )
-from flag_cleanup.mock_stubs import PINNED_PARAMETER, SIBLING_TEST, TEST
+from flag_cleanup.mock_stubs import PINNED_PARAMETER, SIBLING_TEST, TEST, TEST_PHASE
 from flag_cleanup.residue import Residue
 from flag_cleanup.urls import without_userinfo
 
@@ -330,6 +330,53 @@ def _removed_member_lines(removed: list[tuple[str, str]]) -> list[str]:
         "writing it was a constructor statement, deleted with it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _removed_dart_field_lines(removed: list[tuple[str, str]]) -> list[str]:
+    """The note naming each Dart private field this pull request removed, or
+    nothing. Not a warning; see :mod:`~flag_cleanup.dart_field_removal`."""
+    if not removed:
+        return []
+    count = len(removed)
+    noun = "Dart private field was" if count == 1 else "Dart private fields were"
+    return [
+        f"> **{count} {noun} removed.** Every read of "
+        f"{'it' if count == 1 else 'them'} was a flag read this pull request "
+        "removed, so `dart analyze` would report `unused_field`, and nothing its "
+        "deletion skips can do work: its initializer, if any, is constant, or "
+        "never runs because the field is `late` or `static`, and nothing else "
+        "in its library wrote it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_dart_field_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Dart private field the fold left unread, or
+    nothing. ``dart analyze`` reports it as ``unused_field`` and exits
+    non-zero. See :mod:`~flag_cleanup.dart_field_removal` for when one is
+    removed instead."""
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "field is" if count == 1 else "fields are"
+    return [
+        f"> **⚠️ {count} Dart private {noun} no longer read.** Every read was a "
+        "flag read this pull request removed, and `dart analyze` now reports "
+        "`unused_field`, which fails a CI that gates on the analyzer. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        "removing it would change a constructor (a `this.` parameter or an "
+        "initializer-list entry sets it), its initializer may do work, it is "
+        "annotated or still assigned, deleting it would leave an import or a "
+        "private declaration unused, or its library has `part` files. Remove "
+        f"{'it' if count == 1 else 'each'}, with whatever sets it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -824,9 +871,11 @@ def pr_body(
     ]
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
-    lines += _unread_member_lines(unread_members)
+    lines += _unread_member_lines([m for m in unread_members if not m[0].endswith(".dart")])
+    lines += _unread_dart_field_lines([m for m in unread_members if m[0].endswith(".dart")])
     lines += _unread_constructor_parameter_lines(unread_constructor_parameters)
-    lines += _removed_member_lines(removed_members)
+    lines += _removed_member_lines([m for m in removed_members if not m[0].endswith(".dart")])
+    lines += _removed_dart_field_lines([m for m in removed_members if m[0].endswith(".dart")])
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_binding_lines(unread_bindings)
@@ -924,6 +973,7 @@ def pr_body(
     mocked_tests = [(path, text) for path, kind, text in test_doubles if kind == "test"]
     sibling_tests = [(path, text) for path, kind, text in test_doubles if kind == SIBLING_TEST]
     pinned = [(path, text) for path, kind, text in test_doubles if kind == PINNED_PARAMETER]
+    phases = [(path, text) for path, kind, text in test_doubles if kind == TEST_PHASE]
     mock_lines = [
         (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
     ]
@@ -957,6 +1007,20 @@ def pr_body(
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in sibling_tests[:20]
             ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if phases:
+        count = len(phases)
+        noun = "part of a test was" if count == 1 else "parts of tests were"
+        lines += [
+            f"> **⚠️ {count} {noun} deleted.** Each set a test fake to "
+            f"`{'false' if candidate.treatment else 'true'}` — the **{deleted}** "
+            "branch — part-way through a test, and back to the kept value "
+            "further on. The statements in between asserted behaviour the code "
+            "can no longer produce; the rest of each test still runs:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in phases[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -1123,7 +1187,7 @@ _WRAPPER_STATUSES = ("complete", "partial")
 #: the refusals, and told apart from them on rendering.
 _WRAPPER_NOTES = ("sibling", "doc-reference", "residue", "residue-kept", "residue-prose")
 #: Test-double removal kinds that are not a mock line.
-_NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER)
+_NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE)
 
 
 def _by_wrapper(
@@ -1454,8 +1518,9 @@ def note_removed_entries(entries: tuple[tuple[str, str], ...]) -> None:
 
 
 def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
-    """Log the tests deleted with a sibling implementation, and the test
-    helper parameters pins removed.
+    """Log the tests deleted with a sibling implementation, the parts of
+    tests run with a fake at the removed value, and the test helper
+    parameters pins removed.
 
     WARNING, like :func:`note_wrapper_findings`: a dry run has no pull request
     body, and each is a change to the customer's test code the diff shows only
@@ -1463,6 +1528,14 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     """
     sibling_tests = [(p, t) for p, kind, t in test_doubles if kind == SIBLING_TEST]
     pinned = [(p, t) for p, kind, t in test_doubles if kind == PINNED_PARAMETER]
+    phases = [(p, t) for p, kind, t in test_doubles if kind == TEST_PHASE]
+    if phases:
+        logger.warning(
+            "%d test phase%s deleted, each run with a fake at the removed value: %s",
+            len(phases),
+            "" if len(phases) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in phases),
+        )
     if sibling_tests:
         logger.warning(
             "%d test%s deleted with a sibling implementation: %s",

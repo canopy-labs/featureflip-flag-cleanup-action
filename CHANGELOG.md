@@ -7,6 +7,84 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.11.0
+
+### New
+
+- **Python:** a function, method or `@property` whose whole body is one read
+  of the flag (`return client.variation("new-checkout", ctx, False)`) is now
+  inlined at every call its file proves is bound to it, and deleted once
+  nothing names it. A function is proven when it is called bare in its own
+  module, or through a top-level `from <its module> import name` or
+  `import <its module> as m`; a method through `self` or `cls` inside its own
+  class, or a static or class method through the class. The import of a
+  deleted function is rewritten so the module still loads. A wrapper with a
+  test double (`patch("app.flags.new_checkout")`, `MagicMock(new_checkout=...)`,
+  `m.new_checkout.return_value = ...`) is left alone, and so is one exported
+  through `__all__`, though its callers are still inlined. Set
+  `inline-wrappers: false` to keep the old behaviour.
+- **Dart:** a keyless wrapper is inlined at its callers and deleted once none
+  is left, as in the other languages. It is a
+  top-level function or getter, or a method or getter of a class, declared to
+  return `bool`, whose whole body is one read of the flag
+  (`bool get newCheckout => client.boolVariation('old-checkout', defaultValue: false);`).
+  A call is inlined only where its file proves it reaches that declaration: a
+  bare or prefixed call through an import of your package, the class's name
+  for a static member, or a receiver every declaration of which in the file
+  is written with the class as its type. A public wrapper of a package that
+  may be published is kept. See README's "Wrapping the SDK" for what is left
+  alone, and why.
+- **Dart:** a private field whose every read was a flag read the run removed
+  is deleted too, since `dart analyze` reports it as `unused_field` and exits
+  non-zero. It goes when nothing else in its library sets it and its
+  initializer cannot do work: absent, constant, or never run because the field
+  is `late` or `static`. One that a constructor sets (`this._client` or an
+  initializer list), one whose initializer may do work, one whose deletion
+  would leave an import or a private declaration unused, an annotated field
+  and a field of a library with `part` files are kept and named in the pull
+  request instead.
+
+### Behaviour changes
+
+- **C#:** a gate method that builds its evaluation context before it reads
+  the flag (`var ctx = new EvaluationContext { … }; if (orgId is { } o)
+  ctx.Set(…); return _client.BoolVariation(…, ctx, false);`) is now inlined
+  at its callers and removed like a one-line gate. Those statements may only
+  build values that end up in the read's arguments.
+- **C#:** a test fake set by a knob no longer has to default to the value the
+  flag keeps serving, and may be a `private` class nested in a test class. A
+  test that sets it to the removed value through a host's field
+  (`factory.Gate.Enabled = false;`) is resolved like any other write, a test
+  that hands it, never set, straight to what it builds is decided by its
+  default, and a test that
+  switches it to the removed value part-way through loses only the
+  statements run that way. The pull request lists each such part.
+- **C#:** once a gate family is complete, the run also removes a test host's
+  field holding a fake (with the registration of it as the instance), a call
+  of a test host's own registration helper, a middleware that only consulted
+  the gate and now passes every request on (with its `UseMiddleware<…>()`
+  registration and its tests), a test class the run's test edits left empty,
+  and a comment standing alone above a deleted registration that names the
+  flag or a deleted type.
+- **C#:** a fallback's setting in a shared options class is removed even when
+  tests build the options class into `new ConfigGate(Options.Create(new
+  FeaturesOptions { … }))`, and when callers pass a configuration they build
+  themselves or a top-level program's `builder.Configuration`.
+- **C#:** a string such as `"*"` no longer keeps a gate as a possible prefix
+  lookup unless your C# spells a lookup that takes a prefix (`GetMember`,
+  `GetMembers`, `FindMembers`, `Type.FilterName`). Another language's source
+  outside every C# project, such as a script's fixture, now counts as prose
+  when it names a gate's type.
+
+### Fixed
+
+- A removal that deletes a whole file no longer fails the run after its
+  branch is pushed. Switching the checkout back to your base branch was
+  refused because the deleted files were back on disk but no longer tracked,
+  which in `mode: remove` stopped every later flag in that run and in
+  `mode: pr-command` reported a re-run that had updated the pull request as
+  failed.
+
 ## 1.10.0
 
 ### Behaviour changes

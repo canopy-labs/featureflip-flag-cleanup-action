@@ -897,11 +897,16 @@ def _dry_run_caveats(
         notes.append(
             f"{unread} C# primary-constructor parameter(s) would be left unread (CS9113)"
         )
-    if unread_members:
+    dart_members = sum(
+        1 for path, kind, _ in bindings if kind == "unread member" and path.endswith(".dart")
+    )
+    if unread_members - dart_members:
         notes.append(
-            f"{unread_members} TypeScript/JavaScript private member(s) would be "
+            f"{unread_members - dart_members} TypeScript/JavaScript private member(s) would be "
             "left unread (TS6133/TS6138)"
         )
+    if dart_members:
+        notes.append(f"{dart_members} Dart private field(s) would be left unread (unused_field)")
     if unread_ctor:
         notes.append(
             f"{unread_ctor} TypeScript/JavaScript constructor parameter(s) would be "
@@ -925,6 +930,7 @@ def _dry_run_caveats(
     removed_tests = sum(1 for _, kind, _ in test_doubles if kind == "test")
     sibling_tests = sum(1 for _, kind, _ in test_doubles if kind == "sibling test")
     pinned = sum(1 for _, kind, _ in test_doubles if kind == "pinned parameter")
+    phases = sum(1 for _, kind, _ in test_doubles if kind == "test phase")
     if removed_tests:
         notes.append(
             f"{removed_tests} test(s) whose mock returns the removed value "
@@ -937,7 +943,9 @@ def _dry_run_caveats(
         )
     if pinned:
         notes.append(f"{pinned} test helper parameter(s) would be removed")
-    mock_lines = len(test_doubles) - removed_tests - sibling_tests - pinned
+    if phases:
+        notes.append(f"{phases} part(s) of tests run with a fake at the removed value would be deleted")
+    mock_lines = len(test_doubles) - removed_tests - sibling_tests - pinned - phases
     if mock_lines:
         notes.append(
             f"{mock_lines} mock stub/verification line(s) "

@@ -667,7 +667,7 @@ entries dropped.
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`). See [Wrapping the SDK](#wrapping-the-sdk). |
-| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript and JavaScript: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function or TypeScript or JavaScript function or class method whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
+| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python and Dart: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, or Dart function, method or getter whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. In the archive modes, the only branch a removal's merge counts on: give them the same value as the cleanup workflow. |
@@ -1066,7 +1066,7 @@ wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
 key is not at the call site and no name will make it matchable. Those reads are
 reported as unremoved rather than guessed at.
 
-**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript and JavaScript.**
+**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript, JavaScript, Python and Dart.**
 A flag is often read once, inside a method, and checked everywhere else through
 that method:
 
@@ -1139,7 +1139,27 @@ if (_flags.IsCheckoutEnabled) { … }
 ```
 
 The body is `=> read`, `{ return read; }`, or a lone `get` accessor of either
-shape, and the read is `BoolVariation` (or one of your `accessors`).
+shape, and the read is `BoolVariation` (or one of your `accessors`). A method's
+`return read;` may follow statements that only build the context the read
+targets:
+
+```csharp
+public bool IsEnabledFor(Guid? userId, Guid? orgId)
+{
+    var ctx = new EvaluationContext { UserId = userId?.ToString() ?? "service" };
+    if (orgId is { } org)
+        ctx.Set("organizationId", org.ToString());
+    return _client.BoolVariation("old-checkout", ctx, false);
+}
+```
+
+Each of them declares a local, or calls a method on one or sets a member of
+one built right there with `new`, optionally under an `if` with no `else`;
+every local ends up in the read's arguments and is read nowhere else; and
+nothing assigns, increments, awaits, throws or passes an argument `ref`,
+`out` or `in` (an object initializer's members aside). Deleting the
+method drops what they compute along with the read's arguments, as folding
+the read does.
 `GetBooleanValueAsync` is never one: it is folded only under `await`, and an
 `async` member returns a `Task<bool>`. A property read is folded as a value:
 `!_flags.IsCheckoutEnabled` keeps its `!`. A property read that is called,
@@ -1609,6 +1629,146 @@ argument when every caller can be found, and a field when its initializer can
 do no work; anything else is named in a warning. See "Supported JS/TS
 flag-read shapes".
 
+In Python, a wrapper is a module-level function, or a method of a
+module-level class (a plain method, a `@staticmethod`, a `@classmethod` or a
+`@property`), whose body is `return <read>`, after an optional docstring:
+
+```python
+def new_checkout(user):
+    return client.variation("old-checkout", user, False)
+
+# elsewhere
+from app.flags import new_checkout
+
+if new_checkout(user): …
+```
+
+The read is `variation` with a boolean literal default (positional or
+`default=`), `get_boolean_value`, or one of your `accessors`, with the key as
+a literal or a constant, as for any other Python read. An `async def`, a
+wrapper with any other decorator (a decorator can change what it returns) and
+one whose parameter default calls something are not wrappers: only the read
+inside them is folded. Python has no static types, so a call is folded only
+where its file ties it to the wrapper:
+
+- a function called bare in its own module, or in a module that imports it
+  with a top-level `from <its module> import new_checkout` (relative imports
+  too), or called as `m.new_checkout(…)` through a top-level
+  `import <its module> as m`, `import <its module>` or
+  `from <package> import <its module>`. The module is found the way a
+  key constant's is (see "Declared in another file"). Each import of a
+  deleted function is rewritten so the module still loads: the name is
+  dropped from its list, or a statement left with no name becomes
+  `import app.flags as _flags  # noqa: F401`;
+- a method called as `self.banner(…)` (or a property read as `self.beta`)
+  inside a method of its own class, or `cls.banner(…)` inside a class method;
+- a static or class method called as `Flags.banner(…)`, where `Flags` is the
+  class in its own module or a top-level `from <its module> import Flags`.
+
+A call is left alone when the file binds the receiver's name anywhere else
+(a parameter, an assignment, a loop or `with` target, a nested function, a
+star import), names `globals`, `vars`, `locals`, `exec`, `eval`, `__dict__`
+or `__getattribute__`, or imports the function under an alias. So is an
+argument that calls, awaits, yields, unpacks (`*args`), iterates or assigns
+(`argument-has-call`), and a function or method used without a call. A
+method called through any other object (`flags.banner(u)` on a parameter) is
+not folded: an annotation proves nothing at run time.
+
+The name must be declared once across the repository's Python files
+(`name-not-unique`): any other function, method, class, parameter,
+assignment (`self.banner = …` and `app.flags.new_checkout = …` included) or
+import alias of it counts, and so does a string naming it in `setattr(…)`
+or `__setattr__(…)`, or in a file that names `globals`, `vars` or the like.
+For a method, any name of it in a class body counts (an import there, too),
+and its class must be bound once: a class rebound later in its module
+(`Flags = wrap(Flags)`), or decorated with anything but `@dataclass`,
+`@final` or `@total_ordering`, makes none of its methods a wrapper. A test double refuses the whole wrapper before any
+call is folded (`test-double`): a string naming it in `patch(…)`,
+`patch.object(…)` or `monkeypatch.setattr(…)`, a keyword naming it in
+`Mock(…)`/`MagicMock(…)` or `patch.multiple(…)`, a write to it or to its
+`return_value`/`side_effect` on a mock, and for a method, a mock of its class
+(`create_autospec(Flags)`, `patch("app.flags.Flags")`). A string naming it
+anywhere else (`__all__`, `getattr(flags, "new_checkout")`) keeps it, though
+its proven callers are still folded (`unparsed-mention`); a docstring does
+not count unless it holds a doctest (`>>>`). A call in a self-documenting
+f-string field (`f"{new_checkout(u)=}"`) is not folded, since that prints its
+source text. An import of a deleted function is kept, and keeps the function,
+when the private alias its rewrite would bind is already used in the file. A method that is its class's only statement is kept, since the
+class would be left with no body.
+
+In Dart, a wrapper is a top-level function or getter, or a method or getter
+of a `class`, static or not, declared to return `bool` (not `bool?`), with no
+`async` or `sync*`, whose whole body is one read of the flag being removed:
+
+```dart
+class Flags {
+  Flags(this.client);
+  final FeatureflipClient client;
+
+  bool get newCheckout => client.boolVariation('old-checkout', defaultValue: false);
+}
+
+// elsewhere
+if (flags.newCheckout) { … }
+```
+
+The read is `boolVariation` (or one of your `accessors`) with the key first,
+as a literal, a constant in the same file, or a constant of another file the
+run proved names it. A call is folded when its file shows which declaration
+it reaches. Dart looks a bare name up in the enclosing scopes first, then in
+the library and its imports, and only then in inherited members, so:
+
+- the wrapper's name must be declared once across the repository's Dart
+  files, counting every local, parameter (of a function type too), field,
+  extension type representation, loop, `catch` or pattern variable, record
+  type field and named constructor, so that nothing can hide it;
+- a top-level wrapper is called bare in its own file or in a file whose import
+  of a library in your package reaches it (directly or through an `export`,
+  with no `hide` of it and any `show` naming it), or through a prefix of such
+  an import (`ff.newCheckout()`), but not a `deferred` one;
+- a static member is called through its class's name, reached the same way,
+  or bare inside its class;
+- an instance member is called bare or through `this` inside its class, or
+  through a name whose every declaration in the file is written with the
+  class as its type, or initialised with `Flags(…)`, `const Flags(…)` or
+  `new Flags(…)` and no type, where one of those declarations encloses the
+  call: a parameter, a local or a field of the enclosing class.
+
+Everything else is left alone: `widget.flags.newCheckout`,
+`context.read<Flags>().newCheckout`, `flags?.newCheckout`, `flags!.newCheckout`,
+a cascade, a `late`, nullable or `dynamic` declaration, a prefixed type
+(`p.Flags`), a constructor parameter, a method torn off without a call, a
+call with type arguments, a mention inside a string, a symbol (`#newCheckout`)
+a statement label, a record field or any other place that is not an
+expression, and every call in a library with `part` files or in a part.
+
+A class anything in the repository extends, implements or mixes in, that is
+`abstract`, `sealed`, `interface` or a `mixin class`, or that itself has an
+`extends`, `implements` or `with` clause, keeps its wrappers (`overridable`),
+as does a member marked `@override`: `@override` is optional, so a member of
+a class with a supertype may override one of the SDK's or a package's. A mock or fake that
+implements the class (`class MockFlags extends Mock implements Flags`, or a
+generated `*.mocks.dart`) keeps them as `test-double`, and so does a call
+inside a `when(() => …)` stub. A member of an extension, mixin, enum or
+extension type is not treated as a wrapper; the read in it is folded where it
+is. A wrapper with any annotation but `@deprecated` keeps its callers inlined
+and is itself kept (`annotated`): `@pragma('vm:entry-point')` means native
+code calls it.
+
+A public wrapper (no leading `_`) in your package's `lib/` is never deleted
+(`published`) unless `pubspec.yaml` says `publish_to: none`, as an app's does:
+another package that depends on yours may call it. Its callers in the
+repository are still inlined, and the removal is reported as partial. An
+instance member of such a package's public class is not inlined at all
+(`interface-published`) unless the class is `final` or `base`: every Dart
+class is an interface, and another package may implement it and pass its own
+member into your code. A doc comment referring to the wrapper
+(`[newCheckout]`, `[Flags.banner]`) keeps it too (`unparsed-mention`), since
+the analyzer resolves the reference. A string
+whose whole text is the wrapper's name (a platform channel's method name, a
+lookup key) also keeps it (`unparsed-mention`); a test's description and
+prose that only mentions the name do not.
+
 A method qualifies when its whole body is one read of the flag being removed
 (`= read`, `{ return read }`, `{ return read; }`), and:
 
@@ -1695,10 +1855,17 @@ implementation was bound. The member is inert when it is one of:
   operator. The last must be declared `bool`;
 - an auto-property with a setter or `init` and no initializer
   (`bool IsCheckoutEnabled { get; set; }`). It counts as returning `false`,
-  so it is inert only when the flag keeps serving `false`.
+  so it is inert only when the flag keeps serving `false` (a test fake's
+  aside, below).
+
+A configuration fallback (`ConfigCheckoutGate`, registered in place of the
+flag-backed gate when no SDK key is set) is such an implementation: it reads
+its options class and nothing else, so it takes the flag's value and goes
+with the family.
 
 The implementation must be a top-level class or struct, not `abstract`,
-`partial`, `static` or generic. It must be sealed or never extended, have every
+`partial`, `static` or generic; a test fake may also be a `private` class
+nested in another type (below). It must be sealed or never extended, have every
 base type in the repository, and, if it is public, sit in a project that cannot
 be packed. It must sit in a file of its own too: one in the wrapper's or the
 interface's file is `sibling-not-inert`. An implementation that returns the
@@ -1722,10 +1889,23 @@ test project. Read the deletion in the diff if your repository does that.
 
 A fake's member may instead return its knob: a settable field or property of
 its own, or a `bool` parameter of its primary constructor, read nowhere else
-in the fake. A knob's default (its initializer, a field's implicit `false`, or
-the parameter's default) must be the value the flag keeps serving. Tests that
-set the knob are resolved like stubs (below): `fake.Enabled = false;`,
-`new FakeFlags { Enabled = false }` and `new FakeFlags(false)`.
+in the fake. The knob only chooses which branch a test runs, whatever its
+default. Tests that set the knob are resolved like stubs (below):
+`fake.Enabled = false;`, `host.Gate.Enabled = false;` (where `host`'s declared
+type is a class of yours whose own field or auto-property `Gate` is declared
+as the fake), `new FakeFlags { Enabled = false }` and `new FakeFlags(false)`.
+A test that hands a fake built with nothing set straight to what it builds
+(`new Svc(new FakeFlags())`) and writes its knob nowhere is decided by the
+knob's default. A test that sets the knob to the value being removed
+part-way through and back (or to the end of its body) loses only the
+statements in between, unless they hold a `return`, a label or a local
+function, declare or write a name the rest of the test reads, hold the
+test's only `await`, or are the only use of a local declared before them;
+the pull request lists each such part. What those statements did to the
+objects the rest of the test uses is not judged: a failure there shows in the
+pull request's checks. A test relying on the default of a fake
+built somewhere else (a field, a factory) now runs the kept branch, and a
+failure there shows in the pull request's checks.
 
 A call is folded only when its file proves the receiver is that method's class:
 
@@ -1791,7 +1971,9 @@ or `PropertyDescriptor`, or does not parse. A C# file that spells
 `IgnoreCase` (`BindingFlags.IgnoreCase`, `StringComparison.OrdinalIgnoreCase`,
 ...) or holds a prefix pattern such as `"IsX*"` (as `GetMember` takes)
 counts every string naming the member in any case, or by such a prefix, even
-where it never spells the name itself. A string spelling an accessor's name
+where it never spells the name itself. A prefix (`"*"` included) counts only
+while some C# file of yours spells a lookup that takes one: `GetMember`,
+`GetMembers`, `FindMembers` or `Type.FilterName`. A string spelling an accessor's name
 (`"get_IsX"`, `"set_IsX"`) or the backing field's (`"<IsX>k__BackingField"`)
 names the member too.
 
@@ -1900,7 +2082,8 @@ Some C# shapes are not resolved, and keep the wrapper partial or need a look:
   implementation in that file, deletes it too;
 - a fake's knob set in a file that names none of the fake, the wrapper, its
   class or its interface (through a factory, say) is not seen, and can leave a
-  test failing in the pull request;
+  test failing in the pull request, as can a test relying on the removed
+  value as the default of a fake it did not build itself;
 - a pack or push made only through a build tool's own API is not seen:
   Cake's `DotNetPack(…)` or `DotNetNuGetPush(…)`, or a Nuke build class. A
   repository that publishes packages only that way reads as packing nothing,
@@ -1923,6 +2106,7 @@ is reported as **partial** rather than **complete**:
 | `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare, or an object literal used other than as a member's receiver (`Object.keys(flags)`, a spread, `flags[k]`, passed or re-exported). |
 | `interface-published` | The interface it implements is public and its module may be published, or has another implementation. In C#, an implementation in a Razor, Web Forms, VB or F# file, or an interface extending it, counts; any other implementation must be inert instead (see `sibling-not-inert`). |
 | `interface-structural` | A Go interface declares a method of the same name, or the wrapper is an exported Go method, which may satisfy an interface outside the repository. Or a TypeScript interface or type literal declares a property or method of the same name. |
+| `published` | Dart only: a public wrapper in a package's `lib/` whose `pubspec.yaml` does not say `publish_to: none`, which another package may call. Its callers are inlined and it is kept. |
 | `receiver-unproven` | Nothing in the file ties the receiver to the method's class. In TypeScript and JavaScript, also a use that hands a function wrapper's module on as an object (see above). |
 | `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
 | `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module, or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). |
@@ -1933,7 +2117,7 @@ is reported as **partial** rather than **complete**:
 | `unparsed-mention` | The name appears in a string (reflection, SpEL), a template, a layout, a Razor view, a C# `cref`, a `//go:linkname` comment, the name of a Go `Example` test, or another file this tool does not parse. Also a Go call in an external test package that declares a named `Example`. For a Java or Kotlin getter method with no parameters (`isEnableX()` or `getEnableX()`), the bean property name a template or SpEL reads it by (`enableX`) counts too, in a string or in a file this tool does not parse. |
 | `declaration-file` | TypeScript and JavaScript: the wrapper is a JavaScript function or member that its own hand-written declaration file declares (`flags.d.ts` beside `flags.js`), and that declaration cannot go with it: it shares a `declare const` with another name, or a TypeScript run of the same removal also edits the file. Its callers are inlined, and the wrapper stays with its declaration, for you to delete together. |
 | `not-folded` | The read inside the method was not folded, because its file could not be processed. |
-| `test-double` | A stub of the method this run could not resolve. In TypeScript and JavaScript, one stub of the wrapper that cannot be resolved, or any stub of a wrapper with a call that is not inlined, refuses it before a caller is inlined, and none of its stubs is edited. So does a stub of its whole class, a stub of an object it cannot rule out, an auto-mocking test bed or runner config, or a module mock of a target that does not resolve to a file or a declared package. |
+| `test-double` | A stub of the method this run could not resolve. In TypeScript and JavaScript, one stub of the wrapper that cannot be resolved, or any stub of a wrapper with a call that is not inlined, refuses it before a caller is inlined, and none of its stubs is edited. So does a stub of its whole class, a stub of an object it cannot rule out, an auto-mocking test bed or runner config, or a module mock of a target that does not resolve to a file or a declared package. In Python, any double of it refuses it (see above), so does a mock of a method's class. |
 | `sibling-not-inert` | Another implementation of the interface returns the value being removed, calls something, is `virtual`, is shared with another interface, or is otherwise not inert (C#). Reported at that implementation. |
 | `sibling-receiver` | Production code reads the member through a receiver typed as another implementation of the interface (C#). |
 | `annotated` | The method carries an annotation a framework may call it through (`@GetMapping`, `@Bean`, `@JvmName`, …), so it is kept even with no caller left. A Go function marked `//export` is kept the same way, and so is a TypeScript or JavaScript method with any decorator. |
@@ -1971,7 +2155,34 @@ or not at all:
   parameterless one;
 - in test projects, each `Mock<T>` or `Substitute.For<T>()` of these types
   that is only passed to such a constructor, each test that only builds one of
-  them and asserts a literal, and a test class those leave empty;
+  them and asserts a literal, and a test class those leave empty, or that the
+  run's test-double edits left empty;
+- in test projects, a field declared as a test fake and initialised by
+  nothing, `new()` or `new Fake()`, when every use of it is something else
+  listed here (registering it as the instance, `services.AddSingleton<I>(Gate)`,
+  included) and nothing outside its class can see it (it is `private`, or its
+  class is a `private` nested one); a `<see cref="Gate"/>` naming it becomes
+  `<c>Gate</c>`;
+- a call of a test host's own registration helper with these types
+  (`Replace<I>(services, new Fake())`), when the helper is a `private` generic
+  method of the same class whose body only calls `RemoveAll<T>()` and
+  `AddSingleton`/`AddScoped`/`AddTransient` (or `TryAdd…`) on its two
+  parameters;
+- a conventional middleware whose `Invoke`/`InvokeAsync(HttpContext, …)`
+  took one of these types and now only passes the request on: its fields are
+  private, its one constructor only stores its arguments, and its method ends
+  `await _next(context);` after nothing but locals no one reads and `if`s
+  holding only those, whose every call is made through a library type's name
+  (`Guid.TryParse(…)`) or on the request's context with no extension method
+  of its name in your C# (`context.Request.Path.StartsWithSegments(…)`). Before the run, those locals must have been read only in
+  the arguments of the calls of the deleted member, and each `if` must have
+  held such a call: they computed the gate's targeting values, and what they
+  call is assumed to do nothing else. The class goes with each
+  `app.UseMiddleware<…>()` registering it, and each test class of a test
+  project every test of which builds it, itself or through a helper of the
+  class declared to return it;
+- a `//` comment block standing alone above a deleted registration, which
+  names the flag or one of the deleted types;
 - a `<see cref="…"/>` naming one of them becomes `<c>…</c>`;
 - the options class an inert implementation read (`_options.Enabled`), with the
   statement binding it to a section (`services.Configure<GateOptions>(
@@ -1983,8 +2194,9 @@ or not at all:
 
 Every mention of each deleted type is looked for by text in every file of the
 repository (build output under `bin` and `obj` aside). Each must be one of the
-above, or a comment or Markdown text, which is listed in the pull request and
-left as it is. Anything else keeps all of it as it was: a string naming the
+above, or a comment, Markdown text or the source of another language outside
+every C# project's directory (another tool's fixture, say), which is listed
+in the pull request and left as it is. Anything else keeps all of it as it was: a string naming the
 type, a configuration or Razor file naming it, a use not listed above, an
 assembly scan whose filter could include the types, a public constructor in a
 project that may be packed, a project `<Using>` of an emptied namespace. The
@@ -2009,9 +2221,12 @@ What still keeps it, by design, until it can be proven:
   has a second constructor;
 - a binding whose configuration is not provably the root (a local, a
   `GetSection(…)` result, a parameter some caller passes something other
-  than a host's `Configuration`) keeps the options class and its keys;
+  than a host's `Configuration` or a configuration it built itself with
+  `new ConfigurationBuilder()…Build()`) keeps the options class and its keys;
 - a setting of an options class shared with other settings is kept when a
-  value of the class is passed on, returned, serialised or reflected over;
+  value of the class is passed on, returned, serialised or reflected over,
+  except straight into `new C(Options.Create(new O { … }))` where `C`'s one
+  constructor declares that parameter `IOptions<O>`;
 - an emptied test class with a base class, an attribute or another part, or
   one named elsewhere, is kept, emptied;
 - a file is deleted only when nothing but namespaces, comments and its own
@@ -2022,8 +2237,8 @@ What still keeps it, by design, until it can be proven:
   may be stale.
 
 **A gate that takes no key and is not inlined is reported, not rewritten.**
-That is every such gate outside Kotlin, Java, C#, Go, TypeScript and
-JavaScript, and one of theirs that does not qualify, such as a gate whose
+That is every such gate outside Kotlin, Java, C#, Go, TypeScript,
+JavaScript and Python, and one of theirs that does not qualify, such as a gate whose
 interface has a second implementation that is not inert:
 
 ```csharp
@@ -3649,6 +3864,26 @@ a `call` member is left in place, since using those spells no name at all.
 Imports in a library that has `part` files are never removed: a part shares its
 library's imports, and nothing here reads the part to see what it uses. Every
 removal is listed in the pull request body.
+
+A private field (`_name`) whose every read was in the removed code is left
+unread, which `dart analyze` reports as `unused_field`. It is deleted, with
+the `///` comment above it (and any `//` line between the two) and a comment
+on its own line, when nothing else in
+its library spells its name and its initializer cannot do work: there is
+none, it is a literal, a `const` expression or a collection literal built of
+those, or the field is `late` or `static`, whose initializer only runs when
+the field is first read. It is kept, and named in the pull request body, when:
+
+* a constructor sets it (`Svc(this._client)`, or `: _client = client`), since
+  removing it would change the constructor every caller uses;
+* something else assigns it, or its initializer may do work
+  (`final _client = FeatureClient();`, `Foo.instance`, `'$x'`);
+* it carries an annotation, is `external` or `abstract`, shares a declaration
+  with another field, or shares its name with a getter, setter or method;
+* its type or initializer is the last use of an import or of a private class,
+  function or variable (`Timer? _timer;` as the only `Timer` in a file that
+  imports `dart:async`), since deleting it would leave that unused instead;
+* its library has `part` files, since another part may read it.
 
 A local whose name is one of Dart's **built-in identifiers** — `on`, `show`,
 `hide`, `late`, `required`, `covariant`, `get`, `set`, `factory`, `operator`,

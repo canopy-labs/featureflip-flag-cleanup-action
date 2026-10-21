@@ -820,9 +820,57 @@ def create_branch(directory: str, branch: str) -> None:
 
 
 def restore_ref(directory: str, ref: str) -> None:
-    """Switch back to ``ref`` (branch name or sha) after the PR work."""
+    """Switch back to ``ref`` (branch name or sha) after the PR work.
+
+    A whole file the removal commit deleted is in the way first. The
+    transform's undo has re-created it, and on the removal branch git no
+    longer tracks it, so ``git checkout`` refuses to overwrite it with the
+    copy ``ref`` holds, after the branch was already pushed.
+    :func:`_clear_deleted_files` removes exactly those files, and only the
+    ones holding the bytes the checkout is about to put back.
+    """
     logger.debug("restoring %s in %s", ref, directory)
+    _clear_deleted_files(directory, ref)
     _git(["checkout", "--quiet", ref, "--"], cwd=directory)
+
+
+def _clear_deleted_files(directory: str, ref: str) -> None:
+    """Remove each file that ``ref`` tracks, HEAD deleted, and the disk holds
+    with exactly ``ref``'s content.
+
+    The content check is what makes this lossless: the checkout writes the
+    same blob straight back, and the caller's snapshot verification still
+    compares the result with what the run started from. A file whose bytes
+    differ is left alone, so the checkout refuses it as it always did rather
+    than losing it. A path git still has in the index is left too: it is not
+    in the checkout's way.
+    """
+    top = _git(["rev-parse", "--show-toplevel"], cwd=directory).strip()
+    raw = _git(
+        ["diff", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-relative",
+         "--diff-filter=D", ref, "HEAD", "--"],
+        cwd=top,
+    )
+    # `-z --raw` alternates ":<modes> <old sha> <new sha> D" with the path.
+    fields = raw.split("\0")
+    deleted = {
+        name: header.split()[2]
+        for header, name in zip(fields[::2], fields[1::2], strict=False)
+        if name
+    }
+    present = [name for name in deleted if os.path.isfile(os.path.join(top, name))]
+    if not present:
+        return
+    indexed = set(
+        _git(["--literal-pathspecs", "ls-files", "-z", "--", *present], cwd=top).split("\0")
+    )
+    present = [name for name in present if name not in indexed]
+    if not present:
+        return
+    hashes = _git(["hash-object", "--", *present], cwd=top).split()
+    for name, sha in zip(present, hashes, strict=True):
+        if sha == deleted[name]:
+            os.remove(os.path.join(top, name))
 
 
 def delete_branch(directory: str, branch: str) -> None:

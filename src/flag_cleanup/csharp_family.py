@@ -140,7 +140,7 @@ def family_of(repo_dir: str, wrapper, index) -> Family:
             for t in index.types.get(wrapper.interface.name, [])
             if t.namespace == wrapper.interface.package and t.path == wrapper.interface.path
         ]
-    sibling_full = frozenset(_full(s.namespace, s.owner) for s in wrapper.siblings)
+    sibling_full = frozenset(_full(s.namespace, s.type_chain) for s in wrapper.siblings)
     decls += [
         t
         for s in wrapper.siblings
@@ -253,7 +253,7 @@ def _sibling_bases_external(repo_dir: str, siblings) -> bool:
     readers = wc._Readers(repo_dir)
     for sibling in siblings:
         reader = readers.get(sibling.path)
-        node = wc._find_type_in(reader.root, sibling.namespace, sibling.owner) if reader is not None else None
+        node = wc._find_type_in(reader.root, sibling.namespace, sibling.type_chain) if reader is not None else None
         if node is None or not wc._bases_in_repository(readers, sibling.path, node):
             return True
     return False
@@ -1605,6 +1605,31 @@ def loose_files(repo_dir: str) -> tuple[str, ...]:
     return _LOOSE[repo_dir]
 
 
+#: The by-name lookups that take a PREFIX (``GetMember("IsX*")``,
+#: ``FindMembers`` with ``Type.FilterName``): the only way a string ending in
+#: ``*`` reaches a member it does not spell.
+_PATTERN_ROUTE = re.compile(r"\bGetMembers?\b|\bFindMembers\b|\bFilterName(?:IgnoreCase)?\b")
+#: repo_dir -> whether a C# file of the checkout spells a prefix lookup.
+_PATTERNS: dict[str, bool] = {}
+
+
+def pattern_routes(repo_dir: str) -> bool:
+    """Whether any C# file of the checkout, ignored ones included, spells a
+    lookup that takes a name prefix (:data:`_PATTERN_ROUTE`), or cannot be
+    read. Without one, ``"*"`` or ``"IsX*"`` names no member, wherever a
+    string may flow. Read once per ``repo_dir``, like the scan."""
+    if repo_dir not in _PATTERNS:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        _PATTERNS[repo_dir] = any(
+            (text := wc._read(f.resolved)) is None or _PATTERN_ROUTE.search(text) is not None
+            for f in source_index.files(repo_dir, {".cs"}, with_ignored=True)
+            if f.path.name.endswith(".cs")
+        )
+    return _PATTERNS[repo_dir]
+
+
 def route_names(root: Node, source: str) -> list[Node] | None:
     """The NAME argument of every call in a parsed file whose callee is
     spelled like a by-name route (``GetProperty``, ``Expression.Property``,
@@ -2148,6 +2173,7 @@ def reset_cache() -> None:
     _ROUTED.clear()
     _NAMEOF.clear()
     _LOOSE.clear()
+    _PATTERNS.clear()
 
 
 def _enclosing(path: str, projects: frozenset[Path]) -> list[Path]:

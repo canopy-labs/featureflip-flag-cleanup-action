@@ -3,7 +3,7 @@
 A removal deletes a constructor parameter and the argument each caller passes
 for it, or a TypeScript field (``ts_field_removal``) with the constructor
 statement that assigns it, and that constructor's parameter when the
-assignment was its last read. Which callers exist is proven per language
+assignment was its last read, or a Dart field (``dart_field_removal``). Which callers exist is proven per language
 (``ctor_param_ts``, ``ctor_param_csharp``); the deletion itself is the
 engine's, through rules rendered here.
 """
@@ -25,7 +25,11 @@ IDENT = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 
 SENTINEL_PREFIX = "__ff_drop_arg_"
 
-_TEMPLATES = {"ts": "ts_ctor_param.toml", "csharp": "csharp_ctor_param.toml"}
+_TEMPLATES = {
+    "ts": "ts_ctor_param.toml",
+    "csharp": "csharp_ctor_param.toml",
+    "dart": "dart_ctor_param.toml",
+}
 _BLOCK = re.compile(r"^# ctor: (parameter|classic|argument)\n", re.MULTILINE)
 
 #: What each form of mark writes in place of its span. An argument becomes the

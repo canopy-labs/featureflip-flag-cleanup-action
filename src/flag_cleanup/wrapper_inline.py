@@ -42,7 +42,9 @@ Anything unproven is left exactly as it is and reported, with its reason.
 The shared loop lives here; what a declaration, a receiver and an import look
 like lives in one profile per language (:mod:`flag_cleanup.wrapper_kotlin`,
 :mod:`flag_cleanup.wrapper_java`, :mod:`flag_cleanup.wrapper_csharp`,
-:mod:`flag_cleanup.wrapper_go`, :mod:`flag_cleanup.wrapper_ts`), with
+:mod:`flag_cleanup.wrapper_go`, :mod:`flag_cleanup.wrapper_ts`,
+:mod:`flag_cleanup.wrapper_python`,
+:mod:`flag_cleanup.wrapper_dart`), with
 the facts both JVM languages share in :mod:`flag_cleanup.wrapper_jvm`. A
 profile that brings its own repository index and qualification says so; one
 that does not is judged by the JVM ones.
@@ -76,6 +78,10 @@ INTERFACE_PUBLISHED = "interface-published"
 #: Never produced for the JVM languages, whose interfaces are nominal. Go's
 #: are structural, and an exported Go method is kept for the same reason.
 INTERFACE_STRUCTURAL = "interface-structural"
+#: A public member of a package that may be published, which code outside the
+#: repository may call: its callers are inlined, and it is never deleted. Only
+#: Dart produces it.
+PUBLISHED = "published"
 #: Nothing in the file ties the call's receiver to the wrapper. Also a use
 #: handing a TypeScript or JavaScript function wrapper's module on as an
 #: object, through which a computed name can call it.
@@ -195,6 +201,14 @@ class Sibling:
     #: ``new Owner(<value>)``; otherwise a member, set as ``x.Knob = <value>``
     #: or ``new Owner { Knob = <value> }``.
     knob_primary: bool = False
+    #: The type's dotted name inside its namespace when it is nested in
+    #: another (``Outer.Owner``); ``None`` for a top-level type.
+    chain: str | None = None
+
+    @property
+    def type_chain(self) -> str:
+        """The type's name inside its namespace, outer types included."""
+        return self.chain or self.owner
 
 
 @dataclass(frozen=True)
@@ -375,9 +389,14 @@ class Profile:
     #: the member, the profile's own judgement; ``None``: every string
     #: literal spelling its name, where ``mention_counts`` counts strings.
     string_mentions: Callable[[wrapper_jvm.Index, str, Wrapper], list[tuple[int, str]]] | None = None
-    #: ``(repo_dir, wrapper)`` -> every remaining mention after the fold, the
-    #: profile's own judgement; ``None`` for the shared scan.
-    leftovers: Callable[[str, Wrapper], list[tuple[str, int, str]]] | None = None
+    #: ``(repo_dir, wrapper, removable)`` -> every remaining mention after the
+    #: fold, the profile's own judgement; ``None`` for the shared scan.
+    leftovers: Callable[[str, Wrapper, frozenset[str]], list[tuple[str, int, str]]] | None = None
+    #: ``(repo_dir, path, wrapper)`` -> ``(before, after)`` for a file the run
+    #: rewrote, with its imports of a function wrapper rewritten so the module
+    #: still loads, or ``None`` when nothing changes; ``None``: Kotlin's
+    #: whole-line deletion.
+    imports: Callable[[str, str, Wrapper], tuple[str, str] | None] | None = None
     #: ``(path, wrapper, index)`` -> the doc comments of a parsed file that
     #: refer to the member and are rewritten when it goes, instead of keeping
     #: it; ``None`` where none is.
@@ -415,7 +434,7 @@ def register(profile: Profile) -> None:
 
 def profile(language: str) -> Profile | None:
     """The language's profile, or ``None`` for a language not covered yet."""
-    from flag_cleanup import wrapper_csharp, wrapper_go, wrapper_java, wrapper_kotlin, wrapper_ts  # noqa: F401 - registration
+    from flag_cleanup import wrapper_csharp, wrapper_dart, wrapper_go, wrapper_java, wrapper_kotlin, wrapper_python, wrapper_ts  # noqa: F401 - registration
 
     return _PROFILES.get(language)
 
@@ -496,9 +515,15 @@ def _fixed_at_removed_value(sibling: Sibling, treatment: bool) -> bool:
     an auto-property left at its ``false`` default. Whatever builds it --
     production code, or a test through any alias, factory, fixture or
     language -- relies on the branch being removed, and nothing here can see
-    all of what builds it, so such a sibling never goes. A test fake whose
-    knob DEFAULTS to the removed value is the same: a test that builds it and
-    never sets the knob runs the removed branch."""
+    all of what builds it, so such a sibling never goes. A test fake set by
+    a knob is not fixed, whatever its knob defaults to: the knob is what its
+    tests choose a branch with."""
+    if sibling.test and sibling.knob is not None:
+        # A test fake's knob only chooses which branch a test exercises. A
+        # test that sets the removed value is deleted with its stub; one that
+        # relies on the default runs the kept branch once the fake is gone,
+        # and a failure there shows in the pull request's own checks.
+        return False
     fixed = {"true": True, "false": False, "auto-property": False}.get(sibling.returns)
     if fixed is None and sibling.knob is not None:
         fixed = {"true": True, "false": False}.get(sibling.knob_default or "")
@@ -1031,7 +1056,7 @@ def _leftovers(
 
     lang = profile(wrapper.language)
     if lang.leftovers is not None:
-        return lang.leftovers(repo_dir, wrapper)
+        return lang.leftovers(repo_dir, wrapper, removable)
     foreign = (
         lang.foreign_extensions if lang.foreign_extensions is not None else wrapper_jvm.FOREIGN_EXTENSIONS
     )
@@ -1344,6 +1369,11 @@ def close_out(
                     edits.append((sibling_path, edit))
                 if wrapper.kind == "function":
                     for path in sorted(removable - {wrapper.path}):
+                        if lang.imports is not None:
+                            rewritten = lang.imports(repo_dir, path, wrapper)
+                            if rewritten is not None:
+                                edits.append((path, rewritten))
+                            continue
                         spans = _function_imports(path, wrapper)
                         if spans:
                             before = _read(path)
