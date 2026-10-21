@@ -302,3 +302,49 @@ holes = ["treated", "stale_flag_name"]
 # it as removable, so a const it reads is kept. The root capture is required:
 # an uncaptured root never matches (see `csharp.toml`).
 not_enclosing_node = """([(encapsed_string) (heredoc)] @interpolation)"""
+
+# --- @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
+#
+# Reached ONLY through the wrapper pass (`wrapper_inline`), as the rules of
+# these names in dart.toml and go.toml are. The pass proves that a call such as
+# `$this->flags->newCheckout($u)`, `Flags::check($u)` or a function's
+# `newCheckout()` reaches a method or function whose whole body is a read of
+# this flag, and replaces the callee (receiver included) with the run's
+# sentinel identifier: `__ff_cleanup_<hash>($u)`, a plain function call. Which
+# calls are this flag's was decided there, call by call, so these rules check
+# nothing but the sentinel. A sentinel left behind is a refusal, never a diff
+# (`SentinelPrePass.survived`).
+#
+# Holes name `sentinel` and not `stale_flag_name`: a call-site file names no
+# key, and the engine skips a file holding none of a seed's hole values.
+#
+# The discarded-statement rule comes first, so a call made only for its value's
+# sake leaves nothing behind rather than a bare `true;` (legal, but a residue).
+# It needs no argument filter, because the wrapper pass refuses every call
+# whose arguments do work.
+[[rules]]
+name = "delete_discarded_sentinel_statement"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @sdk_fn
+    ) @call
+  ) @stmt
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "stmt"
+replace = ""
+holes = ["sentinel"]
+
+[[rules]]
+name = "replace_sentinel_read_with_boolean_literal"
+query = """(
+  (function_call_expression
+    function: (name) @sdk_fn
+  ) @call
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "sentinel"]

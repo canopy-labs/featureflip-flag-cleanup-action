@@ -10,7 +10,9 @@ A TypeScript or JavaScript private field (:mod:`flag_cleanup.ts_field_removal`)
 is marked the same way, with the constructor statement that assigns it, and
 takes the constructor parameter it was assigned from when nothing else reads
 that parameter. A Dart private field (:mod:`flag_cleanup.dart_field_removal`)
-is marked the same way, on its own.
+is marked the same way, with each constructor parameter or initializer-list
+entry that sets it and, when a parameter goes, every caller's argument for it
+(:mod:`flag_cleanup.ctor_param_dart`).
 Deleting by a marked identity rather than by position matters: the engine
 applies a rule until it stops matching, so a positional rule would also delete
 the argument that moves into the emptied slot.
@@ -229,7 +231,7 @@ def remove(
         # file (`a,\r\r\n`): the same repair every other deletion gets.
         for key in files:
             engine_out = Path(key).read_bytes()
-            tidied = tidy(marked[key], engine_out)
+            tidied = tidy(marked[key], engine_out, named_groups=language == "dart")
             if b"\r" in tidied:
                 tidied = syntax.collapse_introduced_carriage_returns(
                     _decode(marked[key]), _decode(tidied), _grammar(key, language)
@@ -341,6 +343,8 @@ def kept_argument_locals(
 
 def _parameter_spans(data: bytes, removal: Removal, language: str) -> list[tuple[int, int]]:
     """Byte spans of ``removal``'s parameter in ``data``, byte-order mark included."""
+    if language == "dart":
+        return []  # a Dart parameter is one of the removal's marked sites
     offset = 3 if data.startswith(b"\xef\xbb\xbf") else 0
     source = _decode(data)
     if language == "csharp":
@@ -384,8 +388,8 @@ def _postcondition(
             else ts_field_removal.has_field(source, grammar, removal.class_name, removal.field)
         ):
             return f"{removal.declaring_path}: the field {removal.field} is still declared"
-        if removal.param_name is None:
-            continue
+        if removal.param_name is None or language == "dart":
+            continue  # a marked Dart parameter left behind keeps the sentinel
         if language == "csharp":
             present = ctor_param_csharp.has_parameter(
                 source, removal.class_name, removal.param_name

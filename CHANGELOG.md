@@ -7,6 +7,58 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.12.0
+
+### New
+
+- **PHP:** a keyless wrapper is inlined at its callers and deleted once none
+  is left, as in the other languages. It is a function, or a method of a
+  class, declared to return `bool` (or with no return type), whose whole body
+  is one read of the flag
+  (`return $this->client->boolVariation('old-checkout', [], false);`). A call
+  is inlined only where its file proves it reaches that declaration: a
+  function name the file's namespace or a `use function` import resolves to
+  it, the class's name or `self::` for a static method, and `$this`, a
+  parameter typed as the class, or a `private` property typed as the class
+  for an instance method. A class that is extended, abstract, has a parent,
+  an interface, a trait or `__call`, or has a test double keeps its wrappers,
+  as does a string naming the wrapper (a callable). A public wrapper of a
+  Composer package that is not a `project` is kept. See README's "Wrapping
+  the SDK" for what is left alone, and why.
+- **Dart:** a private field left unread that a constructor sets is now
+  deleted too, with what sets it: a `this._client` parameter, or an
+  initializer-list entry (`: _client = client`) and the parameter it read
+  when nothing else uses it. Every call of that constructor in the repository
+  loses its argument, positional or named, through `new`, `const`, an import
+  prefix, a redirecting `this(…)` or a subclass's `super(…)`. It happens only
+  when every use of the class is accounted for: a private class in its own
+  file, a public one in every Dart file of a package that is not published.
+  A field whose initializer calls a `const` constructor with constant
+  arguments (`final _client = FeatureClient();`) is deleted too. See README's
+  Dart section for what is still kept and named in the pull request.
+
+### Fixed
+
+- **C#:** more gate families are removed whole instead of being kept by a
+  proof that was too coarse:
+  - a lookup over a local `Dictionary<K, Type>` of `typeof(…)` values no
+    longer counts every string just because a file that does not parse uses
+    a `Dictionary`; such a file may declare a type only under a name written
+    right after `class`, `struct`, `interface`, `enum` or `record`;
+  - in a file that compares names ignoring case, a string passed straight
+    into another file's method (`Assert.True(Allowlist.IsAllowed(Kind.X,
+    "IsEnabled"))`) no longer counts as naming the member;
+  - a member lookup only tested for an attribute no longer keeps a gate
+    whose wrapper file the run itself rewrote;
+  - a constructor taking the gate interface is no longer kept by a
+    target-typed `new(…)` whose type its context names
+    (`static Resp Make() => new(…)`, `Resp r = new(…)`, an element of
+    `new List<Resp> { new(…) }`) or that sits in a project that cannot see
+    the class;
+  - nor by `typeof` passed to your own attribute that keeps the `Type` in a
+    get-only property only compared with `==` or `!=` (a test-coverage
+    marker such as `[Covers(typeof(Job), …)]`).
+
 ## 1.11.0
 
 ### New

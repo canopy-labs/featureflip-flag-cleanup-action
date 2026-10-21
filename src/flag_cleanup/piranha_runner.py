@@ -1663,7 +1663,7 @@ def _transform_flag(
         # engine. See `_inline_bound_reads`.
         "marker": marker_for(flag_key),
     }
-    # The sentinel rules of Java, C#, Go, Dart and the TS family name the hole
+    # The sentinel rules of Java, C#, Go, Dart, PHP and the TS family name the hole
     # whether or not this run marks a wrapper call, and a hole no substitution
     # supplies aborts the engine. Kotlin's is supplied by its pre-pass, which
     # always exists.
@@ -3581,7 +3581,7 @@ def _accessor_templates_for(rules_file: Path) -> str | None:
 
 
 #: The languages whose pre-pass exists only to mark keyless-wrapper calls.
-_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart"})
+_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart", "php"})
 
 
 def _sentinel_prepass(
@@ -3596,11 +3596,11 @@ def _sentinel_prepass(
 
     Kotlin always has one, and it is a workaround for a specific engine
     limitation rather than a general stage — see
-    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go, Dart and the TS family have one only when
+    :mod:`flag_cleanup.kotlin_sentinel`. Java, C#, Go, Dart, PHP and the TS family have one only when
     there are keyless-wrapper calls to mark (``wrapper_spans``, see
     :mod:`flag_cleanup.wrapper_inline`): it marks those and nothing else, and
     the sentinel rules in ``rules/java.toml``, ``rules/csharp.toml``,
-    ``rules/go.toml``, ``rules/dart.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
+    ``rules/go.toml``, ``rules/dart.toml``, ``rules/php.toml`` and ``rules/ts.toml`` fold them. Keeping the decision in one function means the places `run_piranha`
     has to care about it all ask the same question.
     """
     spans = dict(wrapper_spans or {})

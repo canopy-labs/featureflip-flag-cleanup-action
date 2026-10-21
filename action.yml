@@ -218,11 +218,12 @@ inputs:
   inline-wrappers:
     description: >-
       When `true` (the default), a Kotlin, Java, C#, Go, TypeScript, JavaScript,
-      Python or Dart wrapper whose whole body is one read of the flag being removed
-      (a method, a Kotlin property getter or top-level function, a C# get-only
-      `bool` property, a Go function, a TypeScript or JavaScript function or
-      class method, a Python function, method or `@property`, or a Dart
-      function, method or getter) is inlined at
+      Python, Dart or PHP wrapper whose whole body is one read of the flag being
+      removed (a method, a Kotlin property getter or top-level function, a C#
+      get-only `bool` property, a Go function, a TypeScript or JavaScript
+      function or class method, a Python function, method or `@property`, a
+      Dart function, method or getter, or a PHP function or class method) is
+      inlined at
       every call site its file proves is bound to it, and deleted once nothing
       calls it. Each call
       that cannot be proven is left as it is and listed in the pull request

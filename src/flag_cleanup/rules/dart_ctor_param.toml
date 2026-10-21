@@ -1,13 +1,20 @@
 # Private-field removal, rendered per run by `ctor_param_model.render_rules`.
 # Never loaded as shipped.
 #
-# Dart removes a field and never a constructor parameter, so the one block is
-# an `argument` block, rendered once with __CTOR_SENTINEL__: the caller has
-# already replaced every field to delete, and the `;` after it, with a method
-# of that name (`ctor_param_model.FORMS`), so deletion is by identity and the
-# engine's apply-until-no-match loop stops after the marked spans.
+# Every block is an `argument` block, rendered once with __CTOR_SENTINEL__: the
+# caller has already replaced everything to delete with a form of that name
+# (`ctor_param_model.DART_FORMS`), so deletion is by identity and the engine's
+# apply-until-no-match loop stops after the marked spans. Matching by position
+# would re-fire on the argument that shifts into the deleted slot.
 #
-# No holes and no edges: the rule is a seed that matches on its own.
+# - a field, and the `;` after it, became a method of that name;
+# - a constructor parameter (with its `required`, its default value, or the
+#   whole `[...]`/`{...}` group when it was the group's only member) and a
+#   call argument (a named one with its label) became the bare name;
+# - an initializer-list entry became `<name> = 0`, and the whole list, its
+#   `:` included, when it was the list's only entry.
+#
+# No holes and no edges: every rule is a seed that matches on its own.
 
 # ctor: argument
 [[rules]]
@@ -19,5 +26,67 @@ query = """(
   (#eq? @name "__CTOR_SENTINEL__")
 )"""
 replace_node = "member"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_argument"
+query = """(
+  (arguments (identifier) @argument)
+  (#eq? @argument "__CTOR_SENTINEL__")
+)"""
+replace_node = "argument"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_parameter"
+query = """(
+  (formal_parameter . (identifier) @name .) @parameter
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "parameter"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_initializer"
+query = """(
+  (initializers
+    (initializer_list_entry (field_initializer name: (identifier) @name)) @entry
+    (initializer_list_entry))
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "entry"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_later_initializer"
+query = """(
+  (initializers
+    (initializer_list_entry)
+    (initializer_list_entry (field_initializer name: (identifier) @name)) @entry)
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "entry"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_initializers"
+query = """(
+  (initializers
+    .
+    (initializer_list_entry (field_initializer name: (identifier) @name))
+    .) @initializers
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "initializers"
 replace = ""
 is_seed_rule = true

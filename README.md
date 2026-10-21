@@ -667,7 +667,7 @@ entries dropped.
 | `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`). See [Wrapping the SDK](#wrapping-the-sdk). |
-| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python and Dart: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, or Dart function, method or getter whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
+| `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart and PHP: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, Dart function, method or getter, or PHP function or class method whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. In the archive modes, the only branch a removal's merge counts on: give them the same value as the cleanup workflow. |
@@ -1066,7 +1066,7 @@ wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
 key is not at the call site and no name will make it matchable. Those reads are
 reported as unremoved rather than guessed at.
 
-**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript, JavaScript, Python and Dart.**
+**A wrapper that takes no key is inlined at its callers, in Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart and PHP.**
 A flag is often read once, inside a method, and checked everywhere else through
 that method:
 
@@ -1769,6 +1769,87 @@ whose whole text is the wrapper's name (a platform channel's method name, a
 lookup key) also keeps it (`unparsed-mention`); a test's description and
 prose that only mentions the name do not.
 
+In PHP, a wrapper is a function declared at the top of a file or namespace,
+or a method of a `class`, static or not, declared to return `bool` or with no
+return type, whose whole body is `return <read>;`:
+
+```php
+final class Flags
+{
+    public function __construct(private FeatureflipClient $client) {}
+
+    public function newCheckout(): bool
+    {
+        return $this->client->boolVariation('old-checkout', [], false);
+    }
+}
+
+// elsewhere
+if ($this->flags->newCheckout()) { … }
+```
+
+The read is `boolVariation` (or one of your `accessors`) or OpenFeature's
+`getBooleanValue`, with the key first, as a literal, a constant in the same
+file, or a constant of another file the run proved names it. PHP binds a
+function or method name by its namespace and its class, never by what a
+local holds, and compares it without case, so:
+
+- the wrapper's name must be declared once, as a function or a method of any
+  class, interface, trait or enum, across the repository's PHP files
+  (Composer's `vendor/` aside);
+- a function is called bare where the file's namespace, a `use function`
+  import or PHP's fallback to the global namespace reaches it, or by a
+  qualified name that resolves to it (`\App\Flags\newCheckout()`);
+- a static method is called through its class's name, resolved through the
+  file's namespace and `use` imports, or as `self::` inside its class
+  (`static::` too, unless another package may extend the class);
+- an instance method is called as `$this->newCheckout()` inside its class,
+  through a parameter of the enclosing function typed as the class (not
+  nullable, no default, not by reference) that the function only ever uses as
+  an object, or as `$this->flags->newCheckout()` where `flags` is a `private`
+  property of the enclosing class typed as the class, declared or promoted by
+  the constructor.
+
+Everything else is left alone: a local (`$flags = new Flags(…)`), a public
+or protected property, `$flags?->newCheckout()`, a call inside a closure, an
+arrow function or an anonymous class (`Closure::bind` can rebind `$this`), a
+first-class callable (`$flags->newCheckout(...)`), a call passed as an
+argument, parenthesized or not (a literal cannot be passed by reference, and
+the callee's signature is not read), a call that is the whole body of a
+braceless `if`, `else`, loop or `do`, a call whose result is used as an object, a call inside string
+interpolation, a call with an argument that does work (a call, an assignment,
+`new`, an increment, `...$spread`), and every call in a file that does not
+parse. A function with a by-reference parameter, or a default that does work,
+is not treated as a wrapper.
+
+A class anything in the repository extends (an anonymous class too), that is
+`abstract`, that has an `extends` or `implements` clause or uses a trait, or
+that declares `__call` or `__callStatic` keeps its wrappers (`overridable`),
+as does a method marked `#[\Override]`. A `class_alias` of the class keeps
+them as `name-not-unique`. A PHPUnit, Mockery or Prophecy double of the class
+(`createMock(Flags::class)`, `Mockery::mock(Flags::class)`,
+`prophesize(Flags::class)`) or a stub of the method (`->method('newCheckout')`,
+`->shouldReceive('newCheckout')`, a php-mock `getFunctionMock`) keeps them as
+`test-double`. A wrapper with an attribute other than `#[Deprecated]` (or a
+docblock annotation such as `@Route(...)` or `@VirtualProperty`) keeps its callers inlined and is
+itself kept (`annotated`).
+
+A string whose text names the wrapper (`'newCheckout'`,
+`'App\Flags\newCheckout'`, `'Flags::check'`, `'App\Flags\Flags@check'`) keeps it (`unparsed-mention`):
+PHP calls a callable by its name, as in `call_user_func`, `[$flags,
+'newCheckout']` or a framework's registration. So does the name in inline
+markup, and in any other file (a Twig template, a YAML config) in any case,
+and for an `isX`, `getX` or `hasX` wrapper as the `x` a template reads. Its
+callers are still inlined. A dynamic call that
+spells no name (`$flags->$method()`) cannot be seen. A public or protected
+wrapper of a Composer package whose `composer.json` does not say `"type":
+"project"` is never deleted (`published`): Composer's default type is
+`library`, and another package may call it. So is one of a WordPress plugin
+or theme (a `Plugin Name:` or `Theme Name:` header). An instance method of such a
+package's class is not inlined at all (`interface-published`) unless the
+class is `final` or the method `private`, since another package may extend
+the class and pass its own method into your code.
+
 A method qualifies when its whole body is one read of the flag being removed
 (`= read`, `{ return read }`, `{ return read; }`), and:
 
@@ -1971,7 +2052,11 @@ or `PropertyDescriptor`, or does not parse. A C# file that spells
 `IgnoreCase` (`BindingFlags.IgnoreCase`, `StringComparison.OrdinalIgnoreCase`,
 ...) or holds a prefix pattern such as `"IsX*"` (as `GetMember` takes)
 counts every string naming the member in any case, or by such a prefix, even
-where it never spells the name itself. A prefix (`"*"` included) counts only
+where it never spells the name itself, except a string passed straight into
+a method of another file (`Check.True(Allowlist.Has(Kind.X, "IsX"))`: the
+call is a statement of its own, or an argument of one, its qualifier names a
+type, its other arguments read only constants of such types, and nothing on
+the way spells `IgnoreCase`), which is judged where that method is. A prefix (`"*"` included) counts only
 while some C# file of yours spells a lookup that takes one: `GetMember`,
 `GetMembers`, `FindMembers` or `Type.FilterName`. A string spelling an accessor's name
 (`"get_IsX"`, `"set_IsX"`) or the backing field's (`"<IsX>k__BackingField"`)
@@ -1987,7 +2072,11 @@ local nothing writes, passes or returns. Those constants then count where the
 lookup's own would. A lookup on `typeof(C)`, or on a `foreach` variable over
 such a local `Dictionary<K, Type>` (its values) or array of `typeof(…)`, takes
 any name without counting, when no `C` is, derives from or otherwise leads to
-the types (a member of a class does not see an interface's members).
+the types (a member of a class does not see an interface's members). The
+`Dictionary` must be the framework's: no file of yours declares a type of
+that name, and one that does not parse may declare only a name it writes
+right after `class`, `struct`, `interface`, `enum` or `record` (any name, if
+it spells `delegate`).
 
 A `GetProperty` or `GetRuntimeProperty` with a computed name does not make
 strings count when its result is only asked whether it carries an attribute:
@@ -2106,7 +2195,7 @@ is reported as **partial** rather than **complete**:
 | `overridable` | The method is open, abstract or an override, or its class is extended. In C#, also `virtual`, `new`, or a class with a base type outside the repository. In TypeScript, a class that extends or implements a type the repository does not declare, or an object literal used other than as a member's receiver (`Object.keys(flags)`, a spread, `flags[k]`, passed or re-exported). |
 | `interface-published` | The interface it implements is public and its module may be published, or has another implementation. In C#, an implementation in a Razor, Web Forms, VB or F# file, or an interface extending it, counts; any other implementation must be inert instead (see `sibling-not-inert`). |
 | `interface-structural` | A Go interface declares a method of the same name, or the wrapper is an exported Go method, which may satisfy an interface outside the repository. Or a TypeScript interface or type literal declares a property or method of the same name. |
-| `published` | Dart only: a public wrapper in a package's `lib/` whose `pubspec.yaml` does not say `publish_to: none`, which another package may call. Its callers are inlined and it is kept. |
+| `published` | Dart and PHP only: a public wrapper in a package's `lib/` whose `pubspec.yaml` does not say `publish_to: none`, or a public or protected PHP wrapper of a Composer package whose `composer.json` does not say `"type": "project"`, which another package may call. Its callers are inlined and it is kept. |
 | `receiver-unproven` | Nothing in the file ties the receiver to the method's class. In TypeScript and JavaScript, also a use that hands a function wrapper's module on as an object (see above). |
 | `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
 | `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module, or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). |
@@ -2216,9 +2305,30 @@ Two results to know about:
 What still keeps it, by design, until it can be proven:
 
 - a constructor taking the interface is kept, with everything else, when its
-  class is also named in `typeof(…)` (a test attribute included), built with
-  a target-typed `new(…)` anywhere that has the same number of arguments, or
-  has a second constructor;
+  class is also named in `typeof(…)`, built with a target-typed `new(…)`
+  that has the same number of arguments, or has a second constructor. A
+  target-typed `new(…)` does not count in a project that cannot reference the
+  class, or where its context names the type it creates: the arrow body or a
+  `return` of a method, local function or property that is not `async`, an
+  explicitly typed declaration, or an element of a `new List<T> { … }` or
+  `new HashSet<T> { … }` initializer (taken to be the framework's when no
+  file of yours declares one), naming a type of another name that no
+  `using` alias and no type parameter takes. A `typeof(…)` does not count
+  when it is a positional argument of your own `sealed` attribute, named
+  without a qualifier, deriving from `Attribute` alone with a primary
+  constructor and no other, that keeps it only in a get-only `Type`
+  property; every file that may hold the attribute reads that property only
+  to compare it (`==`, `!=`) and spells no string of its name; and no C#
+  file of yours that references the attribute's project, loads an assembly
+  or a type by name at run time, or is a source generator, reads attribute data raw
+  (`CustomAttributes`, `GetCustomAttributesData`, `CustomAttributeData`,
+  `ConstructorArguments`, `TypeDescriptor`), reads a member's value by
+  reflection (`GetValue`, `GetGetMethod`, `PropertyInfo.GetMethod`,
+  `CreateDelegate`, `Expression.Property`, `dynamic`), invokes a method it
+  looked up anywhere but on `typeof(X)` of another type, or takes
+  attributes other than as one named type (`GetCustomAttributes(true)`,
+  `GetCustomAttributes<Attribute>()`). Library code that reflects over every
+  attribute's properties is not seen;
 - a binding whose configuration is not provably the root (a local, a
   `GetSection(…)` result, a parameter some caller passes something other
   than a host's `Configuration` or a configuration it built itself with
@@ -3868,16 +3978,59 @@ removal is listed in the pull request body.
 A private field (`_name`) whose every read was in the removed code is left
 unread, which `dart analyze` reports as `unused_field`. It is deleted, with
 the `///` comment above it (and any `//` line between the two) and a comment
-on its own line, when nothing else in
-its library spells its name and its initializer cannot do work: there is
-none, it is a literal, a `const` expression or a collection literal built of
-those, or the field is `late` or `static`, whose initializer only runs when
-the field is first read. It is kept, and named in the pull request body, when:
+on its own line, when nothing else in its library reads or assigns it and its
+initializer cannot do work: there is none, it is a literal, a `const`
+expression or a collection literal built of those, it calls a `const`
+constructor with constant arguments (`final _client = FeatureClient();` where
+`FeatureClient` declares `const FeatureClient();` in the same file or in a
+file of the repository it imports), or the field is `late` or `static`, whose
+initializer only runs when the field is first read.
 
-* a constructor sets it (`Svc(this._client)`, or `: _client = client`), since
-  removing it would change the constructor every caller uses;
+When a constructor sets it, that goes too:
+
+* a `this._client` parameter is deleted, and so is the `[...]` around it when
+  nothing else is in the brackets;
+* an initializer-list entry (`: _client = client`) is deleted, with the `:`
+  when it was the only entry. When `client` is a parameter of that
+  constructor that nothing else in it uses, the parameter goes as well, with
+  its `required` and its default value, or the whole `{...}` when it was the
+  only named parameter.
+
+A constructor that loses a parameter changes for every caller, so each call
+in the repository loses its argument: by position, or by name for a named
+parameter. That covers `Svc(…)`, `Svc.named(…)`, `Svc.new(…)`, `new` and
+`const` calls, calls through an import prefix, a redirecting `: this(…)` and a
+subclass's `super(…)`. This happens only when every use of the class can be
+accounted for: a private class (`_Svc`) is checked in its own file, any other
+class in every Dart file of the repository that imports its library,
+directly or through a library of the repository that exports it. A file that
+does not import it names some other class of that name (a `Timer` from
+`dart:async`), and is left alone.
+
+The field is kept, and named in the pull request body, when:
+
+* its class is public in `lib/` of a package that may be published (no
+  `publish_to: none` in `pubspec.yaml`), since another package may construct
+  it;
+* the class is used some other way: as a value (`Svc`), as a torn-off
+  constructor (`Svc.new`), through a `typedef`, in a part file, in a
+  redirecting factory or a mixin application
+  (`class B = Svc with M;`), or by a subclass with a `super.` parameter; or
+  the class name is declared twice, or a file of the repository imports
+  `dart:mirrors` or does not parse;
+* the class, the constructor or the parameter carries an annotation (other
+  than `@immutable` and `@deprecated`), since a code generator or an injector
+  may construct it;
+* a constructor sets it from something other than a parameter or a literal,
+  sets it through a named `this._client` parameter, or is a factory;
+* an argument that would be deleted is anything but a literal, a `const`
+  object, a parameter of the function around the call, or a top-level `const`
+  of the file (`Svc(FeatureClient())` and `Svc(widget.client)` may do work, a
+  getter may too, and a local would be left unused), or is the last use of an
+  import or a private declaration;
 * something else assigns it, or its initializer may do work
-  (`final _client = FeatureClient();`, `Foo.instance`, `'$x'`);
+  (`final _client = FeatureClient();` without a `const` constructor,
+  `Foo.instance`, `'$x'`);
 * it carries an annotation, is `external` or `abstract`, shares a declaration
   with another field, or shares its name with a getter, setter or method;
 * its type or initializer is the last use of an import or of a private class,

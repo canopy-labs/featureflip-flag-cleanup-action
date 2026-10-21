@@ -3,8 +3,10 @@
 A removal deletes a constructor parameter and the argument each caller passes
 for it, or a TypeScript field (``ts_field_removal``) with the constructor
 statement that assigns it, and that constructor's parameter when the
-assignment was its last read, or a Dart field (``dart_field_removal``). Which callers exist is proven per language
-(``ctor_param_ts``, ``ctor_param_csharp``); the deletion itself is the
+assignment was its last read, or a Dart field (``dart_field_removal``) with
+whatever in its constructors sets it. Which callers exist is proven per
+language (``ctor_param_ts``, ``ctor_param_csharp``, ``ctor_param_dart``); the
+deletion itself is the
 engine's, through rules rendered here.
 """
 
@@ -36,7 +38,15 @@ _BLOCK = re.compile(r"^# ctor: (parameter|classic|argument)\n", re.MULTILINE)
 #: sentinel itself. A field becomes a method of that name, because a method
 #: has no `;` of its own: the engine deletes a member and the line break before
 #: it, but not the `;` after it. A statement becomes the sentinel and a `;`.
-FORMS = {"argument": "{}", "member": "{}(){{}}", "statement": "{};"}
+#: A Dart constructor parameter becomes the sentinel, a parameter that is a
+#: bare name, and a Dart initializer-list entry an entry setting it.
+FORMS = {
+    "argument": "{}",
+    "member": "{}(){{}}",
+    "statement": "{};",
+    "parameter": "{}",
+    "initializer": "{} = 0",
+}
 
 #: The same for C#, plus a whole type declaration and a ``using`` directive.
 #: A C# method needs a return type, and a bare identifier is not a statement
@@ -136,8 +146,8 @@ def mark(
     parameters). For each argument span and each of those, a line comment that
     trails it on a line of its own is dropped: the engine deletes an item with
     the line break before it, so the comment would otherwise end up describing
-    the item on the line above. A member or statement span already holds its
-    own trailing comment.
+    the item on the line above. A marked parameter is treated the same way. A
+    member or statement span already holds its own trailing comment.
     """
     ordered = sorted((span[0], span[1], span[2] if len(span) > 2 else "argument") for span in spans)
     for (_, end, _), (start, _, _) in zip(ordered, ordered[1:]):
@@ -146,7 +156,7 @@ def mark(
     if ordered and (ordered[0][0] < 0 or ordered[-1][1] > len(data)):
         raise ValueError("span outside the data")
     edits = [(start, end, forms[form].format(sentinel).encode("ascii")) for start, end, form in ordered]
-    arguments = [(start, end) for start, end, form in ordered if form == "argument"]
+    arguments = [(start, end) for start, end, form in ordered if form in ("argument", "parameter")]
     for start, end in [*arguments, *deleted]:
         comment = _trailing_comment(data, start, end)
         if comment is not None:
@@ -179,7 +189,7 @@ def _trailing_comment(data: bytes, start: int, end: int) -> tuple[int, int] | No
 
 _SPACE = b" \t"
 _OPENERS = b"(<["
-_CLOSERS = b")>],"
+_CLOSERS = b")>],;"
 
 
 def _deletion_gaps(before: bytes, after: bytes) -> list[int]:
@@ -208,16 +218,20 @@ def _deletion_gaps(before: bytes, after: bytes) -> list[int]:
     return gaps
 
 
-def tidy(before: bytes, after: bytes) -> bytes:
+def tidy(before: bytes, after: bytes, *, named_groups: bool = False) -> bytes:
     """``after`` with the whitespace each deletion left on its line closed up.
 
     The engine deletes an argument or parameter with one comma and leaves the
-    spaces around the gap: ``f( b)``, ``f(a,  c)``, ``f(a, )``. ``before`` is
+    spaces around the gap: ``f( b)``, ``f(a,  c)``, ``f(a, )``, and a Dart
+    constructor that lost its whole initializer list ``Svc() ;``. ``before`` is
     the text the engine was given, and only gaps where ``after`` lost bytes
     are touched, so the customer's own spacing elsewhere stays. A gap that
     meets a line break (a multi-line list) is left alone: the engine already
     leaves those clean, and indentation is not this function's to change.
+    With ``named_groups`` (Dart), a gap right after ``{`` loses its space as
+    after ``(``: the brace opens a group of named parameters.
     """
+    openers = _OPENERS + b"{" if named_groups else _OPENERS
     out = after
     gaps = _deletion_gaps(before, after)
     for gap in sorted(set(gaps), reverse=True):
@@ -235,7 +249,7 @@ def tidy(before: bytes, after: bytes) -> bytes:
             continue
         # The gap keeps one side's whitespace, the left one where it has any:
         # `f(a,\tb,\tc)` stays tab-separated.
-        fill = b"" if prev in _OPENERS or nxt in _CLOSERS else out[left:gap] or out[gap:right]
+        fill = b"" if prev in openers or nxt in _CLOSERS else out[left:gap] or out[gap:right]
         out = out[:left] + fill + out[right:]
     return out
 

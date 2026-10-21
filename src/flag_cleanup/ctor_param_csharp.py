@@ -21,12 +21,17 @@ that names the type and a reflection call (``Activator.CreateInstance``,
 ``GetType("…")``) refuses.
 
 A target-typed ``new(…)`` never names the type, so any one in the repository
-whose argument count the constructor could accept refuses too.
+whose argument count the constructor could accept refuses too. A caller that
+can tell which files see the type (``sees``) narrows that: a file whose
+project does not reach the type's cannot be given it as a target, and a
+``new(…)`` whose context declares its type by another name
+(:func:`_target_name`) creates that type.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -357,9 +362,11 @@ def _classify(
     namespace: str = "",
     visible: bool = True,
     inert: Callable[[Node], bool] = _inert,
+    typeof: Callable[[Node], str | None] | None = None,
 ) -> str | None:
     """``None`` when this spelling of the type name is accounted for (and
-    records its argument, if it is a call), else why it is not.
+    records its argument, if it is a call), else why it is not. A caller
+    with ``typeof`` judges a ``typeof(…)`` of it instead of refusing it.
 
     ``namespace`` is the declaring namespace; ``visible`` says whether an
     unqualified spelling here can resolve to it (the file sits in it, or
@@ -416,7 +423,10 @@ def _classify(
             return _site(path, following, index, names, sites, inert)
         return _derived(parent, path, index, names, sites, inert)
     if kind == "typeof_expression":
-        return "typeof (reflection can construct it positionally)"
+        reason = typeof(parent) if typeof is not None else None
+        return None if typeof is not None and reason is None else (
+            "typeof (reflection can construct it positionally)" + (f": {reason}" if reason else "")
+        )
     if kind == "type_argument_list":
         generic = parent.parent
         callee = generic.named_children[0] if generic is not None and generic.named_children else None
@@ -607,7 +617,10 @@ def _references(
     repo_dir: str,
     namespace: str = "",
     inert: Callable[[Node], bool] = _inert,
+    sees: Callable[[str], bool] | None = None,
 ) -> tuple[list[Site], str | None]:
+    """Every site that spells the type ``name``, or a reason it cannot be
+    proven: see the module docstring."""
     # `[Foo(…)]` applies `FooAttribute`: both spellings name it.
     short = name.removesuffix(_SUFFIX) if name.endswith(_SUFFIX) and name != _SUFFIX else None
     spellings = "|".join(re.escape(n) for n in (name, short) if n)
@@ -620,6 +633,10 @@ def _references(
     decl = str(Path(decl_path).resolve())
     sites: list[Site] = []
     everywhere = _global_usings(repo_dir) if namespace else set()
+    #: Target-typed ``new(…)``s whose context names another type: the type
+    #: name, and where.
+    targeted: list[tuple[str, str]] = []
+    aliases: set[str] = set()
     for file in source_index.files(repo_dir, with_ignored=True):
         spelled = str(file.path)
         is_cs = spelled.endswith(".cs")
@@ -630,6 +647,11 @@ def _references(
         except OSError:
             return sites, f"{file.path} could not be read"
         mentions = word.search(data) is not None
+        if is_cs and b"using" in data:
+            # Every word between a `using` and its `=`: `unsafe`, a comment
+            # or an escape between them only adds names.
+            for alias in _ALIAS.finditer(_decoded(data.decode("utf-8", "replace"))):
+                aliases.update(_WORD.findall(alias.group(1)))
         if not is_cs:
             if mentions:
                 return sites, f"{file.path} mentions it (razor, cshtml or another .NET guest file)"
@@ -672,11 +694,12 @@ def _references(
             if node.type == "implicit_object_creation_expression":
                 args = _argument_list(node)
                 count = len(_items(args)) if args is not None else 0
-                if arity[0] <= count <= arity[1]:
-                    return sites, (
-                        f"{file.path}:{node.start_point[0] + 1}: "
-                        "a target-typed new(…) could construct it"
-                    )
+                if arity[0] <= count <= arity[1] and (sees is None or sees(file.resolved)):
+                    where = f"{file.path}:{node.start_point[0] + 1}"
+                    target = _target_name(node, repo_dir) if sees is not None else None
+                    if target is None or target == _decoded(name):
+                        return sites, f"{where}: a target-typed new(…) could construct it"
+                    targeted.append((target, where))
                 continue
             if node.type != "identifier" or _text(node) != name:
                 continue
@@ -688,7 +711,11 @@ def _references(
                 or here == namespace
                 or here.startswith(namespace + ".")
             )
-            reason = _classify(node, spelled, start, index, names, local, namespace, visible, inert)
+            reason = _classify(
+                node, spelled, start, index, names, local, namespace, visible, inert,
+                (lambda t, root=root: _compared_type(t, root, repo_dir))
+                if sees is not None else None,
+            )
             if reason is not None:
                 return sites, f"{file.path}:{node.start_point[0] + 1}: {reason}"
         if named_at is not None and reflects:
@@ -698,7 +725,436 @@ def _references(
             )
         # Offsets into the file's bytes, BOM included.
         sites.extend(Site(s.path, s.start + offset, s.end + offset) for s in local)
+    if targeted:
+        items, readable = _xcs().msbuild_usings(repo_dir)
+        aliases |= {_decoded(i.alias) for i in items if i.alias}
+        for target, where in targeted:
+            if not readable or target in aliases:
+                return sites, f"{where}: a target-typed new(…) could construct it (its type may be an alias)"
     return sites, None
+
+
+# --- a typeof kept by an attribute only to be compared ---------------------
+#
+# `[Covers(typeof(Job))]` hands the attribute a `Type`, which reflection
+# could construct positionally. It cannot when the attribute is the
+# checkout's own, keeps the value only in a get-only property, and every
+# read of that property compares it; when nothing that can see the
+# attribute reads attribute data raw, takes an attribute but as a named
+# type, or reads a property's value by reflection; and when no string there
+# names the property.
+
+#: Reads of attribute data that bypass the attribute's own members, and
+#: reflective reads of a member's value. Matched on decoded text, ``Get…``
+#: prefixes included (``GetConstructorArguments``).
+_RAW_ATTRIBUTES = re.compile(
+    r"CustomAttributeData|ConstructorArguments|GetCustomAttributesData"
+    r"|\b(?:CustomAttributes|GetAttributes|GetValue|TypeDescriptor|PropertyDescriptor|GetGetMethod|GetAccessors|CreateDelegate|InvokeMember"
+    r"|MakeMemberAccess|dynamic)\b"
+    r"|\.\s*GetMethod\b(?!\s*[(<])"
+    r"|\bExpression\s*\.\s*(?:Property|PropertyOrField)\b"
+)
+#: Method lookups whose result a file could invoke on an attribute.
+_METHOD_LOOKUPS = frozenset(
+    {"GetMethod", "GetMethods", "GetRuntimeMethod", "GetRuntimeMethods", "GetDeclaredMethod",
+     "GetDeclaredMethods", "DeclaredMethods", "GetMember", "GetMembers", "FindMembers"}
+)
+_METHOD_LOOKUP = re.compile(r"\b(?:" + "|".join(sorted(_METHOD_LOOKUPS)) + r")\b")
+_INVOKE = re.compile(r"\bInvoke\b")
+#: What reaches an assembly's types without a project reference: loading
+#: it at run time, a type by name, or a source generator.
+_LOADS = re.compile(
+    r"\b(?:Assembly\s*\.\s*(?:Load\w*|UnsafeLoadFrom)|LoadFrom\w*|LoadFile|AssemblyLoadContext|MetadataLoadContext"
+    r"|ExecuteAssembly\w*|CreateInstanceFrom\w*|AppDomain|ReflectionOnly\w*)\b"
+    r"|\bGetType\s*\(\s*[^)\s]"
+)
+#: A source generator, which may write code constructing what an
+#: attribute's data names. An analyzer only reports.
+_GENERATOR = re.compile(r"\b(?:ISourceGenerator|IIncrementalGenerator)\b|\[\s*Generator\b")
+_RETRIEVALS = frozenset({"GetCustomAttribute", "GetCustomAttributes"})
+#: Type arguments that take every attribute.
+_ANY_ATTRIBUTE = frozenset({"Attribute", "object", "Object", "dynamic"})
+
+
+def _compared_type(node: Node, root: Node, repo_dir: str) -> str | None:
+    """``None`` when the ``typeof(…)`` ``node`` (in a file parsed as
+    ``root``) is a positional argument of an attribute that keeps it only to
+    be compared (see above); else why not."""
+    from flag_cleanup import csharp_family
+
+    argument = node.parent
+    arguments = argument.parent if argument is not None and argument.type == "attribute_argument" else None
+    attribute = arguments.parent if arguments is not None and arguments.type == "attribute_argument_list" else None
+    if attribute is None or attribute.type != "attribute" or [c.id for c in argument.named_children] != [node.id]:
+        return "not an attribute's positional argument"
+    positional = [c for c in arguments.named_children if c.type == "attribute_argument"]
+    if any(c.child_by_field_name("name") is not None for c in positional):
+        return "the attribute names an argument"
+    # Unqualified only: a qualifier may name another assembly's attribute.
+    name = attribute.child_by_field_name("name")
+    spelled = _simple(name) if name is not None and name.type == "identifier" else None
+    if spelled is None:
+        return "the attribute's name is not a plain one"
+    index = _xcs().csharp_index(repo_dir)
+    candidates = {spelled, spelled + _SUFFIX}
+    infos = [i for n in candidates for i in index.by_last.get(n, ())]
+    if (
+        len(infos) != 1
+        or index.unreadable
+        or any(words is None or words & candidates for words in index.unparsed_types)
+        or "." in infos[0].chain
+    ):
+        return "the attribute is not one type of the checkout"
+    info = infos[0]
+    here = _namespace_of(attribute)
+    if info.namespace and here != info.namespace and (
+        not (here.startswith(info.namespace + ".") or info.namespace in _usings(root) | _global_usings(repo_dir))
+        or _nested_using(root)
+    ):
+        # Outside the attribute's own namespace a nearer `using` may bring in
+        # another assembly's attribute of the name.
+        return "the file may not see the checkout's attribute"
+    property_name = _kept_property(info, arguments, argument)
+    if property_name is None:
+        return f"{info.chain} keeps the value some other way"
+    # A value of the attribute's type reaches only a file that names it or
+    # something leading to it (the gate family's own taint argument).
+    taint = csharp_family._taint(repo_dir, frozenset({info.chain}), frozenset(index.by_last), frozenset(index.by_full))
+    holders = csharp_family.Family(
+        full_names=frozenset(),
+        simple_names=taint.family,
+        members=frozenset(),
+        settable=False,
+        projects=frozenset(),
+        returning=taint.returning,
+        tainting=taint.tainting,
+        opaque=taint.opaque,
+        guest_named=taint.guest_named,
+    )
+    word = re.compile(rf"(?<!\w){re.escape(property_name)}(?!\w)")
+    names = {info.chain, info.chain.removesuffix(_SUFFIX)}
+    # A file reads the attribute's data only from a project that references
+    # it, or by loading its assembly at run time (or as a source generator
+    # reading its syntax): those files are read for what reads attributes or
+    # values by reflection; only a file that may hold the attribute is held
+    # to reading the property by ==.
+    files: list[tuple[str, str, str]] = []
+    projects = _xcs()._project_dirs(repo_dir)
+    generators: set = set()
+    for file in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+        if not str(file.path).endswith(".cs"):
+            continue
+        try:
+            text = file.path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return f"{file.path} could not be read"
+        plain = _decoded(text)
+        if _GENERATOR.search(plain):
+            homes = csharp_family._enclosing(file.resolved, projects)
+            if not homes:
+                return f"{file.path} is a source generator outside every project"
+            generators.update(homes)
+        files.append((str(file.path), file.resolved, text))
+    for spelled, resolved, text in files:
+        plain = _decoded(text)
+        sees = csharp_family.sees(repo_dir, resolved, info.path)
+        if (
+            not sees
+            and not _LOADS.search(plain)
+            and not generators.intersection(csharp_family._enclosing(resolved, projects))
+        ):
+            continue
+        if _RAW_ATTRIBUTES.search(plain):
+            return f"{spelled} reads attribute data or a member's value by reflection"
+        invokes = _INVOKE.search(plain) is not None and _METHOD_LOOKUP.search(plain) is not None
+        if not invokes and "GetCustomAttribute" not in plain and not word.search(plain):
+            continue
+        root = _parse(text.removeprefix("\ufeff"), "csharp")
+        if invokes and not _lookups_bound(root, names):
+            return f"{spelled} invokes a method it looks up on a type that may be the attribute's"
+        holds = sees and not csharp_family.family_free(text, root, holders)
+        reason = _reads_compare(root, property_name, info, resolved, holds)
+        if reason is not None:
+            return f"{spelled}: {reason}"
+    return None
+
+
+def _nested_using(root: Node) -> bool:
+    """Whether a ``using`` directive sits inside a namespace, where it is
+    searched before the namespaces around it."""
+    scoped = next((c for c in root.named_children if c.type == "file_scoped_namespace_declaration"), None)
+    for node in _walk(root):
+        if node.type != "using_directive":
+            continue
+        if scoped is not None and node.start_byte > scoped.start_byte:
+            return True
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "namespace_declaration":
+                return True
+            parent = parent.parent
+    return False
+
+
+def _lookups_bound(root: Node, names: set[str]) -> bool:
+    """Whether every method lookup of a parsed file is a call on
+    ``typeof(X)`` for an ``X`` that is not the attribute."""
+    from flag_cleanup import csharp_family
+
+    for node in _walk(root):
+        if node.type != "identifier" or _decoded(_text(node)) not in _METHOD_LOOKUPS:
+            continue
+        access = node.parent
+        call = access.parent if access is not None and access.type == "member_access_expression" else None
+        if call is None or call.type != "invocation_expression" or access.child_by_field_name("name") != node:
+            return False
+        bound = csharp_family._typeof_type(access.child_by_field_name("expression"))
+        if bound is None or _decoded(bound.rsplit(".", 1)[-1]) in names:
+            return False
+    return True
+
+
+def _kept_property(info, arguments: Node, argument: Node) -> str | None:
+    """The get-only ``Type`` property the attribute class ``info`` keeps its
+    parameter at ``argument``'s place in, when that is all it does with it:
+    a sealed, non-partial class deriving from ``Attribute`` alone, with a
+    primary constructor taking exactly the attribute's positional
+    arguments and no other constructor."""
+    try:
+        source = Path(info.path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if _decoded(source) != source.replace("@", ""):
+        return None  # an escape or a formatting character may hide a use
+    root = _parse(source.removeprefix("\ufeff"), "csharp")
+    if root.has_error:
+        return None
+    found = [
+        n for n in _walk(root)
+        if n.type == "class_declaration"
+        and _simple(n.child_by_field_name("name")) == info.chain
+        and _namespace_of(n) == info.namespace
+    ]
+    if len(found) != 1:
+        return None
+    declaration = found[0]
+    bases = next((c for c in declaration.named_children if c.type == "base_list"), None)
+    parameters = next((c for c in declaration.named_children if c.type == "parameter_list"), None)
+    body = declaration.child_by_field_name("body")
+    modifiers = _modifiers(declaration)
+    if (
+        "sealed" not in modifiers
+        or "partial" in modifiers
+        or bases is None
+        or [_text(b) for b in bases.named_children] not in (["Attribute"], ["System.Attribute"])
+        or parameters is None
+        or body is None
+        or any(c.type == "constructor_declaration" for c in body.named_children)
+    ):
+        return None
+    declared = [c for c in parameters.named_children if c.type == "parameter"]
+    passed = [c for c in arguments.named_children if c.type == "attribute_argument"]
+    position = next(i for i, c in enumerate(passed) if c.id == argument.id)
+    if len(declared) != len(passed) or any(
+        c.type == "modifier" or _text(c) == "params" for d in declared for c in d.children
+    ):
+        return None
+    parameter = declared[position]
+    kind = parameter.child_by_field_name("type")
+    name = _simple(parameter.child_by_field_name("name"))
+    if name is None or kind is None or _text(kind) not in ("Type", "System.Type"):
+        return None
+    uses = [n for n in _walk(body) if n.type == "identifier" and _simple(n) == name]
+    holder = uses[0].parent if len(uses) == 1 else None
+    value = holder.child_by_field_name("value") if holder is not None else None
+    if holder is None or holder.type != "property_declaration" or value is None or value.id != uses[0].id:
+        return None
+    accessors = holder.child_by_field_name("accessors")
+    getters = [c for c in accessors.named_children if c.type == "accessor_declaration"] if accessors else []
+    property_type = holder.child_by_field_name("type")
+    if (
+        len(getters) != 1
+        or [_text(c) for c in getters[0].children if not c.is_named] != ["get", ";"]
+        or getters[0].named_children
+        or property_type is None
+        or _text(property_type) not in ("Type", "System.Type")
+        or any(c.type == "attribute_list" for c in holder.children)
+        or _modifiers(holder) - {"public", "internal"}
+    ):
+        return None
+    return _simple(holder.child_by_field_name("name"))
+
+
+def _reads_compare(root: Node, property_name: str, info, path: str, holds: bool) -> str | None:
+    """``None`` when every attribute retrieval in a parsed file names one
+    attribute type that is no type parameter and, where the file may hold
+    the attribute (``holds``), every mention of ``property_name`` is the
+    attribute's own declaration or a member access compared with ``==`` or
+    ``!=`` and no string spells it; else why not."""
+    if root.has_error:
+        return "does not parse"
+    spellings = {property_name, f"get_{property_name}", f"<{property_name}>k__BackingField"}
+    for node in _walk(root):
+        if holds and node.type in _STRINGS and _decoded(_literal(node)) in spellings:
+            return f"a string names {property_name}"
+        if node.type == "generic_name" and _decoded(_simple(node) or "") in _RETRIEVALS:
+            arguments = next((c for c in node.named_children if c.type == "type_argument_list"), None)
+            taken = arguments.named_children if arguments is not None else []
+            last = taken[0].child_by_field_name("name") if len(taken) == 1 and taken[0].type == "qualified_name" else (
+                taken[0] if len(taken) == 1 else None
+            )
+            simple = _simple(last) if last is not None else None
+            if simple is None or _decoded(simple) in _ANY_ATTRIBUTE or _type_parameter(node, simple):
+                return "retrieves attributes other than as one named type"
+            continue
+        if node.type == "identifier" and _decoded(_text(node)) in _RETRIEVALS:
+            parent = node.parent
+            if parent is None or parent.type != "generic_name":
+                return "retrieves attributes other than as one named type"
+            continue
+        if not holds or node.type != "identifier" or _decoded(_text(node)) != property_name:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "property_declaration" and path == info.path:
+            continue
+        compared = parent.parent if parent is not None and parent.type == "member_access_expression" else None
+        member = parent.child_by_field_name("name") if compared is not None else None
+        if (
+            compared is None
+            or member is None
+            or member.id != node.id
+            or compared.type != "binary_expression"
+            or not any(_text(c) in ("==", "!=") for c in compared.children if not c.is_named)
+        ):
+            return f"reads {property_name} other than to compare it"
+    return None
+
+
+def _type_parameter(node: Node, simple: str) -> bool:
+    """Whether ``simple`` is a type parameter in scope at ``node``."""
+    scope = node.parent
+    while scope is not None:
+        parameters = scope.child_by_field_name("type_parameters") or next(
+            (c for c in scope.children if c.type == "type_parameter_list"), None
+        )
+        if parameters is not None and any(
+            (n := t.child_by_field_name("name")) is not None and _text(n).removeprefix("@") == simple
+            for t in parameters.named_children
+        ):
+            return True
+        scope = scope.parent
+    return False
+
+
+#: The text from a ``using`` to the ``=`` of an alias, global or not; an
+#: over-match only refuses.
+_ALIAS = re.compile(r"\busing\b([^;{}()=]*)=")
+_WORD = re.compile(r"\w+")
+_ESCAPE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+
+
+def _decoded(text: str) -> str:
+    """``text`` as the compiler reads an identifier: escapes decoded,
+    formatting characters dropped, ``@`` dropped."""
+
+    def char(match: re.Match[str]) -> str:
+        try:
+            return chr(int(match.group(1) or match.group(2), 16))
+        except (ValueError, OverflowError):
+            return "\ufffd"
+
+    text = _ESCAPE.sub(char, text)
+    if not text.isascii():
+        text = "".join(c for c in text if unicodedata.category(c) != "Cf")
+    return text.replace("@", "")
+#: Where a ``return`` takes its target type from the enclosing member.
+_RETURNING = frozenset({"method_declaration", "local_function_statement"})
+#: Where a ``return`` belongs to something else, whose type this does not read.
+_FUNCTIONS = frozenset(
+    {
+        "method_declaration", "local_function_statement", "lambda_expression", "anonymous_method_expression",
+        "accessor_declaration", "constructor_declaration", "destructor_declaration", "operator_declaration",
+        "conversion_operator_declaration", "indexer_declaration", "property_declaration",
+    }
+)
+#: Collections whose initializer passes each element to ``Add(T)``.
+_COLLECTIONS = frozenset({"List", "HashSet"})
+
+
+def _xcs():
+    from flag_cleanup import cross_file_csharp
+
+    return cross_file_csharp
+
+
+def _target_name(node: Node, repo_dir: str) -> str | None:
+    """The simple name of the type a target-typed ``new(…)`` creates, when
+    its context declares it: the arrow body of a method, local function or
+    property, or a ``return`` in a method or local function (neither
+    ``async``), the value of an explicitly typed declaration, or an element
+    of a ``List<T>``/``HashSet<T>`` collection initializer (no such type in
+    the checkout). None otherwise, and for a type parameter in scope. The
+    caller still refuses a name some ``using`` aliases."""
+    parent = node.parent
+    declared: Node | None = None
+    if parent is None:
+        return None
+    if parent.type == "arrow_expression_clause" or parent.type == "return_statement":
+        owner = parent.parent
+        if parent.type == "return_statement":
+            while owner is not None and owner.type not in _FUNCTIONS:
+                owner = owner.parent
+        if owner is None or owner.type not in (*_RETURNING, "property_declaration") or "async" in _modifiers(owner):
+            return None
+        declared = owner.child_by_field_name("returns") or owner.child_by_field_name("type")
+    elif parent.type == "variable_declarator":
+        declaration = parent.parent
+        if declaration is None or declaration.type != "variable_declaration":
+            return None
+        if parent.child_by_field_name("name") is None or node.id == parent.child_by_field_name("name").id:
+            return None
+        declared = declaration.child_by_field_name("type")
+    elif parent.type == "initializer_expression" and parent.parent is not None and (
+        parent.parent.type == "object_creation_expression"
+    ):
+        created = parent.parent.child_by_field_name("type")
+        generic = created.child_by_field_name("name") if created is not None and created.type == "qualified_name" else created
+        arguments = next((c for c in generic.named_children if c.type == "type_argument_list"), None) if generic else None
+        if (
+            generic is None
+            or generic.type != "generic_name"
+            or _simple(generic) not in _COLLECTIONS
+            or arguments is None
+            or len(arguments.named_children) != 1
+            or _xcs().csharp_index(repo_dir).may_declare_type(_simple(generic) or "")
+        ):
+            return None
+        declared = arguments.named_children[0]
+    if declared is not None and declared.type == "nullable_type" and declared.named_children:
+        declared = declared.named_children[0]
+    if declared is None:
+        return None
+    if declared.type == "qualified_name":
+        last = declared.child_by_field_name("name")
+        simple = _simple(last) if last is not None else None
+        return _decoded(simple) if simple is not None else None
+    if declared.type not in ("identifier", "generic_name"):
+        return None
+    simple = _simple(declared)
+    if simple is None or _type_parameter(node, simple):
+        return None
+    return _decoded(simple)
+
+
+def _simple(node: Node | None) -> str | None:
+    if node is None:
+        return None
+    if node.type == "identifier":
+        return _text(node).removeprefix("@")
+    if node.type == "generic_name":
+        first = node.named_children[0] if node.named_children else None
+        return _text(first).removeprefix("@") if first is not None and first.type == "identifier" else None
+    return None
 
 
 # --- a classic constructor's parameter of a type a run deletes ------------------
@@ -906,6 +1362,8 @@ def plan_classic(
     the constructor's own ``base(…)`` is returned as ``forwarded``: it can go
     only if the base type's matching parameter goes in the same run, which
     is the caller's to check."""
+    from flag_cleanup import csharp_family
+
     label = f"{class_name}({param_name})"
     root = _parse(source.removeprefix("﻿"), "csharp")
     data = source.removeprefix("﻿").encode("utf-8")
@@ -1063,6 +1521,7 @@ def plan_classic(
         repo_dir,
         _namespace_of(declaration),
         inert=_family_inert(family),
+        sees=lambda caller: csharp_family.sees(repo_dir, caller, path),
     )
     if reason is not None:
         return Refusal(label, reason)

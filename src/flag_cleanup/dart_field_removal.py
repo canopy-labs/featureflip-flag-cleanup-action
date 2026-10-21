@@ -19,23 +19,28 @@ parameter, and the left side of an initializer-list entry or of a plain
 :func:`plan` proves the field can go. Deleting it is safe when nothing the
 deletion skips could do work, and nothing else in the library spells it:
 
-- **no other spelling at all.** The field is unread, so what is left can only
-  write it: a ``this._client`` parameter or an initializer-list entry (both
-  change a constructor, so the field stays reported), or an assignment, whose
-  right side may do work.
+- **no other spelling but a constructor's.** The field is unread, so what is
+  left can only write it: a ``this._client`` parameter or an initializer-list
+  entry, which go with it when :mod:`flag_cleanup.ctor_param_dart` proves the
+  constructor and its callers can change, or an assignment, whose right side
+  may do work.
 - **an initializer that never runs, or does no work**: a ``late`` or
   ``static`` field's initializer runs on the field's first read, which no
   longer happens. Any other field's runs when the object is built, so it must
-  be absent or constant: a literal, a ``const`` expression, or a collection
-  literal built of those (``final _retries = 3;``, ``final _ids = <int>[];``).
-  ``make()``, ``Foo.bar`` (a getter, or a static whose initializer runs on
-  first access) and ``'$x'`` (a ``toString()``) may do work.
+  be absent or constant: a literal, a ``const`` expression, a collection
+  literal built of those (``final _retries = 3;``, ``final _ids = <int>[];``),
+  or a call of a ``const`` constructor with constant arguments
+  (``final _client = FeatureClient();``, see
+  :func:`flag_cleanup.ctor_param_dart.const_construction`). ``make()``,
+  ``Foo.bar`` (a getter, or a static whose initializer runs on first access)
+  and ``'$x'`` (a ``toString()``) may do work.
 - **nothing else left unused.** Every name the declaration spells (its type,
   a ``const _Config()``, a ``late`` field's ``_make()``) must also be spelled
   outside every private field declaration of the file, or be one of
   ``dart:core``'s common types: otherwise deleting it would leave an import,
   a private class or a private function unused, which ``dart analyze``
-  reports in turn.
+  reports in turn. The same holds for what else goes from the file: a
+  parameter's type and default, an argument.
 - **one library, one declaration.** A file with a ``part`` or ``part of``
   directive is refused: another part may read the field. So is a class
   declared twice in its file, a field declared beside others
@@ -55,9 +60,11 @@ field; a ``//`` comment above them may head a group, and stays.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 from tree_sitter import Node
 
+from flag_cleanup import ctor_param_dart
 from flag_cleanup.ctor_param_model import IDENT, Refusal, Removal, Site
 from flag_cleanup.unused import _parse
 
@@ -390,9 +397,14 @@ def _own_declarations(root: Node, name: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _stranded(root: Node, declaration: Node, field: Node, span: tuple[int, int]) -> str | None:
-    """A name ``declaration`` spells that nothing outside the file's private
-    field declarations and ``span`` does, or ``None``."""
+def _stranded(
+    root: Node, declaration: Node, field: Node, spans: list[tuple[int, int]], skip: set[str]
+) -> str | None:
+    """A name that ``declaration``, or what else goes in ``spans``, spells and
+    that nothing outside the file's private field declarations and ``spans``
+    does, or ``None``. ``spans`` starts with the declaration's; ``skip`` holds
+    the names whose every spelling goes with them (the field, a parameter
+    that goes)."""
     fields = [
         (member.start_byte, member.end_byte)
         for cls in _classes(root)
@@ -401,7 +413,7 @@ def _stranded(root: Node, declaration: Node, field: Node, span: tuple[int, int])
         for member, names in _fields(body)
         if any(_text(n).startswith("_") for n in names)
     ]
-    fields.append(span)
+    fields += spans
 
     def elsewhere(name: str) -> bool:
         skipped = fields + (_own_declarations(root, name) if name.startswith("_") else [])
@@ -412,13 +424,22 @@ def _stranded(root: Node, declaration: Node, field: Node, span: tuple[int, int])
             for node in _walk(root)
         )
 
-    for node in _walk(declaration):
+    spelled = list(_walk(declaration)) + [
+        n for n in _walk(root) if any(start <= n.start_byte < end for start, end in spans[1:])
+    ]
+    for node in spelled:
         if node.type not in _SPELLINGS or node == field or node.parent is None:
             continue
-        if node.parent.type in ("label", "symbol_literal"):
-            continue  # a named argument's name, `#sym`: neither names a declaration
+        if node.parent.type in (
+            "label",
+            "symbol_literal",
+            "unconditional_assignable_selector",
+            "conditional_assignable_selector",
+            "cascade_selector",
+        ):
+            continue  # a named argument's name, `#sym`, `.member`: none names a top-level declaration
         name = _text(node)
-        if name not in _CORE and not elsewhere(name):
+        if name not in _CORE and name not in skip and not elsewhere(name):
             return name
     return None
 
@@ -438,18 +459,11 @@ def has_field(source: str, class_name: str, field: str) -> bool:
     return False
 
 
-_WRITES = {
-    "parameter": "set by a constructor parameter (`this.{}`), which removing it would change",
-    "initializer": "set in a constructor's initializer list, which removing it would change",
-    "assignment": "still assigned in its library",
-}
-
-
 def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal:
     """Prove the private field ``label`` (``Class._field``) of the Dart file at
     ``path``, whose current text is ``source``, can be removed. ``repo_dir`` is
-    unused: a private field's library is its file once parts are refused."""
-    del repo_dir
+    where the callers of a constructor that loses a parameter are looked for:
+    a private field's library is its file once parts are refused."""
     class_name, _, field = label.partition(".")
     if IDENT.fullmatch(class_name) is None:
         return Refusal(label, "a name the deletion rules cannot spell")
@@ -482,20 +496,42 @@ def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal
     for modifier, reason in _REFUSED_MODIFIERS.items():
         if modifier in tokens:
             return Refusal(label, reason)
+    writes: list[tuple[str, Node]] = []
     for node in _walk(root):
         if node.type in _NAMES and _text(node) == field and node != names[0]:
             kind = _write_kind(node)
             if kind is None:
                 return Refusal(label, "its name is still spelled as a read in its library")
-            return Refusal(label, _WRITES[kind].format(field))
+            if kind == "assignment":
+                return Refusal(label, "still assigned in its library")
+            writes.append((kind, node))
     if not ({"late", "static"} & tokens):
         value = _initializer(declaration)
-        if value and not _inert(value):
+        if value and not _inert(value) and not ctor_param_dart.const_construction(path, root, value, repo_dir):
             text = " ".join(source[value[0].start_byte : value[-1].end_byte].split())[:60]
             return Refusal(label, f"an initializer that may do work ({text})")
     span = _span(declaration, siblings)
-    stranded = _stranded(root, declaration, names[0], span)
+    sites = [Site(path, *span, "member")]
+    parameter: str | None = None
+    if writes:
+        edits = ctor_param_dart.plan_constructors(path, classes[0], field, writes)
+        if isinstance(edits, str):
+            return Refusal(label, edits)
+        sites += edits.sites
+        parameter = edits.parameter
+    if writes and edits.dropped:
+        callers = ctor_param_dart.plan_callers(path, root, classes[0], edits.dropped, repo_dir)
+        if isinstance(callers, str):
+            return Refusal(label, callers)
+        sites += callers
+    here = str(Path(path).resolve())
+    stranded = _stranded(
+        root,
+        declaration,
+        names[0],
+        [(s.start, s.end) for s in sites if str(Path(s.path).resolve()) == here],
+        {field} | ({parameter} if parameter else set()),
+    )
     if stranded is not None:
         return Refusal(label, f"deleting it would leave `{stranded}` unused")
-    site = Site(path, *span, "member")
-    return Removal(path, class_name, None, label, -1, (site,), False, field)
+    return Removal(path, class_name, parameter, label, -1, tuple(sites), False, field)

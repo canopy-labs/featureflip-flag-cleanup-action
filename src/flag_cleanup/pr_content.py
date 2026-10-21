@@ -346,9 +346,10 @@ def _removed_dart_field_lines(removed: list[tuple[str, str]]) -> list[str]:
         f"> **{count} {noun} removed.** Every read of "
         f"{'it' if count == 1 else 'them'} was a flag read this pull request "
         "removed, so `dart analyze` would report `unused_field`, and nothing its "
-        "deletion skips can do work: its initializer, if any, is constant, or "
-        "never runs because the field is `late` or `static`, and nothing else "
-        "in its library wrote it:",
+        "deletion skips can do work: its initializer, if any, is constant, "
+        "calls a `const` constructor, or never runs because the field is "
+        "`late` or `static`. A constructor parameter that only set it went "
+        "too, with the argument every caller in the repository passed for it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -370,10 +371,11 @@ def _unread_dart_field_lines(unread: list[tuple[str, str]]) -> list[str]:
         "flag read this pull request removed, and `dart analyze` now reports "
         "`unused_field`, which fails a CI that gates on the analyzer. "
         f"{'It was' if count == 1 else 'They were'} left in place because "
-        "removing it would change a constructor (a `this.` parameter or an "
-        "initializer-list entry sets it), its initializer may do work, it is "
-        "annotated or still assigned, deleting it would leave an import or a "
-        "private declaration unused, or its library has `part` files. Remove "
+        "a constructor that sets it could not be changed safely (a caller of "
+        "the class could not be proven, or its argument may do work), its "
+        "initializer may do work, it is annotated or still assigned, deleting "
+        "it would leave an import or a private declaration unused, or its "
+        "library has `part` files. Remove "
         f"{'it' if count == 1 else 'each'}, with whatever sets it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],

@@ -190,19 +190,22 @@ def _attributes_unobservable(wrapper, checkout, full: frozenset[str]) -> bool:
     may declare all answer no."""
     from flag_cleanup import wrapper_csharp as wc
 
-    spans = [(wrapper.path, wrapper.start)]
+    # Found by its type, not its byte span: close-out asks again after the
+    # run has rewritten these files, and every span may have moved.
+    owners = [(wrapper.path, wrapper.package, wrapper.owner)]
     if wrapper.interface is not None:
-        spans.append((wrapper.interface.path, wrapper.interface.start))
-    spans += [(s.path, s.start) for s in wrapper.siblings]
-    for path, start in spans:
+        owners.append((wrapper.interface.path, wrapper.interface.package, wrapper.interface.name))
+    owners += [(s.path, s.namespace, s.type_chain) for s in wrapper.siblings]
+    for path, namespace, chain in owners:
         source = wc._read(path)
         if source is None:
             return False
+        owner = wc._find_type_in(wc.parse(source), namespace, chain)
+        body = wc._child(owner, "declaration_list") if owner is not None else None
         declarations = [
             n
-            for n in cross_file_keys.walk(wc.parse(source))
+            for n in (body.named_children if body is not None else ())
             if n.type in ("property_declaration", "method_declaration")
-            and n.start_byte <= start < n.end_byte
             and (wc._name_of(n) or "").removeprefix("@") == wrapper.name
         ]
         if len(declarations) != 1:
@@ -1805,7 +1808,7 @@ def _typeof_elements(collection: Node | None, arity: int, position: int, repo_di
             or len(arguments.named_children) != 2
             or (arity, position) != (2, 1)
             or repo_dir is None
-            or xcs.csharp_index(repo_dir).may_declare("Dictionary")
+            or xcs.csharp_index(repo_dir).may_declare_type("Dictionary")
             or any(c.type == "argument_list" and c.named_children for c in collection.children)
         ):
             return None
@@ -2204,8 +2207,21 @@ def reaches(repo_dir: str, path: str, family: Family) -> bool:
     """Whether the file ``path`` may hold a value of a family type: its
     project reaches a family project, or it is a file-based app, whose
     references no project file says."""
-    if family.homeless:
-        return True
+    return family.homeless or _reaches_projects(repo_dir, path, family.projects)
+
+
+def sees(repo_dir: str, path: str, declared: str) -> bool:
+    """Whether the file ``path`` may see a type declared in the file
+    ``declared``, by :func:`reaches`' walk. A type outside every project
+    may be seen anywhere."""
+    homes = frozenset(_enclosing(str(Path(declared).resolve()), xcs._project_dirs(repo_dir)))
+    return not homes or _reaches_projects(repo_dir, path, homes)
+
+
+def _reaches_projects(repo_dir: str, path: str, targets: frozenset[Path]) -> bool:
+    """Whether a project holding ``path`` is, or references, one of
+    ``targets``, or ``path`` is a file-based app. An unreadable project
+    graph reaches everything."""
     graph = project_graph(repo_dir)
     if graph is None:
         return True
@@ -2213,7 +2229,7 @@ def reaches(repo_dir: str, path: str, family: Family) -> bool:
     seen: set[Path] = set()
     while pending:
         current = pending.pop()
-        if current in family.projects:
+        if current in targets:
             return True
         if current in seen:
             continue

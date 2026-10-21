@@ -3938,7 +3938,6 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
     family = index.family
     if (
         found
-        and not loose
         and family is not None
         and not csharp_family.computed_name_route(index.repo_dir, family)
         and csharp_family.family_free(source, root, family)
@@ -3946,8 +3945,140 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
         names = csharp_family.route_names(root, source)
         if names is not None:
             spans = {(n.start_byte, n.end_byte) for n in names}
-            found = [n for n in found if (n.start_byte, n.end_byte) in spans]
+            # Where names may be compared ignoring case, a string still
+            # counts unless it can only leave the file.
+            aliased = _aliased(index.repo_dir) if loose else None
+            unbound = _qualifiers_only(root) - aliased if aliased is not None else frozenset()
+            found = [
+                n
+                for n in found
+                if (n.start_byte, n.end_byte) in spans or (loose and not _passed_out(n, unbound))
+            ]
     return [(wi.line_of(n), wi.text_of(n)) for n in found]
+
+
+_IGNORE_CASE = re.compile(r"IgnoreCase\b")
+_LITERALS = frozenset({"string_literal", "verbatim_string_literal", "raw_string_literal"})
+#: Where a name written in a file stands for a type, a namespace or another
+#: type's member, never for something the file binds.
+_QUALIFIER_PARENTS = frozenset(
+    {"member_access_expression", "qualified_name", "typeof_expression", "type_argument_list", "generic_name"}
+)
+
+
+def _aliased(repo_dir: str) -> frozenset[str] | None:
+    """Every name a ``global using`` or project ``<Using>`` item aliases;
+    None when an item cannot be read or a C# 14 ``extension`` block may add
+    a static member to any type: then nothing is passed out."""
+    from flag_cleanup import csharp_family
+
+    items, readable = xcs.msbuild_usings(repo_dir)
+    if not readable or csharp_family.declares_extension_blocks(repo_dir):
+        return None
+    return frozenset(
+        u.alias.removeprefix("@") for u in (*xcs.csharp_index(repo_dir).global_usings, *items) if u.alias
+    )
+
+
+def _qualifiers_only(root: Node) -> frozenset[str]:
+    """The names a file spells only as a qualifier, a type or another
+    type's member (:data:`_QUALIFIER_PARENTS`, or a node's ``type``): never
+    as anything it declares (a type, a method, a local, a parameter, a field,
+    an alias, a pattern variable) or reads as a value."""
+    seen: set[str] = set()
+    bound: set[str] = set()
+    for node in cross_file_keys.walk(root):
+        if node.type != "identifier":
+            continue
+        name = _text(node).removeprefix("@")
+        seen.add(name)
+        parent = node.parent
+        if parent is None or not (
+            parent.type in _QUALIFIER_PARENTS
+            or _field(parent, node) == "type"
+            or parent.type == "attribute" and _field(parent, node) == "name"
+        ):
+            bound.add(name)
+    return frozenset(seen - bound)
+
+
+def _passed_out(node: Node, unbound: frozenset[str]) -> bool:
+    """Whether a string's value can only leave its file, so no comparison
+    of the file sees it: it is an argument of a call ``Q.M(...)``, whose
+    qualifier ``Q`` names nothing the file binds (``unbound``), whose method
+    is no by-name route, which spells no ``IgnoreCase`` and whose other
+    arguments read only such names, and the call is a statement of its own
+    or, by the same rules, an argument of one. The method is then another
+    file's, and what it does with the value is judged there, as for a file
+    that spells no ``IgnoreCase``."""
+    from flag_cleanup import csharp_family
+
+    current = node
+    while current.parent is not None and current.parent.type in _LITERALS:
+        current = current.parent
+    while True:
+        argument = current.parent
+        arguments = argument.parent if argument is not None and argument.type == "argument" else None
+        call = arguments.parent if arguments is not None and arguments.type == "argument_list" else None
+        if call is None or call.type != "invocation_expression":
+            return False
+        function = call.child_by_field_name("function")
+        if function is None or function.type != "member_access_expression":
+            return False
+        member = function.child_by_field_name("name")
+        method = xcs._simple_name(member) if member is not None else None
+        if (
+            method is None
+            or method in csharp_family._NAME_ARGUMENT
+            or method in _declared_methods(current)
+            or not _qualifier(function.child_by_field_name("expression"), unbound)
+            or _IGNORE_CASE.search(_text(call))
+            or any(
+                other.id != argument.id and not _reads_only(other, unbound) for other in arguments.named_children
+            )
+        ):
+            return False
+        if call.parent is not None and call.parent.type == "expression_statement":
+            return True
+        current = call
+
+
+def _declared_methods(node: Node) -> set[str]:
+    """The methods and local functions declared in ``node``'s file: a
+    qualifier may still reach one (a base class's property of a type this
+    file declares)."""
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    return {
+        _text(n).removeprefix("@")
+        for d in cross_file_keys.walk(root)
+        if d.type in ("method_declaration", "local_function_statement")
+        and (n := d.child_by_field_name("name")) is not None
+    }
+
+
+def _qualifier(node: Node | None, unbound: frozenset[str]) -> bool:
+    """Whether ``node`` is ``A`` or ``A.B.C`` for an ``A`` in ``unbound``."""
+    while node is not None and node.type == "member_access_expression":
+        name = node.child_by_field_name("name")
+        if name is None or name.type != "identifier":
+            return False
+        node = node.child_by_field_name("expression")
+    return node is not None and node.type == "identifier" and _text(node).removeprefix("@") in unbound
+
+
+def _reads_only(node: Node, unbound: frozenset[str]) -> bool:
+    """Whether an argument holds no function and every name it spells is in
+    ``unbound`` or is a member of what is (``Kind.X``)."""
+    for child in cross_file_keys.walk(node):
+        if child.type in ("lambda_expression", "anonymous_method_expression"):
+            return False
+        if child.type == "identifier" and _text(child).removeprefix("@") not in unbound:
+            parent = child.parent
+            if parent is None or parent.type != "member_access_expression" or _field(parent, child) != "name":
+                return False
+    return True
 
 
 def leftovers(repo_dir: str, wrapper: wi.Wrapper, removable: frozenset[str] = frozenset()) -> list[tuple[str, int, str]]:
