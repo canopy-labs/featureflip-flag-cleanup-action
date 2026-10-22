@@ -596,11 +596,16 @@ def _option_path(value: str, origin: Path, config: Path, declared_in: Path | Non
     return directory / rest
 
 
-def _config(reader_dir: Path, stop: Path, strict: bool = True) -> _Options | None:
+def _config(
+    reader_dir: Path, stop: Path, strict: bool = True, solution: Path | None = None
+) -> _Options | None:
     """The options of the nearest config, or None when there is none.
 
     Raises :class:`_Unknown` when it cannot be read for certain (see
-    :func:`_options`), or when two configs sit side by side.
+    :func:`_options`), or when two configs sit side by side. With
+    ``solution`` (the reader's own path), a nearest config that delegates
+    through ``references`` is read through the configs it names
+    (:func:`_solution_options`) instead of being refused.
     """
     current = reader_dir
     while True:
@@ -608,10 +613,101 @@ def _config(reader_dir: Path, stop: Path, strict: bool = True) -> _Options | Non
         if len(present) > 1:
             raise _Unknown(str(current))
         if present:
+            if solution is not None and strict:
+                delegated = _solution_options(present[0], solution, stop)
+                if delegated is not None:
+                    return delegated
             return _options(present[0], stop, strict)
         if current == stop or current.parent == current:
             return None
         current = current.parent
+
+
+def _strict_config(config: Path) -> dict:
+    """``config`` parsed the way :func:`_inheriting` parses it strictly."""
+    try:
+        text = config.read_text(encoding="utf-8")
+        if " " in text or " " in text:
+            raise _Unknown(str(config))
+        data = json.loads(_strip_jsonc(text), object_pairs_hook=_no_repeats)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise _Unknown(str(config)) from error
+    if not isinstance(data, dict):
+        raise _Unknown(str(config))
+    return data
+
+
+def _solution_options(config: Path, reader: Path, stop: Path) -> _Options | None:
+    """The options ``reader`` compiles with under a SOLUTION config, or None
+    when ``config`` has no ``references``.
+
+    A solution config (`"files": []` plus ``references``, Vite's default
+    layout) compiles nothing itself: each file belongs to whichever referenced
+    config includes it. Every referenced config that MAY compile ``reader``
+    (:func:`_may_compile`, which over-matches) is read strictly, and the
+    answer stands only when they all read the same options. Raises
+    :class:`_Unknown` when none may, when they disagree, when the solution
+    config may compile ``reader`` itself, or when a reference cannot be read.
+    """
+    data = _strict_config(config)
+    if "references" not in data:
+        return None
+    references = data["references"]
+    if not isinstance(references, list) or _may_compile(config, data, reader):
+        raise _Unknown(str(config))
+    found: list[_Options] = []
+    for reference in references:
+        written = reference.get("path") if isinstance(reference, dict) else None
+        if not isinstance(written, str):
+            raise _Unknown(str(config))
+        target = Path(os.path.normpath(config.parent / written))
+        if target.is_dir():
+            target = target / "tsconfig.json"
+        if not target.is_file() or not target.resolve().is_relative_to(stop):
+            raise _Unknown(str(config))
+        if _may_compile(target, _strict_config(target), reader):
+            found.append(_options(target, stop))
+    if not found or any(options != found[0] for options in found):
+        raise _Unknown(str(config))
+    return found[0]
+
+
+def _may_compile(config: Path, data: dict, reader: Path) -> bool:
+    """Whether ``config``'s ``files`` or ``include`` may hold ``reader``.
+
+    Over-matches on purpose, since every config that may hold it has to
+    agree: an ``include`` pattern counts as the directory before its first
+    wildcard, ``exclude`` is ignored, and a config that sets neither but
+    ``extends`` another counts, its inherited lists unread.
+    """
+    files, include = data.get("files"), data.get("include")
+    target = reader.resolve()
+    if files is None and include is None:
+        return "extends" in data or target.is_relative_to(config.parent.resolve())
+    if files is not None:
+        if not isinstance(files, list):
+            return True
+        for entry in files:
+            if not isinstance(entry, str) or Path(os.path.normpath(config.parent / entry)).resolve() == target:
+                return True
+    if include is not None:
+        if not isinstance(include, list):
+            return True
+        for pattern in include:
+            if not isinstance(pattern, str):
+                return True
+            pattern = pattern.replace("\\", "/")
+            if pattern.startswith(_CONFIG_DIR):
+                pattern = "." + pattern[len(_CONFIG_DIR) :]
+            literal = []
+            for part in pattern.split("/"):
+                if any(ch in part for ch in "*?[{$"):
+                    break
+                literal.append(part)
+            base = Path(os.path.normpath(config.parent.joinpath(*literal))).resolve()
+            if target == base or target.is_relative_to(base):
+                return True
+    return False
 
 
 def _fit(specifier: str, patterns: Iterable[str]) -> tuple[str, str] | None:
@@ -642,6 +738,7 @@ def _resolve(
     beside_declarations: bool = False,
     base_url: Callable[[str, str], bool] | None = None,
     strict: bool = True,
+    solution: bool = False,
 ) -> str | None:
     reader_dir = Path(reader_path).parent
     try:
@@ -650,7 +747,7 @@ def _resolve(
             return hits[0] if hits else None
         if specifier.startswith("/") or not specifier:
             return None
-        options = _config(reader_dir, stop, strict)
+        options = _config(reader_dir, stop, strict, Path(reader_path) if solution else None)
         if options is None:
             return None
         targets = options.targets(specifier)
@@ -684,6 +781,7 @@ def resolve_specifier(
     *,
     beside_declarations: bool = False,
     base_url: Callable[[str, str], bool] | None = None,
+    solution: bool = False,
 ) -> str | None:
     """The absolute path of the file ``specifier`` imports from ``reader_path``.
 
@@ -703,9 +801,13 @@ def resolve_specifier(
     ``base_url(reader_path, specifier)`` lets a bare specifier that no
     ``paths`` pattern fits resolve under the config's explicit ``baseUrl``,
     when it returns true: a runtime may still read such a specifier as a
-    package, which only the caller can rule out.
+    package, which only the caller can rule out. ``solution`` reads a nearest
+    config that delegates through ``references`` by the configs it names
+    (:func:`_solution_options`); otherwise such a config answers nothing.
     """
-    return _resolve(reader_path, specifier, _stop_for(repo_dir), beside_declarations, base_url)
+    return _resolve(
+        reader_path, specifier, _stop_for(repo_dir), beside_declarations, base_url, solution=solution
+    )
 
 
 #: Every config a project can compile with, not only the two names
@@ -746,6 +848,43 @@ def names_package(reader_path: str, specifier: str, repo_dir: str) -> bool:
             current = current.parent
     except (_Unknown, OSError, UnicodeDecodeError, ValueError):
         return False
+
+
+def package_scope(reader_path: str, specifier: str, repo_dir: str) -> str | None:
+    """The directory of the ``package.json`` a runtime looks bare
+    ``specifier`` up from, when ``reader_path``'s compiler can read it only as
+    a package; ``None`` otherwise.
+
+    The nearest config, read as :func:`resolve_specifier` reads it with
+    ``solution``, must have no ``paths`` pattern that fits the specifier and
+    no ``baseUrl`` file that answers it, and no directory from the reader's
+    up to that ``package.json`` may hold a file answering it (classic
+    resolution) or, below the package's own, a ``node_modules`` (a nearer
+    install). Two importers with one scope then load one module for it.
+    """
+    if not specifier or specifier.startswith((".", "/")):
+        return None
+    reader = Path(reader_path)
+    stop = _stop_for(repo_dir)
+    try:
+        options = _config(reader.parent, stop, True, reader)
+        if options is not None and (
+            options.targets(specifier) is not None
+            or options.base_url is not None
+            and _candidates(os.path.normpath(options.base_url / specifier))
+        ):
+            return None
+        current = reader.parent.resolve()
+        while True:
+            if _candidates(os.path.normpath(current / specifier)):
+                return None
+            if (current / "package.json").is_file():
+                return str(current)
+            if os.path.lexists(current / "node_modules") or current == stop or current.parent == current:
+                return None
+            current = current.parent
+    except (_Unknown, OSError):
+        return None
 
 
 def _answers(config: Path, specifier: str, stop: Path) -> bool:

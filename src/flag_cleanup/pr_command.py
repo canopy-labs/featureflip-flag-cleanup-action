@@ -876,6 +876,7 @@ def _dry_run_caveats(
     unread_ctor = sum(1 for _, kind, _ in bindings if kind == "unread constructor parameter")
     unread_bindings = sum(1 for _, kind, _ in bindings if kind == "unread binding")
     emptied = sum(1 for _, kind, _ in bindings if kind == "emptied override")
+    left_out = sum(1 for _, kind, _ in bindings if kind == "dropped override argument")
     dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
     removed_ctor = sum(1 for _, kind, _ in bindings if kind == "removed parameter")
     removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
@@ -884,6 +885,7 @@ def _dry_run_caveats(
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     cleaned = (
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
+        - left_out
         - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments
     )
     if cleaned:
@@ -926,6 +928,8 @@ def _dry_run_caveats(
         notes.append(
             f"{unread_bindings} binding(s) would be left unread by a removed override"
         )
+    if left_out:
+        notes.append(f"{left_out} emptied override argument(s) would be left out")
     if emptied:
         notes.append(f"{emptied} override literal(s) would be left empty")
     if entries:

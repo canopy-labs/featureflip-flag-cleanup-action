@@ -595,9 +595,11 @@ def _ts_import_candidates(
     A replacement also records the specifier it ``loads``. When
     :func:`remove_stranded_bindings` is about to write the bare import, it
     first asks :mod:`flag_cleanup.inert_load` whether loading that module
-    does anything, and deletes the statement if it provably does not. That
-    question reads files, so it is asked only of a statement this pass is
-    acting on, never of every import while candidates are being listed.
+    does anything, and deletes the statement if it provably does not, or if
+    everything it does is done anyway by the modules the file's other imports
+    load (:func:`~flag_cleanup.inert_load.coverage`). Those questions read
+    files, so they are asked only of a statement this pass is acting on,
+    never of every import while candidates are being listed.
 
     Since engine 0.37.0 the engine removes a named specifier its own fold
     stranded when its group keeps another, so this branch is the backstop for
@@ -4901,6 +4903,11 @@ def remove_stranded_bindings(
         if language in {"ts", "tsx", "js"} and path is not None and root is not None
         else None
     )
+    covered = (
+        inert_load.coverage(path, root)
+        if language in {"ts", "tsx", "js"} and path is not None and root is not None
+        else None
+    )
     configured = (
         lru_cache(maxsize=None)(partial(cross_file_ts.jsx_factories, path, root))
         if language in {"ts", "tsx", "js"} and path is not None and root is not None
@@ -4956,8 +4963,12 @@ def remove_stranded_bindings(
                 continue
             if current_count != 0:
                 continue
-            if candidate.loads is not None and inert is not None and inert(candidate.loads):
-                # The bare import would keep a load that does nothing.
+            if candidate.loads is not None and inert is not None and (
+                inert(candidate.loads)
+                or covered(current, (candidate.start, candidate.end), candidate.loads)
+            ):
+                # The bare import would keep a load that does nothing, or one
+                # another import of this file already makes.
                 candidate = replace(candidate, replacement=None, loads=None)
             if inert is not None:
                 specifier = _inert_require(current, candidate, language)

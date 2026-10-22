@@ -7,6 +7,33 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.14.0
+
+### New
+
+- **TypeScript and JavaScript:** a stranded import is no longer left behind as
+  a bare `import "./m";` when the file's other imports already load everything
+  in that module's graph that does work. A barrel that loads a store or a
+  client the same file reaches anyway is the usual case. Only imports the
+  compiler keeps count, and other files' imports never do. See README's
+  caveats for the rules and the one ordering change it can make.
+- **TypeScript and JavaScript:** a `paths` alias is now followed through a
+  solution `tsconfig.json` (`references` plus `"files": []`, as in Vite's
+  template) when the referenced configs that may compile the file agree. A
+  stranded import of an inert module behind such an alias used to keep its
+  bare import.
+- **TypeScript and JavaScript:** an override left as `{}` is now dropped from
+  the call it was passed to when it was the last argument and the function,
+  declared at the top level of the same file and not generic, defaults that
+  parameter to `{}`. `createWrapper(['/login'], {})` becomes
+  `createWrapper(['/login'])`. The pull request lists each call it shortened.
+
+### Fixed
+
+- **TypeScript and JavaScript:** an override whose flag entry sat on a line of
+  its own, leaving `{` and `}` on separate lines, was left empty without being
+  listed in the pull request. It is now listed, or dropped as above.
+
 ## 1.13.0
 
 ### New

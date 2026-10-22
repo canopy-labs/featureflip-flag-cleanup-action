@@ -38,7 +38,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from functools import lru_cache
+from collections.abc import Callable
+from functools import lru_cache, partial
 from pathlib import Path
 
 import tree_sitter_typescript
@@ -182,7 +183,7 @@ def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: se
         and not _substituted(str(stop))
     ):
         return
-    target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir)
+    target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir, solution=True)
     if target is None or target.endswith(_DECLARATION_FILES):
         raise _NotInert
     resolved = Path(target).resolve()
@@ -200,6 +201,350 @@ def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: se
         raise _NotInert
     for loaded in _module_loads(root):
         _check_load(str(resolved), loaded, repo_dir, stop, seen)
+
+
+def _sdk(reader: str, specifier: str, repo_dir: str, stop: Path) -> bool:
+    """Whether ``specifier`` is an audited SDK whose load does nothing."""
+    return (
+        specifier in SIDE_EFFECT_FREE_PACKAGES
+        and cross_file_ts.names_package(reader, specifier, repo_dir)
+        and not _substituted(str(stop))
+    )
+
+
+def coverage(reader_path: str, repo_dir: str) -> Callable[[str, tuple[int, int], str], bool]:
+    """A check of whether a load ``reader_path`` is about to drop is COVERED.
+
+    ``covered(source, own, specifier)`` asks it of the import statement
+    spanning the bytes ``own`` of ``source``, the file as it now stands, which
+    loads ``specifier``. Covered means dropping that statement drops no
+    module that may do work when it loads: every such module its load reaches
+    is loaded anyway by another import that ``source`` keeps
+    (:func:`_certain_loads`), directly or through the files those load.
+    Modules that only declare things (the allow-list :func:`is_inert` applies)
+    are walked through rather than asked for, since loading them does nothing
+    either way.
+
+    The module may now load a few imports later in this file than it did,
+    when only an import below this one reaches it. That is the one change in
+    behaviour, and it shows only when a module relies on another's load-time
+    work without importing it. A module loaded by another FILE does not
+    count: whether that file is in the same program, or loads before this
+    one, is not knowable here.
+
+    Files are read once per check made with this ``coverage``, which serves
+    one file's pass: a pass over the next file sees what this one wrote.
+    """
+    stop = Path(_checkout_root(repo_dir)).resolve()
+    reader = str(Path(reader_path).resolve())
+    files: dict[str, Node | None] = {}
+
+    def parsed(path: str) -> Node | None:
+        if path not in files:
+            try:
+                source = Path(path).read_bytes()
+            except OSError:
+                files[path] = None
+            else:
+                root = _parser(_grammar(path)).parse(source).root_node
+                files[path] = None if root.has_error else root
+        return files[path]
+
+    def identity(importer: str, specifier: str) -> str | tuple[str, str] | None:
+        """What loading ``specifier`` from ``importer`` loads, comparable
+        across importers: a file's path, or a package with the directory its
+        lookup starts from. ``None`` when that cannot be told."""
+        target = cross_file_ts.resolve_specifier(importer, specifier, repo_dir, solution=True)
+        if target is not None:
+            # A declaration file is not what the runtime loads.
+            return None if target.endswith(_DECLARATION_FILES) else str(Path(target).resolve())
+        scope = cross_file_ts.package_scope(importer, specifier, repo_dir)
+        return None if scope is None else (specifier, scope)
+
+    def reached(source: str, own: tuple[int, int]) -> set[str | tuple[str, str]]:
+        root = _parser(_grammar(reader)).parse(source.encode("utf-8")).root_node
+        if root.has_error:
+            return set()
+        found: set[str | tuple[str, str]] = set()
+        pending = [
+            (reader, specifier)
+            for specifier in _certain_loads(root, own, lambda s, n: value_export(reader, s, n))
+        ]
+        while pending:
+            importer, specifier = pending.pop()
+            target = identity(importer, specifier)
+            if target is None or target in found:
+                continue
+            found.add(target)
+            if isinstance(target, str) and target != reader and target.startswith(str(stop) + os.sep):
+                file = parsed(target)
+                if file is not None:
+                    values = partial(value_export, target)
+                    pending.extend((target, s) for s in _certain_loads(file, None, values))
+        return found
+
+    def value_export(importer: str, specifier: str, name: str, depth: int = 0) -> bool:
+        """Whether the module ``specifier`` names from ``importer`` exports
+        ``name`` as a value, which is when a compiler keeps an
+        ``export { name } from`` of it. False when unsure."""
+        target = cross_file_ts.resolve_specifier(importer, specifier, repo_dir, solution=True)
+        if target is None or target.endswith(_DECLARATION_FILES) or depth > _EXPORT_DEPTH:
+            return False
+        file = parsed(str(Path(target).resolve()))
+        return file is not None and _exports_value(
+            file, name, lambda s, n: value_export(target, s, n, depth + 1)
+        )
+
+    def check(importer: str, specifier: str, loaded: set, seen: set[str]) -> None:
+        target = identity(importer, specifier)
+        if target is not None and target in loaded:
+            return
+        if _sdk(importer, specifier, repo_dir, stop):
+            return
+        if not isinstance(target, str) or not Path(target).is_relative_to(stop):
+            raise _NotInert
+        if target == reader or target in seen:
+            # The reader is mid-load whenever its own import reaches it.
+            return
+        seen.add(target)
+        file = parsed(target)
+        if file is None or _declaring_script(file):
+            raise _NotInert
+        for load in _module_loads(file):
+            check(target, load, loaded, seen)
+
+    def covered(source: str, own: tuple[int, int], specifier: str) -> bool:
+        try:
+            check(reader, specifier, reached(source, own), set())
+        except (_NotInert, RecursionError, OSError, UnicodeDecodeError):
+            return False
+        return True
+
+    return covered
+
+
+def _checkout_root(repo_dir: str) -> str:
+    from flag_cleanup.piranha_runner import checkout_root
+
+    return checkout_root(repo_dir)
+
+
+#: How many ``export … from`` hops :func:`coverage` follows to find a value.
+_EXPORT_DEPTH = 16
+
+#: Where an identifier leaf DECLARES a name rather than reading it, keyed by
+#: its parent's type: the field it must sit in, or ``None`` for any. Over-
+#: inclusive on purpose, since a name declared anywhere else in a file may
+#: shadow an import (:func:`_kept_binding`).
+_DECLARING = {
+    "variable_declarator": "name", "assignment_pattern": "left",
+    "object_assignment_pattern": "left", "pair_pattern": "value",
+    "required_parameter": "pattern", "optional_parameter": "pattern",
+    "formal_parameters": None, "rest_pattern": None, "array_pattern": None,
+    "object_pattern": None, "function_declaration": "name",
+    "function_expression": "name", "function": "name",
+    "generator_function_declaration": "name", "generator_function": "name",
+    "class_declaration": "name", "abstract_class_declaration": "name",
+    "class": "name", "catch_clause": "parameter", "arrow_function": "parameter",
+    "for_in_statement": "left", "enum_declaration": "name",
+    "internal_module": "name", "module": "name", "import_specifier": None,
+    "namespace_import": None, "import_clause": None,
+}
+
+#: Nodes whose subtree the compiler erases, so a name under one is not read.
+_ERASED = frozenset({
+    "type_annotation", "type_arguments", "type_parameters", "type_query",
+    "nested_type_identifier", "implements_clause", "extends_type_clause",
+    "type_alias_declaration", "interface_declaration", "ambient_declaration",
+})
+
+_JSX_ELEMENTS = frozenset({"jsx_opening_element", "jsx_closing_element", "jsx_self_closing_element"})
+
+#: Declarations that create a runtime value of their name.
+_VALUE_DECLARATIONS = frozenset({
+    "function_declaration", "generator_function_declaration",
+    "class_declaration", "abstract_class_declaration", "enum_declaration",
+})
+
+
+def _certain_loads(
+    root: Node, own: tuple[int, int] | None, value_export: Callable[[str, str], bool]
+) -> list[str]:
+    """The specifiers ``root``'s top level loads under every compiler setting,
+    skipping the statement that overlaps the bytes ``own``.
+
+    An import counts when it binds nothing, or when one of its names is read
+    as a value and declared nowhere else in the file: a name whose every read
+    is erased or may be shadowed lets the compiler drop the whole statement,
+    as ``tsc`` does. ``export * from`` always counts, and
+    ``export { a } from`` only when ``a`` is a value there (``value_export``);
+    a type re-export is dropped. ``import type``, ``export type`` and
+    ``import x = require`` never count.
+    """
+    loads = []
+    for statement in root.named_children:
+        if own is not None and statement.start_byte < own[1] and statement.end_byte > own[0]:
+            continue
+        tokens = {c.type for c in statement.children if not c.is_named}
+        source = statement.child_by_field_name("source")
+        if source is None or "type" in tokens:
+            continue
+        specifier = _source(statement)
+        if statement.type == "import_statement":
+            clause = next((c for c in statement.named_children if c.type == "import_clause"), None)
+            if clause is None or any(_kept_binding(root, statement, n) for n in _bound(clause)):
+                loads.append(specifier)
+        elif statement.type == "export_statement":
+            if "*" in tokens or any(c.type == "namespace_export" for c in statement.named_children):
+                loads.append(specifier)
+                continue
+            if any(value_export(specifier, name) for name, _ in _export_specifiers(statement)):
+                loads.append(specifier)
+    return loads
+
+
+def _bound(clause: Node) -> list[str]:
+    """The names an ``import_clause`` binds, minus inline ``type`` ones."""
+    names = []
+    for child in clause.named_children:
+        if child.type == "identifier":
+            names.append(child)
+        elif child.type == "namespace_import":
+            names.extend(c for c in child.named_children if c.type == "identifier")
+        elif child.type == "named_imports":
+            for specifier in child.named_children:
+                if specifier.type != "import_specifier" or any(c.type == "type" for c in specifier.children):
+                    continue
+                names.append(specifier.child_by_field_name("alias") or specifier.child_by_field_name("name"))
+    return [n.text.decode("utf-8", "replace") for n in names if n is not None]
+
+
+def _export_specifiers(statement: Node) -> list[tuple[str, str]]:
+    """Each ``(local, exported)`` name pair an ``export { … }`` clause lists,
+    minus inline ``type`` ones."""
+    pairs = []
+    for clause in (c for c in statement.named_children if c.type == "export_clause"):
+        for specifier in clause.named_children:
+            if specifier.type != "export_specifier" or any(c.type == "type" for c in specifier.children):
+                continue
+            name = specifier.child_by_field_name("name")
+            alias = specifier.child_by_field_name("alias") or name
+            if name is not None:
+                pairs.append(
+                    (name.text.decode("utf-8", "replace"), alias.text.decode("utf-8", "replace"))
+                )
+    return pairs
+
+
+def _kept_binding(root: Node, statement: Node, name: str) -> bool:
+    """Whether a compiler keeps ``statement`` for its binding ``name``: the
+    file reads it as a value, and declares the name nowhere else, so that no
+    read can be a shadowing local's."""
+    read = False
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.id == statement.id:
+            continue
+        stack.extend(node.children)
+        if node.child_count or node.text.decode("utf-8", "replace") != name:
+            continue
+        if node.type == "shorthand_property_identifier_pattern" or _declares(node):
+            return False
+        if node.type in {"identifier", "shorthand_property_identifier"} and not _erased(node):
+            read = True
+    return read
+
+
+def _declares(node: Node) -> bool:
+    parent = node.parent
+    if parent is None or node.type != "identifier" or parent.type not in _DECLARING:
+        return False
+    field = _DECLARING[parent.type]
+    if field is None:
+        return True
+    held = parent.child_by_field_name(field)
+    return held is not None and held.id == node.id
+
+
+def _erased(node: Node) -> bool:
+    """Whether the compiler emits nothing that reads ``node``: it sits in a
+    type, names an intrinsic JSX element (``<div>`` is a string), or is
+    exported as is (``export { a }``, ``export default a``), which keeps
+    the import only when the name is a value there, unknown here."""
+    parent = node.parent
+    if parent is not None and parent.type in _JSX_ELEMENTS and node.text[:1].islower():
+        return True
+    if parent is not None and parent.type in {"export_specifier", "export_statement"}:
+        return True
+    current = parent
+    while current is not None:
+        if current.type in _ERASED:
+            return True
+        current = current.parent
+    return False
+
+
+def _exports_value(root: Node, name: str, value_export: Callable[[str, str], bool]) -> bool:
+    """Whether the module ``root`` exports ``name`` as a value. A re-export
+    asks ``value_export(specifier, name)`` of the module it names."""
+    values = {n for top in root.named_children for n in _value_names(top)}
+    for statement in root.named_children:
+        if statement.type != "export_statement":
+            continue
+        tokens = {c.type for c in statement.children if not c.is_named}
+        if "type" in tokens:
+            continue
+        source = statement.child_by_field_name("source")
+        declaration = statement.child_by_field_name("declaration")
+        value = statement.child_by_field_name("value")
+        if "default" in tokens:
+            if name != "default":
+                continue
+            if declaration is not None:
+                return bool(_value_names(declaration)) or declaration.type in _VALUE_EXPRESSIONS
+            # `export default T` is erased when `T` names only a type.
+            return value is not None and (
+                value.type != "identifier" or value.text.decode("utf-8", "replace") in values
+            )
+        namespace = next((c for c in statement.named_children if c.type == "namespace_export"), None)
+        if namespace is not None:
+            if any(c.text.decode("utf-8", "replace") == name for c in namespace.named_children):
+                return True
+            continue
+        if source is not None and "*" in tokens:
+            if name != "default" and value_export(_source(statement), name):
+                return True
+            continue
+        if declaration is not None:
+            if name in _value_names(declaration):
+                return True
+            continue
+        for local, exported in _export_specifiers(statement):
+            if exported == name and (
+                value_export(_source(statement), local) if source is not None else local in values
+            ):
+                return True
+    return False
+
+
+#: An ``export default`` declaration with no name that is still a value.
+_VALUE_EXPRESSIONS = frozenset({"function_expression", "function", "class", "generator_function"})
+
+
+def _value_names(declaration: Node) -> list[str]:
+    """The names a top-level declaration binds to runtime values."""
+    if declaration.type in _VALUE_DECLARATIONS:
+        if declaration.type == "enum_declaration" and any(c.type == "const" for c in declaration.children):
+            return []
+        return [_name(declaration)]
+    if declaration.type in {"lexical_declaration", "variable_declaration"}:
+        return [
+            d.child_by_field_name("name").text.decode("utf-8", "replace")
+            for d in declaration.named_children
+            if d.type == "variable_declarator" and d.child_by_field_name("name").type == "identifier"
+        ]
+    return []
 
 
 @lru_cache(maxsize=None)

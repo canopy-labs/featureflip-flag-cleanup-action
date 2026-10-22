@@ -36,8 +36,9 @@ binding is left unread, which an unused-variable lint rejects. A ``const`` is
 then removed by the stranded-binding pass like any other local. A parameter is
 removed by :func:`drop_unread_parameters` only where every call is in sight and
 none passes it; anywhere else it is REPORTED, because removing a parameter
-changes every call that passes it. :func:`emptied_overrides` reports the
-literals the deletions left as ``{}``.
+changes every call that passes it. :func:`drop_emptied_arguments` removes a
+literal the deletions left as ``{}`` where it is an argument the callee would
+default to ``{}`` anyway, and :func:`emptied_overrides` reports the rest.
 
 The pass runs on the ENGINE's output, in the window every text pass shares, so
 Gate 1 judges its edits and the all-or-nothing rollback covers them.
@@ -46,6 +47,7 @@ Gate 1 judges its edits and the all-or-nothing rollback covers them.
 from __future__ import annotations
 
 import difflib
+from collections import Counter
 from dataclasses import dataclass
 
 from tree_sitter import Node
@@ -379,26 +381,221 @@ def emptied_overrides(before: str, after: str, language: str, flag_key: str) -> 
     Taking the entry is right; what is left may not be. An empty override
     literal is harmless, but the prop or argument carrying it may now be
     pointless, and whether it can go depends on a type declared elsewhere — so
-    it is reported, never edited. Read off the two texts, hunk by hunk: a hunk
-    whose old side held N objects with nothing but entries keyed by the flag
-    reports up to N empty object literals on its CHANGED new lines. Counting
-    the old side's sole-keyed objects rather than the change in empty ones
-    keeps a ``= {}`` default deleted in the same hunk from cancelling one out.
+    it is reported, never edited, unless :func:`drop_emptied_arguments` can
+    remove it. See :func:`_emptied_lines`.
+    """
+    lines = after.splitlines()
+    return tuple(lines[n].strip() for n, _ in _emptied_lines(before, after, language, flag_key))
+
+
+def _emptied_lines(
+    before: str, after: str, language: str, flag_key: str
+) -> list[tuple[int, bool]]:
+    """The line in ``after`` of each object literal this removal emptied, once
+    per literal, and whether that line is CERTAIN.
+
+    Read off the two texts, hunk by hunk: a hunk whose old side held N objects
+    with nothing but entries keyed by the flag reports up to N empty object
+    literals on its CHANGED new lines. Counting the old side's sole-keyed
+    objects rather than the change in empty ones keeps a ``= {}`` default
+    deleted in the same hunk from cancelling one out. An object whose entries
+    sat on lines of their own keeps its opening line unchanged, so an
+    unchanged line counts too, for as many objects as it both lost entries
+    from and gained empty.
+
+    A changed hunk that kept its length is paired line by line the same way.
+    Otherwise a line is certain unless its hunk has more changed lines holding
+    an empty literal than objects it emptied: then the report picks the first
+    ones, and
+    one of them can be an empty object the customer wrote on a line the fold
+    changed (``render(isOn('k') ? 1 : 2, {})``). Good enough for a report
+    line, not for an edit.
     """
     if before == after:
-        return ()
-    old_lines, old_keyed, _old_empty = _object_lines(before, language, flag_key)
+        return []
+    old_lines, old_keyed, old_empty = _object_lines(before, language, flag_key)
     new_lines, _new_keyed, new_empty = _object_lines(after, language, flag_key)
-    found: list[str] = []
+    keyed_at, old_empty_at, new_empty_at = Counter(old_keyed), Counter(old_empty), Counter(new_empty)
+    found: list[tuple[int, bool]] = []
     matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                gained = new_empty_at[j] - old_empty_at[i]
+                found.extend([(j, True)] * min(keyed_at[i], max(gained, 0)))
+            continue
         if tag not in ("replace", "insert"):
             continue
         emptied = sum(1 for n in old_keyed if i1 <= n < i2)
+        if i2 - i1 == j2 - j1:
+            # The fold rewrites lines in place, so a hunk that kept its length
+            # pairs its lines; trusted only when the pairs account for every
+            # object the hunk emptied.
+            paired = [
+                (j, min(keyed_at[i], max(new_empty_at[j] - old_empty_at[i], 0)))
+                for i, j in zip(range(i1, i2), range(j1, j2))
+            ]
+            if sum(count for _, count in paired) == emptied:
+                found.extend((j, True) for j, count in paired for _ in range(count))
+                continue
         unchanged = set(old_lines[i1:i2])
         changed = [n for n in new_empty if j1 <= n < j2 and new_lines[n] not in unchanged]
-        found.extend(new_lines[n].strip() for n in changed[:emptied])
-    return tuple(found)
+        found.extend((n, len(changed) <= emptied) for n in changed[:emptied])
+    return found
+
+
+def drop_emptied_arguments(
+    before: str, after: str, language: str, flag_key: str
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """``after`` without each emptied override passed where the callee would
+    default to ``{}`` anyway, the call each one was dropped from, and the line
+    :func:`emptied_overrides` gives each one in ``after``.
+
+    ``createWrapper(['/login'], {})`` becomes ``createWrapper(['/login'])``
+    when ``createWrapper``'s second parameter is ``flags = {}``: a default is
+    evaluated afresh on each call, so leaving the argument out passes the
+    same thing as passing ``{}``. Only literals :func:`_emptied_lines` names
+    on a CERTAIN line are candidates, so an empty object the customer wrote
+    stays. One goes only when all of this holds:
+
+    * it is the LAST argument, after no spread, in a call with no comment
+      among its arguments, whose callee is a plain name;
+    * the name is declared once, at the top level of this file, as a
+      ``function`` or a ``const`` bound to a function, and every other
+      occurrence of it is the callee of a call, so it is never re-bound,
+      shadowed or handed on;
+    * the parameter in that position defaults to an empty object literal,
+      is not a rest parameter, and no ``this`` parameter shifts positions;
+    * the function has no type parameters, which a passed ``{}`` can infer
+      and a default cannot (``g<T = number>(o: T | {} = {}): T``);
+    * the function never names ``arguments``, which would tell the two
+      calls apart;
+    * it is the only empty object starting on its line, since emptied
+      literals are known by line.
+    """
+    rows = {n for n, certain in _emptied_lines(before, after, language, flag_key) if certain}
+    if not rows:
+        return after, (), ()
+    data = after.encode("utf-8")
+    root = _parse(after, language)
+    empty = [n for n in _walk(root) if n.type == "object" and not n.named_children]
+    per_row = Counter(n.start_point[0] for n in empty)
+    spans: list[tuple[int, int, str]] = []
+    for node in empty:
+        if node.start_point[0] not in rows or per_row[node.start_point[0]] != 1:
+            continue
+        span = _omittable(node, root, data)
+        if span is not None:
+            call = node.parent.parent
+            line = after.splitlines()[node.start_point[0]].strip()
+            spans.append((*span, _one_line(_text(call, data)), line))
+    if not spans:
+        return after, (), ()
+    for start, end, _call, _line in sorted(spans, reverse=True):
+        data = data[:start] + data[end:]
+    spans.sort()
+    return (
+        data.decode("utf-8"),
+        tuple(call for _s, _e, call, _l in spans),
+        tuple(line for _s, _e, _c, line in spans),
+    )
+
+
+def _omittable(literal: Node, root: Node, data: bytes) -> tuple[int, int] | None:
+    """The bytes leaving out the argument ``literal`` takes, or ``None``."""
+    arguments = literal.parent
+    if arguments is None or arguments.type != "arguments":
+        return None
+    passed = arguments.named_children
+    if (
+        passed[-1].id != literal.id
+        or any(c.type in ("comment", "spread_element") for c in passed)
+    ):
+        return None
+    call = arguments.parent
+    callee = call.child_by_field_name("function") if call.type == "call_expression" else None
+    if callee is None or callee.type != "identifier":
+        return None
+    function = _sole_function(_text(callee, data), root, data)
+    parameters = function.child_by_field_name("parameters") if function is not None else None
+    if parameters is None or function.child_by_field_name("type_parameters") is not None:
+        return None
+    members = [c for c in parameters.named_children if c.type != "comment"]
+    position = len(passed) - 1
+    if position >= len(members) or any(
+        (pattern := m.child_by_field_name("pattern")) is not None and pattern.type == "this"
+        for m in members
+    ):
+        return None
+    parameter = members[position]
+    pattern = parameter.child_by_field_name("pattern")
+    default = parameter.child_by_field_name("value")
+    if (
+        parameter.type not in _PARAMETERS
+        or pattern is None
+        or pattern.type == "rest_pattern"
+        or default is None
+        or default.type != "object"
+        or default.named_children
+    ):
+        return None
+    if any(n.type == "identifier" and _text(n, data) == "arguments" for n in _walk(function)):
+        return None
+    if position == 0:
+        # Everything between the parentheses, so a trailing `,` goes too.
+        return arguments.start_byte + 1, arguments.end_byte - 1
+    return passed[position - 1].end_byte, literal.end_byte
+
+
+def _sole_function(name: str, root: Node, data: bytes) -> Node | None:
+    """The top-level function ``name`` binds, when every other occurrence of
+    the name in the file is the callee of a call."""
+    found = None
+    for leaf in _walk(root):
+        if leaf.type not in _NAME_LEAVES or _text(leaf, data) != name:
+            continue
+        function = _top_level_function(leaf)
+        if function is not None and found is None:
+            found = function
+            continue
+        call = leaf.parent
+        if (
+            function is not None
+            or call is None
+            or call.type != "call_expression"
+            or call.child_by_field_name("function").id != leaf.id
+        ):
+            return None
+    return found
+
+
+def _top_level_function(leaf: Node) -> Node | None:
+    """The function ``leaf`` names, when it is the name of a top-level
+    ``function`` declaration or of a top-level ``const`` bound to a function."""
+    holder = leaf.parent
+    if holder is None or holder.child_by_field_name("name") is None:
+        return None
+    if holder.child_by_field_name("name").id != leaf.id:
+        return None
+    if holder.type == "function_declaration":
+        function = statement = holder
+    elif holder.type == "variable_declarator":
+        function = holder.child_by_field_name("value")
+        statement = holder.parent
+        if (
+            function is None
+            or function.type not in ("arrow_function", "function_expression", "function")
+            or statement is None
+            or statement.type != "lexical_declaration"
+            or not statement.text.startswith(b"const")
+        ):
+            return None
+    else:
+        return None
+    scope = statement.parent
+    if scope is not None and scope.type == "export_statement":
+        scope = scope.parent
+    return function if scope is not None and scope.type == "program" else None
 
 
 def _object_lines(

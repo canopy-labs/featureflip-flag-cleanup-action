@@ -1313,7 +1313,9 @@ class TransformOutcome:
     #: ``"unread binding"`` (the parameter or local an override deleted by
     #: :mod:`~flag_cleanup.ts_bound_overrides` was the last reader of) and
     #: ``"emptied override"`` (the line of an object literal the entry
-    #: deletions left as ``{}``).
+    #: deletions left as ``{}``). Kind ``"dropped override argument"`` is
+    #: such a literal removed instead, with the call it was left out of as
+    #: text, because the callee's parameter defaults to ``{}`` anyway.
     bindings: tuple[tuple[str, str, str], ...] = ()
     #: ``(path, text)`` for every flag-keyed ENTRY the ``*_entries.toml``
     #: rules deleted — a registry line, an override property, an object-type
@@ -2141,9 +2143,12 @@ def _transform_flag(
     bindings = bindings + dropped_parameters + unread_bindings
 
     # The override literals the entry deletions left empty (`flags={{}}`).
-    # Reported, never edited: whether the prop carrying one can go depends on
-    # a type declared elsewhere. Last, so it reads the bytes that stay on disk.
-    bindings = bindings + _emptied_overrides(summaries, language, flag_key, repo_dir)
+    # One passed as the last argument of a function in this file whose
+    # parameter defaults to `{}` anyway is dropped; the rest are reported,
+    # never edited, since whether the prop carrying one can go depends on a
+    # type declared elsewhere. Last, so they read the bytes that stay on disk.
+    summaries, emptied_rows = _drop_emptied_arguments(summaries, language, flag_key, repo_dir)
+    bindings = bindings + emptied_rows
 
     # The comments left describing nothing but what this run removed: the
     # flag, or a C# family type it deleted. Last of the edits, so it judges
@@ -2880,25 +2885,49 @@ def _remove_stale_comments(
     return result, tuple(rows), wrapper_rows
 
 
-def _emptied_overrides(
+def _drop_emptied_arguments(
     summaries, language: str, flag_key: str, repo_dir: str
-) -> tuple[tuple[str, str, str], ...]:
-    """``(path, "emptied override", line)`` for each object literal this
-    removal emptied; TypeScript family only. See
-    :func:`~flag_cleanup.ts_bound_overrides.emptied_overrides`."""
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Leave out each emptied override the callee defaults to ``{}`` anyway,
+    and report the rest; TypeScript family only. See
+    :func:`~flag_cleanup.ts_bound_overrides.drop_emptied_arguments` and
+    :func:`~flag_cleanup.ts_bound_overrides.emptied_overrides`.
+
+    Returns the summaries, a ``(path, "dropped override argument", call)``
+    row for each argument left out and a ``(path, "emptied override", line)``
+    row for each literal left. The report is read off the text BEFORE the
+    drop, less the lines dropped: read after, the hunks still count the
+    objects the drop took, and hand those slots to empty literals the
+    customer wrote.
+    """
     if not ts_tests.covers(language):
-        return ()
-    return tuple(
-        (os.path.relpath(summary.path, repo_dir), "emptied override", line)
-        for summary in summaries
-        if summary.original_content != summary.content
-        for line in ts_bound_overrides.emptied_overrides(
-            summary.original_content,
-            summary.content,
-            _grammar_of(summary.path, language),
-            flag_key,
+        return summaries, ()
+    result = []
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content:
+            result.append(summary)
+            continue
+        grammar = _grammar_of(summary.path, language)
+        relative = os.path.relpath(summary.path, repo_dir)
+        emptied = list(
+            ts_bound_overrides.emptied_overrides(
+                summary.original_content, summary.content, grammar, flag_key
+            )
         )
-    )
+        content, calls, lines = ts_bound_overrides.drop_emptied_arguments(
+            summary.original_content, summary.content, grammar, flag_key
+        )
+        for line in lines:
+            emptied.remove(line)
+        rows.extend((relative, "dropped override argument", call) for call in calls)
+        rows.extend((relative, "emptied override", line) for line in emptied)
+        if not calls:
+            result.append(summary)
+            continue
+        Path(summary.path).write_text(content, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, content))
+    return result, tuple(rows)
 
 
 def _restore_tests_using_key_as_data(

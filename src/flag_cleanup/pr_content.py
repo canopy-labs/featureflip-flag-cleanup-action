@@ -173,6 +173,7 @@ REPORTED_BINDING_KINDS = frozenset(
         "kept argument local",
         "unread binding",
         "emptied override",
+        "dropped override argument",
         "removed comment",
     }
 )
@@ -526,6 +527,24 @@ def _emptied_override_lines(emptied: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _dropped_argument_lines(dropped: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each call an emptied override was left out of, or nothing."""
+    if not dropped:
+        return []
+    count = len(dropped)
+    noun = "argument was" if count == 1 else "arguments were"
+    return [
+        f"> **{count} emptied override {noun} left out.** Removing this flag's "
+        f"entry left {'it' if count == 1 else 'each'} as `{{}}`, passed last to "
+        "a function in the same file whose parameter defaults to `{}`, so the "
+        "call passes the same value without it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in dropped[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def _removed_comment_lines(removed: list[tuple[str, str]]) -> list[str]:
     """The callout naming each comment deleted because it described nothing
     but what this pull request removes, or nothing."""
@@ -622,9 +641,10 @@ def pr_body(
     ``"unread member"`` entries, the TypeScript family's counterpart (see
     :func:`_unread_member_lines`), its ``"unread constructor parameter"``
     entries, a plain parameter the family's run left unused (see
-    :func:`_unread_constructor_parameter_lines`), and the family's ``"unread binding"`` and
-    ``"emptied override"`` entries (see :func:`_unread_binding_lines` and
-    :func:`_emptied_override_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
+    :func:`_unread_constructor_parameter_lines`), and the family's ``"unread binding"``,
+    ``"emptied override"`` and ``"dropped override argument"`` entries (see
+    :func:`_unread_binding_lines`, :func:`_emptied_override_lines` and
+    :func:`_dropped_argument_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
 
     ``entries`` is a FOURTH case: a flag-keyed entry — a registry line, an
     override property, an object-type member — deleted under one of the two
@@ -906,6 +926,9 @@ def pr_body(
     emptied = [
         (path, text) for path, kind, text in bindings if kind == "emptied override"
     ]
+    dropped_arguments = [
+        (path, text) for path, kind, text in bindings if kind == "dropped override argument"
+    ]
     removed_comments = [
         (path, text) for path, kind, text in bindings if kind == "removed comment"
     ]
@@ -919,6 +942,7 @@ def pr_body(
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_binding_lines(unread_bindings)
+    lines += _dropped_argument_lines(dropped_arguments)
     lines += _emptied_override_lines(emptied)
     lines += _removed_comment_lines(removed_comments)
     lines += _bare_import_lines(bare_imports)

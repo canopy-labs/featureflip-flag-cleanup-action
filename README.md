@@ -2648,10 +2648,14 @@ the member stays, because there the same rewrite would change other types
 too. In a *value* position
 the same run does empty the object — `{ 'old-checkout': true }` becomes `{}`,
 which is an ordinary empty object and the right shape for an override that no
-longer overrides anything. In TypeScript and JavaScript the pull request lists
-each override it left empty (`<Provider flags={{}}>`), because the prop or
-argument carrying it may now be pointless; whether it can go depends on
-whether it is optional, which this tool cannot see from one file.
+longer overrides anything. In TypeScript and JavaScript, when that `{}` is the
+last argument of a call to a function declared at the top level of the same
+file, and the matching parameter defaults to `{}` (`flags = {}`), the argument
+is left out: the call passes the same value without it. The pull request lists
+each call it shortened, and each other override it left empty
+(`<Provider flags={{}}>`), because the prop or argument carrying it may now be
+pointless; whether it can go depends on whether it is optional, which this
+tool cannot see from one file.
 
 **An entry set to the branch being removed is evidence about the code around
 it**, not just leftover residue. If the flag serves `true` and an entry reads
@@ -3636,6 +3640,29 @@ only declares types, functions, classes and constants built from literals. A
 module of flag-key constants is the usual case. If anything in that graph calls
 a function, builds an object with `new`, uses a decorator, loads a package or
 cannot be found, the bare import stays.
+
+The bare import is also deleted when the file's other imports already load
+everything in that graph that does work. A barrel such as `@/lib/flags` often
+loads a store or a client module that the same file reaches anyway through its
+other imports, so the bare import would load nothing new. Every module in the
+graph that is not provably inert has to be loaded by another import kept in the
+file, directly or through the files that import loads. A package counts when the
+other import names the same package from the same `package.json`. An import
+counts only if the compiler keeps it: one that binds nothing, or one whose name
+is read as a value and declared nowhere else in the file. An import used only as
+a type, or one whose every read could be a local of the same name, does not
+count, and neither does a re-export of a type. Imports in other files that
+merely load the same module do not count either, because this tool cannot know
+which files share a program or which loads first. One thing can change: when
+only an import further down the file reaches a module, that module now loads a
+few lines later. That matters only if some module needs another module's
+load-time work done first without importing it.
+
+A `paths` alias is read through a solution `tsconfig.json` (one with
+`references`, as in Vite's template) when every referenced config whose `files`
+or `include` may hold the importing file reads it the same way. If they
+disagree, if none of them may hold the file, or if the solution config could
+compile the file itself, the alias counts as not found.
 
 The Featureflip JavaScript SDKs are the one exception to "loads a package".
 `@featureflip/js`, `@featureflip/node`, `@featureflip/browser`,
