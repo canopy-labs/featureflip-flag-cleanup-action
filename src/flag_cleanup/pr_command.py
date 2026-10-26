@@ -55,7 +55,7 @@ from flag_cleanup.config import Config, STALENESS_VALUES
 from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
 from flag_cleanup.residue import Residue, classify as classify_residue
-from flag_cleanup.ts_tests import RENAMED_TEST
+from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 
 logger = logging.getLogger(__name__)
 
@@ -884,6 +884,7 @@ def _dry_run_caveats(
     removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
     removed_comments = sum(1 for _, kind, _ in bindings if kind == "removed comment")
     renamed_tests = sum(1 for _, kind, _ in bindings if kind == RENAMED_TEST)
+    removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     state_comments = sum(
@@ -896,7 +897,13 @@ def _dry_run_caveats(
         - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments
         - state_comments
         - renamed_tests
+        - removed_defaults
     )
+    if removed_defaults:
+        notes.append(
+            "the flag's default is the branch being removed, so tests that never "
+            "set it would run the kept branch; run the test suite"
+        )
     if cleaned:
         notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
     if dropped:

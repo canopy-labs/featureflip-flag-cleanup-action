@@ -17,6 +17,13 @@ Deleting by a marked identity rather than by position matters: the engine
 applies a rule until it stops matching, so a positional rule would also delete
 the argument that moves into the emptied slot.
 
+In TypeScript and JavaScript the engine is also handed each file's line width
+(:func:`flag_cleanup.ts_list_join.line_limit`, read from the customer's
+original text): a parameter or argument list these deletions leave with one
+element is then put back on one line by the engine itself, under the same
+conditions :func:`flag_cleanup.ts_list_join.splice` applies to this tool's own
+deletions.
+
 A postcondition then re-reads every file. If a sentinel survived, a parameter
 survived, a file stopped parsing, or a file lost a different number of
 arguments than it had marks, every file this pass touched gets its bytes back
@@ -28,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +48,7 @@ from flag_cleanup import (
     git_ops,
     syntax,
     ts_field_removal,
+    ts_list_join,
     ts_scope,
 )
 from flag_cleanup.ctor_param_model import (
@@ -86,6 +94,33 @@ class Result:
     #: ``(path, name)`` for each deleted argument that was a bare name: the
     #: local it named may now be read by nothing (see :func:`kept_argument_locals`).
     argument_names: tuple[tuple[str, str], ...] = ()
+
+
+
+def _widths(
+    files: list[str],
+    spelling: Mapping[str, str],
+    summaries,
+    before: Mapping[str, bytes],
+    language: str,
+    repo_dir: str,
+) -> dict[str, int]:
+    """The line width :func:`ts_list_join.line_limit` gives each TypeScript or
+    JavaScript file, keyed by its spelling, measured against the customer's
+    text: a file the fold rewrote by its original content, any other by its
+    bytes before marking."""
+    if language not in ("ts", "tsx", "js"):
+        return {}
+    originals = {_key(s.path): s.original_content for s in summaries}
+    widths: dict[str, int] = {}
+    for key in files:
+        original = originals.get(key)
+        if original is None:
+            original = before[key].decode("utf-8", "replace")
+        width = ts_list_join.line_limit(spelling[key], original, repo_dir)
+        if width is not None:
+            widths[spelling[key]] = width
+    return widths
 
 
 def _key(path: str) -> str:
@@ -155,11 +190,15 @@ def remove(
     unread: tuple[Row, ...],
     repo_dir: str,
     *,
-    engine: Callable[[list[str], str], list],
+    engine: Callable[[list[str], str, Mapping[str, int]], list],
 ) -> Result:
     """Remove every unread constructor parameter in ``unread`` whose callers
     can all be proven, and every unread TypeScript, JavaScript or Dart field that
-    can be, through ``engine(paths, rules_text)``."""
+    can be, through ``engine(paths, rules_text, widths)``.
+
+    ``widths`` maps each TypeScript or JavaScript path to the widest line the
+    engine may join a list it shrank onto (none for other languages, or when
+    the repository's width cannot be read)."""
     unchanged = Result(summaries, tuple(unread), (), frozenset())
     kinds = _KINDS.get(language, frozenset())
     by_path = {os.path.relpath(s.path, repo_dir): s for s in summaries}
@@ -212,6 +251,7 @@ def remove(
     rules = render_rules(
         language if language in ("csharp", "dart") else "ts", [r for _, r in removals], sentinel
     )
+    widths = _widths(files, spelling, summaries, before, language, repo_dir)
     # The candidate scan never listed a caller: bring every file this pass
     # writes under the running transform's undo first.
     git_ops.before_writing([spelling[key] for key in files])
@@ -226,7 +266,7 @@ def remove(
         for key in files:
             if marked[key] != before[key]:
                 Path(key).write_bytes(marked[key])
-        engine([spelling[key] for key in files], rules)
+        engine([spelling[key] for key in files], rules, widths)
         # The engine leaves the spaces around each gap on a single-line list.
         # A deleted line of a multi-line list leaves its `\r` behind in a CRLF
         # file (`a,\r\r\n`): the same repair every other deletion gets.

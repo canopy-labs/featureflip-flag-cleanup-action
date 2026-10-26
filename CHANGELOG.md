@@ -7,6 +7,33 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.16.0
+
+### New
+
+- **TypeScript and JavaScript:** a test about the branch being removed is now
+  deleted even when it never sets the flag, as long as your flag registry
+  declares that branch as the flag's default
+  (`'my-flag': { default: false }`) and the test's title names the flag by a
+  word of its key (`hides the GitHub link when the GitHub flag is off` for
+  `web-social-login-github`). Such tests used to survive the removal and fail,
+  since the code they asserted against was gone. Whenever the default was the
+  removed branch, the pull request now also warns that tests leaving the flag
+  unset run the kept branch from now on, and asks you to run the suite before
+  merging.
+- **TypeScript and JavaScript:** a removed constructor parameter now leaves
+  its lists on one line too. When the removal deletes a constructor parameter
+  the flag left unread, together with the argument each caller passed for it,
+  and either list was written one element per line with one element left,
+  `constructor(\n  private readonly log: Logger,\n) {}` comes out as
+  `constructor(private readonly log: Logger) {}` and
+  `new ReportService(\n  logger,\n)` as `new ReportService(logger)`. The
+  conditions are the ones the helper parameters and their arguments already
+  follow: two or more elements before the run, no comment inside the
+  brackets, and a joined line that fits your Prettier `printWidth`, your
+  `.editorconfig` `max_line_length`, or, with neither, the file's longest
+  line.
+
 ## 1.15.0
 
 ### New

@@ -107,6 +107,7 @@ from flag_cleanup.piranha_runner import (
     UnsupportedFlagKeyError,
     candidate_files,
     ensure_supported_key,
+    plan_registry_default,
     transform_flag,
     source_files,
 )
@@ -125,6 +126,7 @@ from flag_cleanup.pr_content import (
     note_flag_state_comments,
     note_removed_comments,
     note_removed_entries,
+    note_removed_defaults,
     note_renamed_tests,
     note_rewritten_build_output,
     pr_body,
@@ -753,6 +755,7 @@ def _process_candidate(
     note_removed_comments(_bindings)
     note_flag_state_comments(_bindings)
     note_renamed_tests(_bindings)
+    note_removed_defaults(_bindings)
     note_wrapper_findings(wrapper_findings)
     note_family_doubles(test_doubles)
     note_constant_wrappers(wrappers)
@@ -1111,6 +1114,7 @@ def _process_candidate_for_pr(
         note_removed_comments(bindings)
         note_flag_state_comments(bindings)
         note_renamed_tests(bindings)
+        note_removed_defaults(bindings)
         # Logged on BOTH outcomes, not only alongside a pull request, because
         # `no-changes` is the one where the body cannot say it: a repository
         # whose only mention of the flag is an override pinning it to the
@@ -1702,6 +1706,9 @@ def _run_plan(
             for path, line, reason, text in findings
         )
 
+    # Read before the first pass writes: a `.ts` registry's pass deletes the
+    # entry a later `.tsx` pass's tests rely on. See `plan_registry_default`.
+    flag_default = plan_registry_default(plan, candidate.key)
     outcomes: list[TransformOutcome] = []
     for directory, language, files in plan:
         if not files:
@@ -1716,6 +1723,7 @@ def _run_plan(
             known_flag_keys=known_flag_keys,
             gates=config.gates,
             inline_wrappers=config.inline_wrappers,
+            flag_default=flag_default,
         )
         outcomes.append(
             replace(

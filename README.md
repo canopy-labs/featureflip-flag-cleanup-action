@@ -2765,6 +2765,41 @@ higher. The title must name the flag by its **key**, since "the flag" alone
 could mean any flag, and the test must not override the key to the branch
 being kept. When both hold, it's deleted and listed like the others.
 
+The bar drops back a step when your **flag registry** says what that default
+is. An entry like `'web-social-login-github': { default: false }` in a
+non-test file is read before the removal starts, and when its default is the
+branch being removed, a test that never sets the key gets that branch as
+surely as one that pins it. Such a test is deleted when its title names the
+flag in the removed state by a word of the key, written just before "flag",
+"feature", "toggle" or "gate":
+
+```ts
+// removing web-social-login-github, keeping its on branch; the default is false
+it('hides the GitHub link when the GitHub flag is off', () => {  // <- deleted
+  render(<LoginPage />, { wrapper: createWrapper() });           //    no override
+  …
+});
+
+it('shows the code step when the web flag is off', …)  // <- kept: "web" is the key's first word
+it('hides the toggle when the dark flag is off', …)    // <- kept: not a word of this key
+```
+
+Some words don't count. The key's first word is usually a prefix other flags
+share. A word that another flag's key also contains could mean either flag:
+"the login feature" when `web-social-login-google` exists too. And words like
+*new*, *legacy* or *beta* describe a flag's age, not what it gates. Other flag
+keys are taken from the project's flag list and from the rest of the registry.
+A test that gives the key any value of its own, directly, through a helper's
+parameter or in a `beforeEach`/`beforeAll` around it, is decided by that value
+instead. A test that sets another flag is left alone. Two registries that
+disagree about the default leave every such test alone, and the pull request
+doesn't warn about either default.
+
+Whenever the default was the branch being removed, the pull request also says
+so, naming the registry entry: every test that never set the flag ran that
+branch and now runs the kept one, and a test that asserted the old behaviour
+without saying so in its title fails. Run the test suite before merging.
+
 A test about the **kept** branch stays, but its title would go on describing
 a condition that no longer exists. So when the title names the flag by its
 key in the kept state, the flag's condition is dropped from it:
@@ -5386,9 +5421,11 @@ means no PR.
   moves.
 * **A parameter or argument list shrunk to one element is joined onto one
   line only in some cases.** In TypeScript and JavaScript, when this tool
-  removes a test helper's parameter, the arguments passed to it, or an
-  argument equal to the callee's default, and the list was written one
-  element per line, the element left is put back beside its brackets:
+  removes a test helper's parameter, the arguments passed to it, an
+  argument equal to the callee's default, or a constructor parameter the
+  flag left unread and the argument each caller passed for it, and the list
+  was written one element per line, the element left is put back beside its
+  brackets:
   `function renderChecklist(\n  steps: number\n) {` becomes
   `function renderChecklist(steps: number) {`, and a trailing comma goes
   with the line breaks. That happens only when the list had two or more
@@ -5400,9 +5437,8 @@ means no PR.
   already had. A Prettier configuration written as code, one that names a
   shared configuration, or one with per-file `overrides` joins nothing. Only
   configuration inside the repository is read. Other lists keep the layout
-  the removal left: object and array literals, JSX attributes, lists the
-  rewrite rules shorten themselves (such as a removed constructor
-  parameter), and every other language.
+  the removal left: object and array literals, JSX attributes, and every
+  other language.
 * **A comparison against a non-literal is propagated but not folded.**
   `if (on === true)` reduces fully, because both sides end up literal. But
   `if (on === other)` becomes `if (true === other)` and stops — correct, and

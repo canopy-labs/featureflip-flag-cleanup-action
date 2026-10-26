@@ -1400,6 +1400,7 @@ def run_piranha(
     known_flag_keys: frozenset[str] = frozenset(),
     gates: tuple[ts_gates.Gate, ...] = (),
     inline_wrappers: bool = True,
+    flag_default: ts_tests.FlagDefault | None = None,
 ) -> str:
     """:func:`transform_flag`, keeping only the diff.
 
@@ -1422,6 +1423,7 @@ def run_piranha(
     return transform_flag(
         repo_dir, language, flag_key, treatment, paths, accessors,
         known_flag_keys=known_flag_keys, gates=gates, inline_wrappers=inline_wrappers,
+        flag_default=flag_default,
     ).diff
 
 
@@ -1435,6 +1437,7 @@ def transform_flag(
     known_flag_keys: frozenset[str] = frozenset(),
     gates: tuple[ts_gates.Gate, ...] = (),
     inline_wrappers: bool = True,
+    flag_default: ts_tests.FlagDefault | None = None,
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -1463,12 +1466,12 @@ def transform_flag(
         try:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
-                known_flag_keys, doubles, gates, inline_wrappers,
+                known_flag_keys, doubles, gates, inline_wrappers, flag_default,
             )
         except _NoReadFolded:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
-                known_flag_keys, None, gates, inline_wrappers,
+                known_flag_keys, None, gates, inline_wrappers, flag_default,
             )
         except BaseException:
             # Newest first: a later pass's "original" is an earlier pass's
@@ -1493,6 +1496,7 @@ def _transform_flag(
     doubles: list[mock_stubs.Prepass] | None,
     gates: tuple[ts_gates.Gate, ...] = (),
     inline_wrappers: bool = True,
+    flag_default: ts_tests.FlagDefault | None = None,
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -1532,6 +1536,16 @@ def _transform_flag(
         delete them once nothing calls them; see
         :mod:`flag_cleanup.wrapper_inline`. ``False`` folds the read inside a
         wrapper and stops there, as before that existed.
+    flag_default:
+        What the flag's registry entries say its default is, read across every
+        language of the run before any of it rewrote a file (see
+        :func:`plan_registry_default`). ``None`` means nobody read them, and
+        they are read off ``paths`` alone; a value whose ``literal`` is
+        ``None`` means they were read and agree on nothing, which this pass
+        must not second-guess from its own files. A TypeScript-family test
+        that leaves the flag unset gets the default, so when it is the removed
+        branch such a test can be about that branch; see
+        :func:`flag_cleanup.ts_tests.find_pinned_tests`.
 
     Returns
     -------
@@ -1614,7 +1628,11 @@ def _transform_flag(
     # The TypeScript family's answer to the same shape, read off the same
     # customer bytes for the same reason: the rules strip the pin, so after the
     # engine there is nothing left to find. See :mod:`flag_cleanup.ts_tests`.
-    pinned_tests = _find_pinned_tests(paths, language, flag_key, untreated)
+    defaults = _registry_defaults(paths, language, flag_key, repo_dir)
+    if flag_default is None:
+        flag_default = registry_default(defaults)
+    flag_default = replace(flag_default, siblings=flag_default.siblings | known_flag_keys)
+    pinned_tests = _find_pinned_tests(paths, language, flag_key, untreated, flag_default)
     # The overrides a helper's parameter feeds, proven on the same bytes for
     # the same reason: no rule touches them, but the engine may still delete
     # one beside another flag's key. See :mod:`flag_cleanup.ts_param_pins`.
@@ -2161,6 +2179,15 @@ def _transform_flag(
     bindings = bindings + unread_constructor + removed_constructor
     bindings = bindings + dropped_parameters + unread_bindings
     bindings = bindings + renamed_tests
+    # A registry entry whose default was the branch the fold removed: every
+    # test that left the flag unset ran that branch, and now runs the kept
+    # one. The deletion above takes those whose titles say so; the pull
+    # request warns about the rest. See `ts_tests.REMOVED_DEFAULT`.
+    bindings = bindings + tuple(
+        (path, ts_tests.REMOVED_DEFAULT, row.entry)
+        for path, row in defaults
+        if flag_default.literal == untreated and row.literal == untreated
+    )
 
     # The literals this run left equal to what the callee would use anyway:
     # override literals the entry deletions emptied (`flags={{}}`) and values
@@ -3019,7 +3046,11 @@ def _restore_tests_using_key_as_data(
 
 
 def _find_pinned_tests(
-    paths: list[str], language: str, flag_key: str, untreated: str
+    paths: list[str],
+    language: str,
+    flag_key: str,
+    untreated: str,
+    default: ts_tests.FlagDefault = ts_tests.FlagDefault(),
 ) -> dict[str, list[ts_tests.PinnedTest]]:
     """The tests to delete per path; empty outside the TypeScript family.
 
@@ -3035,10 +3066,64 @@ def _find_pinned_tests(
             source = Path(path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        tests = ts_tests.find_pinned_tests(source, language, flag_key, untreated)
+        tests = ts_tests.find_pinned_tests(source, language, flag_key, untreated, default)
         if tests:
             found[path] = tests
     return found
+
+
+def _registry_defaults(
+    paths: list[str], language: str, flag_key: str, repo_dir: str
+) -> list[tuple[str, ts_tests.RegistryEntry]]:
+    """``(path, entry)`` for every registry entry in ``paths`` declaring
+    ``flag_key``'s boolean default; empty outside the TypeScript family.
+    ``path`` is relative to ``repo_dir``. An unreadable file yields nothing,
+    as in :func:`_find_pinned_tests`."""
+    if not ts_tests.covers(language):
+        return []
+    found = []
+    for path in paths:
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        relative = os.path.relpath(path, repo_dir)
+        found.extend(
+            (relative, entry)
+            for entry in ts_tests.registry_defaults(
+                source, _grammar_of(path, language), flag_key
+            )
+        )
+    return found
+
+
+def registry_default(
+    defaults: Iterable[tuple[str, ts_tests.RegistryEntry]],
+) -> ts_tests.FlagDefault:
+    """The one literal every entry in ``defaults`` declares, or ``None`` when
+    there is none or they disagree: two registries with two defaults leave no
+    single value a test that never sets the flag can be said to get. The
+    siblings are every registry's, whatever the literal."""
+    rows = [entry for _path, entry in defaults]
+    literals = {row.literal for row in rows}
+    return ts_tests.FlagDefault(
+        literals.pop() if len(literals) == 1 else None,
+        frozenset(key for row in rows for key in row.siblings),
+    )
+
+
+def plan_registry_default(
+    passes: Iterable[tuple[str, str, list[str]]], flag_key: str
+) -> ts_tests.FlagDefault:
+    """:func:`registry_default` across every ``(directory, language, paths)``
+    pass of a run, read before any pass writes. The registry is often a
+    ``.ts`` file while the tests that rely on it are ``.tsx``, and the two are
+    different passes; by the second, the first has deleted the entry."""
+    return registry_default(
+        row
+        for directory, language, paths in passes
+        for row in _registry_defaults(paths, language, flag_key, directory)
+    )
 
 
 def _find_parameter_pins(
@@ -3583,7 +3668,11 @@ def _execute_readers(
 
 
 def _execute_ctor_param_rules(
-    paths: list[str], language: str, rules_text: str, repo_dir: str
+    paths: list[str],
+    language: str,
+    rules_text: str,
+    repo_dir: str,
+    widths: Mapping[str, int] | None = None,
 ) -> list:
     """Run the rendered constructor-parameter rules over ``paths``, once per grammar.
 
@@ -3591,7 +3680,16 @@ def _execute_ctor_param_rules(
     callers, with no const, JSX, entry or edge rules beside it. Returns the
     engine's summaries of the files it changed. See
     :mod:`flag_cleanup.ctor_param_removal`.
+
+    ``widths`` gives a file the widest line the engine may join a parameter or
+    argument list onto when these deletions leave it one element; it reaches
+    the engine as that file's ``print_width`` fact. A file without one keeps
+    the layout the deletion left.
     """
+    facts = {
+        os.path.abspath(path): [{"print_width": str(width)}]
+        for path, width in (widths or {}).items()
+    }
     collected: list = []
     with tempfile.TemporaryDirectory(prefix="flag-cleanup-ctor-") as tmp:
         rules_file = Path(tmp) / "ctor_rules.toml"
@@ -3612,6 +3710,11 @@ def _execute_ctor_param_rules(
                     argument_flags=_load_argument_flags(spec.rule_base),
                     flag_key="(constructor parameters)",
                     repo_dir=repo_dir,
+                    file_facts={
+                        path: facts[os.path.abspath(path)]
+                        for path in members
+                        if os.path.abspath(path) in facts
+                    },
                 )
             )
     return collected
@@ -4425,7 +4528,9 @@ def _remove_unread_constructor_parameters(
             language,
             pending,
             repo_dir,
-            engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+            engine=lambda paths, rules, widths: _execute_ctor_param_rules(
+                paths, language, rules, repo_dir, widths=widths
+            ),
         )
         still += result.unread
         if not result.rewritten:
@@ -4778,6 +4883,7 @@ def _execute(
     flag_key: str,
     repo_dir: str,
     entries_rules_file: Path | None = None,
+    file_facts: Mapping[str, list[dict[str, str]]] | None = None,
 ):
     """Run Piranha over ``paths``, optionally with the const rules prepended.
 
@@ -4788,6 +4894,9 @@ def _execute(
 
     The entry rules are APPENDED, and order does not matter for them: every one
     is a seed rule that matches on its own.
+
+    ``file_facts`` are per-file facts for the engine, by path, beside the Go
+    import facts this computes itself.
     """
     with tempfile.TemporaryDirectory(prefix="ff-piranha-cfg-") as cfg_dir:
         cfg = Path(cfg_dir)
@@ -4801,6 +4910,13 @@ def _execute(
         if edges:
             (cfg / "edges.toml").write_text(edges, encoding="utf-8")
 
+        # Go: the name each unaliased import is guessed to bind, so the engine
+        # can delete one its own fold stranded (see
+        # :func:`~flag_cleanup.unused.go_import_facts`). Then whatever the
+        # caller computed, such as a TypeScript file's line width (see
+        # :func:`_execute_ctor_param_rules`).
+        facts = _go_file_facts(paths) if piranha_language == "go" else {}
+        facts.update({os.path.abspath(path): found for path, found in (file_facts or {}).items()})
         args = PiranhaArguments(
             piranha_language,
             paths_to_codebase=paths,
@@ -4812,10 +4928,7 @@ def _execute(
             # empty, as it always has: the file set a run commits and rolls
             # back is the one it started with.
             delete_file_if_empty=False,
-            # Go only: the name each unaliased import is guessed to bind, so
-            # the engine can delete one its own fold stranded. See
-            # :func:`~flag_cleanup.unused.go_import_facts`.
-            **({"file_facts": _go_file_facts(paths)} if piranha_language == "go" else {}),
+            **({"file_facts": facts} if facts else {}),
             **argument_flags,
         )
         try:

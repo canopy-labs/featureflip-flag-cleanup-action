@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.15.0"
+version = "1.16.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -471,7 +471,15 @@ dependencies = [
     # as the name `x\$`, so the fold left that read behind and Gate 1 refused
     # the file; now it folds to `'${true}\$'` (`dart/short_template`). No
     # TypeScript or C# grammar rev moved, so `+canopy.3` and `+canopy.1` stay.
-    "polyglot-piranha==0.38.0",
+    #
+    # 0.39.0. A TypeScript/TSX/JavaScript parameter or argument list that an
+    # engine deletion leaves with one element goes back on one line when the
+    # file has a `print_width` input fact and the line fits it, under the
+    # conditions `ts_list_join` applies to this tool's own deletions. The
+    # constructor-parameter run hands each file its `ts_list_join.line_limit`;
+    # no other engine run deletes a parameter or an argument. No grammar rev
+    # moved, so `+canopy.3` and `+canopy.1` stay.
+    "polyglot-piranha==0.39.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

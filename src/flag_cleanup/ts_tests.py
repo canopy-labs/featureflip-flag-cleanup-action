@@ -24,6 +24,12 @@ that hedges with "even", "regardless" or "whether" is about something that
 holds in both states and is kept. Everything else is left to
 ``rules/ts_entries.toml``, which strips the pin like any other entry.
 
+A test that never sets the flag gets its default, so when the registry
+declares the removed branch as that default (``'k': { default: false }``, see
+:func:`registry_defaults`), the default is the pin. Nothing in such a test
+names the flag, so its title has to, by a word of the key: "when the GitHub
+flag is off".
+
 This is a heuristic, and the pull request names every test it deleted, with
 its title, so a reviewer can check each call. Its errors are bounded on both
 sides: a test it should have deleted and did not fails loudly in CI, and one
@@ -92,14 +98,45 @@ class PinnedTest:
     ordinal: int
 
 
+@dataclass(frozen=True)
+class FlagDefault:
+    """What a run's registries say about the flag being removed.
+
+    ``literal`` is the default every registry entry for the key agrees on, or
+    ``None`` when there is none or they disagree. ``siblings`` are the OTHER
+    flag keys the run knows of: the project's, and every key beside this one
+    in a registry. A title word one of them shares names no flag in
+    particular. See :func:`find_pinned_tests`.
+    """
+
+    literal: str | None = None
+    siblings: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class RegistryEntry:
+    """One registry entry declaring a boolean default for a key."""
+
+    literal: str
+    #: The entry's text, on one line.
+    entry: str
+    #: The keys of the other entries in the same registry object.
+    siblings: frozenset[str]
+
+
 def find_pinned_tests(
-    source: str, language: str, flag_key: str, untreated: str
+    source: str,
+    language: str,
+    flag_key: str,
+    untreated: str,
+    default: FlagDefault = FlagDefault(),
 ) -> list[PinnedTest]:
     """Every test in ``source`` to delete because it exercises the removed branch.
 
     ``untreated`` is the literal of the branch the fold DELETES, as the rules
-    spell it. A test enclosing another chosen one is chosen instead of it, so
-    nothing is deleted twice.
+    spell it. ``default`` is what the run's registries say about the flag (see
+    :func:`registry_defaults`). A test enclosing another chosen one is chosen
+    instead of it, so nothing is deleted twice.
     """
     data = source.encode("utf-8")
     root = _parse(source, language)
@@ -144,6 +181,36 @@ def find_pinned_tests(
         if any(pins(pair, treated) for pair in _walk(node)):
             continue
         chosen[node.id] = node
+
+    # A test can also reach the removed branch by never setting the flag at
+    # all, when the registry's default IS that branch: `it('hides the link
+    # when the GitHub flag is off', …)` rendering with no override. The default
+    # stands in for the pin, so it anchors only when it equals the removed
+    # literal and the test gives the key no value of its own. "The flag" alone
+    # is too weak here, since a test file can be about several flags, so the
+    # title has to qualify its subject with a word of the key, and not the
+    # key's leading word: that is usually a namespace other flags share
+    # (`web-`), and "the web flag" names none of them in particular. Nor does
+    # a word another flag's key shares ("the login feature" beside
+    # `web-social-login-google`), or a generic one ("the new feature"). A test
+    # that sets another flag, or sits under a `beforeEach` that sets this one,
+    # is left alone: it is not plainly about this flag left at its default.
+    if default.literal == untreated:
+        qualified = _qualified_removed_state_pattern(flag_key, untreated, default.siblings)
+        setup = _setup_scopes(root, data, flag_key)
+        for node, _callee, title in titled:
+            if qualified is None or not qualified.search(title) or _HEDGES.search(title):
+                continue
+            if any(_contains(scope, node) for scope in setup):
+                continue
+            if any(
+                _sets_key(inner, data, flag_key)
+                or any(_sets_key(inner, data, key) for key in default.siblings)
+                or (inner.start_byte, inner.end_byte) in calls
+                for inner in _walk(node)
+            ):
+                continue
+            chosen[node.id] = node
 
     outermost = [
         node
@@ -291,6 +358,55 @@ def _drop_kept_clause(
     return None
 
 
+#: The ``bindings`` kind of a row naming a registry entry whose default was
+#: the branch the fold removed. Its text is the entry, on one line.
+REMOVED_DEFAULT = "removed default"
+
+
+def registry_defaults(source: str, language: str, flag_key: str) -> list[RegistryEntry]:
+    """Each registry entry in ``source`` declaring a boolean default for
+    ``flag_key``: ``'k': { default: false }``.
+
+    A lookup by key reads its fallback out of the entry, so a test that never
+    sets the flag gets that value; see :func:`find_pinned_tests`. Only the
+    entry's OWN ``default`` member counts, and nothing in a test file does,
+    where the same shape is fixture data.
+    """
+    data = source.encode("utf-8")
+    root = _parse(source, language)
+    if _titled_tests(root, data):
+        return []
+    found = []
+    for pair in _walk(root):
+        if pair.type != "pair" or not _keyed_by(pair, data, flag_key):
+            continue
+        value = pair.child_by_field_name("value")
+        if value is None or value.type != "object":
+            continue
+        for member in value.named_children:
+            if member.type != "pair":
+                continue
+            name = member.child_by_field_name("key")
+            literal = member.child_by_field_name("value")
+            if (
+                name is not None
+                and literal is not None
+                and _key_text(name, data) == "default"
+                and literal.type in ("true", "false")
+            ):
+                siblings = frozenset(
+                    name
+                    for other in (pair.parent.named_children if pair.parent else ())
+                    if other.type == "pair" and other.id != pair.id
+                    and (key := other.child_by_field_name("key")) is not None
+                    and (name := _key_text(key, data)) is not None
+                )
+                found.append(
+                    RegistryEntry(literal.type, " ".join(_text(pair, data).split()), siblings)
+                )
+    return found
+
+
 def is_test_file(source: str, language: str) -> bool:
     """Whether ``source`` declares a test: an ``it``/``test``/``describe`` with a title."""
     return bool(_titled_tests(_parse(source, language), source.encode("utf-8")))
@@ -395,6 +511,97 @@ def _removed_state_pattern(
         rf"\b{subject}\b(?:\W+\w+){{0,2}}?\W+{state}\b|\b{state}\W+{subject}\b",
         re.IGNORECASE,
     )
+
+
+#: Words a key is made of that never name it in a title: the subjects and
+#: states the patterns already match on, and words that describe a flag's
+#: life rather than what it gates ("the new feature", "the beta flag").
+_NOT_QUALIFIERS = frozenset(
+    {"flag", "flags", "feature", "features", "toggle", "toggles", "gate", "gates",
+     "on", "off", "enabled", "disabled", "enable", "disable", "true", "false",
+     "the", "is", "use", "show", "hide", "new", "old", "legacy", "beta", "alpha",
+     "experiment", "experimental", "test", "temp", "tmp", "next", "preview", "rollout"}
+)
+
+
+def _key_words(flag_key: str) -> list[str]:
+    """``flag_key``'s words, lowercased: split at punctuation and case."""
+    return [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", flag_key)]
+
+
+def _qualified_removed_state_pattern(
+    flag_key: str, untreated: str, siblings: frozenset[str] = frozenset()
+) -> re.Pattern[str] | None:
+    """A title naming the flag in the removed state by a word of its key:
+    "the GitHub flag is off" for ``web-social-login-github``.
+
+    The word must sit directly before the subject noun, and be one of the
+    key's words other than its first that no key in ``siblings`` shares (see
+    :func:`find_pinned_tests` for why). ``None`` when the key has no such
+    word, as a one-word key does: a title naming it names the whole key, which
+    the keyed pattern already takes.
+    """
+    words = _key_words(flag_key)
+    shared = {w for key in siblings if key != flag_key for w in _key_words(key)}
+    qualifiers = (
+        {w for w in words[1:] if len(w) > 1 and not w.isdigit()} - _NOT_QUALIFIERS - shared
+    )
+    if not qualifiers:
+        return None
+    qualifier = "|".join(sorted(map(re.escape, qualifiers)))
+    subject = rf"\b(?:{qualifier})[\s-]+(?:{_SUBJECTS})\b"
+    state = rf"(?:{_STATES[untreated]})"
+    return re.compile(
+        rf"{subject}(?:\W+\w+){{0,2}}?\W+{state}\b|\b{state}\W+{subject}",
+        re.IGNORECASE,
+    )
+
+
+#: The hooks that run before each test of their scope.
+_SETUP_CALLEES = frozenset({"beforeEach", "beforeAll"})
+
+
+def _setup_scopes(root: Node, data: bytes, flag_key: str) -> list[Node]:
+    """The scopes whose tests a ``beforeEach``/``beforeAll`` gives ``flag_key``
+    a value in: the block around the hook, or the whole file."""
+    scopes = []
+    for node in _walk(root):
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        if callee is None or callee.type != "identifier" or _text(callee, data) not in _SETUP_CALLEES:
+            continue
+        if not any(_sets_key(inner, data, flag_key) for inner in _walk(node)):
+            continue
+        scope = node.parent
+        while scope is not None and scope.type not in ("statement_block", "program"):
+            scope = scope.parent
+        scopes.append(scope if scope is not None else root)
+    return scopes
+
+
+def _sets_key(node: Node, data: bytes, flag_key: str) -> bool:
+    """Whether ``node`` gives ``flag_key`` a value: a pair keyed by it, with
+    any value, or a shorthand property spelling it."""
+    if node.type == "shorthand_property_identifier":
+        return _text(node, data) == flag_key
+    return node.type == "pair" and _keyed_by(node, data, flag_key)
+
+
+def _keyed_by(pair: Node, data: bytes, flag_key: str) -> bool:
+    key = pair.child_by_field_name("key")
+    return key is not None and _key_text(key, data) == flag_key
+
+
+def _key_text(key: Node, data: bytes) -> str | None:
+    """A pair key's name: an identifier's text, or a plain string's."""
+    if key.type == "property_identifier":
+        return _text(key, data)
+    if key.type == "string":
+        fragments = key.named_children
+        if len(fragments) == 1 and fragments[0].type == "string_fragment":
+            return _text(fragments[0], data)
+    return None
 
 
 def _pins(pair: Node, data: bytes, flag_key: str, untreated: str) -> bool:

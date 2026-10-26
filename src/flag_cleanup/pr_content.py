@@ -31,7 +31,7 @@ from flag_cleanup.cross_file_keys import (
 )
 from flag_cleanup.mock_stubs import PINNED_PARAMETER, SIBLING_TEST, TEST, TEST_PHASE
 from flag_cleanup.residue import Residue
-from flag_cleanup.ts_tests import RENAMED_TEST
+from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 from flag_cleanup.urls import without_userinfo
 
 if TYPE_CHECKING:
@@ -180,6 +180,7 @@ REPORTED_BINDING_KINDS = frozenset(
         stale_comments.REMOVED_BRANCH_KIND,
         stale_comments.FLAG_STATE_KIND,
         RENAMED_TEST,
+        REMOVED_DEFAULT,
     }
 )
 
@@ -636,6 +637,43 @@ def _renamed_tests(bindings: tuple[tuple[str, str, str], ...]) -> list[tuple[str
     ]
 
 
+def _removed_defaults(bindings: tuple[tuple[str, str, str], ...]) -> list[tuple[str, str]]:
+    """``(path, entry)`` for each registry entry whose default was the removed
+    branch; see :data:`~flag_cleanup.ts_tests.REMOVED_DEFAULT`."""
+    return [(path, text) for path, kind, text in bindings if kind == REMOVED_DEFAULT]
+
+
+def _removed_default_lines(
+    defaults: list[tuple[str, str]], kept: str, deleted: str, any_deleted: bool
+) -> list[str]:
+    """The warning that the flag's default was the branch this pull request
+    deleted, or nothing.
+
+    Every test that leaves the flag unset ran that branch and now runs the
+    kept one. Nothing names the flag in such a test, so no rewrite can find
+    it unless its title says what it tests; any other one that asserted the
+    removed behaviour fails, and only running the suite shows which.
+    """
+    if not defaults:
+        return []
+    taken = (
+        "The deleted tests above whose titles said so are gone; any other "
+        if any_deleted
+        else "Any "
+    )
+    return [
+        f"> **⚠️ The flag's default was its {deleted} branch, the one this pull "
+        f"request deleted.** A test that never set the flag ran that branch, and "
+        f"now runs the **{kept}** branch instead. {taken}test that asserted the "
+        f"{deleted} behaviour without saying so in its title will fail. Run the "
+        "test suite before merging:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(entry)}" for path, entry in defaults[:20]],
+        *([f"> - ...and {len(defaults) - 20} more"] if len(defaults) > 20 else []),
+        "",
+    ]
+
+
 def _renamed_test_lines(renamed: list[tuple[str, str, str]], kept: str) -> list[str]:
     """The callout naming each test title rewritten because it named the
     flag's KEPT state, old and new, or nothing."""
@@ -739,7 +777,10 @@ def pr_body(
     :func:`_unread_constructor_parameter_lines`), and the family's ``"unread binding"``,
     ``"emptied override"`` and ``"dropped default argument"`` entries (see
     :func:`_unread_binding_lines`, :func:`_emptied_override_lines` and
-    :func:`_dropped_argument_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
+    :func:`_dropped_argument_lines`). Its ``"removed default"`` entries are
+    not bindings at all: each names a registry entry whose default was the
+    removed branch, which gets a warning of its own (see
+    :func:`_removed_default_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
 
     ``entries`` is a FOURTH case: a flag-keyed entry — a registry line, an
     override property, an object-type member — deleted under one of the two
@@ -792,6 +833,7 @@ def pr_body(
     served = "true" if candidate.treatment else "false"
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
     renamed_tests = _renamed_tests(bindings)
+    removed_defaults = _removed_defaults(bindings)
     flag_url = (
         f"{_without_userinfo(config.api_url)}/api/v1/orgs/{quote(config.org, safe='')}"
         f"/projects/{quote(config.project, safe='')}"
@@ -1313,13 +1355,14 @@ def pr_body(
         count = len(deleted_tests)
         noun = "test was" if count == 1 else "tests were"
         lines += [
-            f"> **⚠️ {count} {noun} deleted.** Each pinned the flag to its "
+            f"> **⚠️ {count} {noun} deleted.** Each ran the flag's "
             f"**{deleted}** branch — the one this pull request just deleted — "
-            "and its title says that branch is what it tests, so its assertions "
-            "describe behaviour the code can no longer produce. The choice was "
-            "made from the title, so check each one. Other overrides pinning "
-            "that branch were stripped like any other entry: their tests are "
-            "about something that holds either way.",
+            "by pinning the flag to it or by leaving the flag unset where its "
+            "default serves it, and its title says that branch is what it tests, "
+            "so its assertions describe behaviour the code can no longer "
+            "produce. The choice was made from the title, so check each one. "
+            "Other overrides pinning that branch were stripped like any other "
+            "entry: their tests are about something that holds either way.",
             ">",
             *[
                 f"> - {_md_code(path)} — {_md_code(title)}"
@@ -1328,6 +1371,7 @@ def pr_body(
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+    lines += _removed_default_lines(removed_defaults, kept, deleted, bool(deleted_tests))
     lines += _renamed_test_lines(renamed_tests, kept)
     if wrapper_findings:
         lines += _wrapper_lines(wrapper_findings)
@@ -1698,6 +1742,18 @@ def note_flag_state_comments(bindings: tuple[tuple[str, str, str], ...]) -> None
         rows = [f"{path}:{text}" for path, row_kind, text in bindings if row_kind == kind]
         if rows:
             logger.info("%d comment(s) %s (kept): %s", len(rows), what, "; ".join(rows))
+
+
+def note_removed_defaults(bindings: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the registry entries whose default was the removed branch; the dry
+    run's only outlet for the warning :func:`pr_body` carries."""
+    defaults = _removed_defaults(bindings)
+    if defaults:
+        logger.warning(
+            "the flag's default was the branch being removed, so tests that never "
+            "set it now run the kept branch; run the test suite: %s",
+            "; ".join(f"{path}: {_one_line(entry)}" for path, entry in defaults),
+        )
 
 
 def note_renamed_tests(bindings: tuple[tuple[str, str, str], ...]) -> None:
