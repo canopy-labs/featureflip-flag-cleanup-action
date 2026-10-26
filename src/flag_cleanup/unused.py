@@ -995,8 +995,10 @@ def _dart_import_candidates(
     """Every Dart import whose bindings this pass can name.
 
     Every form needs the library itself, which ``resolve`` finds when it is
-    in the checkout (see :mod:`flag_cleanup.dart_namespace`); one it cannot
-    read — a ``dart:`` library, another package's — is never offered. Even
+    in the checkout (see :mod:`flag_cleanup.dart_namespace`), or when it is a
+    Featureflip Dart SDK library whose release the package's lock pins to
+    one that was audited; one it cannot read — a ``dart:`` library, any other
+    package's — is never offered. Even
     a prefix needs it: an extension the library declares applies through
     ``as legacy`` too, and a call to its member spells neither the prefix nor
     any shown name, so every candidate's ``names`` carries the library's

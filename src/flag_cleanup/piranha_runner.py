@@ -104,6 +104,8 @@ from flag_cleanup import (
     stale_comments,
     ts_bound_overrides,
     ts_dead_code,
+    ts_default_arguments,
+    ts_list_join,
     ts_fold,
     ts_gates,
     ts_param_pins,
@@ -850,12 +852,16 @@ def _grammar_of(path: str, language: str) -> str:
 
     ``language`` itself, except for a cross-file reader of a sibling file type
     in its key-constant family: a ``.tsx`` reader handed to the ``ts`` run is
-    parsed, rewritten and checked as TSX. Every pass that parses a file asks
-    this rather than trusting the run's language.
+    parsed, rewritten and checked as TSX -- and for a caller of a keyless
+    wrapper in a sibling file type its profile names: an ``.erb`` template
+    calling a Ruby helper is parsed, rewritten and checked as ERB. Every pass
+    that parses a file asks this rather than trusting the run's language.
     """
     if path.endswith(_language_spec(language).extensions):
         return language
-    for sibling in sorted(cross_file_keys.family(language)):
+    wrappers = wrapper_inline.profile(language)
+    callers = frozenset(wrappers.siblings) if wrappers is not None else frozenset()
+    for sibling in sorted(cross_file_keys.family(language) | callers):
         if path.endswith(_LANGUAGES[sibling].extensions):
             return sibling
     return language
@@ -1313,9 +1319,14 @@ class TransformOutcome:
     #: ``"unread binding"`` (the parameter or local an override deleted by
     #: :mod:`~flag_cleanup.ts_bound_overrides` was the last reader of) and
     #: ``"emptied override"`` (the line of an object literal the entry
-    #: deletions left as ``{}``). Kind ``"dropped override argument"`` is
-    #: such a literal removed instead, with the call it was left out of as
-    #: text, because the callee's parameter defaults to ``{}`` anyway.
+    #: deletions left as ``{}``). Kind ``"dropped default argument"`` is a
+    #: literal this run wrote, an emptied override or a folded value, left
+    #: out instead, with the call or element it was left out of as text,
+    #: because the callee's declaration defaults to the same value. Kind
+    #: ``"renamed test"`` is a test title that named the flag's KEPT branch,
+    #: with the flag's condition dropped; its text is the old title and the
+    #: new one, separated by a newline. See
+    #: :func:`~flag_cleanup.ts_tests.rename_kept_titles`.
     bindings: tuple[tuple[str, str, str], ...] = ()
     #: ``(path, text)`` for every flag-keyed ENTRY the ``*_entries.toml``
     #: rules deleted — a registry line, an override property, an object-type
@@ -2028,6 +2039,14 @@ def _transform_flag(
         summaries, language, pinned_tests, repo_dir
     )
 
+    # Drop the flag's condition from the titles of the tests that survive
+    # because they test the KEPT branch: "renders X when the k flag is on"
+    # describes a condition that no longer exists. After the deletion, which
+    # identifies its tests by title. See `ts_tests.rename_kept_titles`.
+    summaries, renamed_tests = _rename_kept_titles(
+        summaries, language, flag_key, spec.true_literal if treatment else spec.false_literal, repo_dir
+    )
+
     # The parameters the bound-entry deletions left unread, where no call can
     # still pass one. After the test deletion, because the test about the
     # removed branch is usually the one caller that did; before the stranded
@@ -2141,13 +2160,14 @@ def _transform_flag(
     )
     bindings = bindings + unread_constructor + removed_constructor
     bindings = bindings + dropped_parameters + unread_bindings
+    bindings = bindings + renamed_tests
 
-    # The override literals the entry deletions left empty (`flags={{}}`).
-    # One passed as the last argument of a function in this file whose
-    # parameter defaults to `{}` anyway is dropped; the rest are reported,
-    # never edited, since whether the prop carrying one can go depends on a
-    # type declared elsewhere. Last, so they read the bytes that stay on disk.
-    summaries, emptied_rows = _drop_emptied_arguments(summaries, language, flag_key, repo_dir)
+    # The literals this run left equal to what the callee would use anyway:
+    # override literals the entry deletions emptied (`flags={{}}`) and values
+    # the fold wrote (`{ enabled: true }`). One the callee's declaration proves
+    # a no-op is left out; an emptied one that stays is reported. Last, so
+    # they read the bytes that stay on disk.
+    summaries, emptied_rows = _drop_default_arguments(summaries, language, flag_key, repo_dir)
     bindings = bindings + emptied_rows
 
     # The comments left describing nothing but what this run removed: the
@@ -2165,6 +2185,11 @@ def _transform_flag(
         repo_dir,
     )
     bindings = bindings + comment_rows
+
+    # Comments beside the changes that describe a flag's state without naming
+    # it ("while the flag is off"): reported, never edited. After every edit,
+    # so the lines named are the ones that stay on disk.
+    bindings = bindings + _flag_state_comments(summaries, language, flag_key, treatment, repo_dir)
 
     # GATE 1 — if the transform broke any file, discard ALL of it. A partial
     # rewrite is not an option: the flag would look half-removed, and a diff
@@ -2767,6 +2792,7 @@ def _drop_unread_parameters(
             summary.content,
             _grammar_of(summary.path, language),
             parameters[relative],
+            width=ts_list_join.line_limit(summary.path, summary.original_content, repo_dir),
         )
         if not removed:
             result.append(summary)
@@ -2885,18 +2911,42 @@ def _remove_stale_comments(
     return result, tuple(rows), wrapper_rows
 
 
-def _drop_emptied_arguments(
+def _flag_state_comments(
+    summaries, language: str, flag_key: str, treatment: bool, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """A ``(path, kind, "<line>: <text>")`` row for each comment on or
+    directly above a changed line that describes a flag's state without
+    naming the key; ``kind`` says whether it describes the branch this run
+    deleted. Report only. See :func:`flag_cleanup.stale_comments.flag_state_comments`.
+    """
+    rows: list[tuple[str, str, str]] = []
+    for s in summaries:
+        if s.original_content == s.content or not s.content:
+            continue
+        grammar = _grammar_of(s.path, language)
+        if grammar == "erb" or not s.path.endswith(_LANGUAGES[grammar].extensions):
+            continue
+        relative = os.path.relpath(s.path, repo_dir)
+        for found in stale_comments.flag_state_comments(
+            s.original_content, s.content, grammar, flag_key, treatment
+        ):
+            kind = stale_comments.REMOVED_BRANCH_KIND if found.removed else stale_comments.FLAG_STATE_KIND
+            rows.append((relative, kind, f"{found.line}: {found.text}"))
+    return tuple(rows)
+
+
+def _drop_default_arguments(
     summaries, language: str, flag_key: str, repo_dir: str
 ) -> tuple[list, tuple[tuple[str, str, str], ...]]:
-    """Leave out each emptied override the callee defaults to ``{}`` anyway,
-    and report the rest; TypeScript family only. See
-    :func:`~flag_cleanup.ts_bound_overrides.drop_emptied_arguments` and
+    """Leave out each literal this run left equal to the callee's default,
+    and report each emptied override that stays; TypeScript family only. See
+    :mod:`~flag_cleanup.ts_default_arguments` and
     :func:`~flag_cleanup.ts_bound_overrides.emptied_overrides`.
 
-    Returns the summaries, a ``(path, "dropped override argument", call)``
-    row for each argument left out and a ``(path, "emptied override", line)``
-    row for each literal left. The report is read off the text BEFORE the
-    drop, less the lines dropped: read after, the hunks still count the
+    Returns the summaries, a ``(path, "dropped default argument", site)``
+    row for each literal left out and a ``(path, "emptied override", line)``
+    row for each emptied literal left. The report is read off the text BEFORE
+    the drop, less the lines dropped: read after, the hunks still count the
     objects the drop took, and hand those slots to empty literals the
     customer wrote.
     """
@@ -2915,18 +2965,24 @@ def _drop_emptied_arguments(
                 summary.original_content, summary.content, grammar, flag_key
             )
         )
-        content, calls, lines = ts_bound_overrides.drop_emptied_arguments(
-            summary.original_content, summary.content, grammar, flag_key
+        dropped = ts_default_arguments.drop_default_arguments(
+            summary.original_content,
+            summary.content,
+            grammar,
+            flag_key,
+            summary.path,
+            repo_dir,
+            width=ts_list_join.line_limit(summary.path, summary.original_content, repo_dir),
         )
-        for line in lines:
+        for line in dropped.lines:
             emptied.remove(line)
-        rows.extend((relative, "dropped override argument", call) for call in calls)
+        rows.extend((relative, "dropped default argument", site) for site in dropped.sites)
         rows.extend((relative, "emptied override", line) for line in emptied)
-        if not calls:
+        if not dropped.sites:
             result.append(summary)
             continue
-        Path(summary.path).write_text(content, encoding="utf-8")
-        result.append(Rewrite(summary.path, summary.original_content, content))
+        Path(summary.path).write_text(dropped.content, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, dropped.content))
     return result, tuple(rows)
 
 
@@ -3030,13 +3086,18 @@ def _strip_parameter_pins(
             if summary is not None
             else Path(path).read_text(encoding="utf-8")
         )
+        original = summary.original_content if summary else before
         after, stripped = ts_param_pins.strip_parameter_pins(
-            before, _grammar_of(path, language), flag_key, path_pins
+            before,
+            _grammar_of(path, language),
+            flag_key,
+            path_pins,
+            width=ts_list_join.line_limit(path, original, repo_dir),
         )
         if after == before:
             continue
         Path(path).write_text(after, encoding="utf-8")
-        rewrite = Rewrite(path, summary.original_content if summary else before, after)
+        rewrite = Rewrite(path, original, after)
         if summary is None:
             result.append(rewrite)
         else:
@@ -3068,6 +3129,39 @@ def _delete_pinned_tests(
         relative = os.path.relpath(summary.path, repo_dir)
         deleted.extend((relative, title) for title in titles)
     return result, tuple(deleted)
+
+
+def _rename_kept_titles(
+    summaries, language: str, flag_key: str, kept: str, repo_dir: str
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Rewrite each changed file's titles that name the kept branch; a
+    ``(path, "renamed test", "<old>\\n<new>")`` row for each.
+
+    Only a file the transform changed, as with the deletion: an untouched file
+    is not part of this removal, and a file put back whole has no summary
+    change left to add to.
+    """
+    if not ts_tests.covers(language):
+        return summaries, ()
+    result = []
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content:
+            result.append(summary)
+            continue
+        content, renamed = ts_tests.rename_kept_titles(
+            summary.content, _grammar_of(summary.path, language), flag_key, kept
+        )
+        if not renamed:
+            result.append(summary)
+            continue
+        Path(summary.path).write_text(content, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, content))
+        relative = os.path.relpath(summary.path, repo_dir)
+        rows.extend(
+            (relative, ts_tests.RENAMED_TEST, f"{old}\n{new}") for old, new in renamed
+        )
+    return result, tuple(rows)
 
 
 def _external_keys(

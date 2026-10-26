@@ -45,13 +45,15 @@ changes, or a parameter that goes (a code generator or an injector may
 construct it), a class name declared twice, and a file that does not parse.
 
 Each argument that goes must do no work when skipped, and strand nothing: a
-literal built of literals, a ``const`` object, a call with constant
-arguments of a constructor that builds the object and does nothing else
-(:func:`const_construction`), or a bare name that is a parameter of a
-function around the call or a top-level ``const`` of the file (a getter, a
-property such as ``widget.client`` or a lazily initialised variable may do
-work, and a local left unread is ``unused_local_variable``). Every name it spells must be spelled
-elsewhere in its file too. A
+literal built of literals, a ``const`` object, a call of a constructor that
+builds the object and does nothing else (:func:`const_construction`), a bare
+name that is a parameter of a function around the call or a variable of the
+file whose initializer is inert (:func:`_inert_name`), or ``widget.f`` in a
+Flutter ``State`` where ``f`` is provably a plain field of the widget
+(:func:`_widget_field`). Any other property may be a getter, a lazily
+initialised variable with an initializer that may do work runs it on its
+first read, and a local left unread is ``unused_local_variable``. Every name
+it spells must be spelled elsewhere in its file too. A
 positional argument is found by its index among the positional ones, a named
 one by its label. A call that passes fewer positional arguments than the index
 passes nothing to delete.
@@ -620,6 +622,8 @@ _BINDERS = frozenset(
         "function_signature",
     }
 )
+#: The binders above that declare one variable, its name first.
+_DECLARATORS = frozenset({"initialized_variable_definition", "initialized_identifier", "static_final_declaration"})
 #: Holders of a parameter list whose names are in scope below them.
 _FUNCTIONS = frozenset(
     {"function_expression", "declaration", "method_signature", "function_signature", "lambda_expression"}
@@ -645,20 +649,16 @@ def _own_parameters(holder: Node) -> set[str]:
 
 
 def _member(node: Node) -> Node:
-    """The top-level declaration or class member enclosing ``node``."""
-    while node.parent is not None and node.parent.type not in ("program", "class_body"):
+    """The top-level declaration or type member enclosing ``node``."""
+    while node.parent is not None and node.parent.type not in ("program", "class_body", "enum_body", "extension_body"):
         node = node.parent
     return node
 
 
-def _inert_name(argument: Node, name: str, root: Node) -> bool:
-    """Whether the bare name ``name`` passed in ``argument`` reads a value
-    without doing work, and skipping it strands no local: a parameter of a
-    function enclosing the call (an unused parameter is no warning), or a
-    top-level ``const`` of the file. Refused when the member around the call
-    binds the name any other way, since the argument may then name that
-    binding instead; and a getter, a lazily initialised variable or a local
-    is never a candidate."""
+def _bound_in_member(argument: Node, name: str) -> bool:
+    """Whether the member around ``argument`` binds ``name`` other than as
+    the enclosing function's own name or a parameter: the argument may then
+    name that binding instead."""
     member = _member(argument)
     siblings = [member]
     following = member.next_named_sibling
@@ -673,7 +673,16 @@ def _inert_name(argument: Node, name: str, root: Node) -> bool:
             ):
                 if n.parent is member:
                     continue  # the enclosing function's own name
-                return False
+                if n.parent.type in _DECLARATORS and n != next(
+                    (c for c in n.parent.named_children if c.type == "identifier"), None
+                ):
+                    continue  # read in an initializer, not the name it declares
+                return True
+    return False
+
+
+def _enclosing_parameters(argument: Node) -> set[str]:
+    """The parameter names of every function around ``argument``."""
     scope: set[str] = set()
     current = argument
     while current.parent is not None:
@@ -682,26 +691,532 @@ def _inert_name(argument: Node, name: str, root: Node) -> bool:
         if current.type == "function_body" and current.prev_named_sibling is not None:
             scope |= _own_parameters(current.prev_named_sibling)
         current = current.parent
-    if name in scope:
+    return scope
+
+
+#: The body of each kind of type declaration.
+_BODIES = {
+    "class_definition": "class_body",
+    "mixin_declaration": "class_body",
+    "enum_declaration": "enum_body",
+    "extension_declaration": "extension_body",
+    "extension_type_declaration": "class_body",
+}
+#: What every object has, inherited from ``Object`` by a type with no
+#: supertype clause.
+_OBJECT_MEMBERS = frozenset({"hashCode", "runtimeType", "toString", "noSuchMethod"})
+#: What every enum has besides.
+_ENUM_MEMBERS = frozenset({"values", "index", "name"})
+#: What may come before a variable's declarator list among its siblings.
+_VARIABLE_PREFIX = frozenset(
+    {
+        "late",
+        "external",
+        "static",
+        "covariant",
+        "final_builtin",
+        "const_builtin",
+        "inferred_type",
+        "type_identifier",
+        "type_arguments",
+        "nullable_type",
+        "function_type",
+        "record_type",
+        "annotation",
+        "comment",
+        "documentation_comment",
+    }
+)
+_TYPES = frozenset({"type_identifier", "type_arguments", "nullable_type", "function_type", "record_type"})
+
+
+def _enclosing_type(node: Node) -> Node | None:
+    """The class, mixin, enum or extension whose body holds ``node``."""
+    for ancestor in _ancestors(node):
+        if ancestor.parent is not None and _BODIES.get(ancestor.parent.type) == ancestor.type:
+            return ancestor.parent
+    return None
+
+
+def _body(declaration: Node) -> Node | None:
+    return next((c for c in declaration.named_children if c.type == _BODIES.get(declaration.type)), None)
+
+
+def _declared_members(body: Node) -> dict[str, list[Node]]:
+    """Each name a member of ``body`` declares (a field, a getter, a setter,
+    a method, an enum constant), with the member declaring it."""
+    found: dict[str, list[Node]] = {}
+    for member in body.named_children:
+        names: list[Node] = []
+        if member.type == "enum_constant":
+            names = [c for c in member.named_children[:1] if c.type == "identifier"]
+        elif member.type == "declaration":
+            for child in member.named_children:
+                if child.type in ("initialized_identifier_list", "static_final_declaration_list"):
+                    names += [d.named_children[0] for d in child.named_children if d.named_children]
+                elif child.type == "identifier_list":
+                    names += [c for c in child.named_children if c.type == "identifier"]
+                elif child.type == "identifier":
+                    names.append(child)  # `external FeatureClient client;`
+                elif child.type in ("function_signature", "getter_signature", "setter_signature"):
+                    names += [c for c in child.named_children[:3] if c.type == "identifier"][:1]
+        elif member.type == "method_signature":
+            for child in member.named_children:
+                if child.type in ("function_signature", "getter_signature", "setter_signature"):
+                    names += [c for c in child.named_children[:3] if c.type == "identifier"][:1]
+        for name in names:
+            found.setdefault(_text(name), []).append(member)
+    return found
+
+
+def _has_supertype_clause(declaration: Node) -> bool:
+    """Whether ``declaration`` names a supertype it inherits members from:
+    ``extends``/``with`` (a class's ``superclass`` holds both), an enum's
+    ``with``, or a mixin's ``on``."""
+    if any(c.type in ("superclass", "mixins") for c in declaration.named_children):
         return True
-    return any(
-        top.type == "static_final_declaration_list"
-        and top.prev_named_sibling is not None
-        and top.prev_named_sibling.type == "const_builtin"
-        and any(
-            d.type == "static_final_declaration" and d.named_children and _text(d.named_children[0]) == name
-            for d in top.named_children
-        )
-        for top in root.named_children
+    return declaration.type == "mixin_declaration" and any(c.type == "on" for c in declaration.children)
+
+
+def _variable_prefix(listing: Node) -> list[Node]:
+    """The modifiers, type and annotations before ``listing``, a declarator
+    list, among its siblings."""
+    found: list[Node] = []
+    previous = listing.prev_sibling
+    while previous is not None and previous.type in _VARIABLE_PREFIX:
+        found.append(previous)
+        previous = previous.prev_sibling
+    return found[::-1]
+
+
+def _initializer_of(declarator: Node) -> list[Node]:
+    nodes: list[Node] = []
+    after = False
+    for part in declarator.children:
+        if after and part.is_named and "comment" not in part.type:
+            nodes.append(part)
+        after = after or part.type == "="
+    return nodes
+
+
+def _inert_declaration(path: str, root: Node, declarator: Node, prefix: list[Node], repo_dir: str) -> str | None:
+    """Why reading the variable ``declarator`` declares may do work, or
+    ``None`` when it cannot. Dart initializes a top-level or static variable
+    on its first read, so that read runs the initializer and nothing else:
+    the initializer must be inert. ``prefix`` is its modifiers and type."""
+    kinds = {c.type for c in prefix}
+    if "external" in kinds:
+        return "an `external` variable, which may be a getter"
+    value = _initializer_of(declarator)
+    if not value:
+        return "a variable with no initializer"  # a `late` one throws when read unset
+    # Passed where a typed parameter is wanted, a `dynamic` value is cast,
+    # and the cast may throw. An inferred type is the initializer's, which
+    # is `dynamic` only for `null`; a declared one may be `dynamic` through
+    # a typedef, so it must be the class the initializer constructs.
+    types = [c for c in prefix if c.type in _TYPES]
+    if not types and len(value) == 1 and value[0].type == "null_literal":
+        return "a `dynamic` variable (`null` infers it), which the call would cast"
+    if types:
+        declared = "".join(_text(t) for t in types)
+        declared = declared[:-1] if declared.endswith("?") else declared
+        if declared != _constructed_class(value):
+            return "a declared type other than the class its initializer builds, which may be `dynamic`"
+    from flag_cleanup.dart_field_removal import _inert
+
+    if "const_builtin" in kinds and _constructed_class(value) is not None:
+        return None  # a constant construction runs no code
+    if _inert(value) or const_construction(path, root, value, repo_dir, names=False):
+        return None
+    return "a variable whose initializer may do work"
+
+
+def _constructed_class(value: list[Node]) -> str | None:
+    """The class an initializer constructs (``const C()``, ``new C()``,
+    ``C()``, ``C.named()``), as spelled; ``None`` for anything else."""
+    if len(value) == 1 and value[0].type in ("const_object_expression", "new_expression"):
+        labels = [c for c in value[0].named_children if c.type == "type_identifier"]
+        return _text(labels[0]) if len(labels) == 1 else None
+    if value and value[0].type == "identifier" and len(value) in (2, 3) and all(n.type == "selector" for n in value[1:]):
+        return _text(value[0])
+    return None
+
+
+def _inert_static(path: str, root: Node, members: list[Node], repo_dir: str) -> str | None:
+    if len(members) != 1 or members[0].type != "declaration":
+        return "a member of the enclosing type that is not one static field"
+    member = members[0]
+    prefix = [c for c in member.children if c.type in _VARIABLE_PREFIX]
+    if "static" not in {c.type for c in prefix}:
+        return "an instance member of the enclosing type"
+    listing = next((c for c in member.named_children if c.type in ("initialized_identifier_list", "static_final_declaration_list")), None)
+    if listing is None or len(listing.named_children) != 1:
+        return "a static field with no initializer, or declared beside others"
+    return _inert_declaration(path, root, listing.named_children[0], prefix, repo_dir)
+
+
+def _inert_top_level(path: str, root: Node, name: str, repo_dir: str) -> str | None:
+    from flag_cleanup.dart_field_removal import _TYPE_DECLARATIONS as declarations
+    from flag_cleanup.dart_field_removal import _callable_names
+
+    if name in _callable_names(root):
+        return "a getter, setter or function of that name is declared in the file"
+    if any(
+        n.type in declarations
+        and (label := next((c for c in n.named_children if c.type in ("identifier", "type_identifier")), None)) is not None
+        and _text(label) == name
+        for n in root.named_children
+    ):
+        return "a type of that name is declared in the file"
+    found: list[tuple[Node, Node]] = []
+    for listing in root.named_children:
+        if listing.type in ("initialized_identifier_list", "static_final_declaration_list"):
+            found += [(listing, d) for d in listing.named_children if d.named_children and _text(d.named_children[0]) == name]
+        elif listing.type == "identifier_list":
+            found += [(listing, c) for c in listing.named_children if c.type == "identifier" and _text(c) == name]
+    if not found:
+        return "not a variable declared in the file (an import's, or a local's)"
+    if len(found) != 1:
+        return "declared more than once in the file"
+    listing, declarator = found[0]
+    if declarator.type == "identifier":
+        return "a variable with no initializer"
+    return _inert_declaration(path, root, declarator, _variable_prefix(listing), repo_dir)
+
+
+def _inert_name(
+    path: str, argument: Node, name: str, root: Node, repo_dir: str, *, parameters: bool = True
+) -> str | None:
+    """Why the bare name ``name`` passed in ``argument`` may do work when
+    read, or strand a local; ``None`` when it cannot. Accepted:
+
+    - a parameter of a function enclosing the call (an unused parameter is
+      no warning);
+    - a variable of the file whose initializer is inert (see
+      :func:`_inert_declaration`): a top-level one, or a ``static`` field of
+      the class, mixin or enum around the call.
+
+    Refused when the member around the call binds the name any other way;
+    for a file with part files (another part may declare it); inside an
+    extension; and, for a top-level variable read inside a type, when the
+    type declares a member of the name or names a supertype, since the
+    name may then be that member. A getter, a local, an import's name or a
+    variable with no initializer is never a candidate."""
+    if _bound_in_member(argument, name):
+        return "bound again in the member around the call"
+    if name in _enclosing_parameters(argument):
+        # A constructor's argument is never a parameter: the parameter's
+        # type is not known, and a `dynamic` one would be cast there.
+        return None if parameters else "a parameter, passed on to a constructor"
+    if any(c.type in ("part_directive", "part_of_directive") for c in root.named_children):
+        return "its library has part files"
+    owner = _enclosing_type(argument)
+    if owner is not None:
+        if owner.type in ("extension_declaration", "extension_type_declaration"):
+            return "read inside an extension"
+        body = _body(owner)
+        members = _declared_members(body) if body is not None else {}
+        if name in members:
+            from flag_cleanup.dart_field_removal import _callable_names
+
+            if name in _callable_names(root):
+                return "a getter, setter or function of that name is declared in the file"
+            return _inert_static(path, root, members[name], repo_dir)
+        if _has_supertype_clause(owner):
+            return "read inside a type with an `extends`, `with` or `on` clause, which may inherit it"
+        if name in _OBJECT_MEMBERS or (owner.type == "enum_declaration" and name in _ENUM_MEMBERS):
+            return "a member every object of the enclosing type has"
+    return _inert_top_level(path, root, name, repo_dir)
+
+
+# --- `widget.f` in a Flutter `State` -------------------------------------------
+
+#: The public libraries of ``package:flutter``. None declares or exports a
+#: top-level ``widget``, and ``State`` is declared once, in the widgets
+#: library, which ``material`` and ``cupertino`` export.
+_FLUTTER_LIBRARIES = frozenset(
+    f"package:flutter/{name}.dart"
+    for name in (
+        "animation", "cupertino", "foundation", "gestures", "material", "painting",
+        "physics", "rendering", "scheduler", "semantics", "services", "widget_previews",
+        "widgets",
     )
+)
+_STATE_LIBRARIES = frozenset(f"package:flutter/{name}.dart" for name in ("widgets", "material", "cupertino"))
+
+
+def _brings(spec: Node, name: str) -> bool:
+    """Whether the import ``spec``'s combinators let ``name`` through."""
+    shown: set[str] | None = None
+    hidden: set[str] = set()
+    for combinator in (c for c in spec.named_children if c.type == "combinator"):
+        names = {_text(c) for c in combinator.named_children if c.type == "identifier"}
+        if combinator.children and combinator.children[0].type == "show":
+            shown = names if shown is None else shown & names
+        else:
+            hidden |= names
+    return name not in hidden and (shown is None or name in shown)
+
+
+def _flutter_state(path: str, root: Node, repo_dir: str) -> str | None:
+    """Why ``State`` and a bare ``widget`` in ``root`` may not be Flutter's
+    ``State`` and its getter, or ``None``. A top-level ``widget`` in scope
+    would win over the inherited getter, so no import may bring one."""
+    from flag_cleanup import dart_namespace
+
+    declared = dart_namespace.declared_names(root)
+    if declared is None:
+        return "the file declares names that cannot be read"
+    for name in ("State", "widget"):
+        if name in declared.names:
+            return f"the file declares `{name}`"
+    resolve = dart_namespace.resolver(path, repo_dir)
+    flutter = False
+    for spec in (n for n in _walk(root) if n.type == "import_specification"):
+        if any(c.type == "as" for c in spec.children):
+            continue  # a prefix brings no bare name
+        uri = dart_namespace.uri_of(spec)
+        if uri is None:
+            return f"{_where(path, spec)}: an import whose library cannot be told"
+        if uri in _FLUTTER_LIBRARIES:
+            flutter = flutter or (uri in _STATE_LIBRARIES and _brings(spec, "State"))
+            continue
+        if uri.startswith("dart:") or not (_brings(spec, "State") or _brings(spec, "widget")):
+            continue
+        namespace = resolve(uri)
+        if namespace is None:
+            return f"{_where(path, spec)}: an import whose names cannot be read may bring a `widget` or a `State`"
+        if {"State", "widget"} & set(namespace.names):
+            return f"{_where(path, spec)}: an import brings a `widget` or a `State`"
+    if not flutter:
+        return "`State` is not imported from `package:flutter/widgets.dart`, `material.dart` or `cupertino.dart`"
+    return None
+
+
+def _state_widget(owner: Node | None) -> str | Node:
+    """The type argument ``W`` of ``owner``'s ``extends State<W>``, or why
+    ``owner`` is not such a class."""
+    if owner is None or owner.type != "class_definition":
+        return "not inside a class"
+    superclass = next((c for c in owner.named_children if c.type == "superclass"), None)
+    if superclass is None or [c.type for c in superclass.named_children] != ["type_identifier", "type_arguments"]:
+        return "not inside a class that extends `State<…>`, and nothing else"
+    state, arguments = superclass.named_children
+    if _text(state) != "State":
+        return "not inside a class that extends `State<…>`, and nothing else"
+    if [c.type for c in arguments.named_children] != ["type_identifier"]:
+        return "the `State`'s widget type is not a plain class name"
+    widget = arguments.named_children[0]
+    parameters = next((c for c in owner.named_children if c.type == "type_parameters"), None)
+    if parameters is not None and any(
+        c.type == "type_identifier" and _text(c) == _text(widget) for p in parameters.named_children for c in p.named_children[:1]
+    ):
+        return "the `State`'s widget type is a type parameter"
+    body = _body(owner)
+    if body is None or "widget" in _declared_members(body):
+        return "the class declares a `widget` member"
+    return widget
+
+
+_SUPERTYPE_CLAUSES = frozenset({"superclass", "interfaces", "mixins", "mixin_application"})
+
+
+def _is_supertype(node: Node) -> bool:
+    """Whether the type name ``node`` is in a supertype clause (and not a
+    type argument there)."""
+    for ancestor in _ancestors(node):
+        if ancestor.type in ("type_arguments", "type_parameters", "type_bound"):
+            return False
+        if ancestor.type in _SUPERTYPE_CLAUSES:
+            return True
+        if ancestor.type == "mixin_declaration":
+            return True  # its `on` clause
+        if ancestor.type in _TYPE_DECLARATIONS or ancestor.type in ("class_body", "enum_body", "extension_body"):
+            return False
+    return False
+
+
+def _widget_field_declaration(cls: Node, field: str) -> str | None:
+    """Why ``field`` may not be a plain field of the class ``cls``."""
+    from flag_cleanup.dart_field_removal import _fields
+
+    if field.startswith("_"):
+        return f"`{field}` is private, and this may be its last read"
+    body = _body(cls)
+    members = _declared_members(body).get(field, []) if body is not None else []
+    if len(members) != 1 or members[0].type != "declaration":
+        return f"`{field}` is not declared once, as a field, in the widget class"
+    tokens = {c.type for c in members[0].children}
+    for modifier in ("static", "late", "external", "abstract"):
+        if modifier in tokens:
+            return f"`{field}` is a `{modifier}` field"
+    if not any(f == members[0] for f, _ in _fields(body)):
+        return f"`{field}` is not a field of the widget class"
+    types = [c for c in members[0].named_children if c.type in _TYPES]
+    if not types or any(_text(t) == "dynamic" for t in types):
+        return f"`{field}` is `dynamic`, which the call would cast"
+    return None
+
+
+def _field_type(declaring: str, cls: Node, field: str, repo_dir: str) -> str | None:
+    """Why the declared type of the widget field ``field`` may be
+    ``dynamic``, which the call would cast, or ``None``. A typedef may name
+    ``dynamic``, so the type must be one plain name, optionally ``?``, that
+    the widget's file sees as a class, enum, mixin or extension type
+    declared once in the repository, or as a name of an audited Featureflip
+    SDK library it imports."""
+    from flag_cleanup import dart_namespace
+
+    body = _body(cls)
+    member = _declared_members(body)[field][0]
+    types = [c for c in member.named_children if c.type in _TYPES]
+    if [t.type for t in types] not in (["type_identifier"], ["type_identifier", "nullable_type"]):
+        return f"`{field}`'s type is not a plain class name"
+    type_name = _text(types[0])
+    root = _root(cls)
+    found: list[tuple[str, Node]] = []
+    for source in source_index.files(repo_dir, (".dart",), with_ignored=True):
+        file = str(source.path)
+        try:
+            data = source.path.read_bytes()
+        except OSError:
+            return f"{file} could not be read"
+        if type_name.encode() not in data:
+            continue
+        tree = _parse(data.decode("utf-8", "replace"), "dart")
+        if tree.has_error:
+            return f"{file} does not parse"
+        for node in _walk(tree):
+            if node.type in _TYPE_DECLARATIONS:
+                label = next((c for c in node.named_children if c.type in ("identifier", "type_identifier")), None)
+                if label is not None and _text(label) == type_name:
+                    found.append((file, node))
+    if found:
+        if len(found) != 1 or found[0][1].type not in (
+            "class_definition", "enum_declaration", "mixin_declaration", "extension_type_declaration"
+        ):
+            return f"`{type_name}` is not declared once in the repository, as a class"
+        visibility = _visibility(declaring, root, found[0][0], type_name, repo_dir)
+        if isinstance(visibility, str):
+            return visibility
+        if not visibility[0]:
+            return f"the `{type_name}` declared in the repository is not the one the widget's file sees"
+        return None
+    resolve = dart_namespace.resolver(declaring, repo_dir)
+    for spec in (n for n in _walk(root) if n.type == "import_specification"):
+        uri = dart_namespace.uri_of(spec)
+        if (
+            uri is not None
+            and uri.startswith(f"package:{dart_namespace.AUDITED_SDK_PACKAGE}/")
+            and not any(c.type == "as" for c in spec.children)
+            and _brings(spec, type_name)
+            and (namespace := resolve(uri)) is not None
+            and type_name in namespace.names
+        ):
+            return None
+    return f"`{type_name}` is not a class of the repository or of the audited Featureflip SDK, so it may be `dynamic`"
+
+
+def _widget_field(path: str, argument: Node, value: list[Node], root: Node, repo_dir: str) -> str | None:
+    """Why the argument ``widget.f`` may do work, or ``None`` when it reads
+    a plain field of the mounted widget. ``widget`` is the getter
+    ``State.widget``, which returns the widget and does nothing else (it
+    throws only before mounting). So the read is pure when:
+
+    - the call is inside ``class S extends State<W>`` (nothing more in that
+      clause), with Flutter's ``State`` (see :func:`_flutter_state`), and
+      ``S`` declares no ``widget``;
+    - ``W`` is declared exactly once in the repository, visible to the call,
+      in a package that is not published, and no class of the repository
+      names it as a supertype, aliases it or names it in an annotation (a
+      generated mock would implement it);
+    - ``f`` is a field of ``W``'s body, declared once, not ``static``,
+      ``late``, ``external`` or ``abstract``, with a type that is not
+      ``dynamic``;
+    - no getter named ``f`` and no ``noSuchMethod`` is declared anywhere in
+      the repository."""
+    field = _selected(value[1])
+    if field is None or len(value[1].named_children) != 1:
+        return "not a plain `widget.<field>` read"
+    if _bound_in_member(argument, "widget") or "widget" in _enclosing_parameters(argument):
+        return "`widget` is bound in the member around the call"
+    if any(c.type in ("part_directive", "part_of_directive") for c in root.named_children):
+        return "its library has part files"
+    widget = _state_widget(_enclosing_type(argument))
+    if isinstance(widget, str):
+        return widget
+    reason = _flutter_state(path, root, repo_dir)
+    if reason is not None:
+        return reason
+    name = _text(widget)
+    state = next(c for c in _enclosing_type(argument).named_children if c.type == "identifier")
+    state_name = _text(state)
+    getters = {field, "widget"}
+    declarations: list[tuple[str, Node]] = []
+    for source in source_index.files(repo_dir, (".dart",), with_ignored=True):
+        file = str(source.path)
+        try:
+            data = source.path.read_bytes()
+        except OSError:
+            return f"{file} could not be read"
+        if not any(needle.encode() in data for needle in (name, state_name, field, "widget", "noSuchMethod")):
+            continue
+        tree = root if str(Path(file).resolve()) == str(Path(path).resolve()) else _parse(data.decode("utf-8", "replace"), "dart")
+        if tree.has_error:
+            return f"{file} does not parse"
+        for node in _walk(tree):
+            if node.type in _TYPE_DECLARATIONS:
+                label = next((c for c in node.named_children if c.type in ("identifier", "type_identifier")), None)
+                if label is not None and _text(label) == name:
+                    declarations.append((file, node))
+                if node.type == "type_alias" and any(
+                    c.type == "type_identifier" and _text(c) == name for c in _walk(node)
+                ):
+                    return f"{_where(file, node)}: a type alias names {name}"
+            elif node.type == "getter_signature" and any(
+                c.type == "identifier" and _text(c) in getters for c in node.named_children
+            ):
+                label = next(_text(c) for c in node.named_children if c.type == "identifier" and _text(c) in getters)
+                return f"{_where(file, node)}: a getter named `{label}` is declared"
+            elif node.type == "function_signature" and any(
+                c.type == "identifier" and _text(c) == "noSuchMethod" for c in node.named_children[:3]
+            ):
+                return f"{_where(file, node)}: `noSuchMethod` is declared"
+            elif node.type == "type_identifier" and _text(node) == state_name and _is_supertype(node):
+                return f"{_where(file, node)}: a class names {state_name} as a supertype"
+            elif node.type == "type_identifier" and _text(node) == name:
+                if _is_supertype(node):
+                    return f"{_where(file, node)}: a class names {name} as a supertype"
+                if any(a.type == "annotation" for a in _ancestors(node)):
+                    return f"{_where(file, node)}: an annotation names {name}"
+            elif node.type == "identifier" and _text(node) == name and any(a.type == "annotation" for a in _ancestors(node)):
+                return f"{_where(file, node)}: an annotation names {name}"
+    if len(declarations) != 1 or declarations[0][1].type != "class_definition":
+        return f"{name} is not declared once in the repository, as a class"
+    declaring, cls = declarations[0]
+    visibility = _visibility(path, root, declaring, name, repo_dir)
+    if isinstance(visibility, str):
+        return visibility
+    if not visibility[0]:
+        return f"the {name} declared in the repository is not the one the file sees"
+    if published(declaring):
+        return f"{name}'s package may be published, and a subclass outside the repository may override `{field}`"
+    if any(c.type == "type_parameters" for c in cls.named_children):
+        return f"{name} is generic, so a field's type may be a type parameter, `dynamic` in `State<{name}>`"
+    reason = _widget_field_declaration(cls, field)
+    if reason is not None:
+        return reason
+    return _field_type(declaring, cls, field, repo_dir)
 
 
 def _argument_site(path: str, arguments: Node, how: tuple[str, int | str], repo_dir: str) -> Site | None | str:
     """The site of the argument a call passes for a dropped parameter,
     ``None`` when it passes none, or why it cannot go. A literal, a constant,
-    a parameter, or a call of a constructor that builds the object and does
-    nothing else (see :func:`const_construction`) can go; anything else may
-    do work the call would no longer do."""
+    a parameter, an inert variable (see :func:`_inert_name`), a plain field
+    of a Flutter ``State``'s widget (see :func:`_widget_field`), or a call
+    of a constructor that builds the object and does nothing else (see
+    :func:`const_construction`) can go; anything else may do work the call
+    would no longer do."""
     kind, key = how
     items = [c for c in arguments.named_children if c.type in ("argument", "named_argument")]
     if kind == "positional":
@@ -727,16 +1242,28 @@ def _argument_site(path: str, arguments: Node, how: tuple[str, int | str], repo_
         value = [c for c in item.named_children if c.type != "label"]
     value = [c for c in value if c.type != "comment"]
     where = _where(path, item)
-    if (
-        not _literal(value)
-        and not (len(value) == 1 and value[0].type == "const_object_expression")
-        and not const_construction(path, _root(item), value, repo_dir)
-    ):
-        if len(value) != 1 or value[0].type != "identifier":
-            return f"{where}: an argument that may do work ({' '.join(_text(item).split())[:60]})"
-        if not _inert_name(item, _text(value[0]), _root(item)):
-            return f"{where}: an argument that is neither a parameter nor a constant ({_text(value[0])})"
+    root = _root(item)
+    if _literal(value) or (len(value) == 1 and value[0].type == "const_object_expression"):
+        return Site(path, item.start_byte, item.end_byte, "argument")
+    if len(value) == 2 and value[0].type == "identifier" and _text(value[0]) == "widget" and value[1].type == "selector":
+        reason = _widget_field(path, item, value, root, repo_dir)
+        if reason is not None:
+            return f"{where}: an argument that may do work ({' '.join(_text(item).split())[:60]}: {reason})"
+        return Site(path, item.start_byte, item.end_byte, "argument")
+    if const_construction(path, root, value, repo_dir):
+        return Site(path, item.start_byte, item.end_byte, "argument")
+    if len(value) != 1 or value[0].type != "identifier":
+        return f"{where}: an argument that may do work ({' '.join(_text(item).split())[:60]})"
+    reason = _inert_name(path, item, _text(value[0]), root, repo_dir)
+    if reason is not None:
+        return f"{where}: an argument that is neither a parameter nor an inert variable ({_text(value[0])}: {reason})"
     return Site(path, item.start_byte, item.end_byte, "argument")
+
+
+def inert_initializer_name(path: str, node: Node, root: Node, repo_dir: str) -> str | None:
+    """Why the bare name ``node``, a whole field initializer, may do work;
+    ``None`` when it reads an inert variable (see :func:`_inert_name`)."""
+    return _inert_name(path, node, _text(node), root, repo_dir)
 
 
 def plan_callers(
@@ -833,8 +1360,11 @@ def _root(node: Node) -> Node:
 
 def _stranded_by_arguments(path: str, root: Node, sites: list[Site]) -> str | None:
     """A name the arguments ``sites`` of one file spell that nothing else in
-    the file does (an import, a private declaration): deleting them would
-    leave it unused."""
+    the file does (an import, a private declaration), or a private variable
+    nothing else reads (see :func:`private_variable_unread`): deleting them
+    would leave it unused. A ``.member`` names no
+    declaration of the file, and neither does the ``widget`` of an argument
+    ``widget.f`` (see :func:`_widget_field`)."""
     from flag_cleanup.dart_field_removal import _CORE, _own_declarations
 
     spans = [(s.start, s.end) for s in sites]
@@ -845,9 +1375,22 @@ def _stranded_by_arguments(path: str, root: Node, sites: list[Site]) -> str | No
     for node in _walk(root):
         if node.type not in ("identifier", "type_identifier") or not inside(node, spans):
             continue
-        if node.parent is not None and node.parent.type == "label":
+        if node.parent is not None and node.parent.type in (
+            "label",
+            "unconditional_assignable_selector",
+            "conditional_assignable_selector",
+            "cascade_selector",
+        ):
+            continue
+        if widget_head(node, spans):
             continue
         name = _text(node)
+        if name.startswith("_"):
+            unread = private_variable_unread(root, name, spans)
+            if unread:
+                return f"{_where(path, node)}: deleting the argument would leave `{name}` unused"
+            if unread is not None:
+                continue
         skipped = spans + (_own_declarations(root, name) if name.startswith("_") else [])
         if name not in _CORE and not any(
             n.type in ("identifier", "type_identifier", "identifier_dollar_escaped")
@@ -859,17 +1402,79 @@ def _stranded_by_arguments(path: str, root: Node, sites: list[Site]) -> str | No
     return None
 
 
+def widget_head(node: Node, spans: list[tuple[int, int]]) -> bool:
+    """Whether ``node`` is the ``widget`` of an argument ``widget.f`` that
+    is one of ``spans``: the inherited getter, which no declaration of the
+    file provides (see :func:`_widget_field`)."""
+    if _text(node) != "widget" or node.parent is None or (node.parent.start_byte, node.parent.end_byte) not in spans:
+        return False
+    values = [c for c in node.parent.named_children if c.type not in ("label", "comment")]
+    return bool(values) and values[0] == node
+
+
+def _declares_variable(node: Node) -> bool:
+    """Whether the identifier ``node`` is the name a variable, field or
+    parameter declaration declares."""
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type in _DECLARATORS:
+        return node == next((c for c in parent.named_children if c.type == "identifier"), None)
+    if parent.type == "identifier_list":
+        return True
+    if parent.type == "declaration":
+        return True  # `external FeatureClient _client;`
+    if parent.type == "formal_parameter":
+        return _parameter_name(parent) == _text(node)
+    return False
+
+
+def private_variable_unread(root: Node, name: str, skipped: list[tuple[int, int]]) -> bool | None:
+    """For a private ``name`` that a variable, field or parameter of the
+    file declares: whether nothing outside ``skipped`` reads it, which
+    ``dart analyze`` reports once ``skipped`` is deleted. Names are matched
+    by spelling, so a name declared twice in the file counts as unread (a
+    read may be the other declaration's), and so does one only written
+    (``_c = …``, ``this._c``). ``None`` when no variable declares it."""
+    from flag_cleanup.dart_field_removal import _write_kind
+
+    def inside(node: Node) -> bool:
+        return any(start <= node.start_byte < end for start, end in skipped)
+
+    spellings = [
+        n for n in _walk(root)
+        if n.type in ("identifier", "identifier_dollar_escaped") and _text(n).lstrip("$") == name
+    ]
+    declared = [n for n in spellings if n.type == "identifier" and _declares_variable(n)]
+    if not declared:
+        return None
+    if len(declared) > 1:
+        return True
+    return not any(n not in declared and not inside(n) and _write_kind(n) is None for n in spellings)
+
+
 # --- a construction that does nothing but build the object --------------------
 
 
-def _const_arguments(arguments: Node) -> bool:
+def _const_arguments(path: str, root: Node, arguments: Node, repo_dir: str, names: bool) -> bool:
+    """Whether every argument is a literal, a ``const`` object or, with
+    ``names``, a bare name reading an inert variable (see
+    :func:`_inert_name`). A variable's own initializer is judged without
+    ``names``, so no chain of variables is followed."""
     for item in arguments.named_children:
         if item.type == "comment":
             continue
         if item.type not in ("argument", "named_argument"):
             return False
         value = [c for c in item.named_children if c.type not in ("label", "comment")]
-        if not (_literal(value) or (len(value) == 1 and value[0].type == "const_object_expression")):
+        if _literal(value) or (len(value) == 1 and value[0].type == "const_object_expression"):
+            continue
+        if not (
+            names
+            and len(value) == 1
+            and value[0].type == "identifier"
+            and _inert_name(path, item, _text(value[0]), root, repo_dir, parameters=False) is None
+        ):
             return False
     return True
 
@@ -980,10 +1585,11 @@ def _imported(path: str, root: Node, class_name: str, repo_dir: str) -> Node | N
     return found[0] if len(found) == 1 else None
 
 
-def const_construction(path: str, root: Node, nodes: list[Node], repo_dir: str) -> bool:
+def const_construction(path: str, root: Node, nodes: list[Node], repo_dir: str, *, names: bool = True) -> bool:
     """Whether the expression ``nodes`` (a postfix chain) calls, with
-    constant arguments, a constructor that builds a value and does nothing
-    else (see :func:`_has_const_constructor`): ``FeatureClient()`` where
+    constant arguments (or, with ``names``, bare names of inert variables,
+    see :func:`_const_arguments`), a constructor that builds a value and
+    does nothing else (see :func:`_has_const_constructor`): ``FeatureClient()`` where
     ``FeatureClient`` has a ``const FeatureClient();`` or a plain
     ``FeatureClient();``. The class must be declared in the file, or in the
     one checkout file an import brings it in from, and nothing else in the
@@ -992,11 +1598,11 @@ def const_construction(path: str, root: Node, nodes: list[Node], repo_dir: str) 
     if len(nodes) == 1 and nodes[0].type == "new_expression":
         node = nodes[0]
         label = next((c for c in node.named_children if c.type == "type_identifier"), None)
-        names = [c for c in node.named_children if c.type == "identifier"]
+        idents = [c for c in node.named_children if c.type == "identifier"]
         arguments = next((c for c in node.named_children if c.type == "arguments"), None)
         if label is None or arguments is None:
             return False
-        class_name, name = _text(label), _text(names[0]) if names else ""
+        class_name, name = _text(label), _text(idents[0]) if idents else ""
     elif nodes and nodes[0].type == "identifier" and all(n.type == "selector" for n in nodes[1:]):
         class_name = _text(nodes[0])
         if len(nodes) == 2:
@@ -1011,7 +1617,9 @@ def const_construction(path: str, root: Node, nodes: list[Node], repo_dir: str) 
     else:
         return False
     name = "" if name == "new" else name
-    if not _const_arguments(arguments):
+    if name.startswith("_"):
+        return False  # a private constructor whose last call this may be
+    if not _const_arguments(path, root, arguments, repo_dir, names):
         return False
     from flag_cleanup.wrapper_dart import binds
 

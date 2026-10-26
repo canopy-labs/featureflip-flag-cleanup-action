@@ -41,10 +41,16 @@ seen. A docstring is a string.
 Every rewrite is checked before it is kept: the file is parsed again and its
 code tokens (every leaf outside a comment) must be exactly what they were. A
 file that fails that is left as it was.
+
+Separately, and only to REPORT: :func:`flag_state_comments` finds comments on
+or directly above a changed line that describe a flag's state without naming
+the key ("while the flag is off"), and :func:`describes_removed` says whether
+a comment describes the branch the run deleted. Neither edits anything.
 """
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -52,6 +58,7 @@ from dataclasses import dataclass
 from tree_sitter import Node
 
 from flag_cleanup import syntax, unused
+from flag_cleanup.ts_tests import _HEDGES, _removed_state_pattern
 
 #: Words a comment may hold beside the removed names and still be ABOUT them
 #: only. Function words, the vocabulary of flags, and the words of a removal
@@ -418,3 +425,149 @@ def follow(row_text: str, source: str, removals: list[Removal]) -> int | None:
     if not hits and any(needle in r.text or (r.text and r.text in needle) for r in removals):
         return None
     return hits[0] + 1 if len(hits) == 1 else 0
+
+
+# --- Comments that describe the flag's state without naming it ------------
+#
+# Report only: nothing below edits a byte.
+
+#: The fixed phrases that describe a flag's state in prose: "the flag is
+#: off", "flag is enabled", "while the flag …", "when the checkout flag …".
+#: Deliberately narrow and anchored on the word ``flag`` (or ``toggle``): a
+#: comment matching one is only REPORTED, but a report that fires on every
+#: "when the user is enabled" would bury the ones that matter.
+FLAG_STATE = re.compile(
+    r"\b(?:flag|toggle)s?\s+(?:is|are|was|were)\s+(?:(?:turned|switched)\s+)?"
+    r"(?:on|off|enabled|disabled)\b"
+    r"|\b(?:while|when|whenever|if|unless)\s+the\s+"
+    r"(?:[^\s]+\s+){0,2}?(?:flag|toggle)s?\b",
+    re.IGNORECASE,
+)
+
+#: The comment kinds a run reports, as ``bindings`` rows.
+REMOVED_BRANCH_KIND = "removed-branch comment"
+FLAG_STATE_KIND = "flag-state comment"
+
+
+@dataclass(frozen=True)
+class StateComment:
+    """A comment near the run's changes that describes the flag's state."""
+
+    #: 1-based line holding the start of the phrase.
+    line: int
+    #: That line's comment text.
+    text: str
+    #: Whether the comment describes the branch the run deleted, which makes
+    #: it false rather than just stale.
+    removed: bool
+
+
+def describes_removed(text: str, flag_key: str, treatment: bool) -> bool:
+    """Whether ``text`` describes the flag in the state whose branch a removal
+    serving ``treatment`` deletes ("the flag is off" when ``true`` is served).
+
+    The same words, and the same hedges ("even when the flag is off" holds in
+    both states), that decide which tests are about the removed branch.
+    """
+    untreated = "false" if treatment else "true"
+    return bool(_removed_state_pattern(flag_key, untreated).search(text)) and not _HEDGES.search(text)
+
+
+def _changed_rows(before: str, after: str) -> tuple[set[int], set[int]]:
+    """The 0-based lines of ``after`` the run wrote, and the lines of
+    ``after`` that lines the run deleted sat directly above."""
+    matcher = difflib.SequenceMatcher(
+        None, before.split("\n"), after.split("\n"), autojunk=False
+    )
+    written: set[int] = set()
+    below_deletion: set[int] = set()
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if j1 == j2:
+            below_deletion.add(j1)
+        written.update(range(j1, j2))
+    return written, below_deletion
+
+
+def flag_state_comments(
+    before: str, after: str, grammar: str, flag_key: str, treatment: bool
+) -> list[StateComment]:
+    """The comments of ``after`` that sit on, or directly above, a line the
+    run changed and describe a flag's state without naming ``flag_key``.
+
+    Such a comment sat beside the read the run folded, so "while the flag is
+    off" is likely about THIS flag even though it never says which. That is a
+    guess from the wording, which is why each is only reported: a comment
+    naming the key is decided by :func:`rewrite` and the kept-comment report
+    instead, and is left out here. A run of adjacent comments is one comment,
+    so a phrase wrapped onto its next line is still found.
+    """
+    if before == after or not FLAG_STATE.search(after):
+        return []
+    data = after.encode("utf-8")
+    try:
+        root = _parse(data, grammar)
+    except Exception:  # noqa: BLE001 - report only; an unparsable file reports nothing
+        return []
+    names = names_pattern(flag_key)
+    written, below_deletion = _changed_rows(before, after)
+    starts = _line_starts(data)
+    ends = [*(s for s in starts[1:]), len(data)]
+
+    def row_of(offset: int) -> int:
+        lo, hi = 0, len(starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    # Group adjacent own-line comments, as :func:`plan` does; a comment after
+    # code is a group of its own.
+    groups: list[list[Node]] = []
+    for node in _comments(root):
+        first = row_of(node.start_byte)
+        own_line = not data[starts[first] : node.start_byte].strip()
+        previous = groups[-1][-1] if groups else None
+        if (
+            previous is not None
+            and own_line
+            and row_of(previous.end_byte) + 1 == first
+            and not data[previous.end_byte : node.start_byte].strip()
+            and not data[starts[row_of(previous.start_byte)] : previous.start_byte].strip()
+        ):
+            groups[-1].append(node)
+        else:
+            groups.append([node])
+
+    found: list[StateComment] = []
+    for group in groups:
+        first, last = row_of(group[0].start_byte), row_of(group[-1].end_byte)
+        rows = range(first, last + 1)
+        near = any(r in written for r in rows) or last + 1 in written or last + 1 in below_deletion
+        if not near:
+            continue
+        # Each row's comment text: from the comment's start on its first row.
+        texts: list[str] = []
+        for row in rows:
+            begin = max(starts[row], group[0].start_byte) if row == first else starts[row]
+            texts.append(data[begin : ends[row]].decode("utf-8", "replace").strip())
+        if any(names.search(t.encode("utf-8")) for t in texts):
+            continue
+        contents = [_content(t.encode("utf-8")).decode("utf-8", "replace") for t in texts]
+        joined = ""
+        offsets: list[int] = []
+        for content in contents:
+            offsets.append(len(joined))
+            joined += content + " "
+        match = FLAG_STATE.search(joined)
+        if match is None:
+            continue
+        at = max(i for i, offset in enumerate(offsets) if offset <= match.start())
+        found.append(
+            StateComment(first + at + 1, texts[at], describes_removed(joined, flag_key, treatment))
+        )
+    return found

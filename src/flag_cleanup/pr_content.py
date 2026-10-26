@@ -18,6 +18,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+from flag_cleanup import stale_comments
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
 from flag_cleanup.cross_file_keys import (
@@ -30,6 +31,7 @@ from flag_cleanup.cross_file_keys import (
 )
 from flag_cleanup.mock_stubs import PINNED_PARAMETER, SIBLING_TEST, TEST, TEST_PHASE
 from flag_cleanup.residue import Residue
+from flag_cleanup.ts_tests import RENAMED_TEST
 from flag_cleanup.urls import without_userinfo
 
 if TYPE_CHECKING:
@@ -173,8 +175,11 @@ REPORTED_BINDING_KINDS = frozenset(
         "kept argument local",
         "unread binding",
         "emptied override",
-        "dropped override argument",
+        "dropped default argument",
         "removed comment",
+        stale_comments.REMOVED_BRANCH_KIND,
+        stale_comments.FLAG_STATE_KIND,
+        RENAMED_TEST,
     }
 )
 
@@ -528,16 +533,18 @@ def _emptied_override_lines(emptied: list[tuple[str, str]]) -> list[str]:
 
 
 def _dropped_argument_lines(dropped: list[tuple[str, str]]) -> list[str]:
-    """The callout naming each call an emptied override was left out of, or nothing."""
+    """The callout naming each call or element a literal equal to the
+    callee's default was left out of, or nothing."""
     if not dropped:
         return []
     count = len(dropped)
     noun = "argument was" if count == 1 else "arguments were"
     return [
-        f"> **{count} emptied override {noun} left out.** Removing this flag's "
-        f"entry left {'it' if count == 1 else 'each'} as `{{}}`, passed last to "
-        "a function in the same file whose parameter defaults to `{}`, so the "
-        "call passes the same value without it:",
+        f"> **{count} {noun} left out as the callee's default.** Removing this "
+        f"flag left {'it' if count == 1 else 'each'} equal to the value the "
+        "function or component it was passed to already defaults that "
+        "parameter or prop to: an override this removal emptied to `{}`, or a "
+        "value it folded. The call passes the same value without it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in dropped[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -559,6 +566,94 @@ def _removed_comment_lines(removed: list[tuple[str, str]]) -> list[str]:
         "and listed below:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _state_rows(bindings, kind: str) -> list[tuple[str, int, str]]:
+    """``(path, line, text)`` for each ``kind`` row, whose text is ``"<line>: <comment>"``."""
+    rows = []
+    for path, row_kind, text in bindings:
+        if row_kind == kind:
+            line, _, comment = text.partition(": ")
+            rows.append((path, int(line) if line.isdigit() else 0, comment))
+    return rows
+
+
+def _flag_state_comment_lines(
+    removed: list[tuple[str, int, str]], near: list[tuple[str, int, str]], deleted: str
+) -> list[str]:
+    """The callouts naming each comment that describes the flag's state:
+    first those describing the branch this pull request deleted, then those
+    beside its changes that describe some flag's state without naming this
+    one. Nothing, when there are none. Comments are never edited for this."""
+
+    def items(rows: list[tuple[str, int, str]]) -> list[str]:
+        return [
+            *[f"> - {_md_code(path)} line {line}: {_md_code(text)}" for path, line, text in rows[:20]],
+            *([f"> - ...and {len(rows) - 20} more"] if len(rows) > 20 else []),
+        ]
+
+    lines: list[str] = []
+    if removed:
+        count = len(removed)
+        noun = "comment describes" if count == 1 else "comments describe"
+        lines += [
+            f"> **ℹ️ {count} {noun} behaviour this pull request removed.** "
+            f"{'It describes' if count == 1 else 'Each describes'} the flag as "
+            f"**{deleted}**, and the {deleted} branch is the one this pull request "
+            "deleted, so the comment is now false rather than just out of date. "
+            "Comments are never edited by this tool; reword or delete "
+            f"{'it' if count == 1 else 'each'}:",
+            ">",
+            *items(removed),
+            "",
+        ]
+    if near:
+        count = len(near)
+        noun = "comment" if count == 1 else "comments"
+        verb = "describes" if count == 1 else "describe"
+        lines += [
+            f"> **ℹ️ {count} {noun} next to code this pull request changed "
+            f"{verb} a flag's state without naming this flag** (\"while the "
+            "flag is on\"). That it is about this flag is a guess from the "
+            "wording, so nothing was changed; check that "
+            f"{'it still reads' if count == 1 else 'each still reads'} true:",
+            ">",
+            *items(near),
+            "",
+        ]
+    return lines
+
+
+def _renamed_tests(bindings: tuple[tuple[str, str, str], ...]) -> list[tuple[str, str, str]]:
+    """``(path, old title, new title)`` for each test title the run rewrote."""
+    return [
+        (path, *text.split("\n", 1))
+        for path, kind, text in bindings
+        if kind == RENAMED_TEST and "\n" in text
+    ]
+
+
+def _renamed_test_lines(renamed: list[tuple[str, str, str]], kept: str) -> list[str]:
+    """The callout naming each test title rewritten because it named the
+    flag's KEPT state, old and new, or nothing."""
+    if not renamed:
+        return []
+    count = len(renamed)
+    noun = "test was" if count == 1 else "tests were"
+    return [
+        f"> **{count} {noun} renamed.** {'Its' if count == 1 else 'Each'} title "
+        f"said it tests this flag's **{kept}** branch, the one this pull request "
+        "keeps, so once the flag is gone that condition no longer exists. The "
+        "condition was dropped from the title and the rest was kept. The edit "
+        "was made from the title alone, so check each one:",
+        ">",
+        *[
+            f"> - {_md_code(path)}: {_md_code(old)} → {_md_code(new)}"
+            for path, old, new in renamed[:20]
+        ],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -642,7 +737,7 @@ def pr_body(
     :func:`_unread_member_lines`), its ``"unread constructor parameter"``
     entries, a plain parameter the family's run left unused (see
     :func:`_unread_constructor_parameter_lines`), and the family's ``"unread binding"``,
-    ``"emptied override"`` and ``"dropped override argument"`` entries (see
+    ``"emptied override"`` and ``"dropped default argument"`` entries (see
     :func:`_unread_binding_lines`, :func:`_emptied_override_lines` and
     :func:`_dropped_argument_lines`). :data:`REPORTED_BINDING_KINDS` is the set.
 
@@ -696,6 +791,7 @@ def pr_body(
     """
     served = "true" if candidate.treatment else "false"
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
+    renamed_tests = _renamed_tests(bindings)
     flag_url = (
         f"{_without_userinfo(config.api_url)}/api/v1/orgs/{quote(config.org, safe='')}"
         f"/projects/{quote(config.project, safe='')}"
@@ -777,12 +873,27 @@ def pr_body(
             ),
             "",
         ]
+    # Comments describing the flag's state, those describing the deleted
+    # branch first: a kept comment naming the flag moves up here when it
+    # does, and is not listed again below.
+    removed_branch = [
+        row
+        for row in residue.comment_lines
+        if stale_comments.describes_removed(row[2], candidate.key, candidate.treatment)
+    ]
+    lines += _flag_state_comment_lines(
+        removed_branch + _state_rows(bindings, stale_comments.REMOVED_BRANCH_KIND),
+        _state_rows(bindings, stale_comments.FLAG_STATE_KIND),
+        deleted,
+    )
     if residue.comment_only:
         shown = residue.comment_only[:20]
         # Each file with the lines naming the flag, so the reviewer reads the
         # sentence to fix here rather than searching for it.
         named: dict[str, list[tuple[int, str]]] = {}
         for path, line, text in residue.comment_lines:
+            if (path, line, text) in removed_branch:
+                continue
             named.setdefault(path, []).append((line, text))
         lines += [
             f"> **ℹ️ {len(residue.comment_only)} file(s) mention this flag only "
@@ -927,7 +1038,7 @@ def pr_body(
         (path, text) for path, kind, text in bindings if kind == "emptied override"
     ]
     dropped_arguments = [
-        (path, text) for path, kind, text in bindings if kind == "dropped override argument"
+        (path, text) for path, kind, text in bindings if kind == "dropped default argument"
     ]
     removed_comments = [
         (path, text) for path, kind, text in bindings if kind == "removed comment"
@@ -1217,6 +1328,7 @@ def pr_body(
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+    lines += _renamed_test_lines(renamed_tests, kept)
     if wrapper_findings:
         lines += _wrapper_lines(wrapper_findings)
     wrappers = without_inlined(wrappers, wrapper_findings)
@@ -1572,6 +1684,31 @@ def note_removed_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:
             "%d comment(s) naming only this flag removed: %s",
             len(removed),
             "; ".join(f"{path}: {text}" for path, text in removed),
+        )
+
+
+def note_flag_state_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the comments beside this run's changes that describe a flag's
+    state without naming it, those describing the deleted branch first; the
+    dry run's only outlet. Nothing was edited for them."""
+    for kind, what in (
+        (stale_comments.REMOVED_BRANCH_KIND, "describe behaviour this run removed"),
+        (stale_comments.FLAG_STATE_KIND, "beside the changes describe a flag's state"),
+    ):
+        rows = [f"{path}:{text}" for path, row_kind, text in bindings if row_kind == kind]
+        if rows:
+            logger.info("%d comment(s) %s (kept): %s", len(rows), what, "; ".join(rows))
+
+
+def note_renamed_tests(bindings: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the test titles this run rewrote; the dry run's only outlet besides
+    the diff."""
+    renamed = _renamed_tests(bindings)
+    if renamed:
+        logger.info(
+            "%d test title(s) naming this flag's kept branch rewritten: %s",
+            len(renamed),
+            "; ".join(f"{path}: {_one_line(old)} -> {_one_line(new)}" for path, old, new in renamed),
         )
 
 

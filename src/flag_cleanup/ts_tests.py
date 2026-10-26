@@ -184,6 +184,113 @@ def delete_tests(source: str, language: str, tests: list[PinnedTest]) -> tuple[s
     return data.decode("utf-8"), deleted
 
 
+#: The ``bindings`` kind of a row naming a title :func:`rename_kept_titles`
+#: rewrote. Its text is the old title and the new one, separated by a newline,
+#: which no title it rewrites contains.
+RENAMED_TEST = "renamed test"
+
+
+def rename_kept_titles(
+    source: str, language: str, flag_key: str, kept: str
+) -> tuple[str, list[tuple[str, str]]]:
+    """``source`` with the flag's condition dropped from every title naming the
+    KEPT branch, and ``(old, new)`` for each title it rewrote.
+
+    ``kept`` is the literal of the branch the fold keeps. A test titled
+    ``renders the checklist when the my-flag flag is on`` survives a removal
+    that keeps the on branch, and its title then describes a condition that no
+    longer exists. It becomes ``renders the checklist``; ``… when the my-flag
+    flag is on and a project exists`` becomes ``… when a project exists``.
+
+    The bar is set above the deletion's, because this edits text a person
+    wrote rather than reading it: the title must spell the KEY, never just
+    "the flag"; the clause must be one of a fixed set of shapes (see
+    :func:`_kept_clauses`); a hedged title is left alone; and the result must
+    name neither the key nor the removed state, and must not be empty. Any
+    other title is left exactly as it was, and reported as it was before. A
+    title is only a string, so a rewrite cannot break the build, and each one
+    is named in the pull request.
+    """
+    data = source.encode("utf-8")
+    root = _parse(source, language)
+    clauses = _kept_clauses(flag_key, kept)
+    key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", re.IGNORECASE)
+    removed = _removed_state_pattern(flag_key, "true" if kept == "false" else "false")
+    edits: list[tuple[int, int, bytes]] = []
+    renamed: list[tuple[str, str]] = []
+    for node, _callee, title in _titled_tests(root, data):
+        arguments = node.child_by_field_name("arguments")
+        if arguments is None or not hands_callback(arguments):
+            continue
+        literal = arguments.named_children[0]
+        raw = data[literal.start_byte + 1 : literal.end_byte - 1].decode("utf-8")
+        if raw != title or "\n" in title or not key.search(title) or _HEDGES.search(title):
+            continue
+        new = _drop_kept_clause(title, clauses)
+        if (
+            new is None
+            or not new.strip()
+            or key.search(new)
+            or removed.search(new)
+            # Never cut through an escape sequence.
+            or new.count("\\") != title.count("\\")
+        ):
+            continue
+        edits.append((literal.start_byte + 1, literal.end_byte - 1, new.encode("utf-8")))
+        renamed.append((title, new))
+    for start, end, text in sorted(edits, reverse=True):
+        data = data[:start] + text + data[end:]
+    return data.decode("utf-8"), renamed
+
+
+def _kept_clauses(flag_key: str, kept: str) -> list[tuple[re.Pattern[str], str]]:
+    """The fixed set of clause shapes :func:`rename_kept_titles` drops, each
+    with its replacement, tried in order.
+
+    ``REF`` is the key, optionally with ``the`` and a ``flag``/``feature``/
+    ``toggle``/``gate`` noun on either side; ``STATE`` a word for the kept
+    branch. Every shape is anchored on what follows the state word — the end
+    of the title, ``and``, or a comma — so "is on Free" is never read as a
+    state.
+    """
+    key = rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])"
+    noun = r"(?:flag|feature|toggle|gate)"
+    ref = rf"(?:the\s+)?(?:{noun}\s+)?{key}(?:\s+{noun})?"
+    state = rf"(?:{_STATES[kept]})"
+    conj = r"(?:when|while|if|once)"
+    # `when REF is STATE`, or `with REF STATE`.
+    clause = rf"(?:{conj}\s+{ref}\s+(?:is|are)\s+{state}|with\s+{ref}\s+{state})"
+    default = r"(?:\s*\((?:by\s+)?default\))?"
+    flags = re.IGNORECASE
+    return [
+        # `renders X when REF is STATE` → `renders X`.
+        (re.compile(rf",?\s+{clause}{default}(?=[\s.]*$)", flags), ""),
+        # `when REF is STATE and Y` → `when Y`.
+        (
+            re.compile(
+                rf"\b({conj}|with)\s+(?:{ref}\s+(?:is|are)\s+{state}|{ref}\s+{state})\s+and\s+",
+                flags,
+            ),
+            r"\1 ",
+        ),
+        # `when Y and REF is STATE` → `when Y`.
+        (re.compile(rf"\s+and\s+{ref}\s+(?:is|are)\s+{state}{default}(?=\s*(?:,|$))", flags), ""),
+        # `when REF is STATE, X` → `X`.
+        (re.compile(rf"^\s*{clause}{default}\s*,\s*", flags), ""),
+    ]
+
+
+def _drop_kept_clause(
+    title: str, clauses: list[tuple[re.Pattern[str], str]]
+) -> str | None:
+    """``title`` with the first matching clause shape dropped once, or ``None``."""
+    for pattern, replacement in clauses:
+        new, count = pattern.subn(replacement, title, count=1)
+        if count:
+            return new
+    return None
+
+
 def is_test_file(source: str, language: str) -> bool:
     """Whether ``source`` declares a test: an ``it``/``test``/``describe`` with a title."""
     return bool(_titled_tests(_parse(source, language), source.encode("utf-8")))

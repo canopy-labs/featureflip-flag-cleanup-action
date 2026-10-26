@@ -48,12 +48,14 @@ from flag_cleanup import (
     orchestrate,
     pr_content,
     source_index,
+    stale_comments,
 )
 from flag_cleanup.client import Candidate, FeatureflipClient
 from flag_cleanup.config import Config, STALENESS_VALUES
 from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
 from flag_cleanup.residue import Residue, classify as classify_residue
+from flag_cleanup.ts_tests import RENAMED_TEST
 
 logger = logging.getLogger(__name__)
 
@@ -876,17 +878,24 @@ def _dry_run_caveats(
     unread_ctor = sum(1 for _, kind, _ in bindings if kind == "unread constructor parameter")
     unread_bindings = sum(1 for _, kind, _ in bindings if kind == "unread binding")
     emptied = sum(1 for _, kind, _ in bindings if kind == "emptied override")
-    left_out = sum(1 for _, kind, _ in bindings if kind == "dropped override argument")
+    left_out = sum(1 for _, kind, _ in bindings if kind == "dropped default argument")
     dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
     removed_ctor = sum(1 for _, kind, _ in bindings if kind == "removed parameter")
     removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
     removed_comments = sum(1 for _, kind, _ in bindings if kind == "removed comment")
+    renamed_tests = sum(1 for _, kind, _ in bindings if kind == RENAMED_TEST)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
+    state_comments = sum(
+        1 for _, kind, _ in bindings
+        if kind in (stale_comments.REMOVED_BRANCH_KIND, stale_comments.FLAG_STATE_KIND)
+    )
     cleaned = (
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
         - left_out
         - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments
+        - state_comments
+        - renamed_tests
     )
     if cleaned:
         notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
@@ -901,6 +910,15 @@ def _dry_run_caveats(
         notes.append(f"{removed_members} private field(s) would be removed")
     if removed_comments:
         notes.append(f"{removed_comments} comment(s) naming only this flag would be removed")
+    if state_comments:
+        notes.append(
+            f"{state_comments} comment(s) beside the changes would describe a flag's state "
+            "(reported, not edited)"
+        )
+    if renamed_tests:
+        notes.append(
+            f"{renamed_tests} test title(s) naming this flag's kept branch would be rewritten"
+        )
     if kept_locals:
         notes.append(
             f"{kept_locals} local(s) would be left unread after their argument was removed"
@@ -929,7 +947,7 @@ def _dry_run_caveats(
             f"{unread_bindings} binding(s) would be left unread by a removed override"
         )
     if left_out:
-        notes.append(f"{left_out} emptied override argument(s) would be left out")
+        notes.append(f"{left_out} argument(s) equal to the callee's default would be left out")
     if emptied:
         notes.append(f"{emptied} override literal(s) would be left empty")
     if entries:

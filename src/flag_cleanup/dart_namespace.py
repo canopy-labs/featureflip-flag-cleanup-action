@@ -38,7 +38,10 @@ smaller:
   invoking a member spell nothing, an operator (``a + b``) and ``call``
   (``x()``), so an extension declaring either refuses;
 * a ``dart:`` library, another package, a conditional URI and anything
-  outside the checkout refuse, because the declarations are not in hand;
+  outside the checkout refuse, because the declarations are not in hand.
+  The one exception is the Featureflip Dart SDK itself (see
+  :func:`audited_sdk`), whose namespace was read off every published
+  version and is carried here as a table;
 * an ``export`` recurses, honouring ``show`` and ``hide`` for top-level
   names only, and inherits the refusal of anything it cannot resolve.
   ``part`` files are read as part of the library they belong to.
@@ -89,6 +92,39 @@ _VARIABLE_LISTS = {
 
 _PUBSPEC_NAME = re.compile(r"^name:\s*['\"]?([A-Za-z_]\w*)['\"]?\s*$", re.MULTILINE)
 _QUOTED = re.compile(r"""^(['"])([^'"$\\]*)\1$""")
+
+#: The pub.dev package of the Featureflip Dart SDK.
+AUDITED_SDK_PACKAGE = "featureflip"
+
+#: Every public library of that package, mapped to every top-level name it
+#: exports in ANY version of :data:`AUDITED_SDK_VERSIONS`. Read off each
+#: version's published archive with :func:`library_names`, exports followed:
+#: no version exports another package or a ``dart:`` library, and none
+#: declares an extension or an extension type anywhere under ``lib/``, so no
+#: call can depend on the import without spelling one of these names. A
+#: union across versions is a superset of any one version's namespace, which
+#: is the safe direction (see the module docstring).
+AUDITED_SDK: dict[str, frozenset[str]] = {
+    "package:featureflip/featureflip.dart": frozenset({
+        "EvaluateResponse", "EvaluationEvent", "EvaluationInspector",
+        "FeatureflipClient", "FeatureflipConfig", "FeatureflipProvider",
+        "FlagValue", "SdkEvent",
+    }),
+}
+
+#: The published versions that table was read from. A later release may
+#: export a name the table lacks, so the table applies only to a package
+#: whose ``pubspec.lock`` resolves the SDK to one of these.
+AUDITED_SDK_VERSIONS = frozenset({
+    "0.1.0", "1.0.3", "1.0.4", "2.0.0", "2.1.0", "2.2.0", "2.3.0", "2.4.0",
+    "2.4.1", "2.5.0", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.7.0", "2.8.0",
+})
+
+#: The hosts a lock entry may name for the SDK: pub.dev and its old name. Any
+#: other server may publish a different package under the same name.
+_PUB_DEV = frozenset({"https://pub.dev", "https://pub.dartlang.org"})
+_MENTIONS_SDK = re.compile(rf"\b{AUDITED_SDK_PACKAGE}\b")
+_LOCK_FIELD = re.compile(r"^\s+(source|version|url):\s*['\"]?([^'\"\s]*)['\"]?\s*$")
 
 
 @dataclass(frozen=True)
@@ -146,11 +182,104 @@ def resolver(importer: str, root: str) -> Callable[[str], Namespace | None]:
         if uri not in cache:
             target = locate(uri, importer_path, root_path)
             cache[uri] = (
-                None if target is None else _library_names(target, root_path, set(), 0)
+                audited_sdk(uri, importer_path, root_path)
+                if target is None
+                else _library_names(target, root_path, set(), 0)
             )
         return cache[uri]
 
     return resolve
+
+
+def audited_sdk(uri: str, importer: Path, root: Path) -> Namespace | None:
+    """What an import of a Featureflip Dart SDK library brings into a file at
+    ``importer``, from :data:`AUDITED_SDK`; ``None`` when ``uri`` is not one
+    of its libraries, or the name ``featureflip`` may not mean the audited
+    package there.
+
+    It does when the importer's package (the nearest ``pubspec.yaml``) is not
+    itself named ``featureflip``, overrides nothing of that name (in
+    ``dependency_overrides`` or a ``pubspec_overrides.yaml``), is not a pub
+    workspace member (whose lock lives elsewhere), and has a
+    ``pubspec.lock`` beside it that resolves ``featureflip`` to an audited
+    version hosted on pub.dev. A path, git or other-server source, a version
+    the table was not read from, or a lock that cannot be read leaves the
+    import unknown, as any other package's is.
+
+    The namespace has no extension members: no audited version declares an
+    extension.
+    """
+    names = AUDITED_SDK.get(uri)
+    if names is None:
+        return None
+    home = package_root(importer, root)
+    if home is None or package_name(home) == AUDITED_SDK_PACKAGE:
+        return None
+    pubspec = _read_text(home / "pubspec.yaml", root)
+    lock = _read_text(home / "pubspec.lock", root)
+    if pubspec is None or lock is None or _substitutes_sdk(pubspec):
+        return None
+    overrides = home / "pubspec_overrides.yaml"
+    if overrides.exists() or overrides.is_symlink():
+        text = _read_text(overrides, root)
+        if text is None or _MENTIONS_SDK.search(text):
+            return None
+    if _locked_sdk_version(lock) not in AUDITED_SDK_VERSIONS:
+        return None
+    return Namespace(names, frozenset())
+
+
+def _read_text(path: Path, root: Path) -> str | None:
+    """``path``'s text, if it is a file inside ``root`` (a symlink out of the
+    checkout is not followed)."""
+    try:
+        if not path.is_file() or not path.resolve().is_relative_to(root):
+            return None
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _substitutes_sdk(pubspec: str) -> bool:
+    """Whether ``pubspec`` may resolve ``featureflip`` other than through its
+    lock: it is that package however its ``name:`` is written, a
+    ``dependency_overrides`` section mentions it, or it is a
+    ``resolution: workspace`` member (its lock is the workspace's)."""
+    section = None
+    for line in pubspec.splitlines():
+        if line[:1] not in ("", " ", "\t", "#"):
+            section = line
+            key = line.split(":", 1)[0].strip(" '\"")
+            if key == "resolution" and "workspace" in line:
+                return True
+            if key == "name" and _MENTIONS_SDK.search(line):
+                return True
+        if section is not None and "dependency_overrides" in section and _MENTIONS_SDK.search(line):
+            return True
+    return False
+
+
+def _locked_sdk_version(lock: str) -> str | None:
+    """The version ``lock`` resolves ``featureflip`` to, when it is the one
+    entry of that name and is hosted on pub.dev; otherwise ``None``."""
+    lines = lock.splitlines()
+    if "packages:" not in lines:
+        return None
+    entries = [i for i, line in enumerate(lines) if line.rstrip() == f"  {AUDITED_SDK_PACKAGE}:"]
+    if len(entries) != 1 or entries[0] < lines.index("packages:"):
+        return None
+    fields: dict[str, str] = {}
+    for line in lines[entries[0] + 1 :]:
+        if line.strip() and not line.startswith("   "):
+            break
+        match = _LOCK_FIELD.match(line)
+        if match is not None:
+            if match.group(1) in fields:
+                return None
+            fields[match.group(1)] = match.group(2)
+    if fields.get("source") != "hosted" or fields.get("url") not in _PUB_DEV:
+        return None
+    return fields.get("version")
 
 
 def locate(uri: str, importer: Path, root: Path) -> Path | None:

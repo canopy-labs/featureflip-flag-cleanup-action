@@ -49,6 +49,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
+from flag_cleanup import ts_list_join
 from flag_cleanup.ts_syntax import _parse, _walk
 
 #: Nodes whose parameters bind names, as the TypeScript grammars spell them.
@@ -128,7 +129,11 @@ def pinned_calls(source: str, language: str, flag_key: str) -> dict[tuple[int, i
 
 
 def strip_parameter_pins(
-    source: str, language: str, flag_key: str, pins: list[ParameterPin]
+    source: str,
+    language: str,
+    flag_key: str,
+    pins: list[ParameterPin],
+    width: int | None = None,
 ) -> tuple[str, list[str]]:
     """``source`` without each pin's entries, parameter and arguments.
 
@@ -137,6 +142,9 @@ def strip_parameter_pins(
     prong's to delete, and only its parameter and arguments are then left
     here. Each pin is re-proven against ``source`` and skipped whole when it
     no longer holds. Returns the entries this deleted, as written.
+
+    A parameter or argument list a deletion leaves with one element is put
+    back on one line when it fits ``width``; see :mod:`flag_cleanup.ts_list_join`.
     """
     entries: list[str] = []
     for pin in pins:
@@ -145,11 +153,12 @@ def strip_parameter_pins(
         edits = _edits(root, data, flag_key, pin)
         if not edits:
             continue
-        for start, end, entry in sorted(edits, reverse=True):
+        for start, end, entry in edits:
             if entry:
                 entries.append(_entry_text(data, start, end))
-            data = data[:start] + data[end:]
-        source = data.decode("utf-8")
+        source = ts_list_join.splice(
+            source, [(start, end) for start, end, _ in edits], language, width
+        )
     return source, sorted(entries)
 
 

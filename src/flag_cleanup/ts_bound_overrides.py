@@ -36,9 +36,10 @@ binding is left unread, which an unused-variable lint rejects. A ``const`` is
 then removed by the stranded-binding pass like any other local. A parameter is
 removed by :func:`drop_unread_parameters` only where every call is in sight and
 none passes it; anywhere else it is REPORTED, because removing a parameter
-changes every call that passes it. :func:`drop_emptied_arguments` removes a
-literal the deletions left as ``{}`` where it is an argument the callee would
-default to ``{}`` anyway, and :func:`emptied_overrides` reports the rest.
+changes every call that passes it. A literal the deletions left as ``{}``
+goes where the callee would default to ``{}`` anyway
+(:mod:`~flag_cleanup.ts_default_arguments`), and :func:`emptied_overrides`
+reports the rest.
 
 The pass runs on the ENGINE's output, in the window every text pass shares, so
 Gate 1 judges its edits and the all-or-nothing rollback covers them.
@@ -52,6 +53,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
+from flag_cleanup import ts_list_join
 from flag_cleanup.ts_syntax import _parse, _walk
 
 #: Nodes whose parameters can bind a name.
@@ -381,8 +383,9 @@ def emptied_overrides(before: str, after: str, language: str, flag_key: str) -> 
     Taking the entry is right; what is left may not be. An empty override
     literal is harmless, but the prop or argument carrying it may now be
     pointless, and whether it can go depends on a type declared elsewhere — so
-    it is reported, never edited, unless :func:`drop_emptied_arguments` can
-    remove it. See :func:`_emptied_lines`.
+    it is reported, never edited, unless
+    :mod:`~flag_cleanup.ts_default_arguments` can remove it. See
+    :func:`_emptied_lines`.
     """
     lines = after.splitlines()
     return tuple(lines[n].strip() for n, _ in _emptied_lines(before, after, language, flag_key))
@@ -444,160 +447,6 @@ def _emptied_lines(
     return found
 
 
-def drop_emptied_arguments(
-    before: str, after: str, language: str, flag_key: str
-) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """``after`` without each emptied override passed where the callee would
-    default to ``{}`` anyway, the call each one was dropped from, and the line
-    :func:`emptied_overrides` gives each one in ``after``.
-
-    ``createWrapper(['/login'], {})`` becomes ``createWrapper(['/login'])``
-    when ``createWrapper``'s second parameter is ``flags = {}``: a default is
-    evaluated afresh on each call, so leaving the argument out passes the
-    same thing as passing ``{}``. Only literals :func:`_emptied_lines` names
-    on a CERTAIN line are candidates, so an empty object the customer wrote
-    stays. One goes only when all of this holds:
-
-    * it is the LAST argument, after no spread, in a call with no comment
-      among its arguments, whose callee is a plain name;
-    * the name is declared once, at the top level of this file, as a
-      ``function`` or a ``const`` bound to a function, and every other
-      occurrence of it is the callee of a call, so it is never re-bound,
-      shadowed or handed on;
-    * the parameter in that position defaults to an empty object literal,
-      is not a rest parameter, and no ``this`` parameter shifts positions;
-    * the function has no type parameters, which a passed ``{}`` can infer
-      and a default cannot (``g<T = number>(o: T | {} = {}): T``);
-    * the function never names ``arguments``, which would tell the two
-      calls apart;
-    * it is the only empty object starting on its line, since emptied
-      literals are known by line.
-    """
-    rows = {n for n, certain in _emptied_lines(before, after, language, flag_key) if certain}
-    if not rows:
-        return after, (), ()
-    data = after.encode("utf-8")
-    root = _parse(after, language)
-    empty = [n for n in _walk(root) if n.type == "object" and not n.named_children]
-    per_row = Counter(n.start_point[0] for n in empty)
-    spans: list[tuple[int, int, str]] = []
-    for node in empty:
-        if node.start_point[0] not in rows or per_row[node.start_point[0]] != 1:
-            continue
-        span = _omittable(node, root, data)
-        if span is not None:
-            call = node.parent.parent
-            line = after.splitlines()[node.start_point[0]].strip()
-            spans.append((*span, _one_line(_text(call, data)), line))
-    if not spans:
-        return after, (), ()
-    for start, end, _call, _line in sorted(spans, reverse=True):
-        data = data[:start] + data[end:]
-    spans.sort()
-    return (
-        data.decode("utf-8"),
-        tuple(call for _s, _e, call, _l in spans),
-        tuple(line for _s, _e, _c, line in spans),
-    )
-
-
-def _omittable(literal: Node, root: Node, data: bytes) -> tuple[int, int] | None:
-    """The bytes leaving out the argument ``literal`` takes, or ``None``."""
-    arguments = literal.parent
-    if arguments is None or arguments.type != "arguments":
-        return None
-    passed = arguments.named_children
-    if (
-        passed[-1].id != literal.id
-        or any(c.type in ("comment", "spread_element") for c in passed)
-    ):
-        return None
-    call = arguments.parent
-    callee = call.child_by_field_name("function") if call.type == "call_expression" else None
-    if callee is None or callee.type != "identifier":
-        return None
-    function = _sole_function(_text(callee, data), root, data)
-    parameters = function.child_by_field_name("parameters") if function is not None else None
-    if parameters is None or function.child_by_field_name("type_parameters") is not None:
-        return None
-    members = [c for c in parameters.named_children if c.type != "comment"]
-    position = len(passed) - 1
-    if position >= len(members) or any(
-        (pattern := m.child_by_field_name("pattern")) is not None and pattern.type == "this"
-        for m in members
-    ):
-        return None
-    parameter = members[position]
-    pattern = parameter.child_by_field_name("pattern")
-    default = parameter.child_by_field_name("value")
-    if (
-        parameter.type not in _PARAMETERS
-        or pattern is None
-        or pattern.type == "rest_pattern"
-        or default is None
-        or default.type != "object"
-        or default.named_children
-    ):
-        return None
-    if any(n.type == "identifier" and _text(n, data) == "arguments" for n in _walk(function)):
-        return None
-    if position == 0:
-        # Everything between the parentheses, so a trailing `,` goes too.
-        return arguments.start_byte + 1, arguments.end_byte - 1
-    return passed[position - 1].end_byte, literal.end_byte
-
-
-def _sole_function(name: str, root: Node, data: bytes) -> Node | None:
-    """The top-level function ``name`` binds, when every other occurrence of
-    the name in the file is the callee of a call."""
-    found = None
-    for leaf in _walk(root):
-        if leaf.type not in _NAME_LEAVES or _text(leaf, data) != name:
-            continue
-        function = _top_level_function(leaf)
-        if function is not None and found is None:
-            found = function
-            continue
-        call = leaf.parent
-        if (
-            function is not None
-            or call is None
-            or call.type != "call_expression"
-            or call.child_by_field_name("function").id != leaf.id
-        ):
-            return None
-    return found
-
-
-def _top_level_function(leaf: Node) -> Node | None:
-    """The function ``leaf`` names, when it is the name of a top-level
-    ``function`` declaration or of a top-level ``const`` bound to a function."""
-    holder = leaf.parent
-    if holder is None or holder.child_by_field_name("name") is None:
-        return None
-    if holder.child_by_field_name("name").id != leaf.id:
-        return None
-    if holder.type == "function_declaration":
-        function = statement = holder
-    elif holder.type == "variable_declarator":
-        function = holder.child_by_field_name("value")
-        statement = holder.parent
-        if (
-            function is None
-            or function.type not in ("arrow_function", "function_expression", "function")
-            or statement is None
-            or statement.type != "lexical_declaration"
-            or not statement.text.startswith(b"const")
-        ):
-            return None
-    else:
-        return None
-    scope = statement.parent
-    if scope is not None and scope.type == "export_statement":
-        scope = scope.parent
-    return function if scope is not None and scope.type == "program" else None
-
-
 def _object_lines(
     source: str, language: str, flag_key: str
 ) -> tuple[list[str], list[int], list[int]]:
@@ -618,7 +467,10 @@ def _object_lines(
 
 
 def drop_unread_parameters(
-    source: str, language: str, keys: frozenset[tuple[str, str]]
+    source: str,
+    language: str,
+    keys: frozenset[tuple[str, str]],
+    width: int | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """``source`` without each parameter named in ``labels`` that no call can
     still pass, and the label of each one it removed.
@@ -642,6 +494,9 @@ def drop_unread_parameters(
       tagged template, or the function handed on as a value, refuses;
     * nothing in the function still names the binding, and no comment sits in
       the bytes the deletion takes.
+
+    A parameter list the deletion leaves with one element is put back on one
+    line when it fits ``width``; see :mod:`flag_cleanup.ts_list_join`.
     """
     if not keys:
         return source, ()
@@ -663,9 +518,8 @@ def drop_unread_parameters(
             dropped.append((parameter.start_byte, label))
     if not spans:
         return source, ()
-    for start, end in sorted(spans, reverse=True):
-        data = data[:start] + data[end:]
-    return data.decode("utf-8"), tuple(label for _, label in sorted(dropped))
+    content = ts_list_join.splice(source, spans, language, width)
+    return content, tuple(label for _, label in sorted(dropped))
 
 
 def _droppable(parameter: Node, root: Node, data: bytes) -> tuple[int, int] | None:

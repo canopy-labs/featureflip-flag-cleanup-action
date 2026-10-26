@@ -122,8 +122,10 @@ from flag_cleanup.pr_content import (
     without_inlined,
     note_deleted_tests,
     note_kept,
+    note_flag_state_comments,
     note_removed_comments,
     note_removed_entries,
+    note_renamed_tests,
     note_rewritten_build_output,
     pr_body,
     pr_title,
@@ -749,6 +751,8 @@ def _process_candidate(
 
     _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
     note_removed_comments(_bindings)
+    note_flag_state_comments(_bindings)
+    note_renamed_tests(_bindings)
     note_wrapper_findings(wrapper_findings)
     note_family_doubles(test_doubles)
     note_constant_wrappers(wrappers)
@@ -1105,6 +1109,8 @@ def _process_candidate_for_pr(
     if action in {"pr-opened", "no-changes"}:
         _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
         note_removed_comments(bindings)
+        note_flag_state_comments(bindings)
+        note_renamed_tests(bindings)
         # Logged on BOTH outcomes, not only alongside a pull request, because
         # `no-changes` is the one where the body cannot say it: a repository
         # whose only mention of the flag is an override pinning it to the

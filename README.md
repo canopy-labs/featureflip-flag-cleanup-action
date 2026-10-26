@@ -1925,13 +1925,56 @@ reopened through `class_eval`,
 `class << Flags` or a refinement keeps its wrappers (`overridable`). A call
 through a computed name (`send(name)`) cannot be seen. A method under a
 Sorbet `sig` keeps its callers inlined and is itself kept (`annotated`). An
-ERB, HAML or Slim template, an RBS signature, or any other file, naming the method keeps it
-too, with its Ruby callers still inlined (`other-language` for ERB,
-`unparsed-mention` otherwise). In a gem (a `.gemspec` beside or above the
+ERB template calling a Rails helper is a caller too, under the rule below. Any
+other ERB template, a HAML or Slim template, an RBS signature, or any other
+file, naming the method keeps it, with its Ruby callers still inlined
+(`other-language` for ERB, `unparsed-mention` otherwise). In a gem (a `.gemspec` beside or above the
 wrapper), another repository may subclass the class and override the method,
 so an instance method is not inlined at all (`interface-published`), only a
 class method's calls through the class's name are, and a public one is never
 deleted (`published`).
+
+A Rails view calls a helper bare, and resolves the name through every helper
+module Rails includes in it:
+
+```erb
+<% if new_checkout? %>
+  <%= render "checkout/new" %>
+<% end %>
+<p class="<%= new_checkout? ? "new" : "old" %>"><%= new_checkout? %></p>
+```
+
+Those calls are inlined, and the helper deleted once nothing else names it,
+when all of this holds:
+
+- the wrapper is an instance method of a module in `app/helpers/` of a Rails
+  application (`config/application.rb` beside that `app/`), and the module
+  has the name Rails derives from its file: `app/helpers/admin/flags_helper.rb`
+  holds `Admin::FlagsHelper`. A module function is not one;
+- nothing in the repository spells `include_all_helpers`, `clear_helpers` or
+  `helpers_path`, which change which helpers a view includes;
+- the template is under that application's `app/views/`. A view component's
+  template, a template elsewhere or in another application keeps the helper
+  (`other-language`), as before;
+- the call is `new_checkout?`, `new_checkout!`, `beta?(@user)`,
+  `plain_on()` or `self.new_checkout?`, not inside a block (`each do`,
+  `form_with do`), a lambda or a `def`, and not across two tags. A bare
+  name without `?`, `!` or parentheses is never taken for a call there,
+  since `render` may pass the template a local of that name;
+- its value is used: a condition, an operand, an argument, a value, or the
+  whole of an output tag (`<%= new_checkout? %>`, `<%== new_checkout? %>`,
+  which print the literal). A statement tag (`<% new_checkout? %>`, and
+  `<%- … -%>`, which prints nothing) is not one, nor is an output tag holding
+  more than one statement. Arguments follow the Ruby rule, a local only when
+  the template assigns it first, outside a block.
+
+The template's ERB run must be configured (`erb` in `languages`, the default),
+and the template must not read the flag itself, since its own run rewrites
+it; otherwise its calls stay and are reported `outside-run`. A symbol or
+string spelling the name in the template's code refuses the wrapper, as in a
+Ruby file. The name in the markup or in a comment tag (`<%# … %>`) keeps it
+(`unparsed-mention`). A same-named helper from a gem, which Rails could also
+include, is not seen.
 
 In Swift, a wrapper is a function declared at the top of a file, or a method
 or computed property of a top-level `struct`, `enum` or `class`, static or
@@ -2608,8 +2651,10 @@ naming the files that still mention the key. Clean those up and the next run
 removes the entry. A comment never keeps an entry, and neither does a
 JavaScript or TypeScript test's title (`it('shows the banner when old-checkout
 is on', () => …)`): nothing is typed against a title and nothing looks it up.
-A file whose only mentions are titles and comments is listed on its own, under
-"name this flag only in test titles", so you can reword the titles. Any other
+A title that names the flag's kept state in one of a few fixed shapes is
+reworded for you (see "renamed" below). A file whose only mentions left are
+other titles and comments is listed on its own, under "name this flag only in
+test titles", so you can reword the rest. Any other
 string keeps the entry, even in a test, because fixture data that borrows the
 key can still reach a lookup by key.
 
@@ -2648,14 +2693,37 @@ the member stays, because there the same rewrite would change other types
 too. In a *value* position
 the same run does empty the object — `{ 'old-checkout': true }` becomes `{}`,
 which is an ordinary empty object and the right shape for an override that no
-longer overrides anything. In TypeScript and JavaScript, when that `{}` is the
-last argument of a call to a function declared at the top level of the same
-file, and the matching parameter defaults to `{}` (`flags = {}`), the argument
-is left out: the call passes the same value without it. The pull request lists
-each call it shortened, and each other override it left empty
-(`<Provider flags={{}}>`), because the prop or argument carrying it may now be
-pointless; whether it can go depends on whether it is optional, which this
-tool cannot see from one file.
+longer overrides anything.
+
+In TypeScript and JavaScript, a literal the run produced that equals what the
+callee would use anyway is left out. That covers an override emptied to `{}`,
+and a value the fold wrote, such as `{ enabled: onboardingFlag }` becoming
+`{ enabled: true }`. The callee's declaration must prove it:
+
+- `<Provider flags={{}}>` loses the prop when `Provider` destructures
+  `{ flags = {} }` and its props type marks `flags` optional;
+- `useRole(id, { enabled: true })` becomes `useRole(id)` when `useRole`
+  declares `{ enabled = true }: { enabled?: boolean } = {}`. When the literal
+  is not the last argument, or the parameter has no `= {}` default, only the
+  matching properties go.
+
+The callee is followed into other files, through `import { … }`, `tsconfig`
+`paths` aliases and `export { … } from` barrels, to the one declaration it
+names. "Equal" means `{}`, `[]`, booleans, `null`, a number or string of the
+same value, or `undefined` for a member with or without a default. Nothing
+is left out where the proof fails: a callee from a package or a declaration
+file, an overload, a function that reads `arguments` or takes type
+parameters, a JavaScript function with JSDoc types, a `...rest` in the
+destructuring, a member typed as required, a component wrapped in anything
+but React's `memo` or `forwardRef` (and `memo` handed a fresh `{}` or `[]`),
+a `defaultProps` anywhere that names the component, an element that spreads
+attributes, a test that mocks the callee's module or spies on it, and any
+JSX prop at all where code in the repository reads an element's props from
+outside the component (`cloneElement`, `Children`, `element.props`, a shallow
+renderer). A literal you wrote yourself is never touched, even when it equals
+the default. The pull request lists each call and element it shortened, and
+each emptied override it kept (`<Provider flags={{}}>`), since the prop or
+argument carrying it may now be pointless.
 
 **An entry set to the branch being removed is evidence about the code around
 it**, not just leftover residue. If the flag serves `true` and an entry reads
@@ -2696,6 +2764,34 @@ override to go on, the title has to carry the whole decision, so the bar is
 higher. The title must name the flag by its **key**, since "the flag" alone
 could mean any flag, and the test must not override the key to the branch
 being kept. When both hold, it's deleted and listed like the others.
+
+A test about the **kept** branch stays, but its title would go on describing
+a condition that no longer exists. So when the title names the flag by its
+key in the kept state, the flag's condition is dropped from it:
+
+```ts
+// before, removing old-checkout and keeping its on branch
+it('renders the summary when the old-checkout flag is on', …)
+it('renders the summary when the old-checkout flag is on and the cart has items', …)
+it('shows the coupon when the user is signed in and old-checkout is enabled', …)
+
+// after
+it('renders the summary', …)
+it('renders the summary when the cart has items', …)
+it('shows the coupon when the user is signed in', …)
+```
+
+Only these shapes are rewritten: `when`/`while`/`if`/`once` followed by the
+key (with or without "the" and "flag") and "is on" (or *enabled*, *true*,
+*turned on*; *off*, *disabled*, *false*, *not enabled* for an off branch),
+`with` followed by the key and the state, each either ending the title, as
+one half of an `and`, or opening it before a comma. A trailing "(default)"
+goes with the clause. A title that only says "the flag", that hedges, whose
+condition is the whole title, or that would still name the key or the
+removed state afterwards is left as it was and reported as before. A title is
+only a string, so a wrong rewrite cannot break your build, and the pull
+request lists every rewrite, old title and new, under "tests were renamed".
+This happens only in files the run changed.
 
 An override can also reach the literal **through a helper's parameter**:
 
@@ -3666,10 +3762,10 @@ compile the file itself, the alias counts as not found.
 
 The Featureflip JavaScript SDKs are the one exception to "loads a package".
 `@featureflip/js`, `@featureflip/node`, `@featureflip/browser`,
-`@featureflip/react` and `@featureflip/react/testing` do nothing when they load,
-in every published version, so a stranded import of one of them is deleted
-outright, and a repository module that loads one can still count as inert. Only
-those five specifiers count. Any other `@featureflip/` package keeps its bare
+`@featureflip/react`, `@featureflip/react/testing` and `@featureflip/edge` do
+nothing when they load, in every published version, so a stranded import of
+one of them is deleted outright, and a repository module that loads one can
+still count as inert. Only those six specifiers count. Any other `@featureflip/` package keeps its bare
 import. The name is trusted only when it can mean nothing but the published
 package, so the bare import stays when:
 
@@ -3686,8 +3782,8 @@ package, so the bare import stays when:
   or any directory above it, where the compiler's classic module resolution
   looks;
 - anything in the repository can put other code under the name of any of the
-  four SDK packages, since they load each other (`@featureflip/node` loads
-  `@featureflip/js`, `@featureflip/react` loads `@featureflip/browser`). That
+  five SDK packages, since most of them load each other (`@featureflip/node`
+  loads `@featureflip/js`, `@featureflip/react` loads `@featureflip/browser`). That
   means a `package.json` that is one of them (a workspace member or a vendored
   copy), depends on one with anything but a registry version (`file:`, `npm:`,
   `link:`, `workspace:`, a Git URL, a `.tgz`), or names one anywhere else, such
@@ -4099,8 +4195,8 @@ flag is refused.
 A local bound to the read is inlined and its declaration removed; one that is
 later **reassigned** is left standing. A short-form string template that reads
 it is rewritten with the other reads, as the braced literal:
-`'enabled=$enabled'` becomes `'enabled=${true}'`. One followed directly by an
-escaped dollar sign (`'$enabled\$'`) keeps the local, as its literal.
+`'enabled=$enabled'` becomes `'enabled=${true}'`, and one followed directly
+by an escaped dollar sign the same way (`'$enabled\$'` becomes `'${true}\$'`).
 `stringVariation` / `numberVariation` /
 `jsonVariation` are never matched — the method name is the only type signal
 Dart's untyped call site carries, and it is compared exactly.
@@ -4141,7 +4237,15 @@ cast that can throw, and removing it would lose the throw).
 An import goes when nothing it binds is spelled any more. What it binds is read
 from the imported library, so this works for relative imports and for your own
 package's `package:` imports, and never for `dart:` libraries or another
-package, which are always left in place:
+package, which are always left in place. The one exception is the Featureflip
+Dart SDK, `package:featureflip/featureflip.dart`: what it exports was read from
+every published version of `featureflip`, none of which declares an extension,
+so its import is judged the same way when your package's `pubspec.lock`
+resolves `featureflip` from pub.dev to one of those versions. It stays in place
+when there is no `pubspec.lock` beside your `pubspec.yaml` (a pub workspace
+member included), when the lock names a path, git or other-server source or a
+newer release, and when `dependency_overrides` or a `pubspec_overrides.yaml`
+mentions `featureflip`. The forms below apply to it as to any other:
 
 * `import '…' as legacy;` binds its prefix;
 * `import '…' show A, B;` binds each shown name, so `show A, B` can lose `A`
@@ -4171,15 +4275,22 @@ no initializer list, in a class with no `extends` or `with` clause and no
 field initializer that may do work), or the field is `late` or `static`, whose
 initializer only runs when the field is first read. So a field holding a
 keyless wrapper class built that way (`final _flags = Flags();`) is deleted
-once the wrappers it was read for are.
+once the wrappers it was read for are. So is one whose initializer reads a
+variable of the file whose own initializer only builds a value, alone or as
+such a constructor's argument (`final _flags = Flags(client);` under
+`final client = FeatureClient();`), on the conditions given for arguments
+below.
 
 When the field was the last use of a name an import brings, the import goes
 too: one of a library in the repository when nothing else it brings is
 spelled, not even a member of an extension it declares (otherwise the field
-is kept), and one of another package (`package:featureflip/featureflip.dart`) only when
-it has no prefix and a single `show` list whose every name goes with the
-field. What any other import of another package brings, its extensions
-included, cannot be read, so that field is kept.
+is kept). So does a plain import of the Featureflip Dart SDK under the
+conditions above: `final FeatureflipClient _client;` under
+`import 'package:featureflip/featureflip.dart';` goes with its import. One of
+any other package goes only when it has no prefix and a single `show` list
+whose every name goes with the field. What any other import of another
+package brings, its extensions included, cannot be read, so that field is
+kept.
 
 When a constructor sets it, that goes too:
 
@@ -4202,6 +4313,51 @@ directly or through a library of the repository that exports it. A file that
 does not import it names some other class of that name (a `Timer` from
 `dart:async`), and is left alone.
 
+An argument that reads a name goes with the parameter in three cases:
+
+* a parameter of a function around the call;
+* a variable declared in the caller's own file, top-level or as a `static`
+  field of the class, mixin or enum around the call, whose initializer only
+  builds a value: a literal, a `const` expression, or a call with constant
+  arguments of a constructor that only builds the object
+  (`final client = FeatureClient();`). Dart initializes such a variable when
+  it is first read, and that initializer does nothing else. It is kept when
+  the variable has no initializer (a `late` one throws when read unset), is
+  `external`, is `dynamic` (`final x = null;` included), declares a type
+  other than the class its initializer builds (`const int n = 1;`: a
+  typedef may make a declared type `dynamic`, and a `dynamic` argument is
+  cast), shares its name with a getter, setter or function of the file, or
+  the file has `part` files. A private variable must still be read
+  somewhere else once the argument goes, and be the only declaration of
+  its name in the file.
+  A top-level variable read inside a class, mixin or enum also needs that
+  type to declare no member of that name and to have no `extends`, `with` or
+  `on` clause, and it is never accepted inside an extension. A constructor
+  call's own arguments may read such a variable too
+  (`final _flags = Flags(client);`), but a parameter may not;
+* `widget.client` inside `class _CheckoutPageState extends State<CheckoutPage>`,
+  where `widget` is Flutter's getter for the mounted widget and `client` is a
+  plain field of it. That needs: `State` imported without a prefix from
+  `package:flutter/widgets.dart`, `material.dart` or `cupertino.dart`; no
+  `with` clause and no `widget` member in the `State` class, and no class in
+  the repository extending it; one `CheckoutPage` class in the repository,
+  not generic, seen by the file, outside a package that may be published,
+  with `client` declared once in it as a public field that is not `static`,
+  `late`, `external` or `abstract`; the field's type one class, enum, mixin
+  or extension type of the repository, or a class the Featureflip Dart SDK
+  exports (under the `pubspec.lock` conditions above), since any other type
+  may be `dynamic` through a typedef; no class in the repository naming
+  `CheckoutPage` as a supertype, in a `typedef` or in an annotation (a
+  generated mock implements it); and no `client` getter, no `widget` getter
+  and no `noSuchMethod` declared anywhere in the repository.
+  A top-level `widget` in scope would win over the inherited getter, so the
+  file must declare none, and every other import without a prefix must be
+  `dart:`, Flutter's, one of the repository's libraries without a `widget` or
+  `State`, or a `show` list naming neither. An import of another package
+  (`import 'package:provider/provider.dart';`) cannot be read, and keeps the
+  field. Any other shape of property (`this.widget.client`,
+  `widget?.client`, `widget.client.id`) is kept.
+
 The field is kept, and named in the pull request body, when:
 
 * its class is public in `lib/` of a package that may be published (no
@@ -4219,12 +4375,13 @@ The field is kept, and named in the pull request body, when:
 * a constructor sets it from something other than a parameter or a literal,
   sets it through a named `this._client` parameter, or is a factory;
 * an argument that would be deleted is anything but a literal, a `const`
-  object, a call with constant arguments of a constructor that only builds
-  the object (as for an initializer, below), a parameter of the function
-  around the call, or a top-level `const` of the file (`Svc(widget.client)`
-  may run a getter, `Svc(FeatureClient(config))` reads a variable that may be
-  initialised on first use, and a local would be left unused), or is the last
-  use of an import or a private declaration;
+  object, a call of a constructor that only builds the object (as for an
+  initializer, below), a parameter of the function around the call, a
+  variable of the file whose initializer only builds a value, or a Flutter
+  widget's plain field, each as described below (`Svc(config.client)` may
+  run a getter, `Svc(client)` with `final client = Client.connect();` runs
+  `connect` when `client` is first read, and a local would be left unused),
+  or is the last use of an import or a private declaration;
 * something else assigns it, or its initializer may do work
   (`final _client = FeatureClient();` whose constructor has a body,
   an initializer list or a superclass, `Foo.instance`, `'$x'`);
@@ -4232,8 +4389,9 @@ The field is kept, and named in the pull request body, when:
   with another field, or shares its name with a getter, setter or method;
 * its type or initializer is the last use of an import that cannot go with
   it (`Timer? _timer;` as the only `Timer` in a file that imports
-  `dart:async`, or `final FeatureClient _client;` under a plain
-  `import 'package:featureflip/featureflip.dart';`) or of a private class,
+  `dart:async`, `final FeatureClient _client;` under a plain import of
+  another package, or under the Featureflip Dart SDK's import when the
+  conditions above do not hold) or of a private class,
   function or variable, since deleting it would leave that unused instead;
 * its library has `part` files, since another part may read it.
 
@@ -5051,6 +5209,17 @@ means no PR.
   in the pull request, and every rewrite is checked by parsing the file again:
   its code must be exactly what it was, or the file is left alone.
 
+  **A comment beside the change that describes a flag's state is reported
+  even when it does not name the flag.** A comment on a line the run changed,
+  or directly above one, that says "the flag is on/off", "flag is
+  enabled/disabled", "while the flag …" or "when the flag …" is listed in the
+  pull request. It is likely about this flag, but that is a guess from its
+  wording, so it is never edited. A comment that describes the branch the run
+  deleted ("the flag is off" when the flag serves `true`) is listed first,
+  under "describes behaviour this pull request removed", whether or not it
+  names the flag: it is now false rather than just out of date. A comment
+  that hedges ("even when the flag is off") is not counted as one.
+
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift
   (`.swift`) were each an uncovered extension once and are now processed
@@ -5215,6 +5384,25 @@ means no PR.
   behind, so the surviving markup keeps its own indentation instead of the
   guard's — the markup emitted is the same, only the whitespace between it
   moves.
+* **A parameter or argument list shrunk to one element is joined onto one
+  line only in some cases.** In TypeScript and JavaScript, when this tool
+  removes a test helper's parameter, the arguments passed to it, or an
+  argument equal to the callee's default, and the list was written one
+  element per line, the element left is put back beside its brackets:
+  `function renderChecklist(\n  steps: number\n) {` becomes
+  `function renderChecklist(steps: number) {`, and a trailing comma goes
+  with the line breaks. That happens only when the list had two or more
+  elements before the run and exactly one after, the element fits on one
+  line, no comment sits inside the brackets, and the joined line fits the
+  width your repository asks for: Prettier's `printWidth` (or the
+  `max_line_length` it reads from `.editorconfig`, or its default of 80),
+  else `.editorconfig`'s `max_line_length`, else the longest line the file
+  already had. A Prettier configuration written as code, one that names a
+  shared configuration, or one with per-file `overrides` joins nothing. Only
+  configuration inside the repository is read. Other lists keep the layout
+  the removal left: object and array literals, JSX attributes, lists the
+  rewrite rules shorten themselves (such as a removed constructor
+  parameter), and every other language.
 * **A comparison against a non-literal is propagated but not folded.**
   `if (on === true)` reduces fully, because both sides end up literal. But
   `if (on === other)` becomes `if (true === other)` and stops — correct, and

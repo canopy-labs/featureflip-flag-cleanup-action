@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "1.14.0"
+version = "1.15.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -459,7 +459,19 @@ dependencies = [
     # `_ENGINE_STRANDED_LOCAL_RULES` and `_ENGINE_STRANDED_IMPORT_RULES`, and
     # `unused.py`'s C# and TS branches stay as the backstop. No grammar rev
     # moved, so `+canopy.3` stays.
-    "polyglot-piranha==0.37.0",
+    #
+    # 0.38.0. The engine's tree-sitter-dart is upstream 0.3.0 from crates.io
+    # again, not the canopy-labs fork: upstream shipped its own fix for the
+    # arrow-body tail the fork carried. 0.3.0 renamed node kinds, so the
+    # engine-side Dart rules here moved with it (`class_member` is now
+    # `member_declaration` in `dart_const.toml` and `dart_ctor_param.toml`,
+    # `pair` is `map_element` in `dart_entries.toml`). Everything that parses
+    # with Gate 1's PyPI 0.1.0 grammar keeps the 0.1.0 names, which did not
+    # change. One output change: a local read as `'$x\$'` used to be lexed
+    # as the name `x\$`, so the fold left that read behind and Gate 1 refused
+    # the file; now it folds to `'${true}\$'` (`dart/short_template`). No
+    # TypeScript or C# grammar rev moved, so `+canopy.3` and `+canopy.1` stay.
+    "polyglot-piranha==0.38.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -587,9 +599,9 @@ dependencies = [
     "tree-sitter-c-sharp==0.23.5+canopy.1",
     # Dart. The ONE grammar here that is NOT the version the engine bundles,
     # and the gap is a whole restructuring rather than a skew: the engine pins
-    # `tree-sitter-dart 0.2.0` (a conventional `call_expression` /
-    # `member_expression` grammar that exposes string content as
-    # `template_chars_*`), while 0.1.0 is the only release on PyPI and models a
+    # `tree-sitter-dart 0.3.0` (0.2.0 until engine 0.38.0: a conventional
+    # `call_expression` / `member_expression` grammar that exposes string
+    # content as `template_chars_*`), while 0.1.0 is the only release on PyPI and models a
     # call as a flat selector chain exposing NO node for a string's content at
     # all. A rule written for one matches nothing under the other.
     #

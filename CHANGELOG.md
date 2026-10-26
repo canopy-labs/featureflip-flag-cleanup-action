@@ -7,6 +7,98 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.15.0
+
+### New
+
+- **Dart:** a plain `import 'package:featureflip/featureflip.dart';` that a
+  removal leaves unused is now removed, so `dart analyze` no longer fails on
+  `unused_import`. Before, it was always kept, and a private field whose type
+  was its last use (`final FeatureflipClient _client;`) was kept with it and
+  named in the pull request. Now both go. What the Featureflip Dart SDK
+  exports was read from every published version of the `featureflip`
+  package, and none of them declares an extension, so nothing can rely on
+  the import without naming something it exports. This applies only when the
+  package's `pubspec.lock` resolves `featureflip` to one of those versions
+  from pub.dev, and nothing overrides it. Without a lock, with a path, git or
+  other-server source, or on a newer release, the import and the field stay
+  as before.
+- **TypeScript and JavaScript:** `@featureflip/edge`, the Cloudflare Workers
+  SDK, is treated like the other Featureflip JavaScript SDKs. It does nothing
+  when it loads, so an import of it that a removal leaves unused is deleted
+  instead of being kept as a bare `import "@featureflip/edge";`.
+- **TypeScript and JavaScript:** a test that stays because it tests the
+  branch being kept no longer keeps a title describing a flag that is gone.
+  When the title names the flag by its key in the kept state
+  (`renders the summary when the my-flag flag is on and the cart has items`),
+  the flag's condition is dropped from it
+  (`renders the summary when the cart has items`). Only a fixed set of title
+  shapes is rewritten, and only in files the run changed; any other title is
+  reported as before. The pull request lists each rewrite, old title and new.
+- **Every language:** the pull request now lists comments next to the code it
+  changed that describe a flag's state without naming the flag, such as
+  `// Skips polling while the flag is off.` above the line the fold
+  rewrote. Before, only comments naming the key were reported. This is a guess
+  from the wording ("the flag is on", "flag is disabled", "while the flag",
+  "when the flag"), so these comments are listed and never edited.
+- **TypeScript and JavaScript:** a parameter or argument list written one
+  element per line is put back on one line when the removal leaves it with a
+  single element. `function renderChecklist(\n  steps: number\n) {` now
+  comes out as `function renderChecklist(steps: number) {`, so you no longer
+  join it by hand in review. It applies to the helper parameters, their
+  arguments, and the default-valued arguments this tool removes. A list is
+  joined only when it had two or more elements before the run, holds no
+  comment, and the joined line fits your Prettier `printWidth`, your
+  `.editorconfig` `max_line_length`, or, with neither, the file's longest
+  line. See README's known gaps for the details.
+- **Every language:** a reported comment that describes the branch this pull
+  request deleted ("the flag is off" when the flag serves `true`) is listed
+  first, under its own heading, because it is now false rather than just out
+  of date. That covers kept comments that name the flag too. A comment that
+  hedges ("even when the flag is off") is not counted as one.
+- **Ruby and ERB:** a keyless wrapper that is a Rails helper is now inlined
+  where your views call it (`<% if new_checkout? %>`, `<%= new_checkout? %>`),
+  and deleted once nothing else names it. It must be an instance method of a
+  module in `app/helpers/` of a Rails application, named as Rails derives it
+  from its file, and the template must be under that application's
+  `app/views/`. Calls inside a block, a bare name without `?`, `!` or
+  parentheses, and a statement tag whose value nothing uses are left alone and
+  reported. Nothing in the repository may spell `include_all_helpers`,
+  `clear_helpers` or `helpers_path`. Any other template naming a wrapper keeps
+  it, as before (`other-language`). See README, "Wrapping the SDK".
+- **Dart:** a private field set by a constructor is now removed when a caller
+  passes it a variable or a Flutter widget's field. Before, that kept the
+  field and its parameter and named them in the pull request. Two shapes are
+  covered. The first is a variable declared in the caller's own file, either
+  top-level or a `static` field of the enclosing class, whose initializer
+  only builds a value (`final client = FeatureClient();` passed as
+  `Svc(client)`). The same goes for a field built from one
+  (`final _flags = Flags(client);`). Dart initializes such a variable when
+  it is first read, and that initializer does nothing else. The second is
+  `widget.client` inside a `State<CheckoutPage>` subclass, when `client` is
+  a plain public field of the one `CheckoutPage` in the repository, typed
+  with a class of the repository or of the Featureflip Dart SDK, and nothing
+  in the repository declares a `client` or `widget` getter or a
+  `noSuchMethod`, subclasses the state, or subclasses, implements or mocks
+  the widget. Any other property
+  (`this.widget.client`, `widget?.client`, `config.client`) is still kept,
+  and so are a `State` with a `with` clause and a file that imports another
+  package without a prefix or a `show` list: what it brings cannot be read,
+  and a top-level `widget` it declared would be the one `widget.client`
+  reads. See README, "Supported Dart/Flutter flag-read shapes".
+
+### Fixed
+
+- **Ruby:** a wrapper call whose argument is a name an earlier, already closed
+  block bound (`items.each { |u| … }` then `Flags.on?(u)`) is no longer
+  inlined. That name is a method call there, which inlining would drop
+  (`argument-has-call`).
+- **Dart:** a flag value held in a local and read in a string as `'$enabled\$'`
+  (a template followed by an escaped dollar sign) is now inlined, giving
+  `'${true}\$'`. The escape used to be read as part of the name, so that read
+  was left behind and the whole flag was refused with "a string template still
+  reads a variable the rewrite deleted".
+
 ## 1.14.0
 
 ### New

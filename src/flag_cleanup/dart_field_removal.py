@@ -29,11 +29,14 @@ deletion skips could do work, and nothing else in the library spells it:
   longer happens. Any other field's runs when the object is built, so it must
   be absent or constant: a literal, a ``const`` expression, a collection
   literal built of those (``final _retries = 3;``, ``final _ids = <int>[];``),
-  or a call, with constant arguments, of a ``const`` constructor or of one
+  a call, with constant arguments, of a ``const`` constructor or of one
   that runs no code of its own (``final _client = FeatureClient();``, see
-  :func:`flag_cleanup.ctor_param_dart.const_construction`). ``make()``,
-  ``Foo.bar`` (a getter, or a static whose initializer runs on first access)
-  and ``'$x'`` (a ``toString()``) may do work.
+  :func:`flag_cleanup.ctor_param_dart.const_construction`), or a bare name
+  reading a top-level or static variable of the file whose own initializer
+  is inert, as the initializer or as such a constructor's argument
+  (``final _flags = Flags(client);`` under ``final client = Client();``).
+  ``make()``, ``Foo.bar`` (a getter, or a static whose initializer runs on
+  first access) and ``'$x'`` (a ``toString()``) may do work.
 - **nothing else left unused.** Every name the declaration spells (its type,
   a ``const _Config()``, a ``late`` field's ``_make()``) must also be spelled
   outside every private field declaration of the file, or be one of
@@ -41,8 +44,9 @@ deletion skips could do work, and nothing else in the library spells it:
   a private class or a private function unused, which ``dart analyze``
   reports in turn. The same holds for what else goes from the file: a
   parameter's type and default, an argument. A name an import brings is the
-  exception when the import can go too: one of a library in the checkout is
-  judged by the stranded-binding pass that runs next, and an unprefixed
+  exception when the import can go too: one of a library in the checkout,
+  or of the Featureflip Dart SDK's audited libraries, is judged by the
+  stranded-binding pass that runs next, and an unprefixed
   ``show`` import of any other library goes with the field when every name
   it shows does (see :func:`_import_strand`).
 - **one library, one declaration.** A file with a ``part`` or ``part of``
@@ -422,14 +426,18 @@ def _import_strand(
     spelled, a call of it or not; so an import of the checkout that brings
     nothing else spelled is accepted only when no such member is.
 
-    The library of a ``package:`` or ``dart:`` import outside the checkout
-    cannot be read, so what it brings is known only when the import is
-    unprefixed and has one ``show`` list: then it brings those names and
-    nothing else, not even an extension it does not show. It goes when every
-    name it shows goes with the field, each spelled only as a type there,
-    which an extension never is. Any other import of such a library might be
-    what brings the name, or something an extension call needs, so it keeps
-    the field unless an import above already accounts for the name."""
+    The resolver also knows the Featureflip Dart SDK's libraries from an
+    audited table, when the package's lock pins a release that table was
+    read from (see :func:`flag_cleanup.dart_namespace.audited_sdk`), so such
+    an import is judged the same way. Any other library of a ``package:`` or
+    ``dart:`` import outside the checkout cannot be read, so what it brings
+    is known only when the import is unprefixed and has one ``show`` list:
+    then it brings those names and nothing else, not even an extension it
+    does not show. It goes when every name it shows goes with the field,
+    each spelled only as a type there, which an extension never is. Any
+    other import of such a library might be what brings the name, or
+    something an extension call needs, so it keeps the field unless an
+    import above already accounts for the name."""
     if name.startswith("_"):
         return None
     known = False
@@ -498,6 +506,10 @@ def _stranded(
     fields += spans + directives
 
     def elsewhere(name: str) -> bool:
+        if name.startswith("_"):
+            unread = ctor_param_dart.private_variable_unread(root, name, fields)
+            if unread is not None:
+                return not unread
         skipped = fields + (_own_declarations(root, name) if name.startswith("_") else [])
         return any(
             node.type in _SPELLINGS
@@ -513,6 +525,8 @@ def _stranded(
     for node in spelled:
         if node.type not in _SPELLINGS or node == field or node.parent is None:
             continue
+        if ctor_param_dart.widget_head(node, spans[1:]):
+            continue  # `widget.f`'s getter is inherited, not declared in the file
         if node.parent.type in (
             "label",
             "symbol_literal",
@@ -604,7 +618,11 @@ def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal
         value = _initializer(declaration)
         if value and not _inert(value) and not ctor_param_dart.const_construction(path, root, value, repo_dir):
             text = " ".join(source[value[0].start_byte : value[-1].end_byte].split())[:60]
-            return Refusal(label, f"an initializer that may do work ({text})")
+            if len(value) != 1 or value[0].type != "identifier":
+                return Refusal(label, f"an initializer that may do work ({text})")
+            reason = ctor_param_dart.inert_initializer_name(path, value[0], root, repo_dir)
+            if reason is not None:
+                return Refusal(label, f"an initializer that may do work ({text}: {reason})")
     span = _span(declaration, siblings)
     sites = [Site(path, *span, "member")]
     parameter: str | None = None

@@ -46,6 +46,32 @@ subclass in another repository, so its instance methods are refused
 class's name are inlined; a public one is never deleted (``published``).
 A call through a computed name (``send(name)``, ``public_send(*args)``) is
 not seen, as Python's ``getattr`` with a computed string is not.
+
+An ERB template calls a Rails helper bare (``<% if new_checkout? %>``), and
+those calls are inlined too, under a narrow rule, because a view resolves a
+bare name through every helper module Rails mixes into it:
+
+* the wrapper is an instance method of a module in ``app/helpers/`` of a Rails
+  application (a ``config/application.rb`` beside that ``app/``), whose name
+  is the one Rails derives from its file (``admin/flags_helper.rb`` holds
+  ``Admin::FlagsHelper``);
+* nothing in the repository spells ``include_all_helpers``,
+  ``clear_helpers`` or ``helpers_path``, which change which helpers a view
+  includes;
+* the template is under that application's ``app/views/``. A template
+  anywhere else (a view component, a mailer engine, a gem) is not a caller
+  this proves, and keeps the wrapper as before;
+* the call is ``m?``, ``m!``, ``m(...)`` or ``self.m?``, outside every block
+  (a block may be evaluated against another object) and every ``def``,
+  inside one tag, where its value is used: a condition, an operand, an
+  argument, a value, or the whole of an output tag (``<%= m? %>``). A bare
+  ``m`` is never a call there: ``render`` may pass a local of that name.
+
+The template's code is judged as the Ruby it is, through the tags' code
+joined in source order, and each proven call is mapped back to its bytes in
+the file. A symbol or a string spelling the name in that code refuses the
+wrapper, as in a Ruby file; a mention in the markup or in a comment tag keeps
+it.
 """
 
 from __future__ import annotations
@@ -114,6 +140,12 @@ _INERT_ARGUMENTS = frozenset({
     "integer", "float", "rational", "complex", "true", "false", "nil", "self", "simple_symbol",
     "instance_variable", "class_variable", "global_variable", "constant", "scope_resolution",
 })
+#: Settings through which an application changes which helper modules its
+#: views include.
+_HELPER_SETTINGS = ("include_all_helpers", "clear_helpers", "helpers_path")
+#: Nodes of a template's code between which a call may run on another
+#: object, or not at all.
+_TEMPLATE_BREAKS = frozenset({"block", "do_block", "lambda", *_DEFS, "class", "module", "singleton_class"})
 
 
 def parse(source: str) -> Node:
@@ -368,6 +400,163 @@ def members(root: Node, name: str) -> list[Node]:
     ]
 
 
+# --- ERB templates --------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _View:
+    """A template's Ruby: the code of its tags joined with newlines in source
+    order, parsed, with the way back from each of its bytes into the file.
+
+    Its offsets are its own, so nothing reads one as a file's: every span and
+    line handed out goes through :meth:`span` and :meth:`line`."""
+
+    root: Node
+    #: ``(view start, file start, length, printed)`` per tag, in order;
+    #: ``printed`` for an output tag (``<%=``, ``<%==``).
+    segments: tuple[tuple[int, int, int, bool], ...]
+    data: bytes
+
+    def _segment(self, node: Node) -> tuple[int, int, int, bool] | None:
+        for segment in self.segments:
+            start, _, length, _ = segment
+            if start <= node.start_byte and node.end_byte <= start + length:
+                return segment
+        return None
+
+    def span(self, node: Node) -> tuple[int, int] | None:
+        """The node's bytes in the file, or ``None`` when it spans two tags."""
+        segment = self._segment(node)
+        if segment is None:
+            return None
+        start, file_start, _, _ = segment
+        return file_start + node.start_byte - start, file_start + node.end_byte - start
+
+    def line(self, node: Node) -> int:
+        segment = self._segment(node) or next(
+            (s for s in reversed(self.segments) if s[0] <= node.start_byte), None
+        )
+        if segment is None:
+            return 1
+        offset = segment[1] + max(0, min(node.start_byte - segment[0], segment[2]))
+        return self.data[:offset].count(b"\n") + 1
+
+    def printed(self, statement: Node) -> bool:
+        """Whether a top-level statement is the whole code of an output tag,
+        whose value the template prints."""
+        segment = self._segment(statement)
+        if segment is None or not segment[3]:
+            return False
+        start, _, length, _ = segment
+        return not [
+            other for other in _named(self.root)
+            if other != statement and other.start_byte < start + length and other.end_byte > start
+        ]
+
+
+def _view(source: str) -> _View:
+    template = syntax._parse(source, "erb")
+    data = source.encode("utf-8")
+    codes = sorted((n for n in syntax._walk(template) if n.type == "code"), key=lambda n: n.start_byte)
+    parts: list[bytes] = []
+    segments: list[tuple[int, int, int, bool]] = []
+    offset = 0
+    for code in codes:
+        if parts:
+            offset += 1  # the newline joining two tags
+        opening = code.parent.children[0] if code.parent is not None and code.parent.children else None
+        printed = (
+            code.parent is not None
+            and code.parent.type == "output_directive"
+            # The grammar calls `<%-` an output directive too; it prints nothing.
+            and opening is not None
+            and _text(opening).startswith("<%=")
+        )
+        segments.append((offset, code.start_byte, code.end_byte - code.start_byte, printed))
+        parts.append(data[code.start_byte : code.end_byte])
+        offset += code.end_byte - code.start_byte
+    return _View(parse(b"\n".join(parts).decode("utf-8")), tuple(segments), data)
+
+
+def _markup_lines(source: str, name: str) -> list[tuple[int, str]]:
+    """Lines where the name is spelled outside every tag's code: in the markup
+    or a comment tag, where nothing here can tell what reads it."""
+    template = syntax._parse(source, "erb")
+    data = bytearray(source.encode("utf-8"))
+    for code in (n for n in syntax._walk(template) if n.type == "code"):
+        data[code.start_byte : code.end_byte] = bytes(
+            b if b == 0x0A else 0x20 for b in data[code.start_byte : code.end_byte]
+        )
+    word = _word(name)
+    return [
+        (number, " ".join(line.split()))
+        for number, line in enumerate(data.decode("utf-8").splitlines(), start=1)
+        if word.search(line)
+    ]
+
+
+def _views_dir(wrapper: wi.Wrapper, owner: Node | None) -> Path | None:
+    """The ``app/views/`` whose templates call the wrapper as a Rails helper,
+    or ``None`` when it is not one: an instance method of a module in
+    ``app/helpers/`` of a Rails application, named as Rails derives the name
+    from its file, which is how Rails includes it in every view."""
+    if wrapper.kind != "method" or wrapper.static or owner is None or owner.type != "module":
+        return None
+    path = Path(wrapper.path)
+    for helpers in path.parents:
+        if helpers.name != "helpers" or helpers.parent.name != "app":
+            continue
+        root = helpers.parent.parent
+        if not (root / "config" / "application.rb").is_file():
+            return None
+        parts = path.relative_to(helpers).with_suffix("").parts
+        expected = "::".join("".join(w[:1].upper() + w[1:] for w in part.split("_")) for part in parts)
+        return root / "app" / "views" if expected == wrapper.package else None
+    return None
+
+
+def _template_judge(path: str, node: Node, wrapper: wi.Wrapper, view: _View) -> wi.Occurrence:
+    def occurrence(shown: Node, reason: str | None, span=None) -> wi.Occurrence:
+        return wi.Occurrence(path, view.line(node), wi.text_of(shown), span, reason, suffix="()" if span else "")
+
+    parent = node.parent
+    if parent is None or parent.type != "call" or parent.child_by_field_name("method") != node:
+        # A bare `m` may be a local that `render` passed the template.
+        return occurrence(parent or node, wi.RECEIVER_UNPROVEN)
+    call = parent
+    receiver = call.child_by_field_name("receiver")
+    if receiver is not None and (receiver.type != "self" or _text(call.child_by_field_name("operator")) != "."):
+        return occurrence(call, wi.RECEIVER_UNPROVEN)
+    ancestors = list(_ancestors(call))
+    if any(a.type in ("interpolation", "heredoc_body") for a in ancestors):
+        return occurrence(call, wi.UNPARSED_MENTION)
+    if any(a.type in _TEMPLATE_BREAKS for a in ancestors):
+        return occurrence(call, wi.RECEIVER_UNPROVEN)
+    span = view.span(call)
+    if span is None or not _value_used(call, view.printed):
+        return occurrence(call, wi.RECEIVER_UNPROVEN)
+    reason = _arguments_reason(call, wrapper)
+    if reason is not None:
+        return occurrence(call, reason)
+    return occurrence(call, None, span)
+
+
+def _template_occurrences(path: str, source: str, wrapper: wi.Wrapper) -> list[wi.Occurrence]:
+    view = _view(source)
+    if view.root.has_error:
+        return [wi.Occurrence(path, 1, "", None, wi.RECEIVER_UNPROVEN)]
+    found = [
+        _template_judge(path, node, wrapper, view)
+        for node in _walk(view.root)
+        if node.type == "identifier" and _text(node) == wrapper.name and not names_only(node)
+    ]
+    found += [
+        wi.Occurrence(path, line, text, None, wi.UNPARSED_MENTION)
+        for line, text in _markup_lines(source, wrapper.name)
+    ]
+    return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
+
+
 # --- The repository index -----------------------------------------------------
 
 
@@ -462,6 +651,7 @@ class Index:
     def build(cls, repo_dir: str, wrapper: wi.Wrapper) -> Index:
         index = cls(repo_dir=repo_dir, gem=_gem(wrapper.path))
         word = _word(wrapper.name)
+        views = index._views_dir(wrapper)
         for path in cross_file_keys.mention_files(
             repo_dir, [wrapper.name, wrapper.owner], exclude=(), extra_suffixes=_EXTRA_SUFFIXES
         ):
@@ -469,6 +659,9 @@ class Index:
             if text is None:
                 logger.info("cannot read %s, so no keyless wrapper qualifies", path)
                 index.unreadable = True
+                continue
+            if path.endswith(".erb"):
+                index._template(path, text, wrapper, views)
                 continue
             if not _ruby_text(path, text):
                 if not Path(path).suffix and not ruby_owner_reach.is_ruby(path, text):
@@ -495,7 +688,39 @@ class Index:
             index._scan_owner(path, ancestor, wrapper, magic_only=True)
         return index
 
-    def _scan(self, path: str, root: Node, wrapper: wi.Wrapper) -> None:
+    def _views_dir(self, wrapper: wi.Wrapper) -> Path | None:
+        """Where templates may call the wrapper as a helper (see
+        :func:`_views_dir`), unless something in the repository changes which
+        helpers a view includes."""
+        home = self.file(wrapper.path)
+        views = _views_dir(wrapper, _owner_declaration(home[1], wrapper) if home is not None else None)
+        if views is None:
+            return None
+        settings = cross_file_keys.mention_files(
+            self.repo_dir, list(_HELPER_SETTINGS), exclude=(), extra_suffixes=_EXTRA_SUFFIXES
+        )
+        for path in settings:
+            text = _read(path)
+            if text is None or any(re.search(rf"\b{s}\b", text) for s in _HELPER_SETTINGS):
+                logger.info("%s may change which helpers a view includes, so no template call is proven", path)
+                return None
+        return views
+
+    def _template(self, path: str, text: str, wrapper: wi.Wrapper, views: Path | None) -> None:
+        """A template calling the wrapper as a helper is parsed through its
+        code and scanned like a Ruby file; any other one mentioning the name
+        keeps the wrapper (``other-language``)."""
+        view = _view(text) if views is not None and Path(path).resolve().is_relative_to(views) else None
+        if view is None or view.root.has_error:
+            if wi._foreign_lines(path, wrapper.name):
+                self.foreign.append(path)
+            return
+        self.parsed.append(path)
+        self._scan(path, view.root, wrapper, view.line)
+
+    def _scan(
+        self, path: str, root: Node, wrapper: wi.Wrapper, line_of: Callable[[Node], int] = wi.line_of
+    ) -> None:
         name, owner = wrapper.name, wrapper.owner
         word = _word(name)
         if root.has_error and any(
@@ -506,42 +731,42 @@ class Index:
         for node in _walk(root):
             kind = node.type
             if kind in _DEFS and _text(node.child_by_field_name("name")) == name:
-                self.declarations.append((path, wi.line_of(node), _text(node).split("\n", 1)[0].strip()))
+                self.declarations.append((path, line_of(node), _text(node).split("\n", 1)[0].strip()))
             elif kind in ("alias", "undef") and any(
                 _text(c) == name or _symbol_text(c) == name for c in node.named_children
             ):
-                self.declarations.append((path, wi.line_of(node), wi.text_of(node)))
+                self.declarations.append((path, line_of(node), wi.text_of(node)))
             elif _symbol_text(node) in (name, owner):
                 into = self.doubles if _in_double(node) else self.named
-                into.append((path, wi.line_of(node), wi.text_of(node.parent or node)))
+                into.append((path, line_of(node), wi.text_of(node.parent or node)))
             elif kind in ("string_content", "heredoc_content") and (
                 word.search(_text(node)) or _owner_string(_text(node), wrapper)
             ):
                 into = self.doubles if _in_double(node) else self.named
-                into.append((path, wi.line_of(node), wi.text_of(node.parent or node)))
+                into.append((path, line_of(node), wi.text_of(node.parent or node)))
             elif kind in ("class", "module"):
                 written = node.child_by_field_name("name")
                 if _last_segment(written) == owner:
-                    self.owners.append((path, wi.line_of(node), wi.text_of(written)))
+                    self.owners.append((path, line_of(node), wi.text_of(written)))
                 self.classes.setdefault(_last_segment(written), []).append((path, node))
             elif kind in ("assignment", "operator_assignment") and _last_segment(
                 node.child_by_field_name("left")
             ) == owner:
-                self.owners.append((path, wi.line_of(node), wi.text_of(node)))
+                self.owners.append((path, line_of(node), wi.text_of(node)))
             elif kind == "singleton_class" and _last_segment(node.child_by_field_name("value")) == owner:
-                self.opened.append((path, wi.line_of(node), wi.text_of(node).split("\n", 1)[0]))
+                self.opened.append((path, line_of(node), wi.text_of(node).split("\n", 1)[0]))
             elif kind == "call":
                 method = _call_method(node)
                 receiver = node.child_by_field_name("receiver")
                 arguments = _named(node.child_by_field_name("arguments"))
                 if _last_segment(receiver) == owner and method in _OPENING:
-                    self.opened.append((path, wi.line_of(node), wi.text_of(node).split("\n", 1)[0]))
+                    self.opened.append((path, line_of(node), wi.text_of(node).split("\n", 1)[0]))
                 elif method == "refine" and arguments and _last_segment(arguments[0]) == owner:
-                    self.opened.append((path, wi.line_of(node), wi.text_of(node).split("\n", 1)[0]))
+                    self.opened.append((path, line_of(node), wi.text_of(node).split("\n", 1)[0]))
                 elif method in _DOUBLES and (
                     _last_segment(receiver) == owner or any(_last_segment(a) == owner for a in arguments)
                 ):
-                    self.doubles.append((path, wi.line_of(node), wi.text_of(node).split("\n", 1)[0]))
+                    self.doubles.append((path, line_of(node), wi.text_of(node).split("\n", 1)[0]))
 
     def subclasses_of(self, wrapper: wi.Wrapper) -> list[tuple[str, Node]]:
         found: list[tuple[str, Node]] = []
@@ -779,30 +1004,51 @@ def _local(node: Node, scope: Node | None) -> bool:
     parameter BEFORE it, as Ruby's parser decides: a read, not a call."""
     name = _text(node)
     return scope is not None and any(
-        n.type == "identifier" and _text(n) == name and n.end_byte <= node.start_byte and _declares(n)
+        n.type == "identifier"
+        and _text(n) == name
+        and n.end_byte <= node.start_byte
+        and _declares(n)
+        and _block_reaches(n, node, scope)
         for n in _walk(scope)
     )
 
 
-def _value_used(expression: Node) -> bool:
+def _block_reaches(declaration: Node, node: Node, scope: Node) -> bool:
+    """Whether every block or lambda between ``declaration`` and ``scope``
+    holds ``node`` as well: a block's parameters and locals end with it."""
+    parent = declaration.parent
+    while parent is not None and parent != scope:
+        if parent.type in ("block", "do_block", "lambda") and not (
+            parent.start_byte <= node.start_byte and node.end_byte <= parent.end_byte
+        ):
+            return False
+        parent = parent.parent
+    return True
+
+
+def _value_used(expression: Node, printed: Callable[[Node], bool] | None = None) -> bool:
     """Whether the expression's value is used where a literal can stand: a
     condition, an operand, a value, an argument, or the last statement of a
-    method's or a block's body."""
+    method's or a block's body. In a template's code, ``printed`` says
+    whether a top-level statement is the whole of an output tag, whose value
+    is printed."""
     parent = expression.parent
     if parent is None:
         return False
     kind = parent.type
+    if kind == "program":
+        return printed is not None and printed(expression)
     if kind in ("if", "unless", "while", "until", "elsif", "if_modifier", "unless_modifier",
                 "while_modifier", "until_modifier"):
         return parent.child_by_field_name("condition") == expression
     if kind == "unary":
-        return _text(parent.child_by_field_name("operator")) in ("!", "not") and _value_used(parent)
+        return _text(parent.child_by_field_name("operator")) in ("!", "not") and _value_used(parent, printed)
     if kind == "parenthesized_statements":
-        return len(_named(parent)) == 1 and _value_used(parent)
+        return len(_named(parent)) == 1 and _value_used(parent, printed)
     if kind == "conditional":
-        return parent.child_by_field_name("condition") == expression or _value_used(parent)
+        return parent.child_by_field_name("condition") == expression or _value_used(parent, printed)
     if kind == "binary":
-        return _value_used(parent)
+        return _value_used(parent, printed)
     if kind in ("argument_list", "pair", "array", "return", "next", "break"):
         return kind != "pair" or parent.child_by_field_name("value") == expression
     if kind in ("assignment", "operator_assignment"):
@@ -882,6 +1128,9 @@ def _ancestors(node: Node) -> Iterable[Node]:
 
 
 def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> list[wi.Occurrence]:
+    if path.endswith(".erb"):
+        # Only a template the index admitted as a helper's caller is here.
+        return _template_occurrences(path, source, wrapper)
     cached = index.file(path, source)
     if cached is None:
         return [wi.Occurrence(path, 1, "", None, wi.RECEIVER_UNPROVEN)]
@@ -952,6 +1201,9 @@ wi.register(
         qualify=qualify,
         strings=frozenset({"string", "heredoc_body"}),
         foreign_extensions=(),
+        # A template calling a helper is rewritten by this run, under the ERB
+        # grammar; see `_template_occurrences`.
+        siblings=("erb",),
         names_only=names_only,
         members=members,
         keep=keep,

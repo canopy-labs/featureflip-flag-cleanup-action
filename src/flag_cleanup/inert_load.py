@@ -65,15 +65,18 @@ SIDE_EFFECT_FREE_PACKAGES = frozenset({
     "@featureflip/browser",
     "@featureflip/react",
     "@featureflip/react/testing",
+    "@featureflip/edge",
 })
 
 #: The manifest fields where naming a package only says which published
 #: version to install, as long as the version spells a registry range.
 _DEPENDENCY_FIELDS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
 
-#: The packages behind :data:`SIDE_EFFECT_FREE_PACKAGES`. They load each
-#: other (`node` loads `js`, `react` loads `browser`), so a substitute for any
-#: one of them reaches a load of another.
+#: The packages behind :data:`SIDE_EFFECT_FREE_PACKAGES`. Most of them load
+#: each other (`node` loads `js`, `react` loads `browser`), so a substitute for
+#: any one of them reaches a load of another. `edge` loads none of them, and
+#: is checked with the rest anyway: one answer for all of them is simpler and
+#: only ever keeps more bare imports.
 _SDK_PACKAGES = frozenset("/".join(s.split("/")[:2]) for s in SIDE_EFFECT_FREE_PACKAGES)
 
 #: A registry range or tag: version characters only, so no protocol or path

@@ -22,7 +22,7 @@
 [[rules]]
 name = "delete_ctor_marked_member"
 query = """(
-  (class_member
+  (member_declaration
     (method_declaration
       signature: (method_signature (constructor_signature name: (identifier) @name)))) @member
   (#eq? @name "__CTOR_SENTINEL__")

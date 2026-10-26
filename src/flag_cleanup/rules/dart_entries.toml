@@ -90,7 +90,7 @@
 [[rules]]
 name = "delete_flag_keyed_boolean_pair_single_quoted"
 query = """(
-  (pair . (string_literal) @flag_name . [(true) (false)] @value) @entry
+  (map_element . (string_literal) @flag_name . [(true) (false)] @value) @entry
   (#eq? @flag_name "'@stale_flag_name'")
   (#eq? @value "@treated")
 )"""
@@ -104,7 +104,7 @@ holes = ["stale_flag_name", "treated"]
 [[rules]]
 name = "delete_flag_keyed_boolean_pair_double_quoted"
 query = '''(
-  (pair . (string_literal) @flag_name . [(true) (false)] @value) @entry
+  (map_element . (string_literal) @flag_name . [(true) (false)] @value) @entry
   (#eq? @flag_name "\"@stale_flag_name\"")
   (#eq? @value "@treated")
 )'''
@@ -122,7 +122,7 @@ holes = ["stale_flag_name", "treated"]
 [[rules]]
 name = "delete_flag_keyed_registry_pair_single_quoted"
 query = """(
-  (pair . (string_literal) @flag_name . (_) @value) @entry
+  (map_element . (string_literal) @flag_name . (_) @value) @entry
   (#eq? @flag_name "'@stale_flag_name'")
   (#not-eq? @value "@untreated")
 )"""
@@ -134,7 +134,7 @@ holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 [[rules.filters]]
 enclosing_node = "(set_or_map_literal) @registry"
 contains = """(
-  (pair . (string_literal) @sibling)
+  (map_element . (string_literal) @sibling)
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
@@ -145,7 +145,7 @@ at_least = 1
 [[rules]]
 name = "delete_flag_keyed_registry_pair_double_quoted"
 query = '''(
-  (pair . (string_literal) @flag_name . (_) @value) @entry
+  (map_element . (string_literal) @flag_name . (_) @value) @entry
   (#eq? @flag_name "\"@stale_flag_name\"")
   (#not-eq? @value "@untreated")
 )'''
@@ -157,7 +157,7 @@ holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 [[rules.filters]]
 enclosing_node = "(set_or_map_literal) @registry"
 contains = """(
-  (pair . (string_literal) @sibling)
+  (map_element . (string_literal) @sibling)
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
