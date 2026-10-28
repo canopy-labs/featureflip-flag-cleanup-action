@@ -105,8 +105,9 @@ TEST_PHASE = "test phase"
 #: A ``[Theory]`` that lost the rows passing the removed value to a helper.
 TEST_ROWS = "test rows"
 #: A member that called a public test helper (:mod:`flag_cleanup.cs_shared_pins`)
-#: with the removed value, and now runs with the kept one; carries the member
-#: and its line, for review.
+#: with the removed value, or a private one relying on a default that is the
+#: removed value, and now runs with the kept one; carries the member and its
+#: line, for review.
 REBUILT = "rebuilt with the kept value"
 
 #: An argument list's tail after the key: balanced to three levels, which
@@ -385,6 +386,11 @@ class WrapperStub:
     #: knobs and constructions above (its project is a test project). Off
     #: unless the caller says so.
     test_code: bool = False
+    #: C#: ``(owner, method, parameter, index)`` of each public static test
+    #: helper whose parameter builds one of these fakes, which a private
+    #: helper's pin may pass its own parameter on to
+    #: (:func:`flag_cleanup.cs_shared_pins.forwards`).
+    forwards: frozenset[tuple[str, str, str, int]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -943,6 +949,8 @@ class _Unit:
     kept: bool = False
     #: C#: the values the test's fakes are built with (:attr:`WrapperStub.sibling_owners`).
     constructions: list[bool] = field(default_factory=list)
+    #: C#: each of those constructions, with its value.
+    built: list[tuple[Node, bool]] = field(default_factory=list)
     #: C#: the stubs among :attr:`stubs` that write a fake's knob.
     knob_writes: list[Node] = field(default_factory=list)
     #: C#: a fake whose value decides the test can be reached by code that may
@@ -1286,6 +1294,7 @@ def resolve(
     receivers: frozenset[str] = frozenset(),
     knob_receivers: frozenset[str] | None = None,
     targets: Mapping[str, StubTargets] | None = None,
+    checkout: tuple[str, str] | None = None,
 ) -> tuple[str, list[Removal]]:
     """``source`` with every decidable test-double line resolved; what went.
 
@@ -1358,10 +1367,12 @@ def resolve(
         return _describes_read(text, mention) or (knob_mention is not None and bool(knob_mention.search(text)))
 
     statements = _statements(root, data, profile.blocks, describes)
+    if language == "csharp" and wrapper is not None:
+        statements += [n for n in _constructor_bodies(root, data) if describes(_text(n, data))]
     return _apply(
         source, language, profile, root, data, statements, patterns, treatment,
         wrapper=wrapper, siblings=siblings, fakes=bool(fakes), owners=owners,
-        knob_writes=patterns[-1][1] if knob_holders else None, defaults=defaults,
+        knob_writes=patterns[-1][1] if knob_holders else None, defaults=defaults, checkout=checkout,
     )
 
 
@@ -1395,6 +1406,7 @@ def _apply(
     owners: dict[str, tuple[str, bool]] | None = None,
     knob_writes: re.Pattern[str] | None = None,
     defaults: dict[str, bool] | None = None,
+    checkout: tuple[str, str] | None = None,
 ) -> tuple[str, list[Removal]]:
     """Decide each test or statement from its stubs and delete what goes, with
     the ``extra`` spans another recogniser already decided. ``siblings``,
@@ -1461,7 +1473,7 @@ def _apply(
             # alone: a helper's knob write is not a stub pin.
             knob = knob_writes is not None and knob_writes.search(_text(statement, data)) is not None
             pin = (
-                cs_param_pins.find(root, data, statement, groups["param"])
+                cs_param_pins.find(root, data, statement, groups["param"], forwards=wrapper.forwards)
                 if fakes and not unit.kept and not knob
                 else None
             )
@@ -1502,7 +1514,11 @@ def _apply(
             if test is None:
                 # A helper's parameter may choose it, as one chooses a stub.
                 passed = _construction_parameter(node, owners, data) if built is _UNREADABLE else None
-                pin = cs_param_pins.find(root, data, node, _text(passed, data)) if passed is not None and fakes else None
+                pin = (
+                    cs_param_pins.find(root, data, node, _text(passed, data), forwards=wrapper.forwards)
+                    if passed is not None and fakes
+                    else None
+                )
                 if pin is not None:
                     pins.append((node, pin, units.setdefault(node.id, _Unit(None, None))))
                     constructed[node.id] = passed
@@ -1513,6 +1529,7 @@ def _apply(
                 unit.unprovable = True
             elif built is not None:
                 unit.constructions.append(built)
+                unit.built.append((node, built))
                 if (
                     simple in wrapper.flippable_owners
                     and (simple in wrapper.settable_owners or not owners[simple][1])
@@ -1542,14 +1559,28 @@ def _apply(
     #: ``(start, end, removal)`` of each test phase the last decision made.
     phases: list[tuple[int, int, Removal]] = []
 
+    #: ``(call, test name)`` of each pinned call rebuilt with the kept value.
+    rebuilt: list[tuple[Node, str | None]] = []
+    #: The pins (by method start) one of whose calls passes the removed value
+    #: only through the parameter's default: such a test never chose the
+    #: value it runs with, so whether it holds with the kept one cannot be
+    #: told, and the pin is not made.
+    defaulted_removed: set[int] = set()
+
     def decide(live: list[tuple[Node, cs_param_pins.CsPin, _Unit]]):
         """``(tests, lines, pinned calls)`` with the pins in ``live`` made."""
         phases.clear()
+        rebuilt.clear()
+        defaulted_removed.clear()
         pinned: dict[int, list[bool]] = {}
         calls: list[tuple[cs_param_pins.CsPin, Node, bool | None, Node | None]] = []
         emptied: list[tuple[Node, str, str]] = []
+        removed = "false" if treatment else "true"
         for _, pin, _ in live:
-            for call, value in cs_param_pins.calls(root, data, pin) or ():
+            defaulted: set[int] = set()
+            for call, value in cs_param_pins.calls(root, data, pin, defaulted=defaulted) or ():
+                if value == removed and call.id in defaulted:
+                    defaulted_removed.add(pin.method_start)
                 if value == cs_param_pins.ROWS:
                     # The theory's rows say the value: it goes when none
                     # passes the kept one, and is cut otherwise.
@@ -1581,10 +1612,11 @@ def _apply(
                 unit.test is not None
                 and not unit.unprovable
                 and values == {True, False}
-                and not unit.constructions
+                and all(v == treatment or _construction_start(n, data) is not None for n, v in unit.built)
+                and len(unit.built) == len(unit.constructions)
                 and unit.test.id not in pinned
             ):
-                found = _phases(unit, treatment, doubles, data)
+                found = _phases(unit, treatment, doubles, data, checkout)
                 if found is not None:
                     phases.extend(found)
                     lines += [(v, VERIFICATION) for v in unit.verifications]
@@ -1612,7 +1644,7 @@ def _apply(
     while True:
         tests, lines, calls = decide(live)
         deleted = [test for test, _, _ in tests]
-        refused = set()
+        refused = set(defaulted_removed)
         for pin, call, value, test in calls:
             if any(t.start_byte <= call.start_byte and call.end_byte <= t.end_byte for t in deleted):
                 continue
@@ -1630,7 +1662,8 @@ def _apply(
                 refused.add(pin.method_start)
         if not refused:
             raw = _pin_spans(root, data, live, deleted, treatment, theory_writes)
-            if raw is not None and not _overlaps(raw, tests, lines, data):
+            forwarded = [span for _, pin, _ in live for span in pin.forwards]
+            if raw is not None and not _overlaps(raw + forwarded, tests, lines, data):
                 break
             refused = {pin.method_start for _, pin, _ in live}
         for _, pin, unit in live:
@@ -1652,7 +1685,9 @@ def _apply(
         )
     ]
     extra = list(extra)
-    if not lines and not tests and not extra and not phases:
+    # A pin whose every call keeps its test still edits: the parameter, the
+    # arguments and a construction's literal.
+    if not lines and not tests and not extra and not phases and not raw and not live:
         return source, []
     spans: list[tuple[int, int, Removal | None]] = []
     for test, name, kind in tests:
@@ -1664,7 +1699,7 @@ def _apply(
         if any(start <= line.start_byte and line.end_byte <= end for start, end, _ in phases):
             continue
         text = " ".join(_text(line, data).split())
-        spans.append((line.start_byte, line.end_byte, Removal(kind, text)))
+        spans.append((*_line_span(line, data), Removal(kind, text)))
     spans += [(start, end, None) for start, end in raw]
     kept_literal = "true" if treatment else "false"
     spans += [
@@ -1672,6 +1707,8 @@ def _apply(
         for statement, _, _ in live
         if statement.id in constructed
     ]
+    # A shared helper the parameter was passed on to builds the same fake.
+    spans += [(start, end, kept_literal) for _, pin, _ in live for start, end in pin.forwards]
     spans += extra
     spans.sort(key=lambda span: span[0])
     result = source
@@ -1695,7 +1732,13 @@ def _apply(
     # the deletion itself still parses, is asked here.
     if _parse_errors(profile.parse(result, language)) > _parse_errors(root):
         return source, []
-    removals = [removal for _, _, removal in spans if isinstance(removal, Removal)]
+    # One phase cut around a statement it keeps is two spans sharing ONE row,
+    # so collapse by identity only: two tests deleting the same line are two
+    # equal rows, and stay two.
+    removals: list[Removal] = []
+    for _, _, removal in spans:
+        if isinstance(removal, Removal) and not any(removal is listed for listed in removals):
+            removals.append(removal)
     return result, removals + [_pin_removal(root, data, pin, deleted) for pin in _with_chained(root, data, live)] + [
         Removal(
             TEST_ROWS,
@@ -1703,6 +1746,10 @@ def _apply(
             f"and parameter `{_text(theory.parameter.child_by_field_name('name'), data)}`",
         )
         for theory, kept in _cut_theories(root, data, live, deleted, treatment, theory_writes)
+    ] + [
+        Removal(REBUILT, f"{name or 'line'} (line {call.start_point[0] + 1})")
+        for call, name in rebuilt
+        if not any(t.start_byte <= call.start_byte < t.end_byte for t in deleted)
     ]
 
 
@@ -1752,12 +1799,28 @@ def _declared_in_block_scope(statement: Node, data: bytes) -> set[str]:
     return found
 
 
+#: Where an initializer's ``Name = value`` names a member of the object being
+#: built. An array's initializer (``new[] { x = 1 }``, ``int[] a = { … }``)
+#: assigns the local ``x`` instead.
+_OBJECT_CREATIONS = frozenset({"object_creation_expression", "implicit_object_creation_expression"})
+
+
 def _written(node: Node, data: bytes) -> set[str]:
     """Names ``node`` writes: an assignment's target, an increment's
-    operand, a ``ref``/``out`` argument."""
+    operand, a ``ref``/``out`` argument. An object initializer's ``Member =
+    …`` (``new T { Member = … }``) sets the new object's member, which is no
+    name in scope."""
     found: set[str] = set()
     for n in _walk(node):
         target = None
+        if (
+            n.type == "assignment_expression"
+            and n.parent is not None
+            and n.parent.type == "initializer_expression"
+            and n.parent.parent is not None
+            and n.parent.parent.type in _OBJECT_CREATIONS
+        ):
+            continue
         if n.type == "assignment_expression":
             target = n.child_by_field_name("left")
         elif n.type in ("postfix_unary_expression", "prefix_unary_expression") and any(
@@ -1801,7 +1864,9 @@ def _phase_independent(test: Node, phase: list[Node], data: bytes) -> bool:
     return not awaits or any(outside(n) for n in awaits)
 
 
-def _phases(unit: _Unit, treatment: bool, doubles: list[Node], data: bytes) -> list[tuple[int, int, Removal]] | None:
+def _phases(
+    unit: _Unit, treatment: bool, doubles: list[Node], data: bytes, checkout: tuple[str, str] | None = None
+) -> list[tuple[int, int, Removal]] | None:
     """The spans of a C# test that run with a fake's knob at the removed
     value, when the test writes it there part-way through: each
     removed-value write is followed, in the same block and with no other
@@ -1816,6 +1881,13 @@ def _phases(unit: _Unit, treatment: bool, doubles: list[Node], data: bytes) -> l
         return None
     found: list[tuple[int, int, Removal]] = []
     order = sorted(doubles, key=lambda n: n.start_byte)
+    for construction, value in unit.built:
+        if value == treatment:
+            continue
+        cut = _construction_phase(unit, construction, treatment, order, data, checkout)
+        if cut is None:
+            return None
+        found += cut
     for write, value in unit.stubs:
         if value == treatment:
             continue
@@ -1854,6 +1926,222 @@ def _phases(unit: _Unit, treatment: bool, doubles: list[Node], data: bytes) -> l
         text = " ".join(_text(write, data).split())
         found.append((_with_leading_comments(write, data), phase[-1].end_byte, Removal(TEST_PHASE, f"{unit.name}: {text}")))
     return found or None
+
+
+def _construction_start(construction: Node, data: bytes) -> tuple[Node, str, Node] | None:
+    """``(statement, local, literal)`` when ``construction`` is the whole
+    initializer of ``var local = new Fake(…)``, a statement of its test's
+    own body, built with a ``bool`` literal: such a construction may start
+    a removed-value phase (:func:`_construction_phase`)."""
+    declarator = construction.parent
+    while declarator is not None and declarator.type == "equals_value_clause":
+        declarator = declarator.parent
+    declaration = declarator.parent if declarator is not None and declarator.type == "variable_declarator" else None
+    statement = declaration.parent if declaration is not None and declaration.type == "variable_declaration" else None
+    if statement is None or statement.type != "local_declaration_statement" or len(
+        [d for d in declaration.named_children if d.type == "variable_declarator"]
+    ) != 1:
+        return None
+    if any(c.type == "modifier" or (not c.is_named and _text(c, data) in ("using", "await")) for c in statement.children):
+        return None
+    name = declarator.child_by_field_name("name")
+    literal = next((n for n in _walk(construction) if n.type == "boolean_literal"), None)
+    if name is None or literal is None or statement.parent is None or statement.parent.type != "block":
+        return None
+    method = statement.parent.parent
+    if method is None or method.type != "method_declaration":
+        return None
+    return statement, _text(name, data), literal
+
+
+def _local_value(statement: Node) -> Node | None:
+    """The initializer of a one-declarator, non-``using`` local declaration."""
+    declaration = next((c for c in statement.named_children if c.type == "variable_declaration"), None)
+    declarators = [d for d in declaration.named_children if d.type == "variable_declarator"] if declaration else []
+    if len(declarators) != 1 or any(not c.is_named and c.type in ("using", "await") for c in statement.children):
+        return None
+    name = declarators[0].child_by_field_name("name")
+    values = [c for c in declarators[0].named_children if name is None or c.id != name.id]
+    while values and values[-1].type == "equals_value_clause":
+        values = list(values[-1].named_children)
+    return values[-1] if values else None
+
+
+#: Constant values a kept local may be built of.
+_KEPT_CONSTANTS = frozenset(
+    {"boolean_literal", "integer_literal", "real_literal", "character_literal", "string_literal",
+     "verbatim_string_literal", "raw_string_literal", "null_literal"}
+)
+
+
+def _kept_building(value: Node, repo_dir: str, path: str) -> bool:
+    """Whether evaluating ``value``, kept inside a cut removed-value phase,
+    runs nothing that could observe the fake: a name, a constant, a static
+    member of a type (``NullLogger<T>.Instance``), a value's field or
+    auto-property, or a construction of a class whose constructors only
+    assign (:func:`ctor_param_csharp._plain_construction`) from such
+    arguments. Anything else may compute from the removed value, and then the
+    rest of the test, run at the kept one, would assert something else."""
+    from flag_cleanup import ctor_param_csharp
+    from flag_cleanup import wrapper_csharp as wc
+
+    kind = value.type
+    if kind in _KEPT_CONSTANTS or kind == "identifier":
+        return True
+    if kind == "object_creation_expression":
+        arguments = value.child_by_field_name("arguments")
+        items = [a for a in arguments.named_children if a.type == "argument"] if arguments is not None else []
+        return ctor_param_csharp._plain_construction(value, repo_dir, path) and all(
+            (e := ctor_param_csharp._expression(a)) is not None and _kept_building(e, repo_dir, path) for a in items
+        )
+    if kind != "member_access_expression":
+        return False
+    receiver = value.child_by_field_name("expression")
+    member = value.child_by_field_name("name")
+    if receiver is None or member is None or member.type != "identifier":
+        return False
+    readers = wc._Readers(repo_dir)
+    if receiver.type in ("generic_name", "predefined_type") or (
+        receiver.type == "identifier" and wc._binding(receiver, receiver.text.decode("utf-8", "replace"), readers, path) is None
+    ):
+        return True  # a static member of a type: nothing reaches a fake just built plainly
+    typed = wc._static_type(receiver, readers, path)
+    found = wc._checkout_type(typed, readers) if typed is not None else None
+    if found is None or not _kept_building(receiver, repo_dir, path):
+        return False
+    declaration, _ = found
+    body = declaration.child_by_field_name("body")
+    name = member.text.decode("utf-8", "replace")
+    members = list(body.named_children) if body is not None else []
+    fields = {f for m in members if m.type == "field_declaration" for f in ctor_param_csharp._field_names(m)}
+    for m in members:
+        if m.type == "field_declaration" and name in fields:
+            return True
+        if m.type == "property_declaration" and wc._name_of(m) == name:
+            return ctor_param_csharp._auto_property(m) or _stored_getter(m, fields)
+    return False
+
+
+def _stored_getter(property_node: Node, fields: set[str]) -> bool:
+    """Whether reading ``property_node`` runs nothing but a read of its own
+    type's fields: its getter is one expression of those fields, constants,
+    ``??`` and ``throw`` (``public T X => _x ?? throw new …;``). A throw
+    yields no value, so what it builds cannot reach the kept local."""
+    expression = None
+    value = property_node.child_by_field_name("value")
+    if value is not None and value.type == "arrow_expression_clause":
+        expression = value.named_children[0] if value.named_children else None
+    else:
+        accessors = next((c for c in property_node.named_children if c.type == "accessor_list"), None)
+        getters = [
+            a for a in (accessors.named_children if accessors is not None else ())
+            if a.type == "accessor_declaration" and any(not c.is_named and c.type == "get" for c in a.children)
+        ]
+        if len(getters) != 1:
+            return False
+        arrow = next((c for c in getters[0].named_children if c.type == "arrow_expression_clause"), None)
+        block = next((c for c in getters[0].named_children if c.type == "block"), None)
+        if arrow is not None:
+            expression = arrow.named_children[0] if arrow.named_children else None
+        elif block is not None:
+            statements = [c for c in block.named_children if "comment" not in c.type]
+            if len(statements) == 1 and statements[0].type == "return_statement":
+                expression = statements[0].named_children[0] if statements[0].named_children else None
+    return expression is not None and _stored_read(expression, fields)
+
+
+def _stored_read(node: Node, fields: set[str]) -> bool:
+    kind = node.type
+    if kind in _KEPT_CONSTANTS or kind == "throw_expression":
+        return True
+    if kind == "identifier":
+        return node.text.decode("utf-8", "replace") in fields
+    if kind == "member_access_expression":
+        receiver = node.child_by_field_name("expression")
+        name = node.child_by_field_name("name")
+        return (
+            receiver is not None and receiver.type == "this_expression"
+            and name is not None and name.text.decode("utf-8", "replace") in fields
+        )
+    if kind in ("parenthesized_expression", "postfix_unary_expression"):
+        return bool(node.named_children) and _stored_read(node.named_children[0], fields)
+    if kind == "binary_expression":
+        operator = node.child_by_field_name("operator")
+        left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+        return (
+            operator is not None and operator.type == "??"
+            and left is not None and right is not None
+            and _stored_read(left, fields) and _stored_read(right, fields)
+        )
+    return False
+
+
+def _construction_phase(
+    unit: _Unit,
+    construction: Node,
+    treatment: bool,
+    order: list[Node],
+    data: bytes,
+    checkout: tuple[str, str] | None = None,
+) -> list[tuple[int, int, Removal | str]] | None:
+    """The edits that cut the removed-value phase a construction starts:
+    ``var gate = new Fake(enabled: false); …; gate.Enabled = true;``. The
+    construction takes the kept literal; the statements up to the kept-value
+    write of the same local's knob go, but for a local declaration read after
+    them whose initializer only builds objects (:data:`_KEPT_BUILDING`); the
+    write goes as a stub. ``None`` when the shape is anything else, or what
+    goes is not independent of the rest (:func:`_phase_independent`)."""
+    from flag_cleanup import ctor_param_csharp
+
+    start = _construction_start(construction, data)
+    if start is None or unit.test is None or checkout is None:
+        return None
+    repo_dir, path = checkout
+    # A fake whose construction runs code may have handed itself on already.
+    if not ctor_param_csharp._plain_construction(construction, repo_dir, path):
+        return None
+    statement, local, literal = start
+    later = [n for n in order if n.start_byte >= statement.end_byte]
+    back = later[0] if later else None
+    if (
+        back is None
+        or back.parent is None
+        or back.parent.id != statement.parent.id
+        or not any(s.id == back.id and v == treatment for s, v in unit.stubs)
+        or not _knob_key(back, data).startswith(local + ".")
+    ):
+        return None
+    siblings = [c for c in statement.parent.named_children if "comment" not in c.type]
+    between = [c for c in siblings if statement.end_byte <= c.start_byte and c.end_byte <= back.start_byte]
+    after = [c for c in siblings if c.start_byte >= back.end_byte]
+    read_after = {_text(n, data) for c in after for n in _walk(c) if n.type == "identifier"}
+    kept = [
+        c for c in between
+        if c.type == "local_declaration_statement"
+        and _declared_in_block_scope(c, data) & read_after
+        and (value := _local_value(c)) is not None
+        and _kept_building(value, repo_dir, path)
+    ]
+    cut = [c for c in between if c not in kept]
+    if any(n.type in _PHASE_JUMPS for c in cut for n in _walk(c)):
+        return None
+    declared = set().union(*(_declared_in_block_scope(c, data) for c in cut)) if cut else set()
+    if any(n.type == "identifier" and _text(n, data) in declared for c in (*kept, *after) for n in _walk(c)):
+        return None
+    if cut and not _phase_independent(unit.test, cut, data):
+        return None
+    kept_literal = "true" if treatment else "false"
+    text = " ".join(_text(statement, data).split())
+    removal = Removal(TEST_PHASE, f"{unit.name}: {text}")
+    edits: list[tuple[int, int, Removal | str]] = [(literal.start_byte, literal.end_byte, kept_literal)]
+    runs: list[list[Node]] = []
+    for c in cut:
+        if runs and siblings.index(c) == siblings.index(runs[-1][-1]) + 1:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    edits += [(_with_leading_comments(run[0], data), run[-1].end_byte, removal) for run in runs]
+    return edits
 
 
 def _with_chained(
@@ -1957,7 +2245,7 @@ def _overlaps(raw: list[tuple[int, int]], tests, lines, data: bytes) -> bool:
     """Whether a cut shares a byte -- or a deleted line's whole line -- with
     any other edit."""
     whole = [unused._expand_to_whole_lines(data, _with_leading_comments(t, data), t.end_byte) for t, _, _ in tests]
-    whole += [unused._expand_to_whole_lines(data, n.start_byte, n.end_byte) for n, _ in lines]
+    whole += [unused._expand_to_whole_lines(data, *_line_span(n, data)) for n, _ in lines]
     ordered = sorted(raw)
     if any(a[1] > b[0] for a, b in zip(ordered, ordered[1:])):
         return True
@@ -2022,6 +2310,58 @@ def _enclosing_test(statement: Node, profile: _Profile, data: bytes) -> tuple[No
             return ancestor, name
         ancestor = ancestor.parent
     return None, None
+
+
+def _constructor_bodies(root: Node, data: bytes) -> list[Node]:
+    """The expression body of each C# constructor that can be deleted with
+    it (``public Tests() => _gate.Setup(…).Returns(true);``): a class's one
+    instance constructor, with no parameters, initializer, attribute or
+    comment, in a class that is not ``partial`` and has no primary
+    constructor. The class's implicit constructor then does the same, less
+    that statement. :func:`_line_span` deletes the whole constructor."""
+    found = []
+    for ctor in _walk(root):
+        if ctor.type != "constructor_declaration":
+            continue
+        body = ctor.child_by_field_name("body")
+        if body is None or body.type != "arrow_expression_clause":
+            continue
+        words = {_text(c, data) for c in ctor.children if c.type == "modifier"}
+        parameters = ctor.child_by_field_name("parameters")
+        owner = ctor.parent.parent if ctor.parent is not None else None
+        if (
+            words & {"static", "extern", "unsafe"}
+            or parameters is None
+            or parameters.named_children
+            or any(c.type in ("attribute_list", "constructor_initializer") for c in ctor.children)
+            or any("comment" in n.type for n in _walk(ctor))
+            or owner is None
+            or owner.type != "class_declaration"
+            or any(c.type == "parameter_list" for c in owner.children)
+            or "partial" in {_text(c, data) for c in owner.children if c.type == "modifier"}
+        ):
+            continue
+        others = [
+            m
+            for m in ctor.parent.named_children
+            if m.type == "constructor_declaration"
+            and m.id != ctor.id
+            and "static" not in {_text(c, data) for c in m.children if c.type == "modifier"}
+        ]
+        expressions = [c for c in body.named_children if "comment" not in c.type]
+        if not others and len(expressions) == 1:
+            found.append(expressions[0])
+    return found
+
+
+def _line_span(line: Node, data: bytes) -> tuple[int, int]:
+    """What deleting the statement ``line`` deletes: the statement, or the
+    whole constructor whose expression body it is (:func:`_constructor_bodies`)."""
+    if line.parent is not None and line.parent.type == "arrow_expression_clause":
+        ctor = line.parent.parent
+        if ctor is not None and ctor.type == "constructor_declaration":
+            return _with_leading_comments(ctor, data), ctor.end_byte
+    return line.start_byte, line.end_byte
 
 
 def _with_leading_comments(node: Node, data: bytes) -> int:
@@ -2143,6 +2483,7 @@ class Prepass:
     repo_dir: str | None = None
 
     def apply(self, paths: list[str]) -> None:
+        forwards = self._forwards(paths)
         for path in paths:
             try:
                 source = _read_exact(path)
@@ -2159,6 +2500,7 @@ class Prepass:
                     ),
                     owner_defaults=wrapper.owner_defaults,
                     test_code=path in self.test_code,
+                    forwards=forwards,
                 )
                 knob_receivers = self.knob_receivers.get(path, frozenset())
             resolved, removed = resolve(
@@ -2167,6 +2509,7 @@ class Prepass:
                 receivers=self.receivers.get(path, frozenset()),
                 knob_receivers=knob_receivers,
                 targets=self.targets.get(path),
+                checkout=(self.repo_dir, os.path.abspath(path)) if self.repo_dir is not None else None,
             )
             if not removed:
                 continue
@@ -2178,15 +2521,15 @@ class Prepass:
             _write_exact(path, resolved)
         self._apply_shared(paths)
 
-    def _apply_shared(self, paths: list[str]) -> None:
-        """A public test helper's pins (:mod:`flag_cleanup.cs_shared_pins`):
-        its calls may be in any file of the checkout, so they are made after
-        every file's own pass, and all or none."""
-        from flag_cleanup import cs_shared_pins
-
+    def _shared_helpers(
+        self, paths: list[str]
+    ) -> tuple[dict[str, str], dict[str, dict[str, tuple[str, bool]]]] | None:
+        """``(helpers, owners)`` for :mod:`flag_cleanup.cs_shared_pins`: the
+        text of each test file in ``paths`` holding a proven fake, and those
+        fakes; ``None`` when there are none."""
         wrapper = self.wrapper
         if self.language != "csharp" or wrapper is None or self.repo_dir is None or not wrapper.sibling_owners:
-            return
+            return None
         helpers: dict[str, str] = {}
         owners: dict[str, dict[str, tuple[str, bool]]] = {}
         for path in paths:
@@ -2201,8 +2544,28 @@ class Prepass:
             except (OSError, UnicodeDecodeError):
                 continue
             owners[key] = proven
-        if not helpers:
+        return (helpers, owners) if helpers else None
+
+    def _forwards(self, paths: list[str]) -> frozenset[tuple[str, str, str, int]]:
+        """The public helpers a private helper's pin may pass its parameter
+        on to (:func:`flag_cleanup.cs_shared_pins.forwards`)."""
+        from flag_cleanup import cs_shared_pins
+
+        shared = self._shared_helpers(paths)
+        if shared is None:
+            return frozenset()
+        return cs_shared_pins.forwards(self.repo_dir, *shared, dict(self.edited))
+
+    def _apply_shared(self, paths: list[str]) -> None:
+        """A public test helper's pins (:mod:`flag_cleanup.cs_shared_pins`):
+        its calls may be in any file of the checkout, so they are made after
+        every file's own pass, and all or none."""
+        from flag_cleanup import cs_shared_pins
+
+        shared = self._shared_helpers(paths)
+        if shared is None:
             return
+        helpers, owners = shared
         kept = "true" if self.treatment else "false"
         plan = cs_shared_pins.plan(self.repo_dir, helpers, owners, kept, dict(self.edited))
         if plan is None:

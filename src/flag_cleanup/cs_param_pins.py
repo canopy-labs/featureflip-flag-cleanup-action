@@ -25,7 +25,9 @@ Everything that has to hold, each checked rather than assumed:
   ``partial`` (another part could call it).
 * Every other mention of the method's name in the file is the callee of a
   plain call, never a method group, a declaration, a qualified call or a
-  string (reflection). Each call passes ``true``/``false`` at the parameter
+  string (reflection). A static helper is never called through a value, so
+  ``services.BuildServiceProvider()`` on a local, a parameter or any
+  expression that is no name is another method and does not count. Each call passes ``true``/``false`` at the parameter
   (by name anywhere, or positionally as the last argument passed) or
   nothing, and nothing needs a missing default.
 * No span the edit deletes holds a comment: it is the customer's, and
@@ -88,6 +90,12 @@ class CsPin:
     #: ``"true"``/``"false"``, or ``None`` when the parameter has none.
     default: str | None
     method_start: int
+    #: The helper is ``static``: no call through a value can be its.
+    static: bool = False
+    #: Byte spans of the parameter's other reads, each passing it to a shared
+    #: helper that pins the same fake (:func:`_forwarded`): each takes the
+    #: kept literal, which that helper's own pin then cuts.
+    forwards: tuple[tuple[int, int], ...] = ()
 
 
 def _walk(node: Node):
@@ -129,9 +137,18 @@ def _default(parameter: Node, data: bytes) -> tuple[bool, str | None]:
     return True, _text(after[0], data)
 
 
-def find(root: Node, data: bytes, statement: Node, parameter: str, depth: int = 0) -> CsPin | None:
+def find(
+    root: Node,
+    data: bytes,
+    statement: Node,
+    parameter: str,
+    depth: int = 0,
+    forwards: frozenset[tuple[str, str, str, int]] = frozenset(),
+) -> CsPin | None:
     """The pin ``statement`` (a stub returning ``parameter``) makes, or
-    ``None`` when any of the module's conditions does not hold."""
+    ``None`` when any of the module's conditions does not hold.
+    ``forwards`` holds the shared helpers (``(owner, method, parameter,
+    index)``) the parameter may also be passed to (:func:`_forwarded`)."""
     from flag_cleanup import mock_stubs
 
     method = _method_of(statement)
@@ -176,11 +193,19 @@ def find(root: Node, data: bytes, statement: Node, parameter: str, depth: int = 
     ok, default = _default(declared, data)
     if not ok:
         return None
-    # Nothing but the stub mentions the parameter.
+    # Nothing but the stub mentions the parameter, or a call passing it to a
+    # shared helper pinning the same fake.
+    passed_on: list[tuple[int, int]] = []
     for node in _walk(body):
+        if node.type == "implicit_parameter" and _text(node, data).removeprefix("@") == parameter:
+            return None  # `enabled => …` declares another of the name, which shadows it
         if node.type == "identifier" and _text(node, data).removeprefix("@") == parameter:
             if not (statement.start_byte <= node.start_byte < statement.end_byte):
-                return None
+                if node.parent is not None and node.parent.type == "argument" and node.parent.child_by_field_name("name") == node:
+                    continue  # a named argument's label, `enabled: …`
+                if not _forwarded(node, forwards, data):
+                    return None
+                passed_on.append((node.start_byte, node.end_byte))
     # A doc comment naming the parameter (`<param name="on">`, `<paramref>`)
     # would dangle: CS1572/CS1734, an error under TreatWarningsAsErrors.
     named = re.compile(rf"(?<![\w$@]){re.escape(parameter)}(?![\w$])")
@@ -192,10 +217,44 @@ def find(root: Node, data: bytes, statement: Node, parameter: str, depth: int = 
     word = re.compile(rf"(?<![\w$@]){re.escape(name)}(?![\w$])")
     if any(n.type in _STRINGS and word.search(_text(n, data)) for n in _walk(root)):
         return None
-    pin = CsPin(name, parameter, index, default, method.start_byte)
+    pin = CsPin(name, parameter, index, default, method.start_byte, "static" in words, tuple(passed_on))
     if calls(root, data, pin, depth) is None or edits(root, data, pin, depth) is None:
         return None
     return pin
+
+
+def _forwarded(name: Node, forwards: frozenset[tuple[str, str, str, int]], data: bytes) -> bool:
+    """Whether the identifier ``name`` is the whole argument a call
+    ``Owner.M(…)`` passes at the parameter of a shared helper in
+    ``forwards``: a static method of a class whose simple name is proven to
+    mean it (:mod:`flag_cleanup.cs_shared_pins`), so the value builds the
+    same fake this pin does."""
+    argument = name.parent
+    if argument is None or argument.type != "argument" or argument.named_children[-1].id != name.id:
+        return False
+    if any(not c.is_named and _text(c, data) in ("ref", "out", "in") for c in argument.children):
+        return False
+    call = argument.parent.parent if argument.parent is not None else None
+    if call is None or call.type != "invocation_expression" or call.child_by_field_name("arguments") != argument.parent:
+        return False
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return False
+    receiver = function.child_by_field_name("expression")
+    method = function.child_by_field_name("name")
+    if receiver is None or method is None or receiver.type not in ("identifier", "qualified_name", "member_access_expression"):
+        return False
+    owner = _text(receiver, data).rsplit(".", 1)[-1].removeprefix("@")
+    if receiver.type == "identifier" and _declared_local(receiver, owner, data):
+        return False  # a value of the name, which hides the class
+    for forward_owner, forward_method, forward_parameter, forward_index in forwards:
+        if (owner, _text(method, data).removeprefix("@")) != (forward_owner, forward_method):
+            continue
+        shared = CsPin(forward_method, forward_parameter, forward_index, None, -1)
+        at, _deletable = _argument_at(call, shared, data)
+        if at is not None and at.id == argument.id:
+            return True
+    return False
 
 
 def _argument_at(call: Node, pin: CsPin, data: bytes) -> tuple[Node | None, bool]:
@@ -217,10 +276,14 @@ def _argument_at(call: Node, pin: CsPin, data: bytes) -> tuple[Node | None, bool
     return None, True
 
 
-def calls(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[Node, str]] | None:
+def calls(
+    root: Node, data: bytes, pin: CsPin, depth: int = 0, defaulted: set[int] | None = None
+) -> list[tuple[Node, str]] | None:
     """Every call of the helper with the literal it pins; ``None`` when any
     mention is not a plain call, or a call cannot be pinned. A call passing
-    another helper's parameter on stands for that helper's calls."""
+    another helper's parameter on stands for that helper's calls.
+    ``defaulted`` collects the ids of the calls whose literal is the
+    parameter's default, passed nowhere."""
     found: list[tuple[Node, str]] = []
     for node in _walk(root):
         if node.type != "identifier" or _text(node, data).removeprefix("@") != pin.method:
@@ -229,6 +292,8 @@ def calls(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[Nod
         if parent is not None and parent.type == "method_declaration" and parent.start_byte == pin.method_start:
             if parent.child_by_field_name("name") == node:
                 continue
+        if pin.static and _through_a_value(node, data):
+            continue
         if parent is None or parent.type != "invocation_expression" or parent.child_by_field_name("function") != node:
             return None
         argument, deletable = _argument_at(parent, pin, data)
@@ -236,6 +301,8 @@ def calls(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[Nod
             if pin.default is None or not deletable:
                 return None
             found.append((parent, pin.default))
+            if defaulted is not None:
+                defaulted.add(parent.id)
             continue
         value = argument.named_children[-1] if argument.named_children else None
         if value is not None and value.type == "identifier" and deletable and theory_at(parent, pin, data) is not None:
@@ -243,7 +310,7 @@ def calls(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[Nod
             continue
         if value is not None and value.type == "identifier" and deletable:
             outer = _outer(root, data, parent, argument, value, depth)
-            through = calls(root, data, outer, depth + 1) if outer is not None else None
+            through = calls(root, data, outer, depth + 1, defaulted) if outer is not None else None
             # A theory's rows would say the value of the OUTER pin, which the
             # caller asks of this one.
             if through is None or any(v == ROWS for _, v in through):
@@ -254,6 +321,85 @@ def calls(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[Nod
             return None
         found.append((parent, _text(value, data)))
     return found
+
+
+#: Receivers that are values whatever names are in scope: an instance's
+#: member, never a static one of the helper's class.
+_VALUE_RECEIVERS = frozenset(
+    {
+        "invocation_expression",
+        "object_creation_expression",
+        "implicit_object_creation_expression",
+        "element_access_expression",
+        "this_expression",
+        "this",
+        "base",
+        "parenthesized_expression",
+        "await_expression",
+        "string_literal",
+        "interpolated_string_expression",
+    }
+)
+
+
+def _through_a_value(name: Node, data: bytes) -> bool:
+    """Whether the identifier ``name`` is a member called through a value
+    (``services.M()`` on a local or a parameter, ``new X().M()``), which is
+    no static method of the helper's class. A receiver that may name a type
+    (``Owner.M()``, a member access, a generic name) is not one."""
+    access = name.parent
+    if access is None or access.type != "member_access_expression" or access.child_by_field_name("name") != name:
+        return False
+    receiver = access.child_by_field_name("expression")
+    if receiver is None:
+        return False
+    if receiver.type in _VALUE_RECEIVERS:
+        return True
+    return receiver.type == "identifier" and _declared_local(receiver, _text(receiver, data).removeprefix("@"), data)
+
+
+def _declared_local(at: Node, name: str, data: bytes) -> bool:
+    """Whether a local, a parameter or a ``foreach`` variable named ``name``
+    is in scope at ``at`` (declared before it in an enclosing block, or by
+    an enclosing method, lambda or local function): a value, which hides any
+    type of the name."""
+    node = at
+    while node is not None and node.type not in ("class_declaration", "struct_declaration", "record_declaration"):
+        parent = node.parent
+        if parent is None:
+            return False
+        if parent.type == "block":
+            for statement in parent.named_children:
+                if statement.start_byte >= node.start_byte:
+                    break
+                if statement.type == "local_declaration_statement":
+                    if any(
+                        d.type == "variable_declarator"
+                        and (n := d.child_by_field_name("name")) is not None
+                        and _text(n, data) == name
+                        for v in statement.named_children
+                        if v.type == "variable_declaration"
+                        for d in v.named_children
+                    ):
+                        return True
+        elif parent.type == "foreach_statement":
+            left = parent.child_by_field_name("left")
+            if left is not None and left.type == "identifier" and _text(left, data) == name:
+                return True
+        elif parent.type in ("method_declaration", "local_function_statement", "lambda_expression", "constructor_declaration"):
+            parameters = parent.child_by_field_name("parameters")
+            # `x => …`: the lambda's one parameter is the field itself.
+            if parameters is not None and parameters.type == "identifier" and _text(parameters, data) == name:
+                return True
+            for item in _walk(parameters) if parameters is not None else ():
+                if item.type in ("parameter", "implicit_parameter"):
+                    label = item.child_by_field_name("name") if item.type == "parameter" else item
+                    if label is not None and _text(label, data) == name:
+                        return True
+                elif item.type == "identifier" and item.parent is parameters and _text(item, data) == name:
+                    return True
+        node = parent
+    return False
 
 
 def _outer(root: Node, data: bytes, call: Node, argument: Node, value: Node, depth: int) -> CsPin | None:

@@ -25,6 +25,10 @@ inference, in two ways that hold for any code that compiles:
     method extends, when that method's header does; an alias spelling one;
   - *family-returning* member names: the non-private members whose header
     spells a name collected, a record's positional parameters among them.
+    A name only static members add (``Protectors.Create()``, no extension
+    method) is reached through its owner, a tainting name already, so proof
+    2 does not count it in a file without a ``using static``; inside the
+    owner's own declaration its header puts the name back.
 
   ``dynamic`` is collected from the start, as a type that can hold a family
   value: ``var x = D.Get(); x.IsEnabled`` names no family type when ``Get``
@@ -57,6 +61,24 @@ inference, in two ways that hold for any code that compiles:
   parameter takes it), a family class (``new(...) { IsEnabled = ... }``),
   and an interface with attributes (``[CoClass]`` makes ``new IGate()``
   legal).
+
+  The taint reads the checkout's headers only, so one assumption is taken:
+  a library member does not hand a family value back as ``dynamic``. It
+  fails where a library member typed ``dynamic`` is reached unspelled, and
+  that is an inherited one: MVC's ``Controller.ViewBag`` is a slot another
+  file may store the gate in (``ViewBag.Gate = _gate``), read back as
+  ``ViewBag.Gate.IsEnabled`` in a file that names nothing. Such a member is
+  reached unspelled only inside a type that inherits it, so a read inside a
+  type with a library class up its base chain, through the checkout's own
+  bases, is judged even in a family-free file (:func:`exposed_spans`) when
+  its receiver may start at an inherited member. A
+  base spelled like an interface (``I`` and a capital) is taken as one,
+  whose members a class does not inherit unspelled. A library member reached
+  through a name the file spells is not seen: a static ``dynamic`` property
+  of a library type, or ``ViewBag`` read off an instance of a repository
+  controller from outside it. Nor are strings and crefs: in a family-free
+  file a string counts only as a by-name route's own name argument, whatever
+  value the route is given.
 
   A private member is visible only inside its own type, so it is left out,
   except in a ``partial`` type, whose other parts may live in other files,
@@ -119,6 +141,11 @@ class Family:
     #: The same, as :func:`family_free` judges a file: without types that take
     #: a family value only through a constructor. ``None`` means ``tainting``.
     reaching: frozenset[str] | None = None
+    #: ``(name, owner)`` for each name of :attr:`returning` that only static
+    #: members add (``TestProtectors.Create()``): reached through the owner's
+    #: name, a reaching one, except inside the owner or under a ``using
+    #: static`` (see :func:`family_free`).
+    static_returning: frozenset[tuple[str, str]] = frozenset()
     #: Some family type is declared outside every project, or the wrapper's
     #: own class was not found, so project reachability proves nothing.
     homeless: bool = False
@@ -158,6 +185,15 @@ class Family:
     #: unknown), and nothing derives from a family class. See
     #: :func:`_attribute_only`.
     attributes_unobservable: bool = False
+    #: Simple names of the checkout's types, and of those among them with a
+    #: library class up their base chains (:func:`_library_based`). A base
+    #: in neither reads as a library class unless it is spelled like an
+    #: interface.
+    repo_types: frozenset[str] = frozenset()
+    library_based: frozenset[str] = frozenset()
+    #: Full names of the checkout's types: a qualified base spelling none of
+    #: them names a library class, whatever its simple name.
+    repo_full_types: frozenset[str] = frozenset()
 
 
 def _full(namespace: str, name: str) -> str:
@@ -213,6 +249,7 @@ def family_of(repo_dir: str, wrapper, index) -> Family:
         settable=any(_settable(t.path, t.start, t.end, wrapper.name) for t in decls),
         projects=frozenset(p for home in homes for p in home),
         returning=taint.returning,
+        static_returning=taint.static_returning,
         sibling_full_names=sibling_full,
         tainting=taint.tainting,
         reaching=taint.reaching,
@@ -223,7 +260,95 @@ def family_of(repo_dir: str, wrapper, index) -> Family:
         dynamic_anywhere=spells_dynamic(repo_dir),
         sibling_bases_external=_sibling_bases_external(repo_dir, wrapper.siblings),
         attributes_unobservable=_attributes_unobservable(wrapper, checkout, full),
+        repo_types=frozenset(checkout.by_last),
+        library_based=library_based(checkout),
+        repo_full_types=frozenset(checkout.by_full),
     )
+
+
+def library_based(checkout) -> frozenset[str]:
+    """Simple names of the checkout's types that may inherit a library
+    class's members: a base the checkout does not declare and that is not
+    spelled like an interface, at any depth through its own types. A type a
+    file that does not parse whole may declare is one, since its base list
+    may be lost."""
+    memo: dict[str, bool] = {}
+
+    def based(name: str, seen: frozenset[str]) -> bool:
+        if name in memo:
+            return memo[name]
+        infos = checkout.by_last.get(name, ())
+        if not infos:
+            found = _INTERFACE_NAME.match(name) is None
+        elif any(words is None or name in words for words in checkout.unparsed_types):
+            found = True
+        elif name in seen:
+            return False  # a cycle does not compile
+        else:
+            found = any(based(s, seen | {name}) for info in infos for s in info.supertypes)
+        memo[name] = found
+        return found
+
+    return frozenset(name for name in checkout.by_last if based(name, frozenset()))
+
+
+#: A type header with a base list, as text: for a file that does not parse
+#: whole, whose base lists may be lost. A constraint (``where T : new()``)
+#: matches too, which only errs toward based.
+_BASED_HEADER = re.compile(r"\b(?:class|struct|record)\s+@?[^\W\d]\w*[^{;=]*?:")
+
+
+def _inherits_library(node: Node, family: Family) -> bool:
+    """Whether the type declaration ``node`` may inherit a library class's
+    members (see :attr:`Family.library_based`)."""
+    from flag_cleanup import cross_file_csharp as xcs
+    from flag_cleanup import wrapper_csharp as wc
+
+    if node.type == "interface_declaration":
+        return False
+    # Another part of a partial type may be the one with the base.
+    if (wc._name_of(node) or "").removeprefix("@") in family.library_based:
+        return True
+    bases = next((c for c in node.named_children if c.type == "base_list"), None)
+    for child in bases.named_children if bases is not None else ():
+        target = (
+            child.named_children[0]
+            if child.type == "primary_constructor_base_type" and child.named_children
+            else child
+        )
+        base = xcs._simple_name(target)
+        if base is None:
+            continue
+        if base in family.library_based:
+            return True
+        # Spelled qualified, a base is the checkout's only under a full name
+        # of the checkout's ending so: `Microsoft.AspNetCore.Mvc.Controller`
+        # is no `enum Controller` the checkout declares.
+        dotted = xcs._dotted(target) if target.type in ("qualified_name", "alias_qualified_name") else None
+        ours = base in family.repo_types and (
+            dotted is None or any(f == dotted or f.endswith("." + dotted) for f in family.repo_full_types)
+        )
+        if not ours and _INTERFACE_NAME.match(base) is None:
+            return True
+    return False
+
+
+def exposed_spans(source: str, root: Node, family: Family) -> list[tuple[int, int]]:
+    """The byte spans of the file's types that may inherit a library class's
+    members, nested ones inside them included: there an inherited member
+    typed ``dynamic`` (MVC's ``ViewBag``) is reached unspelled, and may hold
+    a family value another file stored. The whole file when it does not
+    parse whole and some type header has a base list, or it spells a type
+    another file may give a library base (a ``partial`` part)."""
+    if root.has_error:
+        based = _BASED_HEADER.search(source) or _spells(source, family.library_based)
+        return [(0, len(source.encode("utf-8")))] if based else []
+    spans: list[tuple[int, int]] = []
+    for node in cross_file_keys.walk(root):
+        if node.type in _TYPE_DECLARATIONS and _inherits_library(node, family):
+            if not any(start <= node.start_byte < end for start, end in spans):
+                spans.append((node.start_byte, node.end_byte))
+    return spans
 
 
 #: Modifiers under which a deleted member's lookup may differ from an
@@ -397,6 +522,8 @@ class _Header:
     #: ``text`` as proof 2 reads it, when that differs: a constructor's
     #: inbound parameter types left out. See the module docstring.
     narrow: str | None = None
+    #: A member reached only through its owner's name (:func:`_qualified_only`).
+    static: bool = False
 
 
 @dataclass(frozen=True)
@@ -408,6 +535,9 @@ class _Taint:
     opaque: bool
     guest_named: bool
     reaching: frozenset[str] | None = None
+    #: Of ``returning``, the names only static members add, each reached
+    #: through its owner's name; ``(name, owner)`` pairs.
+    static_returning: frozenset[tuple[str, str]] = frozenset()
 
 
 # Keyed by the name set itself, so an entry is never stale: a grown set is a
@@ -492,8 +622,10 @@ def _taint(
     # spelled like the interface may mean anything (its file spells the name,
     # so it was read): then the narrow reading proves nothing.
     near, reaching, returning = set(simple), {_DYNAMIC_NAME, *stemmed_names}, set[str]()
+    statics: set[tuple[str, str]] = set()
+    instance: set[str] = set()
     rebound = any(h.kind == "alias" and h.name in inbound for h in headers)
-    _close(headers, near, reaching, returning, narrow=not rebound)
+    _close(headers, near, reaching, returning, narrow=not rebound, statics=statics, instance=instance)
     tainting -= family | {_DYNAMIC_NAME}
     return _Taint(
         frozenset(family),
@@ -502,6 +634,7 @@ def _taint(
         opaque,
         guest_named,
         frozenset(reaching - near - {_DYNAMIC_NAME}),
+        frozenset((name, owner) for name, owner in statics if name not in instance and name not in near),
     )
 
 
@@ -568,10 +701,18 @@ class _Binder:
 
 
 def _close(
-    headers: list[_Header], family: set[str], tainting: set[str], returning: set[str], narrow: bool = False
+    headers: list[_Header],
+    family: set[str],
+    tainting: set[str],
+    returning: set[str],
+    narrow: bool = False,
+    statics: set[tuple[str, str]] | None = None,
+    instance: set[str] | None = None,
 ) -> None:
     """Apply every header that spells a collected name, until none adds one;
-    ``narrow`` reads each header as proof 2 does."""
+    ``narrow`` reads each header as proof 2 does. ``statics`` collects
+    ``(name, owner)`` of each returning name a static member adds, and
+    ``instance`` each one any other member adds."""
     while True:
         size = len(family) + len(tainting) + len(returning)
         names = frozenset(family | tainting)
@@ -586,6 +727,11 @@ def _close(
             else:
                 if header.name is not None:
                     returning.add(header.name)
+                    if header.static and header.owner is not None:
+                        if statics is not None:
+                            statics.add((header.name, header.owner))
+                    elif instance is not None:
+                        instance.add(header.name)
                 if header.owner is not None:
                     tainting.add(header.owner)
                 tainting.update(header.extends)
@@ -922,11 +1068,12 @@ def _headers(
             # type taints by name.
             continue
         text = _header_text(node)
+        static = _qualified_only(node, holder)
         if node.type in ("field_declaration", "event_field_declaration"):
             declaration = wc._child(node, "variable_declaration")
             for declarator in declaration.named_children if declaration is not None else ():
                 if declarator.type == "variable_declarator" and (dname := wc._name_of(declarator)):
-                    found.append(_Header("member", text, dname.removeprefix("@"), owner))
+                    found.append(_Header("member", text, dname.removeprefix("@"), owner, static=static))
             continue
         name = wc._name_of(node) if node.type in _NAMED_BY_FIELD else None
         name = name.removeprefix("@") if name else None
@@ -940,8 +1087,34 @@ def _headers(
             extends, unreadable = _extension(node, name, repo_types, repo_full, lookup)
             if unreadable:
                 found.append(_Header("opaque", text))
-        found.append(_Header("member", text, name, owner, extends))
+        found.append(_Header("member", text, name, owner, extends, static=static))
     return found
+
+
+def _qualified_only(node: Node, holder: Node | None) -> bool:
+    """Whether the member ``node`` is reached only through its owner's name:
+    a ``static`` field, property, event or method (no extension method,
+    which ``x.M()`` calls) of a class, struct or record that is neither
+    ``abstract`` nor ``virtual`` (``T.M()`` reaches an interface's). Outside
+    the owner, a type deriving from it and a ``using static`` of it, C#
+    reaches one only as ``Owner.M``."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    if holder is None or holder.type not in ("class_declaration", "struct_declaration", *_RECORDS):
+        return False
+    if node.type not in ("field_declaration", "event_field_declaration", "property_declaration", "method_declaration", "event_declaration"):
+        return False
+    words = xcs._modifiers(node)
+    if "static" not in words or words & {"abstract", "virtual", "override", "extern"}:
+        return False
+    if node.type == "method_declaration":
+        parameters = node.child_by_field_name("parameters")
+        first = next((p for p in parameters.named_children if p.type == "parameter"), None) if parameters else None
+        if first is not None and any(not c.is_named and wc._text(c) == "this" for c in first.children):
+            return False
+        if first is not None and any(c.type == "modifier" and wc._text(c) == "this" for c in first.children):
+            return False
+    return True
 
 
 # --- project reachability -----------------------------------------------------
@@ -2451,9 +2624,14 @@ def _bounded_away(bounds: frozenset[str] | None, family: Family) -> bool:
 
 def reset_cache() -> None:
     """For tests that rebuild a tree under the same path."""
-    from flag_cleanup import wrapper_csharp
+    from flag_cleanup import ctor_param_csharp, wrapper_csharp
+
+    ctor_param_csharp._UNPARSED.clear()
+    ctor_param_csharp._CONVERSIONS.clear()
 
     wrapper_csharp._FAKE_NAMES.clear()
+    wrapper_csharp._LOCATOR_DECLARED.clear()
+    wrapper_csharp._EXTENSION_NAMES.clear()
     _GRAPHS.clear()
     _LINKED.clear()
     _SCANS.clear()
@@ -2583,19 +2761,20 @@ def free_members(source: str, root: Node, family: Family, repo_dir: str) -> list
     One assumption is taken that the whole-file proof also makes: a library
     member does not hand a family value back as ``dynamic``. Two guards keep
     it narrow. Nothing is free while any file of the checkout spells
-    ``dynamic`` (a repository member returning it is not among the names), and
-    nothing in a type with a library base class, whose inherited members (MVC's
-    ``ViewBag``) are reached unspelled. A library base spelled like an
-    interface (``I`` and a capital) is taken as one."""
-    from flag_cleanup import cross_file_csharp as xcs
+    ``dynamic`` (a repository member returning it is not among the names).
+    And inside a type with a library class up its base chain, whose
+    inherited members (MVC's ``ViewBag``) are reached unspelled, the caller
+    still judges a read whose receiver may start at one
+    (:func:`exposed_spans`)."""
     from flag_cleanup import wrapper_csharp as wc
 
     if family.opaque or family.dynamic_anywhere or root.has_error or _APP_DIRECTIVE.search(source):
         return []
-    checkout = xcs.csharp_index(repo_dir)
     reaching = family.tainting if family.reaching is None else family.reaching
     family_types = {n.removeprefix("@") for n in family.simple_names}
-    known = family_types | set(reaching) | set(family.returning)
+    # A static member's bare name inside its owner is among ``leading``: the
+    # owner is declared here, its header spelling a collected name.
+    known = family_types | set(reaching) | set(_returning_outside(family, source))
     free: list[Node] = []
     outermost = [
         n for n in cross_file_keys.walk(root)
@@ -2604,13 +2783,6 @@ def free_members(source: str, root: Node, family: Family, repo_dir: str) -> list
     for top in outermost:
         types = [n for n in cross_file_keys.walk(top) if n.type in _TYPE_DECLARATIONS]
         if any(_PARTIAL.search(_header_text(t)) for t in types) or (family.guest_named and _PARTIAL.search(wc._text(top))):
-            continue
-        if any(
-            not checkout.by_last.get(base) and not _INTERFACE_NAME.match(base)
-            for t in types
-            if t.type != "interface_declaration"
-            for base in xcs._supertypes(t)
-        ):
             continue
         members = [n for n in cross_file_keys.walk(top) if n.type in _JUDGED_MEMBERS]
         leading: set[str] = set()
@@ -2657,18 +2829,33 @@ def free_members(source: str, root: Node, family: Family, repo_dir: str) -> list
     return free
 
 
+#: A ``using static`` directive, in a file or as a global one.
+_USING_STATIC = re.compile(r"\busing(?:\s|/\*.*?\*/|//[^\n]*)+static\b", re.DOTALL)
+
+
+def _returning_outside(family: Family, source: str) -> frozenset[str]:
+    """The family-returning names a file can reach a member by, outside the
+    members' owners: all of them, less those only static members add, each
+    reached as ``Owner.M`` (``Owner`` is a reaching name, which the file
+    then spells). A file with a ``using static`` reaches them all bare."""
+    if not family.static_returning or _USING_STATIC.search(source):
+        return family.returning
+    return family.returning - frozenset(n for n, _ in family.static_returning)
+
+
 def family_free(source: str, root: Node, family: Family) -> bool:
     """Whether nothing in the file can introduce a value of a family type.
 
     Judged on the raw text, comments and strings included, which can only
     over-taint; ``root`` is the caller's parse of ``source``, unused here. A
     file-based app is never family-free: a ``#:package`` may bring in
-    anything.
+    anything. A read inside a type inheriting a library class's members is
+    judged all the same (:func:`exposed_spans`).
     """
     del root
     if family.opaque or _DYNAMIC.search(source) or _APP_DIRECTIVE.search(source):
         return False
     reaching = family.tainting if family.reaching is None else family.reaching
-    if _spells(source, family.simple_names | reaching | family.returning):
+    if _spells(source, family.simple_names | reaching | _returning_outside(family, source)):
         return False
     return not (family.guest_named and _PARTIAL.search(source))

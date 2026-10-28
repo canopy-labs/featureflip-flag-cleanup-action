@@ -305,8 +305,8 @@ def _list(root: str) -> tuple[SourceFile, ...]:
             # Nothing git lists sits below a symlink, so only the file itself
             # can be one, and a plain file needs no resolving.
             found[path] = SourceFile(path, str(resolved_base / relative), is_ignored)
-        elif stat.S_ISLNK(mode) and not path.is_dir():
-            found[path] = SourceFile(path, str(path.resolve()), is_ignored)
+        elif stat.S_ISLNK(mode) and not path.is_dir() and (resolved := _resolved(path)) is not None:
+            found[path] = SourceFile(path, resolved, is_ignored)
     for rel, is_ignored in directories.items():
         relative = Path(rel)
         if pruned(relative):
@@ -417,8 +417,19 @@ def _walked(
     for path in paths:
         text = str(path)
         if path.is_symlink() or not text.startswith(prefix):
-            resolved = str(path.resolve())
+            resolved = _resolved(path)
+            if resolved is None:
+                continue
         else:
             resolved = resolved_prefix + text[len(prefix):]
         found.append(SourceFile(path, resolved, ignored))
     return found
+
+
+def _resolved(path: Path) -> str | None:
+    """``path`` resolved, or None for a symlink that loops: it names no file,
+    so nothing can read it, and resolving it raises."""
+    try:
+        return str(path.resolve())
+    except (RuntimeError, OSError):
+        return None

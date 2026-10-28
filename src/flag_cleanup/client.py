@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
 
+from flag_cleanup import http_retry
 from flag_cleanup.urls import without_userinfo
 
 
@@ -468,6 +470,7 @@ class FeatureflipClient:
         api_token: str,
         *,
         transport: httpx.BaseTransport | None = None,
+        sleep: http_retry.Sleep = time.sleep,
     ) -> None:
         if not token_is_sendable(api_token):
             # The value is deliberately not in the message: see
@@ -478,8 +481,12 @@ class FeatureflipClient:
                 "header. The value is not shown."
             )
         self._client = httpx.Client(
-            base_url=api_url.rstrip("/"), transport=transport, auth=_BearerAuth(api_token)
+            base_url=api_url.rstrip("/"),
+            transport=transport,
+            auth=_BearerAuth(api_token),
+            timeout=http_retry.TIMEOUT,
         )
+        self._sleep = sleep
 
     def close(self) -> None:
         self._client.close()
@@ -504,7 +511,7 @@ class FeatureflipClient:
             query = dict(params)
             if cursor is not None:
                 query["cursor"] = cursor
-            response = self._client.get(path, params=query)
+            response = http_retry.get(self._client, path, params=query, sleep=self._sleep)
             _raise_for_status_without_credentials(response)
             try:
                 payload = response.json()

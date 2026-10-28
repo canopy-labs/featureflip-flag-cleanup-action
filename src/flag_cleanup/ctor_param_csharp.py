@@ -94,13 +94,197 @@ def _inert(node: Node) -> bool:
     if node.type == "member_access_expression":
         expression = node.child_by_field_name("expression")
         name = node.child_by_field_name("name")
+        # A type's static member (`NullLogger<T>.Instance`, `string.Empty`)
+        # is a read like a value's member.
         return (
             expression is not None
             and name is not None
             and name.type == "identifier"
-            and _inert(expression)
+            and (expression.type in ("generic_name", "predefined_type") or _inert(expression))
         )
     return False
+
+
+#: Literals that convert to no interface the checkout declares: ``int``,
+#: ``string`` and the rest implement only library interfaces, and an
+#: interface declares no conversion.
+_LITERALS = frozenset(
+    {
+        "integer_literal", "real_literal", "boolean_literal", "character_literal", "string_literal",
+        "verbatim_string_literal", "raw_string_literal", "interpolated_string_expression",
+    }
+)
+
+
+def _literal_for_an_interface(arguments: Node, interfaces: frozenset[int]) -> bool:
+    """Whether a target-typed ``new(…)``'s positional arguments pass a
+    literal (:data:`_LITERALS`, a negated number among them) where the
+    constructor takes one of the checkout's interfaces (``interfaces``, by
+    position): then it cannot be calling that constructor. Never with a named
+    argument, whose position this does not follow."""
+    items = _items(arguments)
+    if not interfaces or any(i.child_by_field_name("name") is not None for i in items):
+        return False
+    for position in interfaces:
+        value = _expression(items[position]) if position < len(items) else None
+        if value is not None and value.type == "prefix_unary_expression" and _text(value).startswith("-") and value.named_children:
+            value = value.named_children[-1]
+        if value is not None and (value.type in _LITERALS or _builtin_constant(value)):
+            return True
+    return False
+
+
+#: Types a ``const`` can have, none of which converts to an interface the
+#: checkout declares.
+_CONST_TYPES = frozenset(
+    {"string", "bool", "char", "byte", "sbyte", "short", "ushort", "int", "uint", "long", "ulong", "float",
+     "double", "decimal", "nint", "nuint"}
+)
+
+
+def _builtin_constant(name: Node) -> bool:
+    """Whether the identifier ``name`` can only be a ``const`` field of a
+    predefined type (``private const string ExceptionType = "…";``) that the
+    innermost type enclosing it declares: that type has no primary-constructor
+    parameter of the name, and the member holding ``name`` binds the name
+    nowhere (:func:`_binds`), so no local, parameter, pattern, query or loop
+    variable can be what it reads. A const of an outer type is never taken:
+    the inner type's own, inherited and primary-constructor names win."""
+    if name.type != "identifier":
+        return False
+    spelled = _text(name).removeprefix("@")
+    member, owner = _member_and_owner(name)
+    if owner is None or member is None or owner.type not in _CONST_OWNERS or _binds(member, spelled):
+        return False
+    header = next((c for c in owner.children if c.type == "parameter_list"), None)
+    if header is not None and _binds(header, spelled):
+        return False
+    body = owner.child_by_field_name("body")
+    for declared in body.named_children if body is not None else ():
+        if declared.type != "field_declaration" or "const" not in _modifiers(declared):
+            continue
+        declaration = next((c for c in declared.named_children if c.type == "variable_declaration"), None)
+        if declaration is None or spelled not in _declared_by(declaration):
+            continue
+        type_node = declaration.child_by_field_name("type")
+        return type_node is not None and type_node.type == "predefined_type" and _text(type_node) in _CONST_TYPES
+    return False
+
+
+#: Type declarations, any of which bounds the members a name is looked up in.
+_TYPE_DECLARATIONS = frozenset(
+    {"class_declaration", "struct_declaration", "record_declaration", "record_struct_declaration",
+     "interface_declaration", "enum_declaration", "extension_declaration"}
+)
+
+
+def _member_and_owner(at: Node) -> tuple[Node | None, Node | None]:
+    """The member declaration holding ``at`` and the innermost type that
+    declares it; for a top-level statement, the compilation unit and None."""
+    node = at
+    while node.parent is not None:
+        parent = node.parent
+        if parent.type == "declaration_list" and parent.parent is not None and parent.parent.type in _TYPE_DECLARATIONS:
+            return node, parent.parent
+        if parent.type in _TYPE_DECLARATIONS:
+            return node, parent
+        node = parent
+    return node, None
+
+
+#: Parents whose identifier child binds a name whatever field holds it.
+_BINDING_PARENTS = frozenset({"tuple_pattern", "let_clause", "join_clause", "join_into_clause", "query_continuation"})
+
+
+def _bindings(scope: Node, spelled: str) -> int:
+    """How many places in ``scope`` may bind the name ``spelled``: an
+    identifier in a ``name`` field (declarators, parameters, patterns,
+    ``out var``, deconstructions, ``from``, ``catch``, local functions; and,
+    over-counting on purpose, member names and named arguments), a
+    ``foreach`` variable, a range variable of the other query clauses, a
+    deconstruction element and an implicit lambda parameter."""
+    count = 0
+    for n in _walk(scope):
+        if n.type == "implicit_parameter":
+            count += _text(n).removeprefix("@") == spelled
+            continue
+        if n.type != "identifier" or _text(n).removeprefix("@") != spelled or n.parent is None:
+            continue
+        parent = n.parent
+        index = next(i for i, c in enumerate(parent.children) if c.id == n.id)
+        field = parent.field_name_for_child(index)
+        if field == "name" or (field == "left" and parent.type == "foreach_statement") or parent.type in _BINDING_PARENTS:
+            count += 1
+    return count
+
+
+def _binds(scope: Node, spelled: str) -> bool:
+    return _bindings(scope, spelled) > 0
+
+
+def _declared_by(node: Node, header_only: bool = False) -> set[str]:
+    """The names ``node`` declares: its variable declarators (in its header
+    only, with ``header_only``), parameters, implicit lambda parameter,
+    ``foreach`` variable and ``catch`` variable."""
+    found: set[str] = set()
+    parameters = node.child_by_field_name("parameters")
+    if parameters is not None:
+        if parameters.type in ("identifier", "implicit_parameter"):
+            found.add(_text(parameters))
+        for p in parameters.named_children:
+            label = p.child_by_field_name("name") if p.type == "parameter" else (p if p.type == "implicit_parameter" else None)
+            if label is not None:
+                found.add(_text(label))
+    left = node.child_by_field_name("left") if node.type == "foreach_statement" else None
+    if left is not None and left.type == "identifier":
+        found.add(_text(left))
+    scope = [c for c in node.children if c.type in ("variable_declaration", "catch_declaration")] if header_only else [node]
+    for part in scope:
+        for n in _walk(part):
+            if n.type == "variable_declarator" and (d := n.child_by_field_name("name")) is not None:
+                found.add(_text(d))
+            elif n.type == "catch_declaration" and (d := n.child_by_field_name("name")) is not None:
+                found.add(_text(d))
+    return found
+
+
+#: Constructs that bind names of their own around the code inside them.
+_BINDERS = frozenset(
+    {"method_declaration", "constructor_declaration", "local_function_statement", "lambda_expression",
+     "anonymous_method_expression", "foreach_statement", "for_statement", "using_statement", "catch_clause",
+     "accessor_declaration", "operator_declaration", "conversion_operator_declaration", "indexer_declaration"}
+)
+#: Types whose ``const`` fields an unqualified name inside them may read.
+_CONST_OWNERS = frozenset(
+    {"class_declaration", "struct_declaration", "record_declaration", "record_struct_declaration", "interface_declaration"}
+)
+
+
+def _interface_positions(parameter_list: Node | None, root: Node, path: str, repo_dir: str) -> frozenset[int]:
+    """The positions of the parameters typed as an interface the checkout
+    declares, resolved by C#'s lookup from the declaring file."""
+    from flag_cleanup import cross_file_csharp as xcs
+    from flag_cleanup import wrapper_csharp as wc
+
+    if parameter_list is None:
+        return frozenset()
+    reader = xcs._Reader(root, path, repo_dir)
+    readers = wc._Readers(repo_dir)
+    checkout = xcs.csharp_index(repo_dir)
+    found = set()
+    for position, parameter in enumerate(_parameters(parameter_list)):
+        type_node = parameter.child_by_field_name("type")
+        if type_node is not None and type_node.type == "nullable_type" and type_node.named_children:
+            type_node = type_node.named_children[0]
+        full = wc._type_full(type_node, reader) if type_node is not None else None
+        infos = [i for i in checkout.by_full.get(full or "", ()) if not i.generic]
+        if len(infos) != 1:
+            continue
+        declaring = readers.get(infos[0].path)
+        declaration = wc._find_type(declaring.root, infos[0].chain) if declaring is not None else None
+        if declaration is not None and declaration.type == "interface_declaration":
+            found.add(position)
+    return frozenset(found)
 
 
 def _items(argument_list: Node) -> list[Node]:
@@ -591,6 +775,8 @@ def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal
         return Refusal(label, "an attribute on the parameter (keyed or explicit injection)")
     if any(c.type == "modifier" for c in parameter.children):
         return Refusal(label, "a parameter modifier (ref, out, in, this, scoped)")
+    from flag_cleanup import csharp_family
+
     exported = any(c.type == "modifier" and _text(c) == "public" for c in declaration.children)
     sites, reason = _references(
         class_name,
@@ -601,6 +787,10 @@ def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal
         _arity(parameters),
         repo_dir,
         _namespace_of(declaration),
+        # A project that cannot reference the type's cannot construct it.
+        sees=lambda caller: csharp_family.sees(repo_dir, caller, path),
+        interfaces=_interface_positions(parameters, root, path, repo_dir),
+        inert_in=lambda node, caller: _plain_construction(node, repo_dir, caller),
     )
     if reason is not None:
         return Refusal(label, reason)
@@ -618,6 +808,8 @@ def _references(
     namespace: str = "",
     inert: Callable[[Node], bool] = _inert,
     sees: Callable[[str], bool] | None = None,
+    interfaces: frozenset[int] = frozenset(),
+    inert_in: Callable[[Node, str], bool] | None = None,
 ) -> tuple[list[Site], str | None]:
     """Every site that spells the type ``name``, or a reason it cannot be
     proven: see the module docstring."""
@@ -637,8 +829,15 @@ def _references(
     #: name, and where.
     targeted: list[tuple[str, str]] = []
     aliases: set[str] = set()
+    base_inert = inert
     for file in source_index.files(repo_dir, with_ignored=True):
         spelled = str(file.path)
+        # An argument may also be judged by what the file it is in names.
+        inert = (
+            (lambda node, path=file.resolved: base_inert(node) or inert_in(node, path))
+            if inert_in is not None
+            else base_inert
+        )
         is_cs = spelled.endswith(".cs")
         if not is_cs and not spelled.endswith(guests):
             continue
@@ -657,6 +856,9 @@ def _references(
                 return sites, f"{file.path} mentions it (razor, cshtml or another .NET guest file)"
             continue
         if not mentions and not _NEW_CALL.search(data):
+            continue
+        if not mentions and sees is not None and not sees(file.resolved):
+            # Naming nothing, its `new(…)`s build no type its project cannot see.
             continue
         if file.ignored and mentions:
             return sites, f"{file.path} mentions it and is ignored (not the repository's source)"
@@ -694,11 +896,26 @@ def _references(
             if node.type == "implicit_object_creation_expression":
                 args = _argument_list(node)
                 count = len(_items(args)) if args is not None else 0
-                if arity[0] <= count <= arity[1] and (sees is None or sees(file.resolved)):
+                if (
+                    arity[0] <= count <= arity[1]
+                    and (sees is None or sees(file.resolved))
+                    and not (args is not None and _literal_for_an_interface(args, interfaces))
+                ):
                     where = f"{file.path}:{node.start_point[0] + 1}"
-                    target = _target_name(node, repo_dir) if sees is not None else None
-                    if target is None or target == _decoded(name):
+                    target = _target_name(node, repo_dir, file.resolved) if sees is not None else None
+                    if target is None:
                         return sites, f"{where}: a target-typed new(…) could construct it"
+                    if target == _decoded(name):
+                        # Its context declares this very type: a construction
+                        # like `new Svc(…)`, its argument edited the same way.
+                        # The declared type's own spelling is judged by this
+                        # walk like any other, which compares it as written:
+                        # a file spelling a name with an escape is refused.
+                        if b"\\u" in data or b"\\U" in data:
+                            return sites, f"{where}: a target-typed new(…) could construct it"
+                        reason = _site(spelled, args, index, names, local, inert)
+                        if reason is not None:
+                            return sites, f"{where}: {reason}"
                     targeted.append((target, where))
                 continue
             if node.type != "identifier" or _text(node) != name:
@@ -1069,6 +1286,8 @@ def _decoded(text: str) -> str:
     return text.replace("@", "")
 #: Where a ``return`` takes its target type from the enclosing member.
 _RETURNING = frozenset({"method_declaration", "local_function_statement"})
+#: Operators declare what they return in ``type``: a conversion its target.
+_OPERATORS = ("operator_declaration", "conversion_operator_declaration")
 #: Where a ``return`` belongs to something else, whose type this does not read.
 _FUNCTIONS = frozenset(
     {
@@ -1079,6 +1298,70 @@ _FUNCTIONS = frozenset(
 )
 #: Collections whose initializer passes each element to ``Add(T)``.
 _COLLECTIONS = frozenset({"List", "HashSet"})
+#: Library lists whose indexer's element type is their one type argument.
+_INDEXED_LISTS = frozenset({"List", "IList"})
+#: Library dictionaries whose indexer's element type is their second type argument.
+_INDEXED_MAPS = frozenset({"Dictionary", "SortedDictionary", "SortedList"})
+
+
+def _indexed_element(initializer: Node | None, repo_dir: str, from_path: str | None) -> Node | None:
+    """The element type an index initializer (``[k] = …``) of ``initializer``
+    assigns: the creation's own list or dictionary type, when that is a
+    library type (no checkout type of its name)."""
+    if initializer is None or initializer.type != "initializer_expression":
+        return None
+    creation = initializer.parent
+    if creation is None or creation.type != "object_creation_expression":
+        return None
+    created = creation.child_by_field_name("type")
+    generic = created.child_by_field_name("name") if created is not None and created.type == "qualified_name" else created
+    if generic is None or generic.type != "generic_name":
+        return None
+    arguments = next((c for c in generic.named_children if c.type == "type_argument_list"), None)
+    simple = _simple(generic) or ""
+    if arguments is None or _may_declare_type(repo_dir, simple, from_path):
+        return None
+    count = len(arguments.named_children)
+    if simple in _INDEXED_LISTS and count == 1:
+        return arguments.named_children[0]
+    if simple in _INDEXED_MAPS and count == 2:
+        return arguments.named_children[1]
+    return None
+
+
+def _explicit_local_type(at: Node, name: str) -> Node | None:
+    """The declared type of the local or parameter ``name`` that ``at``
+    reads, when the nearest binding of the name is one with a type written
+    out; ``None`` for ``var``, a pattern variable, a member, or anything this
+    cannot place, and whenever the member holding ``at`` binds the name more
+    than once (a lambda's, a pattern's or another switch section's)."""
+    member, _ = _member_and_owner(at)
+    if member is None or _bindings(member, name) != 1:
+        return None
+    node = at
+    while node.parent is not None:
+        parent = node.parent
+        if parent.type in ("block", "switch_section"):
+            for statement in reversed([c for c in parent.named_children if c.end_byte <= node.start_byte]):
+                if statement.type != "local_declaration_statement":
+                    if name in _declared_by(statement):
+                        return None
+                    continue
+                declaration = next((c for c in statement.named_children if c.type == "variable_declaration"), None)
+                if declaration is not None and name in _declared_by(declaration):
+                    type_node = declaration.child_by_field_name("type")
+                    return None if type_node is None or type_node.type == "implicit_type" else type_node
+        elif parent.type in _BINDERS:
+            parameters = parent.child_by_field_name("parameters")
+            for p in parameters.named_children if parameters is not None else ():
+                if p.type == "parameter" and _text(p.child_by_field_name("name") or p) == name:
+                    return p.child_by_field_name("type")
+            if name in _declared_by(parent, header_only=True):
+                return None
+        if parent.type in _CONST_OWNERS:
+            return None
+        node = parent
+    return None
 
 
 def _xcs():
@@ -1087,11 +1370,55 @@ def _xcs():
     return cross_file_csharp
 
 
-def _target_name(node: Node, repo_dir: str) -> str | None:
+#: repo_dir -> ``(resolved path, type names it may declare)`` of each C#
+#: file that cannot be read (``None``: any) or does not parse whole.
+_UNPARSED: dict[str, list[tuple[str, frozenset[str] | None]]] = {}
+
+
+def _unparsed_files(repo_dir: str) -> list[tuple[str, frozenset[str] | None]]:
+    if repo_dir not in _UNPARSED:
+        from flag_cleanup import source_index
+
+        found: list[tuple[str, frozenset[str] | None]] = []
+        for file in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+            if not str(file.path).endswith(".cs"):
+                continue
+            try:
+                text = file.path.read_bytes().decode("utf-8-sig")
+            except (OSError, UnicodeDecodeError):
+                found.append((file.resolved, None))
+                continue
+            if _parse(text, "csharp").has_error:
+                found.append((file.resolved, _xcs()._declarable_words(text)))
+        _UNPARSED[repo_dir] = found
+    return _UNPARSED[repo_dir]
+
+
+def _may_declare_type(repo_dir: str, name: str, from_path: str | None) -> bool:
+    """Whether a type of this simple name may be declared where ``from_path``
+    (or, with ``None``, any file) can see it: the index holds one in a project
+    that file can see, or a file this cannot read or parse whole may declare
+    one there."""
+    from flag_cleanup import csharp_family
+
+    index = _xcs().csharp_index(repo_dir)
+    if from_path is None:
+        return index.may_declare_type(name)
+    if index.unreadable or any(csharp_family.sees(repo_dir, from_path, info.path) for info in index.by_last.get(name, ())):
+        return True
+    return any(
+        (words is None or name in words) and csharp_family.sees(repo_dir, from_path, path)
+        for path, words in _unparsed_files(repo_dir)
+    )
+
+
+def _target_name(node: Node, repo_dir: str, from_path: str | None = None) -> str | None:
     """The simple name of the type a target-typed ``new(…)`` creates, when
-    its context declares it: the arrow body of a method, local function or
-    property, or a ``return`` in a method or local function (neither
-    ``async``), the value of an explicitly typed declaration, or an element
+    its context declares it: the arrow body of a method, local function,
+    operator, conversion operator or property, or a ``return`` in a method,
+    local function or operator (neither ``async``), the value of an explicitly typed declaration, a branch of a
+    conditional that is one of these and whose other branch has no type of
+    its own (``null``, ``default``, another ``new(…)``), or an element
     of a ``List<T>``/``HashSet<T>`` collection initializer (no such type in
     the checkout). None otherwise, and for a type parameter in scope. The
     caller still refuses a name some ``using`` aliases."""
@@ -1099,12 +1426,60 @@ def _target_name(node: Node, repo_dir: str) -> str | None:
     declared: Node | None = None
     if parent is None:
         return None
-    if parent.type == "arrow_expression_clause" or parent.type == "return_statement":
+    if parent.type == "conditional_expression" and node.id != (parent.child_by_field_name("condition") or node).id:
+        # `c ? null : new(…)`: with no natural type on the other branch the
+        # conditional is target-typed, so the `new` creates what it is
+        # converted to. One that has a type (`c ? foo : new(…)`) types the
+        # `new` itself, which its context may only convert.
+        other = parent.child_by_field_name(
+            "alternative" if node.id == (parent.child_by_field_name("consequence") or node).id else "consequence"
+        )
+        untyped = other is not None and (
+            other.type in ("null_literal", "implicit_object_creation_expression")
+            or (other.type == "default_expression" and not other.named_children)
+        )
+        return _target_name(parent, repo_dir, from_path) if untyped else None
+    if (
+        parent.type == "assignment_expression"
+        and parent.child_by_field_name("right") is not None
+        and parent.child_by_field_name("right").id == node.id
+        and any(not c.is_named and _text(c) == "=" for c in parent.children)
+    ):
+        # `x = new(…)` and `x[i] = new(…)` for a local or parameter `x` of a
+        # declared type: that type, or the element type of a library list or
+        # array (no checkout type of the list's name).
+        left = parent.child_by_field_name("left")
+        if left is not None and left.type == "element_binding_expression":
+            # `new Dictionary<K, V> { [k] = new(…) }`: the value type of a
+            # library dictionary, or the element type of a library list.
+            declared = _indexed_element(parent.parent, repo_dir, from_path)
+        elif left is not None and left.type == "identifier":
+            declared = _explicit_local_type(left, _text(left))
+        elif left is not None and left.type == "element_access_expression":
+            target = left.child_by_field_name("expression")
+            collection = _explicit_local_type(target, _text(target)) if target is not None and target.type == "identifier" else None
+            if collection is not None and collection.type == "nullable_type" and collection.named_children:
+                collection = collection.named_children[0]
+            if collection is not None and collection.type == "array_type":
+                declared = collection.child_by_field_name("type")
+            elif collection is not None and collection.type == "generic_name":
+                arguments = next((c for c in collection.named_children if c.type == "type_argument_list"), None)
+                simple = _simple(collection) or ""
+                if (
+                    arguments is not None
+                    and len(arguments.named_children) == 1
+                    and simple in _INDEXED_LISTS
+                    and not _may_declare_type(repo_dir, simple, from_path)
+                ):
+                    declared = arguments.named_children[0]
+        if declared is None:
+            return None
+    elif parent.type == "arrow_expression_clause" or parent.type == "return_statement":
         owner = parent.parent
         if parent.type == "return_statement":
             while owner is not None and owner.type not in _FUNCTIONS:
                 owner = owner.parent
-        if owner is None or owner.type not in (*_RETURNING, "property_declaration") or "async" in _modifiers(owner):
+        if owner is None or owner.type not in (*_RETURNING, *_OPERATORS, "property_declaration") or "async" in _modifiers(owner):
             return None
         declared = owner.child_by_field_name("returns") or owner.child_by_field_name("type")
     elif parent.type == "variable_declarator":
@@ -1126,7 +1501,7 @@ def _target_name(node: Node, repo_dir: str) -> str | None:
             or _simple(generic) not in _COLLECTIONS
             or arguments is None
             or len(arguments.named_children) != 1
-            or _xcs().csharp_index(repo_dir).may_declare_type(_simple(generic) or "")
+            or _may_declare_type(repo_dir, _simple(generic) or "", from_path)
         ):
             return None
         declared = arguments.named_children[0]
@@ -1266,6 +1641,313 @@ def _family_object(node: Node, family: frozenset[str]) -> bool:
             for a in (_items(arguments) if arguments is not None else [])
         )
     return False
+
+
+def _plain_construction(node: Node, repo_dir: str, path: str, depth: int = 0) -> bool:
+    """Whether ``node`` builds a checkout class whose construction runs
+    nothing but assignments: ``new Stub(enabled: true)`` for ``class Stub {
+    public Stub(bool enabled) => Enabled = enabled; public bool Enabled { get;
+    set; } }``. The class (resolved from ``path``) is not generic or partial,
+    has no base class (interfaces only), no static constructor, every field
+    and property initializer is a literal or a primary-constructor
+    parameter, and every constructor only assigns a parameter or a literal
+    to one of its own members, chaining at most to ``this(…)`` of the same.
+    Its arguments are inert themselves."""
+    from flag_cleanup import cross_file_csharp as xcs
+    from flag_cleanup import csharp_family
+    from flag_cleanup import wrapper_csharp as wc
+
+    if node.type != "object_creation_expression" or depth > 2 or node.child_by_field_name("initializer") is not None:
+        return False
+    arguments = node.child_by_field_name("arguments")
+    if not all(
+        (e := _expression(a)) is not None and (_inert(e) or _plain_construction(e, repo_dir, path, depth + 1))
+        for a in (_items(arguments) if arguments is not None else [])
+    ):
+        return False
+    readers = wc._Readers(repo_dir)
+    reader = readers.get(path)
+    type_node = node.child_by_field_name("type")
+    full = wc._type_full(type_node, reader) if reader is not None and type_node is not None else None
+    infos = [i for i in xcs.csharp_index(repo_dir).by_full.get(full or "", ()) if not i.generic and not i.partial]
+    if len(infos) != 1:
+        return False
+    declaring = readers.get(infos[0].path)
+    declaration = wc._find_type(declaring.root, infos[0].chain) if declaring is not None else None
+    if declaration is None or declaration.type != "class_declaration":
+        return False
+    # A user-defined conversion runs code where a value is passed or stored:
+    # refused when one the checkout declares could serve a slot of the class.
+    targets = _conversion_targets(repo_dir)
+    if targets is None or any(_may_convert_into(t, declaring, readers, targets) for t in _stored_types(declaration)):
+        return False
+    for base in wc._base_nodes(declaration):
+        simple = xcs._simple_name(base) or ""
+        found = wc._checkout_type(wc._Typed(base, declaring), readers)
+        if found is not None:
+            if found[0].type != "interface_declaration":
+                return False
+        elif csharp_family._INTERFACE_NAME.match(simple) is None or simple.endswith(("Exception", "Attribute")):
+            return False
+    primary = {wc._name_of(p) for p in (wc._child(declaration, "parameter_list").named_children if wc._child(declaration, "parameter_list") is not None else ()) if p.type == "parameter"}
+    body = declaration.child_by_field_name("body")
+    # Assigning a property runs its setter: only fields and auto-properties.
+    members = {
+        n
+        for m in (body.named_children if body is not None else ())
+        if m.type == "field_declaration" or (m.type == "property_declaration" and _auto_property(m))
+        for n in (wc._member_names(m) if m.type == "property_declaration" else _field_names(m))
+    }
+    for member in body.named_children if body is not None else ():
+        if member.type == "constructor_declaration":
+            if "static" in xcs._modifiers(member) or not _assigning_constructor(member, members):
+                return False
+        elif member.type in ("field_declaration", "event_field_declaration", "property_declaration"):
+            for initial in _initializers(member):
+                if not (initial.type in _CONSTANT_VALUES or (
+                    initial.type == "identifier" and wc._text(initial) in primary
+                )):
+                    return False
+        elif member.type in ("destructor_declaration", "operator_declaration", "conversion_operator_declaration"):
+            continue
+    return True
+
+
+#: Values that run nothing: literals, but no interpolated string, whose holes do.
+_CONSTANT_VALUES = (_LITERALS - {"interpolated_string_expression"}) | {"null_literal"}
+#: Predefined numeric types: a conversion to one serves a wider one too.
+_NUMERIC = frozenset(
+    {"sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong", "nint", "nuint", "float", "double", "decimal", "char"}
+)
+#: repo_dir -> :func:`_conversion_targets`.
+_CONVERSIONS: dict[str, tuple[frozenset[str], bool] | None] = {}
+
+
+def _conversion_targets(repo_dir: str) -> tuple[frozenset[str], bool] | None:
+    """What a value may become through a user-defined ``implicit`` or
+    ``explicit`` conversion the checkout declares: the simple names of each
+    operator's target type and of every type a checkout target derives from
+    or implements (a conversion to ``T`` serves a slot of any of those), all
+    numeric types when a target is numeric; and whether some target is a
+    library or generic type, whose supertypes are not known here. ``None``
+    when a file cannot be read or parsed."""
+    if repo_dir not in _CONVERSIONS:
+        _CONVERSIONS[repo_dir] = _find_conversion_targets(repo_dir)
+    return _CONVERSIONS[repo_dir]
+
+
+def _find_conversion_targets(repo_dir: str) -> tuple[frozenset[str], bool] | None:
+    from flag_cleanup import cross_file_csharp as xcs
+    from flag_cleanup import wrapper_csharp as wc
+
+    pattern = re.compile(r"\b(?:implicit|explicit)\s+operator\b")
+    names: set[str] = set()
+    library = False
+    readers = wc._Readers(repo_dir)
+    for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+        text = wc._read(f.resolved)
+        if text is None:
+            return None
+        if pattern.search(text) is None:
+            continue
+        reader = readers.get(f.resolved)
+        if reader is None or reader.root.has_error:
+            return None
+        for node in _walk(reader.root):
+            if node.type != "conversion_operator_declaration":
+                continue
+            target = node.child_by_field_name("type")
+            if target is None:
+                return None
+            pending = [(target, reader)]
+            seen: set[str] = set()
+            while pending:
+                type_node, in_reader = pending.pop()
+                if type_node.type == "nullable_type" and type_node.named_children:
+                    type_node = type_node.named_children[0]
+                if type_node.type == "predefined_type":
+                    simple = wc._text(type_node)
+                    names.add(simple)
+                    if simple in _NUMERIC:
+                        names.update(_NUMERIC)
+                    continue
+                simple = xcs._simple_name(type_node)
+                if simple is None:
+                    return None
+                if simple in seen:
+                    continue
+                seen.add(simple)
+                names.add(simple)
+                # Every part of a partial type, and a generic one, has bases.
+                full = wc._type_full(type_node, in_reader)
+                infos = xcs.csharp_index(repo_dir).by_full.get(full or "", ()) if full is not None else ()
+                if not infos:
+                    library = True
+                    continue
+                for info in infos:
+                    declaring = readers.get(info.path)
+                    declaration = (
+                        wc._find_type_in(declaring.root, info.namespace, info.chain) if declaring is not None else None
+                    )
+                    if declaration is None:
+                        return None
+                    pending.extend((base, declaring) for base in wc._base_nodes(declaration))
+    return frozenset(names), library
+
+
+def _stored_types(declaration: Node) -> list[Node | None]:
+    """The declared types a construction of ``declaration`` passes values
+    into or stores: its primary-constructor and constructor parameters, and
+    its fields, events and properties (``None`` for one it cannot read)."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    body = declaration.child_by_field_name("body")
+    members = list(body.named_children) if body is not None else []
+    found: list[Node | None] = []
+    lists = [wc._child(declaration, "parameter_list")]
+    lists += [wc._child(m, "parameter_list") for m in members if m.type == "constructor_declaration"]
+    for listed in lists:
+        for parameter in listed.named_children if listed is not None else ():
+            if parameter.type == "parameter":
+                found.append(parameter.child_by_field_name("type"))
+    for member in members:
+        if member.type in ("property_declaration", "event_declaration"):
+            found.append(member.child_by_field_name("type"))
+        elif member.type in ("field_declaration", "event_field_declaration"):
+            variables = wc._child(member, "variable_declaration")
+            found.append(variables.child_by_field_name("type") if variables is not None else None)
+    return found
+
+
+def _may_convert_into(
+    type_node: Node | None, reader: object, readers: object, targets: tuple[frozenset[str], bool]
+) -> bool:
+    """Whether a user-defined conversion of :func:`_conversion_targets` could
+    serve a slot of type ``type_node``: never ``object`` or ``dynamic``,
+    which take every value by a standard conversion."""
+    from flag_cleanup import cross_file_csharp as xcs
+    from flag_cleanup import wrapper_csharp as wc
+
+    names, library = targets
+    while type_node is not None and type_node.type in ("nullable_type", "array_type"):
+        type_node = type_node.named_children[0] if type_node.named_children else None
+    if type_node is None:
+        return True
+    if type_node.type == "predefined_type":
+        simple = wc._text(type_node)
+        return simple != "object" and simple in names
+    simple = xcs._simple_name(type_node)
+    if simple is None:
+        return True
+    if simple == "dynamic":
+        return False
+    if simple in names:
+        return True
+    # A library target serves a library-typed slot; a checkout type's
+    # subtypes are all in ``names``.
+    full = wc._type_full(type_node, reader)
+    return library and not (full is not None and xcs.csharp_index(readers.repo_dir).by_full.get(full))
+
+
+def _auto_property(property_node: Node) -> bool:
+    """Whether every accessor of a property has no body (``{ get; set; }``)."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    accessors = wc._child(property_node, "accessor_list")
+    if accessors is None:
+        return False
+    listed = [a for a in accessors.named_children if a.type == "accessor_declaration"]
+    return bool(listed) and all(a.child_by_field_name("body") is None for a in listed)
+
+
+def _field_names(field_node: Node) -> list[str]:
+    from flag_cleanup import wrapper_csharp as wc
+
+    declaration = wc._child(field_node, "variable_declaration")
+    return [
+        n
+        for d in (declaration.named_children if declaration is not None else ())
+        if d.type == "variable_declarator" and (n := wc._name_of(d))
+    ]
+
+
+def _initializers(member: Node) -> list[Node]:
+    """The initializer values of a field's declarators or a property."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    found = []
+    if member.type == "property_declaration":
+        value = member.child_by_field_name("value")
+        # `=> expr` is the getter's body, run when read, not an initializer.
+        if value is not None and value.type != "arrow_expression_clause":
+            found.append(value)
+        return found
+    declaration = wc._child(member, "variable_declaration")
+    for declarator in declaration.named_children if declaration is not None else ():
+        if declarator.type != "variable_declarator":
+            continue
+        values = [c for c in wc._named(declarator) if c.id != (declarator.child_by_field_name("name") or c).id]
+        found += values[-1:]
+    return found
+
+
+def _assigning_constructor(constructor: Node, members: set[str]) -> bool:
+    """Whether ``constructor`` only assigns its parameters or literals to the
+    class's own ``members`` (``M = p``, ``this.M = p``), chaining at most to
+    ``this(…)`` with such arguments."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    listed = constructor.child_by_field_name("parameters")
+    names = {wc._name_of(p) for p in (listed.named_children if listed is not None else ()) if p.type == "parameter"}
+    if listed is not None and any(
+        c.type == "modifier" for p in listed.named_children if p.type == "parameter" for c in p.children
+    ):
+        return False
+
+    def value_ok(value: Node | None) -> bool:
+        return value is not None and (
+            value.type in _CONSTANT_VALUES or (value.type == "identifier" and wc._text(value) in names)
+        )
+
+    initializer = wc._child(constructor, "constructor_initializer")
+    if initializer is not None:
+        if not wc._text(initializer).lstrip(": \t\n").startswith("this"):
+            return False
+        chained = _argument_list(initializer)
+        if chained is not None and not all(value_ok(_expression(a)) for a in _items(chained)):
+            return False
+    body = constructor.child_by_field_name("body")
+    if body is None:
+        return False
+    if body.type == "arrow_expression_clause":
+        statements = [c for c in body.named_children if c.type != "comment"]
+    elif body.type == "block":
+        statements = []
+        for statement in body.named_children:
+            if statement.type == "comment":
+                continue
+            if statement.type != "expression_statement" or len(statement.named_children) != 1:
+                return False
+            statements.append(statement.named_children[0])
+    else:
+        return False
+    for expression in statements:
+        if expression.type != "assignment_expression":
+            return False
+        operator = next((c for c in expression.children if not c.is_named), None)
+        left = expression.child_by_field_name("left")
+        if operator is None or wc._text(operator) != "=" or left is None:
+            return False
+        if left.type == "member_access_expression":
+            receiver = left.child_by_field_name("expression")
+            if receiver is None or receiver.type != "this":
+                return False
+            left = left.child_by_field_name("name")
+        if left is None or left.type != "identifier" or wc._text(left) not in members:
+            return False
+        if not value_ok(expression.child_by_field_name("right")):
+            return False
+    return True
 
 
 def _family_inert(family: frozenset[str]) -> Callable[[Node], bool]:
@@ -1522,6 +2204,8 @@ def plan_classic(
         _namespace_of(declaration),
         inert=_family_inert(family),
         sees=lambda caller: csharp_family.sees(repo_dir, caller, path),
+        interfaces=_interface_positions(parameters, root, path, repo_dir),
+        inert_in=lambda node, caller: _plain_construction(node, repo_dir, caller),
     )
     if reason is not None:
         return Refusal(label, reason)

@@ -1336,11 +1336,12 @@ def pr_body(
         count = len(rebuilt)
         noun = "test now runs" if count == 1 else "tests now run"
         lines += [
-            f"> **⚠️ {count} {noun} with the kept value: review them.** Each built a test fake "
-            f"with `{'false' if candidate.treatment else 'true'}` — the **{deleted}** branch — through a "
-            "public test helper that other files call, often as a neutral baseline. Nothing was "
-            "deleted: the helper's parameter is gone and the fake is built with the kept value, so a "
-            "test that asserted on the removed behaviour may now fail:",
+            f"> **⚠️ {count} {noun} with the kept value: review {'it' if count == 1 else 'them'}.** "
+            f"Each built a test fake with `{'false' if candidate.treatment else 'true'}` — the "
+            f"**{deleted}** branch — through another member of a public test helper "
+            "(`Off() => Create(false)`), not by passing the value itself. Nothing was deleted: the "
+            "helper's parameter is gone and the fake is built with the kept value, so a test that "
+            "asserted on the removed behaviour may now fail:",
             ">",
             *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in rebuilt[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -1929,7 +1930,7 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     rebuilt = [(p, t) for p, kind, t in test_doubles if kind == REBUILT]
     if rebuilt:
         logger.warning(
-            "%d test%s now run%s with the kept value through a public test helper; review: %s",
+            "%d test%s now run%s with the kept value through a test helper; review: %s",
             len(rebuilt),
             "" if len(rebuilt) == 1 else "s",
             "s" if len(rebuilt) == 1 else "",

@@ -2225,11 +2225,12 @@ A call is folded only when its file proves the receiver is that method's class:
   its type, or created as `FeatureFlags(…)`, `new FeatureFlags(…)` (also as
   `var x = new FeatureFlags(…)` in C#), `mockk<FeatureFlags>()` or
   `mock(FeatureFlags.class)`;
-- in C#, `var x = services.GetRequiredService<IFeatureFlags>()` (and
-  `GetService`, `GetRequiredKeyedService`, `GetKeyedService`), when
-  `Microsoft.Extensions.DependencyInjection` is in scope and no type of yours
-  declares a method of one of those names (a C# file that does not parse
-  counts as declaring any name it spells);
+- in C#, `services.GetRequiredService<IFeatureFlags>()` (and `GetService`,
+  `GetRequiredKeyedService`, `GetKeyedService`), read directly or through a
+  `var` it initializes, when `Microsoft.Extensions.DependencyInjection` is in
+  scope and no type of yours declares a method of one of those names (a C#
+  file that does not parse counts as declaring one when it spells the name
+  with type arguments anywhere but after a `.`);
 - `this.field` of such a field;
 - the class's name, for a `static` method or a member of an `object` or
   companion object;
@@ -2252,13 +2253,22 @@ when:
   (`public Job(IGate gate)`) does not count as leading to one: it takes a
   value in and hands none back. This holds only while the interface has no
   attributes, and never while a `global using static` (or a project
-  `<Using Static="true">` item) names one of these types or leads to one;
+  `<Using Static="true">` item) names one of these types or leads to one.
+  An inherited library member typed `dynamic` (MVC's `ViewBag`) may hold one
+  of the types, so a read that may go through one is not cleared this way.
+  That means a read inside a class with a library class among its bases
+  (directly or through bases of yours, or a class nested in one) through
+  `this`, an inherited member or a `var` holding one, and a read anywhere
+  through a member such a class of yours inherits rather than declares. A
+  library base named like an
+  interface (`I` and a capital) is taken as one. This assumes no other
+  library member hands one of the types back as `dynamic`, a lambda's
+  parameter included;
 - it is read through a receiver (`row.IsCheckoutEnabled`) in a member whose
   own text spells none of those names, nor a private member or nested type of
   its class that leads to one, nor `dynamic`, while no file of yours uses
-  `dynamic` outside a comment or a string, its class is none of the types and inherits from no library
-  class (a library base spelled like an interface, `I` and a capital, is
-  taken as one), and no extension block or implementation based outside the
+  `dynamic` outside a comment or a string, its class is none of the types, the read cannot go
+  through an inherited library member (see the point above), and no extension block or implementation based outside the
   repository is in play. This assumes a
   library call never hands one of the types back as `dynamic`;
 - its receiver's declared type is another type;
@@ -2385,7 +2395,11 @@ expression), is pinned the same way, the construction then taking the kept
 literal, when every call in the file
 passes a literal or relies on a literal default. The stub, the parameter and
 the argument at every call go, and a test whose call passes the value being
-removed goes whole. A call may also pass an xUnit `[Theory]`'s own `bool`
+removed goes whole. A call that gets the removed value only through the
+parameter's default, passing nothing, never chose it and may still depend on
+it, so the helper is left as it is and the wrapper stays partial. Another method of
+the same name called on a value (`services.BuildServiceProvider()` inside a
+static `BuildServiceProvider(…)` helper) is not a call of the helper. A call may also pass an xUnit `[Theory]`'s own `bool`
 parameter (`Make(on)` in `Rows(bool on, string expected)`), when every
 attribute on the theory is `[Theory]` or one `[InlineData(…)]` per line with a
 `true`/`false` literal in that column and no property set (`Skip`), the
@@ -2407,16 +2421,33 @@ keep the stub, and the wrapper stays partial.
 A public static helper of a `static` class whose `bool` parameter builds a
 test fake (`public static Expiry Create(Ctx c, bool expiration = true) =>
 new(c, new StubGate(expiration))`) is called from other files, often as a
-neutral baseline by tests about something else. No test is deleted for it:
-the fake is built with the value the flag keeps, the parameter goes, and every
-call loses its argument. Each test that passed the value being removed, directly
-or through another public helper of the same class (`Off() => Create(c,
-false)`), now runs with the kept value, and the pull request lists it for
-review, since one that asserted on the removed behaviour may now fail. Every
+neutral baseline by tests about something else. The fake is built with the
+value the flag keeps, the parameter goes, and every call loses its argument. A
+test that passes the value being removed itself is deleted, as for a private
+helper. One that reaches it through another public helper of the same class
+(`Off() => Create(c, false)`) now runs with the kept value, and the pull request
+lists it for review, since one that asserted on the removed behaviour may now
+fail. A call that passes nothing, where the parameter's default is the value
+being removed, never chose that value and may still depend on it, so the
+helper is left as it is and the wrapper stays partial. Every
 call in the repository must be `Owner.Create(…)` (or a plain call inside the
 class) passing a `true`/`false` literal or nothing. The class's name must be
-declared once and named by no `using static`, alias, string or Razor file,
-and the parameter by no doc comment. Otherwise the wrapper stays partial.
+declared once and named by no `using static`, alias, string or Razor file.
+A doc comment may name the parameter only as `<paramref name="…"/>`, which
+becomes `<c>…</c>`. Otherwise the wrapper stays partial.
+
+The same holds for a public instance method of a top-level `sealed` class
+(`public sealed class TestHost { public Svc Make(bool enabled = false) => … }`,
+called as `using var h = TestHost.Create(); h.Make()`). In a file that may
+hold a `TestHost`, every `recv.Make(…)` must have a receiver whose type is
+known: declared, created with `new`, a `var` from either, or the result of a
+static method of one of your types whose declared return type says it. A
+receiver of another type calls another method, and one whose type cannot be
+told, a `dynamic` one or a conditional access (`h?.Make()`) keeps the
+wrapper. So does a helper with an overload of its name, or one that may
+implement or override a member of a base (any base but your own types that
+do not declare the name, `IDisposable` and `IAsyncDisposable`), and a call of
+its name inside a type nested in the class.
 
 A test that reads the member through a receiver typed as another
 implementation (`var config = new ConfigFlags(o); … config.IsCheckoutEnabled`)

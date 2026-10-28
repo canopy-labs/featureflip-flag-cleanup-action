@@ -1915,11 +1915,46 @@ def _namespace_in_scope(at: Node, reader: xcs._Reader, namespace: str) -> bool:
     )
 
 
-def _locator_ok(at: Node, reader: xcs._Reader) -> bool:
+#: A lookup's name followed by type arguments: a generic method's
+#: declaration, or a call of one.
+_LOCATOR_GENERIC = re.compile(r"(?<![\w@])@?(?:" + "|".join(sorted(_LOCATORS)) + r")\s*<")
+#: repo_dir -> whether a C# file that does not parse whole may declare a
+#: generic method named as a typed lookup.
+_LOCATOR_DECLARED: dict[str, bool] = {}
+
+
+def _unparsed_declares_locator(repo_dir: str) -> bool:
+    """Whether a C# file of the checkout that cannot be read, or does not
+    parse whole, may declare a generic method named like one of
+    :data:`_LOCATORS`: a spelling of the name with type arguments that is
+    not a member access (``sp.GetRequiredService<T>()`` is one, and only a
+    call). A bare call counts, which only errs toward declaring."""
+    if repo_dir not in _LOCATOR_DECLARED:
+        from flag_cleanup import source_index
+
+        found = False
+        for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+            if not f.path.name.endswith(".cs"):
+                continue
+            text = _read(f.resolved)
+            if text is None:
+                found = True
+                break
+            if _LOCATOR_GENERIC.search(text) is None or not parse(text).has_error:
+                continue
+            if any(not text[: m.start()].rstrip().endswith(".") for m in _LOCATOR_GENERIC.finditer(text)):
+                found = True
+                break
+        _LOCATOR_DECLARED[repo_dir] = found
+    return _LOCATOR_DECLARED[repo_dir]
+
+
+def _locator_ok(at: Node, reader: xcs._Reader, repo_dir: str) -> bool:
     """Whether a ``GetRequiredService<T>()`` here can only be the DI lookup:
     its namespace is in scope, and no repository type declares a method of
-    one of those names."""
-    if any(reader.index.spelled_where_unparsed(n) for n in _LOCATORS):
+    one of those names (:func:`_unparsed_declares_locator` for a file this
+    cannot read whole)."""
+    if reader.index.unreadable or _unparsed_declares_locator(repo_dir):
         return False
     if not _namespace_in_scope(at, reader, _DI_NAMESPACE):
         return False
@@ -2060,9 +2095,87 @@ def _declarator_type(
             return _UNTYPED
         if type_node.type == "implicit_type":
             values = [c for c in _named(declarator) if c.id != declarator.child_by_field_name("name").id]
-            return _creation_type(values[-1] if values else None, factories)
+            found = _creation_type(values[-1] if values else None, factories)
+            if found == _UNTYPED and values and readers is not None and path is not None:
+                return _self_factory(values[-1], name, readers, path) or _UNTYPED
+            return found
         return type_node
     return None
+
+
+def _nested_type_named(at: Node, name: str) -> bool:
+    """Whether the nearest enclosing type declaring a member ``name`` around
+    ``at`` declares only nested types of that name."""
+    scope = at.parent
+    while scope is not None:
+        if scope.type in _SCOPE_TYPES:
+            body = scope.child_by_field_name("body")
+            named = [
+                m
+                for m in (body.named_children if body is not None else ())
+                if name in _member_names(m) or (m.type in _TYPES and (_name_of(m) or "").removeprefix("@") == name)
+            ]
+            if named:
+                return all(m.type in _TYPES for m in named)
+        scope = scope.parent
+    return False
+
+
+def _self_factory(value: Node, name: str, readers: _Readers, path: str) -> Node | None:
+    """``Owner`` in ``var name = Owner.M(…)`` -- the receiver, a type node
+    of this file -- when ``Owner`` is a repository type whose every method
+    ``M`` is static, takes no type parameter and is declared to return
+    ``Owner`` itself, no other member of it is named ``M`` (a delegate
+    property is invoked the same way), no base may declare one (overload
+    resolution falls back to a base's applicable method), and no C# 14
+    ``extension`` block anywhere may add one. ``None`` otherwise."""
+    from flag_cleanup import csharp_family
+
+    if value.type != "invocation_expression":
+        return None
+    function = value.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return None
+    receiver = function.child_by_field_name("expression")
+    method = function.child_by_field_name("name")
+    if receiver is None or method is None or method.type != "identifier":
+        return None
+    if csharp_family.declares_extension_blocks(readers.repo_dir):
+        return None  # a C# 14 `extension(Owner)` block may add a static `M` of its own
+    head = receiver
+    while head.type == "member_access_expression":
+        head = head.child_by_field_name("expression")
+    if head is None or head.type != "identifier" or _text(head) == name:
+        return None
+    if _binding(value, _text(head), readers, path, locals_only=True) is not None:
+        return None  # a local or parameter of the name, which hides the type
+    if _binding(value, _text(head), readers, path) is not None and not _nested_type_named(value, _text(head)):
+        return None  # a member of the name, which hides the type
+    reader = readers.get(path)
+    full = _type_full(receiver, reader) if reader is not None else None
+    if full is None:
+        return None
+    infos = [i for i in xcs.csharp_index(readers.repo_dir).by_full.get(full, ()) if not i.generic]
+    if len(infos) != 1 or infos[0].partial:
+        return None
+    declaring = readers.get(infos[0].path)
+    declaration = _find_type(declaring.root, infos[0].chain) if declaring is not None else None
+    body = declaration.child_by_field_name("body") if declaration is not None else None
+    if body is None or _inherits(declaration, _text(method), readers, infos[0].path):
+        return None
+    named = [m for m in body.named_children if _text(method) in _member_names(m)]
+    if not named:
+        return None
+    for member in named:
+        returns = member.child_by_field_name("returns") if member.type == "method_declaration" else None
+        if (
+            returns is None
+            or "static" not in xcs._modifiers(member)
+            or _child(member, "type_parameter_list") is not None
+            or _type_full(returns, declaring) != full
+        ):
+            return None
+    return receiver
 
 
 def _parameter_type(parameters: Node | None, name: str) -> Node | str | None:
@@ -2107,9 +2220,46 @@ def _inherits(scope: Node, name: str, readers: _Readers, path: str) -> bool:
         return True
     if not _base_nodes(scope):
         return False
-    if not _bases_in_repository(readers, path, scope):
+    if not _bases_in_repository(readers, path, scope) and not _library_bases_are_interfaces(readers, path, scope, set()):
         return True
     return name in xcs.csharp_index(readers.repo_dir).inherited_members(xcs._supertypes(scope))
+
+
+def _library_bases_are_interfaces(readers: _Readers, path: str, type_node: Node, seen: set[str]) -> bool:
+    """Whether every base of ``type_node``, through the repository's own
+    types, is a repository type or a library one spelled like an interface
+    (``IJob``) that the checkout declares nothing of the name of. A class
+    reaches no interface member by its simple name, so such a base adds no
+    name to its scope (the convention :func:`csharp_family.library_based`
+    takes too)."""
+    from flag_cleanup import csharp_family
+
+    reader = readers.get(path)
+    if reader is None:
+        return False
+    checkout = xcs.csharp_index(readers.repo_dir)
+    for base in _base_nodes(type_node):
+        full = _type_full(base, reader)
+        infos = [i for i in checkout.by_full.get(full or "", ()) if not i.generic]
+        if full is not None and len(infos) == 1 and not infos[0].partial:
+            if full in seen:
+                continue
+            seen.add(full)
+            declaring = readers.get(infos[0].path)
+            declaration = _find_type(declaring.root, infos[0].chain) if declaring is not None else None
+            if declaration is None or not _library_bases_are_interfaces(readers, infos[0].path, declaration, seen):
+                return False
+            continue
+        simple = xcs._simple_name(base)
+        if (
+            simple is None
+            or checkout.may_declare_type(simple)
+            or csharp_family._INTERFACE_NAME.match(simple) is None
+            # Class conventions that also start so (`IOException`).
+            or simple.endswith(("Exception", "Attribute"))
+        ):
+            return False
+    return True
 
 
 def _in_global_statement(at: Node) -> bool:
@@ -2495,7 +2645,23 @@ def _in_test_double(at: Node, data: bytes) -> bool:
     node = at
     while node.parent is not None and node.parent.type != "block" and node.type not in _MEMBERS:
         node = node.parent
-    return bool(mock_stubs._DSL.search(data[node.start_byte : node.end_byte].decode("utf-8", "replace")))
+    return bool(mock_stubs._DSL.search(_code_only(node, data)))
+
+
+def _code_only(node: Node, data: bytes) -> str:
+    """``node``'s text with each comment and plain string literal in it
+    blanked: a mocking DSL is a call, so prose ("every tick") is none, and a
+    real one is never only a comment or a string."""
+    text = bytearray(data[node.start_byte : node.end_byte])
+    stack = list(node.children)
+    while stack:
+        child = stack.pop()
+        if child.type == "comment" or child.type in _LITERALS:
+            start, end = child.start_byte - node.start_byte, child.end_byte - node.start_byte
+            text[start:end] = re.sub(rb"[^\n]", b" ", bytes(text[start:end]))
+            continue
+        stack.extend(child.children)
+    return text.decode("utf-8", "replace")
 
 
 def _enclosing_test_method(at: Node, data: bytes) -> bool:
@@ -2768,6 +2934,163 @@ def _target_object_type(node: Node, readers: _Readers, path: str) -> Node | None
     return bound if bound is not None and not isinstance(bound, str) else None
 
 
+#: Where a receiver chain goes on toward its head, by field.
+_CHAIN_FIELDS = {
+    "member_access_expression": "expression",
+    "invocation_expression": "function",
+    "element_access_expression": "expression",
+    "conditional_access_expression": "condition",
+}
+#: Heads whose type is spelled where they stand, or is no class's.
+_TYPED_HEADS = frozenset(
+    {
+        "object_creation_expression",
+        "array_creation_expression",
+        "cast_expression",
+        "typeof_expression",
+        "default_expression",
+        "string_literal",
+        "verbatim_string_literal",
+        "raw_string_literal",
+        "interpolated_string_expression",
+        "integer_literal",
+        "real_literal",
+        "boolean_literal",
+        "character_literal",
+        "predefined_type",
+    }
+)
+
+
+def _chain_head(node: Node | None) -> Node | None:
+    """Where the receiver chain ``node`` starts: ``ViewBag`` in
+    ``ViewBag.Gate``, ``this`` in ``this.Get()[0]``."""
+    while node is not None:
+        field = _CHAIN_FIELDS.get(node.type)
+        if field is not None:
+            node = node.child_by_field_name(field)
+        elif node.type in ("parenthesized_expression", "await_expression") and node.named_children:
+            node = node.named_children[0]
+        elif node.type == "postfix_unary_expression" and _text(node).endswith("!"):
+            node = _unwrap(node)
+        else:
+            return node
+    return None
+
+
+def _implicit_value(at: Node, name: str) -> Node | None | bool:
+    """The value a ``var`` local or ``foreach (var …)`` variable named
+    ``name`` takes from, when that is what binds it at ``at``; True when a
+    lambda's parameter binds it; None otherwise."""
+    scope = at.parent
+    while scope is not None and scope.type not in _SCOPE_TYPES:
+        if scope.type in ("lambda_expression", "anonymous_method_expression"):
+            if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+                return True
+        elif scope.type in _FUNCTIONS:
+            if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+                return None
+        elif scope.type == "foreach_statement":
+            left = scope.child_by_field_name("left")
+            if left is not None and left.type == "identifier" and _text(left) == name:
+                kind = scope.child_by_field_name("type")
+                return scope.child_by_field_name("right") if kind is not None and kind.type == "implicit_type" else None
+        elif scope.type in ("block", "switch_section"):
+            for statement in _statements_in_scope(scope):
+                if statement.type != "local_declaration_statement" or statement.start_byte >= at.start_byte:
+                    continue
+                declaration = _child(statement, "variable_declaration")
+                kind = declaration.child_by_field_name("type") if declaration is not None else None
+                for declarator in declaration.named_children if declaration is not None else ():
+                    if declarator.type == "variable_declarator" and _name_of(declarator) == name:
+                        if kind is None or kind.type != "implicit_type":
+                            return None
+                        values = [c for c in _named(declarator) if c.id != declarator.child_by_field_name("name").id]
+                        return values[-1] if values else None
+        scope = scope.parent
+    return None
+
+
+def _type_word(type_node: Node | None) -> str | None:
+    """The simple name a type node spells: ``Foo`` in ``Ns.Foo<T>?``."""
+    while type_node is not None and type_node.type in ("nullable_type", "array_type") and type_node.named_children:
+        type_node = type_node.named_children[0]
+    if type_node is None:
+        return None
+    if type_node.type == "predefined_type":
+        return _text(type_node)
+    name = xcs._simple_name(type_node)
+    return name.removeprefix("@") if name is not None else None
+
+
+def _off_library(head: Node, word: str | None, based: frozenset[str], members_of) -> bool:
+    """Whether a chain starting at ``head``, a value of the type ``word``,
+    goes on through a member that type inherits from a library class: one
+    of the checkout's ``based`` types, whose next member is declared by
+    none of the checkout's types up its chain (``_inner.ViewBag``, not
+    ``_context.Flags``)."""
+    if word not in based:
+        return False
+    parent = head.parent
+    while parent is not None and parent.type == "parenthesized_expression":
+        head, parent = parent, parent.parent
+    if parent is None or parent.type != "member_access_expression" or _field(parent, head) != "expression":
+        return True
+    name = parent.child_by_field_name("name")
+    if name is not None and name.type == "generic_name" and name.named_children:
+        name = name.named_children[0]
+    return name is None or _text(name).removeprefix("@") not in members_of(word)
+
+
+def _inherited_reach(
+    receiver: Node | None,
+    readers: _Readers,
+    path: str,
+    based: frozenset[str],
+    inside: bool,
+    members_of,
+    depth: int = 0,
+) -> bool:
+    """Whether a read's receiver chain may start at a member a type inherits
+    from a library class, such as MVC's ``ViewBag``, typed ``dynamic``.
+
+    Anywhere, at a value whose declared or created type is one of the
+    checkout's ``based`` types when the chain goes on through a member it
+    inherits (:func:`_off_library`: ``_inner.ViewBag``,
+    ``new Home().ViewBag``). ``inside`` such a type, also at
+    ``this``/``base``, a name nothing in the file binds or a base may
+    supply, or a pattern, ``out`` or deconstruction variable. A ``var``
+    local or ``foreach`` variable is followed to its value. A lambda's
+    parameter starts at none, by the assumption that a library never hands
+    a family value back as ``dynamic``; nor does a name a declaration
+    spelling another type binds, unless that type is ``dynamic``."""
+    head = _chain_head(_unwrap(receiver))
+    if head is None:
+        return inside
+    if head.type in ("object_creation_expression", "cast_expression"):
+        return _off_library(head, _type_word(head.child_by_field_name("type")), based, members_of)
+    if head.type in _TYPED_HEADS:
+        return False
+    if head.type == "generic_name" and head.named_children:
+        head = head.named_children[0]
+    if head.type != "identifier":
+        return inside  # `this`, `base`, or an expression this does not follow
+    name = _text(head).removeprefix("@")
+    # Before any enclosing local: one in a lambda may shadow it.
+    if _pattern_binds(head, name):
+        return inside
+    value = _implicit_value(head, name)
+    if value is True:
+        return False
+    if isinstance(value, Node):
+        return depth >= 8 or _inherited_reach(value, readers, path, based, inside, members_of, depth + 1)
+    bound = _binding(head, name, readers, path)
+    if bound is None or isinstance(bound, str):
+        return inside
+    word = _type_word(bound)
+    return word == "dynamic" or _off_library(head, word, based, members_of)
+
+
 def _declaring_scope(at: Node, name: str) -> Node | None:
     """The node whose scope declares the ``name`` read at ``at``: a block, a
     function or lambda with that parameter, a ``for``/``foreach``/``using``
@@ -2913,15 +3236,25 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     reader = xcs._Reader(root, path, index.repo_dir)
     readers = _Readers(index.repo_dir)
     readers.add(reader)
-    readers.locator = _locator_ok(root, reader)
+    readers.locator = _locator_ok(root, reader, index.repo_dir)
     readers.substitute = _substitute_ok(root, reader, readers)
     from flag_cleanup import csharp_family
 
     family = index.family
-    if family is not None and (
-        not csharp_family.reaches(index.repo_dir, path, family)
-        or csharp_family.family_free(source, root, family)
-    ):
+    if family is not None and not csharp_family.reaches(index.repo_dir, path, family):
+        return []
+    # Types inheriting a library class's members: one of those may be typed
+    # `dynamic` (MVC's `ViewBag`) and hold a family value another file
+    # stored, so a read whose receiver may start at one is judged even where
+    # proof 2 holds (`exposed_read`). In a family-free file no other mention
+    # is the wrapper's.
+    exposed = csharp_family.exposed_spans(source, root, family) if family is not None else []
+    whole = family is not None and csharp_family.family_free(source, root, family)
+    # The checkout's types inheriting a library class, which the file names:
+    # one of their values reaches those members by name from anywhere.
+    based = family.library_based if family is not None else frozenset()
+    names_based = csharp_family._spells(source, based)
+    if whole and not exposed and not names_based:
         # No value of a family type can be here: no mention is the wrapper's.
         return []
     # A member name is evidence of a type only where nothing can bind any
@@ -2958,12 +3291,57 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         targets.add(f"{interface.package}.{interface.name}" if interface.package else interface.name)
     # A read through a shared fake binds the member it keeps (wi.SharedFake).
     shared = {_full_name(s.namespace, s.chain or s.owner) for s in wrapper.shared}
+    def in_exposed(node: Node) -> bool:
+        return any(start <= node.start_byte < end for start, end in exposed)
+
+    reached: dict[int, bool] = {}
+    checkout = xcs.csharp_index(index.repo_dir)
+    member_sets: dict[str, frozenset[str]] = {}
+
+    def members_of(name: str) -> frozenset[str]:
+        """Every member the checkout's types of this simple name declare or
+        inherit from the checkout's types. A file that does not parse whole
+        may declare more, and a member it hides then counts as inherited:
+        only a member found declared is cleared."""
+        if name not in member_sets:
+            infos = checkout.by_last.get(name, ())
+            supertypes = [s for info in infos for s in info.supertypes]
+            member_sets[name] = frozenset().union(*(info.members for info in infos)) | checkout.inherited_members(
+                supertypes
+            )
+        return member_sets[name]
+
+    def exposed_read(node: Node) -> bool:
+        """Whether a mention proof 2 clears may still bind through an
+        inherited library member (:func:`_inherited_reach`); a name that is
+        no member access only inside a type inheriting one."""
+        if node.id not in reached:
+            inside = in_exposed(node)
+            parent = node.parent
+            if parent is None or parent.type != "member_access_expression" or _field(parent, node) != "name":
+                reached[node.id] = inside
+            else:
+                reached[node.id] = (inside or names_based) and _inherited_reach(
+                    parent.child_by_field_name("expression"), readers, path, based, inside, members_of
+                )
+        return reached[node.id]
+
+    def judged(node: Node) -> bool:
+        """Whether a mention in a family-free file may be the wrapper's."""
+        return not whole or exposed_read(node)
+
+    # A cref names a member; no value reaches it through `dynamic`.
     found: list[wi.Occurrence] = [
         wi.Occurrence(path, wi.line_of(c), wi.text_of(c), None, wi.UNPARSED_MENTION)
         for c, after in _crefs(root, wrapper, index)
-        if after is None
+        if after is None and not whole
     ]
-    found += _knob_leftovers(path, source, root, reader, readers, wrapper, index)
+    exposed_lines = [(data.count(b"\n", 0, a) + 1, data.count(b"\n", 0, b) + 1) for a, b in exposed]
+    found += [
+        o
+        for o in _knob_leftovers(path, source, root, reader, readers, wrapper, index)
+        if not whole or any(a <= o.line <= b for a, b in exposed_lines)
+    ]
     test_project: list[bool] = []
     #: receiver name -> reads of the member through it in the file; per test
     #: method, and how many of those were proven sibling reads.
@@ -2971,6 +3349,14 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     scoped_mentions: dict[tuple[str | None, str], int] = defaultdict(int)
     sibling_reads: dict[tuple[str | None, str], int] = defaultdict(int)
     methods = _methods_by_name(root)
+
+    owner_full = f"{wrapper.package}.{wrapper.owner}" if wrapper.package else wrapper.owner
+
+    def in_test_method(access: Node) -> bool:
+        """Whether ``access`` is in a test method of a test project."""
+        if not test_project:
+            test_project.append(_test_project(path, index.repo_dir) is True)
+        return bool(test_project[0] and _enclosing_test_method(access, data))
 
     def sibling_read(access: Node, line: int, name: str | None) -> wi.Occurrence:
         """A read through a receiver typed as a sibling, whose member goes
@@ -2993,10 +3379,10 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     found += [
         wi.Occurrence(path, wi.line_of(n), wi.text_of(n.parent or n), None, wi.RECEIVER_UNPROVEN)
         for n in reader.occurrences("@" + wrapper.name)
-        if n.type == "identifier" and not names_only(n)
+        if n.type == "identifier" and not names_only(n) and judged(n)
     ]
     for node in reader.occurrences(wrapper.name):
-        if node.type != "identifier" or names_only(node) or xcs._in_directive(node):
+        if node.type != "identifier" or names_only(node) or xcs._in_directive(node) or not judged(node):
             continue
         parent = node.parent
         line = wi.line_of(node)
@@ -3011,7 +3397,8 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             parent is not None
             and parent.type == "member_access_expression"
             and _field(parent, node) == "name"
-            and any(start <= node.start_byte < end for start, end in free)
+            and (whole or any(start <= node.start_byte < end for start, end in free))
+            and not exposed_read(node)
         ):
             continue
         if _in_pattern_path(node):
@@ -3089,6 +3476,11 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
                 if _type_full(bound, reader) in family.sibling_full_names:
                     found.append(sibling_read(access, line, name))
                     continue
+                if _type_full(bound, reader) == owner_full and in_test_method(access):
+                    # The wrapper's own unit test: what it asserts about the
+                    # member goes with it, as a sibling's test does.
+                    found.append(sibling_read(access, line, name))
+                    continue
             if bound is None:
                 static_type = wrapper.static and _resolves(receiver, reader, targets) is None
                 reason = None if static_type else wi.RECEIVER_UNPROVEN
@@ -3135,6 +3527,15 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
                 if bound is None or isinstance(bound, str)
                 else _resolves(bound, reader, targets)
             )
+        elif readers.locator and (located := _locator_type(receiver)) is not None:
+            # `sp.GetRequiredService<T>().M`: the lookup's `T`, as it is for a
+            # `var` it initializes.
+            if family is not None and (_foreign_type(located, reader, family) or _type_full(located, reader) in shared):
+                continue
+            if family is not None and _type_full(located, reader) in family.sibling_full_names:
+                found.append(sibling_read(access, line, None))
+                continue
+            reason = _resolves(located, reader, targets)
         elif receiver.type == "object_creation_expression":
             created = receiver.child_by_field_name("type")
             if family is not None and created is not None and (
@@ -3147,6 +3548,14 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             reason = wi.RECEIVER_UNPROVEN
         else:
             reason = wi.RECEIVER_UNPROVEN
+        if (
+            reason == wi.RECEIVER_UNPROVEN
+            and receiver is not None
+            and receiver.type != "this"
+            and not exposed_read(node)
+            and _free_value(receiver, readers, path, family)
+        ):
+            continue  # another type's member of the name
         if reason is None and called and _argument_has_call(call):
             reason = wi.ARGUMENT_HAS_CALL
         shown = call if called else access
@@ -3166,7 +3575,7 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         for (scope, name), count in sibling_reads.items()
         if scope is not None
         and count == scoped_mentions[(scope, name)]
-        and _bound_only_as_sibling(_scope_nodes(methods[scope]), name, reader, readers, family)
+        and _bound_only_as_sibling(_scope_nodes(methods[scope]), name, reader, readers, family, owner_full)
     }
     # The same for a mock's or substitute's name, which the test-double pass
     # also matches by name: every read through it is proven the wrapper's,
@@ -3192,6 +3601,327 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         for o in found
     ]
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
+
+
+# --- Free receivers: a value no family type can be the static type of ---------
+#
+# A read `R.M` binds to the wrapper's member only when R's static type is a
+# family type. In a file that may hold a family value (so proof 2 does not
+# clear it), `_static_type` follows R to a type it can see: a local's declared
+# type or `var` initializer, a checkout type's declared field, property or
+# non-generic method type, `new T(…)`, `await`, and the LINQ / EF Core
+# operators whose result is their source's element type whatever their
+# lambdas say. Anything else is unknown, and the read stays unproven. A type
+# that spells no family or reaching name is not one: a reaching type is one
+# whose members lead to the family, so a type outside them has no member
+# that does (the closure in `csharp_family`).
+
+#: Operators keeping the source sequence's element type.
+_SEQUENCE_KEEPING = frozenset(
+    {
+        "Where", "AsNoTracking", "AsTracking", "AsQueryable", "AsEnumerable", "OrderBy", "OrderByDescending",
+        "ThenBy", "ThenByDescending", "Skip", "Take", "Distinct", "Reverse", "ToList", "ToArray",
+    }
+)
+#: Operators returning one element of it; their `…Async` forms return a task of one.
+_ELEMENT_TAKING = frozenset(
+    {"First", "FirstOrDefault", "Single", "SingleOrDefault", "Last", "LastOrDefault", "ElementAt", "ElementAtOrDefault"}
+)
+#: Generic library types read as a sequence of their one type argument.
+_SEQUENCES = frozenset(
+    {
+        "DbSet", "IQueryable", "IOrderedQueryable", "IEnumerable", "IOrderedEnumerable", "List", "IList",
+        "IReadOnlyList", "ICollection", "IReadOnlyCollection", "HashSet",
+    }
+)
+_TASKS = frozenset({"Task", "ValueTask"})
+_FREE_DEPTH = 8
+
+
+@dataclass(frozen=True)
+class _Typed:
+    """A static type: a type node and the reader of the file it is spelled
+    in; ``task`` when the value is a task of it."""
+
+    node: Node
+    reader: xcs._Reader
+    task: bool = False
+
+
+def _generic_argument(typed: _Typed, names: frozenset[str]) -> _Typed | None:
+    """The one type argument of ``typed`` when it is a library generic type
+    named in ``names`` (no checkout type of the name), unwrapping ``T?``."""
+    node = typed.node
+    if node.type == "nullable_type" and node.named_children:
+        node = node.named_children[0]
+    if node.type == "qualified_name":
+        node = node.child_by_field_name("name") or node
+    if node.type != "generic_name" or not node.named_children:
+        return None
+    simple = _text(node.named_children[0]).removeprefix("@")
+    arguments = next((c for c in node.named_children if c.type == "type_argument_list"), None)
+    if simple not in names or arguments is None or len(arguments.named_children) != 1:
+        return None
+    if typed.reader.index.may_declare_type(simple):
+        return None
+    return _Typed(arguments.named_children[0], typed.reader)
+
+
+def _checkout_type(typed: _Typed, readers: _Readers) -> tuple[Node, str] | None:
+    """The declaration of the checkout type ``typed`` names, and its file."""
+    node = typed.node
+    nullable = node.type == "nullable_type"
+    if nullable and node.named_children:
+        node = node.named_children[0]
+    full = _type_full(node, typed.reader)
+    infos = [i for i in typed.reader.index.by_full.get(full or "", ()) if not i.generic and not i.partial]
+    if len(infos) != 1:
+        return None
+    declaring = readers.get(infos[0].path)
+    declaration = _find_type(declaring.root, infos[0].chain) if declaring is not None else None
+    if declaration is not None and nullable and declaration.type in ("struct_declaration", "record_struct_declaration"):
+        return None  # `S?` is `Nullable<S>`, whose members are not `S`'s
+    return (declaration, infos[0].path) if declaration is not None else None
+
+
+def _member_type(
+    declaration: Node, path: str, name: str, readers: _Readers, method: bool, depth: int = 0
+) -> _Typed | None:
+    """The declared type of ``declaration``'s own field or property
+    ``name``, or with ``method`` the return type of its every method of the
+    name (none generic, all the same, and no base that may declare one)."""
+    body = declaration.child_by_field_name("body")
+    reader = readers.get(path)
+    if body is None or reader is None:
+        return None
+    # A field or property the type declares hides any base member of the
+    # name; a base's methods of the name join overload resolution.
+    if method and _inherits(declaration, name, readers, path):
+        return None
+    named = [m for m in body.named_children if name in _member_names(m) or (m.type == "field_declaration" and any(
+        _name_of(d) == name for v in m.named_children if v.type == "variable_declaration" for d in v.named_children
+        if d.type == "variable_declarator"))]
+    if not named:
+        # A field or property is looked up the class chain, nearest first: a
+        # repository base class declaring it is where it binds.
+        base = _base_class(declaration, path, readers) if not method and depth < _FREE_DEPTH else None
+        return _member_type(*base, name, readers, method, depth + 1) if base is not None else None
+    if method:
+        # An inaccessible instance method, or an extension of the name the
+        # checkout declares, can leave the call to an extension method.
+        if any(
+            m.type != "method_declaration"
+            or _child(m, "type_parameter_list") is not None
+            or not xcs._modifiers(m) & {"public", "internal"}
+            for m in named
+        ) or _checkout_extension(readers.repo_dir, name):
+            return None
+        returns = {_text(m.child_by_field_name("returns")) for m in named if m.child_by_field_name("returns") is not None}
+        if len(returns) != 1 or len([m for m in named if m.child_by_field_name("returns") is not None]) != len(named):
+            return None
+        return _Typed(named[0].child_by_field_name("returns"), reader)
+    if len(named) != 1:
+        return None
+    from flag_cleanup import csharp_family
+
+    if csharp_family.declares_extension_blocks(readers.repo_dir):
+        return None  # a C# 14 extension property may be what an access binds
+    member = named[0]
+    if member.type == "property_declaration":
+        type_node = member.child_by_field_name("type")
+    elif member.type == "field_declaration":
+        declaration_node = _child(member, "variable_declaration")
+        type_node = declaration_node.child_by_field_name("type") if declaration_node is not None else None
+    else:
+        return None
+    if type_node is None or type_node.type == "implicit_type":
+        return None
+    return _Typed(type_node, reader)
+
+
+def _base_class(declaration: Node, path: str, readers: _Readers) -> tuple[Node, str] | None:
+    """The repository class ``declaration`` (a class) derives from, by its
+    first base, and that class's file; ``None`` for anything else."""
+    if declaration.type not in ("class_declaration", "record_declaration"):
+        return None
+    bases = _base_nodes(declaration)
+    reader = readers.get(path)
+    if not bases or reader is None:
+        return None
+    found = _checkout_type(_Typed(bases[0], reader), readers)
+    if found is None or found[0].type not in ("class_declaration", "record_declaration"):
+        return None
+    return found
+
+
+def _local_initializer(at: Node, name: str) -> Node | None:
+    """The initializer of the ``var`` local ``name`` that ``at`` reads, when
+    the nearest binding of the name around ``at`` is one, declared before it
+    in an enclosing block of the same function."""
+    node = at
+    while node.parent is not None:
+        parent = node.parent
+        if parent.type in ("block", "switch_section"):
+            for statement in reversed([c for c in parent.named_children if c.end_byte <= node.start_byte]):
+                if statement.type != "local_declaration_statement":
+                    continue
+                declaration = _child(statement, "variable_declaration")
+                for declarator in declaration.named_children if declaration is not None else ():
+                    if declarator.type == "variable_declarator" and _name_of(declarator) == name:
+                        if declaration.child_by_field_name("type") is None or declaration.child_by_field_name("type").type != "implicit_type":
+                            return None
+                        values = [c for c in _named(declarator) if c.id != declarator.child_by_field_name("name").id]
+                        return values[-1] if values else None
+        elif parent.type in _FUNCTIONS or parent.type in _TYPES or parent.type in (
+            "foreach_statement", "for_statement", "using_statement", "fixed_statement", "catch_clause",
+        ):
+            return None
+        node = parent
+    return None
+
+
+def _checkout_extension(repo_dir: str, name: str) -> bool:
+    """Whether some checkout C# file may declare an extension method
+    ``name`` (``static … name(this …``), or an ``extension`` block."""
+    from flag_cleanup import csharp_family
+
+    key = (repo_dir, name)
+    if key not in _EXTENSION_NAMES:
+        pattern = re.compile(rf"\b{re.escape(name)}\s*(?:<[^>()]*>)?\s*\(\s*this\b")
+        found = csharp_family.declares_extension_blocks(repo_dir)
+        for f in source_index.files(repo_dir, {".cs"}, with_ignored=True) if not found else ():
+            text = _read(f.resolved)
+            if text is None or pattern.search(text):
+                found = True
+                break
+        _EXTENSION_NAMES[key] = found
+    return _EXTENSION_NAMES[key]
+
+
+#: ``(repo_dir, name)`` -> :func:`_checkout_extension`.
+_EXTENSION_NAMES: dict[tuple[str, str], bool] = {}
+
+
+def _static_type(expr: Node | None, readers: _Readers, path: str, depth: int = 0) -> _Typed | None:
+    """``expr``'s static type as far as the section above can see; ``None``
+    for anything else."""
+    if expr is None or depth > _FREE_DEPTH:
+        return None
+    reader = readers.get(path)
+    if reader is None:
+        return None
+    kind = expr.type
+    if kind == "parenthesized_expression" or (kind == "postfix_unary_expression" and _text(expr).rstrip().endswith("!")):
+        inner = [c for c in expr.named_children if c.type not in _COMMENTS]
+        return _static_type(inner[0], readers, path, depth + 1) if len(inner) == 1 else None
+    if kind == "await_expression":
+        inner = [c for c in expr.named_children if c.type not in _COMMENTS]
+        typed = _static_type(inner[-1], readers, path, depth + 1) if inner else None
+        if typed is None:
+            return None
+        if typed.task:
+            return _Typed(typed.node, typed.reader)
+        return _generic_argument(typed, _TASKS)
+    if kind == "object_creation_expression":
+        created = expr.child_by_field_name("type")
+        return _Typed(created, reader) if created is not None else None
+    if kind == "identifier":
+        name = _text(expr)
+        bound = _binding(expr, name, readers, path)
+        if isinstance(bound, Node):
+            return None if bound.type == "implicit_type" else _Typed(bound, reader)
+        if bound == _UNTYPED and not _pattern_binds(expr, name):
+            return _static_type(_local_initializer(expr, name), readers, path, depth + 1)
+        return None
+    if kind == "element_access_expression":
+        typed = _static_type(expr.child_by_field_name("expression"), readers, path, depth + 1)
+        if typed is None or typed.task:
+            return None
+        if typed.node.type == "array_type":
+            element = typed.node.child_by_field_name("type")
+            return _Typed(element, typed.reader) if element is not None else None
+        return _generic_argument(typed, frozenset({"List", "IList", "IReadOnlyList"}))
+    call = expr if kind == "invocation_expression" else None
+    access = call.child_by_field_name("function") if call is not None else expr
+    if access is None or access.type != "member_access_expression":
+        return None
+    member = access.child_by_field_name("name")
+    if member is None or member.type != "identifier":
+        return None
+    name = _text(member)
+    typed = _static_type(access.child_by_field_name("expression"), readers, path, depth + 1)
+    if typed is None or typed.task:
+        return None
+    if call is not None and (name in _SEQUENCE_KEEPING or name.removesuffix("Async") in _SEQUENCE_KEEPING | _ELEMENT_TAKING):
+        element = _generic_argument(typed, _SEQUENCES)
+        if element is None or _checkout_extension(readers.repo_dir, name):
+            return None
+        if name in _SEQUENCE_KEEPING:
+            return typed
+        if name.endswith("OrDefault") and name != "ElementAtOrDefault" and any(
+            a.named_children and a.named_children[-1].type != "lambda_expression"
+            for a in (call.child_by_field_name("arguments").named_children if call.child_by_field_name("arguments") else ())
+            if a.type == "argument"
+        ):
+            return None  # `FirstOrDefault(fallback)` infers the element type from the fallback too
+        base = name.removesuffix("Async")
+        if base in _SEQUENCE_KEEPING:
+            return None  # ToListAsync: a task of a list this does not build
+        return _Typed(element.node, element.reader, task=name.endswith("Async"))
+    found = _checkout_type(typed, readers)
+    if found is None:
+        return None
+    declaration, declaring_path = found
+    return _member_type(declaration, declaring_path, name, readers, call is not None)
+
+
+def _free_value(receiver: Node, readers: _Readers, path: str, family) -> bool:
+    """Whether ``receiver``'s static type is known (:func:`_static_type`)
+    and can be no family type: it spells no family, reaching or ``dynamic``
+    name, names no type parameter, and is no supertype of a family type, which
+    may declare the member read."""
+    from flag_cleanup import csharp_family
+
+    if family is None or family.opaque:
+        return False
+    typed = _static_type(receiver, readers, path)
+    if typed is None or typed.task:
+        return False
+    text = _text(typed.node)
+    reaching = family.tainting if family.reaching is None else family.reaching
+    if csharp_family._spells(text, family.simple_names | reaching | {"dynamic", "object"}):
+        return False
+    words = set(re.findall(r"[^\W\d]\w*", text))
+    if words & _type_parameters_around(typed.node) or words & _family_supertypes(readers.repo_dir, family):
+        return False
+    return True
+
+
+def _type_parameters_around(node: Node) -> set[str]:
+    """Every type parameter declared by a declaration enclosing ``node``."""
+    found: set[str] = set()
+    while node is not None:
+        parameters = _child(node, "type_parameter_list") if node.type in (*_TYPES, *_FUNCTIONS) else None
+        for parameter in parameters.named_children if parameters is not None else ():
+            found.add(_text(parameter).split()[-1].removeprefix("@"))
+        node = node.parent
+    return found
+
+
+def _family_supertypes(repo_dir: str, family) -> frozenset[str]:
+    """Simple names of the checkout types a family type derives from, at any
+    depth: a value of one may be a family value."""
+    checkout = xcs.csharp_index(repo_dir)
+    pending = [n.rsplit(".", 1)[-1] for n in family.full_names]
+    seen: set[str] = set()
+    while pending:
+        name = pending.pop()
+        for info in checkout.by_last.get(name, ()):
+            for supertype in info.supertypes:
+                if supertype not in seen:
+                    seen.add(supertype)
+                    pending.append(supertype)
+    return frozenset(seen)
 
 
 def _receiver_name(node: Node) -> str | None:
@@ -3284,13 +4014,14 @@ def _scope_nodes(method: Node) -> Iterator[Node]:
 
 
 def _bound_only_as_sibling(
-    nodes: Iterable[Node], name: str, reader: xcs._Reader, readers: _Readers, family
+    nodes: Iterable[Node], name: str, reader: xcs._Reader, readers: _Readers, family, owner: str | None = None
 ) -> bool:
     """Whether every binding of ``name`` among ``nodes`` is declared with a
-    type that resolves to a sibling (:func:`_bound_only_as`)."""
+    type that resolves to a sibling, or to the wrapper's own class ``owner``
+    (:func:`_bound_only_as`)."""
     if family is None:
         return False
-    siblings = family.sibling_full_names
+    siblings = family.sibling_full_names | ({owner} if owner else set())
     return _bound_only_as(nodes, name, readers, lambda t, at: _type_full(t, reader) in siblings, reader.path)
 
 
@@ -3346,7 +4077,7 @@ def _bound_only_as(
             declaration = parent.parent
             if declaration is None or declaration.type != "variable_declaration":
                 return False
-            if not accepted(_declarator_type(declaration, _text(node), readers.factories()), node):
+            if not accepted(_declarator_type(declaration, _text(node), readers.factories(), readers, path), node):
                 return False
         elif parent.type == "tuple_pattern" and parent.parent is not None and _deconstructed(parent.parent) is not None:
             declaration = parent.parent.parent
@@ -3356,6 +4087,8 @@ def _bound_only_as(
             if not accepted(parent.child_by_field_name(_TYPED_BINDINGS[parent.type]), node):
                 return False
         elif parent.type in _UNTYPED_BINDINGS:
+            if parent.type == "lambda_expression" and field_name == "body":
+                continue  # `_ => gate`: read by the body, bound by nothing
             return False
     return True
 
@@ -4027,7 +4760,271 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
                 for n in found
                 if (n.start_byte, n.end_byte) in spans or (loose and not _passed_out(n, unbound))
             ]
+    elif found and family is not None and not csharp_family.computed_name_route(index.repo_dir, family):
+        # A file that may hold a family value: a string that goes nowhere a
+        # family value is -- thrown with constants, compared by a value
+        # assertion, or used by a private helper only so -- is no more a
+        # route's name than in a family-free file, unless it is a route's own
+        # NAME argument.
+        names = csharp_family.route_names(root, source)
+        if names is not None:
+            spans = {(n.start_byte, n.end_byte) for n in names}
+            asserts = _framework_assert(root, index.repo_dir)
+            readers = _Readers(index.repo_dir)
+            found = [
+                n
+                for n in found
+                if (n.start_byte, n.end_byte) in spans
+                or not (
+                    _constant_creation_argument(n, family)
+                    or (asserts and _value_assertion_argument(n))
+                    or _private_helper_argument(n, readers, path, family, asserts)
+                )
+            ]
     return [(wi.line_of(n), wi.text_of(n)) for n in found]
+
+
+#: A test framework's ``Assert`` methods that compare their arguments as
+#: values (xUnit's, NUnit's and MSTest's spellings): none takes a member
+#: name, so a string passed to one names nothing.
+_VALUE_ASSERTIONS = frozenset(
+    {
+        "Equal", "NotEqual", "Contains", "DoesNotContain", "StartsWith", "EndsWith", "Matches", "DoesNotMatch",
+        "AreEqual", "AreNotEqual",
+    }
+)
+
+
+def _framework_assert(root: Node, repo_dir: str) -> bool:
+    """Whether ``Assert`` in this file can only be a test framework's class:
+    the checkout declares nothing of the name, no ``using`` aliases it, and
+    the file spells it only as the receiver of a member access."""
+    if xcs.csharp_index(repo_dir).may_declare("Assert"):
+        return False
+    aliased = _aliased(repo_dir)
+    if aliased is None or "Assert" in aliased:
+        return False
+    for node in cross_file_keys.walk(root):
+        if node.type == "identifier" and _text(node).removeprefix("@") == "Assert":
+            parent = node.parent
+            if parent is None or parent.type != "member_access_expression" or _field(parent, node) != "expression":
+                return False
+    return True
+
+
+def _private_helper_argument(node: Node, readers: _Readers, path: str, family, asserts: bool) -> bool:
+    """Whether the string ``node`` is a whole positional argument of a call
+    ``M(…)`` of the enclosing class's one private method ``M`` (not generic,
+    no base that may declare one, no local of the name), whose ``string``
+    parameter there is used only as an index into a value no family type
+    can be (:func:`_free_value`: ``ex.Errors[field]``) or as a whole
+    argument of a value assertion (``asserts``: :func:`_framework_assert`)."""
+    literal = node.parent if node.type == "string_content" else node
+    argument = literal.parent if literal is not None and literal.type in _LITERALS else None
+    if argument is None or argument.type != "argument" or argument.named_children[-1].id != literal.id:
+        return False
+    if argument.child_by_field_name("name") is not None:
+        return False
+    arguments = argument.parent
+    call = arguments.parent if arguments is not None else None
+    if call is None or call.type != "invocation_expression" or call.child_by_field_name("arguments") != arguments:
+        return False
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "identifier":
+        return False
+    name = _text(function)
+    if _binding(call, name, readers, path, locals_only=True) is not None:
+        return False  # a local function or delegate of the name
+    owner = _enclosing_type(call)
+    body = owner.child_by_field_name("body") if owner is not None else None
+    if body is None or "partial" in xcs._modifiers(owner) or _inherits(owner, name, readers, path):
+        return False
+    methods = [m for m in body.named_children if m.type == "method_declaration" and _name_of(m) == name]
+    if len(methods) != 1:
+        return False
+    method = methods[0]
+    words = xcs._modifiers(method)
+    if "private" not in words or words & {"partial", "extern"} or _child(method, "type_parameter_list") is not None:
+        return False
+    listed = method.child_by_field_name("parameters")
+    parameters = [p for p in listed.named_children if p.type == "parameter"] if listed is not None else []
+    items = [a for a in arguments.named_children if a.type == "argument"]
+    position = next((i for i, a in enumerate(items) if a.id == argument.id), None)
+    if position is None or len(parameters) != len(items) or len(listed.named_children) != len(
+        [c for c in listed.named_children if c.type in ("parameter", "comment")]
+    ):
+        return False
+    parameter = parameters[position]
+    type_node = parameter.child_by_field_name("type")
+    if type_node is None or _text(type_node).replace(" ", "") not in ("string", "string?") or any(
+        c.type in ("modifier", "attribute_list") for c in parameter.children
+    ):
+        return False
+    spelled = _name_of(parameter)
+    method_body = method.child_by_field_name("body")
+    if not spelled or method_body is None:
+        return False
+    for read in cross_file_keys.walk(method_body):
+        if read.type not in ("identifier", "implicit_parameter") or _text(read).removeprefix("@") != spelled:
+            continue
+        if not _harmless_name_read(read, readers, path, family, asserts):
+            return False
+    return True
+
+
+def _harmless_name_read(read: Node, readers: _Readers, path: str, family, asserts: bool) -> bool:
+    """See :func:`_private_helper_argument`."""
+    argument = read.parent
+    if read.type != "identifier" or argument is None or argument.type != "argument" or argument.named_children[-1].id != read.id:
+        return False
+    container = argument.parent
+    if container is None:
+        return False
+    if container.type == "bracketed_argument_list" and container.parent is not None:
+        access = container.parent
+        if access.type == "element_access_expression":
+            return _free_value(access.child_by_field_name("expression"), readers, path, family)
+    return bool(asserts and container.type == "argument_list" and _value_assertion_call(container.parent))
+
+
+def _value_assertion_argument(node: Node) -> bool:
+    """Whether the string ``node`` is a whole argument of ``Assert.M(…)``
+    for ``M`` one of :data:`_VALUE_ASSERTIONS` (``Assert.Contains("IsX",
+    errors.Keys)``); the caller proves what ``Assert`` is."""
+    literal = node.parent if node.type == "string_content" else node
+    if literal is None or literal.type not in _LITERALS:
+        return False
+    argument = literal.parent
+    if argument is None or argument.type != "argument" or argument.named_children[-1].id != literal.id:
+        return False
+    call = argument.parent.parent if argument.parent is not None else None
+    if call is None or call.child_by_field_name("arguments") != argument.parent:
+        return False
+    return _value_assertion_call(call)
+
+
+def _value_assertion_call(call: Node | None) -> bool:
+    """Whether ``call`` is ``Assert.M(…)`` for ``M`` one of
+    :data:`_VALUE_ASSERTIONS`; the caller proves what ``Assert`` is."""
+    if call is None or call.type != "invocation_expression":
+        return False
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return False
+    receiver = function.child_by_field_name("expression")
+    name = function.child_by_field_name("name")
+    return (
+        receiver is not None
+        and receiver.type == "identifier"
+        and _text(receiver) == "Assert"
+        and name is not None
+        and name.type == "identifier"
+        and _text(name) in _VALUE_ASSERTIONS
+    )
+
+
+#: Literals that are constants, whatever their text.
+_CONSTANTS = frozenset(
+    {"integer_literal", "real_literal", "boolean_literal", "null_literal", "character_literal", *_STRINGS}
+)
+
+
+def _constant(node: Node) -> bool:
+    """Whether ``node`` is a constant expression this can read: a literal, a
+    ``nameof``, or constants joined by an operator or parentheses."""
+    from flag_cleanup import csharp_family
+
+    if node.type in _CONSTANTS or csharp_family.nameof_value(node) is not None:
+        return True
+    if node.type in ("binary_expression", "parenthesized_expression"):
+        return all(_constant(c) for c in node.named_children if c.type != "comment")
+    return False
+
+
+#: What a thrown value may be built of on the way from a string up to its
+#: ``throw`` (:func:`_thrown_constant`).
+_THROWN_PARTS = frozenset(
+    {
+        "argument", "argument_list", "initializer_expression", "object_creation_expression",
+        "array_creation_expression", "implicit_array_creation_expression", "parenthesized_expression",
+    }
+)
+
+
+def _constant_creation_argument(node: Node, family) -> bool:
+    """Whether the string ``node`` is a whole argument of a ``new T(…)`` that
+    is thrown carrying nothing but constants (:func:`_thrown_constant`):
+    ``throw new ValidationException(new[] { new ValidationFailure("IsX", "…") })``.
+    A thrown object reaches only ``catch`` handlers, and none in the
+    checkout looks a member up by a computed name (the caller's
+    precondition), so the string goes nowhere a family value is."""
+    literal = node.parent if node.type == "string_content" else node
+    if literal is None or literal.type not in _LITERALS:
+        return False
+    argument = literal.parent
+    if argument is None or argument.type != "argument" or argument.named_children[-1].id != literal.id:
+        return False
+    arguments = argument.parent
+    creation = arguments.parent if arguments is not None else None
+    if creation is None or creation.type != "object_creation_expression":
+        return False
+    return _thrown_constant(creation, family)
+
+
+def _thrown_constant(creation: Node, family) -> bool:
+    """Whether ``creation`` is part of what a ``throw`` throws, built only of
+    creations, arrays and constants: every name in the thrown expression is
+    a created type's (spelling no family, reaching or family-returning name),
+    an argument's or initializer's label, or inside a ``nameof``."""
+    from flag_cleanup import csharp_family
+
+    top = creation
+    while top.parent is not None and top.parent.type in _THROWN_PARTS:
+        top = top.parent
+    if top.parent is None or top.parent.type not in ("throw_statement", "throw_expression"):
+        return False
+    reaching = family.tainting if family.reaching is None else family.reaching
+    names = family.simple_names | reaching | family.returning
+    for n in cross_file_keys.walk(top):
+        if n.type in ("this", "base", "this_expression", "base_expression"):
+            return False
+        if n.type in ("object_creation_expression", "array_creation_expression"):
+            created = n.child_by_field_name("type")
+            if created is not None and csharp_family._spells(_text(created), names):
+                return False
+        if n.type != "identifier":
+            continue
+        if not _constant_name(n, top):
+            return False
+    return True
+
+
+def _constant_name(name: Node, top: Node) -> bool:
+    """Whether the identifier ``name`` inside ``top`` carries no value: part
+    of a created type, an argument's label, an object initializer's member,
+    or inside a ``nameof``."""
+    from flag_cleanup import csharp_family
+
+    node = name
+    while node is not None and node.id != top.id:
+        parent = node.parent
+        if parent is None:
+            return False
+        if parent.type in ("object_creation_expression", "array_creation_expression") and _field(parent, node) == "type":
+            return True
+        if parent.type == "argument" and _field(parent, node) == "name":
+            return True
+        if (
+            parent.type == "assignment_expression"
+            and _field(parent, node) == "left"
+            and parent.parent is not None
+            and parent.parent.type == "initializer_expression"
+        ):
+            return True
+        if csharp_family.nameof_value(parent) is not None:
+            return True
+        node = parent
+    return False
 
 
 _IGNORE_CASE = re.compile(r"IgnoreCase\b")

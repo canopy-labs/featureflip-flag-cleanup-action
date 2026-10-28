@@ -52,7 +52,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import appsettings_edit, ctor_param_csharp, file_deletion, git_ops, source_index, syntax
+from flag_cleanup import appsettings_edit, cs_param_pins, ctor_param_csharp, file_deletion, git_ops, source_index, syntax
 from flag_cleanup import cross_file_csharp as xcs
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.cross_file_dotnet_guest import DOTNET_GUEST_EXTENSIONS
@@ -950,9 +950,16 @@ def _lambda_parameters(node: Node) -> list[str]:
     return names
 
 
+#: Arguments a factory may pass that run no code.
+_LITERALS = frozenset(
+    {"boolean_literal", "integer_literal", "real_literal", "character_literal", "string_literal", "null_literal"}
+)
+
+
 def _factory(node: Node, names: frozenset[str]) -> bool:
     """``sp => new W(sp.GetRequiredService<X>(), …)``: builds a family type
-    from resolved services and nothing else."""
+    from resolved services and literals (``_ => new FixedGate(true)``, a
+    pinned fake's kept value) and nothing else."""
     if node.type != "lambda_expression":
         return False
     params = _lambda_parameters(node)
@@ -969,6 +976,8 @@ def _factory(node: Node, names: frozenset[str]) -> bool:
     arguments = body.child_by_field_name("arguments")
     for argument in ctor_param_csharp._items(arguments) if arguments is not None else []:
         value = ctor_param_csharp._expression(argument)
+        if value is not None and value.type in _LITERALS:
+            continue
         if value is None or value.type != "invocation_expression":
             return False
         receiver, name, generic = _call_name(value)
@@ -984,18 +993,20 @@ def _within(node: Node, ancestor: Node | None) -> bool:
     return ancestor is not None and ancestor.start_byte <= node.start_byte and node.end_byte <= ancestor.end_byte
 
 
-def _family_instance(value: Node | None, names: frozenset[str]) -> str | None:
+def _family_instance(value: Node | None, names: frozenset[str], shared: frozenset[str] = frozenset()) -> str | None:
     """What a registration's instance argument is: ``"new"`` for ``new F()``
     of a family type with no argument and no initializer (building it runs
-    no code but the fake's own, which goes), the field's name for a bare
-    ``X`` or ``this.X`` (deleted only with that field, see
-    :func:`_fake_fields`), else ``None``."""
+    no code but the fake's own, which goes), or of a ``shared`` fake (one
+    that stays for another gate: its registration for this family's
+    interface goes, and building it ran only a test fake's code), the
+    field's name for a bare ``X`` or ``this.X`` (deleted only with that
+    field, see :func:`_fake_fields`), else ``None``."""
     if value is None:
         return None
     if value.type == "object_creation_expression":
         arguments = value.child_by_field_name("arguments")
         if (
-            ctor_param_csharp._simple_type(value.child_by_field_name("type")) in names
+            ctor_param_csharp._simple_type(value.child_by_field_name("type")) in names | shared
             and value.child_by_field_name("initializer") is None
             and (arguments is None or not ctor_param_csharp._items(arguments))
         ):
@@ -1074,7 +1085,9 @@ def _registration_helper(invocation: Node) -> bool:
     return True
 
 
-def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str, str | None] | str | None:
+def _registration(
+    node: Node, names: frozenset[str], shared: frozenset[str] = frozenset()
+) -> tuple[Node, str, str | None] | str | None:
     """The registration statement a spelling names a registered type in,
     with its text and the field it registers as the instance (which must go
     too), or why it is not one this pass may delete; ``None`` when the
@@ -1099,7 +1112,7 @@ def _registration(node: Node, names: frozenset[str]) -> tuple[Node, str, str | N
             and len(values) == 2
             and values[0] is not None
             and values[0].type == "identifier"
-            and (instance := _family_instance(values[1], names)) is not None
+            and (instance := _family_instance(values[1], names, shared)) is not None
             and statement.parent is not None
             and statement.parent.type == "block"
             and _registration_helper(invocation)
@@ -1497,6 +1510,26 @@ def _constructor_parameter(node: Node) -> tuple[Node, Node] | None:
     return declaration, parameter
 
 
+def _shared_base(node: Node, shared: frozenset[str]) -> tuple[Node, Node] | None:
+    """``(base list, entry)`` when the spelling ``node`` is one entry of the
+    base list of a ``shared`` fake (wi.SharedFake) that has another: the
+    family's interface leaves it, and the fake stays for the others."""
+    entry = node
+    while entry.parent is not None and entry.parent.type in ("qualified_name", "alias_qualified_name"):
+        entry = entry.parent
+    bases = entry.parent
+    if bases is None or bases.type != "base_list":
+        return None
+    declaration = bases.parent
+    name = declaration.child_by_field_name("name") if declaration is not None else None
+    if name is None or declaration.type not in ("class_declaration", "record_declaration", "struct_declaration"):
+        return None
+    if _text(name) not in shared:
+        return None
+    entries = [c for c in bases.named_children if c.type != "argument_list"]
+    return (bases, entry) if len(entries) > 1 and all(c.type != "argument_list" for c in bases.named_children) else None
+
+
 def prove(
     wrapper: wi.Wrapper, repo_dir: str, originals: dict[str, str] | None = None, flag_key: str | None = None
 ) -> Residue:
@@ -1508,10 +1541,15 @@ def prove(
     targets += _middlewares(wrapper, frozenset(t.name for t in targets), repo_dir, originals or {})
     residue = Residue(wrapper.label, targets)
     names = frozenset(t.name for t in targets)
+    shared = frozenset(s.owner.rsplit(".", 1)[-1] for s in getattr(wrapper, "shared", ()))
     fulls = frozenset(t.full for t in targets if t.namespace)
     index = xcs.csharp_index(repo_dir)
+    # Mentions are matched by name, which is exact while every type of the
+    # name is one of the targets: two private fakes nested in different test
+    # classes may share one, and both go.
+    target_fulls = frozenset(t.full for t in targets)
     for target in targets:
-        if any(i.full != target.full for i in index.by_last.get(target.name, ())):
+        if any(i.full not in target_fulls for i in index.by_last.get(target.name, ())):
             raise Kept(_rel(target.path, repo_dir), target.line, f"another type is also named {target.name}")
     whole, partial = _whole_files(targets, repo_dir)
     residue.delete = whole
@@ -1544,6 +1582,7 @@ def prove(
     #: is a field: it goes only with that field.
     instances: list[tuple[str, str, Node]] = []
     fields: list[tuple[str, Node, Node, str]] = []
+    rebased: set[tuple[str, int]] = set()
     for path in cs_files:
         if path in whole:
             continue
@@ -1558,7 +1597,28 @@ def prove(
         for node in _spellings(file, names):
             if _inside(own, node.start_byte + file.offset):
                 continue
-            registration = _registration(node, names)
+            rebase = _shared_base(node, shared)
+            if rebase is not None:
+                bases, entry = rebase
+                if (path, bases.start_byte) in rebased:
+                    raise Kept(_rel(path, repo_dir), node.start_point[0] + 1, "two of the family's types in one base list")
+                rebased.add((path, bases.start_byte))
+                # Every entry counts, whatever its node type: a qualified one
+                # beside plain names is still one of several.
+                entries = [c for c in bases.named_children if c.type != "comment"]
+                position = next(i for i, c in enumerate(entries) if c.id == entry.id)
+                if position > 0:
+                    start, end = entries[position - 1].end_byte, entry.end_byte
+                else:
+                    start, end = entry.start_byte, entries[1].start_byte
+                data = file.data[file.offset :]
+                old = data[bases.start_byte : bases.end_byte]
+                new = data[bases.start_byte : start] + data[end : bases.end_byte]
+                residue.rewrites.setdefault(path, []).append((old, new))
+                fake = _text(bases.parent.child_by_field_name("name"))
+                residue.rows.append((path, node.start_point[0] + 1, f"base {_text(entry)} of {fake}"))
+                continue
+            registration = _registration(node, names, shared)
             if isinstance(registration, str):
                 raise Kept(_rel(path, repo_dir), node.start_point[0] + 1, registration)
             if registration is not None:
@@ -2658,7 +2718,13 @@ def _knob(sibling, targets: list[Target], repo_dir: str) -> tuple[str, str] | No
     parts = sibling.returns.split(".")
     if len(parts) != 2 or not all(re.fullmatch(r"[^\W\d]\w*", p) for p in parts):
         return None
-    target = next((t for t in targets if t.kind == "sibling" and t.name == sibling.owner), None)
+    target = next(
+        (
+            t for t in targets
+            if t.kind == "sibling" and t.name == sibling.owner and t.path == str(Path(sibling.path).resolve())
+        ),
+        None,
+    )
     if target is None:
         return None
     file = _read(target.path)

@@ -7,6 +7,204 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.18.0
+
+### Fixed
+
+- **C#:** more of the constructor parameters a removal leaves typed as a
+  deleted interface are now removed instead of kept with a finding. A
+  target-typed `new(…)` elsewhere is no longer taken for a possible caller
+  when it passes a `const` of a built-in type where that constructor takes
+  the interface, or when its own type is clear from where it stands: assigned
+  to a local, parameter, array element or `List<T>` element of a declared
+  type, returned from an operator or conversion operator, or set by an index
+  initializer of a `Dictionary<K, V>` or `List<T>`.
+
+- **C#:** the gate class's own unit test, which builds the class and reads
+  the member (`var gate = new FeatureflipGate(client); Assert.Equal(flagValue,
+  gate.IsEnabled);`), is now deleted with the member, as a test fake's test
+  is. Before, the read was replaced with the kept value, leaving
+  `Assert.Equal(flagValue, true)`: an analyzer error that broke the build, and
+  a failing row. Reads through the class outside test methods are still
+  replaced.
+
+- **C#:** a test helper whose `bool` parameter defaults to the value being
+  removed, called somewhere without an argument, is now left as it is and
+  your gate kept. Such a call never chose the removed value and may depend on
+  it, so rebuilding it with the kept value could leave a failing test. Before,
+  the call ran with the kept value and was listed for review. A test that
+  passes the removed value itself to a public helper is now deleted, as for a
+  private one.
+
+- **C#:** a read of a member named like your gate's, through a value whose
+  type can't be a gate, no longer keeps the gate in a file that also holds
+  one. The value's type is followed through locals, your types' declared
+  fields, properties and methods (base classes included), `new`, `await`,
+  and the LINQ and EF Core operators that keep their source's element type
+  (`(await h.Context.Subscriptions.SingleAsync(s => …)).IsEnabled`). A
+  projection such as `Select`, `dynamic`, or an extension method of the
+  operator's name in your code still keeps it.
+
+- **C#:** a string naming the gate's member passed to a private helper of
+  the same class, which only uses it as a key into such a value
+  (`ex.Errors[field]`) or in a test framework's value assertion, no longer
+  keeps your gate.
+
+- **C#:** a test that builds its fake at the removed value and switches it
+  to the kept one halfway (`var gate = new StubGate(enabled: false); …
+  gate.Enabled = true;`) now loses its removed-value half. The fake is built
+  with the kept value, and a local built from it in between, such as
+  `var job = new Job(gate, …)`, stays, as does one read from a property that
+  only reads a field or throws (`factory.TenantContext`). The other way round, a fake built at
+  the kept value and switched to the removed one (`var stub = new
+  StubGate(true); … stub.Enabled = false; …`), loses the write and what
+  follows it, as a fake set up in a field already did. Before, any
+  construction in such a test kept the gate.
+
+- **C#:** a constructor argument that builds a class whose constructors only
+  assign their parameters (`new StubGate(enabled: true)`) no longer keeps an
+  unread constructor parameter. Before, such an argument counted as one that
+  may do work.
+
+- **C#:** a private test helper whose `bool` parameter builds a test fake and
+  is also passed on to a public static helper building the same fake
+  (`TestExpiry.Create(ctx, expiration: gateOn)`) is now pinned. That argument
+  takes the kept value, which the public helper's own rebuild then removes.
+  Before, the second use of the parameter kept your gate.
+
+- **C#:** a statement whose comment or string happens to hold a mocking
+  word ("checked every tick", `"Returns"`) is no longer taken for a mock's
+  setup. Before, a gate read in it kept your gate as a test double.
+
+- **C#:** a string naming the gate's member in a file that holds the gate no
+  longer keeps it when it is only part of an exception thrown with nothing
+  but constants (`throw new ValidationException(new[] { new
+  ValidationFailure("IsEnabled", "IsEnabled is required.") })`). A by-name
+  lookup's own name argument still counts.
+
+- **C#:** a mock whose name a lambda's body also reads in the same file
+  (`services.AddScoped(_ => gate)` in a helper) is now resolved. Before, its
+  `Setup` lines stayed and kept your gate.
+
+- **C#:** a test class whose constructor only stubs the kept value
+  (`public Tests() => _gate.SetupGet(g => g.IsEnabled).Returns(true);`) now
+  loses that constructor, when it is the class's only one. Before, the stub
+  kept your gate.
+
+- **C#:** a test phase run at the removed value is now cut even when it
+  builds an object whose initializer sets a member named like something the
+  rest of the test reads (`new HttpRequestMessage(…) { Content = … }`, then
+  `res.Content`). Before, the whole test stayed and kept your gate.
+
+- **C#:** a string naming the gate's member passed to a test framework's
+  value assertion (`Assert.Contains("IsEnabled", ex.Errors.Keys)`,
+  `Assert.Equal`, `Assert.AreEqual`, …) no longer keeps your gate, when
+  `Assert` can only be the framework's class.
+
+- **C#:** a gate read through a primary-constructor parameter of a class
+  that implements a library interface (`class Job(IGate gate) : IJob`) is
+  now proven. Before, the library base was taken to maybe declare a member
+  of the parameter's name, and the read kept your gate. A library base spelled
+  like a class (`JobBase`, `IOException`) still does.
+
+- **C#:** a file is no longer taken to reach a gate just because it calls
+  some `Create(…)` when a static helper of that name returns something
+  holding the gate (`TestProtectors.Create()`). Such a static member is
+  reached only through its class's name, which the file would spell. An
+  instance or extension method of the name, or a `using static`, still
+  counts.
+
+- **C#:** a test harness from a static factory that returns its own class
+  (`using var h = Harness.Create();`) is now typed like `new Harness()`, so
+  a fake's knob written through it (`h.Gate.Enabled = false`) is resolved.
+  Before, the write kept your gate.
+
+- **C#:** fewer target-typed `new(…)` calls elsewhere keep an unread
+  constructor parameter. One in a project that can't reference the class no
+  longer counts for a primary constructor either, nor does one passing a
+  literal (`new(Limits.Projects, 1, 3)`) where the constructor takes an
+  interface your code declares. Before, either kept the parameter.
+
+- **C#:** a constructor parameter of a type the removal deletes is now
+  removed when some file builds a class with a target-typed `new(…)` in a
+  conditional whose other branch is `null`, `default` or another `new(…)`
+  (`dto is null ? null : new(dto.Id, …)`). Before, that `new(…)` kept the
+  parameter, whatever class it built.
+
+- **C#:** a public instance helper of a `sealed` test class whose `bool`
+  parameter builds a test fake (`h.CreateHandler(planGated: true)` on a
+  harness from `using var h = Harness.Create()`) is now rebuilt like a public
+  static one. The fake is built with the kept value, the parameter and every
+  argument go, and each test that passed the removed value is listed for
+  review. Calls on another class's method of the same name are left alone. A
+  `<paramref>` naming the parameter in either kind of helper's doc comment
+  becomes `<c>…</c>` instead of keeping your gate.
+
+- **C#:** a pinned test helper whose every call keeps its test (each passes
+  the kept value, or the default rebuilds it) is now edited. Before, its
+  parameter, arguments and fake stayed as they were, and the fake kept your
+  gate's member.
+
+- **C#:** more of an emptied gate family's leftovers are now removed instead
+  of keeping the interface and its fakes in place:
+  - a test fake that also serves other gates (`class OnGate : IGateA, IGateB`)
+    loses the removed gate's interface from its base list, and its
+    registration for that interface goes;
+  - two private fakes of the same name nested in different test classes both
+    go;
+  - a registration whose factory passes only literals
+    (`services.AddScoped<IGate>(_ => new FixedGate(true))`) goes;
+  - a `new(…)` whose context names the consumer being rebuilt (`Handler
+    Make() => new(…)`) loses its argument like `new Handler(…)`;
+  - a C# file of a project that cannot see yours, which does not parse or
+    builds things with `new(…)`, no longer keeps a constructor parameter.
+
+- **C#:** a private static test helper whose `bool` parameter builds a test
+  fake no longer keeps your gate just because its body calls another method of
+  the same name on a value. `BuildServiceProvider(…, bool planGated = false)`
+  ending in `return services.BuildServiceProvider();` is now pinned like any
+  other helper.
+
+- **C#:** a test whose call to a pinned private helper gets the value being
+  removed only through the parameter's default (`BuildServiceProvider(cs)` with
+  `planGated = false`) is no longer deleted. It runs with the kept value, and
+  the pull request lists it for review, as for a public helper. A call that
+  passes the removed value explicitly still deletes its test.
+
+- **C#:** a read through a dependency-injection lookup used directly
+  (`Assert.True(sp.GetRequiredService<IGate>().IsEnabled)`) is now rewritten
+  like one through a `var` it initializes, instead of keeping your gate. Lookup
+  reads also stay proven in a repository where some C# file does not parse
+  but only *calls* `GetRequiredService<…>()`. Before, any such file spelling the
+  name switched the proof off for every file.
+
+- A request to the Featureflip or GitHub API that stalls or drops no longer
+  fails the run on its own. Each read now waits up to 30 seconds for an answer
+  rather than 5, and one that times out or loses its connection is tried again
+  twice, after 1 and then 4 seconds. A write is never repeated, since one that
+  timed out may still have landed. An error the API answered with is reported
+  as before.
+
+- A symlink that points at itself, or into a loop of links, no longer stops
+  the run. A checkout holding one (`node_modules -> node_modules`, say) failed
+  every flag with `Symlink loop from …` when the link had no file extension or
+  a source one. Such a link names no file, so it is now skipped like any other
+  file nothing can read.
+
+- **C#:** a wrapper member could be removed while a controller still read it
+  through MVC's `ViewBag`. `ViewBag` is a library member typed `dynamic`, so a
+  file that stored your gate in it (`ViewBag.Gate = _gate;`) could hand it to
+  another controller that read `ViewBag.Gate.IsEnabled` while spelling none of
+  your gate's types. That read was not counted. Now it is judged like one in
+  a file that names your gate. This covers a read inside a class with a
+  library class among its bases (directly or through bases of your own, a
+  class nested in one included) whose receiver may start at an inherited
+  member. It also covers a read anywhere through a member such a class of
+  yours inherits (`_inner.ViewBag…`, `new HomeController().ViewBag…`, but
+  not `_db.Flags…` when your context declares `Flags`). A read through a
+  lambda's parameter or a declared variable of another type is cleared as
+  before, and so is a base named like an interface (`I` and a capital).
+
 ## 1.17.0
 
 ### New

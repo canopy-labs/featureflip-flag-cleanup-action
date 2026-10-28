@@ -41,10 +41,13 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 import httpx
+
+from flag_cleanup import http_retry
 
 logger = logging.getLogger(__name__)
 
@@ -224,10 +227,12 @@ class GitHubApi:
         *,
         api_url: str = DEFAULT_API_URL,
         transport: httpx.BaseTransport | None = None,
+        sleep: http_retry.Sleep = time.sleep,
     ) -> None:
         self._client = httpx.Client(
             base_url=api_url.rstrip("/"),
             transport=transport,
+            timeout=http_retry.TIMEOUT,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
@@ -235,12 +240,13 @@ class GitHubApi:
             },
         )
         self._graphql_url = graphql_url(api_url)
+        self._sleep = sleep
 
     def close(self) -> None:
         self._client.close()
 
     def get(self, path: str, params: dict[str, str] | None = None) -> httpx.Response:
-        return self._client.get(path, params=params)
+        return http_retry.get(self._client, path, params=params, sleep=self._sleep)
 
     def post(self, path: str, json: dict) -> httpx.Response:
         return self._client.post(path, json=json)
