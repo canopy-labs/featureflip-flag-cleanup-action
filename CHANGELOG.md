@@ -7,6 +7,212 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.17.0
+
+### New
+
+- **TypeScript and TSX:** OpenFeature's React SDK. `useBooleanFlagValue("KEY",
+  default)` from `@openfeature/react-sdk` is removed like `useFeatureFlag`,
+  including through a key constant, a key imported from another file, and a
+  hook of your own that wraps it. `client.getBooleanValue("KEY", default)` is
+  removed in a file importing `@openfeature/react-sdk` when `client` is what
+  that file got from `useOpenFeatureClient()`, as it already was in a file
+  importing `@openfeature/web-sdk`. A client from one of your own modules is
+  left alone there, since it may be a server client. A file that also mentions any other `@openfeature/…`
+  package, a server client included, is still left alone. `useBooleanFlagDetails`
+  and `useFlag` return details rather than a value and are not rewritten. The
+  import a removal strands is kept as `import "@openfeature/react-sdk";` unless
+  you list the package in `side-effect-free-modules`.
+
+- **TypeScript and JavaScript:** a value the removal shortened goes back onto
+  the line of its `=` or `:` once it fits. `const pollEnabled =\n
+  onboardingEnabled && !dismissed;` comes out as `const pollEnabled =
+  !dismissed;`, and the same goes for an assignment, an object property and a
+  class field. A JSX element written over several lines goes back onto its
+  tag's line the same way: `<Provider\n  flags={{ a: true, b: false }}\n>`
+  with `b` removed becomes `<Provider flags={{ a: true }}>`. Only a layout the
+  line's length needed is joined: a value you wrapped although it fit, one
+  that still spans lines, and one with a comment where it breaks are left as
+  they are. The width is the one the list joins use.
+- **TSX and JavaScript:** a fragment the removal leaves directly inside
+  another fragment or an HTML element, as `{flag && (<>…</>)}` folds to, is
+  replaced by its children, re-indented. Under a component (`<Menu>`), a
+  fragment holding text, and a `React.Fragment` with a `key` stay as they
+  are, as do `<option>`, `<textarea>` and `<title>`.
+
+- **TypeScript and JavaScript:** a JSX element whose attributes the removal
+  deleted no longer leaves its `>` on a line of its own. When an emptied or
+  default-equal prop is dropped from an element written one attribute per
+  line, `<TestProvider\n  flags={{}}\n>` comes out as `<TestProvider>`,
+  and `<Panel\n  a={1}\n  b\n/>` with `b` removed as `<Panel a={1} />`.
+  The conditions are the ones the parameter and argument lists follow: every
+  attribute left on one line, no comment inside the element, and a joined
+  line that fits your Prettier `printWidth`, your `.editorconfig`
+  `max_line_length`, or, with neither, the file's longest line. A Prettier
+  configuration that sets `singleAttributePerLine` now joins nothing, lists
+  included.
+- **TypeScript and JavaScript:** an argument equal to the callee's default is
+  now left out when the callee is a test helper declared inside a block, such
+  as `const renderWithProviders = (ui, flags = {}) => …` inside
+  `describe(…, () => { … })`. `renderWithProviders(<Page />, {})` comes out
+  as `renderWithProviders(<Page />)`. The helper must be bound once, to a
+  function, in a block that encloses the call, and never re-assigned. An
+  unexported top-level `let` helper is followed the same way as a `const`.
+- **Every language:** a file that names the flag's key only as a URL path
+  segment in a string, such as
+  `` fetch(`/environments/${id}/scheduled-changes`) `` or
+  `[HttpPost("{id}/scheduled-changes")]`, is now listed in its own ℹ️
+  paragraph of the pull request instead of under "still reference this
+  flag". An endpoint named after its feature used to make a complete
+  removal look unfinished. Nothing about what is rewritten changes.
+- **Every language:** when `directories` leaves part of the checkout out,
+  the pull request now names the files there that also mention the flag,
+  in an ℹ️ paragraph ("N file(s) outside the swept directories also name
+  this flag; not examined"). Before, a script or `README` outside the
+  configured directories that still named the key went unmentioned, and the
+  pull request read as if nothing was left. Nothing outside `directories` is
+  edited.
+- **C#:** a test fake whose one constructor stores its `bool` argument in the
+  knob its member reads (`public StubGate(bool enabled) => Enabled = enabled;`)
+  no longer refuses its gate family as `sibling-not-inert`. Each construction
+  is judged by its argument like any other knob setting: `new StubGate(true)`
+  with the kept value stays, a test building it with the removed value is
+  deleted, and a construction passing a variable keeps the wrapper.
+- **Every language:** a comment beside the change that describes the branch
+  the removal kept ("the member lookup only runs while the flag is on", when
+  the flag serves `true`) is now listed in its own ℹ️ paragraph, since its
+  condition is gone and the code it describes now always runs. It used to
+  sit in the general list of flag-state comments, or, in a comment of
+  several lines where another line named the flag, not be listed at all.
+  Comments are still never edited.
+
+- **TypeScript and JavaScript:** a new input, `side-effect-free-modules`,
+  takes module specifiers whose load does nothing, spelled exactly as your
+  imports spell them (`@/lib/featureflip, ./keys`). An import the removal
+  left with nothing to import is deleted instead of being kept as a bare
+  `import "…";`, and a CommonJS `require` likewise. Since this rests on your
+  word rather than a proof, the pull request names each import deleted this
+  way. The default is empty, which changes nothing.
+
+### Fixed
+
+- **C#:** a `[Theory]` writing its own `bool` parameter to a test fake's knob
+  (`_gate.Enabled = on;`, the rows saying `on`) no longer keeps the gate. Each
+  row passing the value being removed is deleted, the column and the
+  parameter go with the write, and a theory left with no row goes whole.
+
+- **C#:** a public static test helper whose `bool` parameter builds a test
+  fake, called from other files (`TestExpiry.Create(ctx, expiration: false)`,
+  `TestExpiry.Off(ctx)`), no longer keeps the gate. The fake is built with the
+  kept value, the parameter and every call's argument go, and no test is
+  deleted: each one that passed the value being removed is listed in the pull
+  request for review.
+
+- **C#:** a receiver read with a member none of your gate's types declares
+  is proven no gate even when its type comes from a library
+  (`var config = await response.Content.ReadFromJsonAsync<Dto>()`) or an
+  untyped lambda parameter (`c => c.IsEnabled && c.Strategy == 1`), and when
+  that member is passed as an argument (`Assert.Equal(key, config.Key)`) or
+  compared with `==`/`!=`. These assume no library hands one of your types
+  back as `dynamic`, as the per-member proof already did. The argument and
+  comparison cases also require that no file of yours declares or calls a
+  method of that name. A `foreach` variable is judged like any other local; any
+  `foreach` in a member used to leave its name unproven.
+
+- **C#:** a read through a receiver also read with a member none of your gate's
+  types declares is proven again in a repository where some C# file does not
+  parse, unless that file may declare one of the types or a type they inherit
+  from. A `dynamic` in a comment or a string no longer counts as one, and a
+  file outside every project no longer counts just because some project
+  compiles a file from outside its own folder.
+
+- **TypeScript and JavaScript:** in a file importing `@openfeature/web-sdk`,
+  a `getBooleanValue` read on a client imported from one of your own modules
+  was rewritten too. If that client was a server client, its read was a
+  promise, and the result (`true.then(...)`) failed at runtime. The read is
+  now rewritten only when the same file binds the client to
+  `OpenFeature.getClient()`, with `OpenFeature` imported from
+  `@openfeature/web-sdk` under that name. Other reads are left alone, and the
+  pull request names the file as still referencing the flag.
+
+- **C#:** one test or method that names your gate's interface no longer makes
+  every unrelated `IsEnabled` in the same file block the gate's removal. Each
+  member is judged on its own text: one that names nothing leading to the
+  gate (an Entity Framework row's `config.IsEnabled`, say) is not counted.
+  A file of your repository outside every project (a test fixture, say) no
+  longer counts for whether the repository uses `dynamic`.
+
+- **C#:** two ways a wrapper member could be removed while a file still read
+  it. A file that spelled none of your gate's types could take one from a
+  member typed `dynamic` in another file (`var x = D.Get(); x.IsEnabled`), or
+  call a static wrapper's member by its bare name under a `global using
+  static` (or a project `<Using Static="true">` item). Such a read was not
+  counted, and the removal broke the build. A member typed `dynamic` now
+  counts like one returning your gate's interface, and a `global using
+  static` naming one of your gate's types means no file is cleared just for
+  the names it spells.
+
+- **C#:** a project that compiles a file from another project's folder
+  (`<Compile Include="..\Other\Stub.cs" Link="Stub.cs" />`) no longer makes
+  every gate in the repository count as published. The file now counts as
+  compiled by both projects. A link the tool cannot resolve, through a
+  property or a wildcard, still makes every project count as reachable.
+
+- **C#:** a target-typed `new(…)` is read by the type its context declares.
+  A property `Dictionary<string, string> Txt { get; } = new(comparer)` no
+  longer counts as a possible construction of a test fake built through its
+  constructor's `bool`, and a test helper `Svc Make() => new(_fake)` hands the
+  fake to the code under test rather than letting it escape.
+
+- **C#:** a private test helper whose `bool` parameter builds a test fake
+  (`private static Policy Make(bool enabled = true) => new(new
+  StubGate(enabled));`) is resolved like one whose parameter chooses a stub:
+  each test calling it with the value being removed is deleted, the others
+  lose the argument, the parameter goes, and the fake is built with the kept
+  value. A helper passing its own `bool` parameter on to such a helper
+  (`Make(bool enabled = true) => Build(enabled)`) is resolved the same way, by
+  its own calls. A call passing the kept value no longer has to be in a plain
+  test: one in a `[Theory]` just loses the argument.
+
+- **C#:** a test fake whose member is a get-only auto-property set from its
+  primary constructor (`class FixedGate(bool on) : IGate { public bool
+  IsEnabled { get; } = on; }`) is now handled like one returning `=> on`. A
+  target-typed `new(…)` that cannot build a fake (it passes the wrong number
+  of arguments, or sits outside the type a private fake is nested in) no
+  longer keeps the gate.
+
+- **C#:** an xUnit `[Theory]` that passes its own `bool` parameter to a test
+  helper choosing the flag's stubbed value (`[InlineData(true, "new")]
+  [InlineData(false, "old")] … Make(on)`) no longer keeps the gate. The rows
+  for the value being removed are deleted, that column and the parameter go
+  from the rest, and a theory with no row left is deleted. The pull request
+  lists each one.
+
+- **C#:** a test fake that serves several gates with one member
+  (`class OnGate : ICheckoutGate, IWebhooksGate { public bool IsEnabled =>
+  true; }`) no longer blocks removing each gate. When the member already
+  returns the value the flag keeps serving, it is left as it is for the other
+  gates, and the pull request lists it.
+
+- **C#:** a class that takes your gate's interface through a constructor
+  (`public Job(IGate gate)`, the usual dependency-injection shape) no longer
+  stops every file that names the class from being cleared. Those files used
+  to need a proof for each unrelated `IsEnabled` they read, such as one on an
+  Entity Framework row, and when the proof failed the gate was left
+  unremoved.
+
+- **TSX and JavaScript:** a comment inside a folded `{...}` in JSX, as in
+  `{/* why */ flag && <Panel />}`, is no longer dropped with the braces. Such
+  a container is now left as it is.
+
+- **C#:** a test that set a fake's knob to the value being removed and then
+  handed the fake to code that sets it back (a helper method, a lambda) was
+  deleted as a test of the removed branch, though it ran the kept one. When
+  any test code in your repository writes the fake's knob outside a test
+  body, a test is now decided by such a write or construction only if the
+  fake stays within the test (written there, read, or passed to an object
+  being constructed); otherwise the test and the wrapper are left for you.
+
 ## 1.16.0
 
 ### New

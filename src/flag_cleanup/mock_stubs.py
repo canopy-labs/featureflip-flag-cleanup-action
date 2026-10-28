@@ -102,6 +102,12 @@ PINNED_PARAMETER = "pinned parameter"
 #: The statements of a C# test that set a fake's knob to the removed value
 #: and back (:func:`_phases`); carries the test's name and the first write.
 TEST_PHASE = "test phase"
+#: A ``[Theory]`` that lost the rows passing the removed value to a helper.
+TEST_ROWS = "test rows"
+#: A member that called a public test helper (:mod:`flag_cleanup.cs_shared_pins`)
+#: with the removed value, and now runs with the kept one; carries the member
+#: and its line, for review.
+REBUILT = "rebuilt with the kept value"
 
 #: An argument list's tail after the key: balanced to three levels, which
 #: covers matchers such as ``any(Context.class)`` and ``It.IsAny<C>()``.
@@ -355,6 +361,26 @@ class WrapperStub:
     #: test that builds one with no initializer and never writes the knob
     #: is decided by that value.
     owner_defaults: frozenset[tuple[str, bool]] = frozenset()
+    #: C#: the fakes of :attr:`sibling_owners` built through a constructor that
+    #: writes a SETTABLE knob (``Stub(bool on) => Enabled = on;``). Unlike a
+    #: primary constructor's parameter, the value it is built with can be
+    #: overwritten later, by a helper or a lambda no receiver proof sees, so a
+    #: construction decides its test only when the fake is handed straight to
+    #: another construction, bound to no name anything could reach it by.
+    settable_owners: frozenset[str] = frozenset()
+    #: C#: the fakes whose knob some test code writes from outside a test
+    #: body, or inside a lambda or local function (a helper's
+    #: ``g.Enabled = true``, ``s => s.Enabled = true``): such a write can set a
+    #: fake back after a test chose its value, unseen by the test. While any
+    #: is listed, a test is decided by a knob write or a settable fake's
+    #: construction only when the fake cannot reach such code
+    #: (:func:`_escapes`). Empty, every write is in a test body, judged there.
+    flippable_owners: frozenset[str] = frozenset()
+    #: C#: the simple names of the types test projects declare. A fake handed
+    #: to one of them being constructed (``new Flipper(g)``) may be stored
+    #: where something later sets its knob; one handed to anything else
+    #: built (the code under test) cannot be.
+    test_types: frozenset[str] = frozenset()
     #: C#: whether the file is test code this pass may edit for the pins,
     #: knobs and constructions above (its project is a test project). Off
     #: unless the caller says so.
@@ -919,6 +945,10 @@ class _Unit:
     constructions: list[bool] = field(default_factory=list)
     #: C#: the stubs among :attr:`stubs` that write a fake's knob.
     knob_writes: list[Node] = field(default_factory=list)
+    #: C#: a fake whose value decides the test can be reached by code that may
+    #: set its knob unseen (:func:`_escapes`), so the test cannot be decided
+    #: by the removed value: neither deleted nor cut into phases.
+    escapes: bool = False
 
 
 #: A fake built in a shape nothing here reads.
@@ -927,12 +957,268 @@ _UNREADABLE = object()
 _NOT_A_FAKE = object()
 
 
+#: Where a name is captured: code that runs at a time the test does not choose.
+_CAPTURING = frozenset({"lambda_expression", "anonymous_method_expression", "local_function_statement"})
+
+
+def _knob_receivers_written(statement: Node, data: bytes, knobs: frozenset[str]) -> list[tuple[str, bool]]:
+    """``(receiver, through this)`` for each knob ``statement`` writes: ``r``
+    in ``r.Knob = …`` (``False``) or ``this.r.Knob = …`` (``True``); a longer
+    chain (``host.Fake.Knob``) as written."""
+    found: list[tuple[str, bool]] = []
+    for node in _walk(statement):
+        if node.type != "assignment_expression":
+            continue
+        left = node.child_by_field_name("left")
+        if left is None or left.type != "member_access_expression":
+            continue
+        member = left.child_by_field_name("name")
+        if member is None or _text(member, data) not in knobs:
+            continue
+        receiver = left.child_by_field_name("expression")
+        via_this = False
+        if receiver is not None and receiver.type == "member_access_expression":
+            inner = receiver.child_by_field_name("expression")
+            if inner is not None and inner.type in ("this", "this_expression"):
+                receiver, via_this = receiver.child_by_field_name("name"), True
+        found.append((_text(receiver, data) if receiver is not None else "", via_this))
+    return found
+
+
+def _built_type(creation: Node | None, data: bytes) -> str | None:
+    """The simple name of the type ``creation`` builds: written, or for a
+    target-typed ``new(…)`` the type its context declares (an arrow body or
+    ``return`` of a method that is not ``async``, an explicitly typed
+    declaration). ``None`` for anything else, and for a name a ``using``
+    alias of the file defines, which may stand for any type."""
+    if creation is None:
+        return None
+    if creation.type == "object_creation_expression":
+        built = creation.child_by_field_name("type")
+        name = re.split(r"[.:<]", _text(built, data))[-1].strip() if built is not None else None
+    elif creation.type == "implicit_object_creation_expression":
+        from flag_cleanup import ctor_param_csharp
+
+        parent = creation.parent
+        if parent is None or parent.type == "initializer_expression":
+            return None  # a collection element: the repository may declare the collection
+        name = ctor_param_csharp._target_name(creation, "")
+    else:
+        return None
+    if name is None:
+        return None
+    root = creation
+    while root.parent is not None:
+        root = root.parent
+    for node in _walk(root):
+        if node.type == "using_directive":
+            alias = node.child_by_field_name("name")
+            if alias is not None and _text(alias, data).removeprefix("@") == name:
+                return None
+    return name
+
+
+def _built_escapes(
+    node: Node, test: Node, data: bytes, knobs: frozenset[str], profile: _Profile, test_types: frozenset[str]
+) -> bool:
+    """Whether a fake constructed at ``node`` inside ``test`` can be reached by
+    code that may set its knob: bound to a name that :func:`_escapes`, or
+    handed to anything but an object of a type no test project declares."""
+    holder = node.parent
+    if holder is not None and holder.type == "variable_declarator":
+        name = holder.child_by_field_name("name")
+        return name is None or _escapes(_text(name, data), False, node, test, data, knobs, profile, test_types)
+    if holder is not None and holder.type == "assignment_expression" and _same(holder.child_by_field_name("right"), node):
+        left = holder.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            return _escapes(_text(left, data), False, node, test, data, knobs, profile, test_types)
+    if holder is not None and holder.type == "argument":
+        return not _into_code_under_test(holder, data, test_types)
+    return True
+
+
+def _into_code_under_test(argument: Node, data: bytes, test_types: frozenset[str]) -> bool:
+    """Whether ``argument`` is passed, by value, to the construction of a type
+    no test project declares: the code under test, which can only see the
+    fake through its interface."""
+    if any(not c.is_named and _text(c, data) in ("ref", "out", "in") for c in argument.children):
+        return False
+    creation = argument.parent.parent if argument.parent is not None else None
+    built = _built_type(creation, data)
+    return built is not None and built not in test_types
+
+
+def _same(a: Node | None, b: Node) -> bool:
+    return a is not None and a.start_byte == b.start_byte and a.end_byte == b.end_byte
+
+
+def _escapes(
+    name: str,
+    via_this: bool,
+    at: Node,
+    test: Node,
+    data: bytes,
+    knobs: frozenset[str],
+    profile: _Profile,
+    test_types: frozenset[str],
+) -> bool:
+    """Whether the fake bound to ``name`` -- a local of ``test``, or a private
+    field of its class (always, when reached ``via_this``) -- may have its
+    knob set by code the test-double pass does not judge.
+
+    A use is harmless when it writes the knob inside the test (each write is
+    judged there) or in the class's instance constructor (it runs before the
+    test body), reads the knob, or hands the fake by value to the
+    construction of a type no test project declares (the code under test
+    sees it only through its interface). Anything else escapes: any other
+    member (a method, an extension method, a property that may return the
+    fake), an argument to a call or to a test type's constructor, a capture
+    by a lambda or local function, being assigned, aliased or returned. For
+    a field, so does handing ``this`` anywhere, which reaches every field. A
+    name bound any other way (a parameter, a property, a field that is not
+    private, a static field, a field of a partial class) escapes too.
+
+    Another test of the class is not looked at unless this one calls it: it
+    never runs inside this one (a fresh instance each under xUnit, before or
+    after it under a runner that shares one)."""
+    scope = _binding_scope(name, via_this, test, data)
+    if scope is None:
+        return True
+    root, declared = scope
+    field = root.id != test.id
+    called = {
+        _text(fn, data)
+        for node in _walk(test)
+        if node.type == "invocation_expression"
+        and (fn := node.child_by_field_name("function")) is not None
+        and fn.type == "identifier"
+    }
+    for node in _walk(root):
+        if field and node.type in ("this", "this_expression") and node.is_named:
+            parent = node.parent
+            if parent is None or parent.type != "member_access_expression" or not _same(
+                parent.child_by_field_name("expression"), node
+            ):
+                return True
+        if node.type != "identifier" or node.id == declared or _text(node, data) != name:
+            continue
+        inside = test.start_byte <= node.start_byte < test.end_byte
+        if not inside:
+            other, _ = _enclosing_test(node, profile, data)
+            if other is not None and other.id != test.id:
+                other_name = other.child_by_field_name("name")
+                if other_name is None or _text(other_name, data) not in called:
+                    continue
+        if not _harmless_use(node, root, data, knobs, inside, test_types):
+            return True
+    return False
+
+
+def _binding_scope(name: str, via_this: bool, test: Node, data: bytes) -> tuple[Node, int] | None:
+    """``(the scope to search, the declaring identifier's id)`` for ``name``:
+    the test, for one of its locals (never when reached through ``this``);
+    its class, for a private, non-static field of a non-partial class;
+    ``None`` otherwise."""
+    if not via_this:
+        for node in _walk(test):
+            if node.type == "variable_declarator":
+                declared = node.child_by_field_name("name")
+                if declared is not None and _text(declared, data) == name:
+                    return test, declared.id
+    owner = test.parent
+    while owner is not None and owner.type not in ("class_declaration", "struct_declaration", "record_declaration"):
+        owner = owner.parent
+    if owner is None or any(_text(c, data) == "partial" for c in owner.children if c.type == "modifier"):
+        return None
+    body = owner.child_by_field_name("body")
+    for member in body.named_children if body is not None else ():
+        if member.type != "field_declaration":
+            continue
+        words = {_text(c, data) for c in member.children if c.type == "modifier"}
+        variable = next((c for c in member.named_children if c.type == "variable_declaration"), None)
+        for declarator in variable.named_children if variable is not None else ():
+            declared = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+            if declared is not None and _text(declared, data) == name:
+                if words & {"public", "protected", "internal", "static"}:
+                    return None
+                return owner, declared.id
+    return None
+
+
+def _harmless_use(
+    node: Node, root: Node, data: bytes, knobs: frozenset[str], inside: bool, test_types: frozenset[str]
+) -> bool:
+    """Whether this mention of a fake's name cannot set its knob unseen; see
+    :func:`_escapes`."""
+    value = node
+    parent = node.parent
+    if parent is not None and parent.type == "member_access_expression" and _same(parent.child_by_field_name("name"), node):
+        receiver = parent.child_by_field_name("expression")
+        if receiver is None or receiver.type not in ("this", "this_expression"):
+            return True  # `other.name`: another object's member, not this binding
+        value, parent = parent, parent.parent
+    ancestor = value.parent
+    in_constructor = False
+    while ancestor is not None and ancestor.id != root.id:
+        if ancestor.type in _CAPTURING:
+            return False
+        if ancestor.type == "constructor_declaration" and not any(
+            _text(c, data) == "static" for c in ancestor.children if c.type == "modifier"
+        ):
+            in_constructor = True
+        ancestor = ancestor.parent
+    if parent is None:
+        return False
+    if parent.type == "member_access_expression" and _same(parent.child_by_field_name("expression"), value):
+        member = parent.child_by_field_name("name")
+        if member is None or _text(member, data) not in knobs:
+            # A method, an extension method, or a member that may hand the
+            # fake on (`Self => this`).
+            return False
+        outer = parent.parent
+        written = (
+            outer is not None
+            and outer.type in ("assignment_expression", "prefix_unary_expression", "postfix_unary_expression")
+            and (outer.type != "assignment_expression" or _same(outer.child_by_field_name("left"), parent))
+        ) or (outer is not None and outer.type == "argument")
+        if not written:
+            return True  # a read of the knob
+        # Judged as a stub in the test, or set before it by the constructor.
+        return (inside or in_constructor) and (outer is None or outer.type != "argument")
+    if parent.type == "argument":
+        return _into_code_under_test(parent, data, test_types)
+    return False
+
+
 def _passed_straight_into_a_construction(node: Node) -> bool:
     """``new Svc(new Fake())``: the fake is an argument of an object
     creation and bound to no name the test could reach it by."""
     argument = node.parent
     holder = argument.parent.parent if argument is not None and argument.type == "argument" and argument.parent is not None else None
     return holder is not None and holder.type in ("object_creation_expression", "implicit_object_creation_expression")
+
+
+def _construction_parameter(node: Node, owners: dict[str, tuple[str, bool]], data: bytes) -> Node | None:
+    """The identifier a construction of a positional-knob fake passes as its
+    one argument (``new Fake(on)``, ``new Fake(enabled: on)``), when that is
+    all it passes: a helper's parameter a construction pin may make."""
+    type_node = node.child_by_field_name("type")
+    if type_node is None or node.child_by_field_name("initializer") is not None:
+        return None
+    simple = _text(type_node, data)
+    if simple not in owners or not owners[simple][1]:
+        return None
+    arguments = node.child_by_field_name("arguments")
+    passed = [a for a in arguments.named_children if a.type != "comment"] if arguments is not None else []
+    if len(passed) != 1 or passed[0].type != "argument":
+        return None
+    label = passed[0].child_by_field_name("name")
+    value = passed[0].named_children[-1] if passed[0].named_children else None
+    if (label is not None and _text(label, data) != owners[simple][0]) or value is None or value.type != "identifier":
+        return None
+    if any(not c.is_named and _text(c, data) in ("ref", "out", "in") for c in passed[0].children):
+        return None
+    return value
 
 
 def _construction_value(node: Node, owners: dict[str, tuple[str, bool]], data: bytes):
@@ -1058,14 +1344,15 @@ def resolve(
         patterns = [(kind, re.compile(p)) for kind, p in profile.patterns(reads, key)]
     # C#: a statement naming a fake's knob through a proven receiver is a
     # line of the double too: a write of a literal is resolved like a stub,
-    # anything else (a read, a computed value) leaves its test unprovable.
+    # one of a `[Theory]`'s own parameter by its rows, and anything else (a
+    # read, a computed value) leaves its test unprovable.
     knob_mention: re.Pattern[str] | None = None
     if knob_holders:
         holders = "|".join(re.escape(r) for r in sorted(knob_holders, key=len, reverse=True))
         knobs = "|".join(re.escape(k) for k in sorted(knob_names, key=len, reverse=True))
         holder = rf"(?:this\s*\.\s*)?(?:{holders})"
         knob_mention = re.compile(rf"(?<![\w$]){holder}\s*\.\s*(?:{knobs})\b")
-        patterns.append((STUB, re.compile(rf"{holder}\s*\.\s*(?:{knobs})\s*=\s*{_BOOL}")))
+        patterns.append((STUB, re.compile(rf"{holder}\s*\.\s*(?:{knobs})\s*=\s*{_VALUE}")))
 
     def describes(text: str) -> bool:
         return _describes_read(text, mention) or (knob_mention is not None and bool(knob_mention.search(text)))
@@ -1154,6 +1441,12 @@ def _apply(
     units: dict[int, _Unit] = {}
     #: A stub returning a helper's parameter, with the pin proving it.
     pins: list[tuple[Node, cs_param_pins.CsPin, _Unit]] = []
+    #: A pinned construction's id -> the parameter it passes, which takes the
+    #: kept literal instead of being deleted with a stub's line.
+    constructed: dict[int, Node] = {}
+    #: A fake's knob written with a ``[Theory]``'s own parameter, whose rows
+    #: say the value (:func:`cs_param_pins.theory_write`).
+    theory_writes: list[tuple[Node, cs_param_pins.TheoryRows]] = []
     for statement in statements:
         if statement.id in containers:
             continue
@@ -1164,12 +1457,22 @@ def _apply(
             unit.kept = True
         kind, value, groups = _recognise(_text(statement, data), patterns)
         if kind == STUB and groups.get("param") is not None:
+            # A knob written from a parameter is decided by a theory's rows
+            # alone: a helper's knob write is not a stub pin.
+            knob = knob_writes is not None and knob_writes.search(_text(statement, data)) is not None
             pin = (
                 cs_param_pins.find(root, data, statement, groups["param"])
-                if fakes and not unit.kept
+                if fakes and not unit.kept and not knob
                 else None
             )
-            if pin is None:
+            theory = (
+                cs_param_pins.theory_write(statement, groups["param"], data)
+                if knob and fakes and not unit.kept
+                else None
+            )
+            if theory is not None:
+                theory_writes.append((statement, theory))
+            elif pin is None:
                 unit.unprovable = True
             else:
                 pins.append((statement, pin, unit))
@@ -1177,6 +1480,13 @@ def _apply(
             unit.stubs.append((statement, value == "true"))
             if knob_writes is not None and knob_writes.search(_text(statement, data)):
                 unit.knob_writes.append(statement)
+                if test is not None and wrapper.flippable_owners and any(
+                    "." not in receiver
+                    and _escapes(receiver, via_this, statement, test, data, wrapper.knobs, profile, wrapper.test_types)
+                    for receiver, via_this in _knob_receivers_written(statement, data, wrapper.knobs)
+                ):
+                    # Something other than this test may set the knob back.
+                    unit.escapes = True
         elif kind == VERIFICATION:
             unit.verifications.append(statement)
         else:
@@ -1190,13 +1500,32 @@ def _apply(
                 continue
             test, name = _enclosing_test(node, profile, data)
             if test is None:
+                # A helper's parameter may choose it, as one chooses a stub.
+                passed = _construction_parameter(node, owners, data) if built is _UNREADABLE else None
+                pin = cs_param_pins.find(root, data, node, _text(passed, data)) if passed is not None and fakes else None
+                if pin is not None:
+                    pins.append((node, pin, units.setdefault(node.id, _Unit(None, None))))
+                    constructed[node.id] = passed
                 continue  # no one test to decide; prove reports what is left
             unit = units.setdefault(test.id, _Unit(test, name))
+            simple = re.split(r"[.:]", _text(node.child_by_field_name("type"), data))[-1].strip()
             if built is _UNREADABLE:
                 unit.unprovable = True
             elif built is not None:
                 unit.constructions.append(built)
-            elif defaults and _passed_straight_into_a_construction(node):
+                if (
+                    simple in wrapper.flippable_owners
+                    and (simple in wrapper.settable_owners or not owners[simple][1])
+                    and _built_escapes(node, test, data, wrapper.knobs, profile, wrapper.test_types)
+                ):
+                    # Built into a settable knob, then reachable by code that
+                    # may set it back.
+                    unit.escapes = True
+            elif (
+                defaults
+                and _passed_straight_into_a_construction(node)
+                and not (wrapper.flippable_owners and _built_type(node.parent.parent.parent, data) in wrapper.test_types)
+            ):
                 # Built as it is, at a default that is the removed value, and
                 # handed straight to what the test builds, so nothing can set
                 # it: the test runs the removed branch and goes, unless it
@@ -1217,15 +1546,24 @@ def _apply(
         """``(tests, lines, pinned calls)`` with the pins in ``live`` made."""
         phases.clear()
         pinned: dict[int, list[bool]] = {}
-        calls: list[tuple[cs_param_pins.CsPin, Node, bool, Node | None]] = []
+        calls: list[tuple[cs_param_pins.CsPin, Node, bool | None, Node | None]] = []
+        emptied: list[tuple[Node, str, str]] = []
         for _, pin, _ in live:
             for call, value in cs_param_pins.calls(root, data, pin) or ():
+                if value == cs_param_pins.ROWS:
+                    # The theory's rows say the value: it goes when none
+                    # passes the kept one, and is cut otherwise.
+                    theory = cs_param_pins.theory_at(call, pin, data)
+                    if theory is not None and not any(v == ("true" if treatment else "false") for _, _, v in theory.rows):
+                        emptied.append((theory.method, theory.name, TEST))
+                    calls.append((pin, call, None, theory.method if theory is not None else None))
+                    continue
                 test, name = _enclosing_test(call, profile, data)
                 if test is not None:
                     units.setdefault(test.id, _Unit(test, name))
                     pinned.setdefault(test.id, []).append(value == "true")
                 calls.append((pin, call, value == "true", test))
-        tests: list[tuple[Node, str, str]] = list(sibling_tests)
+        tests: list[tuple[Node, str, str]] = list(sibling_tests) + emptied
         lines: list[tuple[Node, str]] = []
         for unit in units.values():
             values = {v for _, v in unit.stubs} | set(unit.constructions)
@@ -1233,6 +1571,9 @@ def _apply(
                 values |= set(pinned.get(unit.test.id, ()))
             if unit.kept or (unit.test is not None and unit.test.id in sibling_ids):
                 continue
+            if unit.escapes and (not treatment) in values:
+                # The removed value may not be the one the test runs with.
+                unit.unprovable = True
             if unit.test is not None and not unit.unprovable and values == {not treatment}:
                 tests.append((unit.test, unit.name or "", TEST))
                 continue
@@ -1252,7 +1593,16 @@ def _apply(
             lines += [(v, VERIFICATION) for v in unit.verifications]
             if not unit.unprovable and values == {treatment}:
                 lines += [(s, STUB) for s, _ in unit.stubs]
-        lines += [(statement, STUB) for statement, _, _ in live]
+        lines += [(statement, STUB) for statement, _, _ in live if statement.id not in constructed]
+        # A theory writing its parameter to a knob: rows of the removed value
+        # go, and the write with them, since every row left writes the kept one.
+        for statement, theory in theory_writes:
+            if any(v == ("true" if treatment else "false") for _, _, v in theory.rows):
+                lines.append((statement, STUB))
+            else:
+                emptied_write = (theory.method, theory.name, TEST)
+                if emptied_write not in tests:
+                    tests.append(emptied_write)
         return tests, lines, calls
 
     # A pin is made whole or not at all: every call's test must go, or keep
@@ -1266,11 +1616,20 @@ def _apply(
         for pin, call, value, test in calls:
             if any(t.start_byte <= call.start_byte and call.end_byte <= t.end_byte for t in deleted):
                 continue
+            if value is None:
+                # A theory cut by its rows holds no double of its own.
+                if test is None or any(test.start_byte <= s.start_byte < test.end_byte for s in doubles):
+                    refused.add(pin.method_start)
+                continue
+            # A call passing the kept value only loses its argument, wherever
+            # it is: outside any test (a `[Theory]`, a field) as well. One
+            # passing the removed value needs a test to delete, and a test
+            # left whole keeps its call as written.
             unit = units.get(test.id) if test is not None else None
-            if unit is None or unit.kept or value != treatment:
+            if value != treatment or (unit is not None and unit.kept) or (test is not None and unit is None):
                 refused.add(pin.method_start)
         if not refused:
-            raw = _pin_spans(root, data, live, deleted)
+            raw = _pin_spans(root, data, live, deleted, treatment, theory_writes)
             if raw is not None and not _overlaps(raw, tests, lines, data):
                 break
             refused = {pin.method_start for _, pin, _ in live}
@@ -1307,6 +1666,12 @@ def _apply(
         text = " ".join(_text(line, data).split())
         spans.append((line.start_byte, line.end_byte, Removal(kind, text)))
     spans += [(start, end, None) for start, end in raw]
+    kept_literal = "true" if treatment else "false"
+    spans += [
+        (constructed[statement.id].start_byte, constructed[statement.id].end_byte, kept_literal)
+        for statement, _, _ in live
+        if statement.id in constructed
+    ]
     spans += extra
     spans.sort(key=lambda span: span[0])
     result = source
@@ -1315,9 +1680,10 @@ def _apply(
     # left directly inside a brace or doubled up. A pin's parameter and
     # arguments are cut exactly.
     for start, end, removal in reversed(spans):
-        if removal is None:
+        if removal is None or isinstance(removal, str):
+            # A cut, or a pinned construction's parameter given the kept literal.
             encoded = result.encode("utf-8")
-            result = (encoded[:start] + encoded[end:]).decode("utf-8")
+            result = (encoded[:start] + (removal or "").encode("utf-8") + encoded[end:]).decode("utf-8")
             continue
         result = unused._delete_method(
             result, unused.Candidate(removal.text, start, end, removal.kind, removal.text)
@@ -1329,8 +1695,15 @@ def _apply(
     # the deletion itself still parses, is asked here.
     if _parse_errors(profile.parse(result, language)) > _parse_errors(root):
         return source, []
-    removals = [removal for _, _, removal in spans if removal is not None]
-    return result, removals + [_pin_removal(root, data, pin, deleted) for _, pin, _ in live]
+    removals = [removal for _, _, removal in spans if isinstance(removal, Removal)]
+    return result, removals + [_pin_removal(root, data, pin, deleted) for pin in _with_chained(root, data, live)] + [
+        Removal(
+            TEST_ROWS,
+            f"{theory.name}: {sum(v != kept for _, _, v in theory.rows)} of {len(theory.rows)} rows removed, "
+            f"and parameter `{_text(theory.parameter.child_by_field_name('name'), data)}`",
+        )
+        for theory, kept in _cut_theories(root, data, live, deleted, treatment, theory_writes)
+    ]
 
 
 #: What a test phase may not hold: a jump out of it, a label into it, or a
@@ -1483,6 +1856,19 @@ def _phases(unit: _Unit, treatment: bool, doubles: list[Node], data: bytes) -> l
     return found or None
 
 
+def _with_chained(
+    root: Node, data: bytes, live: list[tuple[Node, cs_param_pins.CsPin, _Unit]]
+) -> list[cs_param_pins.CsPin]:
+    """Each pin in ``live``, and after it each helper its calls pass the
+    parameter on to (:func:`cs_param_pins.chained`), once."""
+    found: list[cs_param_pins.CsPin] = []
+    for _, pin, _ in live:
+        for each in (pin, *cs_param_pins.chained(root, data, pin)):
+            if all((p.method_start, p.parameter) != (each.method_start, each.parameter) for p in found):
+                found.append(each)
+    return found
+
+
 def _pin_removal(root: Node, data: bytes, pin: cs_param_pins.CsPin, deleted: list[Node]) -> Removal:
     """The pull request's row for one pin: the helper as declared, and the
     calls that lost the argument. A call in a deleted test went with it, and
@@ -1509,13 +1895,51 @@ def code_span(text: str) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
-def _pin_spans(
-    root: Node, data: bytes, live: list[tuple[Node, cs_param_pins.CsPin, _Unit]], deleted: list[Node]
-) -> list[tuple[int, int]] | None:
-    """Every byte span the pins in ``live`` cut: each parameter, and each
-    argument outside a deleted test."""
-    spans: list[tuple[int, int]] = []
+def _cut_theories(
+    root: Node,
+    data: bytes,
+    live: list[tuple[Node, cs_param_pins.CsPin, _Unit]],
+    deleted: list[Node],
+    treatment: bool,
+    theory_writes: list[tuple[Node, cs_param_pins.TheoryRows]] = (),
+) -> list[tuple[cs_param_pins.TheoryRows, str]]:
+    """``(theory, kept literal)`` for each ``[Theory]`` a pin in ``live``, or
+    a knob write of its own parameter, cuts by its rows rather than deleting
+    it."""
+    kept = "true" if treatment else "false"
+    found = [
+        (theory, kept)
+        for _, theory in theory_writes
+        if not any(t.start_byte <= theory.method.start_byte < t.end_byte for t in deleted)
+    ]
     for _, pin, _ in live:
+        for call, value in cs_param_pins.calls(root, data, pin) or ():
+            if value != cs_param_pins.ROWS or any(t.start_byte <= call.start_byte < t.end_byte for t in deleted):
+                continue
+            theory = cs_param_pins.theory_at(call, pin, data)
+            if theory is not None:
+                found.append((theory, kept))
+    return found
+
+
+def _pin_spans(
+    root: Node,
+    data: bytes,
+    live: list[tuple[Node, cs_param_pins.CsPin, _Unit]],
+    deleted: list[Node],
+    treatment: bool,
+    theory_writes: list[tuple[Node, cs_param_pins.TheoryRows]] = (),
+) -> list[tuple[int, int]] | None:
+    """Every byte span the pins in ``live`` cut: each parameter, each
+    argument outside a deleted test, and a cut theory's rows, column and
+    parameter."""
+    spans: list[tuple[int, int]] = []
+    for theory, kept in _cut_theories(root, data, live, deleted, treatment, theory_writes):
+        cut = cs_param_pins.theory_spans(theory, data, kept)
+        if not cut:
+            return None
+        spans += cut
+    for pin in _with_chained(root, data, live):
         edits = cs_param_pins.edits(root, data, pin)
         if edits is None:
             return None
@@ -1714,6 +2138,9 @@ class Prepass:
     edited: dict[str, str] = field(default_factory=dict)
     #: absolute path -> the spelling :meth:`apply` was handed it by.
     spelled: dict[str, str] = field(default_factory=dict)
+    #: C#: the checkout, for a public test helper's calls in any file
+    #: (:mod:`flag_cleanup.cs_shared_pins`).
+    repo_dir: str | None = None
 
     def apply(self, paths: list[str]) -> None:
         for path in paths:
@@ -1749,6 +2176,55 @@ class Prepass:
             self.removals[key] = removed
             self.edited[key] = resolved
             _write_exact(path, resolved)
+        self._apply_shared(paths)
+
+    def _apply_shared(self, paths: list[str]) -> None:
+        """A public test helper's pins (:mod:`flag_cleanup.cs_shared_pins`):
+        its calls may be in any file of the checkout, so they are made after
+        every file's own pass, and all or none."""
+        from flag_cleanup import cs_shared_pins
+
+        wrapper = self.wrapper
+        if self.language != "csharp" or wrapper is None or self.repo_dir is None or not wrapper.sibling_owners:
+            return
+        helpers: dict[str, str] = {}
+        owners: dict[str, dict[str, tuple[str, bool]]] = {}
+        for path in paths:
+            if path not in self.test_code:
+                continue
+            proven = {o: (k, p) for o, k, p in self.owners.get(path, ()) if (o, k, p) in wrapper.sibling_owners}
+            if not proven:
+                continue
+            key = os.path.abspath(path)
+            try:
+                helpers[key] = self.edited.get(key) or _read_exact(path)
+            except (OSError, UnicodeDecodeError):
+                continue
+            owners[key] = proven
+        if not helpers:
+            return
+        kept = "true" if self.treatment else "false"
+        plan = cs_shared_pins.plan(self.repo_dir, helpers, owners, kept, dict(self.edited))
+        if plan is None:
+            return
+        written: dict[str, tuple[str, str]] = {}
+        for key, edits in plan.edits.items():
+            try:
+                base = self.edited.get(key) or _read_exact(key)
+            except (OSError, UnicodeDecodeError):
+                return
+            new = cs_shared_pins.apply(base, edits)
+            if new is None:
+                return
+            written[key] = (base, new)
+        for key, (base, new) in written.items():
+            self.spelled.setdefault(key, key)
+            self.originals.setdefault(key, base)
+            self.edited[key] = new
+            _write_exact(key, new)
+        for key, rows in plan.rows.items():
+            self.spelled.setdefault(key, key)
+            self.removals.setdefault(key, []).extend(Removal(kind, text) for kind, text in rows)
 
     def reapply(self, wrapper: WrapperStub) -> None:
         """Resolve every file this pass edited again, from the text it found

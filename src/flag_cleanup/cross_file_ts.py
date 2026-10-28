@@ -40,7 +40,8 @@ A mention in another file is proven only when that file can mean nothing else:
 
 Only the call shapes the reader rules in ``rules/ts_xconst.toml`` rewrite are
 reads, and those are the shapes the shipped seeds fold: the first argument of a
-non-optional ``boolVariation(...)`` or ``useFeatureFlag(...)`` call, bare or as
+non-optional ``boolVariation(...)``, ``useFeatureFlag(...)`` or
+``useBooleanFlagValue(...)`` call, bare or as
 a method, of ``await getBooleanValue(...)``, or of a configured accessor.
 
 A bare name that the file binds only itself -- a local, a parameter, its own
@@ -95,7 +96,7 @@ from flag_cleanup import key_const, key_const_visibility, source_index, ts_synta
 #: Callees whose FIRST argument the reader rules rewrite. `getBooleanValue`
 #: only when awaited: the bare call is a `Promise<boolean>`, exactly as in
 #: `ts.toml` and `key_const._ts_is_removable_read`.
-_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag", "getBooleanValue"})
+_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag", "useBooleanFlagValue", "getBooleanValue"})
 _AWAITED_ONLY_CALLEES = frozenset({"getBooleanValue"})
 
 #: What the compiler tries for an extensionless specifier, in its order.

@@ -131,6 +131,7 @@ from flag_cleanup.syntax import (
 from flag_cleanup.primary_constructor import unread_parameters
 from flag_cleanup.ts_unread_members import unread_constructor_parameters, unread_members
 from flag_cleanup.ts_syntax import strip_dangling_type_separators
+from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_bindings
 
 logger = logging.getLogger(__name__)
@@ -1741,6 +1742,15 @@ def _transform_flag(
         without_const,
     )
 
+    # Each TypeScript-family file's line width, for the engine's joins (see
+    # :func:`_print_width_facts`), off the customer's bytes: nothing below has
+    # marked a file yet.
+    widths = (
+        _print_width_facts(sorted({*paths, *reader_paths}), repo_dir)
+        if language in ("ts", "tsx", "js")
+        else {}
+    )
+
     # THE KOTLIN PRE-PASS — besides the test-double pass, the only thing in
     # this tool that edits the customer's files before the engine does. It
     # marks the calls the rules are allowed to rewrite, because Kotlin rules
@@ -1832,6 +1842,7 @@ def _transform_flag(
         argument_flags=argument_flags,
         flag_key=flag_key,
         repo_dir=repo_dir,
+        file_facts=widths,
     )
 
     unprocessable: list[str] = list(skipped)
@@ -2472,12 +2483,15 @@ def _plan_wrappers(
         return {
             "knobs": frozenset(s.knob for s in going if not s.knob_primary) - staying_knobs,
             "sibling_owners": frozenset(
-                (s.owner, s.knob, s.knob_primary) for s in going if s.owner not in staying_owners
+                (s.owner, *s.construction) for s in going if s.owner not in staying_owners
             ),
             "owner_defaults": frozenset(
                 (s.owner, (s.knob_default or "false") == "true")
                 for s in going
-                if s.owner not in staying_owners and not s.knob_primary
+                if s.owner not in staying_owners and not s.construction[1]
+            ),
+            "settable_owners": frozenset(
+                s.owner for s in going if s.owner not in staying_owners and s.knob_parameter is not None
             ),
         }
 
@@ -2488,7 +2502,7 @@ def _plan_wrappers(
     if qualified and doubles is not None:
         receivers = wrapper_inline.stub_receivers(language, qualified)
         sibling_reads = wrapper_inline.sibling_receivers(language, qualified)
-        knob_reads, built, test_code = wrapper_inline.fake_settings(language, qualified)
+        knob_reads, built, test_code, flippable, test_types = wrapper_inline.fake_settings(language, qualified)
 
         def spell(found: dict) -> dict:
             return {by_resolved[r]: names for r, names in found.items() if r in by_resolved}
@@ -2498,12 +2512,16 @@ def _plan_wrappers(
         if spelled or sibling_spelled or knob_spelled or built_spelled:
             stub_pass = mock_stubs.Prepass(
                 language, flag_key, treatment, accessors,
-                wrapper=mock_stubs.WrapperStub(tuple(sorted({w.name for w, _ in qualified})), **fakes(frozenset())),
+                wrapper=mock_stubs.WrapperStub(
+                    tuple(sorted({w.name for w, _ in qualified})), **fakes(frozenset()),
+                    flippable_owners=flippable, test_types=test_types,
+                ),
                 receivers=spelled,
                 siblings=sibling_spelled,
                 knob_receivers=knob_spelled,
                 owners=built_spelled,
                 test_code=frozenset(by_resolved[r] for r in test_code if r in by_resolved),
+                repo_dir=repo_dir if language == "csharp" else None,
             )
             doubles.append(stub_pass)
             stub_pass.apply(sorted({*spelled, *sibling_spelled, *knob_spelled, *built_spelled}))
@@ -2944,7 +2962,7 @@ def _flag_state_comments(
     """A ``(path, kind, "<line>: <text>")`` row for each comment on or
     directly above a changed line that describes a flag's state without
     naming the key; ``kind`` says whether it describes the branch this run
-    deleted. Report only. See :func:`flag_cleanup.stale_comments.flag_state_comments`.
+    deleted, the one it kept, or neither. Report only. See :func:`flag_cleanup.stale_comments.flag_state_comments`.
     """
     rows: list[tuple[str, str, str]] = []
     for s in summaries:
@@ -2957,7 +2975,13 @@ def _flag_state_comments(
         for found in stale_comments.flag_state_comments(
             s.original_content, s.content, grammar, flag_key, treatment
         ):
-            kind = stale_comments.REMOVED_BRANCH_KIND if found.removed else stale_comments.FLAG_STATE_KIND
+            kind = (
+                stale_comments.REMOVED_BRANCH_KIND
+                if found.removed
+                else stale_comments.KEPT_BRANCH_KIND
+                if found.kept
+                else stale_comments.FLAG_STATE_KIND
+            )
             rows.append((relative, kind, f"{found.line}: {found.text}"))
     return tuple(rows)
 
@@ -4410,12 +4434,18 @@ def _remove_stranded_bindings(
         )
         relative = os.path.relpath(summary.path, repo_dir)
         kept = "marked import" if grammar == "python" else "bare import"
-        bindings.extend(
-            (relative, "module marker" if c.replacement == MODULE_MARKER else kept, c.replacement)
-            if c.replacement is not None
-            else (relative, c.kind, c.text)
-            for c in acted
-        )
+        for c in acted:
+            if c.declared is not None:
+                # Deleted on the customer's word rather than a proof, and named
+                # as such; a module marker left in its place is named too.
+                bindings.append((relative, DECLARED_LOAD, c.declared))
+                if c.replacement is None:
+                    continue
+            bindings.append(
+                (relative, "module marker" if c.replacement == MODULE_MARKER else kept, c.replacement)
+                if c.replacement is not None
+                else (relative, c.kind, c.text)
+            )
     return cleaned_summaries, tuple(bindings)
 
 
@@ -4914,7 +4944,7 @@ def _execute(
         # can delete one its own fold stranded (see
         # :func:`~flag_cleanup.unused.go_import_facts`). Then whatever the
         # caller computed, such as a TypeScript file's line width (see
-        # :func:`_execute_ctor_param_rules`).
+        # :func:`_print_width_facts`).
         facts = _go_file_facts(paths) if piranha_language == "go" else {}
         facts.update({os.path.abspath(path): found for path, found in (file_facts or {}).items()})
         args = PiranhaArguments(
@@ -4947,6 +4977,28 @@ def _execute(
             raise PiranhaTransformError(
                 f"Piranha aborted while removing {flag_key!r} from {repo_dir}: {exc}"
             ) from exc
+
+
+def _print_width_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[str, str]]]:
+    """Each file's ``print_width`` fact, the width :func:`ts_list_join.line_limit`
+    reads for it, by absolute path. A file it gives no width joins nothing.
+
+    The engine joins, under this width, a layout its own edits made
+    unnecessary: a parameter or argument list shrunk to one element, a value
+    wrapped after its ``=`` or ``:``, and a JSX element spread over lines.
+    Read off the customer's bytes, before any pass marks a file: a mark is a
+    long identifier, and a file whose width falls back to its longest line
+    would otherwise measure the mark."""
+    facts = {}
+    for path in paths:
+        try:
+            original = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        width = ts_list_join.line_limit(path, original, repo_dir)
+        if width is not None:
+            facts[os.path.abspath(path)] = [{"print_width": str(width)}]
+    return facts
 
 
 def _go_file_facts(paths: list[str]) -> dict[str, list[dict[str, str]]]:

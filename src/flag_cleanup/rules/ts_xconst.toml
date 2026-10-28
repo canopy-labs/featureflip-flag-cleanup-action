@@ -12,7 +12,8 @@
 # `ns` and __XCONST_OWNER__ for `Flags`.
 #
 # The callee shapes are the seed rules' in `ts.toml`, changing only the key
-# argument: `boolVariation` and `useFeatureFlag` as a method or a bare call,
+# argument: `boolVariation`, `useFeatureFlag` and `useBooleanFlagValue` as a
+# method or a bare call,
 # never through `?.`, and `getBooleanValue` only under an `await`, matched at
 # the `await_expression` for the reason given there. The sync OpenFeature seed
 # is not copied: it is gated on the file's imports, which a reader of a
@@ -59,6 +60,30 @@ query = """(
       . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
   ) @call
   (#eq? @sdk_fn "useFeatureFlag")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+name = "xconst_qualified_usebooleanflagvalue_read"
+# xconst: qualified
+# @openfeature/react-sdk's hook (#4357). Identical to the useFeatureFlag rule
+# above but for the callee; see it for the filters' reasoning.
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "useBooleanFlagValue")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -134,6 +159,28 @@ holes = ["treated"]
 not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
 
 [[rules]]
+name = "xconst_bare_usebooleanflagvalue_read"
+# xconst: bare
+# @openfeature/react-sdk's hook (#4357). Identical to the useFeatureFlag rule
+# above but for the callee; see it for the filters' reasoning.
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . (identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "useBooleanFlagValue")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
 # xconst: bare
 name = "xconst_bare_getbooleanvalue_read"
 query = """(
@@ -192,6 +239,33 @@ query = """(
           property: (property_identifier) @key_member))
   ) @call
   (#eq? @sdk_fn "useFeatureFlag")
+  (#eq? @key_namespace "__XCONST_NAMESPACE__")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+name = "xconst_nested_usebooleanflagvalue_read"
+# xconst: enum-nested
+# @openfeature/react-sdk's hook (#4357). Identical to the useFeatureFlag rule
+# above but for the callee; see it for the filters' reasoning.
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (member_expression !optional_chain
+          object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
+          property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "useBooleanFlagValue")
   (#eq? @key_namespace "__XCONST_NAMESPACE__")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")

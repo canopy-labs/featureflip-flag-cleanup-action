@@ -14,6 +14,9 @@ caveat:
   prose as well — ``it('renders the page when the flag is on')`` is a string
   no code reads as a key — but prose in front of every run of the suite, so
   the pull request lists it apart from the comments;
+* a file that names the key only as a URL PATH SEGMENT in a string
+  (``/environments/${id}/scheduled-changes``): an endpoint named after the
+  feature, which is common and is no flag read, so it is listed apart;
 * a file whose only mention of the key is an ENUM MEMBER's value (or, in
   TypeScript, a property of an ``as const`` object, which the run reads as
   one): resolved for some languages and forms, so the pull request says which;
@@ -74,6 +77,13 @@ class Residue:
     #: ``comment_only`` file: the prose the run kept because it says
     #: something besides the flag (see :mod:`flag_cleanup.stale_comments`).
     comment_lines: tuple[tuple[str, int, str], ...] = ()
+    #: Files every live mention of the flag in which is a URL path segment in
+    #: a string (and the rest comments or test titles); see :func:`_path_only`.
+    path_only: tuple[str, ...] = ()
+    #: Files outside the run's ``directories`` that also name the flag,
+    #: relative to the checkout root. Never examined and never edited; see
+    #: :func:`flag_cleanup.orchestrate.outside_mentions`.
+    outside: tuple[str, ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
@@ -149,6 +159,46 @@ def _title_only(
             continue
         stack.extend(node.children)
     return in_titles > 0
+
+
+#: What may follow a key that is a whole path segment: another segment, a
+#: query or fragment, or the string's closing quote.
+_PATH_END = frozenset(b"/?#\"'`")
+
+
+def _path_only(root: Node, source: str, mention: re.Pattern[str], language: str) -> bool:
+    """Whether every mention outside comments and test titles is a whole
+    path segment of a URL in a string: ``/`` in front of it, and ``/``,
+    ``?``, ``#`` or the closing quote after it, with one such mention found.
+
+    Read off the bytes around each mention rather than a grammar's string
+    node, so every language answers the same way; the leaf must still be a
+    string's (its type, or its parent's, names one), or ``a/b`` in code
+    would count."""
+    data = source.encode("utf-8")
+    titles = ts_tests.title_nodes(root, data) if language in _TITLED else frozenset()
+    in_paths = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if "comment" in node.type or node.id in titles:
+            continue
+        if node.child_count:
+            stack.extend(node.children)
+            continue
+        text = node.text.decode("utf-8", "replace")
+        matches = list(mention.finditer(text))
+        if not matches:
+            continue
+        if "str" not in node.type and (node.parent is None or "str" not in node.parent.type):
+            return False
+        for match in matches:
+            start = node.start_byte + len(text[: match.start()].encode("utf-8"))
+            end = start + len(match.group().encode("utf-8"))
+            if data[start - 1 : start] != b"/" or (end < len(data) and data[end] not in _PATH_END):
+                return False
+            in_paths += 1
+    return in_paths > 0
 
 
 #: The grammar node of one enum member, per language (measured, not guessed).
@@ -284,6 +334,7 @@ def classify(
     title_only: list[str] = []
     enum_held: list[tuple[str, str]] = []
     comment_lines: list[tuple[str, int, str]] = []
+    path_only: list[str] = []
     for path in paths:
         language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
         if language is None:
@@ -306,11 +357,19 @@ def classify(
         if _title_only(root, source, mention, language):
             title_only.append(path)
             continue
+        if _path_only(root, source, mention, language):
+            path_only.append(path)
+            continue
         held = _enum_held(root, mention, language)
         if held is not None:
             enum_held.append((path, held))
     return Residue(
-        tuple(stubbed), tuple(comment_only), tuple(enum_held), tuple(title_only), tuple(comment_lines)
+        tuple(stubbed),
+        tuple(comment_only),
+        tuple(enum_held),
+        tuple(title_only),
+        tuple(comment_lines),
+        tuple(path_only),
     )
 
 

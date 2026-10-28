@@ -154,6 +154,7 @@ not_contains = ["""(
   (#eq? @rebind "@identifier")
   (#not-eq? @callee "boolVariation")
   (#not-eq? @callee "useFeatureFlag")
+  (#not-eq? @callee "useBooleanFlagValue")
 )""", """(
   (variable_declarator name: (identifier) @rebind
     value: (call_expression
@@ -250,6 +251,7 @@ not_contains = ["""(
   (#eq? @rebind "@variable_name")
   (#not-eq? @callee "boolVariation")
   (#not-eq? @callee "useFeatureFlag")
+  (#not-eq? @callee "useBooleanFlagValue")
 )""", """(
   (variable_declarator name: (identifier) @rebind
     value: (call_expression
@@ -368,6 +370,46 @@ query = """(
     arguments: (arguments . (identifier) @key_const)
   ) @call
   (#eq? @sdk_fn "useFeatureFlag")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(program
+     [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string . (string_fragment) @flag_name .)) .)
+      (export_statement declaration: (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string . (string_fragment) @flag_name .)) .))])
+   (statement_block
+     (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: (string . (string_fragment) @flag_name .)) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules]]
+name = "replace_usebooleanflagvalue_const_key_read_with_boolean_literal"
+# @openfeature/react-sdk's hook (#4357). Identical to the useFeatureFlag rule
+# above but for the callee; see it for the filters' reasoning.
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "useBooleanFlagValue")
 )"""
 replace_node = "call"
 replace = "@treated"

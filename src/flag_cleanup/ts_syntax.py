@@ -57,7 +57,7 @@ from tree_sitter import Language, Node, Parser
 # than the Piranha rules (any call arity, `let`/`var` too, optional chaining
 # included): Gate 2 must never consider FEWER declarations than the rules can
 # act on, and over-matching only costs a skipped cleanup.
-_FLAG_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag"})
+_FLAG_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag", "useBooleanFlagValue"})
 
 # Grammar FIELDS that introduce a binding. Field names are a small closed set in
 # the grammar and mean "this is the thing being declared", which is why the gate

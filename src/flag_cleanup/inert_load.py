@@ -27,6 +27,14 @@ is a specifier the resolver cannot pin to one file, a declaration file
 (the runtime loads a different file), a file outside the checkout, or a file
 that does not parse.
 
+A specifier can also be DECLARED inert by the customer, through the
+``side-effect-free-modules`` input, for the loads no proof here can reach (a
+module graph that ends in a package, or code at module scope that only looks
+like work). That is their word, not a proof: :func:`declaring` holds the list
+for one run, :func:`declared` asks it, and the caller reports every deletion
+it allows separately from the proven ones. The match is on the exact
+spelling of the specifier, never a pattern.
+
 The question is asked of the files on disk at the moment the pass runs. The
 run only ever removes code from them, which can make a module more inert but
 never less, so a module judged inert stays inert in the tree the pull request
@@ -38,7 +46,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -161,6 +170,36 @@ def _parser(grammar: str) -> Parser:
 
 def _grammar(path: str) -> str:
     return "ts" if path.endswith((".ts", ".mts", ".cts")) else "tsx"
+
+
+#: The ``bindings`` kind of an import deleted only because its specifier was
+#: declared (:func:`declared`); its text is the specifier.
+DECLARED_LOAD = "declared side-effect-free import"
+
+#: The specifiers the running pass was told load nothing; see :func:`declaring`.
+_declared: frozenset[str] = frozenset()
+
+
+@contextmanager
+def declaring(specifiers: Iterable[str]) -> Iterator[None]:
+    """Treat a load of each of ``specifiers`` as doing nothing, for the scope.
+
+    Set once per run from the customer's ``side-effect-free-modules`` input,
+    like :func:`flag_cleanup.source_index.run_scope`, rather than threaded
+    through every call down to the stranded-binding pass."""
+    global _declared
+    previous = _declared
+    _declared = frozenset(specifiers)
+    try:
+        yield
+    finally:
+        _declared = previous
+
+
+def declared(specifier: str) -> bool:
+    """Whether the customer declared that loading ``specifier``, spelled
+    exactly so, does nothing."""
+    return specifier in _declared
 
 
 def is_inert(reader_path: str, specifier: str, repo_dir: str) -> bool:

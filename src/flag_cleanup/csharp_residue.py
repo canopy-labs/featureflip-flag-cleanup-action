@@ -299,7 +299,10 @@ def _member_less(declaration: Node, kind: str, knob: str | None = None) -> str |
     ]
     if kind == "interface":
         return f"it still declares {_text(members[0]).split(chr(10))[0][:60]}" if members else None
-    fields: set[str] = set()
+    # The knob goes with the type, so a constructor that stores its argument
+    # in it (``Stub(bool enabled) => Enabled = enabled;``) stores no more than
+    # one storing a private field does.
+    fields: set[str] = {knob} if knob is not None else set()
     for member in members:
         if member.type != "field_declaration":
             continue
@@ -1268,7 +1271,7 @@ def _assembly_scans(repo_dir: str, targets: list[Target], names: frozenset[str])
     from flag_cleanup import csharp_family
 
     projects_all = xcs._project_dirs(repo_dir)
-    homes = [csharp_family._enclosing(t.path, projects_all) for t in targets]
+    homes = [csharp_family._enclosing(t.path, projects_all, repo_dir) for t in targets]
     # `reaches` reads only these two facts of a family.
     family = types.SimpleNamespace(
         projects=frozenset(p for home in homes for p in home),
@@ -3289,10 +3292,10 @@ def _config_keys(
     quoted = re.compile(rb"""["']""" + re.escape(section.encode()) + tail + rb"""["']""", re.IGNORECASE)
     graph = csharp_family.project_graph(repo_dir)
     projects = xcs._project_dirs(repo_dir)
-    homes = {p for b in bindings for p in csharp_family._enclosing(b, projects)}
+    homes = {p for b in bindings for p in csharp_family._enclosing(b, projects, repo_dir)}
 
     def loads(config: Path) -> bool | None:
-        enclosing = csharp_family._enclosing(str(config.resolve()), projects)
+        enclosing = csharp_family._enclosing(str(config.resolve()), projects, repo_dir)
         if not enclosing or graph is None:
             return None
         pending, seen = list(enclosing), set()

@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, prerequisite_hold, ruby_owner_reach, source_index
+from flag_cleanup import git_ops, github_ops, inert_load, prerequisite_hold, ruby_owner_reach, source_index
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -106,6 +106,7 @@ from flag_cleanup.piranha_runner import (
     UnsafeRewriteError,
     UnsupportedFlagKeyError,
     candidate_files,
+    checkout_root,
     ensure_supported_key,
     plan_registry_default,
     transform_flag,
@@ -461,7 +462,8 @@ def run(
         # One listing of the checkout's source files for the whole run: every
         # flag's changes are undone before the next starts, so no candidate
         # adds or removes a file another one would see. See `source_index`.
-        with source_index.run_scope():
+        # The declared side-effect-free modules hold for the same span.
+        with source_index.run_scope(), inert_load.declaring(config.side_effect_free_modules):
             proposed = 0
             for candidate in resolved_client.removal_candidates(
                 config.org, config.project, config.staleness
@@ -742,7 +744,7 @@ def _process_candidate(
         # preview a real run would have contradicted the real run's own body.
         if transform_error is None:
             unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-            sorted_residue = classify_residue(unprocessed, candidate.key, config.accessors)
+            sorted_residue = sort_residue(config, unprocessed, candidate.key)
             enum_held = sorted_residue.enum_held
             wrappers = without_inlined(
                 find_constant_wrappers(diff, config.directories), wrapper_findings
@@ -908,9 +910,7 @@ def _process_candidate_for_pr(
                 logger.info("no changes for %s: opening no PR", candidate.key)
                 action = "no-changes"
                 unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-                sorted_residue = classify_residue(
-                    unprocessed, candidate.key, config.accessors
-                )
+                sorted_residue = sort_residue(config, unprocessed, candidate.key)
                 enum_held = sorted_residue.enum_held
             else:
                 # Computed BEFORE the PR is opened so the body can carry the
@@ -919,7 +919,7 @@ def _process_candidate_for_pr(
                 unprocessed = all_unprocessed(config, candidate.key, unprocessable)
                 # Sorted while the rewrite is still on disk, for the same
                 # reason `unprocessed` is computed here.
-                residue = classify_residue(unprocessed, candidate.key, config.accessors)
+                residue = sort_residue(config, unprocessed, candidate.key)
                 sorted_residue = residue
                 enum_held = residue.enum_held
                 # Same window, same reason: the members it reads are only
@@ -2046,6 +2046,68 @@ def _warn_on_unprocessed_references(
             ", ".join(config.languages),
             ", ".join(unprocessed),
         )
+
+
+def sort_residue(config: Config, unprocessed: tuple[str, ...], flag_key: str) -> Residue:
+    """``unprocessed`` sorted by :func:`~flag_cleanup.residue.classify`, with
+    the files outside the swept directories that name the flag beside it.
+
+    Public: ``pr_command`` regenerates the body through the same path."""
+    return replace(
+        classify_residue(unprocessed, flag_key, config.accessors),
+        outside=outside_mentions(config, flag_key),
+    )
+
+
+def outside_mentions(config: Config, flag_key: str) -> tuple[str, ...]:
+    """Files of the checkout outside every configured directory that name
+    ``flag_key``, relative to the checkout root and sorted.
+
+    Report only. Nothing outside ``directories`` is read by the transform or
+    edited, which is right, but it means the pull request's silence about a
+    file there would read as "no mention left". One ``git grep`` asks the
+    whole checkout: tracked files and untracked ones git does not ignore,
+    any type of text file (a ``README`` that names the flag counts), binary
+    files skipped. Each hit is then held to the same key boundary as the
+    in-scope scan (:func:`_mentions_flag_key`), so ``new-ui`` does
+    not report ``new-ui-shell``, and the same skipped directories,
+    so build output does not either. Outside a git checkout, or if git
+    fails, nothing is reported.
+    """
+    if not config.directories:
+        return ()
+    root = Path(checkout_root(config.directories[0])).resolve()
+    swept = [Path(directory).resolve() for directory in config.directories]
+    if root in swept:
+        return ()
+    try:
+        result = subprocess.run(
+            ["git", "grep", "-l", "-I", "-z", "--untracked", "-F", "-e", flag_key],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return ()
+    if result.returncode not in (0, 1):
+        # 1 is "nothing matched"; anything else is git failing.
+        return ()
+    found: list[str] = []
+    for relative in sorted(r for r in result.stdout.decode("utf-8", "surrogateescape").split("\0") if r):
+        parts = Path(relative).parts
+        if any(part in _SKIP_DIRS or part in _GENERATED_DIRS for part in parts[:-1]):
+            continue
+        path = root / relative
+        resolved = path.resolve()
+        if any(resolved == directory or directory in resolved.parents for directory in swept):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _mentions_flag_key(text, flag_key):
+            found.append(relative)
+    return tuple(found)
 
 
 def _mentions_flag_key(text: str, flag_key: str) -> bool:

@@ -45,6 +45,7 @@ from flag_cleanup import (
     cross_file_keys,
     git_ops,
     github_ops,
+    inert_load,
     orchestrate,
     pr_content,
     source_index,
@@ -54,7 +55,8 @@ from flag_cleanup.client import Candidate, FeatureflipClient
 from flag_cleanup.config import Config, STALENESS_VALUES
 from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
-from flag_cleanup.residue import Residue, classify as classify_residue
+from flag_cleanup.residue import Residue
+from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 
 logger = logging.getLogger(__name__)
@@ -593,7 +595,9 @@ def _regenerate(
     created_branch = False
     snapshot: git_ops.WorktreeSnapshot | None = None
     try:
-        with source_index.run_scope(), orchestrate.piranha_transform(
+        with source_index.run_scope(), inert_load.declaring(
+            config.side_effect_free_modules
+        ), orchestrate.piranha_transform(
             candidate, config, ledger, known_flag_keys
         ) as (
             diff,
@@ -621,7 +625,7 @@ def _regenerate(
                 # complete.
                 raise transform_error
             unprocessed = orchestrate.all_unprocessed(config, key, unprocessable)
-            residue = classify_residue(unprocessed, key, config.accessors)
+            residue = orchestrate.sort_residue(config, unprocessed, key)
             wrappers = pr_content.without_inlined(
                 constant_wrappers.find_constant_wrappers(diff, config.directories),
                 wrapper_findings,
@@ -887,9 +891,15 @@ def _dry_run_caveats(
     removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
+    declared_loads = sum(1 for _, kind, _ in bindings if kind == DECLARED_LOAD)
     state_comments = sum(
         1 for _, kind, _ in bindings
-        if kind in (stale_comments.REMOVED_BRANCH_KIND, stale_comments.FLAG_STATE_KIND)
+        if kind
+        in (
+            stale_comments.REMOVED_BRANCH_KIND,
+            stale_comments.KEPT_BRANCH_KIND,
+            stale_comments.FLAG_STATE_KIND,
+        )
     )
     cleaned = (
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
@@ -898,7 +908,13 @@ def _dry_run_caveats(
         - state_comments
         - renamed_tests
         - removed_defaults
+        - declared_loads
     )
+    if declared_loads:
+        notes.append(
+            f"{declared_loads} import(s) of a module listed in side-effect-free-modules "
+            "would be deleted"
+        )
     if removed_defaults:
         notes.append(
             "the flag's default is the branch being removed, so tests that never "

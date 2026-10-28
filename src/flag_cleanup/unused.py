@@ -351,6 +351,11 @@ class Candidate:
     #: and the pass reads its specifier off the initializer
     #: (``_inert_require``).
     loads: str | None = None
+    #: The specifier a kept load would have loaded, when the pass deleted it
+    #: only because the customer declared that load does nothing
+    #: (:func:`flag_cleanup.inert_load.declared`), so the pull request can say
+    #: the deletion rests on their word. ``None`` otherwise.
+    declared: str | None = None
 
 
 def _candidate(
@@ -4965,16 +4970,23 @@ def remove_stranded_bindings(
                 continue
             if current_count != 0:
                 continue
-            if candidate.loads is not None and inert is not None and (
-                inert(candidate.loads)
-                or covered(current, (candidate.start, candidate.end), candidate.loads)
-            ):
-                # The bare import would keep a load that does nothing, or one
-                # another import of this file already makes.
-                candidate = replace(candidate, replacement=None, loads=None)
+            if candidate.loads is not None and inert is not None:
+                if inert(candidate.loads) or covered(
+                    current, (candidate.start, candidate.end), candidate.loads
+                ):
+                    # The bare import would keep a load that does nothing, or
+                    # one another import of this file already makes.
+                    candidate = replace(candidate, replacement=None, loads=None)
+                elif inert_load.declared(candidate.loads):
+                    # The customer says this load does nothing.
+                    candidate = replace(
+                        candidate, replacement=None, loads=None, declared=candidate.loads
+                    )
             if inert is not None:
                 specifier = _inert_require(current, candidate, language)
-                if specifier is not None and inert(specifier):
+                if specifier is not None and not inert(specifier) and inert_load.declared(specifier):
+                    candidate = replace(candidate, declared=specifier)
+                if specifier is not None and (inert(specifier) or candidate.declared is not None):
                     # So would the `require("./m");` discard. Without an
                     # initializer the declaration reads as inert, and `_apply`
                     # deletes it. Not yet, though: a `require` call is what

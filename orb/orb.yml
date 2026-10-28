@@ -91,6 +91,14 @@ commands:
           being removed (a method, a Kotlin property getter or top-level
           function, or a C# get-only bool property), at every call site that
           is provably bound to it.
+      side-effect-free-modules:
+        type: string
+        default: ""
+        description: >-
+          Comma-separated TypeScript or JavaScript module specifiers, spelled
+          exactly as your imports spell them, whose load does nothing. A
+          stranded import of one is deleted rather than kept bare, and the
+          pull request names each one.
       languages:
         type: string
         default: ""
@@ -186,6 +194,7 @@ commands:
             export FEATUREFLIP_LANGUAGES="<< parameters.languages >>"
             export FEATUREFLIP_ACCESSORS="<< parameters.accessors >>"
             export FEATUREFLIP_INLINE_WRAPPERS="<< parameters.inline-wrappers >>"
+            export FEATUREFLIP_SIDE_EFFECT_FREE_MODULES="<< parameters.side-effect-free-modules >>"
             export FEATUREFLIP_DIRECTORIES="<< parameters.directories >>"
             export FEATUREFLIP_IGNORE="<< parameters.ignore >>"
             export FEATUREFLIP_FLAGS="<< parameters.flags >>"
@@ -211,6 +220,7 @@ commands:
               -e FEATUREFLIP_LANGUAGES \
               -e FEATUREFLIP_ACCESSORS \
               -e FEATUREFLIP_INLINE_WRAPPERS \
+              -e FEATUREFLIP_SIDE_EFFECT_FREE_MODULES \
               -e FEATUREFLIP_DIRECTORIES \
               -e FEATUREFLIP_IGNORE \
               -e FEATUREFLIP_FLAGS \

@@ -170,6 +170,12 @@ class Config:
     #: :mod:`flag_cleanup.wrapper_inline`. ``False`` folds the read inside a
     #: wrapper and stops there.
     inline_wrappers: bool = True
+    #: Module specifiers the customer declares load nothing, spelled exactly
+    #: as their imports spell them. A stranded import of one is deleted where
+    #: it would otherwise be kept bare for its load; see
+    #: :func:`flag_cleanup.inert_load.declaring`. Their word, not a proof, so
+    #: every such deletion is named in the pull request.
+    side_effect_free_modules: tuple[str, ...] = ()
     #: Most pull requests one run may propose; ``0`` means no limit. A bound on
     #: blast radius rather than on correctness — see :data:`DEFAULT_MAX_PRS`.
     max_prs: int = DEFAULT_MAX_PRS
@@ -273,6 +279,9 @@ class Config:
             directories=_split_csv(_get(env, "FEATUREFLIP_DIRECTORIES", "."), default=(".",)),
             languages=languages,
             accessors=accessors,
+            side_effect_free_modules=_split_csv(
+                _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_MODULES", ""), default=()
+            ),
             gates=gates,
             ignore=frozenset(_split_csv(_get(env, "FEATUREFLIP_IGNORE", ""), default=())),
             flags=frozenset(_split_csv(_get(env, "FEATUREFLIP_FLAGS", ""), default=())),

@@ -1,25 +1,28 @@
-"""Put a parameter or argument list a deletion shrank to one element back on one line.
+"""Put a list a deletion shrank back on one line.
 
-The TypeScript-family passes that remove a parameter or an argument splice
-bytes out of a list. When the list was laid out one element per line, the one
-that is left keeps that layout::
+The TypeScript-family passes that remove a parameter, an argument or a JSX
+attribute splice bytes out of a list. When the list was laid out one element
+per line, what is left keeps that layout::
 
     function renderChecklist(
       steps: number
     ) {
 
+    <TestProvider
+    >
+
 which a formatter, or a reviewer, writes as
-``function renderChecklist(steps: number) {``. :func:`splice` makes the
-deletions and then joins each such list, so the edit that shrank the list is
-the edit that tidies it, and nothing the run did not shrink is touched.
+``function renderChecklist(steps: number) {`` and ``<TestProvider>``.
+:func:`splice` makes the deletions and then joins each such list, so the edit
+that shrank the list is the edit that tidies it, and nothing the run did not
+shrink is touched.
 
 A list is joined only when all of this holds, and is left exactly as the
 deletion left it otherwise:
 
 * it is a function's **parameters** or a call's **arguments** (object and
-  array literals, type parameters and JSX attributes are left alone: a
-  formatter keeps an object it finds expanded, and the rest are not edited
-  by these passes);
+  array literals and type parameters are left alone: a formatter keeps an
+  object it finds expanded, and the rest are not edited by these passes);
 * it held two or more elements before the deletions and holds exactly one
   after, so a list the customer wrote with one element is never rewritten;
 * the remaining element is on one line of its own, the opening bracket ends
@@ -30,6 +33,15 @@ deletion left it otherwise:
 
 The trailing comma goes with the line breaks: ``f(a)`` rather than ``f(a,)``,
 as a formatter writes a list that fits on one line.
+
+A JSX opening or self-closing element is the one other list joined, under the
+same conditions except two: any number of attributes may be left, and none
+at all. They go on the tag's line, one space apart, the ``>`` straight after
+them and the ``/>`` a space after: ``<Tag>``, ``<Tag />``, ``<Tag a={1} b>``.
+Every attribute left must sit on one line, with only whitespace between it,
+the tag name and the bracket, and the tag name itself must be on one line.
+
+Where one join would sit inside another, only the inner one is made.
 """
 
 from __future__ import annotations
@@ -39,13 +51,18 @@ import re
 import tomllib
 from collections.abc import Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 from tree_sitter import Node
 
 from flag_cleanup.ts_syntax import _parse, _walk
 
-#: The lists this joins: a function's parameters and a call's arguments.
+#: The lists this joins to their one remaining element: a function's
+#: parameters and a call's arguments.
 _LISTS = frozenset({"formal_parameters", "arguments"})
+
+#: The JSX elements whose attributes this joins onto the tag's line.
+_ELEMENTS = frozenset({"jsx_opening_element", "jsx_self_closing_element"})
 
 #: How wide a tab counts when a joined line is measured, generously, so a
 #: tab-indented file is never judged to have more room than it does.
@@ -102,10 +119,18 @@ def splice(
     joins = _shrunk_lists(source, ordered, language) if width is not None else []
     for start, end in reversed(ordered):
         data = data[:start] + data[end:]
-    for open_end, element_start, element_end, close_start in sorted(
-        (tuple(_moved(offset, ordered) for offset in join) for join in joins), reverse=True
-    ):
-        joined = _joined(data, open_end, element_start, element_end, close_start, width)
+    moved = [
+        _Join(
+            _moved(join.start, ordered),
+            _moved(join.head_end, ordered),
+            tuple((_moved(s, ordered), _moved(e, ordered)) for s, e in join.elements),
+            _moved(join.close_start, ordered),
+            join.attributes,
+        )
+        for join in joins
+    ]
+    for join in sorted(moved, key=lambda j: j.head_end, reverse=True):
+        joined = _joined_attributes(data, join, width) if join.attributes else _joined(data, join, width)
         if joined is not None:
             data = joined
     return data.decode("utf-8")
@@ -142,37 +167,103 @@ def line_limit(path: str, original: str, repo_dir: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def _shrunk_lists(
-    source: str, spans: list[tuple[int, int]], language: str
-) -> list[tuple[int, int, int, int]]:
-    """``(open bracket end, element start, element end, close bracket start)``,
-    in ``source``'s offsets, for each list ``spans`` shrink to one element."""
+class _Join(NamedTuple):
+    """One list to join, by byte offsets."""
+
+    #: Where the list's container starts.
+    start: int
+    #: Where the bytes before the elements end: the opening bracket, or the
+    #: tag name and its type arguments.
+    head_end: int
+    #: Each element left, ``(start, end)``.
+    elements: tuple[tuple[int, int], ...]
+    #: Where the closing bracket starts.
+    close_start: int
+    #: Whether this is a JSX element's attributes rather than a list in brackets.
+    attributes: bool
+
+
+def _shrunk_lists(source: str, spans: list[tuple[int, int]], language: str) -> list[_Join]:
+    """Each list ``spans`` shrink, in ``source``'s offsets: a parameter or
+    argument list left with one element, or a JSX element left with fewer
+    attributes."""
     if not spans:
         return []
     root = _parse(source, language)
-    found: list[tuple[int, int, int, int]] = []
+    found: list[tuple[Node, _Join]] = []
     for container in _walk(root):
-        if container.type not in _LISTS or len(container.children) < 2:
+        if container.type in _LISTS:
+            join = _shrunk_list(container, spans)
+        elif container.type in _ELEMENTS:
+            join = _shrunk_element(container, spans)
+        else:
             continue
-        if not any(container.start_byte < end and start < container.end_byte for start, end in spans):
-            continue
-        if any(node.type == "comment" for node in _walk(container)):
-            continue
-        elements = list(container.named_children)
-        if len(elements) < 2:
-            continue
-        kept = [e for e in elements if not any(s <= e.start_byte and e.end_byte <= t for s, t in spans)]
-        if len(kept) != 1 or _cuts(kept[0], spans) or _cuts_bracket(container, spans):
-            continue
-        found.append(
-            (
-                container.children[0].end_byte,
-                kept[0].start_byte,
-                kept[0].end_byte,
-                container.children[-1].start_byte,
-            )
+        if join is not None:
+            found.append((container, join))
+    # A join inside another moves the outer one's bytes, so the outer one is left.
+    return [
+        join
+        for container, join in found
+        if not any(
+            other is not container
+            and container.start_byte <= other.start_byte
+            and other.end_byte <= container.end_byte
+            for other, _ in found
         )
-    return found
+    ]
+
+
+def _shrunk_list(container: Node, spans: list[tuple[int, int]]) -> _Join | None:
+    if len(container.children) < 2 or not _touched(container, spans) or _has_comment(container):
+        return None
+    elements = list(container.named_children)
+    if len(elements) < 2:
+        return None
+    kept = [e for e in elements if not _taken(e, spans)]
+    if len(kept) != 1 or _cuts(kept[0], spans) or _cuts_bracket(container, spans):
+        return None
+    return _Join(
+        container.start_byte,
+        container.children[0].end_byte,
+        ((kept[0].start_byte, kept[0].end_byte),),
+        container.children[-1].start_byte,
+        False,
+    )
+
+
+def _shrunk_element(container: Node, spans: list[tuple[int, int]]) -> _Join | None:
+    if not _touched(container, spans) or _has_comment(container):
+        return None
+    attributes = container.children_by_field_name("attribute")
+    kept = [a for a in attributes if not _taken(a, spans)]
+    if len(kept) == len(attributes) or any(_cuts(a, spans) for a in kept):
+        return None
+    ids = {a.id for a in attributes}
+    head = [c for c in container.children[:-1] if c.id not in ids]
+    close = container.children[-1]
+    if any(_cuts(node, spans) for node in (*head, close)):
+        return None
+    return _Join(
+        container.start_byte,
+        max(node.end_byte for node in head),
+        tuple((a.start_byte, a.end_byte) for a in kept),
+        close.start_byte,
+        True,
+    )
+
+
+def _touched(container: Node, spans: list[tuple[int, int]]) -> bool:
+    """Whether any span takes bytes from inside ``container``."""
+    return any(container.start_byte < end and start < container.end_byte for start, end in spans)
+
+
+def _taken(node: Node, spans: list[tuple[int, int]]) -> bool:
+    """Whether one span takes all of ``node``."""
+    return any(s <= node.start_byte and node.end_byte <= t for s, t in spans)
+
+
+def _has_comment(container: Node) -> bool:
+    return any(node.type == "comment" for node in _walk(container))
 
 
 def _cuts(node: Node, spans: list[tuple[int, int]]) -> bool:
@@ -197,31 +288,48 @@ def _moved(offset: int, spans: list[tuple[int, int]]) -> int:
 _TRAILING = re.compile(rb"\s*,?\s*")
 
 
-def _joined(
-    data: bytes,
-    open_end: int,
-    element_start: int,
-    element_end: int,
-    close_start: int,
-    width: int,
-) -> bytes | None:
+def _joined(data: bytes, join: _Join, width: int) -> bytes | None:
     """``data`` with the list between the brackets on one line, or ``None``."""
-    before = data[open_end:element_start]
+    ((element_start, element_end),) = join.elements
+    before = data[join.head_end:element_start]
     element = data[element_start:element_end]
-    after = data[element_end:close_start]
+    after = data[element_end:join.close_start]
     if before.strip() or b"\n" not in before or b"\n" in element:
         return None
     if not _TRAILING.fullmatch(after) or b"\n" not in after:
         return None
     # Bracket ends its line, bracket starts its line: whitespace on both
     # sides of the element, line breaks included, and nothing else.
-    line_start = data.rfind(b"\n", 0, open_end) + 1
-    line_end = data.find(b"\n", close_start)
+    return _fitted(data, join, element, width)
+
+
+def _joined_attributes(data: bytes, join: _Join, width: int) -> bytes | None:
+    """``data`` with the JSX element's attributes on its tag's line, or ``None``."""
+    if b"\n" in data[join.start:join.head_end]:
+        return None
+    bounds = [join.head_end, *(offset for element in join.elements for offset in element), join.close_start]
+    gaps = [data[bounds[i]:bounds[i + 1]] for i in range(0, len(bounds), 2)]
+    attributes = [data[start:end] for start, end in join.elements]
+    if any(gap.strip() for gap in gaps) or not any(b"\n" in gap for gap in gaps):
+        return None
+    if any(b"\n" in attribute for attribute in attributes):
+        return None
+    joined = b"".join(b" " + attribute for attribute in attributes)
+    if data.startswith(b"/>", join.close_start):
+        joined += b" "
+    return _fitted(data, join, joined, width)
+
+
+def _fitted(data: bytes, join: _Join, joined: bytes, width: int) -> bytes | None:
+    """``data`` with ``joined`` in place of everything between the list's
+    head and its closing bracket, or ``None`` when that line is wider than ``width``."""
+    line_start = data.rfind(b"\n", 0, join.head_end) + 1
+    line_end = data.find(b"\n", join.close_start)
     line_end = len(data) if line_end == -1 else line_end
-    line = data[line_start:open_end] + element + data[close_start:line_end]
+    line = data[line_start:join.head_end] + joined + data[join.close_start:line_end]
     if _width(line.rstrip(b"\r").decode("utf-8")) > width:
         return None
-    return data[:open_end] + element + data[close_start:]
+    return data[:join.head_end] + joined + data[join.close_start:]
 
 
 def _width(line: str) -> int:
@@ -297,6 +405,10 @@ def _read_prettier(candidate: Path) -> object:
 def _settings(config: object) -> object:
     """The width a parsed Prettier configuration gives, by :func:`_prettier_width`'s values."""
     if not isinstance(config, dict) or "overrides" in config:
+        return _UNKNOWN
+    if config.get("singleAttributePerLine") not in (None, False, "false"):
+        # Prettier keeps two or more JSX attributes one per line, and a join
+        # is told only the width.
         return _UNKNOWN
     width = config.get("printWidth")
     if width is None:

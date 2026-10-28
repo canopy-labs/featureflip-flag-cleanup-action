@@ -44,8 +44,9 @@ file that fails that is left as it was.
 
 Separately, and only to REPORT: :func:`flag_state_comments` finds comments on
 or directly above a changed line that describe a flag's state without naming
-the key ("while the flag is off"), and :func:`describes_removed` says whether
-a comment describes the branch the run deleted. Neither edits anything.
+the key ("while the flag is off"), and :func:`describes_removed` and
+:func:`describes_kept` say whether a comment describes the branch the run
+deleted or the one it kept. None of them edits anything.
 """
 
 from __future__ import annotations
@@ -446,6 +447,7 @@ FLAG_STATE = re.compile(
 
 #: The comment kinds a run reports, as ``bindings`` rows.
 REMOVED_BRANCH_KIND = "removed-branch comment"
+KEPT_BRANCH_KIND = "kept-branch comment"
 FLAG_STATE_KIND = "flag-state comment"
 
 
@@ -460,6 +462,9 @@ class StateComment:
     #: Whether the comment describes the branch the run deleted, which makes
     #: it false rather than just stale.
     removed: bool
+    #: Whether it describes the branch the run kept: that state is now the
+    #: only one, so a qualifier like "only runs while" no longer holds.
+    kept: bool = False
 
 
 def describes_removed(text: str, flag_key: str, treatment: bool) -> bool:
@@ -471,6 +476,14 @@ def describes_removed(text: str, flag_key: str, treatment: bool) -> bool:
     """
     untreated = "false" if treatment else "true"
     return bool(_removed_state_pattern(flag_key, untreated).search(text)) and not _HEDGES.search(text)
+
+
+def describes_kept(text: str, flag_key: str, treatment: bool) -> bool:
+    """Whether ``text`` describes the flag in the state a removal serving
+    ``treatment`` keeps ("the flag is on" when ``true`` is served), by the
+    same words and hedges as :func:`describes_removed`."""
+    treated = "true" if treatment else "false"
+    return bool(_removed_state_pattern(flag_key, treated).search(text)) and not _HEDGES.search(text)
 
 
 def _changed_rows(before: str, after: str) -> tuple[set[int], set[int]]:
@@ -490,6 +503,17 @@ def _changed_rows(before: str, after: str) -> tuple[set[int], set[int]]:
     return written, below_deletion
 
 
+#: Where a sentence ends inside a comment's joined text.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
+def _sentence(text: str, at: int) -> str:
+    """The sentence of ``text`` holding offset ``at``."""
+    start = max((m.end() for m in _SENTENCE_END.finditer(text, 0, at)), default=0)
+    end = _SENTENCE_END.search(text, at)
+    return text[start : end.end() if end else len(text)]
+
+
 def flag_state_comments(
     before: str, after: str, grammar: str, flag_key: str, treatment: bool
 ) -> list[StateComment]:
@@ -499,9 +523,10 @@ def flag_state_comments(
     Such a comment sat beside the read the run folded, so "while the flag is
     off" is likely about THIS flag even though it never says which. That is a
     guess from the wording, which is why each is only reported: a comment
-    naming the key is decided by :func:`rewrite` and the kept-comment report
-    instead, and is left out here. A run of adjacent comments is one comment,
-    so a phrase wrapped onto its next line is still found.
+    line naming the key is decided by :func:`rewrite` and the kept-comment
+    report instead, and is left out here, though another line of the same
+    comment is not. A run of adjacent comments is one comment, so a phrase
+    wrapped onto its next line is still found.
     """
     if before == after or not FLAG_STATE.search(after):
         return []
@@ -555,19 +580,37 @@ def flag_state_comments(
         for row in rows:
             begin = max(starts[row], group[0].start_byte) if row == first else starts[row]
             texts.append(data[begin : ends[row]].decode("utf-8", "replace").strip())
-        if any(names.search(t.encode("utf-8")) for t in texts):
-            continue
         contents = [_content(t.encode("utf-8")).decode("utf-8", "replace") for t in texts]
         joined = ""
         offsets: list[int] = []
         for content in contents:
             offsets.append(len(joined))
             joined += content + " "
-        match = FLAG_STATE.search(joined)
-        if match is None:
+        # The first phrase on a line that does not name the key: a line naming
+        # it is the kept-comment report's, but the group's other lines are not.
+        hit = next(
+            (
+                (row, match)
+                for match in FLAG_STATE.finditer(joined)
+                for row in [max(i for i, offset in enumerate(offsets) if offset <= match.start())]
+                if not names.search(texts[row].encode("utf-8"))
+            ),
+            None,
+        )
+        if hit is None:
             continue
-        at = max(i for i, offset in enumerate(offsets) if offset <= match.start())
+        at, match = hit
+        # Which branch it describes is read off its own sentence, so a hedge
+        # in another sentence of the same comment ("whether any key exists")
+        # does not cancel it.
+        sentence = _sentence(joined, match.start())
+        removed = describes_removed(sentence, flag_key, treatment)
         found.append(
-            StateComment(first + at + 1, texts[at], describes_removed(joined, flag_key, treatment))
+            StateComment(
+                first + at + 1,
+                texts[at],
+                removed,
+                not removed and describes_kept(sentence, flag_key, treatment),
+            )
         )
     return found

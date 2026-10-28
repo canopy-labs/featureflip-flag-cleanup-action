@@ -233,6 +233,28 @@ holes = ["treated", "stale_flag_name"]
 [[rules.filters]]
 not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
 
+[[rules]]
+name = "replace_usebooleanflagvalue_read_with_boolean_literal"
+# @openfeature/react-sdk's hook (#4357). Identical to the useFeatureFlag rule
+# above but for the callee; see it for the filters' reasoning.
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . (string . (string_fragment) @flag_name .))
+  ) @call
+  (#eq? @sdk_fn "useBooleanFlagValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
 
 # --- await <obj>.getBooleanValue("KEY", default, ctx) -> @treated
 # The OpenFeature JS provider (`@featureflip/openfeature-node`). The read a customer
@@ -366,8 +388,10 @@ name = "replace_sync_getbooleanvalue_read_with_boolean_literal"
 # rule and would opt the wrong one out.
 query = """(
   (call_expression
-    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+    function: (member_expression
+                !optional_chain
+                object: (identifier) @client
+                property: (property_identifier) @sdk_fn)
     arguments: (arguments
       . (string . (string_fragment) @flag_name .))) @call
   (#eq? @sdk_fn "getBooleanValue")
@@ -393,6 +417,7 @@ not_contains = ["""(
   (string_fragment) @module
   (#match? @module "^@openfeature/")
   (#not-eq? @module "@openfeature/web-sdk")
+  (#not-eq? @module "@openfeature/react-sdk")
   (#not-eq? @module "@openfeature/core")
 )"""]
 
@@ -400,6 +425,110 @@ not_contains = ["""(
 # `client.getBooleanValue?.("KEY", …)` is `undefined` when the callee is
 # nullish, so a boolean literal is a behaviour change rather than a
 # simplification.
+# Half 3 — the receiver is a client this file got from `OpenFeature.getClient()`.
+# The import alone does not say which client a read is on: a file importing the
+# web SDK can also import a client from a module of the app's own, and that one
+# may be a server client whose read is a promise (`true.then(…)` would follow).
+# `@client` is substituted from the match, so this asks about THIS read's
+# receiver. A client passed in, or bound some other way, is left alone: a miss,
+# never a wrong rewrite.
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+contains = """(
+  (variable_declarator
+    name: (identifier) @bound
+    value: (call_expression
+      function: (member_expression
+        object: (identifier) @api
+        property: (property_identifier) @factory)))
+  (#eq? @bound "@client")
+  (#eq? @api "OpenFeature")
+  (#eq? @factory "getClient")
+)"""
+
+# Half 4 — and that `OpenFeature` is the web SDK's, imported under its own name.
+# Without it a local module exporting the server SDK's `OpenFeature` would pass
+# half 3. An aliased import is left alone for the same reason.
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+contains = """(
+  (import_statement
+    (import_clause (named_imports (import_specifier !alias name: (identifier) @name)))
+    source: (string (string_fragment) @module))
+  (#eq? @name "OpenFeature")
+  (#eq? @module "@openfeature/web-sdk")
+)"""
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules]]
+name = "replace_react_sync_getbooleanvalue_read_with_boolean_literal"
+# accessor-template: none
+#
+# The rule above for a file importing `@openfeature/react-sdk` instead (#4357).
+# A React app reaches the same synchronous web client through
+# `useOpenFeatureClient()`, and its files import the React package, so half 1
+# of the gate above never fires there. Half 2 is unchanged in kind: any OTHER
+# `@openfeature/…` module still refuses the file, and the two sync packages
+# tolerate each other because `@openfeature/react-sdk` re-exports the web SDK.
+# A separate rule rather than an alternation in half 1, for the same reason
+# the SDK-name rules are one per name.
+#
+# Unlike the web-SDK rule it also proves the RECEIVER: almost every flag-reading
+# component imports `@openfeature/react-sdk`, so the import says far less about
+# any one `getBooleanValue` than it does in a web-SDK bootstrap file. A client
+# imported from a module of the app's own may be a server client, whose read is
+# a promise. So the call must be on an identifier this file binds to
+# `useOpenFeatureClient()` (half 3, below). `useOpenFeatureClient()
+# .getBooleanValue(...)` and a client passed in are left alone, which is a miss,
+# never a wrong rewrite.
+query = """(
+  (call_expression
+    function: (member_expression
+                !optional_chain
+                object: (identifier) @client
+                property: (property_identifier) @sdk_fn)
+    arguments: (arguments
+      . (string . (string_fragment) @flag_name .))) @call
+  (#eq? @sdk_fn "getBooleanValue")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+contains = """(
+  (import_statement source: (string (string_fragment) @module)) @import
+  (#eq? @module "@openfeature/react-sdk")
+)"""
+
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+not_contains = ["""(
+  (string_fragment) @module
+  (#match? @module "^@openfeature/")
+  (#not-eq? @module "@openfeature/web-sdk")
+  (#not-eq? @module "@openfeature/react-sdk")
+  (#not-eq? @module "@openfeature/core")
+)"""]
+
+# Half 3 — the receiver is a client this file got from `useOpenFeatureClient()`.
+# `@client` is substituted from the match, so this asks about THIS read's
+# receiver, not about any binding in the file.
+[[rules.filters]]
+enclosing_node = """((program) @program)"""
+contains = """(
+  (variable_declarator
+    name: (identifier) @bound
+    value: (call_expression function: (identifier) @factory))
+  (#eq? @bound "@client")
+  (#eq? @factory "useOpenFeatureClient")
+)"""
+
 [[rules.filters]]
 not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
 

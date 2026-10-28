@@ -668,6 +668,7 @@ entries dropped.
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`). See [Wrapping the SDK](#wrapping-the-sdk). |
 | `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart, PHP, Ruby and Swift: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, Dart function, method or getter, PHP function or class method, Ruby method, or Swift function, method or computed property whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
+| `side-effect-free-modules` | `FEATUREFLIP_SIDE_EFFECT_FREE_MODULES` | *(none)* | TypeScript and JavaScript: comma-separated module specifiers whose load does nothing, spelled exactly as your imports spell them (`@/lib/featureflip, ./keys`). An import the removal left with nothing to import is deleted instead of being kept bare for its load, and the pull request names each one deleted this way. See [Supported JS/TS flag-read shapes](#supported-jsts-flag-read-shapes). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. In the archive modes, the only branch a removal's merge counts on: give them the same value as the cleanup workflow. |
@@ -2148,9 +2149,20 @@ base type in the repository, and, if it is public, sit in a project that cannot
 be packed. It must sit in a file of its own too: one in the wrapper's or the
 interface's file is `sibling-not-inert`. An implementation that returns the
 value being removed is `sibling-not-inert`, since whatever builds it relies on
-that value. So is a member shared with another interface, any call, a
-`virtual` member, and anything else. The pull request lists each
-implementation deleted with the wrapper and what it returned.
+that value. So is any call, a `virtual` member, and anything else. The pull
+request lists each implementation deleted with the wrapper and what it
+returned.
+
+One implementation may serve several interfaces with one member, as a test
+harness's always-on fake often does (`class OnGate : ICheckoutGate,
+IWebhooksGate { public bool IsEnabled => true; }`). Its member is then left
+as it is, since the other interfaces still need it, and a read through the
+implementation's own type is not counted as the wrapper's. This holds only
+when the member returns a `bool` literal equal to the value the flag keeps
+serving. Any other member, or a literal of the value being removed, is
+`sibling-not-inert`. The pull request lists each such implementation. The
+emptied interface stays while such an implementation, or a registration of
+it, still names it.
 
 A test fake is one of these implementations declared in a test project: one
 whose project file, or a file it imports, adds a test framework's package with
@@ -2167,8 +2179,23 @@ test project. Read the deletion in the diff if your repository does that.
 
 A fake's member may instead return its knob: a settable field or property of
 its own, or a `bool` parameter of its primary constructor, read nowhere else
-in the fake. The knob only chooses which branch a test runs, whatever its
-default. Tests that set the knob are resolved like stubs (below):
+in the fake. A get-only auto-property initialized with exactly that parameter
+(`public bool IsEnabled { get; } = on;`) counts as returning it, in a class
+that declares no other constructor (a record does not count: `with` copies one
+without its constructor). A settable knob may also be written by the fake's one
+constructor, when that constructor takes one plain `bool` and only stores it
+there (`public StubGate(bool enabled) => Enabled = enabled;`); every
+construction then sets it too, `new StubGate(false)` or
+`new(enabled: false)`. The knob only chooses which branch a test runs,
+whatever its default. A construction passing anything but a literal
+(`new StubGate(enabled)`, a helper's parameter) keeps the wrapper, as an
+unresolved knob write does. A construction whose type is not written
+(`new(…)`) counts only where it could build such a fake: inside its outer
+type, for a private nested fake, and with as many arguments as its
+constructor takes. It builds the type its context declares (a property or
+variable declared with a type, or the return type of a method whose body is
+the `new(…)` or which returns it), so it counts only when that type is not
+known, or may be the fake: its name or any `using` alias of it. Tests that set the knob are resolved like stubs (below):
 `fake.Enabled = false;`, `host.Gate.Enabled = false;` (where `host`'s declared
 type is a class of yours whose own field or auto-property `Gate` is declared
 as the fake), `new FakeFlags { Enabled = false }` and `new FakeFlags(false)`.
@@ -2183,7 +2210,13 @@ the pull request lists each such part. What those statements did to the
 objects the rest of the test uses is not judged: a failure there shows in the
 pull request's checks. A test relying on the default of a fake
 built somewhere else (a field, a factory) now runs the kept branch, and a
-failure there shows in the pull request's checks.
+failure there shows in the pull request's checks. A fake that some test code sets
+from outside a test body, in a helper or a lambda, may be set again after a
+test chose its value. While any such write exists, a test is decided only
+when its fake stays within the test: written or read there, or handed to an
+object being constructed (`new(…)` included, read by the type its context
+declares, when that is a type of yours outside every test project). Handed to a call, captured by a lambda, aliased or
+returned, it decides nothing, and the wrapper stays.
 
 A call is folded only when its file proves the receiver is that method's class:
 
@@ -2214,11 +2247,30 @@ when:
 - its file's project cannot reference a project declaring one of the types
   (a `.cs` file outside every project included);
 - its file spells none of the types' names, no alias of one, no member or
-  type whose signature leads to one, and no `dynamic`;
+  type whose signature leads to one or to `dynamic`, and no `dynamic`. A
+  constructor whose only such parameter takes the interface by value
+  (`public Job(IGate gate)`) does not count as leading to one: it takes a
+  value in and hands none back. This holds only while the interface has no
+  attributes, and never while a `global using static` (or a project
+  `<Using Static="true">` item) names one of these types or leads to one;
+- it is read through a receiver (`row.IsCheckoutEnabled`) in a member whose
+  own text spells none of those names, nor a private member or nested type of
+  its class that leads to one, nor `dynamic`, while no file of yours uses
+  `dynamic` outside a comment or a string, its class is none of the types and inherits from no library
+  class (a library base spelled like an interface, `I` and a capital, is
+  taken as one), and no extension block or implementation based outside the
+  repository is in play. This assumes a
+  library call never hands one of the types back as `dynamic`;
 - its receiver's declared type is another type;
-- the same receiver is also read with a member none of the types declares (not
-  counted when a file of yours spells `dynamic` or declares an `extension`
-  block);
+- the same receiver is also read with a member none of the types declares,
+  as a value: in an expression, under a further member, or passed as an
+  argument or compared with `==` or `!=` while no file of yours declares or
+  calls a method of that name. Not counted
+  when a file of yours uses `dynamic` outside a comment or a string or
+  declares an `extension` block, or when a file that does not parse may
+  declare one of the types or a type they inherit from. This assumes the
+  same as above, and that no library declares an extension method of that
+  name for any type;
 - it is assigned to, and none of the types declares a setter;
 - it is called, and the member is a property.
 
@@ -2327,14 +2379,44 @@ and every binding of its name in the file must be one. No type of yours may
 be named `Mock` or `Substitute`, and a C# file that does not parse counts as
 declaring any name it spells. In a test project, a
 private test helper's `bool` parameter that only chooses a stub's value
-(`Returns(enabled)`) is pinned the same way, when every call in the file
+(`Returns(enabled)`), or a test fake's knob as the one argument it is built
+with (`=> new(new StubGate(enabled))`, the helper's body a block or an
+expression), is pinned the same way, the construction then taking the kept
+literal, when every call in the file
 passes a literal or relies on a literal default. The stub, the parameter and
 the argument at every call go, and a test whose call passes the value being
-removed goes whole. A helper that is
+removed goes whole. A call may also pass an xUnit `[Theory]`'s own `bool`
+parameter (`Make(on)` in `Rows(bool on, string expected)`), when every
+attribute on the theory is `[Theory]` or one `[InlineData(…)]` per line with a
+`true`/`false` literal in that column and no property set (`Skip`), the
+parameter has no default and is read nowhere else, and the theory has another
+parameter to keep. Each row passing the value being removed is deleted, the
+column goes from the others with the parameter, and a theory left with no row
+goes whole. A `[Theory]` writing its own such parameter to a test fake's
+knob (`_gate.Enabled = on;`) is cut by its rows the same way, and the write
+goes with the parameter. A call may pass another private helper's own `bool` parameter,
+read nowhere else in it (`Make(bool enabled = true) => Build(enabled)`): that
+helper is then pinned by its own calls the same way, and loses the parameter
+too. A call passing the value the flag keeps may stand anywhere, a
+parameterised test included: it only loses the argument. A helper that is
 not private, is generic, a test, `partial` or has an attribute, a parameter
 named in a doc comment or read by anything else, a call that passes something
 other than a literal, and a use of the helper other than a plain call each
 keep the stub, and the wrapper stays partial.
+
+A public static helper of a `static` class whose `bool` parameter builds a
+test fake (`public static Expiry Create(Ctx c, bool expiration = true) =>
+new(c, new StubGate(expiration))`) is called from other files, often as a
+neutral baseline by tests about something else. No test is deleted for it:
+the fake is built with the value the flag keeps, the parameter goes, and every
+call loses its argument. Each test that passed the value being removed, directly
+or through another public helper of the same class (`Off() => Create(c,
+false)`), now runs with the kept value, and the pull request lists it for
+review, since one that asserted on the removed behaviour may now fail. Every
+call in the repository must be `Owner.Create(…)` (or a plain call inside the
+class) passing a `true`/`false` literal or nothing. The class's name must be
+declared once and named by no `using static`, alias, string or Razor file,
+and the parameter by no doc comment. Otherwise the wrapper stays partial.
 
 A test that reads the member through a receiver typed as another
 implementation (`var config = new ConfigFlags(o); … config.IsCheckoutEnabled`)
@@ -2707,9 +2789,12 @@ and a value the fold wrote, such as `{ enabled: onboardingFlag }` becoming
   is not the last argument, or the parameter has no `= {}` default, only the
   matching properties go.
 
-The callee is followed into other files, through `import { … }`, `tsconfig`
+The callee is a `function`, `const` or `let` declared once in the calling
+file, or is followed into other files, through `import { … }`, `tsconfig`
 `paths` aliases and `export { … } from` barrels, to the one declaration it
-names. "Equal" means `{}`, `[]`, booleans, `null`, a number or string of the
+names. A `const` or `let` may sit inside a block that encloses the call, as a
+`renderWithProviders` helper declared inside `describe(…, () => { … })` does;
+it must be bound to a function there and never re-assigned. "Equal" means `{}`, `[]`, booleans, `null`, a number or string of the
 same value, or `undefined` for a member with or without a default. Nothing
 is left out where the proof fails: a callee from a package or a declaration
 file, an overload, a function that reads `arguments` or takes type
@@ -3631,7 +3716,8 @@ so **the whole flag is refused** — see "What is deliberately NOT rewritten".
 | `client.boolVariation("KEY", default)` | browser |
 | `useFeatureFlag("KEY", default)` | react |
 | `await client.getBooleanValue("KEY", default, ctx)` | OpenFeature, async client (`@featureflip/openfeature-node`) |
-| `client.getBooleanValue("KEY", default)` | OpenFeature, sync client (`@openfeature/web-sdk`) — see below |
+| `client.getBooleanValue("KEY", default)` | OpenFeature, sync client (`@openfeature/web-sdk`, or `useOpenFeatureClient()` from `@openfeature/react-sdk`) — see below |
+| `useBooleanFlagValue("KEY", default)` | OpenFeature React (`@openfeature/react-sdk`) |
 
 …in `if`/`else` (with or without an `else`, including `else if` chains), `!`
 negation, ternaries, `&&`/`||` with the flag read on the left, and via a
@@ -3659,10 +3745,35 @@ substituting a literal for an un-awaited call would break a `.then(…)` chain,
 and a bare read used as a condition is already always-truthy in your own code —
 a bug this tool will not quietly convert into the other branch.
 `@openfeature/web-sdk`'s returns a plain boolean, so the bare call is rewritten
-there — but only in a file that imports `@openfeature/web-sdk` **and mentions no
-other `@openfeature/…` package** (`@openfeature/core`, which ships types rather
-than a client, excepted). A file importing both clients is left alone entirely:
-there the imports no longer say which client any one read belongs to. See
+there — but only in a file that imports `@openfeature/web-sdk` or
+`@openfeature/react-sdk` **and mentions no other `@openfeature/…` package**
+(`@openfeature/core`, which ships types rather than a client, excepted). The
+React package hands out the same synchronous client through
+`useOpenFeatureClient()`, and re-exports the web SDK, so the two may appear in
+one file. A file importing a server client as well is left alone entirely:
+there the imports no longer say which client any one read belongs to. The
+read must also be on a client the same file binds: from `OpenFeature.getClient()`
+with `OpenFeature` imported from `@openfeature/web-sdk` under that name
+(`const client = OpenFeature.getClient();`), or from `useOpenFeatureClient()`
+in a React file (`const client = useOpenFeatureClient();`). The imports say
+which clients a file may hold, not which one a read is on, and a client that
+comes from one of your own modules may be a server client whose read is a
+promise.
+
+The React hook `useBooleanFlagValue("KEY", default)` returns a plain boolean
+wherever it is called, so it is rewritten like `useFeatureFlag`, including
+through a key constant and inside your own hooks. The hooks that return details
+rather than a value, `useBooleanFlagDetails` and `useFlag`, are left alone. Once
+the last read in a file is gone, its `@openfeature/react-sdk` import is kept as
+a bare `import "@openfeature/react-sdk";`, since this tool cannot tell whether
+loading that module does work your app relies on. List it in
+[`side-effect-free-modules`](#inputs) to have the import removed instead.
+
+Removing the hook also removes what it subscribed the component to.
+`useBooleanFlagValue` re-renders when the provider becomes ready or flags
+change, and with `{ suspend: true }` it suspends until the provider is ready.
+A component that also reads other flags straight off a client, without a hook,
+may have relied on those re-renders. Check such components in the diff. See
 [Known gaps](#known-gaps) for the reads this cannot reach.
 
 A `const` bound to an awaited read is inlined like any other binding the fold
@@ -3796,6 +3907,16 @@ disagree, if none of them may hold the file, or if the solution config could
 compile the file itself, the alias counts as not found.
 
 The Featureflip JavaScript SDKs are the one exception to "loads a package".
+Some loads no proof here can reach: a module that imports a package, or one
+that builds a client at module scope. When you know such a module's load is
+not needed where the import was stranded, list it in
+`side-effect-free-modules`, spelled exactly as the import spells it
+(`@/lib/featureflip`). A stranded import of it, or a CommonJS `require` of
+it, is then deleted instead of being kept bare, the file's last import leaving
+`export {};` as above. That rests on your word, not a proof, so the pull
+request names each import deleted this way in a paragraph of its own. Nothing
+is matched by pattern, and an empty list, the default, changes nothing.
+
 `@featureflip/js`, `@featureflip/node`, `@featureflip/browser`,
 `@featureflip/react`, `@featureflip/react/testing` and `@featureflip/edge` do
 nothing when they load, in every published version, so a stranded import of
@@ -5225,6 +5346,26 @@ means no PR.
   counted as still referencing the flag in the run's log either: it is
   printed as a note, line by line.
 
+  A file that names the key **only as a URL path segment** in a string is
+  listed in a paragraph of its own too, since an endpoint is often named
+  after its feature: `` `/environments/${id}/scheduled-changes` ``,
+  `"/api/scheduled-changes?page=1"`, `[HttpPost("{id}/scheduled-changes")]`.
+  The key counts as a segment when a `/` comes before it and a `/`, `?`, `#`
+  or the string's closing quote after it. Any other mention in the file, a
+  query key such as `['scheduled-changes', orgId]` included, keeps it in the
+  generic list. This changes only how the file is reported: such a mention
+  still keeps a registry entry for the key, and nothing in the file is
+  rewritten.
+
+  The list covers only `directories`. When you narrow them, one `git grep`
+  of the rest of the checkout looks for the key too, and the pull request
+  names each file it finds in a paragraph of its own: "N file(s) outside the
+  swept directories also name this flag; not examined". That covers any text
+  file git tracks or would track (a `README` or a script as much as source),
+  with the same whole-key match and the same build-output directories
+  skipped as the list above. Those files are never read by the transform and
+  never edited.
+
   **A comment that names only the flag is removed** rather than listed, in
   every language. "Only" is decided by words: once the flag's key (and, for a
   C# gate family, the name of a type the run deleted, with any `.Member` read
@@ -5253,7 +5394,16 @@ means no PR.
   deleted ("the flag is off" when the flag serves `true`) is listed first,
   under "describes behaviour this pull request removed", whether or not it
   names the flag: it is now false rather than just out of date. A comment
-  that hedges ("even when the flag is off") is not counted as one.
+  that describes the branch the run KEPT ("the member lookup only runs while
+  the flag is on" when the flag serves `true`) is listed next, under
+  "describes the flag as on, the branch this pull request kept": the
+  condition is gone, so a qualifier like "only while" no longer holds. A
+  comment that hedges ("even when the flag is off") is counted as neither,
+  and which branch a comment describes is read from the sentence holding the
+  phrase, so a hedge in another sentence of the same comment does not count.
+  In a comment of several lines, only a line that names the flag is left to
+  the paragraph about kept comments; the comment's other lines are still
+  read for a state phrase.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift
@@ -5309,10 +5459,14 @@ means no PR.
   identically — same method name, same arguments — but the first returns a
   promise and the second a plain boolean. Nothing at the call site tells them
   apart, so the rules use the file's imports: a bare `getBooleanValue(...)` is
-  rewritten in a file that imports `@openfeature/web-sdk` and mentions no other
-  `@openfeature/…` package, and is left alone everywhere else. A file that
-  imports both clients is left alone entirely, because there the imports no
-  longer say which client any one read belongs to.
+  rewritten in a file that imports `@openfeature/web-sdk` or
+  `@openfeature/react-sdk` and mentions no other `@openfeature/…` package, and
+  is left alone everywhere else. A file that
+  imports a server client as well is left alone entirely, because there the
+  imports no longer say which client any one read belongs to. The read must
+  also be on a client the file binds to `OpenFeature.getClient()` (with
+  `OpenFeature` imported from `@openfeature/web-sdk` under that name) or, in a
+  React file, to `useOpenFeatureClient()`.
 
   What that does not reach is a client the file never imports — passed in as a
   parameter, read off a context object, or re-exported through a module of your
@@ -5435,10 +5589,15 @@ means no PR.
   `max_line_length` it reads from `.editorconfig`, or its default of 80),
   else `.editorconfig`'s `max_line_length`, else the longest line the file
   already had. A Prettier configuration written as code, one that names a
-  shared configuration, or one with per-file `overrides` joins nothing. Only
-  configuration inside the repository is read. Other lists keep the layout
-  the removal left: object and array literals, JSX attributes, and every
-  other language.
+  shared configuration, one with per-file `overrides`, or one that sets
+  `singleAttributePerLine` joins nothing. Only configuration inside the
+  repository is read. A JSX element whose attributes this tool removed is
+  joined the same way, with any number of attributes left, none included:
+  `<TestProvider\n  flags={{}}\n>` becomes `<TestProvider>`, and
+  `<Panel\n  a={1}\n  b\n/>` with `b` removed becomes `<Panel a={1} />`.
+  Every attribute left must fit on one line and no comment may sit inside
+  the element. Other lists keep the layout the removal left: object and
+  array literals, and every other language.
 * **A comparison against a non-literal is propagated but not folded.**
   `if (on === true)` reduces fully, because both sides end up literal. But
   `if (on === other)` becomes `if (true === other)` and stops — correct, and

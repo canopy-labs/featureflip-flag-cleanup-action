@@ -27,9 +27,11 @@ not hold: ``f(isOn('k') ? 1 : 2, { enabled: true })`` keeps the customer's
 ``enabled: true``. Code the customer already wrote this way is never touched.
 
 **The callee is resolved, never guessed.** Its name must be bound once in the
-caller's file, by a top-level ``function`` or ``const`` or by a named import,
-and every other mention of it there must be a call to it or a JSX tag naming
-it, so it is never re-bound, shadowed or handed on. An import is followed with
+caller's file, by a top-level ``function``, a ``const`` or an unexported
+``let`` (at the top level, or in a block that encloses the call, as a test
+helper declared inside ``describe`` is), or by a named import, and every other mention of it there
+must be a call to it or a JSX tag naming it, so it is never re-bound,
+shadowed or handed on. An import is followed with
 :func:`~flag_cleanup.cross_file_ts.resolve_specifier`, through ``export { … }``
 and ``export { … } from`` to the declaration; a package, a specifier that
 resolves to nothing or to a declaration file, a file outside the checkout, a
@@ -142,6 +144,9 @@ class _Callee:
     modules: frozenset[str] = frozenset()
     #: Every name it goes by along that chain, for ``spyOn(module, 'name')``.
     names: frozenset[str] = frozenset()
+    #: The block a ``const`` or ``let`` below the top level binds it in, which
+    #: a call must be inside to name it; ``None`` at the top level.
+    scope: Node | None = None
 
 
 def drop_default_arguments(
@@ -652,7 +657,11 @@ class _Resolver:
                 self._functions[key] = self._resolve(key[0], component)
             except (OSError, UnicodeDecodeError, RecursionError):
                 self._functions[key] = None
-        return self._functions[key]
+        callee = self._functions[key]
+        if callee is not None and callee.scope is not None and not _within(name, callee.scope):
+            # Outside the block that binds it, the name is some other binding.
+            return None
+        return callee
 
     def _resolve(self, name: str, component: bool) -> _Callee | None:
         binder = _sole_binder(name, self.root, self.data)
@@ -661,7 +670,12 @@ class _Resolver:
         if binder.parent.type == "import_specifier":
             return self._imported(binder.parent, component)
         callee = _declared_callee(binder, self.root, self.data, self.path or "", component)
-        return replace(callee, names=frozenset({name})) if callee is not None else None
+        if callee is None:
+            return None
+        scope = _binding_scope(binder)
+        return replace(
+            callee, names=frozenset({name}), scope=None if scope.type == "program" else scope
+        )
 
     def _imported(self, specifier: Node, component: bool) -> _Callee | None:
         if self.path is None or self.repo_dir is None:
@@ -741,7 +755,8 @@ class _Resolver:
         if onward is not None:
             return self._exported(str(resolved), onward, local, component, modules, names)
         binder = _sole_binder(local, root, data)
-        if binder is None or binder.parent.type == "import_specifier":
+        if binder is None or binder.parent.type == "import_specifier" or _binding_scope(binder).type != "program":
+            # A module exports only what its top level binds.
             return None
         callee = _declared_callee(binder, root, data, str(resolved), component)
         if callee is None:
@@ -925,9 +940,10 @@ def _grammar(path: str) -> str:
 
 
 def _sole_binder(name: str, root: Node, data: bytes) -> Node | None:
-    """The one leaf binding ``name`` in this file, a top-level declaration or
-    a named import, when every other mention of the name is a call to it, a
-    JSX tag naming it or an ``export { … }`` of it."""
+    """The one leaf binding ``name`` in this file, a declaration
+    :func:`_binding_scope` accepts or a named import, when every other
+    mention of the name is a call to it, a JSX tag naming it or an
+    ``export { … }`` of it."""
     found = None
     seen: set[int] = set()
     for leaf in _walk(root):
@@ -937,7 +953,7 @@ def _sole_binder(name: str, root: Node, data: bytes) -> Node | None:
         holder = leaf.parent
         if holder is None:
             return None
-        if _binds_at_top(leaf):
+        if _binding_scope(leaf) is not None:
             if found is not None:
                 return None
             found = leaf
@@ -976,27 +992,51 @@ def _within_import(node: Node) -> bool:
     return False
 
 
-def _binds_at_top(leaf: Node) -> bool:
-    """Whether ``leaf`` names a top-level ``function``, a top-level ``const``
-    or a named import's local binding."""
+def _binding_scope(leaf: Node) -> Node | None:
+    """The scope ``leaf`` binds its name in when it names a top-level
+    ``function``, a ``const`` or ``let`` at the top level or in a block, or
+    a named import's local binding; ``None`` for anything else."""
     holder = leaf.parent
     if holder.type == "import_specifier":
         local = holder.child_by_field_name("alias") or holder.child_by_field_name("name")
-        return _same(local, leaf)
+        return _program(leaf) if _same(local, leaf) else None
     if not _same(holder.child_by_field_name("name"), leaf):
-        return False
+        return None
+    lexical = False
     if holder.type == "function_declaration":
         statement = holder
     elif holder.type == "variable_declarator":
         statement = holder.parent
-        if statement is None or statement.type != "lexical_declaration" or not statement.text.startswith(b"const"):
-            return False
+        if statement is None or statement.type != "lexical_declaration" or not statement.text.startswith(
+            (b"const", b"let")
+        ):
+            return None
+        lexical = True
     else:
-        return False
+        return None
     scope = statement.parent
     if scope is not None and scope.type == "export_statement":
+        if statement.text.startswith(b"let"):
+            # An exported `let` is a live binding its module may re-assign.
+            return None
         scope = scope.parent
-    return scope is not None and scope.type == "program"
+    if scope is None:
+        return None
+    if scope.type == "program" or lexical and scope.type == "statement_block":
+        # A `function` in a block is hoisted out of it in a sloppy-mode
+        # script, so only a lexical binding is scoped by its block.
+        return scope
+    return None
+
+
+def _program(node: Node) -> Node:
+    while node.parent is not None:
+        node = node.parent
+    return node
+
+
+def _within(node: Node, scope: Node) -> bool:
+    return scope.start_byte <= node.start_byte and node.end_byte <= scope.end_byte
 
 
 def _declared_callee(binder: Node, root: Node, data: bytes, path: str, component: bool) -> _Callee | None:

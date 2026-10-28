@@ -36,6 +36,15 @@ Everything that has to hold, each checked rather than assumed:
 Whether each calling test can then go, or keep its call, is the caller's
 question (:func:`flag_cleanup.mock_stubs.resolve`), which refuses the pin
 whole when any one cannot.
+
+One call may pass a parameter instead of a literal: an xunit ``[Theory]``'s
+own, so that each ``[InlineData]`` row says the value (:func:`theory_at`).
+The caller then cuts the rows of the removed value, that column from the
+others and the parameter, or deletes the theory when no row is left.
+
+Or another private helper's own ``bool`` parameter, read nowhere else in it
+(``Make(bool on = true) => new(Policy(on))``): that helper is then pinned
+the same way, by its calls (:func:`chained`), and its parameter goes too.
 """
 
 from __future__ import annotations
@@ -52,6 +61,23 @@ _STRINGS = frozenset(
 )
 #: Method modifiers under which a body or a caller may be out of sight.
 _OPAQUE = frozenset({"partial", "extern", "abstract", "public", "internal", "protected", "virtual", "override"})
+
+
+#: The value :func:`calls` gives a call whose ``[Theory]`` rows say it.
+ROWS = "rows"
+#: How many helpers deep a pin follows a parameter passed on (:func:`chained`).
+_CHAIN_DEPTH = 4
+
+
+@dataclass(frozen=True)
+class TheoryRows:
+    """A ``[Theory]`` passing its own ``bool`` parameter to a pinned call."""
+
+    method: Node
+    name: str
+    parameter: Node
+    #: ``(attribute list, its argument at the parameter's position, literal)``.
+    rows: tuple[tuple[Node, Node, str], ...]
 
 
 @dataclass(frozen=True)
@@ -103,7 +129,7 @@ def _default(parameter: Node, data: bytes) -> tuple[bool, str | None]:
     return True, _text(after[0], data)
 
 
-def find(root: Node, data: bytes, statement: Node, parameter: str) -> CsPin | None:
+def find(root: Node, data: bytes, statement: Node, parameter: str, depth: int = 0) -> CsPin | None:
     """The pin ``statement`` (a stub returning ``parameter``) makes, or
     ``None`` when any of the module's conditions does not hold."""
     from flag_cleanup import mock_stubs
@@ -121,7 +147,8 @@ def find(root: Node, data: bytes, statement: Node, parameter: str) -> CsPin | No
         return None
     name_node = method.child_by_field_name("name")
     body = method.child_by_field_name("body")
-    if name_node is None or body is None or body.type != "block":
+    # A construction pin may sit in an expression body (`=> new(new Fake(on))`).
+    if name_node is None or body is None or body.type not in ("block", "arrow_expression_clause"):
         return None
     name = _text(name_node, data)
     parameters = _parameters(method)
@@ -166,7 +193,7 @@ def find(root: Node, data: bytes, statement: Node, parameter: str) -> CsPin | No
     if any(n.type in _STRINGS and word.search(_text(n, data)) for n in _walk(root)):
         return None
     pin = CsPin(name, parameter, index, default, method.start_byte)
-    if calls(root, data, pin) is None or edits(root, data, pin) is None:
+    if calls(root, data, pin, depth) is None or edits(root, data, pin, depth) is None:
         return None
     return pin
 
@@ -190,9 +217,10 @@ def _argument_at(call: Node, pin: CsPin, data: bytes) -> tuple[Node | None, bool
     return None, True
 
 
-def calls(root: Node, data: bytes, pin: CsPin) -> list[tuple[Node, str]] | None:
+def calls(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[Node, str]] | None:
     """Every call of the helper with the literal it pins; ``None`` when any
-    mention is not a plain call, or a call cannot be pinned."""
+    mention is not a plain call, or a call cannot be pinned. A call passing
+    another helper's parameter on stands for that helper's calls."""
     found: list[tuple[Node, str]] = []
     for node in _walk(root):
         if node.type != "identifier" or _text(node, data).removeprefix("@") != pin.method:
@@ -210,10 +238,177 @@ def calls(root: Node, data: bytes, pin: CsPin) -> list[tuple[Node, str]] | None:
             found.append((parent, pin.default))
             continue
         value = argument.named_children[-1] if argument.named_children else None
+        if value is not None and value.type == "identifier" and deletable and theory_at(parent, pin, data) is not None:
+            found.append((parent, ROWS))
+            continue
+        if value is not None and value.type == "identifier" and deletable:
+            outer = _outer(root, data, parent, argument, value, depth)
+            through = calls(root, data, outer, depth + 1) if outer is not None else None
+            # A theory's rows would say the value of the OUTER pin, which the
+            # caller asks of this one.
+            if through is None or any(v == ROWS for _, v in through):
+                return None
+            found += through
+            continue
         if value is None or value.type != "boolean_literal" or not deletable:
             return None
         found.append((parent, _text(value, data)))
     return found
+
+
+def _outer(root: Node, data: bytes, call: Node, argument: Node, value: Node, depth: int) -> CsPin | None:
+    """The pin of the helper around ``call`` that passes its own parameter
+    ``value`` as ``argument``, read nowhere else in it; ``None`` past
+    :data:`_CHAIN_DEPTH`, which also ends a cycle."""
+    if depth >= _CHAIN_DEPTH:
+        return None
+    return find(root, data, argument, _text(value, data).removeprefix("@"), depth + 1)
+
+
+def chained(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[CsPin]:
+    """The helpers whose parameter ``pin``'s calls pass on, at any depth:
+    each is pinned with it, and its parameter and arguments go too."""
+    found: list[CsPin] = []
+    for node in _walk(root):
+        if node.type != "invocation_expression":
+            continue
+        function = node.child_by_field_name("function")
+        if function is None or function.type != "identifier" or _text(function, data).removeprefix("@") != pin.method:
+            continue
+        argument, deletable = _argument_at(node, pin, data)
+        value = argument.named_children[-1] if argument is not None and argument.named_children else None
+        if value is None or value.type != "identifier" or not deletable or theory_at(node, pin, data) is not None:
+            continue
+        outer = _outer(root, data, node, argument, value, depth)
+        if outer is not None:
+            found += [outer, *chained(root, data, outer, depth + 1)]
+    return found
+
+
+def _simple_attribute(attribute: Node, data: bytes) -> str:
+    name = attribute.child_by_field_name("name")
+    spelled = _text(name, data) if name is not None else ""
+    return re.split(r"[.:]", spelled)[-1].strip().removesuffix("Attribute")
+
+
+def theory_at(call: Node, pin: CsPin, data: bytes) -> TheoryRows | None:
+    """The ``[Theory]`` whose own parameter ``call`` passes at the pin, when
+    its rows can be cut: the method is marked ``[Theory]`` and ``[InlineData]``
+    and nothing else, one attribute per list, each row naming no property
+    and holding a ``true``/``false`` literal at the parameter's position, the
+    parameter a plain ``bool`` with no default, read nowhere but at the call,
+    and another parameter left once it goes (a theory with none is
+    xUnit1006). ``None`` otherwise."""
+    argument, _ = _argument_at(call, pin, data)
+    value = argument.named_children[-1] if argument is not None and argument.named_children else None
+    if value is None or value.type != "identifier":
+        return None
+    return _theory(value, argument.child_by_field_name("name"), data)
+
+
+def theory_write(statement: Node, parameter: str, data: bytes) -> TheoryRows | None:
+    """The ``[Theory]`` whose own parameter ``statement`` writes to a test
+    fake's knob (``_gate.Enabled = on;``), as :func:`theory_at` judges one:
+    the rows say the value, and the write goes with the parameter."""
+    value = None
+    for node in _walk(statement):
+        if node.type == "assignment_expression":
+            right = node.child_by_field_name("right")
+            if right is not None and right.type == "identifier" and _text(right, data).removeprefix("@") == parameter:
+                value = right
+    if value is None:
+        return None
+    return _theory(value, None, data)
+
+
+def _theory(value: Node, label: Node | None, data: bytes) -> TheoryRows | None:
+    """:func:`theory_at`'s question, for the parameter ``value`` reads."""
+    spelled = _text(value, data)
+    method = _method_of(value)
+    if method is None:
+        return None
+    listed = method.child_by_field_name("parameters")
+    if listed is None or any(c.type not in ("parameter", "comment") for c in listed.named_children):
+        return None
+    parameters = _parameters(method)
+    index = next(
+        (i for i, p in enumerate(parameters) if (n := p.child_by_field_name("name")) is not None and _text(n, data) == spelled),
+        None,
+    )
+    if index is None or len(parameters) < 2:
+        return None
+    declared = parameters[index]
+    type_node = declared.child_by_field_name("type")
+    if type_node is None or _text(type_node, data) != "bool":
+        return None
+    if any(c.type in ("modifier", "attribute_list") for c in declared.children):
+        return None
+    ok, default = _default(declared, data)
+    if not ok or default is not None:
+        return None
+    theory = False
+    rows: list[tuple[Node, Node, str]] = []
+    for attribute_list in (c for c in method.children if c.type == "attribute_list"):
+        attributes = [a for a in attribute_list.named_children if a.type == "attribute"]
+        if len(attributes) != 1 or len(attribute_list.named_children) != 1:
+            return None
+        [attribute] = attributes
+        arguments = next((c for c in attribute.named_children if c.type == "attribute_argument_list"), None)
+        kind = _simple_attribute(attribute, data)
+        if kind == "Theory" and arguments is None:
+            theory = True
+            continue
+        if kind != "InlineData" or arguments is None:
+            return None
+        items = [a for a in arguments.named_children if a.type == "attribute_argument"]
+        if len(items) != len(parameters) or any(
+            c.type in ("=", ":") for item in items for c in item.children
+        ):
+            return None
+        literal = items[index].named_children[-1] if items[index].named_children else None
+        if literal is None or literal.type != "boolean_literal":
+            return None
+        rows.append((attribute_list, items[index], _text(literal, data)))
+    if not theory or not rows:
+        return None
+    body = method.child_by_field_name("body")
+    reads = [
+        n
+        for n in (_walk(body) if body is not None else ())
+        if n.type == "identifier"
+        and _text(n, data).removeprefix("@") == spelled
+        and (label is None or not (label.start_byte <= n.start_byte < label.end_byte))
+    ]
+    if len(reads) != 1 or reads[0].id != value.id:
+        return None
+    name = method.child_by_field_name("name")
+    return TheoryRows(method, _text(name, data) if name is not None else "", declared, tuple(rows))
+
+
+def theory_spans(theory: TheoryRows, data: bytes, kept: str) -> list[tuple[int, int]] | None:
+    """What cutting ``theory``'s rows takes: each row of the other value with
+    its whole line, the column from each row of ``kept``, and the
+    parameter. ``None`` when a row shares its line or a cut holds a comment;
+    an empty list when no row is ``kept`` (the theory goes whole)."""
+    if not any(value == kept for _, _, value in theory.rows):
+        return []
+    spans = [_list_span(theory.parameter)]
+    for attribute_list, argument, value in theory.rows:
+        if value == kept:
+            spans.append(_list_span(argument))
+            continue
+        start = data.rfind(b"\n", 0, attribute_list.start_byte) + 1
+        end = data.find(b"\n", attribute_list.end_byte)
+        end = len(data) if end < 0 else end + 1
+        if data[start : attribute_list.start_byte].strip() or data[attribute_list.end_byte : end].strip():
+            return None
+        spans.append((start, end))
+    root = theory.method
+    while root.parent is not None:
+        root = root.parent
+    if any(_holds_comment(root, start, end) for start, end in spans):
+        return None
+    return spans
 
 
 def _list_span(item: Node) -> tuple[int, int]:
@@ -236,19 +431,35 @@ def _holds_comment(root: Node, start: int, end: int) -> bool:
     )
 
 
-def edits(root: Node, data: bytes, pin: CsPin) -> list[tuple[int, int]] | None:
+def edits(root: Node, data: bytes, pin: CsPin, depth: int = 0) -> list[tuple[int, int]] | None:
     """The parameter's span and each passed argument's span, with
-    separators; ``None`` when one holds a comment."""
+    separators; ``None`` when one holds a comment, or a helper the pin's
+    calls pass the parameter on to cannot be edited."""
     method = next(
         (n for n in _walk(root) if n.type == "method_declaration" and n.start_byte == pin.method_start), None
     )
     if method is None:
         return None
     spans = [_list_span(_parameters(method)[pin.index])]
-    for call, _value in calls(root, data, pin) or ():
+    for call in _own_calls(root, data, pin):
         argument, _deletable = _argument_at(call, pin, data)
         if argument is not None:
             spans.append(_list_span(argument))
     if any(_holds_comment(root, start, end) for start, end in spans):
         return None
+    if any(edits(root, data, outer, depth + 1) is None for outer in chained(root, data, pin, depth)):
+        return None
     return spans
+
+
+def _own_calls(root: Node, data: bytes, pin: CsPin) -> list[Node]:
+    """Every call of the helper itself, those passing another helper's
+    parameter on included."""
+    found = []
+    for node in _walk(root):
+        if node.type != "invocation_expression":
+            continue
+        function = node.child_by_field_name("function")
+        if function is not None and function.type == "identifier" and _text(function, data).removeprefix("@") == pin.method:
+            found.append(node)
+    return found

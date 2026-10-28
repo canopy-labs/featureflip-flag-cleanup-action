@@ -26,6 +26,13 @@ inference, in two ways that hold for any code that compiles:
   - *family-returning* member names: the non-private members whose header
     spells a name collected, a record's positional parameters among them.
 
+  ``dynamic`` is collected from the start, as a type that can hold a family
+  value: ``var x = D.Get(); x.IsEnabled`` names no family type when ``Get``
+  returns ``dynamic``, and the read binds to the wrapper's member at run
+  time. So a member typed ``dynamic`` taints its name and its owner, like
+  one returning the interface. It is never a name in the result: a file that
+  spells it is not family-free anyway.
+
   This is a fixpoint, because a value can come through any chain of such
   types: ``o.Shelf()[0].IsEnabled`` names no family type when ``Shelf``
   returns a ``Bag`` whose indexer returns the interface. A parameter type
@@ -36,6 +43,21 @@ inference, in two ways that hold for any code that compiles:
   pattern methods ``foreach``, ``await``, deconstruction and collection
   initializers call are used without spelling any name.
 
+  Proof 2 alone (:func:`family_free`, not the reflection bounds) leaves out
+  a constructor's by-value parameter whose type is the family's interface,
+  spelled plainly (``IGate``, ``Ns.IGate``, ``IGate?``): it takes a family
+  value in and hands none back. A caller has to hold the value already,
+  which taints the caller by itself; a constructor is never a method group,
+  so its parameter types never reach a generic inference; and an interface
+  cannot be built by a target-typed ``new(...)`` whose initializer might set
+  the member. So ``new Job(gate)`` is no evidence against a file that names
+  ``Job`` when that constructor is all ``Job`` spells. A method's parameter
+  still counts (``var a = job.Use;`` is an ``Action<IGate>``), as do
+  ``ref``/``out``/``in``/``params``, a generic or delegate type (a lambda's
+  parameter takes it), a family class (``new(...) { IsEnabled = ... }``),
+  and an interface with attributes (``[CoClass]`` makes ``new IGate()``
+  legal).
+
   A private member is visible only inside its own type, so it is left out,
   except in a ``partial`` type, whose other parts may live in other files,
   and except a field, property or method with an attribute, which a source
@@ -44,7 +66,10 @@ inference, in two ways that hold for any code that compiles:
   A pattern extension method (``GetEnumerator``, ``Deconstruct``, ``Add``,
   ...) on a type outside the repository, or any extension of a type
   parameter, can hand a family value to code that spells no name, so it
-  makes no file family-free; so does a declaration this cannot read.
+  makes no file family-free; so does a declaration this cannot read, and so
+  does a ``global using static`` (or a project ``<Using Static="true">``)
+  spelling a collected name, which brings that type's members into every file
+  of its project by their bare names.
 
 Everything that cannot be read errs toward reachable and tainted.
 """
@@ -63,6 +88,8 @@ from flag_cleanup import cross_file_csharp as xcs
 from flag_cleanup import cross_file_keys
 
 _DYNAMIC = re.compile(r"\bdynamic\b")
+#: Collected from the start of the taint fixpoint, never returned by it.
+_DYNAMIC_NAME = "dynamic"
 _PARTIAL = re.compile(r"\bpartial\b")
 #: Members every type has: never evidence of another type.
 _OBJECT_MEMBERS = frozenset({"Equals", "GetHashCode", "GetType", "ToString"})
@@ -81,14 +108,17 @@ class Family:
     #: Directories of the projects compiling a family type's file.
     projects: frozenset[Path]
     #: Names of non-private members (anywhere) whose header spells a family
-    #: or tainting type's name.
+    #: or reaching type's name.
     returning: frozenset[str]
     #: Full names of the siblings alone.
     sibling_full_names: frozenset[str] = frozenset()
     #: Names of the other types (and aliases) a value of a family type can be
-    #: reached through without spelling a family name: a file spelling one is
-    #: not family-free. See the module docstring.
+    #: reached through without spelling a family name, reflection included:
+    #: a route bound to one of them may reach a family member.
     tainting: frozenset[str] = frozenset()
+    #: The same, as :func:`family_free` judges a file: without types that take
+    #: a family value only through a constructor. ``None`` means ``tainting``.
+    reaching: frozenset[str] | None = None
     #: Some family type is declared outside every project, or the wrapper's
     #: own class was not found, so project reachability proves nothing.
     homeless: bool = False
@@ -107,6 +137,12 @@ class Family:
     #: (or could not be read): a member access may then bind to an extension
     #: member no type declares, so a member name is no evidence of a type.
     extension_blocks: bool = True
+    #: No C# file that could not be read, or does not parse whole, may
+    #: declare a type under the name of a family type or of any supertype up
+    #: their chains (:func:`~flag_cleanup.cross_file_csharp._declarable_words`),
+    #: so ``members`` holds every member they declare. A file that fails to
+    #: parse elsewhere does not matter here.
+    members_complete: bool = False
     #: Some C# or Razor file of the checkout spells ``dynamic`` (or could
     #: not be read): a ``var`` may then hold a value of any type through a
     #: member of another file, so a member name is no evidence of a type.
@@ -157,18 +193,29 @@ def family_of(repo_dir: str, wrapper, index) -> Family:
             members |= info.members
             supertypes.extend(info.supertypes)
     members |= checkout.inherited_members(supertypes)
+    walked = set(simple)
+    pending = list(supertypes)
+    while pending:
+        name = pending.pop()
+        if name not in walked:
+            walked.add(name)
+            pending.extend(s for info in checkout.by_last.get(name, ()) for s in info.supertypes)
     projects_all = xcs._project_dirs(repo_dir)
-    homes = [_enclosing(t.path, projects_all) for t in decls]
-    taint = _taint(repo_dir, simple, frozenset(checkout.by_last), frozenset(checkout.by_full))
+    homes = [_enclosing(t.path, projects_all, repo_dir) for t in decls]
+    inbound = _inbound(wrapper.interface, checkout)
+    taint = _taint(repo_dir, simple, frozenset(checkout.by_last), frozenset(checkout.by_full), inbound)
     return Family(
         full_names=full,
         simple_names=taint.family,
         members=frozenset(members),
+        members_complete=not checkout.unreadable
+        and not any(words is None or name in words for name in walked for words in checkout.unparsed_types),
         settable=any(_settable(t.path, t.start, t.end, wrapper.name) for t in decls),
         projects=frozenset(p for home in homes for p in home),
         returning=taint.returning,
         sibling_full_names=sibling_full,
         tainting=taint.tainting,
+        reaching=taint.reaching,
         homeless=lost or any(not home for home in homes),
         opaque=taint.opaque,
         guest_named=taint.guest_named,
@@ -347,15 +394,20 @@ class _Header:
     extends: tuple[str, ...] = ()
     #: An alias target's simple name.
     target: str | None = None
+    #: ``text`` as proof 2 reads it, when that differs: a constructor's
+    #: inbound parameter types left out. See the module docstring.
+    narrow: str | None = None
 
 
 @dataclass(frozen=True)
 class _Taint:
     family: frozenset[str]
     tainting: frozenset[str]
+    #: What proof 2 judges a file by: ``_close`` read narrowly.
     returning: frozenset[str]
     opaque: bool
     guest_named: bool
+    reaching: frozenset[str] | None = None
 
 
 # Keyed by the name set itself, so an entry is never stale: a grown set is a
@@ -373,7 +425,11 @@ def _spells(text: str, names: frozenset[str]) -> bool:
 
 
 def _taint(
-    repo_dir: str, simple: frozenset[str], repo_types: frozenset[str], repo_full: frozenset[str]
+    repo_dir: str,
+    simple: frozenset[str],
+    repo_types: frozenset[str],
+    repo_full: frozenset[str],
+    inbound: frozenset[str] = frozenset(),
 ) -> _Taint:
     from flag_cleanup import source_index
     from flag_cleanup import wrapper_csharp as wc
@@ -384,11 +440,12 @@ def _taint(
         for f in source_index.files(repo_dir, {".cs"}, with_ignored=True)
         if f.path.name.endswith(".cs")
     ]
-    family, tainting, returning = set(simple), set[str](), set[str]()
+    family, tainting, returning = set(simple), {_DYNAMIC_NAME}, set[str]()
     headers: list[_Header] = []
     opaque = False
     guests = [(path, stem, wc._read(path)) for path, stem in _guests(repo_dir)]
     stemmed: set[str] = set()
+    stemmed_names: set[str] = set()
     guest_named = False
     usings, readable = xcs.msbuild_usings(repo_dir)
     opaque |= not readable
@@ -397,6 +454,8 @@ def _taint(
             headers.append(
                 _Header("alias", using.target, using.alias, target=using.target.rsplit(".", 1)[-1])
             )
+        elif using.kind == "static" and using.target is not None:
+            headers.append(_Header("opaque", using.target))
     parsed: set[str] = set()
     while True:
         before = frozenset(family | tainting)
@@ -413,12 +472,13 @@ def _taint(
                 continue
             parsed.add(path)
             root = wc.parse(text)
-            headers.extend(_headers(root, text, repo_types, repo_full, _Binder(root, path, repo_dir)))
+            headers.extend(_headers(root, text, repo_types, repo_full, _Binder(root, path, repo_dir), inbound))
         _close(headers, family, tainting, returning)
         names = frozenset(family | tainting)
         for path, stem, text in guests:
             if path not in stemmed and (text is None or _spells(text, names)):
                 stemmed.add(path)
+                stemmed_names.add(stem)
                 guest_named = True
                 # The markup's class: whatever names it can reach its
                 # members, and a C# member returning it brings it in.
@@ -427,13 +487,21 @@ def _taint(
             break
     names = frozenset(family | tainting)
     opaque |= any(h.kind == "opaque" and _spells(h.text, names) for h in headers)
-    tainting -= family
+    # Proof 2's closure, over the same headers: the full one read every file
+    # the narrow one can need. A markup class it reached stays in. An alias
+    # spelled like the interface may mean anything (its file spells the name,
+    # so it was read): then the narrow reading proves nothing.
+    near, reaching, returning = set(simple), {_DYNAMIC_NAME, *stemmed_names}, set[str]()
+    rebound = any(h.kind == "alias" and h.name in inbound for h in headers)
+    _close(headers, near, reaching, returning, narrow=not rebound)
+    tainting -= family | {_DYNAMIC_NAME}
     return _Taint(
         frozenset(family),
         frozenset(tainting),
-        frozenset(returning - family),
+        frozenset(returning - near),
         opaque,
         guest_named,
+        frozenset(reaching - near - {_DYNAMIC_NAME}),
     )
 
 
@@ -499,13 +567,17 @@ class _Binder:
         return wc._type_full(node, reader)
 
 
-def _close(headers: list[_Header], family: set[str], tainting: set[str], returning: set[str]) -> None:
-    """Apply every header that spells a collected name, until none adds one."""
+def _close(
+    headers: list[_Header], family: set[str], tainting: set[str], returning: set[str], narrow: bool = False
+) -> None:
+    """Apply every header that spells a collected name, until none adds one;
+    ``narrow`` reads each header as proof 2 does."""
     while True:
         size = len(family) + len(tainting) + len(returning)
         names = frozenset(family | tainting)
         for header in headers:
-            if header.kind == "opaque" or not _spells(header.text, names):
+            text = header.narrow if narrow and header.narrow is not None else header.text
+            if header.kind == "opaque" or not _spells(text, names):
                 continue
             if header.kind == "alias":
                 (family if header.target in family else tainting).add(header.name)
@@ -534,14 +606,23 @@ def _guests(repo_dir: str) -> list[tuple[str, str]]:
     return found
 
 
-def _header_text(node: Node) -> str:
+#: A type spelled as a plain name: ``IGate``, ``Ns.IGate``, ``global::Ns.IGate``, ``IGate?``.
+_PLAIN_TYPE = re.compile(r"(?:@?[^\W\d]\w*\s*(?:::|\.)\s*)*@?([^\W\d]\w*)\s*\??")
+
+
+def _header_text(node: Node, inbound: frozenset[str] = frozenset()) -> str:
     """``node``'s signature: everything but its attributes and its body,
-    accessors or initializer; a field's or event's type alone."""
+    accessors or initializer; a field's or event's type alone. A
+    constructor's by-value parameter whose type is plainly one of
+    ``inbound`` is left out, but for its attributes and default."""
     from flag_cleanup import wrapper_csharp as wc
 
     parts: list[str] = []
     for i, child in enumerate(node.children):
         if not child.is_named or child.type in _BODIES or node.field_name_for_child(i) in _BODY_FIELDS:
+            continue
+        if inbound and node.type == "constructor_declaration" and child.type == "parameter_list":
+            parts.extend(_parameter_text(p, inbound) for p in child.named_children)
             continue
         if child.type == "variable_declaration":
             type_node = child.child_by_field_name("type")
@@ -550,6 +631,63 @@ def _header_text(node: Node) -> str:
             continue
         parts.append(wc._text(child))
     return " ".join(parts)
+
+
+def _parameter_text(parameter: Node, inbound: frozenset[str]) -> str:
+    """A parameter's text, without its type when that type only takes one
+    of ``inbound`` in: by value, spelled plainly."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    whole = wc._text(parameter)
+    type_node = parameter.child_by_field_name("type")
+    if parameter.type != "parameter" or type_node is None or any(c.type == "modifier" for c in parameter.children):
+        return whole
+    spelled = wc._text(type_node)
+    plain = _PLAIN_TYPE.fullmatch(spelled)
+    if plain is None or plain.group(1) not in inbound:
+        return whole
+    start, end = type_node.start_byte - parameter.start_byte, type_node.end_byte - parameter.start_byte
+    data = parameter.text or b""
+    return (data[:start] + data[end:]).decode("utf-8", "replace")
+
+
+def _inbound(interface, checkout) -> frozenset[str]:
+    """The interface a constructor parameter may take in without tainting
+    its type for proof 2: one plain ``interface`` declaration of the name in
+    its file, with no attribute (``[CoClass]`` makes ``new I()`` legal), not
+    ``partial``, and the checkout's only type of that simple name, since the
+    parameter is matched by its spelling. Empty otherwise. A library type of
+    the name is no concern: it cannot hand out a value of a repository type
+    without a generic argument, and a plain name has none."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    if (
+        interface is None
+        or len(checkout.by_last.get(interface.name, ())) != 1
+        or checkout.spelled_where_unparsed(interface.name)
+    ):
+        return frozenset()
+    source = wc._read(interface.path)
+    if source is None:
+        return frozenset()
+    root = wc.parse(source)
+    if root.has_error:
+        return frozenset()
+    declarations = [
+        n
+        for n in cross_file_keys.walk(root)
+        if n.type in _TYPE_DECLARATIONS and (wc._name_of(n) or "").removeprefix("@") == interface.name
+    ]
+    if len(declarations) != 1:
+        return frozenset()
+    [declaration] = declarations
+    if (
+        declaration.type != "interface_declaration"
+        or wc._child(declaration, "attribute_list") is not None
+        or any(c.type == "modifier" and wc._text(c) == "partial" for c in declaration.children)
+    ):
+        return frozenset()
+    return frozenset({interface.name})
 
 
 def _enclosing_type(node: Node) -> Node | None:
@@ -732,6 +870,7 @@ def _headers(
     repo_types: frozenset[str],
     repo_full: frozenset[str],
     lookup: _Binder,
+    inbound: frozenset[str] = frozenset(),
 ) -> list[_Header]:
     from flag_cleanup import wrapper_csharp as wc
 
@@ -742,6 +881,11 @@ def _headers(
         if node.type == "using_directive":
             alias = node.child_by_field_name("name")
             if alias is None:
+                using = xcs._using(node)
+                if using.kind == "static" and using.is_global and node.named_children:
+                    # Its type's members, by their bare names, in every file of
+                    # the project: no file can be judged by what it spells.
+                    found.append(_Header("opaque", wc._text(node.named_children[-1])))
                 continue
             target = next((c for c in reversed(node.named_children) if c.id != alias.id), None)
             if target is not None:
@@ -787,6 +931,11 @@ def _headers(
         name = wc._name_of(node) if node.type in _NAMED_BY_FIELD else None
         name = name.removeprefix("@") if name else None
         extends: tuple[str, ...] = ()
+        if node.type == "constructor_declaration" and inbound:
+            narrow = _header_text(node, inbound)
+            if narrow != text:
+                found.append(_Header("member", text, None, owner, narrow=narrow))
+                continue
         if node.type == "method_declaration":
             extends, unreadable = _extension(node, name, repo_types, repo_full, lookup)
             if unreadable:
@@ -1101,10 +1250,13 @@ def project_graph(repo_dir: str) -> dict[Path, frozenset[Path]] | None:
     the checkout, ``Directory.Build`` ones included, or another file a project
     imports, a ``<project>.user`` file included), when a ``<Reference>`` may
     name an assembly built in the checkout (see :func:`_assembly_inside`), or
-    when a ``<Compile Include>`` brings in a file from outside a project's
-    directory, so that a file's directory no longer says which
-    projects compile it. A referenced project of another language is followed
-    too, since references are transitive.
+    when a ``<Compile Include>`` in a file a project imports (or a ``.user``
+    file) brings in one from outside it. A project's own ``<Compile
+    Include>`` of a file outside its directory is recorded instead, when it
+    resolves to a file of the checkout (no property, no wildcard): the file
+    is then compiled by that project too, and :func:`_enclosing` says so.
+    One that does not resolve is ``None``. A referenced project of another
+    language is followed too, since references are transitive.
 
     Cached per ``repo_dir`` for the run: project files do not change while it
     runs. :func:`reset_cache` is for tests that rewrite them.
@@ -1141,14 +1293,46 @@ def _graph(repo_dir: str) -> dict[Path, frozenset[Path]] | None:
         ):
             return None  # a file any project may import
     graph: dict[Path, set[Path]] = {}
+    linked: dict[Path, set[Path]] = {}
     for project in projects:
         text = texts[project]
         directory = project.parent
         targets = _references(text, directory) or []
-        if _compiles_outside(text, directory) or _assembly_inside(text, directory, root, built):
+        if _assembly_inside(text, directory, root, built):
             return None
+        for outside in _linked_files(text, directory):
+            if outside is None or not cross_file_keys.within(outside, root):
+                return None
+            linked.setdefault(outside, set()).add(directory)
         graph.setdefault(directory, set()).update(t.parent for t in targets)
+    _LINKED[repo_dir] = {k: frozenset(v) for k, v in linked.items()}
     return {k: frozenset(v) for k, v in graph.items()}
+
+
+#: ``repo_dir`` -> file -> the projects linking it in from outside their
+#: directory (:func:`project_graph`).
+_LINKED: dict[str, dict[Path, frozenset[Path]]] = {}
+
+
+def _linked_files(text: str, project: Path) -> list[Path | None]:
+    """Every file a project's ``<Compile Include>`` brings in from outside its
+    directory, resolved; ``None`` for one that cannot be (a property, a
+    wildcard)."""
+    found: list[Path | None] = []
+    for tag in _COMPILE_TAG.finditer(text):
+        include = _attributes(tag.group(1)).get("include")
+        if include is None:
+            continue  # `Remove` or `Update`: never adds a file
+        for value in _paths(include):
+            if any(c in value for c in "*?"):
+                resolved = _relative(value.replace("*", "x").replace("?", "x"), project)
+                if resolved is None or not cross_file_keys.within(resolved, project):
+                    found.append(None)
+                continue
+            resolved = _relative(value, project)
+            if resolved is None or not cross_file_keys.within(resolved, project):
+                found.append(resolved)
+    return found
 
 
 #: ``extension(`` or ``extension<T>(``: the header of a C# 14 extension block.
@@ -1163,27 +1347,125 @@ _SCANS: dict[str, tuple[bool, bool]] = {}
 _DYNAMIC_HOSTS = (".razor", ".cshtml")
 
 
+_LINKED_COMPILE = re.compile(r"<Compile\b[^>]*\bInclude\s*=", re.IGNORECASE)
+_MSBUILD_SUFFIXES = (".csproj", ".props", ".targets")
+
+
 def _scan(repo_dir: str) -> tuple[bool, bool]:
     """One read of every C# file of the checkout, and of the Razor files for
     ``dynamic``, ignored ones included; an unreadable file counts as both.
-    Cached per ``repo_dir``, like the graph."""
+    A file outside every project directory compiles into no project, so it
+    is skipped, unless a project links it in (``<Compile Include>``, as
+    :func:`project_graph` records it). Without a graph, such a file is
+    skipped only when no MSBuild file links one in and every one can be
+    read. In a C# file only a token counts as ``dynamic``
+    (:func:`_dynamic_token`); in markup the word anywhere does. Cached per
+    ``repo_dir``, like the graph."""
     if repo_dir not in _SCANS:
+        from flag_cleanup import cross_file_csharp as xcs
         from flag_cleanup import source_index
         from flag_cleanup import wrapper_csharp as wc
 
+        projects = xcs._project_dirs(repo_dir)
+        links = _LINKED.get(repo_dir, {}) if project_graph(repo_dir) is not None else None
+        everywhere = not projects
+        if links is None:
+            for f in source_index.files(repo_dir, set(_MSBUILD_SUFFIXES), with_ignored=True):
+                if f.path.name.lower().endswith(_MSBUILD_SUFFIXES):
+                    text = wc._read(f.resolved)
+                    everywhere |= text is None or _LINKED_COMPILE.search(text) is not None
         extension = dynamic = False
         for f in source_index.files(repo_dir, {".cs", *_DYNAMIC_HOSTS}, with_ignored=True):
             csharp = f.path.name.endswith(".cs")
             if not csharp and not f.path.name.lower().endswith(_DYNAMIC_HOSTS):
                 continue
+            if (
+                not everywhere
+                and xcs._project_of(f.resolved, projects) is None
+                and (links is None or Path(f.resolved).resolve() not in links)
+            ):
+                continue
             text = wc._read(f.resolved)
             if csharp:
                 extension |= text is None or _EXTENSION_BLOCK.search(text) is not None
-            dynamic |= text is None or _DYNAMIC.search(text) is not None
+                dynamic |= text is None or _dynamic_token(text)
+            else:
+                dynamic |= text is None or _DYNAMIC.search(text) is not None
             if extension and dynamic:
                 break
         _SCANS[repo_dir] = (extension, dynamic)
     return _SCANS[repo_dir]
+
+
+def _dynamic_token(text: str) -> bool:
+    """Whether C# ``text`` may hold a ``dynamic``: an identifier token
+    spelling it (``@dynamic`` too), or any spelling of it in a file that
+    does not parse whole. One inside a comment or a string is no type."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    if _DYNAMIC.search(text) is None:
+        return False
+    root = wc.parse(text)
+    if root.has_error:
+        return True
+    return any(
+        node.type == "identifier" and wc._text(node).removeprefix("@") == "dynamic"
+        for node in cross_file_keys.walk(root)
+    )
+
+
+#: (repo_dir, name) -> whether some file may declare or call a method ``name``.
+_METHOD_NAMES: dict[tuple[str, str], bool] = {}
+
+
+def spells_method(repo_dir: str, name: str) -> bool:
+    """Whether a method called ``name`` may be declared or called anywhere in
+    the checkout, ignored files included: a method or local function of
+    that name, or a call ``name(…)`` or ``x.name(…)`` (type arguments
+    allowed), in a C# file. A constructor, an object creation, a comment or
+    a string is none. A C# file that does not parse whole, a Razor file or
+    an unreadable one counts when it spells ``name`` followed by ``(``."""
+    key = (repo_dir, name)
+    if key not in _METHOD_NAMES:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        call = re.compile(rf"(?<![\w@])@?{re.escape(name)}\s*(?:<[^<>;{{}}()]*>\s*)?\(")
+        found = False
+        for f in source_index.files(repo_dir, {".cs", *_DYNAMIC_HOSTS}, with_ignored=True):
+            csharp = f.path.name.endswith(".cs")
+            if not (csharp or f.path.name.lower().endswith(_DYNAMIC_HOSTS)):
+                continue
+            text = wc._read(f.resolved)
+            if text is not None and call.search(text) is None:
+                continue
+            if text is None or not csharp or _method_named(wc.parse(text), name):
+                found = True
+                break
+        _METHOD_NAMES[key] = found
+    return _METHOD_NAMES[key]
+
+
+def _method_named(root: Node, name: str) -> bool:
+    """Whether ``root`` may declare or call a method ``name`` (see
+    :func:`spells_method`); always, when it does not parse whole."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    if root.has_error:
+        return True
+    for node in cross_file_keys.walk(root):
+        if node.type in ("method_declaration", "local_function_statement"):
+            if wc._name_of(node) == name:
+                return True
+        elif node.type == "invocation_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and function.type == "member_access_expression":
+                function = function.child_by_field_name("name")
+            if function is not None and function.type == "generic_name":
+                function = function.named_children[0] if function.named_children else None
+            if function is not None and function.type == "identifier" and wc._text(function).removeprefix("@") == name:
+                return True
+    return False
 
 
 def declares_extension_blocks(repo_dir: str) -> bool:
@@ -2169,8 +2451,13 @@ def _bounded_away(bounds: frozenset[str] | None, family: Family) -> bool:
 
 def reset_cache() -> None:
     """For tests that rebuild a tree under the same path."""
+    from flag_cleanup import wrapper_csharp
+
+    wrapper_csharp._FAKE_NAMES.clear()
     _GRAPHS.clear()
+    _LINKED.clear()
     _SCANS.clear()
+    _METHOD_NAMES.clear()
     _ROUTES.clear()
     _ATTRIBUTE_ROUTES.clear()
     _ROUTED.clear()
@@ -2179,11 +2466,16 @@ def reset_cache() -> None:
     _PATTERNS.clear()
 
 
-def _enclosing(path: str, projects: frozenset[Path]) -> list[Path]:
+def _enclosing(path: str, projects: frozenset[Path], repo_dir: str | None = None) -> list[Path]:
     """Every project whose directory holds ``path``: an SDK project compiles
     every ``.cs`` file below it, a nested project's included, unless told
-    otherwise, which is not read here."""
-    return [parent for parent in Path(path).parents if parent in projects]
+    otherwise, which is not read here. With ``repo_dir``, also every project
+    that links the file in with a ``<Compile Include>`` (see
+    :func:`project_graph`)."""
+    found = [parent for parent in Path(path).parents if parent in projects]
+    if repo_dir is not None and project_graph(repo_dir) is not None:
+        found += [d for d in sorted(_LINKED.get(repo_dir, {}).get(Path(path).resolve(), ())) if d not in found]
+    return found
 
 
 #: A file-based app's directive (``#:project ../App/App.csproj``,
@@ -2214,7 +2506,7 @@ def sees(repo_dir: str, path: str, declared: str) -> bool:
     """Whether the file ``path`` may see a type declared in the file
     ``declared``, by :func:`reaches`' walk. A type outside every project
     may be seen anywhere."""
-    homes = frozenset(_enclosing(str(Path(declared).resolve()), xcs._project_dirs(repo_dir)))
+    homes = frozenset(_enclosing(str(Path(declared).resolve()), xcs._project_dirs(repo_dir), repo_dir))
     return not homes or _reaches_projects(repo_dir, path, homes)
 
 
@@ -2225,7 +2517,7 @@ def _reaches_projects(repo_dir: str, path: str, targets: frozenset[Path]) -> boo
     graph = project_graph(repo_dir)
     if graph is None:
         return True
-    pending = _enclosing(str(Path(path).resolve()), xcs._project_dirs(repo_dir))
+    pending = _enclosing(str(Path(path).resolve()), xcs._project_dirs(repo_dir), repo_dir)
     seen: set[Path] = set()
     while pending:
         current = pending.pop()
@@ -2241,6 +2533,130 @@ def _reaches_projects(repo_dir: str, path: str, targets: frozenset[Path]) -> boo
 # --- family-free files --------------------------------------------------------
 
 
+_THIS = re.compile(r"(?<![\w@])(?:this|base)\b")
+#: Declarations whose body is judged on its own by :func:`free_members`.
+_JUDGED_MEMBERS = frozenset(
+    {
+        "method_declaration", "constructor_declaration", "destructor_declaration", "property_declaration",
+        "indexer_declaration", "operator_declaration", "conversion_operator_declaration", "event_declaration",
+        "field_declaration", "event_field_declaration",
+    }
+)
+
+
+def _declared_names(node: Node) -> list[str]:
+    from flag_cleanup import wrapper_csharp as wc
+
+    if node.type in ("field_declaration", "event_field_declaration"):
+        declaration = wc._child(node, "variable_declaration")
+        return [
+            n.removeprefix("@")
+            for d in (declaration.named_children if declaration is not None else ())
+            if d.type == "variable_declarator" and (n := wc._name_of(d))
+        ]
+    name = wc._name_of(node)
+    return [name.removeprefix("@")] if name else []
+
+
+#: .NET's naming convention for an interface: a library base spelled so is
+#: taken as one, whose members a class cannot reach without a cast.
+_INTERFACE_NAME = re.compile(r"I[A-Z]")
+
+
+def free_members(source: str, root: Node, family: Family, repo_dir: str) -> list[Node]:
+    """The members of the file's types whose own text can introduce no value
+    of a family type: proof 2 (:func:`family_free`) judged per member, for a
+    file that is not family-free as a whole.
+
+    Inside a member's body a value gets a type from what the member spells
+    (its header, locals, casts, calls) or from what is in scope unspelled:
+    the members of its enclosing types, private ones included, their primary
+    constructors' parameters, and ``this``. So a member is free when its text
+    spells no family, reaching or family-returning name, nor any name a
+    private member or nested type of an enclosing type leads to (collected to
+    a fixpoint over the outermost type), nor ``dynamic``, and no enclosing
+    type is one of those names. Inherited and ``using static`` members are
+    non-private, so already among the returning names. A ``partial`` type may
+    get members from another file, so nothing in it is free; nor is anything
+    in a file that does not parse whole or holds an app directive.
+
+    One assumption is taken that the whole-file proof also makes: a library
+    member does not hand a family value back as ``dynamic``. Two guards keep
+    it narrow. Nothing is free while any file of the checkout spells
+    ``dynamic`` (a repository member returning it is not among the names), and
+    nothing in a type with a library base class, whose inherited members (MVC's
+    ``ViewBag``) are reached unspelled. A library base spelled like an
+    interface (``I`` and a capital) is taken as one."""
+    from flag_cleanup import cross_file_csharp as xcs
+    from flag_cleanup import wrapper_csharp as wc
+
+    if family.opaque or family.dynamic_anywhere or root.has_error or _APP_DIRECTIVE.search(source):
+        return []
+    checkout = xcs.csharp_index(repo_dir)
+    reaching = family.tainting if family.reaching is None else family.reaching
+    family_types = {n.removeprefix("@") for n in family.simple_names}
+    known = family_types | set(reaching) | set(family.returning)
+    free: list[Node] = []
+    outermost = [
+        n for n in cross_file_keys.walk(root)
+        if n.type in _TYPE_DECLARATIONS and _enclosing_type(n) is None
+    ]
+    for top in outermost:
+        types = [n for n in cross_file_keys.walk(top) if n.type in _TYPE_DECLARATIONS]
+        if any(_PARTIAL.search(_header_text(t)) for t in types) or (family.guest_named and _PARTIAL.search(wc._text(top))):
+            continue
+        if any(
+            not checkout.by_last.get(base) and not _INTERFACE_NAME.match(base)
+            for t in types
+            if t.type != "interface_declaration"
+            for base in xcs._supertypes(t)
+        ):
+            continue
+        members = [n for n in cross_file_keys.walk(top) if n.type in _JUDGED_MEMBERS]
+        leading: set[str] = set()
+        while True:
+            names = frozenset(known | leading)
+            size = len(leading)
+            for t in types:
+                name = wc._name_of(t)
+                # Its header holds its base list and primary-constructor
+                # parameters, which are in scope in every member.
+                if name and _spells(_header_text(t), names):
+                    leading.add(name.removeprefix("@"))
+            for member in members:
+                if _spells(_header_text(member), names):
+                    leading.update(_declared_names(member))
+                    # A type leads by its name to what its members lead to.
+                    owner = _enclosing_type(member)
+                    if owner is not None and (name := wc._name_of(owner)):
+                        leading.add(name.removeprefix("@"))
+            if len(leading) == size:
+                break
+        names = frozenset(known | leading)
+        for member in members:
+            text = wc._text(member)
+            # An enclosing family type's members are the family's. Any other
+            # enclosing type is reached unspelled only as `this`/`base` (its
+            # indexer, a pattern method, a conversion); its members by name,
+            # which `names` holds.
+            this = _THIS.search(text) is not None
+            holder = _enclosing_type(member)
+            tainted = False
+            while holder is not None:
+                name = (wc._name_of(holder) or "").removeprefix("@")
+                # A type whose own header leads to one (its base list, say) is
+                # one: its members are reached with an implicit `this`.
+                tainted |= (
+                    name in family_types
+                    or _spells(_header_text(holder), names - {name})
+                    or (this and name in names)
+                )
+                holder = _enclosing_type(holder)
+            if not tainted and not _spells(text, names) and not _DYNAMIC.search(text):
+                free.append(member)
+    return free
+
+
 def family_free(source: str, root: Node, family: Family) -> bool:
     """Whether nothing in the file can introduce a value of a family type.
 
@@ -2252,6 +2668,7 @@ def family_free(source: str, root: Node, family: Family) -> bool:
     del root
     if family.opaque or _DYNAMIC.search(source) or _APP_DIRECTIVE.search(source):
         return False
-    if _spells(source, family.simple_names | family.tainting | family.returning):
+    reaching = family.tainting if family.reaching is None else family.reaching
+    if _spells(source, family.simple_names | reaching | family.returning):
         return False
     return not (family.guest_named and _PARTIAL.search(source))

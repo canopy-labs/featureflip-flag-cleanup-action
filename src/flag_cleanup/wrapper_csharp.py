@@ -49,7 +49,7 @@ from xml.etree import ElementTree
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_csharp as xcs
-from flag_cleanup import cross_file_keys, key_const, mock_stubs, syntax
+from flag_cleanup import cross_file_keys, key_const, mock_stubs, source_index, syntax
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.cross_file_dotnet_guest import CASE_INSENSITIVE_SUFFIXES, DOTNET_GUEST_EXTENSIONS
 
@@ -916,12 +916,15 @@ def published(path: str, repo_dir: str) -> bool:
     project = xcs._project_of(path, projects)
     if project is None:
         return True
+    # A file a project links in from outside its directory ships with that
+    # project too.
+    holders = {project.resolve(), *(p.resolve() for p in csharp_family._enclosing(path, projects, repo_dir))}
     packed = csharp_packing.packed_projects(repo_dir)
-    if packed is csharp_packing.ALL or project.resolve() in packed or _packing_mark(project, repo_dir):
+    if packed is csharp_packing.ALL or holders & set(packed) or any(_packing_mark(h, repo_dir) for h in holders):
         return True
     roots = set(packed)
     for other in projects:
-        if other.resolve() == project.resolve():
+        if other.resolve() in holders:
             continue
         mark = _packing_mark(other, repo_dir)
         # An `<Import>` alone may make a project packable; a test project is
@@ -943,7 +946,7 @@ def published(path: str, repo_dir: str) -> bool:
             continue
         shipped.add(current)
         pending.extend(graph.get(current, ()))
-    return project.resolve() in shipped
+    return bool(holders & shipped)
 
 
 def _packing_mark(project: Path, repo_dir: str) -> str | None:
@@ -1298,8 +1301,10 @@ def _inert_member(
     with a setter or ``init`` (its own knob). A get-only auto-property is
     not: a constructor may set it from anything. In a test sibling a bare
     read of a ``bool`` primary-constructor parameter is inert too, and the
-    parameter is the knob. A method may ignore its parameters, but never
-    read one."""
+    parameter is the knob; so is a get-only auto-property initialized with
+    exactly that parameter, which then holds it unless another constructor
+    sets it (:func:`_knob_default` refuses a type declaring one). A method may ignore
+    its parameters, but never read one."""
     if xcs._modifiers(member) & _OVERRIDES:
         return None
     parameters: set[str] = set()
@@ -1308,6 +1313,20 @@ def _inert_member(
             if member.child_by_field_name("value") is not None:
                 return None  # an initializer may be anything
             return "auto-property", _name_of(member)
+        initial = member.child_by_field_name("value")
+        if _bodiless(member, {"get"}) and initial is not None:
+            # Another constructor could set it: `_knob_default` refuses a
+            # primary-constructor knob in a type that declares one.
+            word = _text(initial).removeprefix("@")
+            bound = _primary_parameter(type_node, word)
+            if (
+                test
+                and type_node.type not in ("record_declaration", "record_struct_declaration")
+                and isinstance(bound, Node)
+                and _is_plain_bool(bound)
+            ):
+                return _text(initial), word
+            return None
         body = _getter_body(member)
     else:
         listed = member.child_by_field_name("parameters")
@@ -1345,8 +1364,11 @@ def _inert_member(
 
 def _siblings(
     wrapper: wi.Wrapper, interface: TypeDecl, index: Index, readers: _Readers
-) -> tuple[tuple[wi.Sibling, ...], str | wi.Refused | None]:
-    """Every other implementation of ``interface``, each inert, or the reason
+) -> tuple[tuple[tuple[wi.Sibling, ...], tuple[wi.SharedFake, ...]] | tuple[()], str | wi.Refused | None]:
+    """``(siblings, shared fakes)``: every other implementation of
+    ``interface``, each inert; one whose member another supertype also
+    declares is a :class:`~flag_cleanup.wrapper_inline.SharedFake` when that
+    member returns a literal, refused otherwise. Or the reason
     one is not (``interface-published`` for one this cannot see: a guest
     file's or a derived interface's).
 
@@ -1384,6 +1406,7 @@ def _siblings(
         | {_full_name(namespace, chain) for _, namespace, chain in candidates}
     )
     found: list[wi.Sibling] = []
+    shared: list[wi.SharedFake] = []
     for (path, namespace, chain), info in sorted(candidates.items()):
         if path == wrapper_path and chain == wrapper.owner and namespace == wrapper.package:
             continue
@@ -1417,8 +1440,11 @@ def _siblings(
         ):
             return refused(wi.SIBLING_NOT_INERT)
         supertypes = _supertypes_of(readers, path, node)
-        if supertypes is None or any(s.full != full and wrapper.name in s.members for s in supertypes):
+        if supertypes is None:
             return refused(wi.SIBLING_NOT_INERT)
+        # Another supertype declaring the name: the one member implements
+        # both, so it cannot go with the wrapper (see wi.SharedFake).
+        serves = sorted({s.last for s in supertypes if s.full != full and wrapper.name in s.members})
         body = node.child_by_field_name("body")
         members = [m for m in (body.named_children if body is not None else ()) if wrapper.name in _member_names(m)]
         kind = "property_declaration" if wrapper.kind == "property" else "method_declaration"
@@ -1444,8 +1470,19 @@ def _siblings(
         if inert is None:
             return refused(wi.SIBLING_NOT_INERT, members[0])
         returns, knob = inert
+        if serves:
+            # Only a literal can stay for both: qualify_all holds it to the
+            # value the run keeps, and refuses it when that is not known.
+            shared.append(
+                wi.SharedFake(
+                    path, info.last, namespace, wi.line_of(members[0]), returns, tuple(serves),
+                    chain if "." in chain else None,
+                )
+            )
+            continue
         default: str | None = None
         primary = False
+        parameter: str | None = None
         if test and returns not in ("true", "false"):
             # A test sets a fake through its knob, and the knob is all that
             # can be followed: one read some other way is not inert here.
@@ -1455,30 +1492,38 @@ def _siblings(
                 known = _knob_default(node, members[0], knob, supertypes)
                 if known is None:
                     return refused(wi.SIBLING_NOT_INERT, members[0])
-                default, primary = known
+                default, primary, parameter = known
         found.append(
             wi.Sibling(
                 path, info.last, namespace, wi.line_of(members[0]),
                 members[0].start_byte, members[0].end_byte, returns, knob if test else None, test,
-                default, primary, chain if "." in chain else None,
+                default, primary, parameter, chain if "." in chain else None,
+                _primary_arity(node) if primary else None,
+                _primary_index(node, knob) if primary else None,
             )
         )
-    return tuple(found), None
+    return (tuple(found), tuple(shared)), None
 
 
 def _knob_default(
     type_node: Node, member: Node, knob: str, supertypes: list
-) -> tuple[str, bool] | None:
-    """``(default, primary)`` of a test fake's ``knob`` (``wi.Sibling.knob_default``,
-    ``knob_primary``), when the knob is all that chooses ``member``'s value:
-    declared once, by the fake itself and no supertype of it, never
-    ``static``, with a literal initializer or none, and mentioned nowhere in
-    the fake but its declaration and ``member``'s read (no other reader, no
-    write of the fake's own). A primary constructor's parameter qualifies
-    only in a type declaring no other constructor, which could pass it
-    anything. A struct can always be built as ``default``, which no
-    initializer reaches, so its knob defaults to ``false`` and takes none.
-    ``None`` otherwise."""
+) -> tuple[str, bool, str | None] | None:
+    """``(default, primary, parameter)`` of a test fake's ``knob``
+    (``wi.Sibling.knob_default``, ``knob_primary``, ``knob_parameter``), when
+    the knob is all that chooses ``member``'s value: declared once, by the
+    fake itself and no supertype of it, never ``static``, with a literal
+    initializer or none, and mentioned nowhere in the fake but its
+    declaration and ``member``'s read (no other reader, no write of the
+    fake's own). A primary constructor's parameter qualifies only in a type
+    declaring no other constructor, which could pass it anything. A struct
+    can always be built as ``default``, which no initializer reaches, so its
+    knob defaults to ``false`` and takes none.
+
+    A member knob may also be written by the class's one constructor, when
+    that constructor takes one plain ``bool`` and does nothing but store it
+    in the knob (``Stub(bool enabled) => Enabled = enabled;``). Every
+    construction then passes the knob's value, so it has no default
+    (``""``), and the parameter is returned. ``None`` otherwise."""
     if any(knob in s.members for s in supertypes):
         return None
     struct = type_node.type in ("struct_declaration", "record_struct_declaration")
@@ -1517,12 +1562,85 @@ def _knob_default(
     if len(declared) != 1 or declared[0][1] is None:
         return None
     name_node, default, primary = declared[0]
+    constructor = None if primary or struct else _knob_constructor(type_node, knob)
+    write = constructor[1] if constructor is not None else None
     for node in cross_file_keys.walk(type_node):
         if node.type != "identifier" or _text(node).removeprefix("@") != knob or node.id == name_node.id:
             continue
+        if write is not None and node.id == write.id:
+            continue
         if not (member.start_byte <= node.start_byte < member.end_byte):
             return None
-    return default, primary
+    if constructor is not None:
+        return "", False, constructor[0]
+    return default, primary, None
+
+
+def _knob_constructor(type_node: Node, knob: str) -> tuple[str, Node] | None:
+    """``(parameter, the knob's identifier it writes)`` when ``type_node``
+    declares exactly one constructor, an instance one with no attribute, no
+    ``this(…)``/``base(…)`` initializer and exactly one plain ``bool``
+    parameter (no default, modifier or attribute), whose whole body is
+    ``Knob = parameter`` or ``this.Knob = parameter``, as an expression body
+    or a block of that one statement."""
+    body = type_node.child_by_field_name("body")
+    constructors = [m for m in (body.named_children if body is not None else ()) if m.type == "constructor_declaration"]
+    if len(constructors) != 1:
+        return None
+    constructor = constructors[0]
+    if (
+        xcs._modifiers(constructor) & {"static", "extern", "unsafe"}
+        or _child(constructor, "attribute_list") is not None
+        or _child(constructor, "constructor_initializer") is not None
+    ):
+        return None
+    listed = constructor.child_by_field_name("parameters")
+    parameters = [p for p in (listed.named_children if listed is not None else ()) if p.type != "comment"]
+    if (
+        len(parameters) != 1
+        or parameters[0].type != "parameter"
+        or not _is_plain_bool(parameters[0].child_by_field_name("type"))
+    ):
+        return None
+    parameter = parameters[0]
+    name = parameter.child_by_field_name("name")
+    if (
+        name is None
+        or _child(parameter, "modifier") is not None
+        or _child(parameter, "attribute_list") is not None
+        or any(c.start_byte >= name.end_byte for c in parameter.named_children)
+    ):
+        return None
+    code = constructor.child_by_field_name("body")
+    if code is None:
+        return None
+    if code.type == "arrow_expression_clause":
+        expressions = [c for c in code.named_children if c.type != "comment"]
+    elif code.type == "block":
+        statements = [c for c in code.named_children if c.type != "comment"]
+        if len(statements) != 1 or statements[0].type != "expression_statement":
+            return None
+        expressions = [c for c in statements[0].named_children if c.type != "comment"]
+    else:
+        return None
+    if len(expressions) != 1 or expressions[0].type != "assignment_expression":
+        return None
+    assignment = expressions[0]
+    left = assignment.child_by_field_name("left")
+    right = assignment.child_by_field_name("right")
+    operator = assignment.child_by_field_name("operator")
+    if left is None or right is None or operator is None or _text(operator) != "=":
+        return None
+    if left.type == "member_access_expression":
+        receiver = left.child_by_field_name("expression")
+        if receiver is None or receiver.type not in ("this", "this_expression"):
+            return None
+        left = left.child_by_field_name("name")
+    if left is None or left.type != "identifier" or _text(left).removeprefix("@") != knob:
+        return None
+    if right.type != "identifier" or _text(right) != _text(name):
+        return None
+    return _text(name).removeprefix("@"), left
 
 
 def _initial(value: Node | None, struct: bool) -> str | None:
@@ -1600,14 +1718,16 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
             )
         ):
             return None, wi.INTERFACE_PUBLISHED
-        siblings, why = _siblings(wrapper, interface, index, readers)
+        implementations, why = _siblings(wrapper, interface, index, readers)
         if why is not None:
             return None, why
+        siblings, shared = implementations
         start, end = declared_in(interface)[wrapper.name]
         member = replace(
             wrapper,
             interface=wi.InterfaceMember(interface.path, interface.name, interface.namespace, start, end),
             siblings=siblings,
+            shared=shared,
         )
         break
     # Every supertype but the implemented interface must be silent on the
@@ -2032,7 +2152,6 @@ def _pattern_binds(at: Node, name: str) -> bool:
                 parent.type.endswith(("_pattern", "_designation"))
                 or parent.type in ("declaration_expression", "from_clause", "let_clause", "join_clause")
                 or parent.type == "query_continuation"
-                or (parent.type == "foreach_statement" and _field(parent, node) == "left")
                 or (parent.type == "catch_declaration")
             ):
                 return True
@@ -2713,10 +2832,30 @@ def _value_use(access: Node) -> bool:
     return False
 
 
-def _co_used(at: Node, name: str, family) -> bool:
+def _group_position(access: Node) -> bool:
+    """Whether ``x.Other`` here is an argument or an operand of ``==``/``!=``:
+    a position a method group may take, and a field, property or event too."""
+    parent = access.parent
+    if parent is None:
+        return False
+    if parent.type == "argument":
+        return True
+    if parent.type == "binary_expression":
+        operator = parent.child_by_field_name("operator")
+        return operator is not None and _text(operator) in ("==", "!=")
+    return False
+
+
+def _co_used(at: Node, name: str, family, repo_dir: str) -> bool:
     """Whether, where ``name`` is declared, the same binding of ``name`` is
     also read as ``name.Other`` for a field, property or event no family
     type declares or inherits: a value of a family type has no ``Other``.
+
+    ``name.Other`` passed as an argument, or compared with ``==``/``!=``,
+    counts too while no file of the checkout may declare or call a method
+    ``Other`` (:func:`csharp_family.spells_method`): a method group there
+    would need a library's extension method of that name taking any type,
+    which is assumed away.
 
     Judged in the declaring block or function, or, for a name no local
     declares, in the member around ``at``; a nested lambda, local function
@@ -2743,6 +2882,8 @@ def _co_used(at: Node, name: str, family) -> bool:
         if _child(ancestor, "type_parameter_list") is not None:
             return False
         ancestor = ancestor.parent
+    from flag_cleanup import csharp_family
+
     known = {m.removeprefix("@") for m in family.members}
     for node in cross_file_keys.walk(region):
         if node.type != "member_access_expression":
@@ -2753,329 +2894,17 @@ def _co_used(at: Node, name: str, family) -> bool:
             continue
         if _text(expression).removeprefix("@") != name.removeprefix("@"):
             continue
-        if _text(member).removeprefix("@") in known or not _value_use(node):
+        other = _text(member).removeprefix("@")
+        if other in known:
+            continue
+        if not _value_use(node) and not (
+            _group_position(node) and not csharp_family.spells_method(repo_dir, other)
+        ):
             continue
         same = _declaring_scope(expression, _text(expression))
         if same is not None and same.id == scope.id:
             return True
     return False
-
-
-#: How many declarations deep :func:`_static_type` follows a value.
-_STATIC_DEPTH = 6
-#: A value whose static type is certainly not ``dynamic``, but unknown here.
-_NOT_DYNAMIC = "not-dynamic"
-_DYNAMIC_WORD = re.compile(r"(?<![\w@])@?dynamic\b")
-_LITERALS = frozenset(
-    {
-        "integer_literal",
-        "real_literal",
-        "character_literal",
-        "boolean_literal",
-        "string_literal",
-        "verbatim_string_literal",
-        "raw_string_literal",
-        "interpolated_string_expression",
-    }
-)
-
-
-def _typed(type_node: Node | None, reader: xcs._Reader | None) -> tuple[Node, xcs._Reader] | None:
-    """A declared type, unless it is ``var`` or spells ``dynamic``."""
-    if type_node is None or reader is None or type_node.type == "implicit_type":
-        return None
-    return None if _DYNAMIC_WORD.search(_text(type_node)) else (type_node, reader)
-
-
-def _local_declarator(statements: list[Node], at: Node, name: str) -> tuple[Node, Node] | str | None:
-    """``(variable_declaration, declarator)`` of the local ``name`` that
-    ``statements`` declare before ``at``; ``_UNTYPED`` for a local function."""
-    found: tuple[Node, Node] | None = None
-    for statement in statements:
-        if statement.type == "global_statement" and statement.named_children:
-            statement = statement.named_children[0]
-        if statement.type == "local_function_statement" and _name_of(statement) == name:
-            return _UNTYPED
-        if statement.type == "local_declaration_statement" and statement.start_byte < at.start_byte:
-            declaration = _child(statement, "variable_declaration")
-            hit = _declarator_named(declaration, name) if declaration is not None else None
-            found = hit or found
-    return found
-
-
-def _declarator_named(declaration: Node, name: str) -> tuple[Node, Node] | None:
-    for declarator in declaration.named_children:
-        if declarator.type == "variable_declarator" and _name_of(declarator) == name:
-            return declaration, declarator
-    return None
-
-
-def _declarator_static(
-    declaration: Node, declarator: Node, readers: _Readers, path: str, depth: int
-) -> tuple[Node, xcs._Reader] | str | None:
-    type_node = declaration.child_by_field_name("type")
-    if type_node is not None and type_node.type != "implicit_type":
-        return _typed(type_node, readers.get(path))
-    name = declarator.child_by_field_name("name")
-    values = [c for c in _named(declarator) if name is None or c.id != name.id]
-    return _static_type(values[-1], readers, path, depth + 1) if values else None
-
-
-def _declared_static(at: Node, name: str, readers: _Readers, path: str, depth: int = 0):
-    """The static type the ``name`` read at ``at`` is declared with, as
-    ``(type node, reader of its file)`` or ``_NOT_DYNAMIC``; ``None`` unless
-    it is certainly not ``dynamic``. Only a declaration with an explicit
-    type, or a ``var`` whose initializer :func:`_static_type` proves, counts:
-    an untyped lambda parameter takes its type from the method it is passed
-    to, which may be a library's taking ``dynamic``."""
-    if depth > _STATIC_DEPTH or _pattern_binds(at, name):
-        return None
-    reader = readers.get(path)
-    scope = at.parent
-    while scope is not None:
-        if scope.type in ("block", "switch_section"):
-            hit = _local_declarator(_statements_in_scope(scope), at, name)
-            if isinstance(hit, str):
-                return None
-            if hit is not None:
-                return _declarator_static(*hit, readers, path, depth)
-        elif scope.type in _FUNCTIONS:
-            parameters = scope.child_by_field_name("parameters")
-            found = _parameter_type(parameters, name)
-            if found is not None:
-                return None if isinstance(found, str) else _typed(found, reader)
-        elif scope.type == "accessor_declaration" and name == "value":
-            return None
-        elif scope.type == "foreach_statement":
-            left = scope.child_by_field_name("left")
-            if left is not None and left.type == "identifier" and _text(left) == name:
-                return _typed(scope.child_by_field_name("type"), reader)
-        elif scope.type in ("for_statement", "using_statement", "fixed_statement"):
-            for part in scope.named_children:
-                if part.type == "variable_declaration" and part.start_byte < at.start_byte:
-                    hit = _declarator_named(part, name)
-                    if hit is not None:
-                        return _declarator_static(*hit, readers, path, depth)
-        elif scope.type == "compilation_unit":
-            return None
-        if scope.type in _SCOPE_TYPES:
-            if _primary_parameter(scope, name) is not None:
-                return None
-            member = _member_binding(scope, name)
-            return None if member is None or isinstance(member, str) else _typed(member, reader)
-        scope = scope.parent
-    return None
-
-
-def _can_take(method: Node, arguments: Node) -> bool:
-    """Whether a call with ``arguments`` may apply to ``method``, judged by
-    how many there are and by the names of the named ones: optional
-    parameters may be left out, and a ``params`` one takes any number.
-
-    A call that no instance overload takes binds to an extension method of
-    the name, which may be a library's returning ``dynamic``. This catches
-    only the wrong number or name of arguments: an argument of the wrong
-    type is the same fallback, and it is not caught here."""
-    parameters = method.child_by_field_name("parameters")
-    names: set[str] = set()
-    required = 0
-    variadic = False
-    after_params = False
-    for child in parameters.children if parameters is not None else ():
-        if child.type == "params":
-            variadic = after_params = True
-        elif child.type == "identifier" and after_params:
-            names.add(_text(child).removeprefix("@"))
-            after_params = False
-        elif child.type == "parameter":
-            name = _name_of(child)
-            if name is not None:
-                names.add(name.removeprefix("@"))
-            if not any(c.type == "=" for c in child.children):
-                required += 1
-    given = [a for a in arguments.named_children if a.type == "argument"]
-    named = [n for a in given if (n := a.child_by_field_name("name")) is not None]
-    if any(_text(n).removeprefix("@") not in names for n in named):
-        return False
-    return required <= len(given) and (variadic or len(given) <= len(names))
-
-
-def _member_static(declaration: Node, name: str, reader: xcs._Reader, arguments: Node | None = None):
-    """The static type of the member ``name`` that a non-generic type
-    ``declaration`` itself declares, or ``None`` when any candidate is
-    generic, untyped or ``dynamic``, or none is declared there.
-
-    With ``arguments`` the member is called: only the methods that may take
-    them (:func:`_can_take`) are candidates, and a field or property of the
-    name is a delegate, whose ``Invoke`` may be a library's. Without them it
-    is read: a method of the name is a method group, not a value."""
-    if _child(declaration, "type_parameter_list") is not None:
-        return None
-    body = declaration.child_by_field_name("body")
-    found: list[Node] = []
-    for member in body.named_children if body is not None else ():
-        if member.type in ("field_declaration", "event_field_declaration"):
-            variables = _child(member, "variable_declaration")
-            if variables is None or _declarator_named(variables, name) is None:
-                continue
-            if member.type == "event_field_declaration" or arguments is not None:
-                return None
-            type_node = variables.child_by_field_name("type")
-        elif _name_of(member) != name:
-            continue
-        elif member.type == "method_declaration":
-            if arguments is None:
-                return None
-            if not _can_take(member, arguments):
-                continue
-            if _child(member, "type_parameter_list") is not None:
-                return None
-            type_node = member.child_by_field_name("returns")
-        elif member.type == "property_declaration" and arguments is None:
-            type_node = member.child_by_field_name("type")
-        else:
-            # An invoked property, an event, a nested type, an enum member:
-            # not a typed value here.
-            return None
-        if _typed(type_node, reader) is None:
-            return None
-        found.append(type_node)
-    if not found:
-        return None
-    return (found[0], reader) if len(found) == 1 else _NOT_DYNAMIC
-
-
-def _repository_member(full: str | None, name: str, readers: _Readers, arguments: Node | None = None):
-    """The static type of the member ``name`` of the repository type ``full``,
-    by :func:`_member_static`, when nothing else may declare it: the type is
-    one non-generic, non-``partial`` declaration whose bases are all
-    repository types silent on the name."""
-    if not full:
-        return None
-    checkout = xcs.csharp_index(readers.repo_dir)
-    infos = [i for i in checkout.by_full.get(full, ()) if not i.generic]
-    if checkout.incomplete or len(infos) != 1 or infos[0].partial or name not in infos[0].members:
-        return None
-    reader = readers.get(infos[0].path)
-    declaration = _find_type(reader.root, infos[0].chain) if reader is not None else None
-    if declaration is None or _inherits(declaration, name, readers, infos[0].path):
-        return None
-    return _member_static(declaration, name, reader, arguments)
-
-
-def _type_name_full(node: Node, readers: _Readers, path: str) -> str | None:
-    """The repository type an expression ``T`` or ``N.T`` names, when nothing
-    in the file binds its first name as a value."""
-    reader = readers.get(path)
-    if reader is None:
-        return None
-    if node.type == "identifier":
-        if _binding(node, _text(node), readers, path) is not None:
-            return None
-        return _type_full(node, reader)
-    parts: list[str] = []
-    current = node
-    while current.type == "member_access_expression":
-        name = current.child_by_field_name("name")
-        if name is None or name.type != "identifier":
-            return None
-        parts.append(_text(name))
-        current = current.child_by_field_name("expression")
-        if current is None:
-            return None
-    if current.type != "identifier" or _binding(current, _text(current), readers, path) is not None:
-        return None
-    first = _text(current)
-    if _type_shadowed(current, first, reader) or not _first_clear(first, current, reader):
-        return None
-    full = ".".join([first, *reversed(parts)])
-    return full if full in reader.index.by_full else None
-
-
-def _owner_full(receiver: Node, readers: _Readers, path: str, depth: int) -> str | None:
-    """The repository type whose member ``receiver.Name`` reads: the static
-    type of a value, or the type the receiver names."""
-    found = _static_type(receiver, readers, path, depth + 1)
-    if isinstance(found, tuple):
-        return _type_full(*found)
-    if found is not None:
-        return None
-    return _type_name_full(receiver, readers, path) if receiver.type in ("identifier", "member_access_expression") else None
-
-
-def _argument_static(argument: Node, readers: _Readers, path: str, depth: int) -> bool:
-    """Whether an argument is certainly not ``dynamic``: one that is makes
-    the whole call dynamically bound, whatever the callee returns."""
-    values = [c for c in _named(argument) if _field(argument, c) != "name"]
-    if not values:
-        return False
-    value = values[-1]
-    if value.type in ("lambda_expression", "anonymous_method_expression", "declaration_expression"):
-        return True
-    return _static_type(value, readers, path, depth + 1) is not None
-
-
-def _static_type(expression: Node | None, readers: _Readers, path: str, depth: int = 0):
-    """The static type of ``expression``, as :func:`_declared_static` gives
-    one, or ``None`` unless it is certainly not ``dynamic``. A value counts
-    only when every member it goes through is a repository member with a
-    declared type: a library member may return ``dynamic``."""
-    if expression is None or depth > _STATIC_DEPTH:
-        return None
-    reader = readers.get(path)
-    kind = expression.type
-    if kind == "parenthesized_expression" or (kind == "postfix_unary_expression" and _text(expression).endswith("!")):
-        inner = _named(expression)
-        return _static_type(inner[0], readers, path, depth + 1) if inner else None
-    if kind in _LITERALS or kind == "typeof_expression":
-        return _NOT_DYNAMIC
-    if kind in ("object_creation_expression", "cast_expression"):
-        return _typed(expression.child_by_field_name("type"), reader)
-    if kind == "as_expression":
-        return _typed(expression.child_by_field_name("right"), reader)
-    if kind == "identifier":
-        return _declared_static(expression, _text(expression), readers, path, depth + 1)
-    if kind == "member_access_expression":
-        return _member_access_static(expression, readers, path, depth)
-    if kind == "invocation_expression":
-        function = expression.child_by_field_name("function")
-        arguments = expression.child_by_field_name("arguments")
-        if function is None or arguments is None:
-            return None
-        if not all(
-            _argument_static(a, readers, path, depth) for a in arguments.named_children if a.type == "argument"
-        ):
-            return None
-        if function.type == "member_access_expression":
-            return _member_access_static(function, readers, path, depth + 1, arguments)
-        if function.type == "identifier":
-            return _unqualified_call(function, readers, path, arguments)
-    return None
-
-
-def _member_access_static(
-    access: Node, readers: _Readers, path: str, depth: int, arguments: Node | None = None
-):
-    """The static type of ``Q.N``, or of ``Q.N(arguments)`` when called."""
-    receiver = access.child_by_field_name("expression")
-    name = access.child_by_field_name("name")
-    if receiver is None or name is None or name.type != "identifier":
-        return None
-    return _repository_member(_owner_full(receiver, readers, path, depth), _text(name), readers, arguments)
-
-
-def _unqualified_call(function: Node, readers: _Readers, path: str, arguments: Node):
-    """The static type of ``M(arguments)``: a method the nearest enclosing
-    type declares itself, with no local, parameter, base or other ``partial``
-    part that may claim ``M``."""
-    name = _text(function)
-    scope = _declaring_scope(function, name)
-    enclosing = _enclosing_type(function)
-    if scope is None or enclosing is None or scope.id != enclosing.id:
-        return None
-    if "partial" in xcs._modifiers(enclosing) or _inherits(enclosing, name, readers, path):
-        return None
-    return _member_static(enclosing, name, readers.get(path), arguments)
 
 
 def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> list[wi.Occurrence]:
@@ -3098,20 +2927,37 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     # A member name is evidence of a type only where nothing can bind any
     # name -- no `dynamic` and no extension block anywhere in the checkout
     # (a `var` takes its type from a member of any file) -- and where every
-    # family type's members are known: every C# file parsed, and no
-    # sibling based on a type outside the repository.
+    # family type's members are known: no file that does not parse whole
+    # may declare a family type or a supertype of one, and no sibling is
+    # based on a type outside the repository.
     co_usage = (
         family is not None
         and not family.extension_blocks
         and not family.dynamic_anywhere
         and not family.opaque
         and not family.sibling_bases_external
-        and not reader.index.incomplete
+        and family.members_complete
+    )
+    # Nor through a receiver in a member of the file whose own text leads to
+    # none (proof 2 per member). It needs what co-usage needs but a complete
+    # index: proof 2 reads an unparsed region as opaque when it spells a
+    # name, and every supertype of a family type is known, or the wrapper or
+    # sibling would not have qualified.
+    free = (
+        [(m.start_byte, m.end_byte) for m in csharp_family.free_members(source, root, family, index.repo_dir)]
+        if family is not None
+        and not family.extension_blocks
+        and not family.dynamic_anywhere
+        and not family.opaque
+        and not family.sibling_bases_external
+        else []
     )
     targets = {f"{wrapper.package}.{wrapper.owner}" if wrapper.package else wrapper.owner}
     if wrapper.interface is not None:
         interface = wrapper.interface
         targets.add(f"{interface.package}.{interface.name}" if interface.package else interface.name)
+    # A read through a shared fake binds the member it keeps (wi.SharedFake).
+    shared = {_full_name(s.namespace, s.chain or s.owner) for s in wrapper.shared}
     found: list[wi.Occurrence] = [
         wi.Occurrence(path, wi.line_of(c), wi.text_of(c), None, wi.UNPARSED_MENTION)
         for c, after in _crefs(root, wrapper, index)
@@ -3158,6 +3004,16 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             if spelled_receiver is not None:
                 mentions[spelled_receiver] += 1
                 scoped_mentions[(_method_scope(node, methods), spelled_receiver)] += 1
+        # Counted above all the same: the test-double pass matches mocks by
+        # name, and a name read here is not proven anyone's. A bare name may
+        # bind through a nested or inherited scope or a `using static`.
+        if (
+            parent is not None
+            and parent.type == "member_access_expression"
+            and _field(parent, node) == "name"
+            and any(start <= node.start_byte < end for start, end in free)
+        ):
+            continue
         if _in_pattern_path(node):
             # `{ A.Name: … }` matches a member PATH of the tested value: no
             # receiver in it is bound where it is written.
@@ -3228,7 +3084,7 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             name = _text(receiver)
             bound = _binding(access, name, readers, path)
             if family is not None and bound is not None and not isinstance(bound, str):
-                if _foreign_type(bound, reader, family):
+                if _foreign_type(bound, reader, family) or _type_full(bound, reader) in shared:
                     continue
                 if _type_full(bound, reader) in family.sibling_full_names:
                     found.append(sibling_read(access, line, name))
@@ -3253,10 +3109,10 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
                 reason is not None
                 and co_usage
                 and (bound is None or bound == _UNTYPED)
-                # Evidence only against a receiver that cannot be `dynamic`:
-                # a library member may hand back a family value as one.
-                and _declared_static(receiver, name, readers, path) is not None
-                and _co_used(access, name, family)
+                # Assumed, as proof 2 per member assumes it: no library member
+                # hands a family value back as `dynamic`. The repository's own
+                # cannot, co-usage being off while any file spells it.
+                and _co_used(access, name, family, index.repo_dir)
             ):
                 continue
         elif (
@@ -3269,7 +3125,7 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             name = _text(field_name)
             bound = _binding(access, name, readers, path, class_only=True)
             if family is not None and bound is not None and not isinstance(bound, str):
-                if _foreign_type(bound, reader, family):
+                if _foreign_type(bound, reader, family) or _type_full(bound, reader) in shared:
                     continue
                 if _type_full(bound, reader) in family.sibling_full_names:
                     found.append(sibling_read(access, line, name))
@@ -3281,7 +3137,9 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
             )
         elif receiver.type == "object_creation_expression":
             created = receiver.child_by_field_name("type")
-            if family is not None and created is not None and _foreign_type(created, reader, family):
+            if family is not None and created is not None and (
+                _foreign_type(created, reader, family) or _type_full(created, reader) in shared
+            ):
                 continue
             if family is not None and created is not None and _type_full(created, reader) in family.sibling_full_names:
                 found.append(sibling_read(access, line, None))
@@ -3548,10 +3406,14 @@ class _Setting:
 
     @property
     def sets_knob(self) -> bool:
-        """Whether it sets ``fake``'s knob, or may set some fake's."""
+        """Whether it sets ``fake``'s knob, or may set some fake's: a
+        construction (``knob`` ``None``) sets one built through its
+        constructor, any other setting the member it writes."""
         if self.fake is None:
             return True
-        return any(self.knob == (None if s.knob_primary else s.knob) for s in self.fake)
+        if self.knob is None:
+            return any(s.construction[1] for s in self.fake)
+        return any(not s.knob_primary and self.knob == s.knob for s in self.fake)
 
 
 def _write_target(node: Node) -> Node | None:
@@ -3616,6 +3478,94 @@ def _member_holder(
     if member is None:
         return None
     return f"{host}.{_text(name)}", member, declaring, host, full
+
+
+def _primary_arity(type_node: Node) -> tuple[int, int]:
+    """``(fewest, most)`` arguments a primary constructor takes: a parameter
+    with a default may be left out (tree-sitter-c-sharp gives the default as
+    an expression after the name)."""
+    listed = _child(type_node, "parameter_list")
+    parameters = [p for p in (listed.named_children if listed is not None else ()) if p.type == "parameter"]
+    defaulted = 0
+    for parameter in parameters:
+        name = parameter.child_by_field_name("name")
+        if name is not None and any(c.start_byte >= name.end_byte for c in parameter.named_children):
+            defaulted += 1
+    return len(parameters) - defaulted, len(parameters)
+
+
+def _primary_index(type_node: Node, name: str | None) -> int | None:
+    """The position of the primary constructor's parameter ``name``."""
+    listed = _child(type_node, "parameter_list")
+    parameters = [p for p in (listed.named_children if listed is not None else ()) if p.type == "parameter"]
+    return next((i for i, p in enumerate(parameters) if _name_of(p) == name), None)
+
+
+def _could_build(sibling: wi.Sibling, node: Node, passed: list[Node], path: str) -> bool:
+    """Whether the construction ``node``, whose type is not known, may build
+    ``sibling`` through its positional knob. A private nested fake is built
+    only inside its outer type; a primary constructor takes as many
+    arguments as its parameters allow; a constructor writing a member knob
+    takes one ``bool``."""
+    if sibling.chain is not None:
+        outer = sibling.chain.split(".")[0]
+        scope = node.parent
+        while scope is not None and not (scope.type in _OWNERS and _name_of(scope) == outer):
+            scope = scope.parent
+        if scope is None or str(Path(path).resolve()) != str(Path(sibling.path).resolve()):
+            return False
+    if sibling.primary_arity is not None:
+        fewest, most = sibling.primary_arity
+        if not fewest <= len(passed) <= most:
+            return False
+        # The argument the knob takes, named or at its position, must be able
+        # to be a `bool`: `new(new Svc())` sets no knob.
+        named = [a for a in passed if (label := a.child_by_field_name("name")) is not None and _text(label) == sibling.knob]
+        index = sibling.primary_knob_index
+        at = named[0] if named else (passed[index] if index is not None and index < len(passed) else None)
+        return at is None or not _not_bool(at)
+    return len(passed) == 1 and not _not_bool(passed[0])
+
+
+#: ``(repo_dir, fake owners)`` -> every name that may denote one of them
+#: (:func:`_aliases`), or ``None``. Cleared by ``csharp_family.reset_cache``.
+_FAKE_NAMES: dict[tuple[str, frozenset[str]], frozenset[str] | None] = {}
+
+
+def _fake_names(repo_dir: str, owners: frozenset[str]) -> frozenset[str] | None:
+    key = (repo_dir, owners)
+    if key not in _FAKE_NAMES:
+        names: set[str] = set()
+        for owner in sorted(owners):
+            aliases = _aliases(repo_dir, owner)
+            if aliases is None:
+                _FAKE_NAMES[key] = None
+                break
+            names |= aliases
+        else:
+            _FAKE_NAMES[key] = frozenset(names)
+    return _FAKE_NAMES[key]
+
+
+def _never_a_fake(declared: Node | None, node: Node, siblings: list[wi.Sibling], repo_dir: str) -> bool:
+    """Whether the target-typed ``new(…)`` at ``node`` certainly builds no
+    fake: the type its context declares (``declared``, or one
+    ``ctor_param_csharp._target_name`` reads off a method's arrow body or
+    ``return``) is generic, which a fake and an alias never are, or spells no
+    name that may denote a fake (its name or an alias of it)."""
+    from flag_cleanup import ctor_param_csharp
+
+    if declared is not None:
+        last = declared.child_by_field_name("name") if declared.type == "qualified_name" else declared
+        if last is not None and last.type == "generic_name":
+            return True
+        name = xcs._simple_name(declared)
+    else:
+        name = ctor_param_csharp._target_name(node, "") if node.parent is not None and node.parent.type != "initializer_expression" else None
+    if name is None:
+        return False
+    names = _fake_names(repo_dir, frozenset(s.owner for s in siblings))
+    return names is not None and name.removeprefix("@") not in names
 
 
 def _typed_fake(
@@ -3699,12 +3649,23 @@ def _knob_settings(
             if type_node is not None:
                 known, fake = _typed_fake(type_node, reader, fakes)
                 simple = xcs._simple_name(type_node)
-                primary = fake is not None and any(s.knob_primary for s in fake)
+                primary = fake is not None and any(s.construction[1] for s in fake)
                 if (known and not primary) or (not known and simple not in owners):
                     continue
             else:
-                fake = None
-                if not any(s.knob_primary for s in siblings):
+                # Target-typed `new(…)`: the declaration it initializes may
+                # still spell the type.
+                declarator = node.parent
+                declaration = declarator.parent if declarator is not None and declarator.type == "variable_declarator" else None
+                declared = declaration.child_by_field_name("type") if declaration is not None else None
+                if declarator is not None and declarator.type == "property_declaration" and declarator.child_by_field_name("value") == node:
+                    declared = declarator.child_by_field_name("type")
+                known, fake = _typed_fake(declared, reader, fakes)
+                if known and fake is None:
+                    continue
+                if not any(s.construction[1] for s in siblings):
+                    continue
+                if not known and _never_a_fake(declared, node, siblings, readers.repo_dir):
                     continue
             arguments = node.child_by_field_name("arguments")
             if arguments is None:
@@ -3712,9 +3673,14 @@ def _knob_settings(
             passed = [a for a in arguments.named_children if a.type != "comment"] if arguments is not None else []
             if fake is None and not passed:
                 continue  # `new()`: no argument chooses anything
+            if fake is None and not any(_could_build(s, node, passed, path) for s in siblings if s.construction[1]):
+                # `new(2026, 1, 1)` or `new(new[] { x })` builds no fake taking
+                # one `bool`, and a private nested fake is built only in its
+                # outer type.
+                continue
             value: str | None = None
             if not passed and fake is not None:
-                value = next(s.knob_default for s in fake if s.knob_primary) or None
+                value = next((s.knob_default for s in fake if s.knob_primary), None) or None
             elif len(passed) == 1 and passed[0].named_children and passed[0].named_children[-1].type == "boolean_literal":
                 value = _text(passed[0].named_children[-1])
             found.append(_Setting(node, None, value, fake, None))
@@ -3723,6 +3689,23 @@ def _knob_settings(
             if any(re.search(rf"\b{re.escape(w)}\b", text) for w in member_knobs | owners):
                 found.append(_Setting(node, None, None, None, None))
     return found
+
+
+#: Argument shapes that can never be a ``bool``.
+_NOT_BOOL = frozenset(
+    {
+        "object_creation_expression", "implicit_object_creation_expression", "array_creation_expression",
+        "implicit_array_creation_expression", "string_literal", "verbatim_string_literal", "raw_string_literal",
+        "interpolated_string_expression", "integer_literal", "real_literal", "character_literal", "null_literal",
+        "lambda_expression", "anonymous_method_expression", "anonymous_object_creation_expression",
+    }
+)
+
+
+def _not_bool(argument: Node) -> bool:
+    """Whether ``argument`` is plainly not a ``bool``, by its shape alone."""
+    value = argument.named_children[-1] if argument.type == "argument" and argument.named_children else argument
+    return value.type in _NOT_BOOL
 
 
 def _knob_scan(path: str, source: str, fakes: dict[str, tuple[wi.Sibling, ...]], repo_dir: str):
@@ -3777,6 +3760,96 @@ def knob_receivers(
     )
 
 
+def test_code_facts(
+    repo_dir: str, knobs: frozenset[str], owners: frozenset[str]
+) -> tuple[bool, frozenset[str]]:
+    """``(flippable, test types)`` over EVERY C# file of a test project in
+    the checkout, not only those naming a fake: a helper that never spells the
+    fake's type (``static void On(dynamic g) => g.Enabled = true``) can still
+    set its knob.
+
+    ``flippable``: some such file writes a member named like one of
+    ``knobs`` from where no test sees it happen -- outside every test
+    method's body, or inside a lambda, an anonymous method or a local
+    function. An object initializer builds a new object and is not one;
+    neither is a write inside one of the fakes themselves (``owners``, whose
+    knob qualification proved is written by nothing else), nor one in the
+    instance constructor of a class that holds tests, which runs before
+    each. The receiver is not resolved: any member of that name counts.
+
+    ``test types``: the simple name of every class, struct and record those
+    files declare. Handing a fake to one being constructed may store it
+    where something later sets its knob; handing it to anything else built
+    (the code under test) cannot."""
+    flippable = False
+    types: set[str] = set()
+    named = re.compile(r"\b(?:" + "|".join(re.escape(k) for k in sorted(knobs)) + r")\b") if knobs else None
+    for listed in source_index.files(repo_dir, (".cs",)):
+        path = str(listed.path)
+        if _test_project(path, repo_dir) is not True:
+            continue
+        try:
+            source = listed.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            flippable = True
+            continue
+        root = parse(source)
+        data = source.encode("utf-8")
+        for node in cross_file_keys.walk(root):
+            if node.type in ("class_declaration", "struct_declaration", "record_declaration", "record_struct_declaration"):
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    types.add(_text(name))
+        if flippable or named is None or not named.search(source):
+            continue
+        flippable = any(_unseen_knob_write(node, data, knobs, owners) for node in cross_file_keys.walk(root))
+    return flippable, frozenset(types)
+
+
+def _unseen_knob_write(node: Node, data: bytes, knobs: frozenset[str], owners: frozenset[str]) -> bool:
+    """Whether ``node`` writes a member named like a knob from where no test
+    sees it; see :func:`test_code_facts`."""
+    if node.type == "assignment_expression":
+        left = node.child_by_field_name("left")
+        targets = [left] if left is not None else []
+    elif node.type == "argument" and any(not c.is_named and _text(c) in ("ref", "out") for c in node.children):
+        targets = list(node.named_children)
+    else:
+        return False
+    written = any(
+        t.type == "member_access_expression"
+        and (name := t.child_by_field_name("name")) is not None
+        and _text(name).removeprefix("@") in knobs
+        for target in targets
+        for t in cross_file_keys.walk(target)
+    )
+    if not written:
+        return False
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type in ("lambda_expression", "anonymous_method_expression", "local_function_statement"):
+            return True
+        if ancestor.type in ("class_declaration", "struct_declaration", "record_declaration"):
+            name = ancestor.child_by_field_name("name")
+            if name is not None and _text(name) in owners:
+                return False
+        if ancestor.type == "method_declaration":
+            return mock_stubs._csharp_test(ancestor, data) is None
+        if ancestor.type == "constructor_declaration":
+            if "static" in xcs._modifiers(ancestor):
+                return True
+            holder = ancestor.parent
+            while holder is not None and holder.type not in ("class_declaration", "struct_declaration", "record_declaration"):
+                holder = holder.parent
+            body = holder.child_by_field_name("body") if holder is not None else None
+            return not any(
+                m.type == "method_declaration" and mock_stubs._csharp_test(m, data) is not None
+                for m in (body.named_children if body is not None else ())
+            )
+        ancestor = ancestor.parent
+    return True
+
+
 def knob_owners(
     path: str, source: str, fakes: dict[str, tuple[wi.Sibling, ...]], repo_dir: str
 ) -> frozenset[tuple[str, str, bool]]:
@@ -3797,7 +3870,7 @@ def knob_owners(
             and xcs._simple_name(n.child_by_field_name("type")) == group[0].owner
         ]
         if built and all(_type_full(t, reader) == full for t in built):
-            found |= {(s.owner, s.knob, s.knob_primary) for s in group}
+            found |= {(s.owner, *s.construction) for s in group}
     return frozenset(found)
 
 

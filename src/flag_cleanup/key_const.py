@@ -814,7 +814,7 @@ def _java_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool
 #: `getBooleanValue` is included but is only removable when AWAITED, which
 #: :func:`_ts_is_removable_read` checks separately -- the bare call is a
 #: `Promise<boolean>`, not a boolean, exactly as in ``ts.toml``.
-_TS_FLAG_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag", "getBooleanValue"})
+_TS_FLAG_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag", "useBooleanFlagValue", "getBooleanValue"})
 _TS_AWAITED_ONLY_CALLEES = frozenset({"getBooleanValue"})
 
 #: A reference can also be an object shorthand (`{ OLD_CHECKOUT }`), which is a

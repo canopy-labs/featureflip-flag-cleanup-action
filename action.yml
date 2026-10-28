@@ -233,6 +233,18 @@ inputs:
       README's "Wrapping the SDK".
     required: false
     default: 'true'
+  side-effect-free-modules:
+    description: >-
+      Comma-separated TypeScript or JavaScript module specifiers whose load
+      does nothing, spelled exactly as your imports spell them, such as
+      `@/lib/featureflip, ./keys`. When a removal leaves an import with
+      nothing to import, it is kept as a bare `import "…";` so the module
+      still loads, unless this tool can prove the load does nothing. A
+      specifier listed here is deleted instead, on your word: the pull request
+      names each one deleted this way. No patterns, only exact spellings.
+      Empty (the default) changes nothing.
+    required: false
+    default: ''
   languages:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
@@ -370,6 +382,7 @@ runs:
     FEATUREFLIP_LANGUAGES: ${{ inputs.languages }}
     FEATUREFLIP_ACCESSORS: ${{ inputs.accessors }}
     FEATUREFLIP_INLINE_WRAPPERS: ${{ inputs.inline-wrappers }}
+    FEATUREFLIP_SIDE_EFFECT_FREE_MODULES: ${{ inputs.side-effect-free-modules }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
     FEATUREFLIP_FLAGS: ${{ inputs.flags }}

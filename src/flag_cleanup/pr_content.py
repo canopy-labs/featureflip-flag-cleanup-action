@@ -29,8 +29,9 @@ from flag_cleanup.cross_file_keys import (
     LEFT_COMPETING,
     NAME_NOT_UNIQUE,
 )
-from flag_cleanup.mock_stubs import PINNED_PARAMETER, SIBLING_TEST, TEST, TEST_PHASE
+from flag_cleanup.mock_stubs import PINNED_PARAMETER, REBUILT, SIBLING_TEST, TEST, TEST_PHASE, TEST_ROWS
 from flag_cleanup.residue import Residue
+from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 from flag_cleanup.urls import without_userinfo
 
@@ -178,11 +179,36 @@ REPORTED_BINDING_KINDS = frozenset(
         "dropped default argument",
         "removed comment",
         stale_comments.REMOVED_BRANCH_KIND,
+        stale_comments.KEPT_BRANCH_KIND,
         stale_comments.FLAG_STATE_KIND,
         RENAMED_TEST,
         REMOVED_DEFAULT,
+        DECLARED_LOAD,
     }
 )
+
+
+def _declared_load_lines(declared: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each import deleted on the customer's
+    ``side-effect-free-modules`` input, or nothing."""
+    if not declared:
+        return []
+    count = len(declared)
+    return [
+        f"> **ℹ️ {count} import{' was' if count == 1 else 's were'} deleted on "
+        "your `side-effect-free-modules` input.** The removal left "
+        f"{'it' if count == 1 else 'each'} with nothing to import, and it would "
+        "have stayed as a bare import for its module load. You listed that "
+        "module as one whose load does nothing, so it went; nothing here proved "
+        "it. Restore the line if the module does work when it loads:",
+        ">",
+        *[
+            f"> - {_md_code(path)}: {_md_code(specifier)} is listed in `side-effect-free-modules`"
+            for path, specifier in declared[:20]
+        ],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
 
 
 def _bare_import_lines(bare_imports: list[tuple[str, str]]) -> list[str]:
@@ -583,12 +609,17 @@ def _state_rows(bindings, kind: str) -> list[tuple[str, int, str]]:
 
 
 def _flag_state_comment_lines(
-    removed: list[tuple[str, int, str]], near: list[tuple[str, int, str]], deleted: str
+    removed: list[tuple[str, int, str]],
+    kept_rows: list[tuple[str, int, str]],
+    near: list[tuple[str, int, str]],
+    deleted: str,
+    kept: str,
 ) -> list[str]:
     """The callouts naming each comment that describes the flag's state:
     first those describing the branch this pull request deleted, then those
-    beside its changes that describe some flag's state without naming this
-    one. Nothing, when there are none. Comments are never edited for this."""
+    describing the branch it kept, then those beside its changes that
+    describe some flag's state without naming this one. Nothing, when there
+    are none. Comments are never edited for this."""
 
     def items(rows: list[tuple[str, int, str]]) -> list[str]:
         return [
@@ -609,6 +640,20 @@ def _flag_state_comment_lines(
             f"{'it' if count == 1 else 'each'}:",
             ">",
             *items(removed),
+            "",
+        ]
+    if kept_rows:
+        count = len(kept_rows)
+        noun = "comment describes" if count == 1 else "comments describe"
+        lines += [
+            f"> **ℹ️ {count} {noun} the flag as **{kept}**, the branch this pull "
+            "request kept; that is now unconditional.** The code "
+            f"{'it describes' if count == 1 else 'they describe'} no longer depends "
+            "on the flag, so a qualifier like \"only while the flag is "
+            f"{kept}\" no longer holds. Comments are never edited by this tool; "
+            f"reword {'it' if count == 1 else 'each'}:",
+            ">",
+            *items(kept_rows),
             "",
         ]
     if near:
@@ -872,6 +917,7 @@ def pr_body(
         set(stubbed_paths)
         | set(residue.comment_only)
         | set(residue.title_only)
+        | set(residue.path_only)
         | set(held_paths)
     )
     generic = tuple(path for path in unprocessed if path not in sorted_out)
@@ -923,10 +969,18 @@ def pr_body(
         for row in residue.comment_lines
         if stale_comments.describes_removed(row[2], candidate.key, candidate.treatment)
     ]
+    kept_branch = [
+        row
+        for row in residue.comment_lines
+        if row not in removed_branch
+        and stale_comments.describes_kept(row[2], candidate.key, candidate.treatment)
+    ]
     lines += _flag_state_comment_lines(
         removed_branch + _state_rows(bindings, stale_comments.REMOVED_BRANCH_KIND),
+        kept_branch + _state_rows(bindings, stale_comments.KEPT_BRANCH_KIND),
         _state_rows(bindings, stale_comments.FLAG_STATE_KIND),
         deleted,
+        kept,
     )
     if residue.comment_only:
         shown = residue.comment_only[:20]
@@ -934,7 +988,7 @@ def pr_body(
         # sentence to fix here rather than searching for it.
         named: dict[str, list[tuple[int, str]]] = {}
         for path, line, text in residue.comment_lines:
-            if (path, line, text) in removed_branch:
+            if (path, line, text) in removed_branch or (path, line, text) in kept_branch:
                 continue
             named.setdefault(path, []).append((line, text))
         lines += [
@@ -971,6 +1025,39 @@ def pr_body(
             *(
                 [f"> - ...and {len(residue.title_only) - len(shown)} more"]
                 if len(residue.title_only) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.path_only:
+        shown = residue.path_only[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.path_only)} file(s) name this flag's key only "
+            "as a URL path segment** (`/…/key`), and perhaps in comments. That "
+            "is usually an endpoint named after the feature rather than a flag "
+            "read, so they were left alone; look again only if your code "
+            "fetches flags by URL:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.path_only) - len(shown)} more"]
+                if len(residue.path_only) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.outside:
+        shown = residue.outside[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.outside)} file(s) outside the swept directories "
+            "also name this flag; not examined.** This run reads and rewrites only "
+            f"{_md_cell(', '.join(_md_code(d) for d in config.directories))}, so "
+            "these were left exactly as they are:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.outside) - len(shown)} more"]
+                if len(residue.outside) > len(shown)
                 else []
             ),
             "",
@@ -1046,6 +1133,7 @@ def pr_body(
             "",
         ]
     bare_imports = [(path, text) for path, kind, text in bindings if kind == "bare import"]
+    declared_loads = [(path, text) for path, kind, text in bindings if kind == DECLARED_LOAD]
     marked_imports = [
         (path, text) for path, kind, text in bindings if kind == "marked import"
     ]
@@ -1098,6 +1186,7 @@ def pr_body(
     lines += _dropped_argument_lines(dropped_arguments)
     lines += _emptied_override_lines(emptied)
     lines += _removed_comment_lines(removed_comments)
+    lines += _declared_load_lines(declared_loads)
     lines += _bare_import_lines(bare_imports)
     lines += _marked_import_lines(marked_imports)
     lines += _module_marker_lines(module_markers)
@@ -1192,6 +1281,8 @@ def pr_body(
     sibling_tests = [(path, text) for path, kind, text in test_doubles if kind == SIBLING_TEST]
     pinned = [(path, text) for path, kind, text in test_doubles if kind == PINNED_PARAMETER]
     phases = [(path, text) for path, kind, text in test_doubles if kind == TEST_PHASE]
+    rows = [(path, text) for path, kind, text in test_doubles if kind == TEST_ROWS]
+    rebuilt = [(path, text) for path, kind, text in test_doubles if kind == REBUILT]
     mock_lines = [
         (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
     ]
@@ -1225,6 +1316,33 @@ def pr_body(
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in sibling_tests[:20]
             ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if rows:
+        count = len(rows)
+        noun = "parameterised test lost rows" if count == 1 else "parameterised tests lost rows"
+        lines += [
+            f"> **⚠️ {count} {noun}.** Each `[InlineData]` row removed passed "
+            f"`{'false' if candidate.treatment else 'true'}` — the **{deleted}** branch — "
+            "to a test helper whose parameter chose the flag's stubbed value. The "
+            "rows left no longer pass it, and the parameter is gone:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in rows[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if rebuilt:
+        count = len(rebuilt)
+        noun = "test now runs" if count == 1 else "tests now run"
+        lines += [
+            f"> **⚠️ {count} {noun} with the kept value: review them.** Each built a test fake "
+            f"with `{'false' if candidate.treatment else 'true'}` — the **{deleted}** branch — through a "
+            "public test helper that other files call, often as a neutral baseline. Nothing was "
+            "deleted: the helper's parameter is gone and the fake is built with the kept value, so a "
+            "test that asserted on the removed behaviour may now fail:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in rebuilt[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -1406,9 +1524,9 @@ _WRAPPER_STATUSES = ("complete", "partial")
 #: wrapper, a doc comment's reference to it rewritten to plain text, and what
 #: the C# residue pass did with what the family left behind. Grouped with
 #: the refusals, and told apart from them on rendering.
-_WRAPPER_NOTES = ("sibling", "doc-reference", "residue", "residue-kept", "residue-prose")
+_WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-prose")
 #: Test-double removal kinds that are not a mock line.
-_NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE)
+_NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT)
 
 
 def _by_wrapper(
@@ -1538,6 +1656,13 @@ def _residue_lines(notes: list[tuple[str, int, str, str, str]]) -> list[str]:
     if siblings:
         lines.append(">   Sibling implementations, each deleted with it:")
         lines += listed(siblings)
+    shared = [r for r in notes if r[2] == "shared"]
+    if shared:
+        lines.append(
+            ">   Implementations that also serve another interface, left as they are "
+            "(they already returned the value that stays):"
+        )
+        lines += listed(shared)
     documented = [r for r in notes if r[2] == "doc-reference"]
     if documented:
         lines.append(">   Doc comments that referred to it, now plain text (check the prose around each still holds):")
@@ -1737,6 +1862,7 @@ def note_flag_state_comments(bindings: tuple[tuple[str, str, str], ...]) -> None
     dry run's only outlet. Nothing was edited for them."""
     for kind, what in (
         (stale_comments.REMOVED_BRANCH_KIND, "describe behaviour this run removed"),
+        (stale_comments.KEPT_BRANCH_KIND, "describe the branch this run kept, now unconditional"),
         (stale_comments.FLAG_STATE_KIND, "beside the changes describe a flag's state"),
     ):
         rows = [f"{path}:{text}" for path, row_kind, text in bindings if row_kind == kind]
@@ -1799,6 +1925,23 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     sibling_tests = [(p, t) for p, kind, t in test_doubles if kind == SIBLING_TEST]
     pinned = [(p, t) for p, kind, t in test_doubles if kind == PINNED_PARAMETER]
     phases = [(p, t) for p, kind, t in test_doubles if kind == TEST_PHASE]
+    rows = [(p, t) for p, kind, t in test_doubles if kind == TEST_ROWS]
+    rebuilt = [(p, t) for p, kind, t in test_doubles if kind == REBUILT]
+    if rebuilt:
+        logger.warning(
+            "%d test%s now run%s with the kept value through a public test helper; review: %s",
+            len(rebuilt),
+            "" if len(rebuilt) == 1 else "s",
+            "s" if len(rebuilt) == 1 else "",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in rebuilt),
+        )
+    if rows:
+        logger.warning(
+            "%d parameterised test%s lost rows of the removed value: %s",
+            len(rows),
+            "" if len(rows) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in rows),
+        )
     if phases:
         logger.warning(
             "%d test phase%s deleted, each run with a fake at the removed value: %s",

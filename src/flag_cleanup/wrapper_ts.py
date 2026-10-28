@@ -60,7 +60,7 @@ MENTION_TYPES = frozenset(
 #: The text of a string or of a template literal outside its ``${}`` holes:
 #: a mention there is reflection, a spy's member name, or a route.
 _STRINGS = frozenset({"string_fragment"})
-_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag"})
+_READ_CALLEES = frozenset({"boolVariation", "useFeatureFlag", "useBooleanFlagValue"})
 _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
 
 

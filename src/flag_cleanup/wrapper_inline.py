@@ -151,6 +151,8 @@ PARTIAL = "partial"
 #: An inert sibling whose member went with a complete wrapper: what it
 #: returned, and the value its callers now see.
 SIBLING = "sibling"
+#: A complete wrapper's note: a shared fake kept its member (:class:`SharedFake`).
+SHARED = "shared"
 #: A doc comment's reference to the member of a complete wrapper, rewritten
 #: to plain text: what it says now, for the reviewer to check the prose.
 DOC_REFERENCE = "doc-reference"
@@ -202,14 +204,56 @@ class Sibling:
     #: ``new Owner(<value>)``; otherwise a member, set as ``x.Knob = <value>``
     #: or ``new Owner { Knob = <value> }``.
     knob_primary: bool = False
+    #: For a member knob, the parameter of the type's one constructor that
+    #: writes it and nothing else (``Stub(bool enabled) => Enabled = enabled;``),
+    #: so every construction sets it too, as ``new Owner(<value>)``. ``None``
+    #: when no constructor writes it.
+    knob_parameter: str | None = None
     #: The type's dotted name inside its namespace when it is nested in
     #: another (``Outer.Owner``); ``None`` for a top-level type.
     chain: str | None = None
+    #: For a primary-constructor knob, how many arguments a construction
+    #: passes: ``(fewest, most)``, the fewest leaving out each defaulted one.
+    primary_arity: tuple[int, int] | None = None
+    #: For a primary-constructor knob, its parameter's position.
+    primary_knob_index: int | None = None
 
     @property
     def type_chain(self) -> str:
         """The type's name inside its namespace, outer types included."""
         return self.chain or self.owner
+
+    @property
+    def construction(self) -> tuple[str, bool]:
+        """``(name, positional)``: what a construction of this fake sets its
+        knob through. Positional for a primary constructor's parameter or the
+        constructor parameter that writes a member knob, named by that
+        parameter; otherwise the member, set in an initializer."""
+        if self.knob_parameter is not None:
+            return self.knob_parameter, True
+        return self.knob or "", self.knob_primary
+
+
+@dataclass(frozen=True)
+class SharedFake:
+    """An implementation of the wrapper's interface whose member also
+    implements another supertype's (a test harness's one always-on fake for
+    several gates). Its member returns a literal and stays: only a call
+    through the wrapper's interface reached it as this member, and that goes
+    with the interface's member. Not a family type: a read through it binds
+    the member it keeps."""
+
+    path: str
+    owner: str
+    namespace: str
+    #: 1-based line of its member.
+    line: int
+    #: The literal the member returns.
+    returns: str
+    #: The other supertypes declaring the member, by name.
+    serves: tuple[str, ...]
+    #: Its dotted name inside its namespace when nested; ``None`` at top level.
+    chain: str | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +277,8 @@ class Wrapper:
     static: bool = False
     interface: InterfaceMember | None = None
     siblings: tuple[Sibling, ...] = ()
+    #: Implementations whose member stays for another supertype.
+    shared: tuple[SharedFake, ...] = ()
     #: Simple names of the annotations on the declaration.
     annotations: tuple[str, ...] = ()
     #: ``method``, ``property`` (a Kotlin getter, read with no call),
@@ -566,10 +612,20 @@ def qualify_all(
         fixed = (
             [s for s in member.siblings if _fixed_at_removed_value(s, treatment)] if treatment is not None else []
         )
-        if fixed:
+        # A shared fake keeps returning its literal for every interface it
+        # serves, so it must already return the value that stays.
+        held = [s for s in member.shared if treatment is not None and s.returns != ("true" if treatment else "false")]
+        if fixed or held:
             findings += [
                 Finding(s.path, s.line, SIBLING_NOT_INERT, f"{s.owner} returns `{s.returns}`", wrapper.label)
-                for s in fixed
+                for s in (*fixed, *held)
+            ]
+            continue
+        if treatment is None and member.shared:
+            # Which value stays is unknown, so no shared fake can be judged.
+            findings += [
+                Finding(s.path, s.line, SIBLING_NOT_INERT, f"{s.owner} returns `{s.returns}`", wrapper.label)
+                for s in member.shared
             ]
             continue
         qualified.append((member, index))
@@ -708,16 +764,21 @@ def sibling_receivers(
 
 def fake_settings(
     language: str, qualified: list[tuple[Wrapper, wrapper_jvm.Index]]
-) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[tuple[str, str, bool]]], frozenset[str]]:
-    """C#: ``(path -> knob receivers, path -> fake owners, test paths)`` for
-    the test-double pass: the receivers proven typed as a test fake and
-    written through its knob, the fakes whose simple name is proven to mean
-    them where they are built, and the files of a test project, where those
-    and helper pins may be resolved. Judged against every qualified
-    wrapper's fakes at once, since the pass matches every knob name of the
-    run on every receiver it is given."""
+) -> tuple[
+    dict[str, frozenset[str]], dict[str, frozenset[tuple[str, str, bool]]], frozenset[str], frozenset[str], frozenset[str]
+]:
+    """C#: ``(path -> knob receivers, path -> fake owners, test paths,
+    flippable owners, test types)`` for the test-double pass: the receivers
+    proven typed as a test fake and written through its knob, the fakes
+    whose simple name is proven to mean them where they are built, the files
+    of a test project, where those and helper pins may be resolved, every
+    fake when some test code may write a knob where no test sees it, and the
+    types test projects declare
+    (:func:`flag_cleanup.wrapper_csharp.test_code_facts`). Judged against
+    every qualified wrapper's fakes at once, since the pass matches every
+    knob name of the run on every receiver it is given."""
     if language != "csharp":
-        return {}, {}, frozenset()
+        return {}, {}, frozenset(), frozenset(), frozenset()
     from flag_cleanup import wrapper_csharp
 
     fakes = wrapper_csharp.fakes_of(w for w, _ in qualified)
@@ -739,7 +800,12 @@ def fake_settings(
         built = wrapper_csharp.knob_owners(path, source, fakes, repo_dir)
         if built:
             owners[path] = built
-    return receivers, owners, frozenset(tests)
+    if not fakes:
+        return receivers, owners, frozenset(tests), frozenset(), frozenset()
+    every = frozenset(s.owner for group in fakes.values() for s in group)
+    knobs = frozenset(s.knob for group in fakes.values() for s in group if s.knob and not s.knob_primary)
+    flippable, types = wrapper_csharp.test_code_facts(repo_dir, knobs, every)
+    return receivers, owners, frozenset(tests), every if flippable else frozenset(), types
 
 
 def _foreign_lines(path: str, name: str) -> list[tuple[int, str]]:
@@ -1422,6 +1488,14 @@ def close_out(
                     extra += [
                         Finding(s.path, s.line, SIBLING, _sibling_note(s, wrapper.name, value), wrapper.label)
                         for s in wrapper.siblings
+                    ]
+                    extra += [
+                        Finding(
+                            s.path, s.line, SHARED,
+                            f"{s.owner} keeps `{wrapper.name} => {s.returns}` for {', '.join(s.serves)}",
+                            wrapper.label,
+                        )
+                        for s in wrapper.shared
                     ]
                     extra += [
                         Finding(p, n, DOC_REFERENCE, t, wrapper.label)
