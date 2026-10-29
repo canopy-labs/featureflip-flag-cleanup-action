@@ -75,6 +75,19 @@ class RemovalPrPermissionError(FeatureflipApiError):
     """
 
 
+class ArchiveReadOnlyError(ArchivePermissionError):
+    """A 403 ``organization_read_only`` from the archive endpoint."""
+
+
+class OrganizationReadOnlyError(RemovalPrPermissionError):
+    """A 403 ``organization_read_only``: the org is over its plan's limits.
+
+    A subclass of :class:`RemovalPrPermissionError` so the caller stops linking
+    for the run (every later write is refused the same way), but reported on its
+    own because the token is fine and the remedy is in Featureflip.
+    """
+
+
 #: The one archive refusal that resolves with nobody doing anything: the code
 #: merged, the deploy has not landed yet, and traffic drains on its own. Every
 #: other 400 — ``FLAG_HAS_DEPENDENTS``, ``FLAG_HAS_PENDING_SCHEDULES`` — needs
@@ -227,6 +240,26 @@ _REMOVAL_CANDIDATES_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/removal-
 _FLAGS_PATH = "/api/v1/orgs/{org}/projects/{project}/flags"
 _ARCHIVE_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/{flag}/archive"
 _REMOVAL_PR_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/{flag}/removal-pr"
+
+
+READ_ONLY_CODE = "organization_read_only"
+
+READ_ONLY_MESSAGE = (
+    "Your Featureflip organization is read-only because it's over its plan's "
+    "limits, so removal PRs weren't linked to their flags. Clean up or choose "
+    "a plan in Featureflip."
+)
+
+
+def _is_read_only_refusal(response: httpx.Response) -> bool:
+    """True for a 403 whose error envelope carries ``organization_read_only``."""
+    if response.status_code != 403:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") == READ_ONLY_CODE
 
 
 def _envelope_detail(response: httpx.Response) -> str:
@@ -763,6 +796,12 @@ class FeatureflipClient:
                 f"flag no longer exists, or FEATUREFLIP_ORG/FEATUREFLIP_PROJECT "
                 f"do not name the project it lives in.{suffix}"
             )
+        if _is_read_only_refusal(response):
+            raise ArchiveReadOnlyError(
+                f"Featureflip refused to archive flag {key!r}. Your Featureflip "
+                f"organization is read-only because it's over its plan's limits. "
+                f"Clean up or choose a plan in Featureflip."
+            )
         if response.status_code in (401, 403):
             raise ArchivePermissionError(
                 f"Featureflip API returned {response.status_code} archiving flag "
@@ -817,6 +856,8 @@ class FeatureflipClient:
 
         detail = _envelope_detail(response)
         suffix = f" {detail}" if detail else ""
+        if _is_read_only_refusal(response):
+            raise OrganizationReadOnlyError(READ_ONLY_MESSAGE)
         if response.status_code in (401, 403):
             raise RemovalPrPermissionError(
                 f"Featureflip API returned {response.status_code} recording the pull "

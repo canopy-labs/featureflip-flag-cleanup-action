@@ -7,6 +7,15 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.18.1
+
+### Fixed
+
+- A Featureflip organization that is read-only because it is over its plan's
+  limits is no longer reported as a token problem. When linking a removal PR
+  to its flag is refused for that reason, the run says so once, stops trying to
+  link for the rest of the run, and the PRs open as usual.
+
 ## 1.18.0
 
 ### Fixed

@@ -89,6 +89,7 @@ from flag_cleanup.client import (
     Candidate,
     FeatureflipApiError,
     FeatureflipClient,
+    OrganizationReadOnlyError,
     RemovalPrPermissionError,
 )
 from flag_cleanup.config import Config
@@ -329,6 +330,9 @@ class _RemovalPrReporter:
             return
         try:
             self._client.set_removal_pr(self._org, self._project, result.key, result.pr_url)
+        except OrganizationReadOnlyError as exc:
+            self._enabled = False
+            logger.warning("%s", exc)
         except RemovalPrPermissionError as exc:
             self._enabled = False
             logger.warning(

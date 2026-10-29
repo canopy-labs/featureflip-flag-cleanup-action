@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from flag_cleanup.archive import ArchiveResult, deferred_detail, dependents_deferred_detail
 from flag_cleanup.client import (
     ArchivePermissionError,
+    ArchiveReadOnlyError,
     FeatureflipApiError,
     FeatureflipClient,
     FlagHasDependentsError,
@@ -466,6 +467,20 @@ def archive_outstanding(
                 )
             )
             continue
+        except ArchiveReadOnlyError as exc:
+            # The org, not the token: every later archive is refused too.
+            results.append(
+                ArchiveResult(
+                    action_taken="failed",
+                    detail=(
+                        f"{exc} Stopping here: the organization is read-only, so "
+                        f"every remaining outstanding archive would be refused too."
+                    ),
+                    key=candidate.key,
+                    pull_request=candidate.pull_request,
+                )
+            )
+            break
         except ArchivePermissionError as exc:
             # Not this flag's problem — the token cannot archive anything, so
             # every remaining candidate would fail identically. Reported as a
