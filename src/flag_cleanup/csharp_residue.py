@@ -3289,9 +3289,10 @@ def _knob(sibling, targets: list[Target], repo_dir: str) -> tuple[str, str] | No
     return (type_name, parts[1]) if type_name is not None else None
 
 
-def _section_of(value: Node | None, consts: dict[str, str], options: str) -> str | None:
+def _section_of(value: Node | None, consts: dict[str, str], options: str, full: str = "") -> str | None:
     """The section a binder argument names: ``"Gate"``, or ``O.SectionName``
-    for a string constant of the options class."""
+    (``Ns.O.SectionName`` too, qualified by a tail of the class's full name
+    ``full``) for a string constant of the options class."""
     if value is None:
         return None
     if value.type == "string_literal" and not any(c.type == "interpolation" for c in value.children):
@@ -3299,13 +3300,21 @@ def _section_of(value: Node | None, consts: dict[str, str], options: str) -> str
     if value.type == "member_access_expression":
         receiver = value.child_by_field_name("expression")
         name = value.child_by_field_name("name")
-        if receiver is not None and name is not None and _text(receiver) == options:
+        if receiver is not None and name is not None and _names_options(receiver, options, full):
             return consts.get(_text(name))
     return None
 
 
+def _names_options(spelled: Node, options: str, full: str) -> bool:
+    """Whether ``spelled`` is ``O`` or a qualified tail of its full name
+    (``Webhooks.O`` for ``App.Webhooks.O``, ``global::`` allowed)."""
+    text = "".join(_text(spelled).split()).removeprefix("global::")
+    return text == options or (bool(full) and text.endswith("." + options) and (full == text or full.endswith("." + text)))
+
+
 def _binding(
-    node: Node, options: str, consts: dict[str, str], rooted: Callable[[Node], bool] = lambda _: False
+    node: Node, options: str, consts: dict[str, str], rooted: Callable[[Node], bool] = lambda _: False,
+    full: str = "", section_local: Callable[[Node], Node | str | None] | None = None,
 ) -> tuple[Node, str, str] | str | None:
     """``(statement, text, section)`` when a spelling of the options class is
     the type argument of a statement binding it to a section; why not, when
@@ -3337,8 +3346,13 @@ def _binding(
         if len(values) != 1 or values[0] is None:
             return None
         if method == "BindConfiguration":
-            return _section_of(values[0], consts, options)
+            return _section_of(values[0], consts, options, full)
         value = values[0]
+        if value.type == "identifier" and section_local is not None:
+            held = section_local(value)
+            if isinstance(held, str):
+                raise _Unrooted(held, "local")
+            value = held if held is not None else value
         if value.type != "invocation_expression":
             return None
         config, getter, _ = _call_name(value)
@@ -3350,11 +3364,13 @@ def _binding(
             raise _Unrooted(_text(config))
         if len(inner_items) != 1:
             return None
-        return _section_of(ctor_param_csharp._expression(inner_items[0]), consts, options)
+        return _section_of(ctor_param_csharp._expression(inner_items[0]), consts, options, full)
 
     try:
         return _bound_section(statement, text, name, chained, invocation, section_argument)
     except _Unrooted as unrooted:
+        if unrooted.args[1:] == ("local",):
+            return f"{unrooted.args[0]} ({text[:60]})"
         return (
             f"the binding reads a section of {unrooted.args[0]}, which is not proven to be the "
             f"configuration root ({text[:60]})"
@@ -3695,6 +3711,85 @@ def _rooted(repo_dir: str) -> Callable[[Node], bool]:
         return calls > 0
 
     return rooted
+
+
+#: Declared types a section local may be written with.
+_SECTION_TYPES = frozenset({"IConfigurationSection", "IConfiguration"})
+
+
+def _section_local(identifier: Node, knob: str, repo_dir: str) -> Node | str | None:
+    """The initializer of the local ``identifier`` names, when the binder is
+    handed a section held in one: ``var s = configuration.GetSection(…);``
+    declared once, before the binding in an enclosing block, and every other
+    use of it reads a subsection of another name (``s.GetSection(nameof(
+    O.Other))``, ``s.GetSection("Other")``), whose key the removal leaves
+    alone. Why not, as a string; None when no such local is declared."""
+    name = _text(identifier)
+    function = _enclosing(identifier, _SCOPES | {"lambda_expression", "anonymous_method_expression"})
+    if function is None:
+        return None
+    declared = [
+        d for d in _walk(function)
+        if d.type == "variable_declarator" and ctor_param_csharp._declarator_name(d) == name
+    ]
+    if len(declared) != 1:
+        return None if not declared else f"the section {name} is declared more than once"
+    declarator = declared[0]
+    declaration = declarator.parent
+    statement = declaration.parent if declaration is not None else None
+    if (
+        declaration is None or declaration.type != "variable_declaration" or len(_declarators(declaration)) != 1
+        or statement is None or statement.type != "local_declaration_statement"
+        or not any(statement.parent == a for a in _ancestors(identifier))
+    ):
+        return f"the section {name} is not a local this pass can follow"
+    kind = declaration.child_by_field_name("type")
+    if kind is None or not (kind.type == "implicit_type" or _text(kind).split(".")[-1] in _SECTION_TYPES):
+        return f"the section {name} is not a local this pass can follow"
+    value = _initial_value(declarator)
+    if value is None:
+        return f"the section {name} has no initializer"
+    for use in _walk(function):
+        if use.type != "identifier" or _text(use) != name or use == identifier:
+            continue
+        if use.parent == declarator and declarator.child_by_field_name("name") == use:
+            continue
+        if not _other_subsection(use, knob, repo_dir):
+            return f"the section {name} is used in a way this pass cannot follow (line {use.start_point[0] + 1})"
+    return value
+
+
+def _ancestors(node: Node):
+    current = node.parent
+    while current is not None:
+        yield current
+        current = current.parent
+
+
+def _other_subsection(use: Node, knob: str, repo_dir: str) -> bool:
+    """``s.GetSection("Other")`` or ``s.GetSection(nameof(O.Other))``, the
+    key's first segment not the ``knob`` (configuration ignores case)."""
+    access = use.parent
+    if access is None or access.type != "member_access_expression" or access.child_by_field_name("expression") != use:
+        return False
+    member = access.child_by_field_name("name")
+    call = access.parent
+    if member is None or _text(member) != "GetSection" or call is None or call.type != "invocation_expression":
+        return False
+    items = ctor_param_csharp._items(call.child_by_field_name("arguments"))
+    values = [ctor_param_csharp._expression(a) for a in items]
+    if len(values) != 1 or values[0] is None:
+        return False
+    value = values[0]
+    if value.type == "string_literal" and not any(c.type == "interpolation" for c in value.children):
+        key = ctor_param_csharp._literal(value) or ""
+    else:
+        from flag_cleanup import csharp_family
+
+        if csharp_family.declares_nameof(repo_dir):
+            return False  # a method of yours named nameof may return anything
+        key = csharp_family.nameof_value(value) or ""
+    return bool(key) and key.split(":")[0].lower() != knob.lower()
 
 
 class _Unrooted(Exception):
@@ -4113,7 +4208,10 @@ def _options_property(
     for spelled in _scan(frozenset({name}), repo_dir, scratch):
         current = _read(spelled)
         for node_ in _spellings(current, frozenset({name})):
-            bound = _binding(node_, name, consts, _rooted(repo_dir))
+            bound = _binding(
+                node_, name, consts, _rooted(repo_dir), full=full,
+                section_local=lambda held: _section_local(held, knob, repo_dir),
+            )
             if isinstance(bound, str):
                 raise Kept(_rel(spelled, repo_dir), node_.start_point[0] + 1, bound)
             if bound is not None:
@@ -4141,7 +4239,7 @@ def _options_property(
     own_span = ctor_param_csharp.declaration_span(node, file.data[file.offset :])
     _flows_only_into_reads(
         name, properties, {path: [(own_span[0] + file.offset, own_span[1] + file.offset)]}, covered, consts, repo_dir,
-        residue.delete,
+        residue.delete, full=full,
     )
     options = _Options(name, [])
     options.spans.setdefault(path, []).append((*span, "member"))
@@ -4239,6 +4337,7 @@ def _flows_only_into_reads(
     consts: dict[str, str],
     repo_dir: str,
     deleted: set[str] = frozenset(),
+    full: str = "",
 ) -> None:
     """Raise :class:`Kept` unless every value of the options class is only
     ever read for one of its other ``properties``: each spelling of the
@@ -4259,17 +4358,52 @@ def _flows_only_into_reads(
             at = node.start_byte + current.offset
             if _inside(skip, at):
                 continue
-            if _binding(node, name, consts) is not None:
+            if _binding(node, name, consts, full=full) is not None:
                 continue
-            parent = node.parent
+            # `Ns.O`, qualified by a tail of the class's full name, is the
+            # class as much as `O` is.
+            head = node
+            if (
+                node.parent is not None
+                and node.parent.type in ("member_access_expression", "qualified_name")
+                and node.parent.child_by_field_name("name") == node
+                and _names_options(node.parent, name, full)
+            ):
+                head = node.parent
+            parent = head.parent
             if (
                 parent is not None
                 and parent.type == "member_access_expression"
-                and parent.child_by_field_name("expression") == node
+                and parent.child_by_field_name("expression") == head
                 and (member := parent.child_by_field_name("name")) is not None
                 and _text(member) in consts
             ):
                 continue  # `O.SectionName`: a constant, no value of the class
+            if (
+                parent is not None
+                and parent.type == "member_access_expression"
+                and parent.child_by_field_name("expression") == head
+                and (member := parent.child_by_field_name("name")) is not None
+                and _text(member) in properties
+                and _nameof_argument(parent, repo_dir)
+            ):
+                continue  # `nameof(O.Other)`: another setting's name, no value
+            configured = _configure_lambda(head, name, repo_dir)
+            if isinstance(configured, str):
+                raise Kept(where, node.start_point[0] + 1, configured)
+            if configured is not None:
+                bound, scope = configured
+                for use in (n for n in _walk(scope) if n.type == "identifier" and _text(n) == bound):
+                    if use.parent is not None and use.parent.type in ("parameter", "implicit_parameter") or (
+                        use.parent is not None and use.parent.type == "lambda_expression" and use.parent.child_by_field_name("parameters") == use
+                    ):
+                        continue
+                    if not _known_read(use, properties, False, name):
+                        raise Kept(
+                            where, use.start_point[0] + 1,
+                            f"a value of {name} flows where the removed setting may be seen ({_text(use.parent)[:50]})",
+                        )
+                continue
             if _wrapped_into_a_judged_parameter(node, name, properties, repo_dir):
                 continue
             binding = _value_binding(node)
@@ -4285,6 +4419,67 @@ def _flows_only_into_reads(
                         f"a value of {name} flows where the removed setting may be seen ({_text(use.parent)[:50]})",
                     )
 
+
+
+def _nameof_argument(access: Node, repo_dir: str) -> bool:
+    """Whether ``access`` is the whole argument of a ``nameof(…)`` that is
+    the language's (no method of yours is named ``nameof``)."""
+    from flag_cleanup import csharp_family
+
+    argument = access.parent
+    arguments = argument.parent if argument is not None and argument.type == "argument" else None
+    call = arguments.parent if arguments is not None else None
+    if call is None or csharp_family.nameof_value(call) is None:
+        return False
+    return not csharp_family.declares_nameof(repo_dir)
+
+
+#: The options library's methods that hand a configuring lambda the options
+#: value, and nothing else.
+_CONFIGURERS = frozenset({"Configure", "PostConfigure", "ConfigureAll", "PostConfigureAll"})
+
+
+def _configure_lambda(head: Node, name: str, repo_dir: str) -> tuple[str, Node] | str | None:
+    """``(parameter, lambda)`` when ``head`` is the one type argument of
+    ``services.PostConfigure<O>(o => …)`` (or ``Configure``,
+    ``ConfigureAll``, ``PostConfigureAll``) whose one argument is a lambda of
+    one parameter; why not, when a method of yours has the name; None for
+    anything else."""
+    holder = head.parent
+    generic = holder.parent if holder is not None and holder.type == "type_argument_list" else None
+    if generic is None or generic.type != "generic_name" or len(_type_arguments(generic)) != 1:
+        return None
+    method = _text(generic.named_children[0])
+    access = generic.parent
+    call = access.parent if access is not None else None
+    if (
+        method not in _CONFIGURERS
+        or access is None or access.type != "member_access_expression" or access.child_by_field_name("name") != generic
+        or call is None or call.type != "invocation_expression" or call.child_by_field_name("function") != access
+    ):
+        return None
+    receiver = access.child_by_field_name("expression")
+    items = ctor_param_csharp._items(call.child_by_field_name("arguments"))
+    values = [ctor_param_csharp._expression(a) for a in items]
+    if receiver is None or receiver.type != "identifier" or len(values) != 1 or values[0] is None or values[0].type != "lambda_expression":
+        return None
+    lambda_ = values[0]
+    parameters = lambda_.child_by_field_name("parameters")
+    if parameters is None:
+        return None
+    if parameters.type in ("identifier", "implicit_parameter"):
+        bound = _text(parameters)
+    else:
+        listed = [p for p in parameters.named_children if p.type == "parameter"]
+        if len(listed) != 1 or listed[0].child_by_field_name("name") is None:
+            return None
+        kind = listed[0].child_by_field_name("type")
+        if kind is not None and ctor_param_csharp._simple_type(kind) != name:
+            return None
+        bound = _text(listed[0].child_by_field_name("name"))
+    if _repository_methods(repo_dir, frozenset({method})) is not None:
+        return f"a method of yours named {method} may be what the call binds to"
+    return bound, lambda_
 
 
 def _wrapped_into_a_judged_parameter(node: Node, name: str, properties: set[str], repo_dir: str) -> bool:

@@ -13,7 +13,7 @@ Supported languages: **TypeScript** (`.ts`, `.mts`, `.cts`), **TSX** (`.tsx`),
 (`.dart`), **Java** (`.java`), **Go** (`.go`), **Python** (`.py`), **Kotlin**
 (`.kt`, `.kts`), **C#** (`.cs`) and **Swift** (`.swift`).
 
-> **Versioning.** `@v1` tracks the newest v1 release. It always resolves to a
+> **Versioning.** `@v2` tracks the newest v2 release. It always resolves to a
 > commit naming one exact image digest, so a run stays reproducible even though
 > the tag itself moves. Pin a released `vX.Y.Z` instead if you would rather not
 > move at all.
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -152,7 +152,7 @@ jobs:
   sweep:
     runs-on: ubuntu-latest
     steps:
-      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -316,7 +316,7 @@ jobs:
   archive:
     runs-on: ubuntu-latest
     steps:
-      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -485,7 +485,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: canopy-labs/featureflip-flag-cleanup-action@v1
+      - uses: canopy-labs/featureflip-flag-cleanup-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -628,7 +628,7 @@ still has to be hosted on GitHub, because the pull requests are opened there.
 ```yaml
 version: 2.1
 orbs:
-  featureflip: featureflip/flag-cleanup@1
+  featureflip: featureflip/flag-cleanup@2
 workflows:
   flag-cleanup:
     jobs:
@@ -782,7 +782,7 @@ dry run asks nothing, says so in its log, and previews every diff as if no pull
 request existed.
 
 Every refusal a real run can produce is reachable in a dry run and is reported
-identically — `[unsafe-key]`, `[piranha-error]` and `[unsafe-rewrite]` all
+identically — `[unsafe-key]`, `[engine-error]` and `[unsafe-rewrite]` all
 appear with the same label and the same exit code. That is what makes the dry
 run worth reading: it cannot approve a flag that the next real run turns down.
 `[blocked]` is too, though a dry run never puts an open pull request on hold.
@@ -860,7 +860,7 @@ would claim it had.
     too long once escaped), or holds characters the rewrite rules cannot search
     for safely (anything outside `A-Z a-z 0-9 - _`; see "Flag keys" below).
     Rename the flag, or add the key to `ignore`.
-  - `[piranha-error]` — the transform engine rejected its own rewrite (its
+  - `[engine-error]` — the transform engine rejected its own rewrite (its
     syntax self-check, or its check for a reserved word left where a name
     belongs). Nothing was written. Please report it.
   - `[unsafe-rewrite]` — the rewrite of one or more files did not survive the
@@ -2623,7 +2623,13 @@ or not at all:
   configuration.GetSection("Gate"))`, `AddOptions<T>().Bind(…)` or
   `.BindConfiguration(…)`), or, when the class holds other settings, only that
   property; and the `Gate:Enabled` key in each `appsettings*.json` of a project
-  that loads the binding. The edit keeps the file's comments and commas;
+  that loads the binding. When the class holds other settings, its binding
+  may also hand over a section held in a local (`var section =
+  configuration.GetSection(GateOptions.SectionName);`) that is used besides
+  only to read subsections of other names (`section.GetSection(nameof(
+  GateOptions.Other))`), and a `services.PostConfigure<GateOptions>(o => …)`
+  may set or read the other settings. Names qualified by the class's
+  namespace (`Options.GateOptions.SectionName`) count as the class. The edit keeps the file's comments and commas;
 - each `using` of a namespace these deletions leave empty.
 
 Every mention of each deleted type is looked for by text in every file of the
@@ -5767,7 +5773,7 @@ means no PR.
   the rest of the flag's files are still cleaned, and the pull request lists them
   under "still reference this flag" so nobody merges it
   believing the flag is gone. Only when *every* candidate file is unparseable
-  does the flag report `[piranha-error]` and exit `1`. Confirmed cases: a
+  does the flag report `[engine-error]` and exit `1`. Confirmed cases: a
   type-level `import()` inside type arguments
   (`importOriginal<typeof import('./x')>()`), and JSX in a `.ts` file — the
   latter correctly, since `tsc` rejects it too. TC39 auto-accessors
@@ -5778,7 +5784,7 @@ means no PR.
   cannot *read*. Any other engine abort comes after it read the file — its
   syntax self-check or another check rejecting the rewrite it produced — so the
   source is fine and the rewrite is not, and the whole flag reports
-  `[piranha-error]` and exits `1`, naming that file.
+  `[engine-error]` and exits `1`, naming that file.
 * **A Go `vendor/` tree is never rewritten.** It is third-party source the
   toolchain owns: `go mod vendor` regenerates it, so a cleanup committed there
   is reverted on the next sync while `go build -mod=vendor` complains in

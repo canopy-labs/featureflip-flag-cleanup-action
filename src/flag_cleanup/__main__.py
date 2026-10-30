@@ -132,7 +132,7 @@ logger = logging.getLogger(__name__)
 #: Outcomes that mean "this flag was not proposed and will not be until
 #: something changes". Every one of them turns the build red — see the module
 #: docstring for why ``no-changes`` is not among them.
-UNPROPOSABLE_ACTIONS = ("failed", "unsafe-key", "piranha-error", "unsafe-rewrite")
+UNPROPOSABLE_ACTIONS = ("failed", "unsafe-key", "engine-error", "unsafe-rewrite")
 
 #: A GitHub workflow command, so the notice becomes an annotation on the run
 #: rather than one line in a green log nobody opens. Must stay on ONE line and
@@ -149,9 +149,34 @@ ARCHIVE_ON_MERGE_DEPRECATION = (
 )
 
 
+#: The logger name the transform engine's records carry in the job log.
+ENGINE_LOGGER_LABEL = "featureflip.engine"
+
+#: The name the engine logs under. It is the engine's Rust crate name, which
+#: pyo3-log turns into the Python logger name, so it cannot be set from here.
+_ENGINE_LOGGER = "polyglot_piranha"
+
+
+def _label_engine_records(record: logging.LogRecord) -> bool:
+    """Show the engine's records under ``ENGINE_LOGGER_LABEL``.
+
+    A handler filter, not a logger one: a filter on root never sees records
+    that propagate up from a child logger, and the engine logs on its own
+    logger. Only the displayed name changes; the record's level, and every
+    ``getLogger(_ENGINE_LOGGER)`` that sets one, are untouched.
+    """
+    if record.name == _ENGINE_LOGGER or record.name.startswith(_ENGINE_LOGGER + "."):
+        record.name = ENGINE_LOGGER_LABEL + record.name[len(_ENGINE_LOGGER) :]
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     del argv  # no CLI flags yet — everything comes from the environment
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    log_handler = logging.StreamHandler()
+    log_handler.addFilter(_label_engine_records)
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", handlers=[log_handler]
+    )
     # httpx logs every request at INFO as a full URL — including any userinfo
     # in `api-url`. That is the exact value `pr_content._without_userinfo`
     # strips before a self-hosted URL can reach a PR body, and a workflow log

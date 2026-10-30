@@ -81,7 +81,7 @@ if ! grep -qF '[dry-run] smoke-flag (status=Dead, treatment=True)' "$WORK/out.tx
 fi
 
 # The transform itself, not just the run: without the rule files Piranha errors
-# and the line above would read [piranha-error].
+# and the line above would read [engine-error].
 if ! grep -q '^-.*boolVariation' "$WORK/out.txt"; then
   echo "smoke: no diff removing the boolVariation call — are rules/*.toml in the image?" >&2
   exit 1

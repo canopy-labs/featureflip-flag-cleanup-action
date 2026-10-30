@@ -2314,12 +2314,23 @@ def _statements_in_scope(scope: Node) -> list[Node]:
     under the next."""
     if scope.type == "switch_section" and scope.parent is not None:
         return [
-            statement
+            _unlabeled(statement)
             for section in scope.parent.named_children
             if section.type == "switch_section"
             for statement in section.named_children
         ]
-    return list(scope.named_children)
+    return [_unlabeled(statement) for statement in scope.named_children]
+
+
+def _unlabeled(statement: Node) -> Node:
+    """The statement a label (``L: object o = a;``) stands on: a labeled
+    declaration declares its local in the block like any other."""
+    while statement.type == "labeled_statement":
+        inner = [c for c in statement.named_children if c.type not in ("identifier", *_COMMENTS)]
+        if not inner:
+            break
+        statement = inner[-1]
+    return statement
 
 
 def _local_binding(
@@ -2337,6 +2348,7 @@ def _local_binding(
     for statement in statements:
         if statement.type == "global_statement" and statement.named_children:
             statement = statement.named_children[0]
+        statement = _unlabeled(statement)
         if statement.type == "local_function_statement" and _name_of(statement) == name:
             return _UNTYPED
         if statement.type == "local_declaration_statement" and statement.start_byte < at.start_byte:
@@ -3630,7 +3642,7 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
 _SEQUENCE_KEEPING = frozenset(
     {
         "Where", "AsNoTracking", "AsTracking", "AsQueryable", "AsEnumerable", "OrderBy", "OrderByDescending",
-        "ThenBy", "ThenByDescending", "Skip", "Take", "Distinct", "Reverse", "ToList", "ToArray",
+        "ThenBy", "ThenByDescending", "Skip", "Take", "Distinct", "Reverse", "ToList",
     }
 )
 #: Operators returning one element of it; their `…Async` forms return a task of one.
@@ -3695,7 +3707,8 @@ def _checkout_type(typed: _Typed, readers: _Readers) -> tuple[Node, str] | None:
 
 
 def _member_type(
-    declaration: Node, path: str, name: str, readers: _Readers, method: bool, depth: int = 0
+    declaration: Node, path: str, name: str, readers: _Readers, method: bool, depth: int = 0,
+    arguments: list[Node] | None = None,
 ) -> _Typed | None:
     """The declared type of ``declaration``'s own field or property
     ``name``, or with ``method`` the return type of its every method of the
@@ -3726,6 +3739,8 @@ def _member_type(
             for m in named
         ) or _checkout_extension(readers.repo_dir, name):
             return None
+        if arguments is not None and not any(_may_apply(m, arguments) for m in named):
+            return None  # no overload of its own applies: an extension method binds
         returns = {_text(m.child_by_field_name("returns")) for m in named if m.child_by_field_name("returns") is not None}
         if len(returns) != 1 or len([m for m in named if m.child_by_field_name("returns") is not None]) != len(named):
             return None
@@ -3772,7 +3787,7 @@ def _local_initializer(at: Node, name: str) -> Node | None:
     while node.parent is not None:
         parent = node.parent
         if parent.type in ("block", "switch_section"):
-            for statement in reversed([c for c in parent.named_children if c.end_byte <= node.start_byte]):
+            for statement in reversed([_unlabeled(c) for c in parent.named_children if c.end_byte <= node.start_byte]):
                 if statement.type != "local_declaration_statement":
                     continue
                 declaration = _child(statement, "variable_declaration")
@@ -3882,7 +3897,66 @@ def _static_type(expr: Node | None, readers: _Readers, path: str, depth: int = 0
     if found is None:
         return None
     declaration, declaring_path = found
-    return _member_type(declaration, declaring_path, name, readers, call is not None)
+    arguments = None
+    if call is not None:
+        listed = call.child_by_field_name("arguments")
+        arguments = [a for a in (listed.named_children if listed is not None else ()) if a.type == "argument"]
+    return _member_type(declaration, declaring_path, name, readers, call is not None, arguments=arguments)
+
+
+#: Library delegate types a lambda converts to.
+_LAMBDA_TARGETS = frozenset({"Func", "Action", "Predicate", "Comparison", "Converter", "EventHandler", "Expression"})
+#: What a literal argument converts to, by its kind.
+_LITERAL_TARGETS = {
+    "string_literal": frozenset({"string", "String", "object", "Object"}),
+    "verbatim_string_literal": frozenset({"string", "String", "object", "Object"}),
+    "raw_string_literal": frozenset({"string", "String", "object", "Object"}),
+    "interpolated_string_expression": frozenset({"string", "String", "object", "Object", "FormattableString", "IFormattable"}),
+    "boolean_literal": frozenset({"bool", "Boolean", "object", "Object"}),
+    "character_literal": frozenset({"char", "Char", "int", "long", "uint", "ulong", "ushort", "float", "double", "decimal", "object", "Object"}),
+    "integer_literal": frozenset({"int", "long", "uint", "ulong", "short", "ushort", "byte", "sbyte", "float", "double", "decimal",
+                                  "Int32", "Int64", "Double", "Decimal", "object", "Object"}),
+    "real_literal": frozenset({"double", "float", "decimal", "Double", "Single", "Decimal", "object", "Object"}),
+}
+
+
+def _may_apply(method: Node, arguments: list[Node]) -> bool:
+    """Whether the method declaration ``method`` may be what a call with
+    these positional ``arguments`` binds to. A call no instance method of
+    the name applies to binds an extension method instead, which this does
+    not see: the number of arguments must fit (a ``params`` call's expanded
+    form is not counted), a lambda must
+    meet a delegate type, and a literal a type it converts to. (Other
+    arguments are not typed here: a value of the wrong type is a known
+    limit.)"""
+    listed = method.child_by_field_name("parameters")
+    parameters = [p for p in (listed.named_children if listed is not None else ()) if p.type == "parameter"]
+    required = [p for p in parameters if not any(c.type in ("=", "equals_value_clause") for c in p.children)]
+    if any(a.child_by_field_name("name") is not None for a in arguments):
+        return False  # a named argument: matched by name, not read here
+    if not len(required) <= len(arguments) <= len(parameters):
+        return False
+    for argument, parameter in zip(arguments, parameters):
+        values = [c for c in _named(argument) if c.type not in _COMMENTS]
+        value = values[-1] if values else None
+        type_node = parameter.child_by_field_name("type")
+        if value is None or type_node is None:
+            return False
+        while type_node.type == "nullable_type" and type_node.named_children:
+            type_node = type_node.named_children[0]
+        spelled = type_node.child_by_field_name("name") if type_node.type == "qualified_name" else type_node
+        if spelled is None:
+            return False
+        if spelled.type == "generic_name":
+            spelled = next((c for c in spelled.named_children if c.type == "identifier"), spelled)
+        simple = _text(spelled)
+        if value.type in ("lambda_expression", "anonymous_method_expression"):
+            if simple not in _LAMBDA_TARGETS:
+                return False
+        elif value.type in _LITERAL_TARGETS:
+            if simple not in _LITERAL_TARGETS[value.type]:
+                return False
+    return True
 
 
 def _free_value(receiver: Node, readers: _Readers, path: str, family) -> bool:

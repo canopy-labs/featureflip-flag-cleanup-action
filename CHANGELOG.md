@@ -7,6 +7,39 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 2.0.0
+
+This is a new major version, so `@v1` stays on 1.19.0. Change
+`featureflip-flag-cleanup-action@v1` to `@v2` in your workflow to get this
+release and the ones after it. The CircleCI orb moves to 2.0.0 for the same
+reason: its default image is now `:v2`.
+
+### Changed
+
+- The transform engine's lines in the job log (`File: … with N rewrites`,
+  `Rewrites used the following rules: …`) are now labelled
+  `featureflip.engine` instead of `polyglot_piranha`. If a log filter of yours
+  matches the old name, update it.
+- **Breaking:** the outcome reported when the transform engine rejects its own
+  rewrite is now `[engine-error]`, renamed from `[piranha-error]`. It still
+  fails the run with exit code `1`. Update any script or log search that
+  matches the old label.
+
+### Fixed
+
+- **C#:** a few values were given the wrong static type when proving a removal
+  safe, which could let a removal through that the C# compiler binds
+  differently: `list.ToArray()` (an array, not the list), a call that no
+  method of your type with that name can take (an extension method binds
+  instead), and a local declared after a label (`L: object o = …;`), which
+  hides a field of the same name like any local.
+
+- **C#:** a setting of an options class shared with other settings is no
+  longer kept by its binding when the section is held in a local
+  (`var section = configuration.GetSection(…)`), when names are qualified by
+  the class's namespace, or when a `PostConfigure<T>(o => …)` sets the other
+  settings from subsections of other names.
+
 ## 1.19.0
 
 ### Added

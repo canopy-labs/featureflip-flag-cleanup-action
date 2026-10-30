@@ -20,7 +20,7 @@ are surfaced explicitly instead of swallowed:
 
 * a REFUSED transform — the engine aborting (``PiranhaTransformError``) or
   Gate 1 rejecting a rewrite (``UnsafeRewriteError``) — abandons the flag
-  entirely, under its own ``action_taken`` (``piranha-error`` /
+  entirely, under its own ``action_taken`` (``engine-error`` /
   ``unsafe-rewrite``) and never as ``no-changes``. Refusing is the safe
   answer; refusing *quietly* is not, because "this repository has nothing to
   clean up" and "I declined to clean it up" are opposite facts that the
@@ -208,7 +208,7 @@ class FlagResult:
       or closed, ``prior_removal`` says which: such a flag is never proposed
       again, so the report must not promise that it will be. Reachable in a
       dry run too, which looks the pull request up but never holds it.
-    * ``"piranha-error"`` — the engine aborted (it could read none of the
+    * ``"engine-error"`` — the engine aborted (it could read none of the
       files, or rejected its own rewrite of one); ``diff`` is empty, but this is a REFUSAL, not a no-match.
     * ``"unsafe-rewrite"`` — Gate 1 refused the rewrite of at least one file
       and it was rolled back, taking the whole flag's transform with it;
@@ -236,7 +236,7 @@ class FlagResult:
 
     A dry run produces only ``dry-run``, ``ignored``, ``not-selected``,
     ``unsafe-key``, ``duplicate``, ``blocked``, ``already-handled``,
-    ``piranha-error`` and ``unsafe-rewrite`` — everything that WRITES to
+    ``engine-error`` and ``unsafe-rewrite`` — everything that WRITES to
     GitHub is unreachable, but every refusal is reachable and is reported identically in both modes, and
     so is ``already-handled`` whenever the dry run has a token to ask with.
     That symmetry is the point of dry-run: a flag a real run would refuse, or
@@ -1204,9 +1204,9 @@ def _refusal_action(error: TransformRefusal) -> str:
 
     Never ``no-changes``: a refusal and a no-match are opposite facts and the
     customer needs to tell them apart. That distinction is the whole reason
-    ``piranha-error`` exists, and ``unsafe-rewrite`` is its Gate 1 twin.
+    ``engine-error`` exists, and ``unsafe-rewrite`` is its Gate 1 twin.
     """
-    return "unsafe-rewrite" if isinstance(error, UnsafeRewriteError) else "piranha-error"
+    return "unsafe-rewrite" if isinstance(error, UnsafeRewriteError) else "engine-error"
 
 
 def _refused_files(error: TransformRefusal) -> tuple[str, ...]:

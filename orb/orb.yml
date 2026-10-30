@@ -150,7 +150,7 @@ commands:
         description: GitHub API origin. Change it only for GitHub Enterprise Server.
       image:
         type: string
-        default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v1
+        default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
         description: The cleanup image. Pin a full version or a digest to stop it moving.
     steps:
       - run:
@@ -266,7 +266,7 @@ jobs:
         description: Print the diffs and open nothing.
       image:
         type: string
-        default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v1
+        default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
         description: The cleanup image.
     steps:
       - checkout
@@ -289,7 +289,7 @@ examples:
     usage:
       version: 2.1
       orbs:
-        featureflip: featureflip/flag-cleanup@1
+        featureflip: featureflip/flag-cleanup@2
       workflows:
         flag-cleanup:
           jobs:
@@ -305,7 +305,7 @@ examples:
     usage:
       version: 2.1
       orbs:
-        featureflip: featureflip/flag-cleanup@1
+        featureflip: featureflip/flag-cleanup@2
       workflows:
         archive-sweep:
           jobs:
