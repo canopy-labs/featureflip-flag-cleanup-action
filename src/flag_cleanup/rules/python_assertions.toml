@@ -1,0 +1,155 @@
+# Assertions the fold made trivially true, for python. Appended to the rules
+# whenever `python_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `python.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `assert client.variation("k", ctx, False)` in a test folds to `assert True`:
+# a check the removal made meaningless. Reached ONLY from the fold's own literal
+# (python_edges.toml, Parent scope from the groups that write one), never as a
+# seed, so an `assert True` the customer wrote stays. The assertion APIs are
+# policy: the `assert` statement and unittest's `self.assert*`. An assertion
+# folded to the FAILING literal (`assert False`) is never matched.
+#
+# A `self.assert*` call is matched at the CALL: its `expression_statement`
+# spans the same text, and the engine's Parent walk skips an ancestor whose
+# text equals the node's, so the statement itself is never offered.
+# Python has no empty suite, so the sole statement of a block becomes `pass`
+# instead (the engine's `replace_sole_if_false_with_pass` does the same for a
+# folded `if`). A block's text starts at its first statement, so a block of
+# one statement spans the same text as it and the Parent walk skips it too:
+# these are rooted at what owns the block (a `def`, an `if`, a `with`), and
+# sit in a group of their own that the edges name first.
+[[rules]]
+name = "replace_sole_trivially_true_assert_statement_with_pass"
+query = """(
+  (_ (block . (assert_statement . (true) .) @statement .)) @owner
+)"""
+replace_node = "statement"
+replace = "pass"
+groups = ["trivial_assertion_sole"]
+is_seed_rule = false
+
+[[rules]]
+name = "replace_sole_trivially_true_assertion_with_pass"
+query = """(
+  (_
+   (block
+    .
+    (expression_statement
+      (call
+        function: (attribute
+          object: (identifier) @assert_self
+          attribute: (identifier) @assert_method)
+        arguments: (argument_list . (true) .))) @statement
+    .)) @owner
+  (#eq? @assert_self "self")
+  (#eq? @assert_method "assertTrue")
+)"""
+replace_node = "statement"
+replace = "pass"
+groups = ["trivial_assertion_sole"]
+is_seed_rule = false
+
+[[rules]]
+name = "replace_sole_trivially_false_assertion_with_pass"
+query = """(
+  (_
+   (block
+    .
+    (expression_statement
+      (call
+        function: (attribute
+          object: (identifier) @assert_self
+          attribute: (identifier) @assert_method)
+        arguments: (argument_list . (false) .))) @statement
+    .)) @owner
+  (#eq? @assert_self "self")
+  (#eq? @assert_method "assertFalse")
+)"""
+replace_node = "statement"
+replace = "pass"
+groups = ["trivial_assertion_sole"]
+is_seed_rule = false
+
+[[rules]]
+name = "replace_sole_trivially_equal_assertion_with_pass"
+query = """(
+  (_
+   (block
+    .
+    (expression_statement
+      (call
+        function: (attribute
+          object: (identifier) @assert_self
+          attribute: (identifier) @assert_method)
+        arguments: (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .))) @statement
+    .)) @owner
+  (#eq? @assert_self "self")
+  (#match? @assert_method "^(assertEqual|assertIs)$")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = "pass"
+groups = ["trivial_assertion_sole"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_true_assert_statement"
+query = """(
+  (assert_statement . (true) .) @statement
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (call
+      function: (attribute
+        object: (identifier) @assert_self
+        attribute: (identifier) @assert_method)
+      arguments: (argument_list . (true) .)) @statement
+  (#eq? @assert_self "self")
+  (#eq? @assert_method "assertTrue")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (call
+      function: (attribute
+        object: (identifier) @assert_self
+        attribute: (identifier) @assert_method)
+      arguments: (argument_list . (false) .)) @statement
+  (#eq? @assert_self "self")
+  (#eq? @assert_method "assertFalse")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (call
+      function: (attribute
+        object: (identifier) @assert_self
+        attribute: (identifier) @assert_method)
+      arguments: (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)) @statement
+  (#eq? @assert_self "self")
+  (#match? @assert_method "^(assertEqual|assertIs)$")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false

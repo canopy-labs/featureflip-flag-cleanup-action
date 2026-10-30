@@ -1,0 +1,20 @@
+# Wires edges onto Java's built-in cascade (see java.toml). Piranha reads
+# [[edges]] only from this file, never from rules.toml.
+#
+# Java is a built-in engine language, so `get_rule_graph` MERGES what is here
+# with the engine's own Java edges rather than replacing them: every built-in
+# edge is still in force and must not be restated.
+#
+# An assertion the fold made trivially true is deleted (java.toml,
+# `trivial_assertion`). Only from the groups that write a literal, so only an
+# assertion this run's fold produced is reached: Parent scope walks the
+# literal, its argument list, the call and the statement.
+[[edges]]
+scope = "Parent"
+from = "replace_expression_with_boolean_literal"
+to = ["trivial_assertion"]
+
+[[edges]]
+scope = "Parent"
+from = "boolean_expression_simplify"
+to = ["trivial_assertion"]

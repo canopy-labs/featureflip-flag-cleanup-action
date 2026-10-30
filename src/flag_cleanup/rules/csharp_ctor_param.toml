@@ -7,7 +7,7 @@
 # blocks an explicit constructor's (its name is the class's). The `argument`
 # blocks delete each span the caller replaced with a form of the sentinel
 # (`ctor_param_model.CSHARP_FORMS`): an argument, a member, a statement, a
-# whole type declaration, a `using` directive.
+# whole type declaration, a `using` directive, a method's parameter.
 
 # ctor: parameter
 [[rules]]
@@ -109,5 +109,16 @@ query = """(
   (#eq? @name "__CTOR_SENTINEL__")
 )"""
 replace_node = "using"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_marked_parameter"
+query = """(
+  (parameter_list (parameter name: (identifier) @id) @param)
+  (#eq? @id "__CTOR_SENTINEL__")
+)"""
+replace_node = "param"
 replace = ""
 is_seed_rule = true

@@ -59,6 +59,7 @@ CSHARP_FORMS = {
     "statement": "{}();",
     "type": "class {}{{}}",
     "using": "using {};",
+    "parameter": "object {}",
 }
 
 

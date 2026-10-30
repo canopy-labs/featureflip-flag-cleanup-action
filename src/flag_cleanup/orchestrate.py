@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, inert_load, prerequisite_hold, ruby_owner_reach, source_index
+from flag_cleanup import git_ops, github_ops, inert_load, prerequisite_hold, report_paths, ruby_owner_reach, source_index
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -1684,6 +1684,22 @@ def piranha_transform(
         _undo_transform(config, snapshot, pending=None)
 
 
+#: The :class:`~flag_cleanup.piranha_runner.TransformOutcome` fields whose
+#: rows start with a path relative to the directory their pass swept.
+_DIRECTORY_RELATIVE_FIELDS = (
+    "stranded",
+    "bindings",
+    "entries",
+    "declined",
+    "test_doubles",
+    "deleted_tests",
+    "kept",
+    "unresolved",
+    "enum_findings",
+    "wrapper_findings",
+)
+
+
 def _run_plan(
     plan: list[tuple[str, str, list[str]]],
     candidate: Candidate,
@@ -1695,19 +1711,18 @@ def _run_plan(
     A refusal propagates out of the first pass that raises it, so a later pass
     never runs after an earlier one was refused; see :func:`piranha_transform`.
 
-    Each pass reports its enum findings and unresolved key-constant references
-    relative to its own directory. They are re-spelled here under that
-    directory, the way the residue scan spells the files it finds, so a
-    finding is compared with the residue by path and ``src/flags.ts`` in one
-    directory is never taken for another's.
+    Each pass reports every row it produces (stranded statements, bindings,
+    entries, test doubles, deleted tests, kept files, enum findings,
+    unresolved key-constant references and wrapper findings) relative to its
+    own directory. They are re-spelled here under that directory, the way the
+    residue scan spells the files it finds, so a finding is compared with the
+    residue by path, ``src/flags.ts`` in one directory is never taken for
+    another's, and one pull request never names a file from two roots.
     """
 
-    def qualify(
-        findings: tuple[tuple[str, int, str, str], ...], directory: str
-    ) -> tuple[tuple[str, int, str, str], ...]:
+    def qualify(rows: tuple[tuple, ...], directory: str) -> tuple[tuple, ...]:
         return tuple(
-            (os.path.normpath(os.path.join(directory, path)), line, reason, text)
-            for path, line, reason, text in findings
+            (os.path.normpath(os.path.join(directory, row[0])), *row[1:]) for row in rows
         )
 
     # Read before the first pass writes: a `.ts` registry's pass deletes the
@@ -1732,12 +1747,10 @@ def _run_plan(
         outcomes.append(
             replace(
                 outcome,
-                unresolved=qualify(outcome.unresolved, directory),
-                enum_findings=qualify(outcome.enum_findings, directory),
-                wrapper_findings=tuple(
-                    (os.path.normpath(os.path.join(directory, path)), line, reason, text, label)
-                    for path, line, reason, text, label in outcome.wrapper_findings
-                ),
+                **{
+                    field: qualify(getattr(outcome, field), directory)
+                    for field in _DIRECTORY_RELATIVE_FIELDS
+                },
             )
         )
     return outcomes
@@ -2023,13 +2036,16 @@ def _warn_on_unprocessed_references(
     # rest because they say something else. Those are logged as what they
     # are, line by line, as the pull request lists them. A test title is not
     # judged that way, so it stays below.
+    show = report_paths.displayer(config.directories)
     if sorted_out.comment_lines:
         logger.info(
             "%d comment line(s) still name flag %r and were kept, because each "
             "also says something else — reword them by hand: %s",
             len(sorted_out.comment_lines),
             flag_key,
-            "; ".join(f"{path}:{line}: {text}" for path, line, text in sorted_out.comment_lines),
+            "; ".join(
+                f"{show(path)}:{line}: {text}" for path, line, text in sorted_out.comment_lines
+            ),
         )
     unprocessed = _not_comment_only(unprocessed, sorted_out)
     if unprocessed:
@@ -2048,7 +2064,7 @@ def _warn_on_unprocessed_references(
             len(unprocessed),
             flag_key,
             ", ".join(config.languages),
-            ", ".join(unprocessed),
+            ", ".join(map(show, unprocessed)),
         )
 
 

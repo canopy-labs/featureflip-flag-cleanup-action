@@ -27,3 +27,23 @@ to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
 scope = "Parent"
 from = "if_cleanup"
 to = ["if_cleanup", "statement_cleanup"]
+
+# An assertion the fold made trivially true is deleted (ts.toml,
+# `trivial_assertion`). Only from the groups that write a literal, so only an
+# assertion this run's fold produced is reached. `expect(<literal>)` is one
+# node too deep for Parent scope, so it is reached through the match-only
+# `trivial_expect_subject` hop.
+[[edges]]
+scope = "Parent"
+from = "replace_expression_with_boolean_literal"
+to = ["trivial_assertion", "trivial_expect_subject"]
+
+[[edges]]
+scope = "Parent"
+from = "boolean_expression_simplify"
+to = ["trivial_assertion", "trivial_expect_subject"]
+
+[[edges]]
+scope = "Parent"
+from = "trivial_expect_subject"
+to = ["trivial_assertion"]

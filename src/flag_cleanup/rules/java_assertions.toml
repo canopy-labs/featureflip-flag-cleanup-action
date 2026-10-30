@@ -1,0 +1,60 @@
+# Assertions the fold made trivially true, for java. Appended to the rules
+# whenever `java_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `java.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `assertTrue(client.boolVariation("k", ctx, false))` in a test folds to
+# `assertTrue(true)`: a check the removal made meaningless. Reached ONLY from
+# the fold's own literal (java_edges.toml, Parent scope from the groups that
+# write one), never as a seed, so an `assertTrue(true)` the customer wrote
+# stays. The assertion APIs are policy: JUnit 4 and 5, called bare (a static
+# import) or on `Assert`/`Assertions`. An assertion folded to the FAILING
+# literal (`assertTrue(false)`) is never matched.
+
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @assert_method
+      arguments: (argument_list . (true) .)) @assert_call) @statement
+  (#eq? @assert_method "assertTrue")
+  (#match? @assert_call "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertTrue[[:space:]]*[(]")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @assert_method
+      arguments: (argument_list . (false) .)) @assert_call) @statement
+  (#eq? @assert_method "assertFalse")
+  (#match? @assert_call "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertFalse[[:space:]]*[(]")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @assert_method
+      arguments: (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)) @assert_call) @statement
+  (#eq? @assert_method "assertEquals")
+  (#match? @assert_call "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertEquals[[:space:]]*[(]")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false

@@ -1,0 +1,72 @@
+# Assertions the fold made trivially true, for csharp. Appended to the rules
+# whenever `csharp_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `csharp.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `Assert.True(client.BoolVariation("k", ctx, false))` in a test folds to
+# `Assert.True(true)`: a precondition the removal made meaningless. Reached ONLY
+# from the fold's own literal (csharp_edges.toml, Parent scope from the groups
+# that write one), never as a seed, so an `Assert.True(true)` the customer
+# wrote as a "reached here" marker stays. The assertion APIs are policy, listed
+# here per test framework (xUnit, NUnit, MSTest); an assertion folded to the
+# FAILING literal (`Assert.True(false)`) is never matched, and is reported.
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @assert_class
+        name: (identifier) @assert_method)
+      arguments: (argument_list . (argument (boolean_literal) @asserted) .))) @statement
+  (#eq? @assert_class "Assert")
+  (#match? @assert_method "^(True|IsTrue|That)$")
+  (#eq? @asserted "true")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @assert_class
+        name: (identifier) @assert_method)
+      arguments: (argument_list . (argument (boolean_literal) @asserted) .))) @statement
+  (#eq? @assert_class "Assert")
+  (#match? @assert_method "^(False|IsFalse)$")
+  (#eq? @asserted "false")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @assert_class
+        name: (identifier) @assert_method)
+      arguments: (argument_list
+        .
+        (argument (boolean_literal) @expected)
+        .
+        (argument (boolean_literal) @asserted)
+        .))) @statement
+  (#eq? @assert_class "Assert")
+  (#match? @assert_method "^(Equal|AreEqual)$")
+  (#eq? @expected @asserted)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false

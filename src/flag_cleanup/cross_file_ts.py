@@ -946,6 +946,59 @@ def jsx_factories(reader_path: str, repo_dir: str) -> dict[str, frozenset[str | 
     return {option: frozenset(found or {None}) for option, found in values.items()}
 
 
+#: The ``jsx`` settings of the automatic runtime, lowercased as the compiler
+#: compares them: an element calls a function the compiler imports itself.
+AUTOMATIC_JSX = frozenset({"react-jsx", "react-jsxdev"})
+
+
+def jsx_automatic(reader_path: str, repo_dir: str) -> bool:
+    """Whether every config that may compile ``reader_path`` sets ``jsx`` to
+    the automatic runtime (:data:`AUTOMATIC_JSX`), read through its
+    ``extends`` chain.
+
+    The configs are those :func:`jsx_factories` reads, narrowed to the ones
+    whose ``files`` or ``include`` may hold the reader (:func:`_may_compile`,
+    which over-matches): a solution config compiling nothing and a build
+    script's config beside the app's do not count. False when none may
+    compile it, when one leaves ``jsx`` unset or sets anything else, and when
+    one or a config it extends cannot be read: the caller keeps imports a
+    classic-runtime element could read unless this is True, so an answer
+    wrongly False costs a missed tidy and one wrongly True breaks the build.
+    """
+    try:
+        reader = Path(reader_path).resolve()
+        current = reader.parent
+        stop = _stop_for(repo_dir)
+        while True:
+            configs = sorted(c for c in current.iterdir() if _ANY_CONFIG.match(c.name) and c.is_file())
+            if configs or current == stop or current.parent == current:
+                break
+            current = current.parent
+        compiling = []
+        for config in configs:
+            data = json.loads(_strip_jsonc(config.read_text(encoding="utf-8")))
+            if not isinstance(data, dict):
+                return False
+            if _may_compile(config, data, reader):
+                compiling.append(config)
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+        return False
+    if not compiling:
+        return False
+    for config in compiling:
+        for options in _loose_chain(config, stop, ()):
+            if options is None:
+                return False
+            if "jsx" in options:
+                value = options["jsx"]
+                if not isinstance(value, str) or value.lower() not in AUTOMATIC_JSX:
+                    return False
+                break
+        else:
+            return False
+    return True
+
+
 def _loose_chain(config: Path, stop: Path, below: tuple[Path, ...]) -> list[dict | None]:
     """``config``'s ``compilerOptions`` and those of every config it
     ``extends``, nearest first as :func:`_inheriting` orders them, with None

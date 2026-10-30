@@ -7,6 +7,208 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 1.19.0
+
+### Added
+
+- **TypeScript and JavaScript:** when the removal leaves every use of a
+  component in the file passing the same `true` or `false` to a prop
+  (`<Row showExpiry={true} />`), the prop is removed: from each element, from
+  the component's destructured parameter and from its props type, and what it
+  guarded inside the component is simplified. This applies to a component that
+  is not exported and is used only as a JSX element in its own file, whose
+  props type is its own. A prop that already received that literal before the
+  run is left alone.
+- **TypeScript and JavaScript:** a prop the removal leaves unread inside such
+  a component (`showExpiry && isExpired(expiresAt)` folding to `false` leaves
+  `expiresAt` passed and never used) is removed the same way: from each
+  element, the destructured parameter and the props type. A value passed to
+  it that could do work (a call) keeps the prop.
+- **TypeScript and JavaScript:** removing a prop every element passes as the
+  same `true` or `false` now reaches an exported component, when every file
+  that renders it imports it by name from the file that declares it and does
+  nothing else with it. The prop goes from the component and from every
+  element, in each of those files. A component that is re-exported, imported
+  under another name or as a namespace, or mentioned any other way is left
+  alone.
+- **TypeScript and JavaScript:** a parameter of a function that is not
+  exported and is only ever called by name in its own file is removed when
+  every call now passes it the same `true` or `false` the removal wrote
+  (`formatRow(name, true)`): from each call and from the function, and what
+  it guarded inside is simplified. A parameter the removal leaves unread in
+  such a function goes the same way, with the value each call passed for it,
+  unless a call passes something that could do work.
+- **C#, Java, Kotlin, Python, TypeScript and JavaScript:** a test assertion
+  the removal turns into one that always passes (`Assert.True(true)`,
+  `assertTrue(true)`, `expect(true).toBe(true)`, `assert True`) is deleted,
+  and listed in the pull request with the deleted mock lines. Only an
+  assertion the removal itself produced is touched: one you wrote that way
+  stays. An assertion the removal turns into one that always FAILS
+  (`Assert.True(false)`) is not edited; the pull request names it so you can
+  delete or rewrite the test.
+
+### Changed
+
+- A comment directly above a statement the removal deleted outright (an
+  inlined declaration, a guard of the removed branch) no longer stays behind
+  unmentioned. When it describes the flag's state ("while the flag is off")
+  it is deleted with the statement; otherwise it is listed under "comments
+  describe behaviour this pull request removed". A comment separated from the
+  statement by a blank line, a doc comment, and one that may also describe
+  the next statement are left alone.
+- A comment that says "the flag" or names a local the removal inlined away
+  is now reported when it sits above the changed code in the same block, not
+  only on or directly above the changed line. Nothing is edited.
+- **TypeScript and JavaScript:** a file whose only mention of the removed
+  flag's key is a string element of an array that also holds a computed
+  value, such as a query cache key `['scheduled-changes', orgId] as const`,
+  is now listed in its own informational group in the pull request body
+  instead of under "still reference this flag". Nothing is rewritten. A list
+  of nothing but string keys, an array handed straight to a call, and a
+  template string still get the warning.
+
+### Fixed
+
+- **C#:** a string a test passes to a private helper that only binds it as a
+  parameter of interpolated SQL (`ExecuteSqlAsync($"… {payloadJson} …")`) no
+  longer keeps an option of the same name in place, even in a file that
+  compares strings ignoring case.
+
+- **C#:** an options class that declares a constant other than a string
+  (`public const long MaxBytes = 64 * 1024;`) no longer keeps its removed
+  setting in place, when the constant's value is only literals and operators.
+
+- **C#:** a Terraform file that names a removed type or options class only
+  in a comment no longer keeps it. The comment is listed in the pull request
+  with the other prose. A name in a value or a heredoc still keeps it.
+
+- **C#:** a read through a local created as a class of yours that derives
+  from a library class (`using var factory = new MyAppFactory(); …
+  factory.Gate.Enabled`) no longer counts as possibly going through a member
+  the library class supplies, when the member read is one your class
+  declares. Before, it kept a gate family's options setting in place.
+
+- **C#:** a configuration key of another section that ends in a removed
+  option's name (`configuration.GetValue("Quartz:Enabled", true)`, the option
+  bound to section `Scheduled`) no longer keeps that option and its
+  configuration key.
+
+- **C#:** a string that matches a removed option's name (for example
+  `nameof(Feature.Enabled)`) no longer keeps that option and its
+  configuration key. This applies when the string is in a file whose every
+  by-name lookup goes through `typeof(T)` of an unrelated type, or passes only
+  constants that name something else (`Entry(e).Property(nameof(E.Date))`).
+
+- Every file path in a pull request body, in a dry run's diff and in the
+  run's report is now written relative to the repository root. A run over
+  several directories used to mix three spellings (from the root, from the
+  swept directory, and absolute), and a dry-run diff carried absolute headers
+  that `git apply` rejects; it now applies from the checkout root.
+- A file whose every comment naming the flag is already listed under what
+  that comment describes is no longer listed again, with no lines under it,
+  under "mention this flag only in comments".
+- **TypeScript and JavaScript:** in a file holding JSX, a named import the
+  removal left unused is now removed even when its `import { … }` keeps other
+  names, if the file's compiler config sets `"jsx": "react-jsx"` or
+  `"react-jsxdev"` and the file has no `@jsx` pragma. It used to be kept,
+  which fails the build under `noUnusedLocals`. Under the classic runtime, or
+  when the runtime cannot be told, such imports are still kept, since an
+  element can call one of them without naming it.
+- **C#:** a `typeof(X)` no longer keeps `X`'s constructor parameter when every
+  value made from it in its file only reads names, flags and attributes. That
+  holds through private fields, loops, LINQ lambdas, method groups and private
+  helpers, as in a structural test over a `private static readonly Type[]` of
+  controllers that checks each one's attributes. Anything that could construct
+  the class or hand the value elsewhere still keeps it.
+
+- **C#:** a target-typed `new(…)` that passes a literal where a constructor
+  takes a class no literal converts to (a class or struct of your repository
+  with no conversion operator, or a framework type such as `TimeProvider`,
+  `HttpClient` or `ILogger<T>`) is no longer taken for a possible call to it.
+  `new(null, 1)` beside a constructor taking `(IGate gate, TimeProvider
+  clock)` used to keep the whole gate family's leftovers.
+
+- **C#:** a constructor parameter is no longer kept just because your
+  repository has another type of the same name in another namespace (two
+  `OrdersController`s, say). Each spelling of the name is looked up
+  the way C# does, through the file's namespaces, `using` directives,
+  global usings and `<Using>` items, and spellings of the other type are
+  left alone. A target-typed `new(…)` is looked up from the type its
+  context spells (`private OrdersController Make() => new(…)`). A spelling
+  that could name either still keeps the parameter.
+
+- **C#, Kotlin, Swift, Go, Ruby and Python:** an inlined local whose
+  declaration sat directly under a comment no longer leaves its `;` at the
+  end of that comment (`// Read once per run.;`).
+- **C#, Java, TypeScript and JavaScript:** a kept branch that declares a
+  local is now unwrapped into the surrounding code, as a branch without one
+  already was, when nothing else in the enclosing method or function uses
+  that name. It used to stay as a bare `{ … }` block. A branch holding a
+  `using` declaration keeps its block, since the block decides when the
+  resource is disposed.
+- **TypeScript and JavaScript:** a destructured name the removal left unused
+  is dropped from its pattern when the pattern keeps another name
+  (`const { orgId, tab } = useParams()` becomes `const { tab } =
+  useParams()`). When it was the pattern's only name and the value is a
+  call, the call is kept as a statement, as it already was for
+  `const orgId = useParams()`; a type argument that spells the name
+  (`useParams<{ orgId: string }>()`) no longer keeps the whole declaration.
+
+- **C#:** a test host's registration through its own helper,
+  `Replace<IGate>(services, new StubGate(enabled: true))`, now goes with the
+  gate family when the fake is built from literals by a constructor that only
+  stores them, also inside a lambda. When the family's leftovers are kept,
+  the pull request now lists every reason, not only the first one found.
+
+- **C#:** a test whose only subject is the removed gate's type, every
+  statement an assertion naming it in `typeof(…)` (for example, that a class's
+  constructors never take the gate), is now deleted with the gate family and
+  listed in the pull request. Before, it kept the family's empty interface and
+  classes in place.
+
+- **C#:** a test class whose every test the removal deleted is now deleted
+  too, with its file when nothing else is declared in it, even when the gate
+  family's other leftovers are kept. Before, the pull request shipped the
+  empty class. A class with an attribute, a base class or another part is
+  kept.
+
+- **C#:** a private helper's parameter of the removed gate's interface that
+  only registers it (`services.AddScoped(_ => gate);`) is now removed with
+  those registrations and every caller's argument, and the test doubles passed
+  for it then go with the gate family. Before, it kept the family's empty
+  interface and classes in place. A named argument (`gate: mock.Object`) no
+  longer keeps a test double either.
+
+- **C#:** a static helper's parameter of the removed gate's interface that the
+  removal left unread is now removed, together with the argument every caller
+  passes for it. The field or constructor parameter that a caller passed in
+  then goes with the rest of the gate family. Before, those leftovers kept the
+  family's empty interface and classes in place.
+
+- **C#:** a gate family's leftovers now also go when they reach a primary
+  constructor (`class Job(IGate gate, …)` whose `gate` the removal left
+  unread), a test local built as a fake and only passed to such a
+  constructor, or a test harness's public auto-property holding a fake that no
+  other file names.
+
+- **C#:** `attributes.Add(new(…))` on a local `List<T>` (declared, `var` from
+  a method of the same class, or `var rows = new List<T>()`, also from inside
+  a loop or lambda) is read as creating a `T`, so it no longer
+  counts as a possible call to an unrelated constructor. Neither does a
+  property initializer `public HashSet<string> Names { get; } = new(comparer);`,
+  which creates the property's type.
+
+- **C#:** a test's Moq field built by a target-typed `new()`
+  (`private readonly Mock<IGate> _gate = new();`) now counts as a double of the
+  gate, like one built with `new Mock<IGate>()`. Before, it kept the gate
+  family's empty interface and classes in place.
+
+- **C#:** a statement that only asks the container for the removed gate's
+  interface, `scope.ServiceProvider.GetRequiredService<IGate>();` (what the
+  removal leaves of `var gate = …` once nothing reads `gate`), now goes with the
+  gate family. Before, it kept the family's empty interface and classes in
+  place. The container then no longer creates the gate at that point.
+
 ## 1.18.1
 
 ### Fixed

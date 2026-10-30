@@ -91,21 +91,28 @@ from flag_cleanup import (
     cross_file_kotlin,
     cross_file_php,
     cross_file_python,
+    failing_assertions,
     file_deletion,
     git_ops,
     go_dead_code,
     go_inline,
     go_stranded,
     kotlin_sentinel,
+    method_param_csharp,
     mock_stubs,
+    report_paths,
     residue,
     ruby_owner_reach,
     source_index,
     stale_comments,
     ts_bound_overrides,
+    ts_constant_params,
+    ts_constant_props,
     ts_dead_code,
     ts_default_arguments,
+    ts_exported_props,
     ts_list_join,
+    ts_unread_props,
     ts_fold,
     ts_gates,
     ts_param_pins,
@@ -1095,6 +1102,76 @@ _ENGINE_UNREACHABLE_RULES = frozenset(
 )
 
 
+#: The rules of ours that delete an assertion the fold made trivially true
+#: (``Assert.True(true)``, ``expect(true).toBe(true)``, ``assert True``), or
+#: write ``pass`` for one that was the only statement of a Python block. Each
+#: is reached only by an edge from the fold's own literal, and the pull request
+#: lists what it deleted with the mock lines (:func:`_engine_assertions`).
+_TRIVIAL_ASSERTION_RULES = frozenset(
+    {
+        "delete_trivially_true_assertion",
+        "delete_trivially_false_assertion",
+        "delete_trivially_equal_assertion",
+        "delete_trivially_true_assert_call",
+        "delete_trivially_true_assert_method",
+        "delete_trivially_equal_assert_method",
+        "delete_trivially_equal_expect",
+        "delete_trivially_truthy_expect",
+        "delete_trivially_falsy_expect",
+        "delete_trivially_true_assert_statement",
+        "replace_sole_trivially_true_assert_statement_with_pass",
+        "replace_sole_trivially_true_assertion_with_pass",
+        "replace_sole_trivially_false_assertion_with_pass",
+        "replace_sole_trivially_equal_assertion_with_pass",
+    }
+)
+
+#: The ``test_doubles`` kind of a deleted assertion.
+TRIVIAL_ASSERTION = "assertion"
+
+
+def _failing_assertions(summaries, language: str, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
+    """``(relative_path, "failing assertion", text)`` for each assertion this
+    run's output holds more of than the customer's file did, among those that
+    can only fail (:func:`flag_cleanup.failing_assertions.failing`)."""
+    rows = []
+    for summary in summaries:
+        found = failing_assertions.failing(
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
+        )
+        rows.extend(
+            (os.path.relpath(summary.path, repo_dir), FAILING_ASSERTION, text) for text in found
+        )
+    if rows:
+        logger.warning(
+            "%d assertion(s) can only fail now that the flag read is a literal; "
+            "each tested the removed branch: %s",
+            len(rows),
+            "; ".join(f"{path}: {text}" for path, _, text in rows),
+        )
+    return tuple(rows)
+
+
+#: The ``bindings`` kind of an assertion the fold made one that can only fail.
+FAILING_ASSERTION = "failing assertion"
+
+
+def _engine_assertions(summaries, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
+    """``(relative_path, "assertion", text)`` for each assertion the fold made
+    trivially true and our rules deleted, read off the engine's summaries by
+    rule name under the same constraint as :func:`_engine_stranded`."""
+    return tuple(
+        (
+            os.path.relpath(summary.path, repo_dir),
+            TRIVIAL_ASSERTION,
+            " ".join(edit.p_match.matched_string.split()),
+        )
+        for summary in summaries
+        for edit in getattr(summary, "rewrites", ())
+        if edit.matched_rule in _TRIVIAL_ASSERTION_RULES
+    )
+
+
 #: The engine's Go rules that delete a local bound to the folded read and
 #: write its value for the local's name (``replace_identifier_with_value``,
 #: ``replace_identifier_with_nil``): the capture names whose identifiers go.
@@ -1188,7 +1265,11 @@ _ENGINE_STRANDED_IMPORT_RULES = {
 #: (``decl``), since a deleted line's match also holds the comment after it.
 #: The one Swift, Java, Kotlin and C# rules and the two TypeScript/JavaScript
 #: rules (``const``/``let`` and ``var``) each delete a literal local's whole
-#: declaration and are named by it (``decl``), for the same reason.
+#: declaration and are named by it (``decl``), for the same reason. The two
+#: TypeScript/JavaScript pattern rules drop one shorthand name from a
+#: destructuring pattern that keeps another (``const { a, b } = load()``
+#: becomes ``const { b } = load()``), and are named by that name (``n``),
+#: since the declaration itself stays.
 _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_short_var": "decl",
     "blank_stranded_short_var": "decl",
@@ -1233,6 +1314,8 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_csharp_local": "decl",
     "delete_stranded_ts_local": "decl",
     "delete_stranded_ts_var": "decl",
+    "delete_stranded_ts_pattern_name": "n",
+    "delete_stranded_ts_pattern_name_last": "n",
 }
 
 
@@ -1744,9 +1827,10 @@ def _transform_flag(
 
     # Each TypeScript-family file's line width, for the engine's joins (see
     # :func:`_print_width_facts`), off the customer's bytes: nothing below has
-    # marked a file yet.
-    widths = (
-        _print_width_facts(sorted({*paths, *reader_paths}), repo_dir)
+    # marked a file yet. And, beside it, whether the file's JSX compiles to
+    # the automatic runtime (:func:`_jsx_runtime_facts`).
+    ts_facts = (
+        _ts_file_facts(sorted({*paths, *reader_paths}), repo_dir)
         if language in ("ts", "tsx", "js")
         else {}
     )
@@ -1842,7 +1926,7 @@ def _transform_flag(
         argument_flags=argument_flags,
         flag_key=flag_key,
         repo_dir=repo_dir,
-        file_facts=widths,
+        file_facts=ts_facts,
     )
 
     unprocessable: list[str] = list(skipped)
@@ -1916,6 +2000,7 @@ def _transform_flag(
         # for the same reason.
         entries, entry_paths = _flag_keyed_entries(summaries, repo_dir)
         engine_stranded = list(_engine_stranded(summaries, language, repo_dir))
+        engine_assertions = list(_engine_assertions(summaries, repo_dir))
         engine_inlined = _engine_inlined(summaries)
         engine_bindings = _engine_bindings(summaries, repo_dir)
 
@@ -1936,6 +2021,14 @@ def _transform_flag(
                 entries=entries,
                 entry_paths=entry_paths,
                 dead_loops=engine_stranded,
+                assertions=engine_assertions,
+                inline_across=_BOUND_ACROSS_FILES.get(language)
+                and partial(
+                    _BOUND_ACROSS_FILES[language],
+                    language=language,
+                    marker=substitutions["marker"],
+                    in_run=lambda p: _grammar_of(p, language) == language,
+                ),
             )
     finally:
         # Every engine invocation — the first pass, the quarantine retry, and
@@ -1959,6 +2052,8 @@ def _transform_flag(
     summaries, test_doubles = _settle_test_doubles(
         summaries, doubles, language, accessors, repo_dir, unprocessable
     )
+    # Listed with the mock lines: each checked a flag read this removal folded.
+    test_doubles = test_doubles + tuple(engine_assertions)
 
     # PHP only, and BEFORE the whitespace tidy rather than beside the Python
     # fold below — that ordering is the point. Promoting a mid-chain `elseif`
@@ -2126,6 +2221,11 @@ def _transform_flag(
     # before Gate 1, which judges every file this rewrites.
     family_names: frozenset[str] = frozenset()
     if language == "csharp":
+        # A helper's parameter of a completed gate interface the fold left
+        # unread goes first, with every caller's argument, so what passed the
+        # argument (a field, a constructor parameter) is judged unread below.
+        summaries, method_rows = _remove_unread_method_parameters(summaries, wrappers, wrapper_rows, repo_dir)
+        bindings = bindings + method_rows
         summaries, residue_rows, family_names = csharp_residue.remove(
             wrappers,
             wrapper_rows,
@@ -2224,10 +2324,29 @@ def _transform_flag(
     )
     bindings = bindings + comment_rows
 
+    # The comment directly above a statement this run deleted outright: gone
+    # with it when it describes the flag's state, reported otherwise.
+    summaries, leading_rows, leading_reported = _leading_comments(
+        summaries,
+        paths,
+        unprocessable,
+        {s.path for s in deleted_files},
+        language,
+        flag_key,
+        repo_dir,
+    )
+    bindings = bindings + leading_rows
+
     # Comments beside the changes that describe a flag's state without naming
     # it ("while the flag is off"): reported, never edited. After every edit,
     # so the lines named are the ones that stay on disk.
-    bindings = bindings + _flag_state_comments(summaries, language, flag_key, treatment, repo_dir)
+    bindings = bindings + _flag_state_comments(
+        summaries, language, flag_key, treatment, repo_dir, leading_reported
+    )
+
+    # An assertion the fold made one that can only fail (`Assert.True(false)`)
+    # tested the branch this removal deletes: reported, never edited.
+    bindings = bindings + _failing_assertions(summaries, language, repo_dir)
 
     # GATE 1 — if the transform broke any file, discard ALL of it. A partial
     # rewrite is not an option: the flag would look half-removed, and a diff
@@ -2857,6 +2976,81 @@ def _drop_unread_parameters(
     return result, tuple(remaining), tuple(dropped)
 
 
+def _flag_still_named(summaries, paths, unprocessable, deleted, flag_key: str) -> bool:
+    """Whether this pass still names ``flag_key`` outside a comment (or could
+    not tell): a file the engine could not process, or one that still names
+    the key in code. While it does, the flag is in use here and a comment
+    describing it may still be true, so no comment about it is deleted."""
+    if unprocessable:
+        return True
+    by_path = {s.path: s for s in summaries}
+    for path in paths:
+        if path in deleted:
+            continue
+        if path in by_path:
+            text = by_path[path].content
+        else:
+            try:
+                with open(path, encoding="utf-8", newline="") as handle:
+                    text = handle.read()
+            except (OSError, UnicodeDecodeError):
+                return True
+        if residue.live_mention(path, text, flag_key):
+            return True
+    return False
+
+
+def _leading_comments(
+    summaries,
+    paths: list[str],
+    unprocessable: Iterable[str],
+    deleted: set[str],
+    language: str,
+    flag_key: str,
+    repo_dir: str,
+) -> tuple[list, tuple[tuple[str, str, str], ...], dict[str, frozenset[int]]]:
+    """Deal with the comment directly above each statement this run deleted
+    outright (see :func:`flag_cleanup.stale_comments.leading_comments`).
+
+    One describing a flag's state explained only that statement, and is
+    deleted with it (a ``removed comment`` row), under the same condition as
+    :func:`_remove_stale_comments`. Any other is reported as describing
+    behaviour this run removed (a ``removed-branch comment`` row). Also
+    returns, per path, the lines of the comments reported, so the flag-state
+    report does not name them twice.
+    """
+    may_delete = not _flag_still_named(summaries, paths, unprocessable, deleted, flag_key)
+    result = list(summaries)
+    rows: list[tuple[str, str, str]] = []
+    reported: dict[str, frozenset[int]] = {}
+    for index, summary in enumerate(result):
+        if summary.original_content == summary.content or not summary.content:
+            continue
+        grammar = _grammar_of(summary.path, language)
+        if grammar == "erb" or not summary.path.endswith(_LANGUAGES[grammar].extensions):
+            continue
+        relative = os.path.relpath(summary.path, repo_dir)
+        found = stale_comments.leading_comments(summary.original_content, summary.content, grammar, flag_key)
+        going = [c for c in found if c.describes_state] if may_delete else []
+        if going:
+            after = stale_comments.remove_leading(summary.content, grammar, going)
+            if after is not None:
+                git_ops.before_writing([summary.path])
+                with open(summary.path, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(after)
+                summary = Rewrite(summary.path, summary.original_content, after)
+                result[index] = summary
+                rows.extend((relative, "removed comment", c.removal.text) for c in going)
+                found = stale_comments.leading_comments(summary.original_content, after, grammar, flag_key)
+        kept = [c for c in found if not (may_delete and c.describes_state)]
+        rows.extend(
+            (relative, stale_comments.REMOVED_BRANCH_KIND, f"{c.removal.line}: {c.text}") for c in kept
+        )
+        if kept:
+            reported[summary.path] = frozenset(row for c in kept for row in c.rows)
+    return result, tuple(rows), reported
+
+
 def _remove_stale_comments(
     summaries,
     paths: list[str],
@@ -2880,7 +3074,7 @@ def _remove_stale_comments(
     are gone by construction. A file the residue named as prose is examined
     too, and its rows are renumbered or dropped to match.
     """
-    if unprocessable:
+    if _flag_still_named(summaries, paths, unprocessable, deleted, flag_key):
         return summaries, (), wrapper_rows
     by_path = {s.path: s for s in summaries}
 
@@ -2894,10 +3088,6 @@ def _remove_stale_comments(
             return None
 
     files = [p for p in paths if p not in deleted]
-    for path in files:
-        text = text_of(path)
-        if text is None or residue.live_mention(path, text, flag_key):
-            return summaries, (), wrapper_rows
     if family_names:
         known = {str(Path(p).resolve()) for p in files} | {str(Path(p).resolve()) for p in deleted}
         root = Path(repo_dir).resolve()
@@ -2957,7 +3147,12 @@ def _remove_stale_comments(
 
 
 def _flag_state_comments(
-    summaries, language: str, flag_key: str, treatment: bool, repo_dir: str
+    summaries,
+    language: str,
+    flag_key: str,
+    treatment: bool,
+    repo_dir: str,
+    reported: dict[str, frozenset[int]] | None = None,
 ) -> tuple[tuple[str, str, str], ...]:
     """A ``(path, kind, "<line>: <text>")`` row for each comment on or
     directly above a changed line that describes a flag's state without
@@ -2973,7 +3168,12 @@ def _flag_state_comments(
             continue
         relative = os.path.relpath(s.path, repo_dir)
         for found in stale_comments.flag_state_comments(
-            s.original_content, s.content, grammar, flag_key, treatment
+            s.original_content,
+            s.content,
+            grammar,
+            flag_key,
+            treatment,
+            (reported or {}).get(s.path, frozenset()),
         ):
             kind = (
                 stale_comments.REMOVED_BRANCH_KIND
@@ -4151,7 +4351,29 @@ def _inline_python_bindings(before: str, after: str, marker: str, *, language: s
 
 
 def _inline_ts_bindings(before: str, after: str, marker: str, *, language: str) -> str:
-    return ts_fold.inline_literal_bindings(before, after, language, marker)
+    """A local the fold bound to a literal (:mod:`flag_cleanup.ts_fold`), or,
+    when there is none, a JSX prop it made one literal at every call site
+    (:mod:`flag_cleanup.ts_constant_props`), or a private function's parameter
+    it made one literal at every call (:mod:`flag_cleanup.ts_constant_params`).
+    One of them per round: each refuses a file that already holds the marker.
+    When none fires, the props, then the private function parameters, the run
+    left unread are deleted (:mod:`flag_cleanup.ts_unread_props`,
+    :func:`flag_cleanup.ts_constant_params.drop_unread_params`): those write
+    no marker, and come last because a round of the others is usually what
+    strands them."""
+    inlined = ts_fold.inline_literal_bindings(before, after, language, marker)
+    if inlined != after:
+        return inlined
+    inlined = ts_constant_props.inline_constant_props(before, after, language, marker)
+    if inlined != after:
+        return inlined
+    inlined = ts_constant_params.inline_constant_params(before, after, language, marker)
+    if inlined != after:
+        return inlined
+    inlined = ts_unread_props.drop_unread_props(before, after, language)
+    if inlined != after:
+        return inlined
+    return ts_constant_params.drop_unread_params(before, after, language)
 
 
 #: The languages whose post-engine inliner hands its result back to the engine
@@ -4166,6 +4388,18 @@ _BOUND_LITERAL_INLINERS = {
 }
 
 
+def _inline_exported_props(files, repo_dir: str, *, language: str, marker: str, in_run):
+    """A prop of an exported component the fold made one literal at every
+    element across the checkout (:mod:`flag_cleanup.ts_exported_props`)."""
+    return ts_exported_props.inline_exported_props(files, language, marker, repo_dir, in_run)
+
+
+#: The languages with an inliner whose edit spans files, run by
+#: :func:`_inline_bound_reads` in a round no single-file inline used. Only the
+#: grammars with JSX.
+_BOUND_ACROSS_FILES = {"tsx": _inline_exported_props, "js": _inline_exported_props}
+
+
 def _inline_bound_reads(
     summaries,
     *,
@@ -4178,6 +4412,8 @@ def _inline_bound_reads(
     entries: tuple[tuple[str, str], ...],
     entry_paths: set[str],
     dead_loops: list[tuple[str, str]] | None = None,
+    assertions: list[tuple[str, str, str]] | None = None,
+    inline_across=None,
 ):
     """Resolve reads the fold left bound to a local, through the engine (#3029).
 
@@ -4259,6 +4495,23 @@ def _inline_bound_reads(
             )
             if inlined != summary.content:
                 staged[path] = (summary.content, inlined)
+        # Only when no single file had anything: an edit spanning files
+        # (``inline_across``) is all or nothing, so it goes in a round of its
+        # own, and a file it reaches that the run had not changed joins it.
+        together: set[str] = set()
+        if not staged and inline_across is not None:
+            across = inline_across(
+                {
+                    p: (s.original_content, s.content)
+                    for p, s in current.items()
+                    if p not in declined
+                },
+                repo_dir,
+            )
+            for path, (previous, rewritten) in across.items():
+                originals.setdefault(path, previous)
+                staged[path] = (previous, rewritten)
+            together = set(across)
         if not staged:
             break
 
@@ -4289,10 +4542,17 @@ def _inline_bound_reads(
         entry_paths |= round_paths
 
         results = {s.path: s for s in produced}
-        for path, (previous, inlined) in staged.items():
+
+        def _content(path: str) -> str:
             summary = results.get(path)
-            content = summary.content if summary is not None else inlined
-            if marker in content:
+            return summary.content if summary is not None else staged[path][1]
+
+        # A cross-file edit whose marker survived in one file is unwound in
+        # every file: the others no longer pass a prop that file still takes.
+        unwind_together = any(marker in _content(p) for p in together)
+        for path, (previous, inlined) in staged.items():
+            content = _content(path)
+            if marker in content or (unwind_together and path in together):
                 # Never a diff. The engine left behind something this pass
                 # wrote, so the file would ship a call to an identifier that
                 # does not exist — and unlike a bad fold it parses, so Gate 1
@@ -4304,6 +4564,8 @@ def _inline_bound_reads(
                 )
                 Path(path).write_text(previous, encoding="utf-8")
                 declined.add(path)
+                if path not in current:
+                    originals.pop(path, None)
                 continue
             current[path] = Rewrite(path, originals[path], content)
 
@@ -4314,6 +4576,10 @@ def _inline_bound_reads(
                 _engine_stranded(
                     [s for s in produced if s.path not in declined], language, repo_dir
                 )
+            )
+        if assertions is not None:
+            assertions.extend(
+                _engine_assertions([s for s in produced if s.path not in declined], repo_dir)
             )
 
     return list(current.values()), entries, entry_paths
@@ -4524,6 +4790,44 @@ def _unread_constructor_rows(
         + _unread_private_members(summaries, language, repo_dir)
         + _unread_plain_constructor_parameters(summaries, language, repo_dir)
     )
+
+
+def _remove_unread_method_parameters(
+    summaries, plan: wrapper_inline.WrapperPlan, statuses: list, repo_dir: str
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Remove each C# static method's parameter typed as the interface of a
+    completed gate family that the run left unread, with each call's
+    argument; see :mod:`~flag_cleanup.method_param_csharp`. Returns the
+    summaries and the rows naming what went, plus what it stranded."""
+    complete = {f.wrapper for f in statuses if f.reason == wrapper_inline.COMPLETE}
+    types = frozenset(
+        w.interface.name
+        for w in plan.wrappers
+        if w.language == "csharp" and w.interface is not None and w.label in complete
+    )
+    if not types:
+        return summaries, ()
+    unread: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content or _grammar_of(summary.path, "csharp") != "csharp":
+            continue
+        relative = os.path.relpath(summary.path, repo_dir)
+        unread.extend(
+            (relative, "unread method parameter", label)
+            for label in method_param_csharp.unread_parameters(summary.original_content, summary.content, types)
+        )
+    if not unread:
+        return summaries, ()
+    result = ctor_param_removal.remove(
+        summaries,
+        "csharp",
+        tuple(unread),
+        repo_dir,
+        engine=lambda paths, rules, widths: _execute_ctor_param_rules(paths, "csharp", rules, repo_dir, widths=widths),
+    )
+    for path, _kind, label in result.unread:
+        logger.info("keeping the unread parameter %s in %s", label, path)
+    return result.summaries, result.rows
 
 
 def _remove_unread_constructor_parameters(
@@ -4935,6 +5239,14 @@ def _execute(
             rules = const_rules_file.read_text(encoding="utf-8") + "\n" + rules
         if entries_rules_file is not None and entries_rules_file.exists():
             rules = rules + "\n" + entries_rules_file.read_text(encoding="utf-8")
+        # The trivial-assertion rules are reached only by edges in the base
+        # edges file, so they ride with it: appended wherever it is used.
+        if edges_file.name.endswith("_edges.toml"):
+            assertions = edges_file.with_name(
+                edges_file.name.removesuffix("_edges.toml") + "_assertions.toml"
+            )
+            if assertions.exists():
+                rules = rules + "\n" + assertions.read_text(encoding="utf-8")
         (cfg / "rules.toml").write_text(rules, encoding="utf-8")
         edges = edges_file.read_text(encoding="utf-8") if edges_file.exists() else ""
         if edges:
@@ -5001,6 +5313,40 @@ def _print_width_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[s
     return facts
 
 
+def _jsx_runtime_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[str, str]]]:
+    """The ``jsx_runtime = "automatic"`` fact for each file in ``paths`` that
+    holds JSX (by text, ``</`` or ``/>``, as the engine's guard finds it) and
+    whose every compiler config sets the automatic runtime
+    (:func:`~flag_cleanup.cross_file_ts.jsx_automatic`), by absolute path.
+
+    Under that runtime an element calls a function the compiler imports
+    itself, never one the file binds, so the engine's stranded-import
+    specifier rules lift their JSX guard for a file carrying the fact. A file
+    with an ``@jsx`` pragma still keeps the guard: the engine withholds on the
+    pragma whatever the fact says. Any doubt about the config answers no fact,
+    which keeps the guard: a missed tidy rather than a broken build."""
+    from flag_cleanup import cross_file_ts
+
+    facts = {}
+    for path in paths:
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            continue
+        if (b"</" in data or b"/>" in data) and cross_file_ts.jsx_automatic(path, repo_dir):
+            facts[os.path.abspath(path)] = [{"jsx_runtime": "automatic"}]
+    return facts
+
+
+def _ts_file_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[str, str]]]:
+    """:func:`_print_width_facts` and :func:`_jsx_runtime_facts` together, by
+    absolute path: one fact each, side by side in the file's list."""
+    facts = _print_width_facts(paths, repo_dir)
+    for path, found in _jsx_runtime_facts(paths, repo_dir).items():
+        facts.setdefault(path, []).extend(found)
+    return facts
+
+
 def _go_file_facts(paths: list[str]) -> dict[str, list[dict[str, str]]]:
     """:func:`~flag_cleanup.unused.go_import_facts` for each Go file in ``paths``, by absolute path."""
     facts = {}
@@ -5026,12 +5372,19 @@ def _summaries_to_diff(summaries, repo_dir: str) -> str:
     same flag over the same tree produces a differently-ordered diff each time.
     That string is what the customer reads in a dry run.
     """
-    # `repo_dir` may name a single FILE (a supported `directories` value), in
-    # which case relative_to(root) is `.` — and the whole diff header becomes
-    # `--- a/.`, which is the entire visible output of a dry run. Relativise
-    # against the parent so the file is named either way.
-    root = Path(repo_dir)
-    root = root.parent if root.is_file() else root
+    # Spelled from the REPOSITORY root, whatever directory this pass swept,
+    # so the diffs of several passes concatenate into one patch that applies
+    # from the checkout root. The residue passes hand back absolute paths and
+    # the engine hands back paths as it was given them; both go through the
+    # one helper every other rendered path uses.
+    root = report_paths.repository_root(repo_dir)
+    # Outside a checkout there is no repository root, and the swept directory
+    # stands in for it. `repo_dir` may name a single FILE (a supported
+    # `directories` value), in which case it is relativised against its
+    # parent, so the header names the file rather than `.`.
+    if root is None:
+        fallback = Path(repo_dir)
+        root = str(fallback.parent if fallback.is_file() else fallback)
     chunks: list[str] = []
     for summary in sorted(summaries, key=lambda s: s.path):
         before = summary.original_content
@@ -5039,10 +5392,7 @@ def _summaries_to_diff(summaries, repo_dir: str) -> str:
         gone = file_deletion.deleted(summary)
         if before == after and not gone:
             continue
-        try:
-            rel = str(Path(summary.path).relative_to(root))
-        except ValueError:
-            rel = summary.path
+        rel = report_paths.shown(summary.path, root)
         # A deleted file is spelled the way git spells one: its new side is
         # /dev/null. An empty file has no hunk, so its headers stand alone.
         tofile = "/dev/null" if gone else f"b/{rel}"

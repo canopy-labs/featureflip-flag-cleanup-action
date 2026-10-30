@@ -1,0 +1,68 @@
+# Assertions the fold made trivially true, for kt. Appended to the rules
+# whenever `kt_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `kt.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the call is deleted
+#
+# `assertTrue(flags.isEnabled("k"))` in a test folds to `assertTrue(true)`: a
+# check the removal made meaningless. Reached ONLY from the fold's own literal
+# (kt_edges.toml, Parent scope from the groups that write one), never as a
+# seed, so an `assertTrue(true)` the customer wrote stays. The assertion APIs
+# are policy: kotlin.test and JUnit, bare or on `Assert`/`Assertions`. The
+# literal is an `identifier` in this grammar (see kt_entries.toml). An
+# assertion folded to the FAILING literal is never matched.
+
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (call_expression
+    .
+    (_) @assert_callee
+    .
+    (value_arguments . (value_argument (identifier) @asserted) .)) @statement
+  (#match? @statement "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertTrue[[:space:]]*[(]")
+  (#eq? @asserted "true")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (call_expression
+    .
+    (_) @assert_callee
+    .
+    (value_arguments . (value_argument (identifier) @asserted) .)) @statement
+  (#match? @statement "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertFalse[[:space:]]*[(]")
+  (#eq? @asserted "false")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (call_expression
+    .
+    (_) @assert_callee
+    .
+    (value_arguments
+      .
+      (value_argument (identifier) @expected)
+      .
+      (value_argument (identifier) @actual)
+      .)) @statement
+  (#match? @statement "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertEquals[[:space:]]*[(]")
+  (#match? @expected "^(true|false)$")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false

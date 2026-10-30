@@ -49,7 +49,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import syntax
+from flag_cleanup import report_paths, syntax
 from flag_cleanup.piranha_runner import _SKIP_DIRS, source_files
 
 # Pruned from the sibling and caller scan for the reason the residual scan
@@ -249,10 +249,25 @@ def _changed_lines(diff: str) -> dict[str, _Changed]:
 def _resolve(rel: str, directories: tuple[str, ...]) -> Path | None:
     """The file a diff path names, under whichever configured directory holds it.
 
-    Diff paths are relative to the directory the transform ran in (its parent,
-    for a directory entry naming a single file), so with several directories
-    configured the first one holding the file is the one that produced it.
+    Diff paths are relative to the repository root, and the file is returned
+    spelled under the first configured directory holding it, the way the
+    corpus spells every other file. Outside a checkout they are relative to
+    the directory the transform ran in (its parent, for a directory entry
+    naming a single file), so with several directories configured the first
+    one holding the file is the one that produced it.
     """
+    root = report_paths.repository_root(directories[0]) if directories else None
+    if root is not None:
+        target = os.path.join(root, rel)
+        if not os.path.isfile(target):
+            return None
+        for directory in directories:
+            base = Path(directory)
+            base = base.parent if base.is_file() else base
+            inside = report_paths.shown(target, os.path.abspath(base))
+            if not os.path.isabs(inside):
+                return Path(os.path.normpath(os.path.join(base, inside)))
+        return None
     for directory in directories:
         root = Path(directory)
         root = root.parent if root.is_file() else root

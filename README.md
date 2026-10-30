@@ -2315,7 +2315,12 @@ where it never spells the name itself, except a string passed straight into
 a method of another file (`Check.True(Allowlist.Has(Kind.X, "IsX"))`: the
 call is a statement of its own, or an argument of one, its qualifier names a
 type, its other arguments read only constants of such types, and nothing on
-the way spells `IgnoreCase`), which is judged where that method is. A prefix (`"*"` included) counts only
+the way spells `IgnoreCase`), which is judged where that method is, and a
+string passed to a `private` method of the class that uses the parameter
+only as a hole of interpolated SQL handed to Entity Framework
+(`db.Database.ExecuteSqlAsync($"… {payloadJson} …")`, or `ExecuteSql`,
+`FromSql`, `SqlQuery`, with no format clause and no method of yours of that
+name): the database binds it as a parameter value. A prefix (`"*"` included) counts only
 while some C# file of yours spells a lookup that takes one: `GetMember`,
 `GetMembers`, `FindMembers` or `Type.FilterName`. A string spelling an accessor's name
 (`"get_IsX"`, `"set_IsX"`) or the backing field's (`"<IsX>k__BackingField"`)
@@ -2551,22 +2556,52 @@ or not at all:
   the parameter, the private field it was stored in, the statement that stored
   it, and the argument every caller passes. A constructor whose only parameter
   that was, written `=> _gate = gate;`, is deleted, and C# supplies the
-  parameterless one;
+  parameterless one. A primary-constructor parameter of these types that the
+  run left unread goes the same way, with every caller's argument, under the
+  rules for an unread primary-constructor parameter below;
 - in test projects, each `Mock<T>` or `Substitute.For<T>()` of these types
+  (a `Mock<T>` field or local may be built with a target-typed `new()`)
   that is only passed to such a constructor, each test that only builds one of
-  them and asserts a literal, and a test class those leave empty, or that the
-  run's test-double edits left empty;
-- in test projects, a field declared as a test fake and initialised by
-  nothing, `new()` or `new Fake()`, when every use of it is something else
-  listed here (registering it as the instance, `services.AddSingleton<I>(Gate)`,
-  included) and nothing outside its class can see it (it is `private`, or its
-  class is a `private` nested one); a `<see cref="Gate"/>` naming it becomes
-  `<c>Gate</c>`;
+  them and asserts a literal, each test whose every statement is an
+  `Assert.…(…)` naming one of them in `typeof(…)` and that names them nowhere
+  else (`Assert.DoesNotContain(…, p => p.ParameterType == typeof(IGate))`:
+  with the type gone it asserts nothing; it is listed in the pull request,
+  with a `//` comment block standing alone above it), and a test class those
+  leave empty, or that the run's test-double edits left empty;
+- in test projects, a field or auto-property declared as a test fake and
+  initialised by nothing, `new()` or `new Fake()` (a property also
+  `new(enabled: true)`, with literal arguments), when every use of it is
+  something else listed here (registering it as the instance,
+  `services.AddSingleton<I>(Gate)`, or passing it to a constructor that loses
+  the parameter, included) and nothing outside its class can see it (it is
+  `private`, or its class is a `private` nested one) or no file names it
+  outside its class; a `<see cref="Gate"/>` naming it becomes `<c>Gate</c>`;
+- in test projects, a local built as a test fake
+  (`var gate = new StubGate(enabled: true);`) whose every later read is an
+  argument this removes;
+- a statement that only asks the container for one of these types and keeps
+  nothing the run still reads: `sp.GetRequiredService<IGate>();` (what is left
+  of `var gate = …` once nothing reads `gate`), or `IGate gate =
+  sp.GetService<IGate>()!;` whose every later read is an argument this
+  removes. The receiver must be a name or a chain of property reads
+  (`scope.ServiceProvider`), and no file of yours may declare a method of the
+  lookup's name;
 - a call of a test host's own registration helper with these types
-  (`Replace<I>(services, new Fake())`), when the helper is a `private` generic
-  method of the same class whose body only calls `RemoveAll<T>()` and
+  (`Replace<I>(services, new Fake())`, wherever it stands, a lambda
+  included), when the helper is a `private` generic method of the same class
+  whose body only calls `RemoveAll<T>()` and
   `AddSingleton`/`AddScoped`/`AddTransient` (or `TryAdd…`) on its two
-  parameters;
+  parameters. The fake may be built with arguments
+  (`new Fake(enabled: true)`) when they are literals and its constructor only
+  stores them;
+- a `private` method's parameter of these types whose only reads register
+  it (`services.AddScoped(_ => gate);`, or another `Add…`/`TryAdd…` that takes
+  its service type from the lambda; `AddSingleton(gate)` too): those
+  registrations, the parameter and the argument every call passes for it. The
+  method must be the only member of its name, its class not `partial`, and
+  every call `M(…)`, `this.M(…)` or `Owner.M(…)` directly in the class (not
+  in a nested type), with an argument that does no work; no `typeof` of the
+  class and no string spelling the method's name may appear anywhere;
 - a conventional middleware whose `Invoke`/`InvokeAsync(HttpContext, …)`
   took one of these types and now only passes the request on: its fields are
   private, its one constructor only stores its arguments, and its method ends
@@ -2594,23 +2629,40 @@ or not at all:
 Every mention of each deleted type is looked for by text in every file of the
 repository (build output under `bin` and `obj` aside). Each must be one of the
 above, or a comment, Markdown text or the source of another language outside
-every C# project's directory (another tool's fixture, say), which is listed
-in the pull request and left as it is. Anything else keeps all of it as it was: a string naming the
+every C# project's directory (another tool's fixture, say), or a Terraform
+or other HCL file (`.tf`, `.tfvars`, `.hcl`) naming it only on comment lines
+(`#`, `//`, a `/* */` block that starts its line; never inside a heredoc),
+which is listed in the pull request and left as it is. Anything else keeps all of it as it was: a string naming the
 type, a configuration or Razor file naming it, a use not listed above, an
 assembly scan whose filter could include the types, a public constructor in a
 project that may be packed, a project `<Using>` of an emptied namespace. The
-pull request then says what kept it, and the flag is still removed. When only
+pull request then lists everything that kept it, and the flag is still removed.
+A test class the run left with no member is deleted even then, and its file
+with it when the file declares nothing else (the pull request lists both),
+unless the class is `partial`, has an attribute, a base class
+(`IClassFixture<T>` included) or type parameters, or is named anywhere else. When only
 the options class or its configuration cannot be followed (the key set as an
 environment variable or in a chart, a string reading the section, a binder
-setting that rejects unknown keys), that part stays and the rest goes.
+setting that rejects unknown keys), that part stays and the rest goes. A
+configuration key of another section that ends in the setting's name
+(`configuration.GetValue("Quartz:Enabled", true)` for a class bound to
+`Scheduled`) does not keep it, when it is a plain string passed straight to
+`GetValue`, `GetSection`, `GetRequiredSection` or a configuration indexer
+and your code declares no method or string indexer of that kind. A constant
+the options class declares keeps it only when its value is more than
+literals and operators (`const long MaxBytes = 64 * 1024` does not; a
+constant naming another member does).
 
-Two results to know about:
+Three results to know about:
 
 - a `using` of an emptied namespace is deleted on the assumption that no
   assembly outside the repository declares types in your own namespace;
 - the SDK client the wrapper class received is no longer created through it.
   If nothing else asks the container for it, it is created later, or not at
   all.
+- a deleted lookup statement no longer asks the container for the gate, so
+  the gate (and what its constructor takes) is not created there. Property
+  reads on the receiver path are assumed to do nothing else.
 
 What still keeps it, by design, until it can be proven:
 
@@ -2620,9 +2672,11 @@ What still keeps it, by design, until it can be proven:
   target-typed `new(…)` does not count in a project that cannot reference the
   class, or where its context names the type it creates: the arrow body or a
   `return` of a method, local function or property that is not `async`, an
-  explicitly typed declaration, or an element of a `new List<T> { … }` or
-  `new HashSet<T> { … }` initializer (taken to be the framework's when no
-  file of yours declares one), naming a type of another name that no
+  explicitly typed declaration, an element of a `new List<T> { … }` or
+  `new HashSet<T> { … }` initializer, or the argument of `x.Add(new(…))` on a
+  library collection `x` declared with its type or `var x = new List<T>(…)`
+  (each taken to be the framework's when no file of yours declares one),
+  naming a type of another name that no
   `using` alias and no type parameter takes. A `typeof(…)` does not count
   when it is a positional argument of your own `sealed` attribute, named
   without a qualifier, deriving from `Attribute` alone with a primary
@@ -2638,7 +2692,35 @@ What still keeps it, by design, until it can be proven:
   looked up anywhere but on `typeof(X)` of another type, or takes
   attributes other than as one named type (`GetCustomAttributes(true)`,
   `GetCustomAttributes<Attribute>()`). Library code that reflects over every
-  attribute's properties is not seen;
+  attribute's properties is not seen. Nor does a `typeof(…)` anywhere else
+  count when every value made from it in its file only reads what cannot
+  construct anything. The value may be held in a collection expression or an
+  array creation, a `private` field of a class that is not `partial`, a
+  local, a `foreach` variable, a lambda's parameter or a `private` method of
+  the same class that has no base class (its parameter, and what it returns
+  to every call of the same number of arguments). Each must be declared
+  `var` or as `Type`, `MemberInfo`, `MethodInfo`, `PropertyInfo`, `object`
+  or a library collection of those, and no type of yours may have one of
+  those names. It may pass through `System.Linq` methods that neither compare
+  nor order (`Where`, `Concat`, `Select`, `SelectMany`, `ToList`, `First`,
+  `Any`, `All`, `Count` and the like, with one lambda or method group of this
+  class at most) and through `GetMethods`/`GetProperties`/`GetMethod`/`GetProperty`
+  (a name and binding flags). It must end in `Name`, `FullName`, `Namespace`,
+  `IsSpecialName` or another flag, `GetCustomAttribute(s)`, `IsDefined`, `==`
+  or `!=` against `null` or another `typeof`, or a pattern that binds
+  nothing. Anything else keeps the constructor: `GetConstructors`, `Invoke`,
+  `DeclaringType`, `Contains`, `OrderBy`, interpolating it into a string, an
+  argument to any other call, an assignment. So does a name read when any C#
+  file of yours looks a type up by name (`GetType(name)`). Reflection could
+  also take the value elsewhere, so a `typeof` of the class holding those
+  fields or methods keeps it too. So does the class handing out `this`, and
+  so does reflection over members (a string or `nameof` naming one of them,
+  `GetFields`, `GetMethod`, `UnsafeAccessor`) in a file that can reach that
+  class's type: one that names it, the class's own file calling `GetType()`,
+  or an assembly scan from a project that can see it. An extension method of
+  yours named like one of the calls made on the value, or a C# 14
+  `extension` block spelling it, keeps it as well. A name built at run time
+  in a file that cannot reach the class is not seen;
 - a binding whose configuration is not provably the root (a local, a
   `GetSection(…)` result, a parameter some caller passes something other
   than a host's `Configuration` or a configuration it built itself with
@@ -3877,6 +3959,12 @@ from before the fold against the code after — so a local declared inside one i
 always left standing rather than guessed at. In a codebase built out of
 arrow-function components, that is most functions.
 
+A local whose value does work (`const params = useParams()`) keeps that work:
+the declaration becomes the call alone, `useParams();`. A destructured name left
+unused leaves its pattern when the pattern keeps another name
+(`const { orgId, tab } = useParams()` becomes `const { tab } = useParams()`),
+and a pattern it was the only name of is treated like the plain local above.
+
 A binding at the **top level of a module** is cleaned too — the usual
 `const client = OpenFeature.getClient();` above the functions that read the
 flag. It needs no name to match against, because a file has exactly one top
@@ -4305,13 +4393,34 @@ holds:
 - an XML-doc `cref` names its constructor (`<see cref="Svc(IClient)"/>`),
   which is CS1574 once the signature changes;
 - a target-typed `new(…)` anywhere in the repository passes a number of
-  arguments the constructor could take;
+  arguments the constructor could take, unless a literal it passes cannot
+  convert to the parameter at that position: an interface the repository
+  declares, a class or struct of the repository that declares no conversion
+  operator (for an interpolated string, which may build a handler, only the
+  interface counts), or a common framework type no literal converts to, such
+  as `TimeProvider`, `CancellationToken`, `HttpClient`, `ILogger<T>` or
+  `IOptions<T>`, taken as the framework's when no file of the repository
+  declares or aliases that name. A `new(…)` passed alone to `x.Add(…)` on a
+  local declared as a framework `List<T>`, `HashSet<T>` or similar creates a
+  `T` (also for `var x = M(…)` with `M` a method declared once in the class
+  and called with exactly its parameters, when no base type is one of the
+  repository's), unless the repository declares an `Add` extension method.
+  One initialising an auto-property creates the property's type;
 - a Razor, `.cshtml` or other non-C# .NET file mentions it, or a `using`
   alias names it;
 - a spelling of the name may be another type: qualified with a different
   namespace, or unqualified in a file that neither sits in the type's
   namespace nor imports it (with `using`, `global using` or an MSBuild
-  `<Using>` item);
+  `<Using>` item). When the repository declares another type of the same
+  name in another namespace, each spelling is looked up the way C# does
+  (enclosing namespaces, then `using` directives, global usings and
+  `<Using>` items), and one that names the other type is skipped. A
+  target-typed `new(…)` whose context spells the shared name (the return
+  type of the method it is returned from, say) is looked up from that
+  spelling the same way. A spelling that may name either (both namespaces
+  imported, a `using` alias, a local of the name), a nested or generic type
+  of the name, or another part of a `partial` type still keeps the
+  parameter;
 - a generic call passes arguments while naming the type
   (`new Mock<Svc>(client, log)`, `Substitute.ForPartsOf<Svc>(…)`), which a
   mock or proxy library uses to construct it positionally;
@@ -4331,6 +4440,22 @@ type's own parameter `c` unread, which is CS9113 again. That parameter is
 removed the same way, with the argument each of its own callers passes, and so
 on down a chain of derived types. When its callers cannot be proven, it is
 named in the warning instead.
+
+A gate passed down to a static helper is handled the same way. When the fold
+leaves a parameter of a removed gate interface unread
+(`public static string ForStorage(string secret, IGate gate) => …`), the
+parameter and every caller's argument for it are removed, so the field or
+constructor parameter the caller passed it from can go with the rest of the
+gate family. This needs the method to be `static`, not `extern`, `partial`,
+`abstract`, `virtual`, `override` or `new`, with no attribute or type
+parameter, and the only member of its name in a top-level `static` class that
+is not `partial` or generic. The parameter must have no attribute, modifier or
+default value, and the method's doc comment must not name it. The class must
+be spelled by its own name only (no alias, `using static`, string, Razor or
+project file, and no `typeof` of it). Every mention of the method must be a
+call (`Owner.M(…)`, or `M(…)` inside the class) passing an argument that does
+no work for it, and a `public` method must not be in a project that may be
+packed. Otherwise the parameter stays.
 
 A type constructed from a name the repository's C# never spells, such as one
 read from configuration and passed to `Type.GetType`, cannot be seen, and

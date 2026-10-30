@@ -395,6 +395,16 @@ def rewrite(source: str, grammar: str, names: re.Pattern[bytes]) -> tuple[str, l
     removals = plan(data, root, names)
     if not removals:
         return source, []
+    after = _cut(data, root, removals, grammar)
+    if after is None:
+        return source, []
+    text = after.decode("utf-8")
+    return ("\ufeff" + text if bom else text), removals
+
+
+def _cut(data: bytes, root: Node, removals: list[Removal], grammar: str) -> bytes | None:
+    """``data`` without ``removals`` (and the blank lines they would double),
+    or ``None`` when the result would change a code token."""
     out = bytearray()
     at = 0
     for start, end in _tidy(data, removals):
@@ -405,9 +415,8 @@ def rewrite(source: str, grammar: str, names: re.Pattern[bytes]) -> tuple[str, l
     out += data[at:]
     after = bytes(out)
     if _code_tokens(_parse(after, grammar)) != _code_tokens(root):
-        return source, []
-    text = after.decode("utf-8")
-    return ("\ufeff" + text if bom else text), removals
+        return None
+    return after
 
 
 def follow(row_text: str, source: str, removals: list[Removal]) -> int | None:
@@ -514,44 +523,92 @@ def _sentence(text: str, at: int) -> str:
     return text[start : end.end() if end else len(text)]
 
 
-def flag_state_comments(
-    before: str, after: str, grammar: str, flag_key: str, treatment: bool
-) -> list[StateComment]:
-    """The comments of ``after`` that sit on, or directly above, a line the
-    run changed and describe a flag's state without naming ``flag_key``.
+#: "The flag" in prose, the subject of a comment about the flag's role
+#: ("the flag only decides whether…") rather than its state. Reported only,
+#: and only near the run's changes, like :data:`FLAG_STATE`.
+THE_FLAG = re.compile(r"\bthe\s+(?:feature\s+)?flag\b(?!\s+(?:client|service|provider|sdk)\b)", re.IGNORECASE)
 
-    Such a comment sat beside the read the run folded, so "while the flag is
-    off" is likely about THIS flag even though it never says which. That is a
-    guess from the wording, which is why each is only reported: a comment
-    line naming the key is decided by :func:`rewrite` and the kept-comment
-    report instead, and is left out here, though another line of the same
-    comment is not. A run of adjacent comments is one comment, so a phrase
-    wrapped onto its next line is still found.
+#: Words that vanish from a file when a branch goes without naming anything
+#: a comment could be about.
+_KEYWORDS = frozenset(
     """
-    if before == after or not FLAG_STATE.search(after):
-        return []
-    data = after.encode("utf-8")
-    try:
-        root = _parse(data, grammar)
-    except Exception:  # noqa: BLE001 - report only; an unparsable file reports nothing
-        return []
-    names = names_pattern(flag_key)
-    written, below_deletion = _changed_rows(before, after)
+    if else elif elsif when then end do return true false null nil none
+    var let const val def fun func function new this self await async
+    """.split()
+)
+_IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")
+
+
+def removed_names(before: str, after: str, root: Node) -> frozenset[str]:
+    """Identifiers on the lines the run changed that appear nowhere in the
+    code of ``after`` (parsed as ``root``; its comments do not count) and at
+    least twice in ``before``: a local bound to the read (``seatCapFlagOn``),
+    read and then inlined away. A comment naming one describes what the flag
+    decided."""
+    matcher = difflib.SequenceMatcher(
+        None, before.split("\n"), after.split("\n"), autojunk=False
+    )
+    lines = before.split("\n")
+    changed = {
+        name
+        for tag, i1, i2, _j1, _j2 in matcher.get_opcodes()
+        if tag != "equal"
+        for line in lines[i1:i2]
+        for name in _IDENTIFIER.findall(line)
+    }
+    left = {
+        name
+        for _type, text in _code_tokens(root)
+        for name in _IDENTIFIER.findall(text.decode("utf-8", "replace"))
+    }
+    return frozenset(
+        name
+        for name in changed - left - _KEYWORDS
+        if len(re.findall(rf"\b{re.escape(name)}\b", before)) >= 2
+    )
+
+
+def _trigger(names: frozenset[str]) -> re.Pattern[str]:
+    """What makes a comment near the run's changes worth reporting: a state
+    phrase, "the flag", or a name the run removed."""
+    parts = [FLAG_STATE.pattern, THE_FLAG.pattern]
+    if names:
+        parts.append(r"(?-i:\b(?:" + "|".join(sorted(map(re.escape, names))) + r")\b)")
+    return re.compile("|".join(f"(?:{part})" for part in parts), re.IGNORECASE)
+
+
+def _indent(line: bytes) -> int:
+    return len(line) - len(line.lstrip(b" \t"))
+
+
+def _reaches_change(
+    data: bytes, starts: list[int], ends: list[int], first: int, last: int, written: set[int], below: set[int]
+) -> bool:
+    """Whether the code below a comment reaches a line the run changed
+    without a blank line and without leaving the comment's block.
+
+    Leaving the block is read off indentation: a line indented less than the
+    comment closes the block the comment is in. A comment at the left margin
+    is never widened this way: there every top-level declaration below it
+    shares its block."""
+    indent = _indent(data[starts[first] : ends[first]])
+    if indent == 0:
+        return False
+    row = last + 1
+    while row < len(starts):
+        line = data[starts[row] : ends[row]]
+        if not line.strip() or _indent(line) < indent:
+            return False
+        if row in written or row in below:
+            return True
+        row += 1
+    return False
+
+
+def _comment_groups(data: bytes, root: Node, row_of) -> list[list[Node]]:
+    """Adjacent own-line comments, grouped as :func:`plan` groups them; a
+    comment after code is a group of its own."""
     starts = _line_starts(data)
-    ends = [*(s for s in starts[1:]), len(data)]
-
-    def row_of(offset: int) -> int:
-        lo, hi = 0, len(starts) - 1
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if starts[mid] <= offset:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
-
-    # Group adjacent own-line comments, as :func:`plan` does; a comment after
-    # code is a group of its own.
     groups: list[list[Node]] = []
     for node in _comments(root):
         first = row_of(node.start_byte)
@@ -567,31 +624,100 @@ def flag_state_comments(
             groups[-1].append(node)
         else:
             groups.append([node])
+    return groups
+
+
+def _row_finder(starts: list[int]):
+    def row_of(offset: int) -> int:
+        lo, hi = 0, len(starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    return row_of
+
+
+def _group_texts(data: bytes, starts: list[int], ends: list[int], group: list[Node], first: int, last: int):
+    """Each row's comment text (from the comment's start on its first row),
+    and the rows' contents joined, with each row's offset into the join."""
+    texts: list[str] = []
+    for row in range(first, last + 1):
+        begin = max(starts[row], group[0].start_byte) if row == first else starts[row]
+        texts.append(data[begin : ends[row]].decode("utf-8", "replace").strip())
+    contents = [_content(t.encode("utf-8")).decode("utf-8", "replace") for t in texts]
+    joined = ""
+    offsets: list[int] = []
+    for content in contents:
+        offsets.append(len(joined))
+        joined += content + " "
+    return texts, joined, offsets
+
+
+def flag_state_comments(
+    before: str,
+    after: str,
+    grammar: str,
+    flag_key: str,
+    treatment: bool,
+    skip: frozenset[int] = frozenset(),
+) -> list[StateComment]:
+    """The comments of ``after`` near a line the run changed that describe a
+    flag's state, or what it decided, without naming ``flag_key``.
+
+    Near is on the changed line, directly above it, or above it in the same
+    block with no blank line between (the comment of the statement before a
+    folded ``if``). Describes is a state phrase (:data:`FLAG_STATE`), "the
+    flag" (:data:`THE_FLAG`), or a local the run removed (see
+    :func:`removed_names`).
+
+    Such a comment sat beside the read the run folded, so "while the flag is
+    off" is likely about THIS flag even though it never says which. That is a
+    guess from the wording, which is why each is only reported: a comment
+    line naming the key is decided by :func:`rewrite` and the kept-comment
+    report instead, and is left out here, though another line of the same
+    comment is not. A run of adjacent comments is one comment, so a phrase
+    wrapped onto its next line is still found. A comment holding a 1-based
+    line in ``skip`` was reported already, and is left out.
+    """
+    if before == after:
+        return []
+    data = after.encode("utf-8")
+    try:
+        root = _parse(data, grammar)
+    except Exception:  # noqa: BLE001 - report only; an unparsable file reports nothing
+        return []
+    trigger = _trigger(removed_names(before, after, root))
+    if not trigger.search(after):
+        return []
+    names = names_pattern(flag_key)
+    written, below_deletion = _changed_rows(before, after)
+    starts = _line_starts(data)
+    ends = [*(s for s in starts[1:]), len(data)]
+    row_of = _row_finder(starts)
 
     found: list[StateComment] = []
-    for group in groups:
+    for group in _comment_groups(data, root, row_of):
         first, last = row_of(group[0].start_byte), row_of(group[-1].end_byte)
         rows = range(first, last + 1)
-        near = any(r in written for r in rows) or last + 1 in written or last + 1 in below_deletion
-        if not near:
+        if any(r + 1 in skip for r in rows):
             continue
-        # Each row's comment text: from the comment's start on its first row.
-        texts: list[str] = []
-        for row in rows:
-            begin = max(starts[row], group[0].start_byte) if row == first else starts[row]
-            texts.append(data[begin : ends[row]].decode("utf-8", "replace").strip())
-        contents = [_content(t.encode("utf-8")).decode("utf-8", "replace") for t in texts]
-        joined = ""
-        offsets: list[int] = []
-        for content in contents:
-            offsets.append(len(joined))
-            joined += content + " "
+        near = any(r in written for r in rows) or last + 1 in written or last + 1 in below_deletion
+        own_line = not data[starts[first] : group[0].start_byte].strip()
+        if not near and not (
+            own_line and _reaches_change(data, starts, ends, first, last, written, below_deletion)
+        ):
+            continue
+        texts, joined, offsets = _group_texts(data, starts, ends, group, first, last)
         # The first phrase on a line that does not name the key: a line naming
         # it is the kept-comment report's, but the group's other lines are not.
         hit = next(
             (
                 (row, match)
-                for match in FLAG_STATE.finditer(joined)
+                for match in trigger.finditer(joined)
                 for row in [max(i for i, offset in enumerate(offsets) if offset <= match.start())]
                 if not names.search(texts[row].encode("utf-8"))
             ),
@@ -614,3 +740,144 @@ def flag_state_comments(
             )
         )
     return found
+
+
+# --- The leading comment of a statement the run deleted outright ----------
+
+
+@dataclass(frozen=True)
+class LeadingComment:
+    """A comment directly above a statement the run deleted outright."""
+
+    #: The whole comment as a removal of its lines in ``after``.
+    removal: Removal
+    #: 1-based lines of ``after`` the comment holds.
+    rows: frozenset[int]
+    #: Its first line's text, for the pull request.
+    text: str
+    #: Whether it describes a flag's state (:data:`FLAG_STATE`): such a
+    #: comment explained only the statement that went, and goes with it.
+    describes_state: bool
+
+
+#: A comment that instructs a tool rather than describing code: never the
+#: deleted statement's prose.
+_DIRECTIVE = re.compile(
+    r"\s*(?:eslint|@ts-|prettier-|istanbul|c8\b|noqa|pylint|type:|nolint|rubocop|swiftlint|#?pragma|#?region|#?endregion)",
+    re.IGNORECASE,
+)
+
+#: The first word of a line that closes the block it sits in.
+_CLOSES = (b"}", b")", b"]", b"end")
+
+
+def leading_comments(before: str, after: str, grammar: str, flag_key: str) -> list[LeadingComment]:
+    """Each own-line comment of ``after`` that sat directly above statements
+    the run deleted whole, and that nothing else claims.
+
+    Directly above is no blank line between. Whole is a run of complete
+    statements of ``before`` (a declaration the run inlined, a guard of the
+    removed branch), never part of one: a deleted ``if`` header whose body
+    stayed is not a deleted statement. Nothing else claims it when the
+    deleted statements were followed by a blank line, the end of their
+    block or the end of the file; otherwise the comment may describe the
+    next statement too. A doc comment documents something that survives,
+    and a comment naming the key is :func:`rewrite`'s; both are left out.
+    """
+    if before == after:
+        return []
+    old = before.encode("utf-8")
+    data = after.encode("utf-8")
+    try:
+        old_root = _parse(old, grammar)
+        root = _parse(data, grammar)
+    except Exception:  # noqa: BLE001 - an unparsable file has no leading comments
+        return []
+    names = names_pattern(flag_key)
+    old_lines = before.split("\n")
+    matcher = difflib.SequenceMatcher(None, old_lines, after.split("\n"), autojunk=False)
+    old_starts = _line_starts(old)
+    starts = _line_starts(data)
+    ends = [*(s for s in starts[1:]), len(data)]
+    row_of = _row_finder(starts)
+    by_last = {}
+    for group in _comment_groups(data, root, row_of):
+        first, last = row_of(group[0].start_byte), row_of(group[-1].end_byte)
+        if not data[starts[first] : group[0].start_byte].strip():
+            by_last[last] = (group, first)
+    found: list[LeadingComment] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "delete" or j1 != j2 or i1 == 0 or j1 == 0:
+            continue
+        if any(not line.strip() for line in old_lines[i1:i2]):
+            continue
+        following = old_lines[i2].lstrip().encode("utf-8") if i2 < len(old_lines) else b""
+        if following and not following.startswith(_CLOSES):
+            continue
+        if not _whole_statements(old_root, old, old_starts, i1, i2):
+            continue
+        entry = by_last.get(j1 - 1)
+        if entry is None:
+            continue
+        group, first = entry
+        last = j1 - 1
+        texts, joined, _offsets = _group_texts(data, starts, ends, group, first, last)
+        raw = data[starts[first] : ends[last]]
+        if (
+            any(t.encode("utf-8").startswith(_DOC_MARKERS) for t in texts)
+            or names.search(raw)
+            or _DIRECTIVE.match(joined)
+        ):
+            continue
+        found.append(
+            LeadingComment(
+                Removal(starts[first], ends[last], first + 1, tuple(range(first, last + 1)), " ".join(texts)),
+                frozenset(range(first + 1, last + 2)),
+                texts[0],
+                bool(FLAG_STATE.search(joined)),
+            )
+        )
+    return found
+
+
+def _whole_statements(root: Node, data: bytes, starts: list[int], first: int, end: int) -> bool:
+    """Whether lines ``first`` to ``end`` (exclusive) of ``data`` hold
+    exactly one or more complete statements and nothing else."""
+    ends = [*(s - 1 for s in starts[1:]), len(data)]
+    begin = starts[first] + (len(data[starts[first] : ends[first]]) - len(data[starts[first] : ends[first]].lstrip()))
+    finish = ends[end - 1]
+    while finish > begin and data[finish - 1 : finish] in (b" ", b"\t", b"\r"):
+        finish -= 1
+    node = root
+    while True:
+        inner = next(
+            (c for c in node.children if c.start_byte <= begin and c.end_byte >= finish),
+            None,
+        )
+        if inner is None:
+            break
+        node = inner
+    if node.start_byte == begin and node.end_byte == finish:
+        covered = [node]
+    else:
+        covered = [c for c in node.named_children if c.start_byte >= begin and c.end_byte <= finish]
+        if not covered or covered[0].start_byte != begin or covered[-1].end_byte != finish:
+            return False
+    return all(_is_statement(c) for c in covered)
+
+
+def _is_statement(node: Node) -> bool:
+    return any(word in node.type for word in ("statement", "declaration", "definition"))
+
+
+def remove_leading(after: str, grammar: str, comments: list[LeadingComment]) -> str | None:
+    """``after`` without ``comments``, or ``None`` when that would change a
+    code token."""
+    if not comments:
+        return after
+    data = after.encode("utf-8")
+    return (
+        cut.decode("utf-8")
+        if (cut := _cut(data, _parse(data, grammar), [c.removal for c in comments], grammar)) is not None
+        else None
+    )

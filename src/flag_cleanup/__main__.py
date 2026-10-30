@@ -91,7 +91,7 @@ import logging
 import sys
 from collections import Counter
 
-from flag_cleanup import github_ops
+from flag_cleanup import github_ops, report_paths
 from flag_cleanup.archive import ArchiveResult, run_archive
 from flag_cleanup.backlog import run_archive_sweep
 from flag_cleanup.client import FeatureflipApiError
@@ -160,9 +160,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     dry_run = False
+    # Identity until the configuration is read: a run that never started has
+    # no paths to show.
+    show = str
     try:
         config = Config.from_env()
         dry_run = config.dry_run
+        show = report_paths.displayer(config.directories)
         if config.mode == MODE_ARCHIVE_ON_MERGE:
             # Returns from inside the `try` so the handler below still maps its
             # two failure types: a misconfigured trigger to exit 2 (nothing was
@@ -235,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         # `run` stamps the completed results onto whatever aborted it — plus a
         # line for the flag it died on — so a failure on candidate 3 does not
         # also hide what candidates 1 and 2 did.
-        _report(getattr(exc, PARTIAL_RESULTS_ATTR, []), dry_run=dry_run)
+        _report(getattr(exc, PARTIAL_RESULTS_ATTR, []), dry_run=dry_run, show=show)
 
         # `run` catches BaseException to do that stamping, so this must too, or
         # the one case the stamping exists for throws the report away: a
@@ -273,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"flag-cleanup: run aborted: {exc}", file=sys.stderr)
         return 1
 
-    _report(results, dry_run=dry_run)
+    _report(results, dry_run=dry_run, show=show)
     _summarize(results, staleness=config.staleness)
 
     unproposable = [
@@ -592,8 +596,12 @@ def _pr_command_failure_body(exc: Exception) -> str:
     )
 
 
-def _report(results: list[FlagResult], *, dry_run: bool) -> None:
-    """Print one line per candidate (plus the diff, when dry-running)."""
+def _report(results: list[FlagResult], *, dry_run: bool, show=str) -> None:
+    """Print one line per candidate (plus the diff, when dry-running).
+
+    ``show`` spells each file path the way the pull request body does:
+    relative to the repository root (see :mod:`flag_cleanup.report_paths`).
+    """
     for result in results:
         detail = f" {result.pr_url}" if result.pr_url else ""
         print(
@@ -605,12 +613,12 @@ def _report(results: list[FlagResult], *, dry_run: bool) -> None:
             # the diff means, and stdout is what a workflow summary captures.
             print(
                 f"    warning: {len(result.unprocessed_files)} file(s) still "
-                f"mention this flag: {', '.join(result.unprocessed_files)}"
+                f"mention this flag: {', '.join(map(show, result.unprocessed_files))}"
             )
         if result.kept_comments:
             # Not a warning: the run read these and kept each because it says
             # something besides the flag. They are a sentence to reword.
-            named = "; ".join(f"{path}:{line}" for path, line, _ in result.kept_comments)
+            named = "; ".join(f"{show(path)}:{line}" for path, line, _ in result.kept_comments)
             print(
                 f"    note: {len(result.kept_comments)} comment line(s) still name "
                 "this flag and also say something else, so they were kept for "
@@ -623,7 +631,7 @@ def _report(results: list[FlagResult], *, dry_run: bool) -> None:
             # go looking for a syntax error in a file that may parse fine.
             reasons = dict(result.refusal_reasons)
             named = ", ".join(
-                f"{path} ({reasons[path]})" if path in reasons else path
+                f"{show(path)} ({reasons[path]})" if path in reasons else show(path)
                 for path in result.refused_files
             )
             print(

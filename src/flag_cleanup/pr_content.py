@@ -18,7 +18,9 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from flag_cleanup import stale_comments
+from dataclasses import replace
+
+from flag_cleanup import report_paths, stale_comments
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
 from flag_cleanup.cross_file_keys import (
@@ -174,6 +176,7 @@ REPORTED_BINDING_KINDS = frozenset(
         "removed member",
         "changed constructor",
         "kept argument local",
+        "failing assertion",
         "unread binding",
         "emptied override",
         "dropped default argument",
@@ -419,6 +422,28 @@ def _unread_dart_field_lines(unread: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _failing_assertion_lines(failing: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each assertion the removal turned into one that can
+    only fail, or nothing. Nothing edits these: the test checked the branch
+    this pull request deletes, and whether to delete or rewrite it is the
+    reviewer's call."""
+    if not failing:
+        return []
+    count = len(failing)
+    noun = "assertion now fails" if count == 1 else "assertions now fail"
+    return [
+        f"> **⚠️ {count} {noun}.** {'It' if count == 1 else 'Each'} checked a flag read "
+        "this pull request replaced with a literal, and the literal is the value the "
+        f"assertion rejects, so the test {'it is in' if count == 1 else 'each is in'} "
+        "described the branch that was removed. Delete or rewrite "
+        f"{'it' if count == 1 else 'each'}:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in failing[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def _kept_argument_local_lines(kept: list[tuple[str, str]]) -> list[str]:
     """The callout naming each local whose only reader was an argument this
     pull request removed with a constructor parameter, or nothing.
@@ -588,9 +613,10 @@ def _removed_comment_lines(removed: list[tuple[str, str]]) -> list[str]:
     noun = "comment was" if count == 1 else "comments were"
     return [
         f"> **{count} {noun} removed.** Each named only this flag (or a type "
-        "this pull request deletes) and said nothing else, so it described "
-        "code that is gone. A comment that also says something else is kept "
-        "and listed below:",
+        "this pull request deletes) and said nothing else, or described the "
+        "flag's state directly above a statement this pull request deleted, "
+        "so it described code that is gone. A comment that also says "
+        "something else is kept and listed below:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -770,6 +796,37 @@ def _marked_import_lines(marked: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _shown_rows(rows: tuple[tuple, ...], show) -> tuple[tuple, ...]:
+    """``rows`` with each row's leading path spelled by ``show``."""
+    return tuple((show(row[0]), *row[1:]) for row in rows)
+
+
+def _shown_residue(residue: Residue, show) -> Residue:
+    """``residue`` with every path spelled by ``show``. ``outside`` is left
+    alone: it is already relative to the checkout root, and read against the
+    working directory it could name a different file."""
+    return replace(
+        residue,
+        stubbed=_shown_rows(residue.stubbed, show),
+        comment_only=tuple(show(path) for path in residue.comment_only),
+        enum_held=_shown_rows(residue.enum_held, show),
+        title_only=tuple(show(path) for path in residue.title_only),
+        comment_lines=_shown_rows(residue.comment_lines, show),
+        path_only=tuple(show(path) for path in residue.path_only),
+        literal_only=tuple(show(path) for path in residue.literal_only),
+    )
+
+
+def _shown_wrapper(wrapper: ConstantWrapper, show) -> ConstantWrapper:
+    """``wrapper`` with its own path, its siblings' and its callers' spelled by ``show``."""
+    return replace(
+        wrapper,
+        path=show(wrapper.path),
+        siblings=tuple((name, show(path)) for name, path in wrapper.siblings),
+        callers=tuple(show(path) for path in wrapper.callers),
+    )
+
+
 def pr_body(
     candidate: Candidate,
     config: Config,
@@ -875,6 +932,23 @@ def pr_body(
     to the code under test, and a registry entry kept because something still
     names the key. Those files also appear in ``unprocessed``; this says why.
     """
+    # Every path below is spelled from the repository root, whichever pass
+    # produced it and however the directories were configured.
+    show = report_paths.displayer(config.directories)
+    unprocessed = tuple(show(path) for path in unprocessed)
+    generated = tuple(show(path) for path in generated)
+    stranded = _shown_rows(stranded, show)
+    bindings = _shown_rows(bindings, show)
+    entries = _shown_rows(entries, show)
+    declined = _shown_rows(declined, show)
+    test_doubles = _shown_rows(test_doubles, show)
+    residue = _shown_residue(residue, show)
+    deleted_tests = _shown_rows(deleted_tests, show)
+    wrappers = tuple(_shown_wrapper(wrapper, show) for wrapper in wrappers)
+    left_in_place = _shown_rows(left_in_place, show)
+    unresolved = _shown_rows(unresolved, show)
+    enum_findings = _shown_rows(enum_findings, show)
+    wrapper_findings = _shown_rows(wrapper_findings, show)
     served = "true" if candidate.treatment else "false"
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
     renamed_tests = _renamed_tests(bindings)
@@ -918,6 +992,7 @@ def pr_body(
         | set(residue.comment_only)
         | set(residue.title_only)
         | set(residue.path_only)
+        | set(residue.literal_only)
         | set(held_paths)
     )
     generic = tuple(path for path in unprocessed if path not in sorted_out)
@@ -982,17 +1057,24 @@ def pr_body(
         deleted,
         kept,
     )
-    if residue.comment_only:
-        shown = residue.comment_only[:20]
-        # Each file with the lines naming the flag, so the reviewer reads the
-        # sentence to fix here rather than searching for it.
-        named: dict[str, list[tuple[int, str]]] = {}
-        for path, line, text in residue.comment_lines:
-            if (path, line, text) in removed_branch or (path, line, text) in kept_branch:
-                continue
-            named.setdefault(path, []).append((line, text))
+    # Each comment-only file with the lines naming the flag, so the reviewer
+    # reads the sentence to fix here rather than searching for it. A file
+    # whose every such line was listed above, under what it describes, is not
+    # listed again: it would show as a path with nothing under it.
+    named: dict[str, list[tuple[int, str]]] = {}
+    listed_above: set[str] = set()
+    for path, line, text in residue.comment_lines:
+        if (path, line, text) in removed_branch or (path, line, text) in kept_branch:
+            listed_above.add(path)
+            continue
+        named.setdefault(path, []).append((line, text))
+    comment_only = tuple(
+        path for path in residue.comment_only if path in named or path not in listed_above
+    )
+    if comment_only:
+        shown = comment_only[:20]
         lines += [
-            f"> **ℹ️ {len(residue.comment_only)} file(s) mention this flag only "
+            f"> **ℹ️ {len(comment_only)} file(s) mention this flag only "
             "in comments.** Nothing there can break, but prose describing the "
             "flag may now describe behaviour that is gone. Each of these "
             "comments also says something else, so it was kept for you to "
@@ -1007,8 +1089,8 @@ def pr_body(
                 )
             ],
             *(
-                [f"> - ...and {len(residue.comment_only) - len(shown)} more"]
-                if len(residue.comment_only) > len(shown)
+                [f"> - ...and {len(comment_only) - len(shown)} more"]
+                if len(comment_only) > len(shown)
                 else []
             ),
             "",
@@ -1042,6 +1124,25 @@ def pr_body(
             *(
                 [f"> - ...and {len(residue.path_only) - len(shown)} more"]
                 if len(residue.path_only) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.literal_only:
+        shown = residue.literal_only[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.literal_only)} file(s) name this flag's key only "
+            "as a string value in a literal** (an element of an array that also "
+            "holds a computed value, such as a query cache key "
+            "`['key', id]`), and perhaps in comments. That is usually a value "
+            "named after the feature rather than a flag read, so they were left "
+            "alone; look again only if your code reads flags by keys held in a "
+            "list:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.literal_only) - len(shown)} more"]
+                if len(residue.literal_only) > len(shown)
                 else []
             ),
             "",
@@ -1161,6 +1262,9 @@ def pr_body(
     kept_argument_locals = [
         (path, text) for path, kind, text in bindings if kind == "kept argument local"
     ]
+    failing_assertions = [
+        (path, text) for path, kind, text in bindings if kind == "failing assertion"
+    ]
     unread_bindings = [
         (path, text) for path, kind, text in bindings if kind == "unread binding"
     ]
@@ -1181,6 +1285,7 @@ def pr_body(
     lines += _removed_member_lines([m for m in removed_members if not m[0].endswith(".dart")])
     lines += _removed_dart_field_lines([m for m in removed_members if m[0].endswith(".dart")])
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
+    lines += _failing_assertion_lines(failing_assertions)
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_binding_lines(unread_bindings)
     lines += _dropped_argument_lines(dropped_arguments)

@@ -3050,6 +3050,7 @@ def _inherited_reach(
     inside: bool,
     members_of,
     depth: int = 0,
+    goes_on: Node | None = None,
 ) -> bool:
     """Whether a read's receiver chain may start at a member a type inherits
     from a library class, such as MVC's ``ViewBag``, typed ``dynamic``.
@@ -3063,12 +3064,21 @@ def _inherited_reach(
     local or ``foreach`` variable is followed to its value. A lambda's
     parameter starts at none, by the assumption that a library never hands
     a family value back as ``dynamic``; nor does a name a declaration
-    spelling another type binds, unless that type is ``dynamic``."""
-    head = _chain_head(_unwrap(receiver))
+    spelling another type binds, unless that type is ``dynamic``.
+
+    ``goes_on`` is where the chain goes on when ``receiver`` is the value a
+    ``var`` was followed to: the read's own head (``db`` in ``var db = new
+    Db(); db.Rows.X``), whose next member is the one a value with no chain
+    of its own (a creation, a cast, a name) is judged by."""
+    whole = _unwrap(receiver)
+    head = _chain_head(whole)
     if head is None:
         return inside
+    # Where the head's next member is read: past the value itself when the
+    # value is nothing but its head.
+    at = goes_on if goes_on is not None and head is whole else head
     if head.type in ("object_creation_expression", "cast_expression"):
-        return _off_library(head, _type_word(head.child_by_field_name("type")), based, members_of)
+        return _off_library(at, _type_word(head.child_by_field_name("type")), based, members_of)
     if head.type in _TYPED_HEADS:
         return False
     if head.type == "generic_name" and head.named_children:
@@ -3083,12 +3093,12 @@ def _inherited_reach(
     if value is True:
         return False
     if isinstance(value, Node):
-        return depth >= 8 or _inherited_reach(value, readers, path, based, inside, members_of, depth + 1)
+        return depth >= 8 or _inherited_reach(value, readers, path, based, inside, members_of, depth + 1, at)
     bound = _binding(head, name, readers, path)
     if bound is None or isinstance(bound, str):
         return inside
     word = _type_word(bound)
-    return word == "dynamic" or _off_library(head, word, based, members_of)
+    return word == "dynamic" or _off_library(at, word, based, members_of)
 
 
 def _declaring_scope(at: Node, name: str) -> Node | None:
@@ -4697,6 +4707,86 @@ def mention_counts(index: Index, path: str, kind: str) -> bool:
     return _BY_NAME.search(source) is not None or not csharp_family.family_free(source, parse(source), family)
 
 
+def _routes_typed_away(root: Node, source: str, path: str, repo_dir: str, family, member: str) -> bool:
+    """Whether every by-name route a family-free file spells is called on
+    ``typeof(T)``, ``T`` a checkout type that is neither a family type nor
+    one a family type derives from: each match of
+    ``csharp_family._UNNAMED_ROUTE`` (``GetMethods``, ``GetType(``, ...) and
+    each call of a NAME-taking route (``GetMethod``, ``GetProperty``, ...),
+    unless that call's NAME is a constant (a literal or a ``nameof``) other
+    than ``member`` (EF's ``Entry(e).Property(nameof(E.CreatedAt))``).
+    A match anywhere else (a comment, a string, another receiver) refuses.
+    Then the file's own lookups reach only that type's members, and a
+    string of the file names the family's member through none of them."""
+    from flag_cleanup import csharp_family, ctor_param_csharp
+
+    if root.has_error:
+        return False
+    reader = xcs._Reader(root, path, repo_dir)
+    checkout = xcs.csharp_index(repo_dir)
+    supertypes = _family_supertypes(repo_dir, family)
+
+    def on_unrelated_type(name: Node | None) -> bool:
+        access = name.parent if name is not None else None
+        if access is None or access.type != "member_access_expression" or access.child_by_field_name("name") != name:
+            return False
+        call = access.parent
+        if call is None or call.type != "invocation_expression" or call.child_by_field_name("function") != access:
+            return False
+        receiver = access.child_by_field_name("expression")
+        if receiver is None or receiver.type != "typeof_expression" or not receiver.named_children:
+            return False
+        full = _type_full(receiver.named_children[0], reader)
+        if full is None or full in family.full_names or not checkout.by_full.get(full):
+            return False
+        return full.rsplit(".", 1)[-1] not in supertypes
+
+    # A method the file declares under a route's name (`DeclaredMembers()`),
+    # spelled as its declaration or a bare call, is the file's own.
+    own = {
+        _text(n.child_by_field_name("name"))
+        for n in cross_file_keys.walk(root)
+        if n.type in ("method_declaration", "local_function_statement") and n.child_by_field_name("name") is not None
+    }
+
+    def own_method(node: Node) -> bool:
+        parent = node.parent
+        if _text(node) not in own or parent is None:
+            return False
+        if parent.type in ("method_declaration", "local_function_statement"):
+            return parent.child_by_field_name("name") == node
+        return parent.type == "invocation_expression" and parent.child_by_field_name("function") == node
+
+    for match in csharp_family._UNNAMED_ROUTE.finditer(source):
+        start = len(source[: match.start()].encode("utf-8"))
+        node = root.descendant_for_byte_range(start, start + 1)
+        if node is None or node.type != "identifier" or node.start_byte != start:
+            return False
+        if node.end_byte != start + len(match.group(0).encode("utf-8")) and not own_method(node):
+            return False
+        if not own_method(node) and not on_unrelated_type(node):
+            return False
+    for node in cross_file_keys.walk(root):
+        if node.type != "invocation_expression":
+            continue
+        function = node.child_by_field_name("function")
+        callee = xcs._last_name(function) if function is not None else ""
+        if callee in csharp_family._NAME_ARGUMENT or callee in csharp_family._ROUTE_TYPES:
+            name = function.child_by_field_name("name") if function.type == "member_access_expression" else None
+            # No argument can name the member: each is a constant naming
+            # something else (a literal or a `nameof`).
+            arguments = node.child_by_field_name("arguments")
+            values = [ctor_param_csharp._expression(a) for a in ctor_param_csharp._items(arguments)] if arguments is not None else []
+            constants = [
+                (csharp_family.nameof_value(v) or _plain_string(v)) if v is not None else None for v in values
+            ]
+            if values and all(c is not None and c.lower() != member.lower() for c in constants):
+                continue
+            if not on_unrelated_type(name):
+                return False
+    return True
+
+
 def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
     """The strings of a parsed C# file that may name the member, where
     :func:`mention_counts` counts the file's strings at all.
@@ -4749,6 +4839,11 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
         and csharp_family.family_free(source, root, family)
     ):
         names = csharp_family.route_names(root, source)
+        # Every lookup of the file is on `typeof(T)` of an unrelated type:
+        # none of its strings can name the family's member through it.
+        typed_away = names is None and _routes_typed_away(root, source, path, index.repo_dir, family, wrapper.name)
+        if typed_away:
+            found = []
         if names is not None:
             spans = {(n.start_byte, n.end_byte) for n in names}
             # Where names may be compared ignoring case, a string still
@@ -4874,6 +4969,8 @@ def _private_helper_argument(node: Node, readers: _Readers, path: str, family, a
 
 def _harmless_name_read(read: Node, readers: _Readers, path: str, family, asserts: bool) -> bool:
     """See :func:`_private_helper_argument`."""
+    if read.type == "identifier" and read.parent is not None and read.parent.type == "interpolation":
+        return _sql_parameter(read.parent, readers.repo_dir)
     argument = read.parent
     if read.type != "identifier" or argument is None or argument.type != "argument" or argument.named_children[-1].id != read.id:
         return False
@@ -4885,6 +4982,43 @@ def _harmless_name_read(read: Node, readers: _Readers, path: str, family, assert
         if access.type == "element_access_expression":
             return _free_value(access.child_by_field_name("expression"), readers, path, family)
     return bool(asserts and container.type == "argument_list" and _value_assertion_call(container.parent))
+
+
+#: Entity Framework's calls that take interpolated SQL as a
+#: ``FormattableString`` and bind each hole as a parameter value.
+_SQL_HOLES = frozenset(
+    {"ExecuteSql", "ExecuteSqlAsync", "ExecuteSqlInterpolated", "ExecuteSqlInterpolatedAsync", "FromSql",
+     "FromSqlInterpolated", "SqlQuery"}
+)
+
+
+def _sql_parameter(interpolation: Node, repo_dir: str) -> bool:
+    """Whether ``interpolation`` (``{x}``, with no alignment or format) is a
+    hole of an interpolated string that is the first argument of
+    ``r.ExecuteSqlAsync(…)`` or another of :data:`_SQL_HOLES`, when the
+    checkout declares no method of the name: the database library binds the
+    value as a SQL parameter and looks nothing up by it."""
+    from flag_cleanup import csharp_residue
+
+    if [c.type for c in _named(interpolation) if c.type != "interpolation_brace"] != ["identifier"]:
+        return False  # an alignment or format clause, or something other than the read
+    string = interpolation.parent
+    argument = string.parent if string is not None and string.type == "interpolated_string_expression" else None
+    if argument is None or argument.type != "argument" or argument.child_by_field_name("name") is not None:
+        return False
+    arguments = argument.parent
+    call = arguments.parent if arguments is not None else None
+    if call is None or call.type != "invocation_expression" or call.child_by_field_name("arguments") != arguments:
+        return False
+    if next((a for a in _named(arguments) if a.type == "argument"), None) != argument:
+        return False
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return False
+    name = _text(function.child_by_field_name("name") or function)
+    if name not in _SQL_HOLES or _checkout_extension(repo_dir, name):
+        return False
+    return csharp_residue._repository_methods(repo_dir, frozenset({name})) is None
 
 
 def _value_assertion_argument(node: Node) -> bool:

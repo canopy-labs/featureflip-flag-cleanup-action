@@ -116,6 +116,9 @@ class Kept(Exception):
         self.path = path
         self.line = line
         self.reason = reason
+        #: The other proofs that failed beside this one, so the report lists
+        #: every leftover a reviewer would have to remove, not the first.
+        self.also: tuple[Kept, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -856,6 +859,52 @@ _FOREIGN_CODE = frozenset(
 )
 
 
+#: Terraform and other HCL files, whose comments (``#``, ``//``, ``/* */``)
+#: no tool reads.
+_HCL_SUFFIXES = frozenset({".tf", ".tfvars", ".hcl"})
+#: A heredoc's opening marker, which ends its line: ``<<EOT`` or ``<<-EOT``.
+_HEREDOC = re.compile(rb"<<(-?)\s*([A-Za-z_][\w-]*)\s*$")
+
+
+def _hcl_comment_lines(data: bytes) -> set[int]:
+    """The (1-based) lines of an HCL file that hold nothing but comment: a
+    line starting with ``#`` or ``//``, or wholly inside a ``/* */`` that
+    starts a line. A heredoc's body is text, never a comment; a line this
+    cannot place (a ``/*`` after code) is not taken for one."""
+    comments: set[int] = set()
+    heredoc: tuple[bool, bytes] | None = None
+    block = False
+    for number, raw in enumerate(data.split(b"\n"), 1):
+        line = raw.rstrip(b"\r")
+        stripped = line.strip()
+        if heredoc is not None:
+            indented, marker = heredoc
+            if (stripped if indented else line) == marker:
+                heredoc = None
+            continue
+        if block:
+            if b"*/" in line:
+                block = False
+                if line.split(b"*/", 1)[1].strip():
+                    continue
+            comments.add(number)
+            continue
+        if stripped.startswith((b"#", b"//")):
+            comments.add(number)
+            continue
+        if stripped.startswith(b"/*"):
+            rest = stripped[2:]
+            if b"*/" not in rest:
+                block = True
+                comments.add(number)
+            elif not rest.split(b"*/", 1)[1].strip():
+                comments.add(number)
+            continue
+        if (opened := _HEREDOC.search(line)) is not None:
+            heredoc = (opened.group(1) == b"-", opened.group(2))
+    return comments
+
+
 def _dotnet_directories(repo_dir: str) -> frozenset[Path]:
     """Every directory of the checkout holding a C# project file."""
     return xcs._project_dirs(source_index.checkout_root(repo_dir))
@@ -885,6 +934,9 @@ def _scan(names: frozenset[str], repo_dir: str, residue: Residue) -> list[str]:
                 residue.prose.append((spelled, line, _line_text(data, match.start())))
         elif path.name.lower().endswith(_GUESTS):
             raise Kept(_rel(spelled, repo_dir), _line(data, word.search(data).start()), "a .NET guest file names it")
+        elif suffix in _HCL_SUFFIXES and {_line(data, m.start()) for m in word.finditer(data)} <= _hcl_comment_lines(data):
+            for match in word.finditer(data):
+                residue.prose.append((spelled, _line(data, match.start()), _line_text(data, match.start())))
         elif suffix in _FOREIGN_CODE and not any(
             parent in (projects := projects if projects is not None else _dotnet_directories(repo_dir))
             for parent in Path(spelled).parents
@@ -989,11 +1041,40 @@ def _factory(node: Node, names: frozenset[str]) -> bool:
     return True
 
 
+def _argument_of(node: Node, classes: set[str]) -> bool:
+    """Whether ``node`` lies in the arguments of ``new C(…)`` for one of
+    ``classes``."""
+    current = node.parent
+    while current is not None:
+        if current.type == "object_creation_expression":
+            arguments = current.child_by_field_name("arguments")
+            if (
+                ctor_param_csharp._simple_type(current.child_by_field_name("type")) in classes
+                and arguments is not None
+                and _within(node, arguments)
+            ):
+                return True
+        current = current.parent
+    return False
+
+
+def _class_span(node: Node, file: _File) -> tuple[int, int]:
+    """The byte span (BOM included) of the type declaration around ``node``."""
+    owner = _enclosing(node, ("class_declaration", "struct_declaration", "record_declaration"))
+    target = owner if owner is not None else node
+    return target.start_byte + file.offset, target.end_byte + file.offset
+
+
 def _within(node: Node, ancestor: Node | None) -> bool:
     return ancestor is not None and ancestor.start_byte <= node.start_byte and node.end_byte <= ancestor.end_byte
 
 
-def _family_instance(value: Node | None, names: frozenset[str], shared: frozenset[str] = frozenset()) -> str | None:
+def _family_instance(
+    value: Node | None,
+    names: frozenset[str],
+    shared: frozenset[str] = frozenset(),
+    plain: Callable[[Node], bool] | None = None,
+) -> str | None:
     """What a registration's instance argument is: ``"new"`` for ``new F()``
     of a family type with no argument and no initializer (building it runs
     no code but the fake's own, which goes), or of a ``shared`` fake (one
@@ -1008,7 +1089,13 @@ def _family_instance(value: Node | None, names: frozenset[str], shared: frozense
         if (
             ctor_param_csharp._simple_type(value.child_by_field_name("type")) in names | shared
             and value.child_by_field_name("initializer") is None
-            and (arguments is None or not ctor_param_csharp._items(arguments))
+            and (
+                arguments is None
+                or not ctor_param_csharp._items(arguments)
+                # `new Fake(enabled: true)`: a constructor that only stores
+                # inert arguments runs nothing the fake's deletion keeps.
+                or (plain is not None and plain(value))
+            )
         ):
             return "new"
         return None
@@ -1086,7 +1173,10 @@ def _registration_helper(invocation: Node) -> bool:
 
 
 def _registration(
-    node: Node, names: frozenset[str], shared: frozenset[str] = frozenset()
+    node: Node,
+    names: frozenset[str],
+    shared: frozenset[str] = frozenset(),
+    plain: Callable[[Node], bool] | None = None,
 ) -> tuple[Node, str, str | None] | str | None:
     """The registration statement a spelling names a registered type in,
     with its text and the field it registers as the instance (which must go
@@ -1112,7 +1202,7 @@ def _registration(
             and len(values) == 2
             and values[0] is not None
             and values[0].type == "identifier"
-            and (instance := _family_instance(values[1], names, shared)) is not None
+            and (instance := _family_instance(values[1], names, shared, plain)) is not None
             and statement.parent is not None
             and statement.parent.type == "block"
             and _registration_helper(invocation)
@@ -1168,7 +1258,7 @@ def _registration(
         rest = values[1:] if keyed else values
         if keyed and (not values or values[0] is None or not ctor_param_csharp._inert(values[0])):
             return f"a keyed registration whose key may do work ({text[:60]})"
-        instance = _family_instance(rest[0], names) if len(rest) == 1 and not keyed else None
+        instance = _family_instance(rest[0], names, plain=plain) if len(rest) == 1 and not keyed else None
         if instance is not None:
             return statement, text, None if instance == "new" else instance
         if len(rest) > 1 or (rest and (rest[0] is None or not _factory(rest[0], names))):
@@ -1395,6 +1485,8 @@ def _fake_field(node: Node, names: frozenset[str]) -> tuple[Node, str] | None:
     nothing, ``new()`` or ``new F()`` (no argument, no initializer)."""
     spelled = _type_position(node)
     declaration = spelled.parent
+    if declaration is not None and declaration.type == "property_declaration" and declaration.child_by_field_name("type") == spelled:
+        return _fake_property(declaration, names)
     if declaration is None or declaration.type != "variable_declaration" or declaration.child_by_field_name("type") != spelled:
         return None
     field = declaration.parent
@@ -1417,6 +1509,37 @@ def _fake_field(node: Node, names: frozenset[str]) -> tuple[Node, str] | None:
         elif _family_instance(value, names) != "new":
             return None
     return (field, name) if name is not None else None
+
+
+def _fake_property(prop: Node, names: frozenset[str]) -> tuple[Node, str] | None:
+    """``(property, name)`` for an auto-property (``{ get; }`` or ``{ get;
+    set; }``, no accessor body, no attribute, not static) whose initializer
+    is nothing, ``new()`` or ``new F(…)`` of a family fake whose arguments
+    are literals: what :func:`_fake_field` takes for a field."""
+    if any(c.type == "attribute_list" for c in prop.children) or _modifiers(prop) & {"static", "abstract", "virtual", "override"}:
+        return None
+    accessors = prop.child_by_field_name("accessors") or _child_of(prop, "accessor_list")
+    if accessors is None or any(
+        c.type == "accessor_declaration" and (c.child_by_field_name("body") is not None or any(x.type in ("block", "arrow_expression_clause") for x in c.children))
+        for c in accessors.named_children
+    ):
+        return None
+    value = prop.child_by_field_name("value")
+    if value is not None and value.type == "arrow_expression_clause":
+        return None
+    if value is not None:
+        if value.type == "implicit_object_creation_expression":
+            if value.child_by_field_name("initializer") is not None or any(c.type == "initializer_expression" for c in value.children):
+                return None
+            arguments = value.child_by_field_name("arguments")
+            if arguments is not None and any(
+                (e := ctor_param_csharp._expression(a)) is None or e.type not in _LITERALS for a in ctor_param_csharp._items(arguments)
+            ):
+                return None
+        elif value.type != "object_creation_expression" or ctor_param_csharp._simple_type(value.child_by_field_name("type")) not in names:
+            return None
+    name = prop.child_by_field_name("name")
+    return (prop, _text(name)) if name is not None else None
 
 
 def _visible_in(field: Node) -> Node | None:
@@ -1454,10 +1577,21 @@ def _fake_fields(
             continue
         scope = _visible_in(field)
         if scope is None:
+            # Seen from outside its class, but spelled nowhere outside it.
+            owner = _enclosing(field, _TYPE_DECLARATIONS)
+            if (
+                owner is not None
+                and "partial" not in _modifiers(owner)
+                and not _named_elsewhere(name, path, (owner.start_byte + file.offset, owner.end_byte + file.offset), repo_dir)
+            ):
+                scope = owner
+        if scope is None:
             continue
         spans = [(s, e) for s, e, _ in residue.spans.get(path, [])]
-        declarator = _declarators(_child_of(field, "variable_declaration"))[0]
-        own = declarator.child_by_field_name("name")
+        if field.type == "property_declaration":
+            own = field.child_by_field_name("name")
+        else:
+            own = _declarators(_child_of(field, "variable_declaration"))[0].child_by_field_name("name")
         uses = [n for n in _walk(scope) if n.type == "identifier" and _text(n) == name and n != own]
         if any(not _inside(spans, n.start_byte + file.offset) for n in uses):
             continue
@@ -1506,6 +1640,164 @@ def _constructor_parameter(node: Node) -> tuple[Node, Node] | None:
     body = constructor.parent
     declaration = body.parent if body is not None else None
     if declaration is None or declaration.type not in _TYPE_DECLARATIONS:
+        return None
+    return declaration, parameter
+
+
+def _fake_local(
+    node: Node, names: frozenset[str], shared: frozenset[str], plain: Callable[[Node], bool]
+) -> tuple[Node, str] | None:
+    """``(statement, name)`` when the spelling ``node`` lies in a local
+    declaration statement in a block that declares one variable, built as a
+    family fake by a construction that runs nothing but the fake's own code
+    (:func:`_family_instance`)."""
+    statement = _enclosing(node, ("local_declaration_statement",))
+    if statement is None or statement.parent is None or statement.parent.type != "block":
+        return None
+    if any(c.type in ("modifier", "attribute_list") for c in statement.children):
+        return None  # `using var`, `const`, `await using`
+    if any(c.type in ("using", "await") for c in statement.children):
+        return None
+    declarators = _declarators(statement)
+    if len(declarators) != 1:
+        return None
+    declaration = next((c for c in statement.named_children if c.type == "variable_declaration"), None)
+    value = _initial_value(declarators[0])
+    name = ctor_param_csharp._declarator_name(declarators[0])
+    if declaration is None or value is None or name is None or not _within(node, declaration):
+        return None
+    if value.type == "implicit_object_creation_expression":
+        type_node = declaration.child_by_field_name("type")
+        if ctor_param_csharp._simple_type(type_node) not in names:
+            return None
+        if value.child_by_field_name("initializer") is not None or any(c.type == "initializer_expression" for c in value.children):
+            return None
+        arguments = value.child_by_field_name("arguments")
+        built = arguments is None or not ctor_param_csharp._items(arguments) or plain(value)
+        return (statement, name) if built else None
+    return (statement, name) if _family_instance(value, names, shared, plain) == "new" else None
+
+
+def _plain_path(node: Node | None) -> bool:
+    """``x``, ``this.x`` or ``x.Y.Z``: a receiver whose evaluation calls
+    nothing but property getters."""
+    if node is None:
+        return False
+    if node.type in ("identifier", "this", "this_expression"):
+        return True
+    if node.type == "member_access_expression":
+        name = node.child_by_field_name("name")
+        return name is not None and name.type == "identifier" and _plain_path(node.child_by_field_name("expression"))
+    return False
+
+
+def _unread_lookup(node: Node, names: frozenset[str]) -> tuple[Node, str | None, str] | None:
+    """``(statement, local, lookup)`` when the spelling ``node`` lies in a
+    statement of a block that only asks the container for a family type:
+    ``<path>.GetRequiredService<F>();`` (what the engine leaves of an unread
+    ``var x = …`` it strands; ``local`` is None), or ``F x =
+    <path>.GetService<F>()!;`` declaring one variable. Whether the lookup is
+    the container's (``wrapper_csharp._locator_ok``) and whether anything
+    still reads the local are judged by the caller."""
+    from flag_cleanup import wrapper_csharp
+
+    statement = _enclosing(node, ("local_declaration_statement", "expression_statement"))
+    if statement is None or statement.parent is None or statement.parent.type != "block":
+        return None
+    name: str | None = None
+    if statement.type == "expression_statement":
+        if len(statement.named_children) != 1:
+            return None
+        value = statement.named_children[0]
+    else:
+        if any(c.type in ("modifier", "attribute_list", "using", "await") for c in statement.children):
+            return None  # `using var`, `const`, `await using`
+        declarators = _declarators(statement)
+        if len(declarators) != 1:
+            return None
+        declaration = next((c for c in statement.named_children if c.type == "variable_declaration"), None)
+        value = _initial_value(declarators[0])
+        name = ctor_param_csharp._declarator_name(declarators[0])
+        if declaration is None or value is None or name is None or not _within(node, declaration):
+            return None
+        declared = declaration.child_by_field_name("type")
+        if declared is None or (declared.type != "implicit_type" and ctor_param_csharp._simple_type(declared) not in names):
+            return None
+        if value.type == "postfix_unary_expression" and [c.type for c in value.children][1:] == ["!"]:
+            value = value.named_children[0]
+    function = wrapper_csharp._called_member(value)
+    if function is None or not _plain_path(function.child_by_field_name("expression")):
+        return None
+    looked_up = wrapper_csharp._single_type_argument(function.child_by_field_name("name"), _RESOLVERS)
+    if looked_up is None or ctor_param_csharp._simple_type(looked_up) not in names:
+        return None
+    arguments = value.child_by_field_name("arguments")
+    if arguments is None or ctor_param_csharp._items(arguments):
+        return None
+    return statement, name, _text(value)
+
+
+def _local_gone(statement: Node, name: str, spans: list[tuple[int, int, str]], file: _File) -> bool:
+    """Whether every later mention of the local ``name`` in its block lies in
+    an argument span this pass deletes, and its block binds the name once."""
+    block = statement.parent
+    deleted = [(s, e) for s, e, form in spans if form == "argument"]
+    declarator = _declarators(statement)[0]
+    own = declarator.child_by_field_name("name")
+    mentions = [n for n in _walk(block) if n.type == "identifier" and _text(n).removeprefix("@") == name and n != own]
+    if any(n.start_byte < statement.start_byte for n in mentions):
+        return False
+    if any(
+        n.parent is not None and n.parent.type == "variable_declarator" and n.parent.child_by_field_name("name") == n
+        for n in mentions
+    ):
+        return False
+    return all(_inside(deleted, n.start_byte + file.offset) for n in mentions)
+
+
+def _method_parameter(node: Node) -> tuple[Node, Node] | None:
+    """``(method, parameter)`` when the spelling ``node`` is the type of a
+    parameter of a method declared in a class or struct."""
+    current = _type_position(node)
+    parameter = current.parent
+    if parameter is None or parameter.type != "parameter" or parameter.child_by_field_name("type") != current:
+        return None
+    parameters = parameter.parent
+    method = parameters.parent if parameters is not None else None
+    if parameters is None or parameters.type != "parameter_list" or method is None or method.type != "method_declaration":
+        return None
+    if method.child_by_field_name("parameters") != parameters:
+        return None
+    owner = method.parent.parent if method.parent is not None else None
+    if owner is None or owner.type not in ("class_declaration", "struct_declaration"):
+        return None
+    return method, parameter
+
+
+def _unread_primary_parameter(node: Node) -> tuple[Node, Node] | None:
+    """``(type, parameter)`` when ``node`` is the type of a primary-constructor
+    parameter of a class or struct that is not ``partial`` and reads it
+    nowhere (the run removed its last read)."""
+    from flag_cleanup import primary_constructor
+
+    current = node
+    while current.parent is not None and current.parent.type in ("qualified_name", "alias_qualified_name", "nullable_type"):
+        current = current.parent
+    parameter = current.parent
+    if parameter is None or parameter.type != "parameter" or parameter.child_by_field_name("type") != current:
+        return None
+    parameters = parameter.parent
+    declaration = parameters.parent if parameters is not None else None
+    if (
+        parameters is None
+        or parameters.type != "parameter_list"
+        or declaration is None
+        or declaration.type not in ("class_declaration", "struct_declaration")
+        or "partial" in _modifiers(declaration)
+    ):
+        return None
+    name = parameter.child_by_field_name("name")
+    if name is None or primary_constructor._reads(declaration, parameters, _text(name)):
         return None
     return declaration, parameter
 
@@ -1577,12 +1869,30 @@ def prove(
     pending: list[tuple[str, Node]] = []
     mentions: list[_Mention] = []
     candidates: dict[tuple[str, str, str], Node] = {}
+    #: Primary-constructor parameters of a family type the run left unread:
+    #: ``(path, class, parameter) -> (spelling, label)``.
+    primaries: dict[tuple[str, str, str], tuple[Node, str]] = {}
+    #: Method parameters of a family type: ``(path, owner, method, parameter) -> spelling``.
+    method_params: dict[tuple[str, str, str, str], Node] = {}
+    #: Why a spelling was not taken, reported when nothing else covers it.
+    reasons: dict[tuple[str, int], str] = {}
+    #: ``(path, spelling, statement, name)`` for each local built as a fake.
+    fake_locals: list[tuple[str, Node, Node, str]] = []
+    #: ``(path, spelling, statement, local, lookup)`` for each statement that
+    #: only asks the container for a family type.
+    lookups: list[tuple[str, Node, Node, str | None, str]] = []
     statements: dict[tuple[str, int], tuple[Node, str]] = {}
     #: ``(path, field name, statement)`` for each registration whose instance
     #: is a field: it goes only with that field.
     instances: list[tuple[str, str, Node]] = []
     fields: list[tuple[str, Node, Node, str]] = []
     rebased: set[tuple[str, int]] = set()
+    #: Failed proofs that do not stop the others: all are reported.
+    blockers: list[Kept] = []
+    #: The spans of classes whose constructor parameter was refused.
+    refused: dict[str, list[tuple[int, int]]] = {}
+    #: Their names: an argument to building one stays with it.
+    refused_names: set[str] = set()
     for path in cs_files:
         if path in whole:
             continue
@@ -1618,9 +1928,11 @@ def prove(
                 fake = _text(bases.parent.child_by_field_name("name"))
                 residue.rows.append((path, node.start_point[0] + 1, f"base {_text(entry)} of {fake}"))
                 continue
-            registration = _registration(node, names, shared)
+            plain = lambda v, path=path: ctor_param_csharp._plain_construction(v, repo_dir, path)  # noqa: E731
+            registration = _registration(node, names, shared, plain)
             if isinstance(registration, str):
-                raise Kept(_rel(path, repo_dir), node.start_point[0] + 1, registration)
+                blockers.append(Kept(_rel(path, repo_dir), node.start_point[0] + 1, registration))
+                continue
             if registration is not None:
                 statement, text, instance = registration
                 statements[(path, statement.start_byte)] = (statement, text)
@@ -1631,12 +1943,38 @@ def prove(
             if held is not None:
                 fields.append((path, node, *held))
                 continue
+            local = _fake_local(node, names, shared, plain)
+            if local is not None:
+                fake_locals.append((path, node, *local))
+                continue
+            lookup = _unread_lookup(node, names)
+            if lookup is not None:
+                lookups.append((path, node, *lookup))
+                continue
             owner = _constructor_parameter(node)
             if owner is not None:
                 declaration, parameter = owner
                 class_name = _text(declaration.child_by_field_name("name"))
                 param_name = _text(parameter.child_by_field_name("name"))
                 candidates.setdefault((path, class_name, param_name), node)
+                continue
+            in_method = _method_parameter(node)
+            if in_method is not None:
+                method, parameter = in_method
+                owner_node = method.parent.parent
+                method_params.setdefault(
+                    (path, _text(owner_node.child_by_field_name("name")), _text(method.child_by_field_name("name")),
+                     _text(parameter.child_by_field_name("name"))),
+                    node,
+                )
+                continue
+            primary = _unread_primary_parameter(node)
+            if primary is not None:
+                declaration, parameter = primary
+                class_name = _text(declaration.child_by_field_name("name"))
+                primaries[(path, class_name, _text(parameter.child_by_field_name("name")))] = (
+                    node, f"{class_name}({_text(parameter)})"
+                )
                 continue
             pending.append((path, node))
 
@@ -1647,23 +1985,36 @@ def prove(
         residue.spans.setdefault(path, []).append((start + file.offset, end + file.offset, "statement"))
         residue.rows.append((path, statement.start_point[0] + 1, f"registration {text}"))
 
-    for (path, class_name, param_name), node in sorted(candidates.items(), key=lambda kv: kv[0]):
+    planned = [(key, node, None) for key, node in sorted(candidates.items(), key=lambda kv: kv[0])]
+    planned += [(key, node, label) for key, (node, label) in sorted(primaries.items(), key=lambda kv: kv[0])]
+    for (path, class_name, param_name), node, primary_label in planned:
         file = files[path]
-        outcome = ctor_param_csharp.plan_classic(
-            path, file.data.decode("utf-8"), class_name, param_name, repo_dir, names
-        )
+        if primary_label is not None:
+            outcome = ctor_param_csharp.plan(path, file.data.decode("utf-8"), primary_label, repo_dir)
+        else:
+            outcome = ctor_param_csharp.plan_classic(
+                path, file.data.decode("utf-8"), class_name, param_name, repo_dir, names
+            )
         if isinstance(outcome, Refusal):
-            raise Kept(
+            blockers.append(Kept(
                 _rel(path, repo_dir), node.start_point[0] + 1,
                 f"{outcome.label}: {_tidy_reason(outcome.reason, repo_dir)}",
-            )
+            ))
+            # What that class still spells of the family stays because of
+            # this refusal, and is not reported again.
+            refused.setdefault(path, []).append(_class_span(node, files[path]))
+            refused_names.add(class_name)
+            continue
         from flag_cleanup import wrapper_csharp
 
         if outcome.exported and wrapper_csharp.published(path, repo_dir):
-            raise Kept(
+            blockers.append(Kept(
                 _rel(path, repo_dir), node.start_point[0] + 1,
                 f"{outcome.label}: a public constructor of a project that may be packed",
-            )
+            ))
+            refused.setdefault(path, []).append(_class_span(node, files[path]))
+            refused_names.add(class_name)
+            continue
         residue.removals.append(outcome)
         line = node.start_point[0] + 1
         residue.rows.append((path, line, f"constructor parameter {outcome.label}"))
@@ -1671,6 +2022,31 @@ def prove(
             residue.rows.append((path, line, f"field {class_name}.{outcome.field}"))
         if outcome.exported:
             residue.rows.append((path, line, f"changed constructor {class_name}"))
+
+    # A private method's parameter whose only reads register it
+    # (`services.AddScoped(_ => gate);`): the registrations, the parameter and
+    # every call's argument go.
+    from flag_cleanup import method_param_csharp
+
+    for (path, owner_name, method_name, param_name), node in sorted(method_params.items(), key=lambda kv: kv[0]):
+        file = files[path]
+        planned_param = method_param_csharp.plan_private(
+            path, file.data.decode("utf-8"), owner_name, method_name, param_name, repo_dir, names
+        )
+        if isinstance(planned_param, Refusal):
+            pending.append((path, node))
+            if not planned_param.quiet:
+                reasons[(path, node.start_byte)] = f"{planned_param.label}: {_tidy_reason(planned_param.reason, repo_dir)}"
+            continue
+        removal, registrations = planned_param
+        residue.removals.append(removal)
+        line = node.start_point[0] + 1
+        residue.rows.append((path, line, f"parameter {removal.label}"))
+        data = file.data
+        for start, end in registrations:
+            residue.spans.setdefault(path, []).append((start, end, "statement"))
+            text = " ".join(data[start:end].decode("utf-8", "replace").split())
+            residue.rows.append((path, _line(data, start), f"registration {text}"))
 
     for removal in residue.removals:
         for site in removal.sites:
@@ -1684,10 +2060,49 @@ def prove(
     for removal in residue.removals:
         for site in removal.forwarded:
             if (str(Path(site.path).resolve()), site.start, site.end) not in argument_sites:
-                raise Kept(
+                blockers.append(Kept(
                     _rel(site.path, repo_dir), _line(Path(site.path).read_bytes(), site.start),
                     f"{removal.label} is passed to a base constructor whose parameter stays",
-                )
+                ))
+
+    # A local built as a fake goes when every read of it is an argument
+    # this pass deletes (`new Job(gate, …)` losing its gate).
+    for path, node, statement, name in fake_locals:
+        file = files[path]
+        if not _local_gone(statement, name, residue.spans.get(path, []), file):
+            pending.append((path, node))
+            continue
+        start, end = ctor_param_csharp.declaration_span(statement, file.data[file.offset :])
+        residue.spans.setdefault(path, []).append((start + file.offset, end + file.offset, "statement"))
+        residue.rows.append((path, statement.start_point[0] + 1, f"local {name}"))
+
+    # A statement that only asks the container for a family type (a local
+    # read by nothing now, or only by arguments this pass deletes) goes too:
+    # the container no longer creates the gate there (README limit).
+    seen_lookups: set[tuple[str, int]] = set()
+    lookup_readers = None
+    for path, node, statement, name, lookup in lookups:
+        file = files[path]
+        if (path, statement.start_byte) in seen_lookups:
+            continue
+        from flag_cleanup import wrapper_csharp
+
+        if lookup_readers is None:
+            lookup_readers = wrapper_csharp._Readers(repo_dir)
+        reader = lookup_readers.get(path)
+        if (
+            reader is None
+            or not wrapper_csharp._locator_ok(statement, reader, repo_dir)
+            or (name is not None and not _local_gone(statement, name, residue.spans.get(path, []), file))
+        ):
+            pending.append((path, node))
+            continue
+        seen_lookups.add((path, statement.start_byte))
+        data = file.data[file.offset :]
+        start, end = ctor_param_csharp.declaration_span(statement, data)
+        start = _owned_comments(statement, data, start, _word(names | ({flag_key} if flag_key else set())))
+        residue.spans.setdefault(path, []).append((start + file.offset, end + file.offset, "statement"))
+        residue.rows.append((path, statement.start_point[0] + 1, f"unread lookup {lookup}"))
 
     # A test host's field holding a fake, registered as the instance: it
     # goes when every use of it is something this pass deletes.
@@ -1695,10 +2110,10 @@ def prove(
     pending += [(path, node) for path, node, _, _ in fields if (path, node.start_byte) not in gone]
     for path, field_name, statement in instances:
         if not any(p == path and n == field_name for p, n in gone.values()):
-            raise Kept(
+            blockers.append(Kept(
                 _rel(path, repo_dir), statement.start_point[0] + 1,
                 f"a registration of {field_name}, a field this pass keeps",
-            )
+            ))
 
     # The test classes of a deleted middleware go with it; what they spell
     # needs nothing else.
@@ -1720,19 +2135,25 @@ def prove(
         if path in residue.delete:
             continue
         if not _inside(covered.get(path, []), node.start_byte + file.offset):
+            if _inside(refused.get(path, []), node.start_byte + file.offset) or _argument_of(node, refused_names):
+                continue
             parent = node.parent.type if node.parent is not None else "nothing"
-            raise Kept(
+            blockers.append(Kept(
                 _rel(path, repo_dir), node.start_point[0] + 1,
-                f"a use of {_text(node)} this pass cannot remove (in {parent})",
-            )
+                reasons.get((path, node.start_byte), f"a use of {_text(node)} this pass cannot remove (in {parent})"),
+            ))
     for mention in mentions:
         if mention.path in residue.delete or _inside(covered.get(mention.path, []), mention.at):
             continue
+        if _inside(refused.get(mention.path, []), mention.at):
+            continue
         where = _rel(mention.path, repo_dir)
         if mention.kind == "string":
-            raise Kept(where, mention.line, "a string names it (reflection or a type-name lookup may load it)")
+            blockers.append(Kept(where, mention.line, "a string names it (reflection or a type-name lookup may load it)"))
+            continue
         if mention.kind == "inheritdoc":
-            raise Kept(where, mention.line, "an <inheritdoc cref> names it")
+            blockers.append(Kept(where, mention.line, "an <inheritdoc cref> names it"))
+            continue
         if mention.kind == "cref" and mention.rewrite is not None:
             residue.rewrites.setdefault(mention.path, []).append(mention.rewrite)
             residue.prose.append(
@@ -1741,8 +2162,16 @@ def prove(
             )
             continue
         if mention.kind == "cref":
-            raise Kept(where, mention.line, f"a doc comment cref names it, not as <see cref=\"…\"/> ({mention.text})")
+            blockers.append(Kept(where, mention.line, f"a doc comment cref names it, not as <see cref=\"…\"/> ({mention.text})"))
+            continue
         residue.prose.append((mention.path, mention.line, mention.text))
+    if blockers:
+        # One row a line: two names on it stay for one reason.
+        seen: set[tuple[str, int]] = set()
+        unique = [k for k in blockers if (k.path, k.line) not in seen and not seen.add((k.path, k.line))]
+        first, *rest = unique
+        first.also = tuple(rest)
+        raise first
     _assembly_scans(repo_dir, targets, names)
     family_deleted = [(t.full, t.namespace) for t in targets]
     try:
@@ -1938,7 +2367,7 @@ def _postcondition(
             return f"{path}:{left[0].start_point[0] + 1}: {_text(left[0])} is still spelled"
     for removal in residue.removals:
         source = Path(removal.declaring_path).read_text(encoding="utf-8")
-        if ctor_param_csharp.has_parameter(source.removeprefix("﻿"), removal.class_name, removal.param_name, classic=True):
+        if ctor_param_csharp.has_parameter(source.removeprefix("﻿"), removal.class_name, removal.param_name, classic=removal.classic):
             return f"{removal.declaring_path}: the parameter {removal.param_name} is still declared"
     return None
 
@@ -1999,7 +2428,7 @@ def apply(
         source = before[path][offset:].decode("utf-8")
         parameters.setdefault(path, []).extend(
             (s + offset, e + offset)
-            for s, e in ctor_param_csharp.parameter_spans(source, removal.class_name, removal.param_name, classic=True)
+            for s, e in ctor_param_csharp.parameter_spans(source, removal.class_name, removal.param_name, classic=removal.classic)
         )
     marked: dict[str, bytes] = {}
     failure: str | None = None
@@ -2085,8 +2514,8 @@ def remove(
             names |= residue.names
         except Kept as kept:
             logger.info("keeping the residue of %s: %s", wrapper.label, kept)
-            path = kept.path or wrapper.path
-            rows.append(wi.Finding(path, kept.line, wi.RESIDUE_KEPT, kept.reason, wrapper.label))
+            for each in (kept, *kept.also):
+                rows.append(wi.Finding(each.path or wrapper.path, each.line, wi.RESIDUE_KEPT, each.reason, wrapper.label))
             continue
         except Exception as exc:  # noqa: BLE001 - residue never refuses the flag
             # A file this cannot read (not UTF-8, say) or any other surprise
@@ -2109,7 +2538,35 @@ def remove(
             wi.Finding(_rel(path, repo_dir), line, wi.RESIDUE_PROSE, text, wrapper.label)
             for path, line, text in dict.fromkeys(residue.prose)
         ]
+    # A test class the run emptied goes even where its family's residue
+    # stays (or there is none): its tests went with the member, and an empty
+    # class is left for a reviewer to delete otherwise.
+    label = next((w.label for w in plan.wrappers if w.language == "csharp"), None)
+    if label is not None:
+        summaries, emptied = _emptied_only(label, summaries, repo_dir, rewrite, engine)
+        rows += emptied
     return summaries, rows, frozenset(names)
+
+
+def _emptied_only(
+    label: str, summaries: list, repo_dir: str, rewrite: Callable, engine: Callable[[list[str], str], object]
+) -> tuple[list, list[wi.Finding]]:
+    """Delete the test classes the run left empty that no residue pass took
+    (:func:`_emptied_test_classes`), with their files when nothing else is
+    declared in them, and the rows saying so."""
+    originals = {str(Path(s.path).resolve()): s.original_content for s in summaries}
+    residue = Residue(label, [])
+    _emptied_test_classes(residue, originals, repo_dir)
+    if not residue.rows:
+        return summaries, []
+    try:
+        summaries = apply(residue, summaries, repo_dir, rewrite, engine)
+    except Kept as kept:
+        logger.info("keeping the emptied test classes: %s", kept)
+        return summaries, []
+    return summaries, [
+        wi.Finding(_rel(path, repo_dir), line, wi.RESIDUE, text, label) for path, line, text in residue.rows
+    ]
 
 
 # --- test doubles and construct-only tests (K5) -------------------------------
@@ -2176,6 +2633,33 @@ def _double_creation(value: Node | None, names: frozenset[str] | None = None) ->
             and not ctor_param_csharp._items(arguments)
         )
     return False
+
+
+def _typed_double(value: Node, declaration: Node, names: frozenset[str]) -> bool:
+    """``Mock<F> m = new(<inert>…)``: a target-typed ``new`` whose target is
+    the declaration's own written type, Moq's ``Mock<F>`` for ``F`` one of
+    ``names``, builds exactly what :func:`_double_creation` takes in its
+    explicit form. An object initializer runs a setter and refuses."""
+    if value.type != "implicit_object_creation_expression" or declaration.type != "variable_declaration":
+        return False
+    if any(c.type == "initializer_expression" for c in value.named_children):
+        return False
+    generic = declaration.child_by_field_name("type")
+    if generic is not None and generic.type == "qualified_name":
+        qualifier = generic.child_by_field_name("qualifier")
+        if qualifier is None or _text(qualifier) != "Moq":
+            return False
+        generic = generic.child_by_field_name("name")
+    if generic is None or generic.type != "generic_name" or _text(generic.named_children[0]) != "Mock":
+        return False
+    types = _type_arguments(generic)
+    if len(types) != 1 or ctor_param_csharp._simple_type(types[0]) not in names:
+        return False
+    arguments = next((c for c in value.named_children if c.type == "argument_list"), None)
+    return all(
+        (e := ctor_param_csharp._expression(a)) is not None and ctor_param_csharp._inert(e)
+        for a in (ctor_param_csharp._items(arguments) if arguments is not None else [])
+    )
 
 
 def _declarators(declaration: Node) -> list[Node]:
@@ -2332,6 +2816,50 @@ def _construct_only(method: Node, names: frozenset[str]) -> bool:
     return built
 
 
+def _type_assertion_only(method: Node, names: frozenset[str]) -> bool:
+    """A test whose only subject is a family type: ``[Fact]`` or
+    ``[Theory]`` (test attributes only), every statement an ``Assert.*(…)``
+    call holding a ``typeof(F)`` of the family, and no spelling of the
+    family outside a ``typeof``. Once the type is deleted it asserts
+    nothing (``Assert.DoesNotContain(…, p => p.ParameterType ==
+    typeof(IGate))``), so it goes; a test that also asserts something else
+    is kept."""
+    from flag_cleanup import wrapper_csharp
+
+    if method.type != "method_declaration":
+        return False
+    attributes = set(wrapper_csharp._attributes(method))
+    if not attributes & {"Fact", "Theory"} or attributes - _TEST_ATTRIBUTES:
+        return False
+    body = method.child_by_field_name("body")
+    if body is None:
+        body = next((c for c in method.children if c.type == "arrow_expression_clause"), None)
+    if body is None:
+        return False
+    if body.type == "block":
+        statements = [c for c in body.named_children if c.type != "comment"]
+        if not statements or any(c.type != "expression_statement" or len(c.named_children) != 1 for c in statements):
+            return False
+        calls = [c.named_children[0] for c in statements]
+    else:
+        calls = [c for c in body.named_children if c.type != "comment"]
+    for call in calls:
+        if call.type != "invocation_expression":
+            return False
+        receiver, _, _ = _call_name(call)
+        if receiver is None or receiver.type != "identifier" or _text(receiver) != "Assert":
+            return False
+        if not any(
+            n.type == "typeof_expression" and ctor_param_csharp._simple_type(next(iter(n.named_children), None)) in names
+            for n in _walk(call)
+        ):
+            return False
+    for node in _walk(method):
+        if node.type == "identifier" and _text(node) in names and _enclosing(node, ("typeof_expression",)) is None:
+            return False
+    return True
+
+
 def _test_doubles(
     pending: list[tuple[str, Node]],
     files: dict[str, _File],
@@ -2382,6 +2910,21 @@ def _test_doubles(
                 residue.rows.append((path, method.start_point[0] + 1, f"test {label}{_text(method.child_by_field_name('name'))}"))
                 touched.add(path)
             continue
+        typed = _enclosing(node, ("typeof_expression",))
+        if typed is not None and method is not None and _type_assertion_only(method, names):
+            data = file.data[file.offset :]
+            start, end = ctor_param_csharp.declaration_span(method, data)
+            start = _owned_comments(method, data, start, re.compile(rb"\S"))
+            if (path, start + file.offset, end + file.offset, "member") not in {(path, *s) for s in residue.spans.get(path, [])}:
+                residue.spans.setdefault(path, []).append((start + file.offset, end + file.offset, "member"))
+                owner = _enclosing(method, ("class_declaration",))
+                label = f"{_text(owner.child_by_field_name('name'))}." if owner is not None else ""
+                residue.rows.append((
+                    path, method.start_point[0] + 1,
+                    f"test {label}{_text(method.child_by_field_name('name'))} (it asserts only on a deleted type)",
+                ))
+                touched.add(path)
+            continue
         binding = _binding_of(node, names)
         if binding is not None:
             name, scope = binding
@@ -2396,10 +2939,16 @@ def _test_doubles(
         ok = True
         for use in (n for n in _walk(scope) if n.type == "identifier" and _text(n) == name):
             parent = use.parent
+            if parent is not None and parent.type == "argument" and parent.child_by_field_name("name") == use:
+                continue  # `gate: …` names the callee's parameter, not the double
             if parent is not None and parent.type == "variable_declarator" and parent.child_by_field_name("name") == use:
                 declaration = parent.parent.parent if parent.parent is not None else None
                 value = _initial_value(parent)
-                if declaration is None or len(_declarators(parent.parent)) != 1 or (value is not None and not _double_creation(value, names)):
+                if (
+                    declaration is None
+                    or len(_declarators(parent.parent)) != 1
+                    or (value is not None and not _double_creation(value, names) and not _typed_double(value, parent.parent, names))
+                ):
                     ok = False
                     break
                 if declaration.type == "field_declaration" and _modifiers(declaration) & {"public", "protected", "internal"}:
@@ -3167,6 +3716,19 @@ def _bound_section(statement, text, name, chained, invocation, section_argument)
     return statement, text, section
 
 
+#: What a constant's value may be built of: literals and the operators
+#: between them, never a name (another constant, ``nameof``, a member).
+_LITERAL_PARTS = frozenset(
+    {"string_literal", "integer_literal", "real_literal", "boolean_literal", "character_literal", "null_literal",
+     "binary_expression", "prefix_unary_expression", "parenthesized_expression", "string_content", "escape_sequence"}
+)
+
+
+def _literal_value(value: Node) -> bool:
+    """Whether ``value`` is built of literals and operators only."""
+    return all(n.type in _LITERAL_PARTS or n.type.endswith("_content") for n in _walk(value) if n.is_named)
+
+
 def _options_class(name: str, knob: str, repo_dir: str) -> tuple[str, Node, _File, dict[str, str], Node, bool]:
     """The options class's file, declaration, string constants, the knob's
     declaration, and whether it holds another setting (then only the knob
@@ -3194,7 +3756,7 @@ def _options_class(name: str, knob: str, repo_dir: str) -> tuple[str, Node, _Fil
         raise Kept(where, line, f"the options class {name} is generic, has a base or carries an attribute")
     if wrapper_csharp.published(info.path, repo_dir):
         raise Kept(where, line, f"the options class {name}'s project may be packed")
-    consts: dict[str, str] = {}
+    consts: dict[str, str | None] = {}
     seen_knob: Node | None = None
     others = False
     body = node.child_by_field_name("body")
@@ -3212,9 +3774,11 @@ def _options_class(name: str, knob: str, repo_dir: str) -> tuple[str, Node, _Fil
             for declarator in _declarators(member):
                 value = _initial_value(declarator)
                 key = ctor_param_csharp._declarator_name(declarator)
-                if key is None or value is None or value.type != "string_literal":
-                    raise Kept(where, member.start_point[0] + 1, f"{name} declares a constant that is not a string")
-                consts[key] = ctor_param_csharp._literal(value)
+                if key is None or value is None or not _literal_value(value):
+                    raise Kept(where, member.start_point[0] + 1, f"{name} declares a constant whose value is not a literal")
+                # A string may name a binding's section; any other literal
+                # (`64 * 1024`) names nothing, and `O.Max` stays a constant.
+                consts[key] = ctor_param_csharp._literal(value) if value.type == "string_literal" else None
             continue
         if member.type == "property_declaration" and _text(member.child_by_field_name("name")) == knob:
             if _modifiers(member) & {"virtual", "abstract", "override", "static", "new"}:
@@ -3542,11 +4106,28 @@ def _options_property(
         except OSError:
             continue
         lines[spelled] = [(_line(data, a), _line(data, max(a, b - 1))) for a, b in spans]
+    # The class stays, and so do its bindings: they tell which key it read.
+    sections: set[str] = set()
+    bindings: set[str] = set()
+    scratch = Residue(residue.label, targets)
+    for spelled in _scan(frozenset({name}), repo_dir, scratch):
+        current = _read(spelled)
+        for node_ in _spellings(current, frozenset({name})):
+            bound = _binding(node_, name, consts, _rooted(repo_dir))
+            if isinstance(bound, str):
+                raise Kept(_rel(spelled, repo_dir), node_.start_point[0] + 1, bound)
+            if bound is not None:
+                sections.add(bound[2])
+                bindings.add(spelled)
+    if len(sections) > 1:
+        raise Kept("", 1, f"{name} is bound to more than one section ({', '.join(sorted(sections))})")
     for mention_path, mention_line, text in wrapper_csharp.leftovers(repo_dir, stand_in):
         resolved = str(Path(mention_path).resolve())
         if resolved in residue.delete:
             continue
         if any(a <= mention_line <= b for a, b in lines.get(resolved, [])):
+            continue
+        if len(sections) == 1 and _other_section_key(resolved, mention_line, text, next(iter(sections)), knob, repo_dir):
             continue
         raise Kept(
             _rel(resolved, repo_dir), mention_line,
@@ -3565,21 +4146,6 @@ def _options_property(
     options = _Options(name, [])
     options.spans.setdefault(path, []).append((*span, "member"))
     options.rows.append((path, line, f"options property {name}.{knob}"))
-    # The class stays, and so do its bindings: they tell which key it read.
-    sections: set[str] = set()
-    bindings: set[str] = set()
-    scratch = Residue(residue.label, targets)
-    for spelled in _scan(frozenset({name}), repo_dir, scratch):
-        current = _read(spelled)
-        for node_ in _spellings(current, frozenset({name})):
-            bound = _binding(node_, name, consts, _rooted(repo_dir))
-            if isinstance(bound, str):
-                raise Kept(_rel(spelled, repo_dir), node_.start_point[0] + 1, bound)
-            if bound is not None:
-                sections.add(bound[2])
-                bindings.add(spelled)
-    if len(sections) > 1:
-        raise Kept("", 1, f"{name} is bound to more than one section ({', '.join(sorted(sections))})")
     if sections:
         own = ctor_param_csharp.declaration_span(node, file.data[file.offset :])
         _config_keys(
@@ -3587,6 +4153,78 @@ def _options_property(
             exempt={path: [(own[0] + file.offset, own[1] + file.offset)]}, whole=False,
         )
     return options
+
+
+#: Configuration reads taking a key as their first argument.
+_CONFIG_READS = frozenset({"GetValue", "GetSection", "GetRequiredSection"})
+_CONFIG_PATH = re.compile(r"[A-Za-z_][\w.]*(?::[A-Za-z_][\w.]*)+")
+
+
+def _other_section_key(path: str, line: int, text: str, section: str, knob: str, repo_dir: str) -> bool:
+    """Whether the leftover mention ``text`` at ``path:line`` is a plain
+    string literal that is a configuration key of another section than the
+    options class's ``section`` (``"Quartz:Enabled"`` for a class bound to
+    ``"Scheduled"``), passed straight to the configuration library: the
+    first argument of ``GetValue``/``GetSection``/``GetRequiredSection`` (no
+    checkout method of those names) or an indexer's only argument. It reads
+    that key, which the run neither removes nor changes, and a string with a
+    ``:`` names no member. Keys compare ignoring case, as configuration
+    does."""
+    literal = text.strip()
+    if not (literal.startswith('"') and literal.endswith('"')) or "\\" in literal:
+        return False
+    key = literal[1:-1]
+    if not _CONFIG_PATH.fullmatch(key):
+        return False
+    *prefix, last = key.split(":")
+    if last.lower() != knob.lower() or ":".join(prefix).lower() == section.lower():
+        return False
+    if any(part.lower() == knob.lower() for part in prefix):
+        return False  # the name again, as a section: not settled
+    file = _read(path)
+    found = [
+        n for n in _walk(file.root)
+        if n.type == "string_literal" and n.start_point[0] + 1 == line and _text(n) == literal
+    ]
+    if len(found) != 1:
+        return False
+    node = found[0]
+    argument = node.parent
+    if argument is None or argument.type != "argument" or argument.child_by_field_name("name") is not None:
+        return False
+    holder = argument.parent
+    if holder is None:
+        return False
+    items = ctor_param_csharp._items(holder)
+    if holder.type == "bracketed_argument_list":
+        return (
+            len(items) == 1
+            and holder.parent is not None
+            and holder.parent.type == "element_access_expression"
+            and not _declares_string_indexer(repo_dir)
+        )
+    call = holder.parent
+    if holder.type != "argument_list" or call is None or call.type != "invocation_expression" or not items or items[0] != argument:
+        return False
+    receiver, method, _ = _call_name(call)
+    if receiver is None or method is None or _text(method) not in _CONFIG_READS:
+        return False
+    return _repository_methods(repo_dir, frozenset({_text(method)})) is None
+
+
+def _declares_string_indexer(repo_dir: str) -> bool:
+    """Whether a C# file of the checkout may declare an indexer taking a
+    string (``this[string key]``), which an ``x["…"]`` could call instead of
+    the configuration's."""
+    pattern = re.compile(rb"\bthis\s*\[\s*(?:string|String|System\.String)\b")
+    for source in source_index.files(repo_dir, (".cs",), with_ignored=True):
+        try:
+            data = source.path.read_bytes()
+        except OSError:
+            return True
+        if pattern.search(data):
+            return True
+    return False
 
 
 _OPTION_WRAPPERS = frozenset({"IOptions", "IOptionsSnapshot", "IOptionsMonitor"})

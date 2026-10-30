@@ -1,0 +1,135 @@
+# Assertions the fold made trivially true, for ts. Appended to the rules
+# whenever `ts_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `ts.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `expect(isEnabled("k")).toBe(true)` in a test folds to `expect(true).toBe(true)`:
+# a check the removal made meaningless. Reached ONLY from the fold's own literal
+# (ts_edges.toml, Parent scope from the groups that write one), never as a
+# seed, so an `expect(true).toBe(true)` the customer wrote stays. The assertion
+# APIs are policy, listed per framework: Node's `assert`, and Jest/Vitest
+# `expect`. An assertion folded to the FAILING literal is never matched.
+#
+# Parent scope reaches four nodes (the literal, its arguments, the call, the
+# statement), and `expect(true).toBe(true)` is five deep. The match-only
+# `trivial_expect_subject` is the hop: it matches `expect(<literal>)` from the
+# literal, writes nothing, and its own edge walks on to the statement.
+[[rules]]
+name = "trivial_expect_subject"
+query = """(
+  (call_expression
+    function: (identifier) @expect_fn
+    arguments: (arguments . [(true) (false)] .)) @expect_call
+  (#eq? @expect_fn "expect")
+)"""
+groups = ["trivial_expect_subject"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_true_assert_call"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @assert_fn
+      arguments: (arguments . (true) .))) @statement
+  (#eq? @assert_fn "assert")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_true_assert_method"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (member_expression
+        object: (identifier) @assert_object
+        property: (property_identifier) @assert_method)
+      arguments: (arguments . (true) .))) @statement
+  (#eq? @assert_object "assert")
+  (#eq? @assert_method "ok")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_equal_assert_method"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (member_expression
+        object: (identifier) @assert_object
+        property: (property_identifier) @assert_method)
+      arguments: (arguments . [(true) (false)] @actual . [(true) (false)] @expected .))) @statement
+  (#eq? @assert_object "assert")
+  (#match? @assert_method "^(equal|strictEqual|deepEqual|deepStrictEqual)$")
+  (#eq? @actual @expected)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_equal_expect"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (member_expression
+        object: (call_expression
+          function: (identifier) @expect_fn
+          arguments: (arguments . [(true) (false)] @actual .))
+        property: (property_identifier) @matcher)
+      arguments: (arguments . [(true) (false)] @expected .))) @statement
+  (#eq? @expect_fn "expect")
+  (#match? @matcher "^(toBe|toEqual|toStrictEqual)$")
+  (#eq? @actual @expected)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_truthy_expect"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (member_expression
+        object: (call_expression
+          function: (identifier) @expect_fn
+          arguments: (arguments . (true) .))
+        property: (property_identifier) @matcher)
+      arguments: (arguments . ")"))) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @matcher "toBeTruthy")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_trivially_falsy_expect"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (member_expression
+        object: (call_expression
+          function: (identifier) @expect_fn
+          arguments: (arguments . (false) .))
+        property: (property_identifier) @matcher)
+      arguments: (arguments . ")"))) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @matcher "toBeFalsy")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false

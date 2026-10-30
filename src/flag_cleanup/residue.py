@@ -17,6 +17,10 @@ caveat:
 * a file that names the key only as a URL PATH SEGMENT in a string
   (``/environments/${id}/scheduled-changes``): an endpoint named after the
   feature, which is common and is no flag read, so it is listed apart;
+* a TypeScript-family file that names it only as a STRING VALUE IN A
+  LITERAL, an element of an array that also holds something computed
+  (``['scheduled-changes', orgId] as const``, a query cache key): a value
+  named after the feature, listed apart for the same reason;
 * a file whose only mention of the key is an ENUM MEMBER's value (or, in
   TypeScript, a property of an ``as const`` object, which the run reads as
   one): resolved for some languages and forms, so the pull request says which;
@@ -84,6 +88,11 @@ class Residue:
     #: relative to the checkout root. Never examined and never edited; see
     #: :func:`flag_cleanup.orchestrate.outside_mentions`.
     outside: tuple[str, ...] = ()
+    #: TypeScript-family files every live mention of the flag in which is a
+    #: whole string element of an array literal beside a non-literal element
+    #: (a query cache key), and the rest comments or test titles; see
+    #: :func:`_literal_only`.
+    literal_only: tuple[str, ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
@@ -199,6 +208,59 @@ def _path_only(root: Node, source: str, mention: re.Pattern[str], language: str)
                 return False
             in_paths += 1
     return in_paths > 0
+
+
+def _literal_only(root: Node, source: str, mention: re.Pattern[str], language: str) -> bool:
+    """Whether every mention outside comments and test titles is a string
+    element of an array literal, the WHOLE string being the key, with one
+    such mention found. TypeScript family only.
+
+    Three things keep a list of flag keys out, since that is a flag read in
+    all but name: the array must hold at least one element that is not a
+    string literal (``['key', orgId]``; ``['key', 'other']`` stays in the
+    generic caveat), it must not be handed straight to a call (the callee may
+    read flags by key), and the string must be a plain one (a template can
+    splice anything in)."""
+    if language not in _TITLED:
+        return False
+    data = source.encode("utf-8")
+    titles = ts_tests.title_nodes(root, data)
+    found = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if "comment" in node.type or node.id in titles:
+            continue
+        if node.child_count:
+            stack.extend(node.children)
+            continue
+        if not mention.search(node.text.decode("utf-8", "replace")):
+            continue
+        string = node.parent
+        if (
+            node.type != "string_fragment"
+            or string is None
+            or string.type != "string"
+            or not mention.fullmatch(node.text.decode("utf-8", "replace"))
+            or len(string.named_children) != 1
+            or not _array_value(string)
+        ):
+            return False
+        found += 1
+    return found > 0
+
+
+def _array_value(string: Node) -> bool:
+    """Whether ``string`` is an element of an array literal that also holds a
+    non-literal element and is not an argument of a call."""
+    array = string.parent
+    if array is None or array.type != "array":
+        return False
+    if array.parent is not None and array.parent.type == "arguments":
+        return False
+    return any(
+        element.type not in ("string", "comment") for element in array.named_children
+    )
 
 
 #: The grammar node of one enum member, per language (measured, not guessed).
@@ -335,6 +397,7 @@ def classify(
     enum_held: list[tuple[str, str]] = []
     comment_lines: list[tuple[str, int, str]] = []
     path_only: list[str] = []
+    literal_only: list[str] = []
     for path in paths:
         language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
         if language is None:
@@ -360,6 +423,9 @@ def classify(
         if _path_only(root, source, mention, language):
             path_only.append(path)
             continue
+        if _literal_only(root, source, mention, language):
+            literal_only.append(path)
+            continue
         held = _enum_held(root, mention, language)
         if held is not None:
             enum_held.append((path, held))
@@ -370,6 +436,7 @@ def classify(
         tuple(title_only),
         tuple(comment_lines),
         tuple(path_only),
+        literal_only=tuple(literal_only),
     )
 
 

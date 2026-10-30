@@ -46,6 +46,7 @@ from flag_cleanup import (
     ctor_param_ts,
     dart_field_removal,
     git_ops,
+    method_param_csharp,
     syntax,
     ts_field_removal,
     ts_list_join,
@@ -74,7 +75,7 @@ _KINDS = {
     "ts": _TS_KINDS,
     "tsx": _TS_KINDS,
     "js": _TS_KINDS,
-    "csharp": frozenset({"unread parameter"}),
+    "csharp": frozenset({"unread parameter", "unread method parameter"}),
     "dart": frozenset({"unread member"}),
 }
 
@@ -169,6 +170,8 @@ def _inside(removal: Removal, repo_dir: str) -> Removal | Refusal:
 
 def _plan(summary, kind: str, label: str, language: str, repo_dir: str) -> Removal | Refusal:
     try:
+        if language == "csharp" and kind == "unread method parameter":
+            return method_param_csharp.plan(summary.path, summary.content, label, repo_dir)
         if language == "csharp":
             return ctor_param_csharp.plan(summary.path, summary.content, label, repo_dir)
         if language == "dart":

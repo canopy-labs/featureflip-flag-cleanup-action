@@ -891,6 +891,7 @@ def _dry_run_caveats(
     removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
+    failing = sum(1 for _, kind, _ in bindings if kind == "failing assertion")
     declared_loads = sum(1 for _, kind, _ in bindings if kind == DECLARED_LOAD)
     state_comments = sum(
         1 for _, kind, _ in bindings
@@ -905,6 +906,7 @@ def _dry_run_caveats(
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
         - left_out
         - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments
+        - failing
         - state_comments
         - renamed_tests
         - removed_defaults
@@ -922,6 +924,8 @@ def _dry_run_caveats(
         )
     if cleaned:
         notes.append(f"{cleaned} stranded import(s)/local(s) would be cleaned up")
+    if failing:
+        notes.append(f"{failing} assertion(s) would only fail, and are left for review")
     if dropped:
         notes.append(f"{dropped} unused parameter(s) would be removed")
     if removed_ctor:

@@ -525,6 +525,7 @@ def _ts_import_candidates(
     before: Node | None,
     guarded: bool = True,
     configured: Callable[[], dict[str, frozenset[str | None]]] | None = None,
+    automatic: Callable[[], bool] | None = None,
 ) -> list[Candidate]:
     """Every binding an `import_statement` introduces, at specifier granularity.
 
@@ -628,10 +629,25 @@ def _ts_import_candidates(
     just the same. ``configured`` reads the factory options of the file's
     compiler config (:func:`~flag_cleanup.cross_file_ts.jsx_factories`), and
     is asked only for a file holding JSX.
+
+    Both JSX guards are lifted under the automatic runtime, where an element
+    calls a function the compiler imports itself and never one the file
+    binds. ``automatic`` answers that from the file's compiler configs
+    (:func:`~flag_cleanup.cross_file_ts.jsx_automatic`), and is asked only
+    for a file holding JSX and no ``@jsx`` pragma of any kind, since a pragma
+    (``@jsxRuntime classic``, ``@jsx h``) can put the file back on the
+    classic runtime. The engine lifts its own specifier guard on the same
+    answer, handed to it as the file's ``jsx_runtime`` fact, so it removes
+    a specifier its fold stranded first, and this branch is the backstop for
+    what the engine withholds and for strands this side's own edits make.
     """
     if guarded and _spells_eval(root):
         return []
-    holds_jsx = guarded and (b"</" in source_bytes or b"/>" in source_bytes)
+    holds_jsx = (
+        guarded
+        and (b"</" in source_bytes or b"/>" in source_bytes)
+        and not _automatic_runtime(root, automatic)
+    )
     candidates = []
     for node in _walk(root):
         if node.type != "import_statement":
@@ -752,6 +768,18 @@ def _ts_import_candidates(
         factories = _jsx_factories(root, configured)
         candidates = [c for c in candidates if c.name not in factories]
     return candidates
+
+
+def _automatic_runtime(root: Node, automatic: Callable[[], bool] | None) -> bool:
+    """Whether a TS-family file's JSX is proven to compile with the automatic
+    runtime: no comment spells a ``@jsx`` pragma of any kind, and its
+    compiler configs say so. See :func:`_ts_import_candidates`."""
+    if automatic is None:
+        return False
+    for node in _walk(root):
+        if node.type in {"comment", "html_comment"} and b"@jsx" in node.text:
+            return False
+    return automatic()
 
 
 #: A ``@jsx`` or ``@jsxFrag`` pragma, with the root identifier of the name it
@@ -1325,6 +1353,7 @@ def _import_candidates(
     resolve: Callable[[str], dart_namespace.Namespace | None] | None = None,
     guarded: bool = True,
     configured: Callable[[], dict[str, frozenset[str | None]]] | None = None,
+    automatic: Callable[[], bool] | None = None,
 ) -> list[Candidate]:
     """Every import binding in ``source`` whose usage this pass can decide.
 
@@ -1334,8 +1363,9 @@ def _import_candidates(
     ``_dart_import_candidates``). ``guarded=False`` lifts the TS family's
     JSX and ``eval`` file guards, for sizing a budget only: another edit can
     delete the text a guard read, and the bindings it held back then count.
-    ``configured`` reads the file's JSX factory options for the JSX guard (see
-    ``_ts_import_candidates``).
+    ``configured`` reads the file's JSX factory options for the JSX guard,
+    and ``automatic`` whether its configs set the automatic runtime, which
+    lifts it (see ``_ts_import_candidates``).
     """
     source_bytes = source.encode("utf-8")
     root = _parse(source, language)
@@ -1358,7 +1388,7 @@ def _import_candidates(
         # `import Combine` is what makes `publisher.sink { … }` resolve.
         return []
     if language in {"ts", "tsx", "js"}:
-        return _ts_import_candidates(root, source_bytes, before, guarded, configured)
+        return _ts_import_candidates(root, source_bytes, before, guarded, configured, automatic)
     if language == "csharp":
         return _csharp_import_candidates(root, source_bytes)
     return []
@@ -1974,7 +2004,11 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
     locals its own fold stranded in a block first, so those two branches are
     the backstop: they act on what the engine withholds (a non-literal value,
     a named C# type, a TS module's top level, a TS declaration with a comment
-    on its line) and on strands this side's own edits make.
+    on its line) and on strands this side's own edits make. Since 0.41.0 the
+    engine also drops a stranded shorthand name from a TS/JS destructuring
+    pattern that keeps another. A pattern the name would empty it keeps
+    unless the value is an object literal, as it keeps ``const x = call()``,
+    and the single-name pattern below takes it as it takes that local.
     """
     declaration_type, name_field, value_field = _VARIABLE_DECLARATIONS[language]
     source_bytes = source.encode("utf-8")
@@ -4350,7 +4384,16 @@ def _is_member_access_property(leaf: Node, language: str) -> bool:
     from an ordinary name by type alone). ``child_by_field_name`` returns a
     FRESH ``Node`` per call, so the comparison is by ``.id``, never ``is`` —
     the same lesson ``key_const``'s C# declarator lookup already paid for.
+
+    The TypeScript family is the exception: there a ``property_identifier``
+    is never a read, wherever it sits. It names a key, of a member access, an
+    object literal (``{ orgId: 1 }``) or an object type
+    (``useParams<{ orgId: string }>()``'s type argument), and the grammar
+    gives every read of a name another node type, a shorthand ``{ orgId }``
+    included.
     """
+    if language in _TS_MODULE_LANGUAGES and leaf.type == "property_identifier":
+        return True
     if language == "dart":
         return (
             leaf.type == "identifier"
@@ -4920,6 +4963,11 @@ def remove_stranded_bindings(
         if language in {"ts", "tsx", "js"} and path is not None and root is not None
         else None
     )
+    automatic = (
+        lru_cache(maxsize=None)(partial(cross_file_ts.jsx_automatic, path, root))
+        if language in {"ts", "tsx", "js"} and path is not None and root is not None
+        else None
+    )
     removed: list[Candidate] = []
     current = after
     original = _parse(before, language)
@@ -4935,7 +4983,9 @@ def remove_stranded_bindings(
         for candidate in (
             _variable_candidates(current, language)
             + methods(current, language)
-            + _import_candidates(current, language, original, resolve, configured=configured)
+            + _import_candidates(
+                current, language, original, resolve, configured=configured, automatic=automatic
+            )
         ):
             if candidate.kind == "private method":
                 before_count = _method_references(before, candidate.name, language)
