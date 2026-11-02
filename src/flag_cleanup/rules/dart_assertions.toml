@@ -134,3 +134,102 @@ not_enclosing_node = """[
   (for_statement body: (expression_statement))
   (do_statement body: (expression_statement))
 ] @braceless"""
+
+# --- an assertion of the flag's own value -> the statement is deleted
+#
+# `expect(AppConfig.isFeatureEnabled('k'), AppConfig.enableK);` checks that the
+# flag reads the value something else holds. The fold leaves
+# `expect(true, AppConfig.enableK);`: the read it tested is gone, and what is
+# left passes or fails with the other side, which is neither trivial nor
+# provably failing, so neither rule above can decide it. The subject being the
+# read ALONE is what makes it a test of the flag and of nothing else, the Dart
+# form of a wrapper's own test.
+#
+# Its own group, reached ONLY from the seed's literal (dart_edges.toml), never
+# from a simplification: the walk then starts at the literal that replaced the
+# read, and a read anywhere else in the statement leaves that literal inside
+# the matcher (excluded by the `not_contains`, which a literal matcher meets
+# too) or the reason (excluded by the `$` predicate: only an interpolation
+# could hold one, and it sits deeper than the walk reaches today, so the
+# predicate is a guard rather than a measured need). So the subject literal
+# here is always the read, never one the customer wrote: `expect(true,
+# read && other)` folds to `expect(true, other)` by a simplification, which
+# does not reach this rule. The cost is `expect(!read, x)`, whose literal comes
+# from a simplification: it stays. `isTrue`/`isFalse` are the rules above and
+# the failing-assertion report's, and a literal matcher the trivially-equal
+# rule's.
+[[rules]]
+name = "delete_flag_value_assertion"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @expect_fn
+      arguments: [
+        (arguments . [(true) (false)] . (_) @matcher .)
+        (arguments . [(true) (false)] . (_) @matcher . (named_argument (label) (string_literal) @reason) .)
+      ])) @statement
+  (#eq? @expect_fn "expect")
+  (#not-match? @matcher "^(isTrue|isFalse)$")
+  (#not-match? @reason "[$]")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["flag_value_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+on_capture = "matcher"
+not_contains = ["[(true) (false)] @flag_value.literal"]
+
+# The braceless-body guard of the trivial rules above, for the same reason:
+# deleting the whole body of an `if` or a loop hands it the next statement.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+# --- a test the flag-value deletion left with nothing in it -> deleted too
+#
+# The flag's own test is usually that one `expect` and nothing else:
+# `test('the switch is exposed', () { expect(<read>, AppConfig.enableX); });`.
+# Left as `test('…', () {\n  });` it runs nothing, and `dart format` rewrites
+# it. Reached ONLY from `delete_flag_value_assertion` (dart_edges.toml): the
+# match-only hop finds the closure the deletion emptied (its block holds
+# nothing, not even a comment), and its own edge walks on to the `test`/
+# `testWidgets` call statement, which takes no argument but the title and the
+# closure (a `skip:` or `tags:` keeps it). A test the customer left empty, or
+# one a trivial-assertion deletion emptied, is not reached.
+[[rules]]
+name = "flag_value_emptied_closure"
+query = """(
+  (function_expression
+    body: (function_expression_body (block) @block)) @closure
+  (#match? @block "^[{][ \\t\\r\\n]*[}]$")
+)"""
+groups = ["flag_value_emptied_closure"]
+is_seed_rule = false
+
+[[rules]]
+name = "delete_test_emptied_by_flag_value_assertion"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @test_fn
+      arguments: (arguments
+        .
+        (string_literal)
+        .
+        (function_expression
+          body: (function_expression_body (block) @block))
+        .))) @statement
+  (#match? @test_fn "^(test|testWidgets)$")
+  (#match? @block "^[{][ \\t\\r\\n]*[}]$")
+)"""
+replace_node = "statement"
+replace = ""
+delete_statement_lines = true
+groups = ["flag_value_emptied_test"]
+is_seed_rule = false

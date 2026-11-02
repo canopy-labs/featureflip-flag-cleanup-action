@@ -40,11 +40,13 @@ import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
+from flag_cleanup.failing_assertions import FLAG_VALUE_ASSERTION
 from flag_cleanup import (
     constant_wrappers,
     cross_file_keys,
     git_ops,
     github_ops,
+    inert_calls,
     inert_load,
     orchestrate,
     pr_content,
@@ -56,6 +58,8 @@ from flag_cleanup.config import Config, STALENESS_VALUES
 from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
 from flag_cleanup.residue import Residue
+from flag_cleanup.discarded_calls import DISCARDED_CALL
+from flag_cleanup.inert_calls import DECLARED_CALL
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 
@@ -597,6 +601,8 @@ def _regenerate(
     try:
         with source_index.run_scope(), inert_load.declaring(
             config.side_effect_free_modules
+        ), inert_calls.declaring(
+            config.side_effect_free_calls
         ), orchestrate.piranha_transform(
             candidate, config, ledger, known_flag_keys
         ) as (
@@ -893,6 +899,8 @@ def _dry_run_caveats(
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     failing = sum(1 for _, kind, _ in bindings if kind == "failing assertion")
     declared_loads = sum(1 for _, kind, _ in bindings if kind == DECLARED_LOAD)
+    declared_calls = sum(1 for _, kind, _ in bindings if kind == DECLARED_CALL)
+    discarded_calls = sum(1 for _, kind, _ in bindings if kind == DISCARDED_CALL)
     state_comments = sum(
         1 for _, kind, _ in bindings
         if kind
@@ -911,7 +919,16 @@ def _dry_run_caveats(
         - renamed_tests
         - removed_defaults
         - declared_loads
+        - declared_calls
+        - discarded_calls
     )
+    if declared_calls:
+        notes.append(
+            f"{declared_calls} discarded call(s) to a name listed in side-effect-free-calls "
+            "would be deleted"
+        )
+    if discarded_calls:
+        notes.append(f"{discarded_calls} call(s) would be kept only as a discard (reported)")
     if declared_loads:
         notes.append(
             f"{declared_loads} import(s) of a module listed in side-effect-free-modules "
@@ -1007,6 +1024,7 @@ def _dry_run_caveats(
     sibling_tests = sum(1 for _, kind, _ in test_doubles if kind == "sibling test")
     pinned = sum(1 for _, kind, _ in test_doubles if kind == "pinned parameter")
     phases = sum(1 for _, kind, _ in test_doubles if kind == "test phase")
+    flag_value = sum(1 for _, kind, _ in test_doubles if kind == FLAG_VALUE_ASSERTION)
     if removed_tests:
         notes.append(
             f"{removed_tests} test(s) whose mock returns the removed value "
@@ -1021,7 +1039,9 @@ def _dry_run_caveats(
         notes.append(f"{pinned} test helper parameter(s) would be removed")
     if phases:
         notes.append(f"{phases} part(s) of tests run with a fake at the removed value would be deleted")
-    mock_lines = len(test_doubles) - removed_tests - sibling_tests - pinned - phases
+    if flag_value:
+        notes.append(f"{flag_value} assertion(s) of the flag's own value would be deleted")
+    mock_lines = len(test_doubles) - removed_tests - sibling_tests - pinned - phases - flag_value
     if mock_lines:
         notes.append(
             f"{mock_lines} mock stub/verification line(s) "

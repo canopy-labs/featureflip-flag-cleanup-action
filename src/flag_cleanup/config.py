@@ -149,6 +149,11 @@ class Config:
     #: ``accessors`` input, split out here because nothing that reads
     #: ``accessors`` can use one. See :mod:`flag_cleanup.ts_gates`.
     gates: tuple[Gate, ...] = ()
+    #: Accessors whose key is not their first argument, with its index:
+    #: ``flag_is_active[1]`` in the input is ``("flag_is_active", 1)`` here, and
+    #: its bare name is in ``accessors``. Python only; see
+    #: :func:`flag_cleanup.rule_synthesis.with_accessors`.
+    key_positions: tuple[tuple[str, int], ...] = ()
     ignore: frozenset[str] = frozenset()
     #: Flag keys this run may propose, as an ALLOWlist. Empty — the default —
     #: means no filtering, so an existing workflow is unaffected.
@@ -177,6 +182,12 @@ class Config:
     #: :func:`flag_cleanup.inert_load.declaring`. Their word, not a proof, so
     #: every such deletion is named in the pull request.
     side_effect_free_modules: tuple[str, ...] = ()
+    #: Function names the customer declares do nothing when called, held to
+    #: the ``accessors`` shape. A discarded call to one that this run left
+    #: behind is deleted instead of kept; see :mod:`flag_cleanup.inert_calls`.
+    #: Their word, not a proof, so every such deletion is named in the pull
+    #: request.
+    side_effect_free_calls: tuple[str, ...] = ()
     #: Most pull requests one run may propose; ``0`` means no limit. A bound on
     #: blast radius rather than on correctness — see :data:`DEFAULT_MAX_PRS`.
     max_prs: int = DEFAULT_MAX_PRS
@@ -232,7 +243,16 @@ class Config:
                 f"expected one or more of {', '.join(supported_languages())}"
             )
 
-        accessors, gates = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
+        accessors, gates, key_positions = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
+        if key_positions and "python" not in languages:
+            # Every other language's run drops them, so the input would be
+            # read and then silently match nothing.
+            raise ConfigError(
+                f"FEATUREFLIP_ACCESSORS value(s) "
+                f"{', '.join(repr(f'{name}[{index}]') for name, index in key_positions)} "
+                "name the position of the key, which only a Python run reads, but "
+                "FEATUREFLIP_LANGUAGES does not include python"
+            )
         suffixed = [name for name in accessors if name.endswith(("?", "!"))]
         if suffixed and not SUFFIXED_ACCESSOR_LANGUAGES & set(languages):
             # Every configured run would drop these (`accessors_for`), so the
@@ -290,8 +310,12 @@ class Config:
             directories=_split_csv(_get(env, "FEATUREFLIP_DIRECTORIES", "."), default=(".",)),
             languages=languages,
             accessors=accessors,
+            key_positions=key_positions,
             side_effect_free_modules=_split_csv(
                 _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_MODULES", ""), default=()
+            ),
+            side_effect_free_calls=_parse_call_names(
+                _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_CALLS", "")
             ),
             gates=gates,
             ignore=frozenset(_split_csv(_get(env, "FEATUREFLIP_IGNORE", ""), default=())),
@@ -332,7 +356,15 @@ class Config:
 _ACCESSOR_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*[?!]?\Z")
 
 
-def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
+#: ``flag_is_active[1]``: a Python accessor whose key is the argument at that
+#: index, counting from 0. Up to 9, which is further than any real read puts
+#: it; each index is one more anchored wildcard in the generated rule.
+_KEY_POSITION_RE = re.compile(r"\A(?P<name>[A-Za-z_][A-Za-z0-9_]*)\[(?P<index>[0-9])\]\Z")
+
+
+def _parse_accessors(
+    value: str,
+) -> tuple[tuple[str, ...], tuple[Gate, ...], tuple[tuple[str, int], ...]]:
     """Split, validate and de-duplicate ``FEATUREFLIP_ACCESSORS``.
 
     Returns the function names and, separately, the gate components
@@ -341,6 +373,10 @@ def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
     Python, against the parsed tree, so it is held to its own shape rather than
     to the function-name one.
 
+    Third, the accessors written with the index of their key
+    (``flag_is_active[1]``): the name joins the function names, and the index
+    is returned beside it. ``[0]`` is the plain name.
+
     De-duplication is not tidiness. Each name becomes one generated rule, and
     two rules sharing a name is a hard engine error — so a repeated value would
     turn a harmless typo into a run that cannot start.
@@ -348,6 +384,29 @@ def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
     names = _split_csv(value, default=())
     gates = {gate: None for name in names if (gate := parse_gate(name)) is not None}
     names = tuple(name for name in names if parse_gate(name) is None)
+    positions: dict[str, int] = {}
+    plain: list[str] = []
+    for name in names:
+        match = _KEY_POSITION_RE.match(name)
+        if match is None:
+            plain.append(name)
+            continue
+        plain.append(match["name"])
+        index = int(match["index"])
+        if index and positions.get(match["name"], index) != index:
+            raise ConfigError(
+                f"FEATUREFLIP_ACCESSORS names {match['name']!r} with two key positions; "
+                "an accessor reads its key from one argument"
+            )
+        if index:
+            positions[match["name"]] = index
+    clashing = sorted(name for name in positions if name in names)
+    if clashing:
+        raise ConfigError(
+            f"FEATUREFLIP_ACCESSORS names {', '.join(repr(n) for n in clashing)} both "
+            "with and without a key position; an accessor reads its key from one argument"
+        )
+    names = tuple(plain)
     invalid = [name for name in names if not _ACCESSOR_RE.match(name)]
     if invalid:
         raise ConfigError(
@@ -363,7 +422,28 @@ def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
     seen: dict[str, None] = {}
     for name in names:
         seen[name] = None
-    return tuple(seen), tuple(gates)
+    return tuple(seen), tuple(gates), tuple(positions.items())
+
+
+def _parse_call_names(value: str) -> tuple[str, ...]:
+    """Split, validate and de-duplicate ``FEATUREFLIP_SIDE_EFFECT_FREE_CALLS``.
+
+    Held to the ``accessors`` shape (:data:`_ACCESSOR_RE`) for the same
+    reason: a name is compared with a callee's name, and anything that is not
+    a plain function name would match nothing, silently. A gate component has
+    no meaning here and is refused like any other non-name.
+    """
+    names = _split_csv(value, default=())
+    invalid = [name for name in names if not _ACCESSOR_RE.match(name)]
+    if invalid:
+        raise ConfigError(
+            f"unsupported FEATUREFLIP_SIDE_EFFECT_FREE_CALLS value(s): "
+            f"{', '.join(repr(name) for name in invalid)}; each must be a function "
+            "or method name in your source, matching [A-Za-z_][A-Za-z0-9_]* with at "
+            "most one trailing ? or ! (Ruby only). A call is matched by the name it "
+            "ends in, so anything else would match nothing"
+        )
+    return tuple(dict.fromkeys(names))
 
 
 #: A deployed ref is pasted into a compare URL's PATH, as the first half of

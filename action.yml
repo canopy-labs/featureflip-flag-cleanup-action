@@ -212,6 +212,9 @@ inputs:
       run fails immediately (exit 2) otherwise, because these are substituted
       into the rewrite rules. Names are matched by callee name only — a wrapper
       whose flag key is not a literal at the call site still cannot be matched.
+      A Python accessor whose key is not its first argument is named with the
+      key's index, counting from 0: `flag_is_active[1]` matches
+      `flag_is_active(request, "my-flag")` and no other slot.
       A JSX gate component is named with its key prop, `FlagGate[flag]`: on a
       `true` removal `<FlagGate flag="my-flag">…</FlagGate>` is replaced by its
       children, and a `false` removal of a flag it gates is refused. One that
@@ -250,6 +253,21 @@ inputs:
       specifier listed here is deleted instead, on your word: the pull request
       names each one deleted this way. No patterns, only exact spellings.
       Empty (the default) changes nothing.
+    required: false
+    default: ''
+  side-effect-free-calls:
+    description: >-
+      Comma-separated function or method names whose call does nothing you need,
+      such as a getter that only returns your flag client
+      (`GetClient, getClient`). When a removal leaves a variable that only fed
+      the removed flag read, a call that initialized it keeps running as a
+      statement of its own (`_ = getClient(p)` in Go, `getClient(p);`
+      elsewhere), because a call can have side effects. A call to a name listed
+      here is deleted instead, on your word, when every argument is a name, a
+      literal or a member read; the pull request names each one deleted this
+      way. Names are plain function names, held to the same rules as
+      `accessors`, and matched by the name the call ends in. Empty (the
+      default) changes nothing.
     required: false
     default: ''
   languages:
@@ -390,6 +408,7 @@ runs:
     FEATUREFLIP_ACCESSORS: ${{ inputs.accessors }}
     FEATUREFLIP_INLINE_WRAPPERS: ${{ inputs.inline-wrappers }}
     FEATUREFLIP_SIDE_EFFECT_FREE_MODULES: ${{ inputs.side-effect-free-modules }}
+    FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: ${{ inputs.side-effect-free-calls }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
     FEATUREFLIP_FLAGS: ${{ inputs.flags }}

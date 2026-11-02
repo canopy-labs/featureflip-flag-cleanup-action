@@ -14,13 +14,14 @@ lexical scope walk (:mod:`flag_cleanup.go_scope`) and the module reader
 (:mod:`flag_cleanup.go_module`) answer both. No other language can read a Go
 constant, so no other file type is asked.
 
-Offered exactly what ``go_const.toml``'s delete rule removes: a package-level
-``const`` declaration of ONE spec with ONE name and ONE interpreted string
-literal value, typed or not (see :func:`flag_cleanup.key_const._go_key_consts`).
-A grouped ``const ( ... )`` of several specs is not offered: that rule removes
-the whole declaration, and deleting one spec of a group can change its
-neighbours (a spec with no value repeats the expression above it, and
-``iota`` counts specs). A ``var`` is not a constant and is never offered.
+Offered exactly what ``go_const.toml``'s delete rules remove: a package-level
+``const`` spec with ONE name and ONE interpreted string literal value, typed or
+not, alone in its declaration or one entry of a ``const ( ... )`` group (see
+:func:`flag_cleanup.key_const._go_key_consts`). A file whose own gate keeps its
+key constants offers none (:func:`flag_cleanup.key_const._go_withholds`): a
+group whose entries depend on their position, since a spec with no value
+repeats the expression above it and ``iota`` counts specs, or a group holding
+the key twice. A ``var`` is not a constant and is never offered.
 
 Refused, and the declaration kept: a read in a file of another module (a
 ``replace`` directive or a workspace can make that import mean this directory
@@ -28,7 +29,8 @@ or a published version), a read through a dot import, an import whose binding
 the stranded-import cleanup cannot see (an unaliased path whose last segment,
 version suffix dropped, is not the package clause), a qualifier or a bare name
 a local declaration shadows, any mention other than the first argument of a
-``BoolVariation`` call or of a configured accessor, a read under ``go`` or
+``BoolVariation`` call, the second of an OpenFeature ``Boolean`` call, or
+either of a configured accessor, a read under ``go`` or
 ``defer``, a discarded read whose arguments call or receive, and any read in
 an external test package that declares a named example (``go vet`` resolves
 the example through that package's import, which the fold can strand).
@@ -50,6 +52,8 @@ from flag_cleanup.unused import go_import_name
 
 #: The SDK reads ``go_const.toml`` folds; the run's accessors are added per call.
 _READ_CALLEES = key_const._GO_FLAG_READ_CALLEES
+#: The SDK reads whose key is the SECOND argument (OpenFeature's ``Boolean``).
+_SECOND_ARGUMENT_CALLEES = key_const._GO_SECOND_ARGUMENT_READ_CALLEES
 
 
 def _text(node: Node) -> str:
@@ -79,9 +83,14 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
     if clause is None:
         return []
     module = _module_id(Path(path).parent, clause)
+    data = source.encode("utf-8")
+    consts = key_const._go_key_consts(root, data, flag_key)
+    if key_const._go_withholds(root, data, consts):
+        # The file's own gate keeps every declaration of the key in it.
+        return []
     return [
         xk.KeyDeclaration(path, const.name, None, module)
-        for const in key_const._go_key_consts(root, source.encode("utf-8"), flag_key)
+        for const in consts
         # Package level only: a local constant is no other file's to read.
         if const.declaration.parent is not None and const.declaration.parent.type == "source_file"
         and const.name != "_"
@@ -168,14 +177,20 @@ class _Target:
 
 
 def _read_call(node: Node, accessors: frozenset[str]) -> Node | None:
-    """The call whose FIRST argument is ``node`` exactly, when its callee is
-    one the reader rules fold: a ``BoolVariation`` or an accessor, written
+    """The call ``node`` is the key of, when its callee is one the reader
+    rules fold: ``node`` the FIRST argument of a ``BoolVariation`` or the
+    SECOND of an OpenFeature ``Boolean``, or either of an accessor, written
     ``f(...)`` or ``x.f(...)``. A comment or parentheses around the key, or
     any other position, is not one."""
     arguments = node.parent
     if arguments is None or arguments.type != "argument_list":
         return None
-    if not arguments.named_children or arguments.named_children[0].id != node.id:
+    named = arguments.named_children
+    if named and named[0].id == node.id:
+        callees = _READ_CALLEES
+    elif len(named) > 1 and named[1].id == node.id:
+        callees = _SECOND_ARGUMENT_CALLEES
+    else:
         return None
     call = arguments.parent
     if call is None or call.type != "call_expression" or call.child_by_field_name("type_arguments") is not None:
@@ -186,7 +201,7 @@ def _read_call(node: Node, accessors: frozenset[str]) -> Node | None:
     if function is None or function.type not in ("identifier", "field_identifier"):
         return None
     name = _text(function)
-    return call if name in _READ_CALLEES or name in accessors else None
+    return call if name in callees or name in accessors else None
 
 
 #: Where a simple statement sits in a header rather than in a statement list.

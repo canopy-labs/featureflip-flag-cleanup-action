@@ -145,3 +145,843 @@ not_enclosing_node = """[
   (foreach_statement body: (expression_statement))
   (do_statement body: (expression_statement))
 ] @braceless"""
+
+# --- Pest: `expect(<literal>)->toBeTrue()` and its kin (the same group)
+#
+# `expect(Feature::active('k'))->toBeTrue();` folds to `expect(true)->toBeTrue();`,
+# which Pest's chain makes one node deeper than PHPUnit's call: literal ->
+# argument list -> `expect(...)` -> `->matcher()` -> statement. The match-only
+# `trivial_expect_subject` hop matches `expect(<literal>)` from the literal and
+# its own edge (php_edges.toml) walks on to the statement, as `ts_assertions.toml`
+# does. `->not->` adds a `member_access_expression` between the two, still within
+# the walk. Only a literal the fold wrote is reached; the failing literal is
+# never matched and is reported (the Action's failing-assertion check, which
+# lists the same matchers).
+[[rules]]
+name = "trivial_expect_subject"
+query = """(
+  (function_call_expression
+    function: (name) @expect_fn
+    arguments: (arguments . (argument (boolean)) .)) @expect_call
+  (#eq? @expect_fn "expect")
+)"""
+groups = ["trivial_expect_subject"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_true_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @subject) .))
+      name: (name) @matcher
+      arguments: (arguments))) @statement
+  (#eq? @expect_fn "expect")
+  (#match? @matcher "^(toBeTrue|toBeTruthy)$")
+  (#match? @subject "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_false_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @subject) .))
+      name: (name) @matcher
+      arguments: (arguments))) @statement
+  (#eq? @expect_fn "expect")
+  (#match? @matcher "^(toBeFalse|toBeFalsy)$")
+  (#match? @subject "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_not_false_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (member_access_expression
+          object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @subject) .))
+          name: (name) @negation)
+      name: (name) @matcher
+      arguments: (arguments))) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @negation "not")
+  (#match? @matcher "^(toBeFalse|toBeFalsy)$")
+  (#match? @subject "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_not_true_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (member_access_expression
+          object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @subject) .))
+          name: (name) @negation)
+      name: (name) @matcher
+      arguments: (arguments))) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @negation "not")
+  (#match? @matcher "^(toBeTrue|toBeTruthy)$")
+  (#match? @subject "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_equal_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @actual) .))
+      name: (name) @matcher
+      arguments: (arguments . (argument (boolean) @expected) .))) @statement
+  (#eq? @expect_fn "expect")
+  (#match? @matcher "^(toBe|toEqual)$")
+  (#eq? @actual @expected)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_unequal_true_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (member_access_expression
+          object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @actual) .))
+          name: (name) @negation)
+      name: (name) @matcher
+      arguments: (arguments . (argument (boolean) @expected) .))) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @negation "not")
+  (#match? @matcher "^(toBe|toEqual)$")
+  (#match? @actual "^[Tt][Rr][Uu][Ee]$")
+  (#match? @expected "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_unequal_false_expect"
+query = """(
+  (expression_statement
+    (member_call_expression
+      object: (member_access_expression
+          object: (function_call_expression
+            function: (name) @expect_fn
+            arguments: (arguments . (argument (boolean) @actual) .))
+          name: (name) @negation)
+      name: (name) @matcher
+      arguments: (arguments . (argument (boolean) @expected) .))) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @negation "not")
+  (#match? @matcher "^(toBe|toEqual)$")
+  (#match? @actual "^[Ff][Aa][Ll][Ss][Ee]$")
+  (#match? @expected "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+# --- a Laravel guard helper the fold made constant
+#
+# `abort_unless(Features::enabled('k'), 404)` folds to `abort_unless(true, 404)`.
+# Laravel's four global guards: `abort_unless`/`throw_unless` pass on `true`,
+# `abort_if`/`throw_if` pass on `false`. A passing guard is deleted -- but only when
+# its other arguments are literals, names, `Foo::class` or a `new` of a class with
+# up to two literal arguments, so that nothing with an effect goes with it.
+# A guard that always stops is rewritten to the call it was: `abort_unless(false,
+# 404, 'x')` is `abort(404, 'x')`, and `throw_if(true, new E())` is `throw new E();`.
+# A deletion is refused inside a braceless `if`/`else`/loop: `if ($c)
+# abort_unless(true, 404);` is the body of the `if`, and deleting it would hand the
+# next statement to the `if`. Reached only from the fold's own literal
+# (php_edges.toml), never as a seed, so a guard the customer wrote with a
+# literal stays.
+
+[[rules]]
+name = "delete_passing_abort_unless_0"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_unless_1"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_unless_2"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_unless_3"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_if_0"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_if_1"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_if_2"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_abort_if_3"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_unless_0"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) .))) @statement
+  (#eq? @guard_fn "throw_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_unless_1"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) .))) @statement
+  (#eq? @guard_fn "throw_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_unless_2"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "throw_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_unless_3"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "throw_unless")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_if_0"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) .))) @statement
+  (#eq? @guard_fn "throw_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_if_1"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) .))) @statement
+  (#eq? @guard_fn "throw_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_if_2"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "throw_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_passing_throw_if_3"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression) (object_creation_expression [(name) (qualified_name)] (arguments)) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]))) (object_creation_expression [(name) (qualified_name)] (arguments (argument [(string) (integer) (float) (null) (boolean)]) (argument [(string) (integer) (float) (null) (boolean)])))]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) . (argument [(string) (integer) (float) (null) (boolean) (variable_name) (class_constant_access_expression)]) .))) @statement
+  (#eq? @guard_fn "throw_if")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "rewrite_stopping_abort_unless_1"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument) @a1 .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = "abort(@a1);"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_abort_unless_2"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument) @a1 . (argument) @a2 .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = "abort(@a1, @a2);"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_abort_unless_3"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument) @a1 . (argument) @a2 . (argument) @a3 .))) @statement
+  (#eq? @guard_fn "abort_unless")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = "abort(@a1, @a2, @a3);"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_abort_if_1"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument) @a1 .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = "abort(@a1);"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_abort_if_2"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument) @a1 . (argument) @a2 .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = "abort(@a1, @a2);"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_abort_if_3"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument) @a1 . (argument) @a2 . (argument) @a3 .))) @statement
+  (#eq? @guard_fn "abort_if")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = "abort(@a1, @a2, @a3);"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_throw_unless"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument (object_creation_expression) @exception) .))) @statement
+  (#eq? @guard_fn "throw_unless")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = "throw @exception;"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_throw_if"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument (object_creation_expression) @exception) .))) @statement
+  (#eq? @guard_fn "throw_if")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = "throw @exception;"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_throw_unless_class"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument (class_constant_access_expression . [(name) (qualified_name)] @exception_class . "::" . (name) @class_keyword)) .))) @statement
+  (#eq? @guard_fn "throw_unless")
+  (#match? @guard_lit "^[Ff][Aa][Ll][Ss][Ee]$")
+  (#eq? @class_keyword "class")
+)"""
+replace_node = "statement"
+replace = "throw new @exception_class();"
+groups = ["trivial_guard"]
+is_seed_rule = false
+
+[[rules]]
+name = "rewrite_stopping_throw_if_class"
+query = """(
+  (expression_statement
+    (function_call_expression
+      function: (name) @guard_fn
+      arguments: (arguments . (argument (boolean) @guard_lit) . (argument (class_constant_access_expression . [(name) (qualified_name)] @exception_class . "::" . (name) @class_keyword)) .))) @statement
+  (#eq? @guard_fn "throw_if")
+  (#match? @guard_lit "^[Tt][Rr][Uu][Ee]$")
+  (#eq? @class_keyword "class")
+)"""
+replace_node = "statement"
+replace = "throw new @exception_class();"
+groups = ["trivial_guard"]
+is_seed_rule = false

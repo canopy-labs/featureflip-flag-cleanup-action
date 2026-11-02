@@ -24,6 +24,8 @@ from flag_cleanup import report_paths, stale_comments
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
 from flag_cleanup.discarded_calls import DISCARDED_CALL
+from flag_cleanup.failing_assertions import FLAG_VALUE_ASSERTION
+from flag_cleanup.inert_calls import DECLARED_CALL
 from flag_cleanup.cross_file_keys import (
     ENUM_DYNAMIC,
     ENUM_UNPROVEN,
@@ -178,6 +180,7 @@ REPORTED_BINDING_KINDS = frozenset(
         "changed constructor",
         "kept argument local",
         "failing assertion",
+        "constant guard",
         "unread binding",
         "emptied override",
         "dropped default argument",
@@ -189,6 +192,7 @@ REPORTED_BINDING_KINDS = frozenset(
         REMOVED_DEFAULT,
         DECLARED_LOAD,
         DISCARDED_CALL,
+        DECLARED_CALL,
     }
 )
 
@@ -446,6 +450,26 @@ def _failing_assertion_lines(failing: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _declared_call_lines(declared: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each discarded call deleted because its callee is
+    listed in the customer's ``side-effect-free-calls`` input, or nothing."""
+    if not declared:
+        return []
+    count = len(declared)
+    noun = "call was" if count == 1 else "calls were"
+    return [
+        f"> **{count} discarded {noun} deleted on your word.** The removal left "
+        f"{'it' if count == 1 else 'each'} running only for its side effects, and "
+        "`side-effect-free-calls` names the function as having none, so "
+        f"{'it was' if count == 1 else 'they were'} deleted rather than kept. If one "
+        "does do work, restore it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in declared[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def _discarded_call_lines(discarded: list[tuple[str, str]]) -> list[str]:
     """The callout naming each call the removal kept running as a discard
     (`_ = getClient(…)`), or nothing.
@@ -464,9 +488,32 @@ def _discarded_call_lines(discarded: list[tuple[str, str]]) -> list[str]:
         "only the removed flag read used. A call can have side effects, so "
         f"{'it was' if count == 1 else 'each was'} kept as `_ = …` and still runs. "
         "If it only fetched a client or built an evaluation context for that read, "
-        "delete the line, and then anything only it used:",
+        "delete the line, and then anything only it used. Naming the function in "
+        "`side-effect-free-calls` has later removals delete such calls themselves:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in discarded[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _constant_guard_lines(guards: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Laravel guard helper the fold made constant, or
+    nothing. One that passed was deleted; one that always stops was rewritten to
+    the call it was (``abort_unless(false, 404)`` to ``abort(404)``), and the
+    code after it can no longer run."""
+    if not guards:
+        return []
+    count = len(guards)
+    noun = "guard was" if count == 1 else "guards were"
+    return [
+        f"> **{count} Laravel {noun} decided.** Each was an `abort_unless`, `abort_if`, "
+        "`throw_unless` or `throw_if` call on a flag read this pull request replaced "
+        "with a literal. A guard that now always passes is deleted. One that now "
+        "always stops is rewritten to the `abort` or `throw` it was, and whatever "
+        "follows it in the same block is unreachable, which a reviewer may want to delete:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in guards[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -973,8 +1020,9 @@ def pr_body(
     it. Named because each was the customer's test code. A C# test that read
     a keyless wrapper's member through a sibling implementation this run
     deleted (``sibling test``), and a test helper parameter a pin removed
-    (``pinned parameter``, one row per helper), each get a list of their own:
-    neither is a mock line.
+    (``pinned parameter``, one row per helper), and an assertion whose whole
+    subject was the flag read (``flag value assertion``), each get a list of
+    their own: none is a mock line.
 
     ``residue`` sorts ``unprocessed`` rather than adding to it. A test that
     still stubs the removed read, a file naming the flag only in comments and
@@ -1359,6 +1407,9 @@ def pr_body(
     failing_assertions = [
         (path, text) for path, kind, text in bindings if kind == "failing assertion"
     ]
+    constant_guards = [
+        (path, text) for path, kind, text in bindings if kind == "constant guard"
+    ]
     unread_bindings = [
         (path, text) for path, kind, text in bindings if kind == "unread binding"
     ]
@@ -1373,6 +1424,9 @@ def pr_body(
     ]
     discarded_calls = [
         (path, text) for path, kind, text in bindings if kind == DISCARDED_CALL
+    ]
+    declared_calls = [
+        (path, text) for path, kind, text in bindings if kind == DECLARED_CALL
     ]
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
@@ -1391,7 +1445,9 @@ def pr_body(
     lines += _removed_dart_field_lines([m for m in removed_members if m[0].endswith(".dart")])
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
     lines += _failing_assertion_lines(failing_assertions)
+    lines += _constant_guard_lines(constant_guards)
     lines += _kept_argument_local_lines(kept_argument_locals)
+    lines += _declared_call_lines(declared_calls)
     lines += _discarded_call_lines(discarded_calls)
     lines += _unread_binding_lines(unread_bindings)
     lines += _dropped_argument_lines(dropped_arguments)
@@ -1513,6 +1569,21 @@ def pr_body(
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in mocked_tests[:20]
             ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    flag_value = [(path, text) for path, kind, text in test_doubles if kind == FLAG_VALUE_ASSERTION]
+    if flag_value:
+        count = len(flag_value)
+        noun = "assertion of the flag's own value was" if count == 1 else "assertions of the flag's own value were"
+        lines += [
+            f"> **{count} {noun} deleted.** Each compared the flag read, and "
+            "nothing else, with an expression that is not a literal. With the "
+            "read gone it tested no code this pull request keeps, and it would "
+            f"fail wherever that expression is not `{'true' if candidate.treatment else 'false'}`. "
+            "A test left with nothing in it is listed here too:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in flag_value[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -1739,7 +1810,9 @@ _WRAPPER_STATUSES = ("complete", "partial")
 #: the refusals, and told apart from them on rendering.
 _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-prose")
 #: Test-double removal kinds that are not a mock line.
-_NOT_MOCK_LINES = (TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT)
+_NOT_MOCK_LINES = (
+    TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
+)
 
 
 def _by_wrapper(
@@ -1790,10 +1863,10 @@ def _wrapper_lines(findings: tuple[tuple[str, int, str, str, str], ...]) -> list
             for r in rows
         )
         lines += [
-            "> **🔁 Wrappers inlined.** Each member below read only this flag and "
-            "took no key. Every call this run could tie to it was folded to the "
-            "value the flag serves, and a member nothing calls any more was "
-            "deleted.",
+            "> **🔁 Wrappers inlined.** Each member below took no key and, with "
+            "this flag removed, returns one value. Every call this run could tie "
+            "to it was folded to that value, and a member nothing calls any more "
+            "was deleted.",
             *(
                 [
                     ">",

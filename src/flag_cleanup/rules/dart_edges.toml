@@ -10,11 +10,13 @@
 # assertion this run's fold produced is reached: Parent scope walks the
 # literal, its argument list, the call and the statement. A literal inside an
 # `equals(...)` matcher is one call deeper than the walk reaches, so it goes
-# through the match-only `trivial_equals_matcher` hop first.
+# through the match-only `trivial_equals_matcher` hop first. An assertion of
+# the flag's own value (`flag_value_assertion`) is reached from the seed's
+# literal only, never from a simplification: see dart_assertions.toml.
 [[edges]]
 scope = "Parent"
 from = "replace_expression_with_boolean_literal"
-to = ["trivial_assertion", "trivial_equals_matcher"]
+to = ["trivial_assertion", "trivial_equals_matcher", "flag_value_assertion"]
 
 [[edges]]
 scope = "Parent"
@@ -25,3 +27,16 @@ to = ["trivial_assertion", "trivial_equals_matcher"]
 scope = "Parent"
 from = "trivial_equals_matcher"
 to = ["trivial_assertion"]
+
+# A test the flag-value deletion emptied goes too (dart_assertions.toml): the
+# closure is three nodes above the deleted statement, so a match-only hop
+# finds it and walks on to the `test(...)` statement.
+[[edges]]
+scope = "Parent"
+from = "flag_value_assertion"
+to = ["flag_value_emptied_closure"]
+
+[[edges]]
+scope = "Parent"
+from = "flag_value_emptied_closure"
+to = ["flag_value_emptied_test"]

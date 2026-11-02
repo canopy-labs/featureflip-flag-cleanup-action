@@ -161,6 +161,11 @@ class Resolution:
     #: folded exactly as it would be with no cross-file pass. The runner reports them only where that gate withholds
     #: the file, as the reason it stays.
     home_findings: tuple[Refusal, ...] = ()
+    #: Declaring files kept (in :attr:`blocked`) whose readers still fold,
+    #: under :attr:`Profile.constant_writes`: every reason the declaration is
+    #: kept is a mention spelling its name, and no file writes it. The runner
+    #: folds the declaring file's own reads too, keeping the declaration.
+    kept_reads_fold: frozenset[str] = frozenset()
 
 
 #: ``(module, owner, name)`` -- what a reader's import or qualifier names.
@@ -293,6 +298,14 @@ class Profile:
     #: :attr:`home_constant_names`).
     #: Off, a kept declaration leaves its proven reads folding.
     readers_need_deletable: bool = False
+    #: ``(repo_dir, names)``: for a profile with :attr:`readers_need_deletable`,
+    #: which of the constant ``names`` some file of the checkout may write.
+    #: A constant no file writes holds its key wherever it is read, so a
+    #: declaration kept only by mentions that spell its name (a test seeding a
+    #: store with it, say) no longer keeps the reads of it: they fold and the
+    #: declaration stays. One kept for anything else (a competing declaration,
+    #: the module reached whole, an unreadable file) still voids its readers.
+    constant_writes: Callable[[str, set[str]], set[str]] | None = None
     #: Whether an escape (:attr:`enum_escapes`) can change what an entry's
     #: accessor returns, not only hand the enum on. Python's can (a write of a
     #: member's ``_value_``, the class replaced in its module), so no read of
@@ -845,6 +858,10 @@ def resolve(
 
     voided = _competing(unique, sources, refusals)
     blocked |= {decl.path for decl in voided if decl.kind == CONSTANT}
+    # Declaring files kept for something other than a parsed mention that
+    # spells the name: their readers are voided whatever `constant_writes`
+    # says (see `Profile.constant_writes`).
+    kept_whole: set[str] = {decl.path for decl in voided if decl.kind == CONSTANT}
     live = [decl for decl in unique if decl not in voided]
 
     # Only a file that spells a constant's NAME can read it. One that names
@@ -871,15 +888,18 @@ def resolve(
                 if source is None:
                     refusals.append(Refusal(path, 1, UNSUPPORTED_FORM, ""))
                     blocked |= {d.path for d in live_constants}
+                    kept_whole |= {d.path for d in live_constants}
                 elif profile.unparsed_constant_mentions is not None:
                     found = profile.unparsed_constant_mentions(path, source, tuple(live_constants), repo_dir)
                     if found:
                         refusals.extend(found)
                         blocked |= spelled_in(source, path)
+                        kept_whole |= spelled_in(source, path)
                 elif hit is not None:
                     line = source.count("\n", 0, hit.start()) + 1
                     refusals.append(Refusal(path, line, UNSUPPORTED_FORM, source.split("\n")[line - 1].strip()))
                     blocked |= spelled_in(source, path)
+                    kept_whole |= spelled_in(source, path)
             continue
         spells = spells_a_name_folded if _case_insensitive(path) else spells_a_name
         if source is not None and not spells.search(source):
@@ -897,6 +917,7 @@ def resolve(
             kinds = ([""] if any(d.kind == CONSTANT for d in live) else []) + entries
             refusals.extend(Refusal(path, 1, UNSUPPORTED_FORM, "", e) for e in kinds)
             blocked |= declaring
+            kept_whole |= declaring
             continue
         in_scope = within(Path(path), scope)
         if not (in_family and in_scope):
@@ -958,6 +979,7 @@ def resolve(
             # name, so the in-file check never sees it.
             for holder, escape in escapes(path, source, constants, repo_dir):
                 blocked.add(holder)
+                kept_whole.add(holder)
                 if escape not in refusals:
                     refusals.append(escape)
     if constants and profile.module_escapes is not None:
@@ -966,6 +988,7 @@ def resolve(
         for path in sorted({d.path for d in constants}):
             for escape in profile.module_escapes(path, repo_dir):
                 blocked.add(path)
+                kept_whole.add(path)
                 if (escape.path, escape.line) not in refused_at:
                     refused_at.add((escape.path, escape.line))
                     refusals.append(escape)
@@ -1013,9 +1036,25 @@ def resolve(
                 continue
             notes.extend(profile.enum_dynamic_uses(path, source, entries, repo_dir))
     if profile.readers_need_deletable:
-        readers, refusals, blocked = _void_readers_of_kept(
-            readers, refusals, blocked | duplicated, unique, lambda path: sources.get(path)
+        voiding = blocked | duplicated
+        if profile.constant_writes is not None:
+            # A declaration kept only by mentions that spell its name, of a
+            # constant no file writes, leaves its readers folding.
+            names = {d.name for d in unique if d.kind == CONSTANT and d.path in blocked}
+            written = profile.constant_writes(repo_dir, names) if names else set()
+            voiding = (
+                kept_whole | duplicated | kept_at_home
+                | {d.path for d in unique if d.kind == CONSTANT and d.path in blocked and d.name in written}
+            )
+        readers, refusals, voided_by = _void_readers_of_kept(
+            readers, refusals, voiding, unique, lambda path: sources.get(path)
         )
+        kept_reads_fold = frozenset(
+            d.path for d in unique if d.kind == CONSTANT and d.path in blocked and d.path not in voided_by
+        ) if profile.constant_writes is not None else frozenset()
+        blocked |= voided_by
+    else:
+        kept_reads_fold = frozenset()
     return Resolution(
         readers,
         tuple(refusals),
@@ -1026,6 +1065,7 @@ def resolve(
         entries_found,
         readers_need_deletable=profile.readers_need_deletable,
         home_findings=home_findings,
+        kept_reads_fold=kept_reads_fold,
     )
 
 
@@ -1237,6 +1277,7 @@ def report_uncovered(
         return resolution
     readers = resolution.readers
     refusals = list(resolution.refusals) + refusals
+    kept_reads_fold = resolution.kept_reads_fold
     if resolution.readers_need_deletable:
         # Each uncovered reader is listed above; the rest fold only if
         # what they read is still deletable.
@@ -1248,15 +1289,20 @@ def report_uncovered(
             except (OSError, UnicodeDecodeError):
                 return None
 
-        readers, refusals, blocked = _void_readers_of_kept(
-            readers, refusals, blocked, resolution.declarations, source_of
+        # What `resolve` let fold stays folding; what an uncovered reader
+        # keeps voids as before.
+        readers, refusals, voided_by = _void_readers_of_kept(
+            readers, refusals, blocked - resolution.kept_reads_fold, resolution.declarations, source_of
         )
+        blocked |= voided_by
+        kept_reads_fold = kept_reads_fold - voided_by
     return replace(
         resolution,
         readers=readers,
         refusals=tuple(refusals),
         deletable=resolution.deletable - blocked,
         blocked=frozenset(blocked),
+        kept_reads_fold=kept_reads_fold,
     )
 
 

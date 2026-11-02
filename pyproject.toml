@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.1.0"
+version = "2.2.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -422,7 +422,7 @@ dependencies = [
     # bc21c68 (upstream 0.23.5 plus one scanner fix): after an escaped `{{` in
     # an interpolated string the next `{` opens a hole, so `$"{{{x}}}"` reads
     # `x` as an expression instead of string text. C# moved, so its Gate 1
-    # grammar moves with it to `tree-sitter-c-sharp==0.23.5+canopy.1` (see
+    # grammar moves with it to `tree-sitter-c-sharp==0.23.5+canopy.N` (see
     # that entry). TypeScript's rev did not move, so `+canopy.3` stays.
     #
     # 0.35.0. Python's and PHP's engines delete the locals their own fold
@@ -532,7 +532,20 @@ dependencies = [
     # parses, a deleted tag line goes entirely, and a rewritten tag keeps
     # its trim marker and layout. No grammar rev moved, so `+canopy.3` and
     # `+canopy.1` stay.
-    "polyglot-piranha==0.43.0",
+    #
+    # 0.44.0. C#: the engine moves to the C# 14 grammar, so the C# wheel
+    # below moves with it to `+canopy.2` in the same commit. Go: a read bound
+    # in an `if` header folds, a tuple declaration's one stranded name becomes
+    # `_`, a range loop whose body now starts with `continue`/`break` is
+    # deleted, and a deletion's blank line inside `{ … }` goes. Python: blank
+    # lines an edit leaves are cut to what black and ruff write, a pragma goes
+    # with the `if`/`else` header it annotated, a comment goes with the dead
+    # statement after a folded `return`, and a pair the fold lets fit goes
+    # back on one line. Dart: an initializer the fold lets fit goes back on
+    # one line. PHP, TS/JS: a boolean cast left on a literal is dropped. Go,
+    # Java, TS/JS: the parentheses of a group the fold reduced to one operand
+    # are dropped. TypeScript's rev did not move, so `+canopy.3` stays.
+    "polyglot-piranha==0.44.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -641,9 +654,13 @@ dependencies = [
     # C#. NOT a PyPI release, and pinned EXACTLY for the same reason as
     # tree-sitter-typescript above: Gate 1 must see the SAME node shapes the
     # engine rewrites against, or its checks silently stop matching.
-    # polyglot-piranha bundles upstream 0.23.5 plus ONE external-scanner patch,
-    # and this wheel is cut from the same commit the engine pins
-    # (canopy-labs/tree-sitter-c-sharp bc21c68):
+    # Since `+canopy.2` polyglot-piranha bundles canopy-labs/tree-sitter-c-sharp
+    # f7e8943: upstream's C# 14 grammar (past the 0.23.5 release, which is now
+    # only a name) plus our patches, and this wheel is cut from that same
+    # commit. The patches: `partial`, `async` and `required` parse as
+    # identifiers at the start of a statement, several real-world shapes
+    # upstream rejected parse, and the escaped-brace fix that was the whole of
+    # `+canopy.1`:
     #
     #   bc21c68  an escaped `{{` left the scanner's brace count at its limit,
     #            so the `{` straight after it could not open a hole:
@@ -657,7 +674,7 @@ dependencies = [
     # whenever the engine's pinned commit does. The test
     # `test_the_csharp_grammar_matches_the_engines_view_of_escaped_braces`
     # fails if the stock grammar is ever installed instead.
-    "tree-sitter-c-sharp==0.23.5+canopy.1",
+    "tree-sitter-c-sharp==0.23.5+canopy.2",
     # Dart. The ONE grammar here that is NOT the version the engine bundles,
     # and the gap is a whole restructuring rather than a skew: the engine pins
     # `tree-sitter-dart 0.3.0` (0.2.0 until engine 0.38.0: a conventional
@@ -711,6 +728,10 @@ packages = ["src/flag_cleanup"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Fixture trees are inputs, not tests: a fixture named `*_test.py` would be
+# collected and leave __pycache__ in its expected tree. Setting this replaces
+# pytest's defaults, so they are repeated.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "fixtures"]
 addopts = ["-ra", "-q", "--strict-markers", "-m", "not nondeterministic"]
 markers = [
     # Preserved engine-bug reproductions. Deselected by default: a test whose

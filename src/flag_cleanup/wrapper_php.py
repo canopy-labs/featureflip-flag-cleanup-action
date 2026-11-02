@@ -992,7 +992,9 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
 
 
-def _named_strings(root: Node, name: str) -> list[tuple[int, str]]:
+def _named_strings(
+    root: Node, name: str, skip: Callable[[Node], bool] | None = None
+) -> list[tuple[int, str]]:
     """Literals whose whole text names the wrapper -- ``'newCheckout'``,
     ``'App\\newCheckout'``, ``'Flags::check'`` -- which PHP can call by that
     name, and inline markup (a template) spelling it as a word."""
@@ -1001,7 +1003,7 @@ def _named_strings(root: Node, name: str) -> list[tuple[int, str]]:
     for node in _walk(root):
         if node.type in _STRINGS:
             value = _string_value(node)
-            if value is None:
+            if value is None or (skip is not None and skip(node)):
                 continue
             tail = re.split(r"::|@|\\", value.strip().lstrip("\\"))[-1]
             if _same(tail, name):
@@ -1016,7 +1018,9 @@ def _named_strings(root: Node, name: str) -> list[tuple[int, str]]:
 
 def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
     cached = index.file(path)
-    return [] if cached is None else _named_strings(cached[1], wrapper.name)
+    if cached is None:
+        return []
+    return _named_strings(cached[1], wrapper.name, wi.key_literal(wrapper, path, cached[0]))
 
 
 def leftovers(
@@ -1038,7 +1042,10 @@ def leftovers(
             found += _template_lines(path, source, wrapper.name)
             continue
         root = parse(source)
-        found += [(path, line, text) for line, text in _named_strings(root, wrapper.name)]
+        found += [
+            (path, line, text)
+            for line, text in _named_strings(root, wrapper.name, wi.key_literal(wrapper, path, source))
+        ]
         found += [
             (path, wi.line_of(n), wi.text_of(n.parent or n))
             for n in _walk(root)

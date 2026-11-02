@@ -151,8 +151,8 @@ class Family:
     homeless: bool = False
     #: Something that may bring a family value in without a name could not be
     #: read: an unreadable C# file or project ``<Using>`` item, a type with a
-    #: parse error, a declaration the grammar misreads (an ``extension``
-    #: block), or a pattern extension method on a type outside the
+    #: parse error, a declaration the grammar misreads, an ``extension``
+    #: block, or a pattern extension method on a type outside the
     #: repository or on a type parameter, spelling one of these names. No
     #: file is then family-free.
     opaque: bool = False
@@ -1050,15 +1050,18 @@ def _headers(
                 if parameter.type == "parameter" and (pname := wc._name_of(parameter)):
                     found.append(_Header("member", wc._text(parameter), pname.removeprefix("@"), name))
             continue
+        if node.type == "extension_declaration":
+            # A C# 14 block adds members to a type declared elsewhere, so what
+            # it spells can be reached without naming this class.
+            found.append(_Header("opaque", wc._text(node)))
+            continue
         if node.type not in _MEMBER_DECLARATIONS:
             continue
         holder = _enclosing_type(node)
         owner = wc._name_of(holder) if holder is not None else None
         owner = owner.removeprefix("@") if owner else None
         if node.type == "constructor_declaration" and (wc._name_of(node) or "").removeprefix("@") != owner:
-            # Not a constructor: a shape this grammar misreads as one, such as
-            # an `extension(...) { ... }` block, whose members it then reads
-            # as local functions and statements.
+            # Not a constructor: a shape this grammar misreads as one.
             found.append(_Header("opaque", wc._text(node)))
             continue
         if _private(node) and not (node.type in _GENERATOR_INPUTS and wc._child(node, "attribute_list")):

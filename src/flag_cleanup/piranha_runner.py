@@ -94,18 +94,26 @@ from flag_cleanup import (
     cross_file_python,
     discarded_calls,
     failing_assertions,
+    inert_calls,
     file_deletion,
     git_ops,
     go_dead_code,
+    go_initializers,
+    go_arity,
     go_inline,
     go_stranded,
+    jvm_constant_fields,
     jvm_emptied_tests,
     jvm_test_titles,
     jvm_unread_members,
     key_const,
+    line_width,
     kotlin_sentinel,
     method_param_csharp,
     mock_stubs,
+    private_constant_params,
+    python_overrides,
+    python_gates,
     report_paths,
     residue,
     ruby_owner_reach,
@@ -1099,6 +1107,7 @@ _ENGINE_DEAD_LOOP_RULES = frozenset(
         "replace_for_false_with_expression_initializer",
         "unwrap_do_false_splice",
         "unwrap_do_false_keep_block",
+        "delete_range_loop_exiting_first",
     }
 )
 
@@ -1139,6 +1148,12 @@ _TRIVIAL_ASSERTION_RULES = frozenset(
         "delete_trivially_equal_expect",
         "delete_trivially_truthy_expect",
         "delete_trivially_falsy_expect",
+        "delete_trivially_true_expect",
+        "delete_trivially_false_expect",
+        "delete_trivially_not_false_expect",
+        "delete_trivially_not_true_expect",
+        "delete_trivially_unequal_true_expect",
+        "delete_trivially_unequal_false_expect",
         "delete_trivially_true_assert_statement",
         "replace_sole_trivially_true_assert_statement_with_pass",
         "replace_sole_trivially_true_assertion_with_pass",
@@ -1153,8 +1168,29 @@ _TRIVIAL_ASSERTION_RULES = frozenset(
     }
 )
 
+#: The ``bindings`` kind of a Laravel guard helper (``abort_unless``, ``abort_if``,
+#: ``throw_unless``, ``throw_if``) the fold made constant: deleted when it passes,
+#: rewritten to the call it was when it always stops. Not a test double, so it
+#: is split off the ``test_doubles`` it is read with.
+CONSTANT_GUARD = "constant guard"
+
+#: The rules that decide a Laravel guard helper (``php_assertions.toml``).
+_GUARD_RULE_PREFIXES = ("delete_passing_", "rewrite_stopping_")
+
 #: The ``test_doubles`` kind of a deleted assertion.
 TRIVIAL_ASSERTION = "assertion"
+
+#: The rules of ours that delete an assertion whose whole subject was the flag
+#: read (``expect(<read>, AppConfig.enableX)``): a test of the flag's own value,
+#: which the fold leaves neither trivially true nor provably failing. Reached
+#: only by an edge from the fold's own literal, like the rules above, and
+#: listed in the pull request under their own heading, with the ``test(…)``
+#: such a deletion left empty, which goes too.
+_FLAG_VALUE_ASSERTION_RULES = frozenset(
+    {"delete_flag_value_assertion", "delete_test_emptied_by_flag_value_assertion"}
+)
+
+FLAG_VALUE_ASSERTION = failing_assertions.FLAG_VALUE_ASSERTION
 
 
 def _failing_assertions(summaries, language: str, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
@@ -1207,18 +1243,34 @@ def _discarded_calls(summaries, language: str, repo_dir: str) -> tuple[tuple[str
 
 
 def _engine_assertions(summaries, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
-    """``(relative_path, "assertion", text)`` for each assertion the fold made
-    trivially true and our rules deleted, read off the engine's summaries by
-    rule name under the same constraint as :func:`_engine_stranded`."""
+    """``(relative_path, kind, text)`` for each assertion our rules deleted,
+    read off the engine's summaries by rule name under the same constraint as
+    :func:`_engine_stranded`: one the fold made trivially true
+    (:data:`TRIVIAL_ASSERTION`), one of the flag's own value
+    (:data:`FLAG_VALUE_ASSERTION`), or a guard the fold decided
+    (:data:`CONSTANT_GUARD`)."""
     return tuple(
         (
             os.path.relpath(summary.path, repo_dir),
-            TRIVIAL_ASSERTION,
-            " ".join(edit.p_match.matched_string.split()),
+            (
+                CONSTANT_GUARD
+                if edit.matched_rule.startswith(_GUARD_RULE_PREFIXES)
+                else TRIVIAL_ASSERTION
+                if edit.matched_rule in _TRIVIAL_ASSERTION_RULES
+                else FLAG_VALUE_ASSERTION
+            ),
+            (
+                ("rewritten: " if edit.matched_rule.startswith("rewrite_stopping_") else "deleted: ")
+                if edit.matched_rule.startswith(_GUARD_RULE_PREFIXES)
+                else ""
+            )
+            + " ".join(edit.p_match.matched_string.split()),
         )
         for summary in summaries
         for edit in getattr(summary, "rewrites", ())
         if edit.matched_rule in _TRIVIAL_ASSERTION_RULES
+        or edit.matched_rule in _FLAG_VALUE_ASSERTION_RULES
+        or edit.matched_rule.startswith(_GUARD_RULE_PREFIXES)
     )
 
 
@@ -1232,7 +1284,27 @@ _GO_INLINE_RULES = {
     "delete_variable_declaration_with_nil": ("variable_name", "err"),
     "split_short_var_declaration_literal_first": ("variable_name",),
     "split_short_var_declaration_literal_last": ("variable_name",),
+    "delete_if_initializer_declaration": ("variable_name",),
 }
+
+
+def _engine_dead_initializers(summaries, language: str) -> dict[str, int]:
+    """``{path: count}`` of the Go ``if`` initializers the engine removed with
+    code that could not run, which Gate 1's initializer count excuses. Read
+    off the engine's summaries under the same constraint as
+    :func:`_engine_stranded`. See :mod:`flag_cleanup.go_initializers`.
+    """
+    counts: dict[str, int] = {}
+    for summary in summaries:
+        if _grammar_of(summary.path, language) != "go":
+            continue
+        count = go_initializers.dead_code_initializers(
+            (edit.matched_rule, edit.p_match.matched_string, edit.replacement_string)
+            for edit in getattr(summary, "rewrites", ())
+        )
+        if count:
+            counts[summary.path] = count
+    return counts
 
 
 def _engine_inlined(summaries) -> dict[str, frozenset[str]]:
@@ -1330,6 +1402,10 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "blank_stranded_short_var_pair": "decl",
     "blank_stranded_short_var_pair_first": "decl",
     "blank_stranded_short_var_pair_last": "decl",
+    "delete_stranded_short_var_triple": "decl",
+    "blank_stranded_short_var_triple": "decl",
+    "blank_stranded_short_var_name_before_witness": "n",
+    "blank_stranded_short_var_name_after_witness": "n",
     "delete_stranded_var_pair": "decl",
     "blank_stranded_var_pair": "decl",
     "blank_stranded_var_pair_first": "decl",
@@ -1549,6 +1625,7 @@ def run_piranha(
     gates: tuple[ts_gates.Gate, ...] = (),
     inline_wrappers: bool = True,
     flag_default: ts_tests.FlagDefault | None = None,
+    key_positions: tuple[tuple[str, int], ...] = (),
 ) -> str:
     """:func:`transform_flag`, keeping only the diff.
 
@@ -1571,7 +1648,7 @@ def run_piranha(
     return transform_flag(
         repo_dir, language, flag_key, treatment, paths, accessors,
         known_flag_keys=known_flag_keys, gates=gates, inline_wrappers=inline_wrappers,
-        flag_default=flag_default,
+        flag_default=flag_default, key_positions=key_positions,
     ).diff
 
 
@@ -1589,8 +1666,14 @@ def transform_flag(
     read_elsewhere: bool = False,
     *,
     entries: bool = True,
+    key_positions: tuple[tuple[str, int], ...] = (),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
+
+    ``key_positions`` names the accessors whose key is not their first
+    argument, with its index (``("flag_is_active", 1)``). Python reads them;
+    every other language's run drops those accessors, since its rules could
+    only match them with the key first.
 
     ``read_elsewhere`` says another language's pass over this directory has a
     read of the flag to fold, so this pass's stubs of it are dead too.
@@ -1626,6 +1709,10 @@ def transform_flag(
     # The one place a run's accessors are narrowed to its language: everything
     # below, rules and passes alike, sees only names its language can spell.
     accessors = rule_synthesis.accessors_for(language, accessors)
+    positions = dict(key_positions)
+    if language != "python":
+        accessors = tuple(name for name in accessors if name not in positions)
+        positions = {}
     doubles: list[mock_stubs.Prepass] = []
     # One listing of the checkout for every scan this transform makes, and for
     # the retry: nothing here adds or removes a file. Inside a run's scope,
@@ -1635,13 +1722,13 @@ def transform_flag(
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
                 known_flag_keys, doubles, gates, inline_wrappers, flag_default, read_elsewhere,
-                entries=entries,
+                entries=entries, key_positions=positions,
             )
         except _NoReadFolded:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
                 known_flag_keys, None, gates, inline_wrappers, flag_default,
-                entries=entries,
+                entries=entries, key_positions=positions,
             )
         except BaseException:
             # Newest first: a later pass's "original" is an earlier pass's
@@ -1670,6 +1757,7 @@ def _transform_flag(
     read_elsewhere: bool = False,
     *,
     entries: bool = True,
+    key_positions: dict[str, int] | None = None,
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -1846,7 +1934,8 @@ def _transform_flag(
     if accessors and language != "kt":
         generated_rules = tempfile.TemporaryDirectory(prefix="flag-cleanup-rules-")
         rules_file, const_rules_file = _write_generated_rules(
-            Path(generated_rules.name), rules_file, const_rules_file, accessors
+            Path(generated_rules.name), rules_file, const_rules_file, accessors,
+            key_positions=key_positions,
         )
 
     # `untreated` is `treated`'s complement — the literal spelling of the branch
@@ -1865,9 +1954,9 @@ def _transform_flag(
         "safe_nav_true_flag_name": flag_key if treatment else "",
         "untreated": spec.false_literal if treatment else spec.true_literal,
         "known_flag_keys": render_known_flag_keys(known_flag_keys, flag_key, language),
-        # `python.toml`'s and `ts.toml`'s marker rules are the consumers, but
-        # it is supplied unconditionally, because a substitution no rule names
-        # costs nothing and a rule whose hole is absent aborts the engine. See
+        # The marker rules of Python, the TS family, Java, Kotlin and Go; supplied
+        # unconditionally, because a substitution no rule names costs nothing
+        # and a rule whose hole is absent aborts the engine. See
         # `_inline_bound_reads`.
         "marker": (ts_fold.marker_for if language in ("ts", "tsx", "js") else marker_for)(flag_key),
     }
@@ -1924,7 +2013,13 @@ def _transform_flag(
         if language in _FOLDS_KEPT_CONSTANTS
         and const_path_is_safe(Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
     ]
-    if kept_declarations and _rewrites_constants(repo_dir, language):
+    if kept_declarations and language == "python":
+        # Only a declaration the resolution kept for mentions that spell its
+        # name, of a constant no file writes (`Profile.constant_writes`).
+        folding = resolution.kept_reads_fold if resolution is not None else frozenset()
+        kept_declarations = [p for p in kept_declarations if str(Path(p).resolve()) in folding]
+    elif kept_declarations and language != "go" and _rewrites_constants(repo_dir, language):
+        # A Go constant cannot be assigned: `go build` rejects it.
         kept_declarations = []
     without_const = [p for p in without_const if p not in kept_declarations]
 
@@ -1947,10 +2042,12 @@ def _transform_flag(
     # :func:`_print_width_facts`), off the customer's bytes: nothing below has
     # marked a file yet. And, beside it, whether the file's JSX compiles to
     # the automatic runtime (:func:`_jsx_runtime_facts`).
+    # A Python or Dart file's width goes the same way (see
+    # :mod:`flag_cleanup.line_width`).
     ts_facts = (
         _ts_file_facts(sorted({*paths, *reader_paths}), repo_dir)
         if language in ("ts", "tsx", "js")
-        else {}
+        else _formatter_width_facts(sorted({*paths, *reader_paths}), language, repo_dir)
     )
 
     # THE KOTLIN PRE-PASS — besides the test-double pass, the only thing in
@@ -2122,6 +2219,7 @@ def _transform_flag(
         engine_stranded = list(_engine_stranded(summaries, language, repo_dir))
         engine_assertions = list(_engine_assertions(summaries, repo_dir))
         engine_inlined = _engine_inlined(summaries)
+        engine_dead_inits = _engine_dead_initializers(summaries, language)
         engine_bindings = _engine_bindings(summaries, repo_dir)
 
         # Python and the TypeScript family. Resolve a local the fold left bound
@@ -2150,6 +2248,22 @@ def _transform_flag(
                     in_run=lambda p: _grammar_of(p, language) == language,
                 ),
             )
+
+        # A member the fold reduced to one value, inlined at its proven
+        # callers through a second engine pass and deleted at close-out with
+        # the keyless wrappers. See :mod:`flag_cleanup.constant_inline`.
+        if inline_wrappers:
+            summaries = _inline_constant_members(
+                summaries,
+                language=language,
+                plan=wrappers,
+                paths=paths + sibling_readers,
+                run_groups=run_groups,
+                rules_file=RULES_DIR / f"{base}.toml",
+                flag_key=flag_key,
+                repo_dir=repo_dir,
+                assertions=engine_assertions,
+            )
     finally:
         # Every engine invocation — the first pass, the quarantine retry, and
         # each round of the Python marker pass — happens inside this
@@ -2173,7 +2287,8 @@ def _transform_flag(
         summaries, doubles, language, accessors, repo_dir, unprocessable, read_elsewhere
     )
     # Listed with the mock lines: each checked a flag read this removal folded.
-    test_doubles = test_doubles + tuple(engine_assertions)
+    engine_guards = tuple(row for row in engine_assertions if row[1] == CONSTANT_GUARD)
+    test_doubles = test_doubles + tuple(row for row in engine_assertions if row[1] != CONSTANT_GUARD)
 
     # PHP only, and BEFORE the whitespace tidy rather than beside the Python
     # fold below — that ordering is the point. Promoting a mid-chain `elseif`
@@ -2210,7 +2325,7 @@ def _transform_flag(
     # Before the whitespace tidy and the stranded-binding pass: the gate's own
     # import is stranded by this edit, and that pass is what removes it.
     summaries = _unwrap_gates(summaries, gate_paths, language, flag_key, gates)
-    summaries = _delete_attribute_gates(summaries, attribute_gates, flag_key, accessors)
+    summaries = _delete_attribute_gates(summaries, attribute_gates, flag_key, accessors, language)
     # The gates that take a boolean, which only the fold above can settle.
     summaries = _unwrap_boolean_gates(summaries, language, gates)
 
@@ -2316,6 +2431,14 @@ def _transform_flag(
     # the difference between a branch that builds and one that does not.
     summaries, bindings = _remove_stranded_bindings(summaries, language, repo_dir)
     bindings = engine_bindings + bindings
+
+    # A discarded call the customer declared side-effect free is deleted,
+    # and what it alone read is offered to the stranded-binding pass again.
+    # After that pass, because its own discards are among the candidates.
+    summaries, declared_calls = _delete_declared_calls(summaries, language, repo_dir)
+    if declared_calls:
+        summaries, called_bindings = _remove_stranded_bindings(summaries, language, repo_dir)
+        bindings = bindings + declared_calls + called_bindings
 
     # Python only, and the same window again: the fallback for a file whose
     # marker the engine did not consume. The binding is inlined with the bare
@@ -2478,6 +2601,10 @@ def _transform_flag(
     # tested the branch this removal deletes: reported, never edited.
     bindings = bindings + _failing_assertions(summaries, language, repo_dir)
 
+    # A Laravel guard helper the fold made constant was deleted or rewritten:
+    # the customer's own code, named so the reviewer reads each.
+    bindings = bindings + engine_guards
+
     # A Go local whose initializer calls something was kept running as
     # `_ = <call>`: reported, so the reviewer can delete a getter that only
     # fed the removed read.
@@ -2511,6 +2638,7 @@ def _transform_flag(
             _gate_baseline(doubles, s.path, s.original_content),
             s.content,
             _grammar_of(s.path, language),
+            excused_initializers=engine_dead_inits.get(s.path, 0),
         )
         # A surviving sentinel means the engine did not consume a read the
         # pre-pass marked. It parses, so Gate 1's checks are blind to it, and
@@ -2529,6 +2657,10 @@ def _transform_flag(
         # so whatever edit stranded it (the fold, a wrapper, a test double).
         if reason is None and _grammar_of(s.path, language) == "go":
             reason = go_stranded.refusal_reason(s.original_content, s.content)
+        # A read returning several values (`on, err := <read>`), folded to
+        # one literal: it parses, and Go rejects the count.
+        if reason is None and _grammar_of(s.path, language) == "go":
+            reason = go_arity.refusal_reason(s.original_content, s.content)
         # Gate 2 let a reference in a block the fold deletes go with the
         # block, which only predicted the fold. If the declaration went and
         # such a name is still referenced, the build fails on it.
@@ -2572,6 +2704,29 @@ def _transform_flag(
             reasons[path] = (
                 "a read of a key constant declared in another file was not rewritten"
             )
+    # A django-waffle pin the test-double pass could not settle keeps a test
+    # on the branch this removal deletes: on a class, in a fixture, or with a
+    # value it cannot read. Asked only of a run that folded a read, as the
+    # pass itself is; a kept-value pin left over is only a mention.
+    if language == "python" and changed:
+        folded = read_elsewhere or any(
+            mock_stubs.folded_a_read(
+                _gate_baseline(doubles, s.path, s.original_content), s.content, "python", accessors
+            )
+            for s in changed
+        )
+        for path in paths if folded else ():
+            if path in unprocessable or path in reasons:
+                continue
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            reason = python_overrides.refusal_reason(
+                text, flag_key, treatment, key_texts.get(path, frozenset())
+            )
+            if reason is not None:
+                reasons[path] = reason
     refused = sorted(reasons)
     if refused:
         _restore(changed)
@@ -2993,10 +3148,11 @@ def _check_attribute_gates(
     resolution: cross_file_keys.Resolution,
     treatment: bool,
 ) -> dict[str, frozenset[str]]:
-    """The files holding a C# attribute gate on this flag, with how each spells
-    its key. Raises if ``treatment`` cannot remove one.
+    """The files holding a C# attribute gate or a Python decorator gate on this
+    flag, with how each spells its key. Raises if ``treatment`` cannot remove
+    one.
     """
-    if language != "csharp" or not accessors:
+    if language not in ("csharp", "python") or not accessors:
         return {}
     names = frozenset(accessors)
     key_texts = _reader_key_texts(resolution, paths)
@@ -3008,6 +3164,13 @@ def _check_attribute_gates(
         except (OSError, UnicodeDecodeError):
             continue
         texts = key_texts.get(path, frozenset())
+        if language == "python":
+            reason = python_gates.refusal_reason(source, flag_key, names, treatment, texts)
+            if reason is not None:
+                reasons[path] = reason
+            elif spelled := python_gates.gate_texts(source, flag_key, names, texts):
+                found[path] = spelled
+            continue
         if treatment:
             spelled = csharp_gates.gate_texts(source, flag_key, names, texts)
             if spelled:
@@ -3021,7 +3184,8 @@ def _check_attribute_gates(
         named = "; ".join(f"{path} ({reasons[path]})" for path in refused)
         logger.warning("refusing to transform for flag %r: %s", flag_key, named)
         raise UnsafeRewriteError(
-            f"an attribute gate on flag {flag_key!r} cannot be removed: {named}",
+            f"{'a decorator' if language == 'python' else 'an attribute'} gate on flag "
+            f"{flag_key!r} cannot be removed: {named}",
             refused=refused,
             discarded=[],
             reasons=reasons,
@@ -3030,7 +3194,11 @@ def _check_attribute_gates(
 
 
 def _delete_attribute_gates(
-    summaries, attribute_gates: dict[str, frozenset[str]], flag_key: str, accessors: tuple[str, ...]
+    summaries,
+    attribute_gates: dict[str, frozenset[str]],
+    flag_key: str,
+    accessors: tuple[str, ...],
+    language: str = "csharp",
 ) -> list:
     """Delete the gates :func:`_check_attribute_gates` found, adding a summary
     for any file the engine did not touch."""
@@ -3039,7 +3207,8 @@ def _delete_attribute_gates(
     for path, texts in attribute_gates.items():
         summary = by_path.get(path)
         before = summary.content if summary is not None else Path(path).read_text(encoding="utf-8")
-        after = csharp_gates.delete_gates(before, flag_key, frozenset(accessors), texts)
+        gates = python_gates if language == "python" else csharp_gates
+        after = gates.delete_gates(before, flag_key, frozenset(accessors), texts)
         Path(path).write_text(after, encoding="utf-8")
         rewrite = Rewrite(path, summary.original_content if summary else before, after)
         if summary is None:
@@ -4061,8 +4230,10 @@ def _reader_rules(
 
 #: Languages whose key constant, kept by a mention elsewhere, keeps its reads
 #: folding. A Rails view or a request spec reaches a concern whole so often that
-#: without this a Ruby key constant would almost never fold.
-_FOLDS_KEPT_CONSTANTS = frozenset({"ruby"})
+#: without this a Ruby key constant would almost never fold. A Go or Python test
+#: seeding a store with the constant does the same. A Go constant cannot be
+#: assigned at all; a Ruby or Python one can, which `_rewrites_constants` asks.
+_FOLDS_KEPT_CONSTANTS = frozenset({"ruby", "go", "python"})
 
 #: What replaces a Ruby constant at run time without spelling its name. Spelled
 #: anywhere in a checkout, a kept constant may not hold the key when it is read.
@@ -4106,8 +4277,8 @@ def _execute_groups(
         with tempfile.TemporaryDirectory(prefix="ff-const-reads-") as scratch:
             reads_only = Path(scratch) / const_rules_file.name
             reads_only.write_text(
-                rule_synthesis.without_rule(
-                    const_rules_file.read_text(encoding="utf-8"), "delete_flag_key_const_declaration"
+                rule_synthesis.without_rules(
+                    const_rules_file.read_text(encoding="utf-8"), "delete_flag_key_"
                 ),
                 encoding="utf-8",
             )
@@ -4387,6 +4558,8 @@ def _write_generated_rules(
     rules_file: Path,
     const_rules_file: Path,
     accessors: tuple[str, ...],
+    *,
+    key_positions: dict[str, int] | None = None,
 ) -> tuple[Path, Path]:
     """Write accessor-extended copies of the rule files and return their paths.
 
@@ -4422,6 +4595,7 @@ def _write_generated_rules(
             rules_file.read_text(encoding="utf-8"),
             accessors,
             templates_text=_accessor_templates_for(rules_file),
+            key_positions=key_positions,
         ),
         encoding="utf-8",
     )
@@ -4435,6 +4609,7 @@ def _write_generated_rules(
             ),
             accessors,
             templates_text=_accessor_templates_for(const_rules_file),
+            key_positions=key_positions,
         ),
         encoding="utf-8",
     )
@@ -4677,11 +4852,21 @@ def _inline_ts_bindings(before: str, after: str, marker: str, *, language: str) 
 #: through a marker rule. Each needs that rule in its base rules file; a
 #: language listed here without one would have every marker survive and every
 #: such file unwound, which is safe and useless.
+def _no_single_file_inline(before: str, after: str, marker: str, *, language: str) -> str:
+    """Java, Kotlin and Go have no single-file inliner: their one marker pass,
+    a private helper's parameter, is proven across files (``_BOUND_ACROSS_FILES``)."""
+    del before, marker, language
+    return after
+
+
 _BOUND_LITERAL_INLINERS = {
     "python": _inline_python_bindings,
     "ts": _inline_ts_bindings,
     "tsx": _inline_ts_bindings,
     "js": _inline_ts_bindings,
+    "java": _no_single_file_inline,
+    "kt": _no_single_file_inline,
+    "go": _no_single_file_inline,
 }
 
 
@@ -4691,10 +4876,31 @@ def _inline_exported_props(files, repo_dir: str, *, language: str, marker: str, 
     return ts_exported_props.inline_exported_props(files, language, marker, repo_dir, in_run)
 
 
-#: The languages with an inliner whose edit spans files, run by
-#: :func:`_inline_bound_reads` in a round no single-file inline used. Only the
-#: grammars with JSX.
-_BOUND_ACROSS_FILES = {"tsx": _inline_exported_props, "js": _inline_exported_props}
+def _inline_private_params(files, repo_dir: str, *, language: str, marker: str, in_run):
+    """A private helper's parameter the fold made one literal at every call
+    (:mod:`flag_cleanup.private_constant_params`). Java and Kotlin edit one
+    file, Go every file of the package, but each proves its calls against the
+    whole checkout, which only this hook is handed."""
+    planned = private_constant_params.inline_across(files, repo_dir, language, marker, in_run)
+    if planned:
+        return planned
+    # A private field the fold left assigned one literal in the constructor
+    # (:mod:`flag_cleanup.jvm_constant_fields`): moved into the declaration,
+    # where the engine's own field inline takes it.
+    return jvm_constant_fields.inline_across(files, repo_dir, language, marker, in_run)
+
+
+#: The languages with an inliner whose edit spans files, or whose proof needs
+#: the checkout, run by :func:`_inline_bound_reads` in a round no single-file
+#: inline used: the grammars with JSX, and the private helpers of Java, Kotlin
+#: and Go.
+_BOUND_ACROSS_FILES = {
+    "tsx": _inline_exported_props,
+    "js": _inline_exported_props,
+    "java": _inline_private_params,
+    "kt": _inline_private_params,
+    "go": _inline_private_params,
+}
 
 
 def _inline_bound_reads(
@@ -4882,6 +5088,146 @@ def _inline_bound_reads(
     return list(current.values()), entries, entry_paths
 
 
+def _constant_rules(rules_file: Path, marks: Mapping[str, str]) -> str:
+    """The sentinel rules of ``rules_file`` (every rule naming the
+    ``sentinel`` hole), once per ``marks`` entry (sentinel -> literal), with
+    the sentinel and the literal written in, as TOML text.
+
+    The pass after the fold folds each mark to a member's value, which need
+    not be the value the flag serves. So ``treated`` is not substituted: the
+    values are written into copies of the rules, one copy per value, and no
+    other seed rule is handed in, since it would fold a read the first pass
+    declined. Each copy keeps its group, so the cleanup cascade runs from its
+    literal as it does from the first pass's."""
+    import json
+    import tomllib
+
+    lines: list[str] = []
+    rules = [
+        rule
+        for rule in tomllib.loads(rules_file.read_text(encoding="utf-8")).get("rules", ())
+        if "sentinel" in rule.get("holes", ())
+    ]
+    for sentinel, literal in marks.items():
+        for rule in rules:
+            copy = dict(rule)
+            copy["name"] = f"{rule['name']}_{literal}"
+            for key in ("query", "replace"):
+                if key in copy:
+                    copy[key] = copy[key].replace("@sentinel", sentinel).replace("@treated", literal)
+            copy["holes"] = [h for h in rule["holes"] if h not in ("sentinel", "treated")]
+            lines.append("[[rules]]")
+            lines += [f"{key} = {json.dumps(value)}" for key, value in copy.items()]
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _inline_constant_members(
+    summaries,
+    *,
+    language: str,
+    plan: wrapper_inline.WrapperPlan,
+    paths: list[str],
+    run_groups,
+    rules_file: Path,
+    flag_key: str,
+    repo_dir: str,
+    assertions: list,
+) -> list:
+    """Fold the proven calls of each member the fold reduced to one value,
+    and add the member to ``plan`` as complete so close-out deletes it.
+
+    ONE engine invocation for every member, whatever its value: each call is
+    marked with its value's sentinel (:func:`_constant_rules`). One, because
+    the spans are proven on the bytes on disk now, and a second invocation
+    would read them off a file the first had rewritten. Inside the rule-file
+    window and before every text pass, for the reasons
+    :func:`_inline_bound_reads` gives. An abort, or a mark left behind, puts
+    every file back and inlines nothing: those members stay, still reported
+    as returning a constant.
+    """
+    from flag_cleanup import constant_inline
+
+    if not constant_inline.supported(language):
+        return summaries
+    by_resolved = {str(Path(p).resolve()): p for p in paths}
+    changed = {
+        s.path: (s.original_content, s.content) for s in summaries if s.original_content != s.content
+    }
+    known = frozenset(w.label for w in plan.wrappers) | frozenset(f.wrapper for f in plan.findings)
+    planned = constant_inline.plan(language, repo_dir, changed, known, lambda p: p in by_resolved)
+    if not planned:
+        return summaries
+    spec = _language_spec(language)
+    literals = {
+        constant_inline.sentinel_for(flag_key, value): spec.true_literal if value else spec.false_literal
+        for value in sorted({m.value for m in planned})
+    }
+    spans: dict[str, list] = {}
+    for member in planned:
+        sentinel = constant_inline.sentinel_for(flag_key, member.value)
+        for path, found in member.spans.items():
+            for span in found:
+                # A span's optional third element is written after the mark
+                # (a property read's `()`).
+                spans.setdefault(by_resolved[path], []).append((sentinel, span))
+    names = sorted(literals)
+    originals: dict[str, str] = {}
+    try:
+        for path, marks in spans.items():
+            source = mock_stubs._read_exact(path)
+            if any(name in source for name in names):
+                raise kotlin_sentinel.SentinelCollisionError(path)
+            data = source.encode("utf-8")
+            for sentinel, span in sorted(marks, key=lambda m: m[1][0], reverse=True):
+                suffix = span[2] if len(span) > 2 else ""
+                data = data[: span[0]] + (sentinel + suffix).encode("utf-8") + data[span[1] :]
+            originals[path] = source
+            mock_stubs._write_exact(path, data.decode("utf-8"))
+    except kotlin_sentinel.SentinelCollisionError:
+        for path, source in originals.items():
+            mock_stubs._write_exact(path, source)
+        return summaries
+
+    def put_back(why: str) -> list:
+        logger.warning(
+            "%s while inlining members that now return a constant; they are kept: %s",
+            why,
+            ", ".join(m.wrapper.label for m in planned),
+        )
+        for path, source in originals.items():
+            mock_stubs._write_exact(path, source)
+        return summaries
+
+    produced: list = []
+    with tempfile.TemporaryDirectory(prefix="flag-cleanup-constants-") as tmp:
+        rules = Path(tmp) / "constant_rules.toml"
+        rules.write_text(_constant_rules(rules_file, literals), encoding="utf-8")
+        try:
+            run_groups(
+                with_const=[],
+                without_const=sorted(originals),
+                collected=produced,
+                rules_file=rules,
+                entries_rules_file=None,
+            )
+        except PiranhaTransformError:
+            return put_back("the transform engine aborted")
+    results = {s.path: s.content for s in produced}
+    contents = {path: results.get(path, mock_stubs._read_exact(path)) for path in originals}
+    if any(name in content for content in contents.values() for name in names):
+        # Never a diff: the engine left a mark this pass wrote.
+        return put_back("a mark survived the engine")
+    current = {s.path: s for s in summaries}
+    for path, content in contents.items():
+        prior = current.get(path)
+        current[path] = Rewrite(path, prior.original_content if prior is not None else originals[path], content)
+    assertions.extend(_engine_assertions(produced, repo_dir))
+    plan.wrappers = plan.wrappers + tuple(m.wrapper for m in planned)
+    plan.complete = plan.complete | frozenset(m.wrapper.label for m in planned)
+    return list(current.values())
+
+
 def _inline_python_literals(summaries) -> list:
     """Inline, with the bare literal, a read still bound to a name, and write it back."""
     folded = []
@@ -4963,6 +5309,32 @@ def _remove_orphans(summaries, language: str) -> list:
         Path(summary.path).write_text(result, encoding="utf-8")
         cleaned.append(Rewrite(summary.path, summary.original_content, result))
     return cleaned
+
+
+def _delete_declared_calls(summaries, language: str, repo_dir: str) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Delete each discarded call this run left behind whose callee the
+    customer listed in ``side-effect-free-calls``; report what went. See
+    :mod:`flag_cleanup.inert_calls`."""
+    if not inert_calls.declared():
+        return list(summaries), ()
+    cleaned_summaries = []
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content or file_deletion.deleted(summary):
+            cleaned_summaries.append(summary)
+            continue
+        grammar = _grammar_of(summary.path, language)
+        cleaned, gone = inert_calls.remove(
+            summary.original_content, summary.content, grammar, path=summary.path, root=repo_dir
+        )
+        if not gone:
+            cleaned_summaries.append(summary)
+            continue
+        Path(summary.path).write_text(cleaned, encoding="utf-8")
+        cleaned_summaries.append(Rewrite(summary.path, summary.original_content, cleaned))
+        relative = os.path.relpath(summary.path, repo_dir)
+        rows.extend((relative, inert_calls.DECLARED_CALL, text) for text in gone)
+    return cleaned_summaries, tuple(rows)
 
 
 def _remove_stranded_bindings(
@@ -5458,6 +5830,17 @@ def _partition_by_const_safety(
             withheld.append(path)
             continue
         allowed_here = const_path_is_safe(source, language, flag_key, accessors, treatment)
+        if not allowed_here and language == "go":
+            grouped = key_const.go_positional_key_consts(source, flag_key)
+            if grouped:
+                logger.warning(
+                    "%s: key constant %s is in a `const ( ... )` block whose entries "
+                    "depend on their position (`iota`, or an entry with no value "
+                    "repeating the one above it), so removing it could change the "
+                    "others: it is kept, and so are its reads",
+                    path,
+                    ", ".join(grouped),
+                )
         if allowed_here and repo_dir is not None:
             consts = externally_visible_key_consts(source, language, flag_key)
             if consts:
@@ -5623,6 +6006,35 @@ def _print_width_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[s
         except (OSError, UnicodeDecodeError):
             continue
         width = ts_list_join.line_limit(path, original, repo_dir)
+        if width is not None:
+            facts[os.path.abspath(path)] = [{"print_width": str(width)}]
+    return facts
+
+
+def _formatter_width_facts(
+    paths: list[str], language: str, repo_dir: str
+) -> dict[str, list[dict[str, str]]]:
+    """Each Python or Dart file's ``print_width`` fact, the width its
+    formatter writes to (:mod:`flag_cleanup.line_width`), by absolute path.
+    The engine puts a Python bracket pair or a Dart initializer its own edit
+    let fit back on one line under it. Read off the customer's bytes, before
+    any pass marks a file. Other languages get none."""
+    if language not in ("python", "dart"):
+        return {}
+    facts = {}
+    for path in paths:
+        if language == "python":
+            if not path.endswith((".py", ".pyi")):
+                continue
+            try:
+                original = Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            width = line_width.python_line_limit(path, original, repo_dir)
+        else:
+            if not path.endswith(".dart"):
+                continue
+            width = line_width.dart_page_width(path, repo_dir)
         if width is not None:
             facts[os.path.abspath(path)] = [{"print_width": str(width)}]
     return facts

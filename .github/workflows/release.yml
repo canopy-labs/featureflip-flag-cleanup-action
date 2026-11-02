@@ -68,7 +68,7 @@ jobs:
             # before anything is built, so a version bumped without its section
             # stops the release rather than publishing one that says nothing
             # about what changed. Only when releasing: a master push that keeps
-            # the version must not fail on a section that is still "Unreleased".
+            # the version must not fail on a section that does not exist yet.
             python3 scripts/changelog_section.py "$VERSION" > /dev/null
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi

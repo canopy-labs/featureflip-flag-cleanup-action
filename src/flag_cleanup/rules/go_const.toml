@@ -67,12 +67,17 @@
 # guard — which matters, because a `var` may be reassigned and its declaration
 # is therefore not a resolvable value.
 #
-# TWO anchors bound the declaration, on two different dimensions, and it takes
-# both. Dropping either is #2700 again.
+# The declaration is bounded on two dimensions, and it takes both. Dropping
+# either is #2700 again.
 #
-#   1. `. (const_spec …) .` means EXACTLY ONE SPEC: the spec must immediately
-#      follow the `const` token and also be last. A grouped
-#      `const ( a = "x"; b = "y" )` therefore matches nothing here.
+#   1. SPECS. A declaration of one spec is deleted whole
+#      (`. (const_spec …) .` in `delete_flag_key_const_declaration`: the spec
+#      immediately follows the `const` token and is also last). A spec of a
+#      `const ( … )` group of several is deleted alone, by
+#      `delete_flag_key_const_spec_in_group`, which needs another spec beside
+#      it. The read rules' scope accepts a spec in either. Whether a group may
+#      lose an entry (no `iota`, no entry without a value) is the GATE's call,
+#      `key_const._go_withholds`, which sees every spec these rules match.
 #   2. `value: (expression_list . (…) .)` means EXACTLY ONE VALUE — and a Go
 #      const spec binds as many names as it has values, so this is what makes
 #      "exactly one NAME" true. Without it `const a, b = "old-checkout", "x"`
@@ -82,13 +87,10 @@
 #      with NO GATE AT ALL and the delete rule takes `b` with it. `go build`
 #      says `undefined: b`.
 #
-# Both fail closed to a silent no-op rather than to a broken build, because the
-# delete rule removes the whole `const_declaration` and would otherwise carry
-# off constants it was never asked about.
-#
 # Note what the anchors do NOT do: `@decl_name` and `@flag_name` are captured
-# independently, so nothing pairs a name with the value written beside it.
-# Bounding the declaration to one of each is what makes that irrelevant.
+# within one spec, but the scope pattern matches ANY spec of a declaration, so
+# a read resolves through the spec whose name it spells and whose value is the
+# key — both predicates bind the same spec.
 #
 # Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
 
@@ -135,14 +137,14 @@ holes = ["stale_flag_name"]
 enclosing_node = """(
   [(source_file
      (const_declaration
-       . (const_spec
-           name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))
    (statement_list
      (const_declaration
-       . (const_spec
-           name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))] @scope
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -181,14 +183,99 @@ holes = ["treated", "stale_flag_name"]
 enclosing_node = """(
   [(source_file
      (const_declaration
-       . (const_spec
-           name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))
    (statement_list
      (const_declaration
-       . (const_spec
-           name: (identifier) @decl_name
-           value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) .))] @scope
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# --- Boolean(ctx, oldCheckout, …): the key in the SECOND argument -----------
+#
+# The OpenFeature client takes `context.Context` first, so its key is the second
+# argument, and `go.toml` anchors its literal-key `Boolean` rules the same way.
+# A wrapper whose first parameter is a context, a tenant or an organisation
+# (`flags.IsEnabled(org, oldCheckout)`) puts the key there too, and reaches
+# these rules through the accessor clones of this pair, exactly as it reaches
+# `go.toml`'s literal pair. Without them a hoisted key in that position matched
+# nothing at all, while the same read with a literal folded.
+#
+# The same two rules in the same order as the BoolVariation pair above, for the
+# same reasons: the discarded statement first (a bare `true` does not compile),
+# the same filters on it, and the same declaration resolution. Only the
+# argument anchor differs: `. (_) . (identifier)`, the key immediately after
+# the first argument. `key_const._go_is_removable_read` counts exactly this
+# position for `Boolean` and for an accessor, so the gate and the rules widen
+# together.
+[[rules]]
+name = "delete_discarded_openfeature_boolean_const_key_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list . (_) . (identifier) @key_const))) @statement
+  (#eq? @sdk_fn "Boolean")
+)"""
+replace_node = "statement"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(source_file
+     (const_declaration
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))
+   (statement_list
+     (const_declaration
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+[[rules]]
+name = "replace_openfeature_boolean_const_key_read_with_boolean_literal"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list . (_) . (identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "Boolean")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(source_file
+     (const_declaration
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))
+   (statement_list
+     (const_declaration
+       (const_spec
+         name: (identifier) @decl_name
+         value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .))))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -203,8 +290,8 @@ enclosing_node = """(
 # anticipate would have its insides removed and its shell left behind.
 #
 # The filter is a SEQUENCING guard, not the safety argument (Gate 2 is — see the
-# header): while any call still takes this const as its first argument, the
-# declaration stays. Without it the delete rule could fire first and strand the
+# header): while any call still takes this const as its first or second
+# argument, the declaration stays. Without it the delete rule could fire first and strand the
 # reads it was supposed to follow, which is a broken build rather than a
 # half-finished cleanup.
 [[rules]]
@@ -233,8 +320,68 @@ delete_whole_lines = true
 
 [[rules.filters]]
 enclosing_node = """([(source_file) (function_declaration) (block)] @container)"""
-not_contains = ["""(
+not_contains = [
+  """(
   (call_expression
     arguments: (argument_list . (identifier) @first_arg)) @surviving_read
   (#eq? @first_arg "@variable_name")
-)"""]
+)""",
+  """(
+  (call_expression
+    arguments: (argument_list . (_) . (identifier) @second_arg)) @surviving_read
+  (#eq? @second_arg "@variable_name")
+)""",
+]
+
+# --- delete ONE spec of a grouped `const ( … )` ------------------------------
+#
+# The key as one entry of a block declaring several, the way Go code usually
+# declares a set of flag keys. Each line of a group is its own `const_spec`, so
+# that line goes and the others stay. The rule above takes a block holding only
+# this spec; this one needs another spec beside it, before or after, so the two
+# never match the same declaration and no `const ( )` is left behind.
+#
+# Removing one entry is safe only when no other entry depends on its position:
+# an entry with no value repeats the one above it, and `iota` counts entries.
+# That is decided by the gate, not here: `key_const._go_withholds` keeps the
+# whole file when the block holding the key has either, because the rules and
+# the gate must recognise the same declarations (`_go_key_consts` sees every
+# spec this rule matches) and the gate is where a withheld file is reported.
+#
+# `gofmt` aligns a block's `=` into a column sized by its longest name.
+# Deleting the longest name leaves the others padded for it: still valid Go,
+# but `gofmt -l` lists the file, as it does after a flag-keyed map entry goes.
+[[rules]]
+name = "delete_flag_key_const_spec_in_group"
+query = """(
+  [(const_declaration
+     (const_spec)
+     (const_spec
+       name: (identifier) @variable_name
+       value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) @spec)
+   (const_declaration
+     (const_spec
+       name: (identifier) @variable_name
+       value: (expression_list . (interpreted_string_literal . (_) @flag_name .) .)) @spec
+     (const_spec))] @group
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "spec"
+replace = ""
+holes = ["stale_flag_name"]
+delete_whole_lines = true
+
+[[rules.filters]]
+enclosing_node = """([(source_file) (function_declaration) (block)] @container)"""
+not_contains = [
+  """(
+  (call_expression
+    arguments: (argument_list . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)""",
+  """(
+  (call_expression
+    arguments: (argument_list . (_) . (identifier) @second_arg)) @surviving_read
+  (#eq? @second_arg "@variable_name")
+)""",
+]

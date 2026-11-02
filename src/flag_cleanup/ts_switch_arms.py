@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from tree_sitter import Node
 
+from flag_cleanup.tree_walk import preorder
 from flag_cleanup.ts_syntax import _parse
 
 _ARMS = frozenset({"switch_case", "switch_default"})
@@ -53,9 +54,7 @@ def literal_arms(source: str, language: str) -> int:
 
 
 def _iter(node: Node):
-    yield node
-    for child in node.children:
-        yield from _iter(child)
+    return preorder(node)
 
 
 def _unparenthesised(node: Node) -> Node:

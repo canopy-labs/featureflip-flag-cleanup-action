@@ -99,6 +99,14 @@ commands:
           exactly as your imports spell them, whose load does nothing. A
           stranded import of one is deleted rather than kept bare, and the
           pull request names each one.
+      side-effect-free-calls:
+        type: string
+        default: ""
+        description: >-
+          Comma-separated function or method names whose call does nothing
+          you need. A call to one that a removal kept only as a discard
+          (`_ = getClient(p)`, `getClient(p);`) is deleted rather than kept,
+          and the pull request names each one.
       languages:
         type: string
         default: ""
@@ -195,6 +203,7 @@ commands:
             export FEATUREFLIP_ACCESSORS="<< parameters.accessors >>"
             export FEATUREFLIP_INLINE_WRAPPERS="<< parameters.inline-wrappers >>"
             export FEATUREFLIP_SIDE_EFFECT_FREE_MODULES="<< parameters.side-effect-free-modules >>"
+            export FEATUREFLIP_SIDE_EFFECT_FREE_CALLS="<< parameters.side-effect-free-calls >>"
             export FEATUREFLIP_DIRECTORIES="<< parameters.directories >>"
             export FEATUREFLIP_IGNORE="<< parameters.ignore >>"
             export FEATUREFLIP_FLAGS="<< parameters.flags >>"
@@ -221,6 +230,7 @@ commands:
               -e FEATUREFLIP_ACCESSORS \
               -e FEATUREFLIP_INLINE_WRAPPERS \
               -e FEATUREFLIP_SIDE_EFFECT_FREE_MODULES \
+              -e FEATUREFLIP_SIDE_EFFECT_FREE_CALLS \
               -e FEATUREFLIP_DIRECTORIES \
               -e FEATUREFLIP_IGNORE \
               -e FEATUREFLIP_FLAGS \

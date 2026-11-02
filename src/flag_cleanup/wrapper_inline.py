@@ -53,6 +53,7 @@ that does not is judged by the JVM ones.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from collections.abc import Callable, Iterable
@@ -294,6 +295,11 @@ class Wrapper:
     #: ``flags.js``), resolved, when it has one. Its declarations of the
     #: wrapper describe it, and go with it.
     declaration_file: str | None = None
+    #: The flag this run removes and the accessors that read it, set when the
+    #: wrapper is discovered: a string that is the key of such a read is the
+    #: flag's key, not a spelling of the wrapper's name.
+    flag_key: str = ""
+    accessors: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -471,6 +477,16 @@ class Profile:
     #: with the declarations describing the wrapper deleted, or ``None`` when
     #: one cannot be deleted alone.
     without_descriptions: Callable[[Wrapper], tuple[str, str] | None] | None = None
+    #: ``(path, source)`` -> the members whose whole body is one boolean
+    #: literal, shaped as :attr:`discover` shapes a wrapper: the members the
+    #: fold reduced to a constant, inlined after the engine by
+    #: :mod:`flag_cleanup.constant_inline`. ``None`` where that pass does not
+    #: run.
+    constants: Callable[[str, str], list[Wrapper]] | None = None
+    #: ``(path, source, callees)`` -> names of the members whose body names
+    #: one of the read callees, which a fold may reduce to a constant: a
+    #: superset, for the undo snapshot. ``None`` beside ``constants=None``.
+    constant_candidates: Callable[[str, str, frozenset[str]], set[str]] | None = None
 
 
 _PROFILES: dict[str, Profile] = {}
@@ -542,8 +558,33 @@ def discover_all(
         if source is None:
             continue
         is_read = lang.read_test(path, source, flag_key, accessors, const_ok, external)
-        found.extend(lang.discover(str(Path(path).resolve()), source, is_read))
+        found.extend(
+            dataclasses.replace(w, flag_key=flag_key, accessors=tuple(accessors))
+            for w in lang.discover(str(Path(path).resolve()), source, is_read)
+        )
     return found
+
+
+def key_literal(wrapper: Wrapper, path: str, source: str) -> Callable[[Node], bool]:
+    """Whether a string node is the key argument of a read of the wrapper's
+    flag: the key the wrapper (or any other read) passes, which is no
+    spelling of the wrapper's name even when the two are the same word."""
+    lang = profile(wrapper.language)
+    if lang is None or not wrapper.flag_key:
+        return lambda node: False
+    is_read = lang.read_test(path, source, wrapper.flag_key, wrapper.accessors, False, ())
+
+    def inside_a_read(node: Node) -> bool:
+        if node.text.decode("utf-8", "replace").strip("'\"") != wrapper.flag_key:
+            return False
+        parent = node.parent
+        while parent is not None:
+            if is_read(parent):
+                return True
+            parent = parent.parent
+        return False
+
+    return inside_a_read
 
 
 def _sibling_note(sibling: Sibling, member: str, value: str) -> str:
@@ -830,10 +871,13 @@ def _line_at(path: str, offset: int) -> int:
     return 1 if source is None else source.encode("utf-8")[:offset].count(b"\n") + 1
 
 
-def _string_mentions(path: str, name: str, templates: bool = False) -> list[tuple[int, str]]:
+def _string_mentions(
+    path: str, name: str, templates: bool = False, skip: Callable[[Node], bool] | None = None
+) -> list[tuple[int, str]]:
     """String literals in a parsed file that spell ``name`` as a word.
 
     With ``templates`` a brace-less ``$name`` interpolation counts too.
+    ``skip`` says which literals are not mentions.
     """
     from flag_cleanup import cross_file_keys
 
@@ -850,6 +894,7 @@ def _string_mentions(path: str, name: str, templates: bool = False) -> list[tupl
         if node.type in lang.strings
         and word.search(node.text.decode("utf-8", "replace"))
         and not (lang.test_title is not None and lang.test_title(path, source, node))
+        and not (skip is not None and skip(node))
     ]
 
 
@@ -926,7 +971,9 @@ def prove_all(
             if lang is not None and lang.string_mentions is not None:
                 strings = lang.string_mentions(index, path, wrapper)
             elif counts is None or counts(index, path, "string"):
-                strings = _string_mentions(path, wrapper.name, wrapper.kind == "property")
+                strings = _string_mentions(
+                    path, wrapper.name, wrapper.kind == "property", key_literal(wrapper, path, _read(path) or "")
+                )
             else:
                 strings = []
             refused += [Finding(path, line, UNPARSED_MENTION, text, wrapper.label) for line, text in strings]
@@ -1006,6 +1053,10 @@ def candidate_names(
             continue
         is_read = lang.read_test(path, source, flag_key, accessors, True, (), loose=True)
         names.update(w.name for w in lang.discover(path, source, is_read))
+        if lang.constant_candidates is not None:
+            # A member the fold may reduce to a constant, whose callers the
+            # pass after the fold may rewrite (:mod:`flag_cleanup.constant_inline`).
+            names.update(lang.constant_candidates(path, source, frozenset(accessors)))
     return names
 
 

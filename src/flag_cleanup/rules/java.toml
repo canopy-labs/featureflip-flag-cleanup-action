@@ -27,6 +27,45 @@
 # 1. The flag read
 # ===========================================================================
 
+# --- @marker(<literal>) — a private helper's parameter, inlined after the engine
+#
+# Not an SDK shape: like `ts.toml`'s rule of the same name, it matches only
+# something THIS TOOL wrote. When every call of a private helper passes the same
+# literal the fold produced at one position, `private_constant_params` deletes
+# the argument and the parameter and writes a call to this marker at each read
+# of it. The engine then runs again and this rule creates the literal INSIDE the
+# cascade, so the `if` it guards folds as a read written inline would. The
+# marker carries its value as its argument: a call passing the opposite of the
+# treatment keeps its own literal. A marker the engine leaves behind unwinds the
+# file. The callee is captured as `@inlined_callee` (not an SDK name, and no
+# capture may start with a hole's name).
+#
+# The callee is the marker with an `inlined` prefix, never the bare marker: the
+# marker and the wrapper SENTINEL are the same identifier (both derive from the
+# key), and the sentinel rule replaces any call of it with `@treated`, whatever
+# its argument. Measured in Kotlin with the bare marker below that rule:
+# `if (!on)`, inlined as `marker(false)`, came out `if (true)` under the true
+# treatment. Above it, a wrapper call passing one boolean literal
+# (`flags.on(true)`, marked as `sentinel(true)`) would fold to that argument
+# instead of the flag's value. A hole is substituted as text, so
+# `"inlined@marker"` is `inlined` followed by the marker (a suffix would not
+# work: `@marker_param` reads as a hole named `marker_param`).
+[[rules]]
+name = "replace_inlined_binding_marker_with_boolean_literal"
+query = """(
+  (method_invocation
+    !object
+    name: (identifier) @inlined_callee
+    arguments: (argument_list . [(true) (false)] @value .)
+  ) @call
+  (#eq? @inlined_callee "inlined@marker")
+)"""
+replace_node = "call"
+replace = "@value"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["marker"]
+
+
 # --- @sentinel(…) — a call to a keyless wrapper, proven and marked before the engine
 #
 # Reached ONLY through the wrapper pass (`wrapper_inline`), which proves that a

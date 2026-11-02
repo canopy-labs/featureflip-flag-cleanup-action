@@ -18,6 +18,13 @@ from __future__ import annotations
 import re
 from collections import Counter
 
+#: The kind of a pull-request row naming an assertion whose whole subject was
+#: the flag read (``expect(<read>, AppConfig.enableX)``), deleted with the
+#: read: a test of the flag's own value, neither trivially true nor provably
+#: failing once the read is a literal, so neither this module nor the
+#: trivial-assertion rules decide it.
+FLAG_VALUE_ASSERTION = "flag value assertion"
+
 _T, _F = r"true", r"false"
 
 
@@ -124,6 +131,23 @@ _RUBY = [
     *[_rb_call("assert_equal", pair) for pair in _either(*_UNEQUAL)],
 ]
 
+#: Pest `expect(<literal>)->matcher()`, and the same after `->not`. Only the
+#: literal matchers the rules delete in their passing form.
+_PEST = r"(?<![\w$>:\\])expect\s*\(\s*"
+_PEST_NOT = r"\s*\)\s*->\s*not\s*->\s*"
+_PEST_PLAIN = r"\s*\)\s*->\s*"
+_PEST_TRUE, _PEST_FALSE = r"(?:toBeTrue|toBeTruthy)\s*\(\s*\)", r"(?:toBeFalse|toBeFalsy)\s*\(\s*\)"
+_PEST_EQ = r"(?:toBe|toEqual)\s*\(\s*{}\s*\)"
+_PHP_PEST = [
+    # A literal that can only fail the matcher, or only fail its negation.
+    _PEST + _F + _PEST_PLAIN + _PEST_TRUE,
+    _PEST + _T + _PEST_PLAIN + _PEST_FALSE,
+    _PEST + _T + _PEST_NOT + _PEST_TRUE,
+    _PEST + _F + _PEST_NOT + _PEST_FALSE,
+    *[_PEST + a + _PEST_PLAIN + _PEST_EQ.format(b) for a, b in _UNEQUAL],
+    *[_PEST + a + _PEST_NOT + _PEST_EQ.format(a) for a in (_T, _F)],
+]
+
 #: PHPUnit on `$this->`, `self::`, `static::` or `Assert::`, with at most a
 #: string message; PHP's literals are case-insensitive.
 _PHP_PREFIX = r"(?:\$this\s*->|(?<![\w$\\])(?:self|static|Assert)\s*::)\s*"
@@ -135,6 +159,7 @@ _PHP = [
         _call(_PHP_PREFIX + "(?:assertSame|assertEquals)", pair + _MESSAGE)
         for pair in _either((_PHP_T, _PHP_F), (_PHP_F, _PHP_T))
     ],
+    *_PHP_PEST,
 ]
 
 #: XCTest, called bare, and Swift Testing's `#expect`; at most a string message.

@@ -2178,17 +2178,13 @@ def _self_factory(value: Node, name: str, readers: _Readers, path: str) -> Node 
     return receiver
 
 
-def _parameter_type(parameters: Node | None, name: str) -> Node | str | None:
-    if parameters is None:
-        return None
-    if parameters.type == "implicit_parameter":
-        return _UNTYPED if _text(parameters) == name else None
-    if parameters.type == "identifier":
-        return _UNTYPED if _text(parameters) == name else None
-    for parameter in parameters.named_children:
-        if parameter.type in ("parameter", "implicit_parameter") and _name_of(parameter) == name:
-            return parameter.child_by_field_name("type") or _UNTYPED
-        if parameter.type == "implicit_parameter" and _text(parameter) == name:
+def _parameter_type(parameters: Iterable[Node], name: str) -> Node | str | None:
+    """What the first of ``parameters`` named ``name`` declares itself to be."""
+    for parameter in parameters:
+        if parameter.type == "parameter":
+            if _name_of(parameter) == name:
+                return parameter.child_by_field_name("type") or _UNTYPED
+        elif _text(parameter) == name:
             return _UNTYPED
     return None
 
@@ -2211,7 +2207,8 @@ def _member_binding(scope: Node, name: str) -> Node | str | None:
 
 
 def _primary_parameter(scope: Node, name: str) -> Node | str | None:
-    return _parameter_type(_child(scope, "parameter_list"), name)
+    listed = _child(scope, "parameter_list")
+    return _parameter_type(listed.named_children if listed is not None else (), name)
 
 
 def _inherits(scope: Node, name: str, readers: _Readers, path: str) -> bool:
@@ -2385,10 +2382,10 @@ def _binding(
             elif scope.type in ("lambda_expression", "anonymous_method_expression"):
                 # A lambda's parameter, typed or not, may be the parameter of
                 # an expression tree, where the call is the payload.
-                if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+                if _parameter_type(xcs.parameter_nodes(scope), name) is not None:
                     found = _UNTYPED
             elif scope.type in _FUNCTIONS:
-                found = _parameter_type(scope.child_by_field_name("parameters"), name)
+                found = _parameter_type(xcs.parameter_nodes(scope), name)
             elif scope.type == "accessor_declaration" and name == "value":
                 found = _UNTYPED
             elif scope.type == "foreach_statement":
@@ -2442,7 +2439,7 @@ def _moq_mock(access: Node, name: str, readers: _Readers, path: str) -> tuple[st
         if lam.type in _MEMBERS:
             return None
         lam = lam.parent
-    if lam is None or _parameter_type(lam.child_by_field_name("parameters"), name) is None:
+    if lam is None or _parameter_type(xcs.parameter_nodes(lam), name) is None:
         return None
     argument = lam.parent
     arguments = argument.parent if argument is not None and argument.type == "argument" else None
@@ -2936,8 +2933,8 @@ def _target_object_type(node: Node, readers: _Readers, path: str) -> Node | None
             return None
         inner = _named(holder)[0]
     elif parent.type == "member_binding_expression" and _field(parent, node) == "name":
-        access = parent.parent
-        if access is None or access.type != "conditional_access_expression" or _field(access, parent) == "condition":
+        access = xcs.null_conditional_access(node)
+        if access is None:
             return None
         inner = access.child_by_field_name("condition")
     if inner is None or inner.type != "identifier":
@@ -2997,10 +2994,10 @@ def _implicit_value(at: Node, name: str) -> Node | None | bool:
     scope = at.parent
     while scope is not None and scope.type not in _SCOPE_TYPES:
         if scope.type in ("lambda_expression", "anonymous_method_expression"):
-            if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+            if _parameter_type(xcs.parameter_nodes(scope), name) is not None:
                 return True
         elif scope.type in _FUNCTIONS:
-            if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+            if _parameter_type(xcs.parameter_nodes(scope), name) is not None:
                 return None
         elif scope.type == "foreach_statement":
             left = scope.child_by_field_name("left")
@@ -3126,7 +3123,7 @@ def _declaring_scope(at: Node, name: str) -> Node | None:
             if _local_binding(_statements_in_scope(scope), at, name) is not None:
                 return scope.parent if scope.type == "switch_section" else scope
         elif scope.type in _FUNCTIONS:
-            if _parameter_type(scope.child_by_field_name("parameters"), name) is not None:
+            if _parameter_type(xcs.parameter_nodes(scope), name) is not None:
                 return scope
         elif scope.type == "accessor_declaration" and name == "value":
             return scope
@@ -4404,7 +4401,11 @@ def _knob_settings(
     of ``x.Knob`` (any write: an assignment, compound or deconstructing, a
     ``ref``/``out``), an initializer's ``Knob = …``, a ``with``, and a
     construction of a fake set by its primary constructor. A target whose
-    type is known and is no fake is not one."""
+    type is known and is no fake is not one.
+
+    A ``x?.Knob`` write is listed like a region that does not parse, with no
+    receiver, type or value: it sets the knob only when ``x`` is not null,
+    which decides nothing here, whichever literal it writes."""
     siblings = [s for group in fakes.values() for s in group]
     member_knobs = {s.knob for s in siblings if not s.knob_primary}
     owners = {s.owner for s in siblings}
@@ -4442,6 +4443,13 @@ def _knob_settings(
             if known and fake is None:
                 continue
             found.append(_Setting(target, receiver, _plain_value(target), fake, knob, holder))
+        elif node.type == "member_binding_expression":
+            name = node.child_by_field_name("name")
+            access = xcs.null_conditional_access(name) if name is not None and name.type == "identifier" else None
+            knob = _text(name).removeprefix("@") if access is not None else None
+            target = _write_target(access) if knob in member_knobs else None
+            if target is not None:
+                found.append(_Setting(target, None, None, None, knob))
         elif node.type == "assignment_expression" and node.parent is not None and node.parent.type == "initializer_expression":
             left = node.child_by_field_name("left")
             knob = _text(left).removeprefix("@") if left is not None and left.type == "identifier" else None
@@ -4634,7 +4642,7 @@ def _unseen_knob_write(node: Node, data: bytes, knobs: frozenset[str], owners: f
     else:
         return False
     written = any(
-        t.type == "member_access_expression"
+        t.type in ("member_access_expression", "member_binding_expression")
         and (name := t.child_by_field_name("name")) is not None
         and _text(name).removeprefix("@") in knobs
         for target in targets

@@ -852,6 +852,42 @@ def _field(parent: Node, child: Node) -> str | None:
     return None
 
 
+def null_conditional_access(name: Node) -> Node | None:
+    """The ``r?.m`` that ``name``, its ``m``, ends, or ``None`` for a name in
+    any other position.
+
+    This is the expression to judge a ``?.`` member by. It is what a write
+    has as its target: C# 14's ``r?.m = v`` is an assignment whose ``left`` is
+    this node, with no ``member_access_expression`` anywhere in it, so
+    anything looking for a written member by that type does not see it. The
+    forms it does not reach are the ones that do hold a member access, which
+    is the written member of ``r?.m.n = v`` and of ``r?[i].n = v``."""
+    binding = name.parent
+    if binding is None or binding.type != "member_binding_expression" or _field(binding, name) != "name":
+        return None
+    access = binding.parent
+    if access is None or access.type != "conditional_access_expression" or _field(access, binding) == "condition":
+        return None
+    return access
+
+
+def parameter_nodes(scope: Node) -> list[Node]:
+    """Each parameter of ``scope`` (a method, local function or lambda), as
+    its ``parameter`` or ``implicit_parameter``.
+
+    Read the field through this and not with ``child_by_field_name``: the
+    untyped lambda ``(ref x, y) => …`` holds no ``parameter_list``, its
+    ``parameters`` field repeats over ``ref``, ``x`` and ``y`` alike, and the
+    lookup gives the first of those, here a modifier with nothing under it."""
+    found: list[Node] = []
+    for part in scope.children_by_field_name("parameters"):
+        if part.type in ("implicit_parameter", "identifier"):
+            found.append(part)
+        elif part.type != "modifier":
+            found += [c for c in part.named_children if c.type in ("parameter", "implicit_parameter")]
+    return found
+
+
 def _type_position(node: Node) -> bool:
     """Whether ``node`` (an identifier) surely names a type, or qualifies one.
 

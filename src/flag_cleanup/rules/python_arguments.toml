@@ -2,29 +2,18 @@
 # piranha_runner.run_piranha. (language, substitutions, paths and rule-graph
 # are supplied by the runner, not here.)
 [piranha_arguments]
-
-# `delete_consecutive_new_lines` is deliberately NOT set here, unlike
-# ts/java/go/swift — Python is the one language where it does more harm than
-# the hole it fills. MEASURED both ways on the same file:
+# Cut the blank lines a removal leaves to what black and ruff write there.
 #
-#   on  -> every run of two-or-more newlines in the WHOLE file collapses to
-#          one. PEP 8 puts two blank lines between top-level definitions, so
-#          this rewrites the spacing of code the removal never touched:
-#          `import log` / blank / blank / `def route` came back with one blank
-#          line, i.e. `E302 expected 2 blank lines, got 1` in a file whose only
-#          intended change was three lines away. That is precisely the
-#          "unrelated formatting change" the flag exists to PREVENT elsewhere.
-#   off -> deleting a module-level guard leaves the two blank lines that were
-#          above it and the two that were below, so four in a row
-#          (`E303 too many blank lines`) — at the deletion site only.
+# This was OFF for Python, the one language where it used to do more harm than
+# the hole it filled: the engine collapsed every run of blank lines in the WHOLE
+# file to one, which rewrote PEP 8's two blank lines between top-level
+# definitions far from the removal (`E302`). Off, a deleted statement kept the
+# blank lines on both sides, and the run of two to five that resulted failed
+# `black --check` and `ruff format --check` at the deletion site.
 #
-# Local damage beats global damage: a reviewer can see why extra blank lines
-# sit where a guard used to be, and nothing else in the file moves. Inside a
-# function the residue is at most one extra blank line, which PEP 8 tolerates.
-# Recorded in README "Known gaps"; revisit if the engine ever grows a
-# language-aware blank-line policy.
-#
-# The empty table above is load-bearing: `_load_argument_flags` reads
-# `[piranha_arguments]` and passes it through as **kwargs, so an absent table
-# and an empty one behave identically — but an empty one says the omission was
-# a decision. Do not delete the file.
+# The engine now touches only the runs an edit wrote or sits against, and for
+# Python cuts each to what the formatters write instead of to one: none at
+# either end of the file, inside brackets, after a decorator or at the start of
+# a block; two before a line at column 0; one anywhere else. A run is never
+# lengthened, and a run inside a string is left whole.
+delete_consecutive_new_lines = true

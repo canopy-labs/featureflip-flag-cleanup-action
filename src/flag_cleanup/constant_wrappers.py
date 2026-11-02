@@ -21,6 +21,11 @@ into the callers, and that is a decision rather than a gap:
   says. Inlining ``true`` at a call through the interface changes what that
   path does, and no amount of parsing can prove that the customer wants it.
 
+(A Swift member the fold left as ``{ <literal> }`` whose every mention is a
+call the keyless-wrapper proofs tie to it is the exception: it is inlined and
+deleted after the fold, by :mod:`flag_cleanup.constant_inline`, which reads
+the members off :func:`reduced_members`. Every other one is reported here.)
+
 So the report names everything a reviewer needs to finish the job by hand —
 the member, the constant it returns, the types it was declared against, the
 other implementations of those types and the files that call it — and changes
@@ -44,6 +49,7 @@ is not one of them.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import re
@@ -259,6 +265,33 @@ def _changed_lines(diff: str) -> dict[str, _Changed]:
             line = int(match.group(2))
             new_left = int(match.group(3) or 1)
     return files
+
+
+def changed_between(before: str, after: str) -> _Changed:
+    """:func:`_changed_lines` for one file, from its two texts instead of a diff.
+
+    The same numbering: an added line by its new line number, a deleted run
+    at the new line it sat in front of.
+    """
+    changed = _Changed(set(), set())
+    matcher = difflib.SequenceMatcher(None, before.splitlines(), after.splitlines(), autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("replace", "delete") and i2 > i1:
+            changed.deleted.add(j1 + 1)
+        if tag in ("replace", "insert"):
+            changed.added.update(range(j1 + 1, j2 + 1))
+    return changed
+
+
+def reduced_members(path: str, before: str, after: str) -> tuple[_Found, ...]:
+    """The members of ``path`` that the edit from ``before`` to ``after``
+    reduced to a constant, read off ``after``: exactly what
+    :func:`find_constant_wrappers` would report for this file, less the
+    siblings and callers. Empty for a language this module does not read."""
+    dialect = _DIALECTS.get(os.path.splitext(path)[1])
+    if dialect is None or before == after:
+        return ()
+    return tuple(_constant_members(after, dialect, changed_between(before, after)))
 
 
 def _resolve(rel: str, directories: tuple[str, ...]) -> Path | None:

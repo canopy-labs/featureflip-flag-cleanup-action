@@ -358,6 +358,39 @@ def discover(path: str, source: str, is_read: Callable[[Node], bool]) -> list[wi
     return found
 
 
+def constants(path: str, source: str) -> list[wi.Wrapper]:
+    """The members of ``source`` shaped like a wrapper whose whole body is a
+    boolean literal (``{ false }``, ``{ return true }``): what a member reads
+    once the fold has reduced it, judged by the same shape rules as
+    :func:`discover`, for the pass after the fold
+    (:mod:`flag_cleanup.constant_inline`)."""
+    return discover(path, source, lambda node: node.type == "boolean_literal")
+
+
+def constant_candidates(path: str, source: str, callees: frozenset[str]) -> set[str]:
+    """Names of the ``Bool`` members of ``source`` whose body names one of
+    ``callees`` (the project's accessors) or the SDK's own read: every member
+    a fold of this flag could reduce to a constant, and more, for the undo
+    snapshot. A superset only widens the snapshot."""
+    from flag_cleanup import constant_wrappers
+
+    words = sorted(_READ_CALLEES | callees)
+    pattern = re.compile(rf"(?<![\w$])(?:{'|'.join(re.escape(c) for c in words)})(?![\w])")
+    names: set[str] = set()
+    for node in _walk(parse(source)):
+        body = constant_wrappers._swift_predicate_body(node)
+        if body is None or not pattern.search(_text(body)):
+            continue
+        name = _field(node, "name")
+        if node.type == "property_declaration":
+            bound = xs._bound(node)
+            if len(bound) == 1:
+                names.add(bound[0])
+        elif name is not None:
+            names.add(_text(name))
+    return names
+
+
 def top_level(wrapper: wi.Wrapper) -> bool:
     return wrapper.kind == "function"
 
@@ -1034,5 +1067,7 @@ wi.register(
         inert_annotations=frozenset(),
         string_mentions=string_mentions,
         leftovers=leftovers,
+        constants=constants,
+        constant_candidates=constant_candidates,
     )
 )

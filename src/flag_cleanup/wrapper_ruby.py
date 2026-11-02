@@ -789,6 +789,7 @@ class Index:
         ):
             logger.info("cannot parse the declarations of %s, so no keyless wrapper qualifies", path)
             self.unreadable = True
+        key_literal = wi.key_literal(wrapper, path, root.text.decode("utf-8", "replace"))
         for node in _walk(root):
             kind = node.type
             if kind in _DEFS and _text(node.child_by_field_name("name")) == name:
@@ -802,7 +803,7 @@ class Index:
                 into.append((path, line_of(node), wi.text_of(node.parent or node)))
             elif kind in ("string_content", "heredoc_content") and (
                 word.search(_text(node)) or _owner_string(_text(node), wrapper)
-            ) and not _spec_title(node):
+            ) and not _spec_title(node) and not key_literal(node):
                 into = self.doubles if _in_double(node) else self.named
                 into.append((path, line_of(node), wi.text_of(node.parent or node)))
             elif kind in ("class", "module"):

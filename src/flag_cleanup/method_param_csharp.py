@@ -91,7 +91,7 @@ def _reads(method: Node, name: str) -> int:
     """How many times the method's body spells ``name`` as something other
     than a member's name after a dot."""
     body = method.child_by_field_name("body") or next(
-        (c for c in method.children if c.type == "arrow_expression_clause"), None
+        (c for c in method.children if c.type in ("arrow_expression_clause", "preproc_if")), None
     )
     if body is None:
         return 0

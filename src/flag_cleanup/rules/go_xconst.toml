@@ -105,3 +105,97 @@ replace_node = "call"
 replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated"]
+
+# The OpenFeature `Boolean(ctx, <key>, …)` shapes: the key in the SECOND
+# argument, as in `go_const.toml`'s pair of the same name. A configured
+# accessor is cloned from these as well as from the blocks above, so a
+# wrapper reads its key in either position, which is what
+# `cross_file_go._read_call` proves.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_delete_discarded_openfeature_boolean_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (_)
+        . (selector_expression
+            operand: (identifier) @key_owner
+            field: (field_identifier) @key_member)))) @statement
+  (#eq? @sdk_fn "Boolean")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+holes = []
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_openfeature_boolean_read"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (_)
+      . (selector_expression
+          operand: (identifier) @key_owner
+          field: (field_identifier) @key_member))) @call
+  (#eq? @sdk_fn "Boolean")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_delete_discarded_openfeature_boolean_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list . (_) . (identifier) @key_member))) @statement
+  (#eq? @sdk_fn "Boolean")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+holes = []
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_openfeature_boolean_read"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list . (_) . (identifier) @key_member)) @call
+  (#eq? @sdk_fn "Boolean")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]

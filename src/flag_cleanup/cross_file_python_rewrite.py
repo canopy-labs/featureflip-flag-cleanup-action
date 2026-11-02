@@ -12,6 +12,7 @@ from flag_cleanup import unused
 from flag_cleanup.cross_file_python_syntax import (
     _Module,
     _alias,
+    _module_of,
     _import_bound_names,
     _in_import,
     _line_end,
@@ -109,11 +110,21 @@ def rewrite_stranded_imports(
             edit = _mark(data, root, line_end)
             if edit is not None:
                 edits.append(edit)
-    for statement, module, ids in stranded.values():
+    # Source order: a statement deleted below no longer loads anything, so
+    # it must not count as the load that lets a LATER statement go too.
+    deleted: set[int] = set()
+    for statement, module, ids in sorted(stranded.values(), key=lambda item: item[0].start_byte):
         entries = [entry for entry, _local in _import_bound_names(statement)]
         parenthesised = any(child.type == "(" for child in statement.children)
         if any(entry.id not in ids for entry in entries):
             edits.extend(_dropped_entries(data, entries, ids, parenthesised))
+            continue
+        whole = _own_statement_lines(data, statement)
+        if whole is not None and _loaded_beside(root, statement, module, stranded, deleted):
+            # Another import of this file loads the module anyway, so the
+            # statement is deleted rather than kept for its load.
+            deleted.add(statement.id)
+            edits.append(whole)
             continue
         line_end = _line_end(data, statement.end_byte)
         if not module.parts or not unused._python_line_can_end_in_a_comment(root, line_end):
@@ -147,6 +158,83 @@ def rewrite_stranded_imports(
     for start, end, text in reversed(edits):
         data = data[:start] + text + data[end:]
     return data.decode("utf-8")
+
+
+def _own_statement_lines(data: bytes, statement: Node) -> tuple[int, int, bytes] | None:
+    """The edit deleting ``statement``'s whole lines, when nothing but
+    indentation and a trailing comment shares them (no ``;`` neighbour)."""
+    line_start = data.rfind(b"\n", 0, statement.start_byte) + 1
+    if data[line_start : statement.start_byte].strip(b" \t"):
+        return None
+    newline = data.find(b"\n", statement.end_byte)
+    end = len(data) if newline == -1 else newline + 1
+    rest = data[statement.end_byte : end].strip()
+    if rest and not rest.startswith(b"#"):
+        return None
+    return line_start, end, b""
+
+
+def _loads(statement: Node) -> list[_Module]:
+    """The modules an import statement names as its own (not the names it
+    imports from one): ``import a.b.c`` names ``a.b.c``, ``from a.b import
+    c`` names ``a.b``. A name imported FROM a module may be an attribute
+    rather than a submodule, so it is never counted as a load."""
+    if statement.type == "import_from_statement":
+        module = statement.child_by_field_name("module_name")
+        return [] if module is None else [_module_of(module)]
+    if statement.type != "import_statement":
+        return []
+    found = []
+    for child in statement.named_children:
+        dotted = child.child_by_field_name("name") if child.type == "aliased_import" else child
+        if dotted is not None and dotted.type == "dotted_name":
+            found.append(_module_of(dotted))
+    return found
+
+
+def _loaded_beside(
+    root: Node,
+    statement: Node,
+    module: _Module,
+    stranded: dict[int, tuple[Node, _Module, set[int]]],
+    deleted: set[int],
+) -> bool:
+    """Whether another top-level import of the file loads ``module`` no later
+    than ``statement`` did.
+
+    Importing ``a.b.c`` loads ``a``, ``a.b`` and ``a.b.c`` in turn, so a
+    statement naming ``module`` or any submodule below it loads it, and a
+    module is executed once per process: a second import of it does nothing.
+    Two placements keep the program exactly as it was. An import EARLIER in
+    the file has already loaded the module when ``statement`` ran. An import
+    IMMEDIATELY after it, with nothing between, loads it before anything else
+    runs. Anything later would move the module's load past the statements in
+    between, which can matter, so it does not count. Only unconditional
+    top-level statements count: an import inside an ``if``, ``try`` or
+    function may not run. Relative and absolute spellings are compared only
+    with their own kind, since telling them apart would need the package
+    this file belongs to.
+    """
+
+    def loads_it(other: Node) -> bool:
+        if other.id in deleted:
+            return False
+        return any(
+            loaded.level == module.level and loaded.parts[: len(module.parts)] == module.parts
+            for loaded in _loads(other)
+        )
+
+    top = [child for child in root.named_children if child.type != "comment"]
+    index = next((i for i, child in enumerate(top) if child.id == statement.id), None)
+    if index is None or not module.parts:
+        return False
+    if any(loads_it(other) for other in top[:index]):
+        return True
+    if index + 1 < len(top):
+        following = top[index + 1]
+        # One the same pass deletes may in turn lean on this statement.
+        return following.id not in stranded and loads_it(following)
+    return False
 
 
 def _still_used(root: Node, local: str) -> bool:

@@ -26,6 +26,8 @@ import io
 import symtable
 import tokenize
 
+from flag_cleanup import python_view
+
 
 #: Bound purely as a runaway guard. Each rewrite strictly removes a binding,
 #: and there are finitely many, so this terminates on its own.
@@ -90,18 +92,24 @@ def inline_literal_bindings(
     The safety argument has two halves, and neither can see what the other
     does. Both must hold, per name:
 
-    * **``symtable`` — CPython's own binding analysis — must place the name in
-      exactly ONE scope, and that scope must be a function.** This is what
-      stops the rewrite that runs and is wrong: two functions can each say
-      ``use_legacy``, one binding a local and the other reading a module
-      global, and every occurrence balances. Only a scope analysis can tell
-      those apart. Requiring a FUNCTION scope is the same call
+    * **``symtable`` — CPython's own binding analysis — must show the name as
+      a plain local of the function that binds it, which no scope nested in
+      that function mentions.** This is what stops the rewrite that runs and
+      is wrong: two functions can each say ``use_legacy``, one binding a
+      local and the other reading a module global, and every occurrence in
+      the file balances. Only a scope analysis can tell those apart, and it
+      also says why the OTHER function never matters: a local is invisible
+      outside the function that binds it and the scopes nested in it, so
+      everything here is judged within that one function, its own reads
+      rewritten and every other function's left alone. Requiring a FUNCTION
+      scope is the same call
       ``ts_const.toml`` makes for an exported const — a module-level or
       class-body binding is public API, its importers do not contain the flag
       key so they are not even in the candidate set, and deleting it would
       break a file this run cannot see.
-    * **every NAME token spelling the name must be one this analysis models**
-      — the binding itself, a load, an attribute, or a keyword-argument name.
+    * **every NAME token spelling the name within that function's lines must
+      be one this analysis models** — the binding itself, a load in its body,
+      an attribute, or a keyword-argument name.
       This is the completeness half, and it is what makes the first half
       trustworthy: ``except E as use_legacy`` is a second binder that symtable
       describes in exactly the same words as the assignment, and that carries
@@ -150,17 +158,65 @@ def inline_literal_bindings(
     return after  # pragma: no cover - bounded by the number of bindings
 
 
-def _literal_binding_names(source: str) -> set[str] | None:
-    """Names ``source`` already binds to a boolean literal; ``None`` if unparseable."""
+def _literal_binding_names(source: str) -> set[tuple[tuple[str, ...], str]] | None:
+    """``(scope path, name)`` for each name ``source`` already binds to a
+    boolean literal; ``None`` if unparseable.
+
+    Keyed by the enclosing ``def``/``class`` names, not by the name alone:
+    ``res = False`` in one function says nothing about the ``res`` another
+    function binds, and keying by name would refuse a flag read in every
+    function of a module where any one of them already held a literal.
+    """
     try:
-        tree = ast.parse(source)
+        tree = ast.parse(python_view.view(source))
     except (SyntaxError, ValueError):
         return None
     return {
-        binding[0]
-        for node in ast.walk(tree)
+        (path, binding[0])
+        for node, path, _owner in _scoped_statements(tree)
         if (binding := _literal_binding(node)) is not None
     }
+
+
+#: The ``ast`` nodes that open a scope a plain assignment can sit in directly.
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _scoped_statements(
+    tree: ast.AST,
+) -> list[tuple[ast.AST, tuple[str, ...], ast.AST]]:
+    """Every STATEMENT with the ``def``/``class`` names enclosing it and its
+    innermost enclosing scope node (the module itself at top level).
+
+    Statements only, reached through the fields that hold blocks: a binding
+    this module rewrites is a statement, and no expression can contain one
+    (a lambda's body is an expression), so walking expressions would only
+    cost time. For the same reason a lambda or a comprehension is never an
+    owner: a statement's scope is the nearest ``def``/``class``.
+    """
+    found: list[tuple[ast.AST, tuple[str, ...], ast.AST]] = []
+    stack: list[tuple[ast.AST, tuple[str, ...], ast.AST]] = [(tree, (), tree)]
+    while stack:
+        node, path, owner = stack.pop()
+        if node is not tree:
+            found.append((node, path, owner))
+        if isinstance(node, _SCOPES):
+            path, owner = path + (node.name,), node
+        for block in _blocks(node):
+            stack.extend((statement, path, owner) for statement in block)
+    return found
+
+
+def _blocks(node: ast.AST) -> list[list[ast.AST]]:
+    """The statement lists directly inside ``node``."""
+    blocks = [
+        block
+        for field in ("body", "orelse", "finalbody")
+        if isinstance(block := getattr(node, field, None), list)
+    ]
+    for holder in [*getattr(node, "handlers", ()), *getattr(node, "cases", ())]:
+        blocks.append(holder.body)
+    return blocks
 
 
 def _literal_binding(node: ast.AST) -> tuple[str, bool] | None:
@@ -190,7 +246,7 @@ def _literal_binding(node: ast.AST) -> tuple[str, bool] | None:
 
 
 def _inline_once(
-    source: str, preexisting: set[str], marker: str | None = None
+    source: str, preexisting: set[tuple[tuple[str, ...], str]], marker: str | None = None
 ) -> str | None:
     """Inline the first eligible binding; ``None`` if there is none.
 
@@ -198,129 +254,229 @@ def _inline_once(
     after it, so a batch of edits computed against the original text would be
     stale for every edit after the first.
     """
-    try:
-        tree = ast.parse(source)
-        table = symtable.symtable(source, "<inline>", "exec")
-    except (SyntaxError, ValueError):  # pragma: no cover - Gate 1 owns this
+    analysis = _Analysis.of(source)
+    if analysis is None:  # pragma: no cover - Gate 1 owns unparseable input
         return None
-    occurrences = _name_token_counts(source)
-    if occurrences is None:  # pragma: no cover - unparseable is caught above
-        return None
-    data = source.encode("utf-8")
-    lines = _line_offsets(data)
-    candidates = [
-        (node, binding)
-        for node in ast.walk(tree)
-        if (binding := _literal_binding(node)) is not None
-        and binding[0] not in preexisting
-    ]
-    # Source order, so a file with several is rewritten the same way every run.
-    candidates.sort(key=lambda item: (item[0].lineno, item[0].col_offset))
-    for node, (name, value) in candidates:
-        edited = _inline_binding(
-            name, value, node, tree, table, occurrences, data, lines, marker
-        )
+    for node, name, value, owner in analysis.candidates(preexisting):
+        if analysis.refusal(name, node, owner) is not None:
+            continue
+        edited = analysis.edit(name, value, node, owner, marker)
         if edited is not None:
             return edited
     return None
 
 
-def _inline_binding(
-    name: str,
-    value: bool,
-    node: ast.AST,
-    tree: ast.AST,
-    table: symtable.SymbolTable,
-    occurrences: dict[str, int],
-    data: bytes,
-    lines: list[int],
-    marker: str | None = None,
-) -> str | None:
-    """The two-part safety check, then the edit. ``None`` if it does not hold."""
-    if not _confined_to_one_function(name, table):
-        return None
-    loads = [
-        found
-        for found in ast.walk(tree)
-        if isinstance(found, ast.Name)
-        and found.id == name
-        and isinstance(found.ctx, ast.Load)
-    ]
-    modelled = len(loads) + _unrelated_uses(tree, name) + 1  # +1: the binding
-    if occurrences.get(name, 0) != modelled:
-        return None
-    span = _whole_lines(data, lines, node)
-    if span is None:
-        return None
-    start, end = span
-    replacements = [
-        (
-            _offset(lines, found.lineno, found.col_offset),
-            _offset(lines, found.end_lineno, found.end_col_offset),
-        )
-        for found in loads
-    ]
-    if any(start <= begin < end for begin, _ in replacements):
-        # Unreachable as things stand, and kept because what makes it so is a
-        # guard three lines up rather than anything about this edit: a
-        # reference sharing the binding's line would be deleted WITH the line
-        # and its replacement spliced into text that no longer exists. Removing
-        # both is what `test_a_binding_sharing_its_line_is_left_alone` measures.
-        return None  # pragma: no cover
-    literal = "True" if value else "False"
-    # A CALL rather than a bare literal when the caller is going to re-run the
-    # engine. Substituting a call for a name can never change precedence — a
-    # call binds tightest — and a call is legal in every position a load of the
-    # name was.
-    substitute = (
-        f"{marker}({literal})" if marker is not None else literal
-    ).encode("utf-8")
-    edits = [(begin, finish, substitute) for begin, finish in replacements]
-    edits.append((start, end, _binding_filler(tree, node, data, start)))
-    text = data
-    for begin, finish, replacement in sorted(edits, reverse=True):
-        text = text[:begin] + replacement + text[finish:]
-    return text.decode("utf-8")
+def unresolved_bindings(before: str, after: str) -> list[tuple[str, int, str]]:
+    """``(name, line, why)`` for each name the transform newly bound to a
+    literal that :func:`inline_literal_bindings` would leave standing.
 
-
-def _confined_to_one_function(name: str, table: symtable.SymbolTable) -> bool:
-    """Whether ``name`` names one function-local and nothing else in the file.
-
-    Every scope that so much as mentions the name appears in ``symtable`` —
-    including a function that only READS it as a global, and a nested function
-    that closes over it — so "exactly one scope holds it" is a single check
-    that covers shadowing, closures and same-named globals at once. It refuses
-    the closure case, which would in fact be sound to inline; that is the price
-    of an invariant worth one line and one sentence.
+    The residue gate refuses such a file whatever this says; this only
+    explains the refusal in words, so a reader is told which name stopped
+    the removal and why rather than "still bound to a name".
     """
-    holders = []
-    for scope in _scopes(table):
+    preexisting = _literal_binding_names(before)
+    analysis = _Analysis.of(after)
+    if preexisting is None or analysis is None:
+        return []
+    found = []
+    for node, name, _value, owner in analysis.candidates(preexisting):
+        why = analysis.refusal(name, node, owner)
+        if why is None and _whole_lines(analysis.data, analysis.lines, node) is None:
+            why = "it shares its line with another statement"
+        if why is not None:
+            found.append((name, node.lineno, why))
+    return found
+
+
+class _Analysis:
+    """One parse of a file: its ``ast``, its symbol table and its NAME tokens."""
+
+    def __init__(
+        self,
+        source: str,
+        tree: ast.AST,
+        table: symtable.SymbolTable,
+        tokens: list[tuple[str, int]],
+    ) -> None:
+        self.tree = tree
+        self.table = table
+        self.tokens = tokens
+        self.data = source.encode("utf-8")
+        self.lines = _line_offsets(self.data)
+        self.statements = _scoped_statements(tree)
+
+    @classmethod
+    def of(cls, source: str) -> _Analysis | None:
+        # Newer syntax elsewhere in the file is read through a same-length view,
+        # so every offset holds in `source` (see `python_view`). Tokens still
+        # come from `source`, so a name only the view hides is still counted.
+        analysed = python_view.view(source)
         try:
-            symbol = scope.lookup(name)
-        except KeyError:
-            continue
-        # Carry the SCOPE with its symbol. Reading the loop variable after the
-        # loop instead reads whichever scope came last in the file, so the
-        # answer moved when an unrelated class was declared below the function
-        # rather than above it.
-        holders.append((scope, symbol))
-        if len(holders) > 1:
-            return False
-    if not holders:
-        return False
-    scope, symbol = holders[0]
-    if scope.get_type() != "function":
-        return False
-    return (
+            tree = ast.parse(analysed)
+            table = symtable.symtable(analysed, "<inline>", "exec")
+        except (SyntaxError, ValueError):
+            return None
+        tokens = _name_tokens(source)
+        if tokens is None:  # pragma: no cover - unparseable is caught above
+            return None
+        return cls(source, tree, table, tokens)
+
+    def candidates(
+        self, preexisting: set[tuple[tuple[str, ...], str]]
+    ) -> list[tuple[ast.AST, str, bool, ast.AST]]:
+        """Each new literal binding, in source order (so a file with several
+        is rewritten the same way every run), with its owner scope node."""
+        found = [
+            (node, binding[0], binding[1], owner)
+            for node, path, owner in self.statements
+            if (binding := _literal_binding(node)) is not None
+            and (path, binding[0]) not in preexisting
+        ]
+        found.sort(key=lambda item: (item[0].lineno, item[0].col_offset))
+        return found
+
+    def refusal(self, name: str, node: ast.AST, owner: ast.AST) -> str | None:
+        """Why ``name`` cannot be inlined; ``None`` when both checks hold."""
+        if not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            where = "a class body" if isinstance(owner, ast.ClassDef) else "module level"
+            return f"it is bound at {where}, where other modules may read it"
+        why = _confined_to_its_function(name, owner, self.table)
+        if why is not None:
+            return why
+        first, last = _span_lines(owner)
+        counted = sum(1 for spelled, row in self.tokens if spelled == name and first <= row <= last)
+        if counted != len(self.loads(name, owner)) + _unrelated_uses(owner, name) + 1:
+            return (
+                "the function spells the name somewhere other than a plain read "
+                "(another binding, a `del`, a `global`/`nonlocal`, or a default)"
+            )
+        return None
+
+    @staticmethod
+    def loads(name: str, owner: ast.AST) -> list[ast.Name]:
+        """Every read of ``name`` in the function's BODY.
+
+        The body only: decorators, defaults and annotations are evaluated in
+        the enclosing scope, so a ``name`` there is a different variable. It
+        still counts as a token, which is what refuses the function.
+        """
+        return [
+            found
+            for statement in owner.body
+            for found in ast.walk(statement)
+            if isinstance(found, ast.Name)
+            and found.id == name
+            and isinstance(found.ctx, ast.Load)
+        ]
+
+    def edit(
+        self,
+        name: str,
+        value: bool,
+        node: ast.AST,
+        owner: ast.AST,
+        marker: str | None,
+    ) -> str | None:
+        """The edit itself, once :meth:`refusal` has passed."""
+        data, lines = self.data, self.lines
+        span = _whole_lines(data, lines, node)
+        if span is None:
+            return None
+        start, end = span
+        replacements = [
+            (
+                _offset(lines, found.lineno, found.col_offset),
+                _offset(lines, found.end_lineno, found.end_col_offset),
+            )
+            for found in self.loads(name, owner)
+        ]
+        if any(start <= begin < end for begin, _ in replacements):
+            # Unreachable as things stand, and kept because what makes it so
+            # is a guard above rather than anything about this edit: a
+            # reference sharing the binding's line would be deleted WITH the
+            # line and its replacement spliced into text that no longer exists.
+            # Removing both is what `test_a_binding_sharing_its_line_is_left_alone`
+            # measures.
+            return None  # pragma: no cover
+        literal = "True" if value else "False"
+        # A CALL rather than a bare literal when the caller is going to re-run
+        # the engine. Substituting a call for a name can never change
+        # precedence -- a call binds tightest -- and a call is legal in every
+        # position a load of the name was.
+        substitute = (
+            f"{marker}({literal})" if marker is not None else literal
+        ).encode("utf-8")
+        edits = [(begin, finish, substitute) for begin, finish in replacements]
+        edits.append((start, end, _binding_filler(self.tree, node, data, start)))
+        text = data
+        for begin, finish, replacement in sorted(edits, reverse=True):
+            text = text[:begin] + replacement + text[finish:]
+        return text.decode("utf-8")
+
+
+def _confined_to_its_function(
+    name: str, owner: ast.AST, table: symtable.SymbolTable
+) -> str | None:
+    """Why ``name`` is not one plain local of ``owner`` that only ``owner``
+    reads; ``None`` when it is.
+
+    Python resolves a name per FUNCTION: a local of one function is invisible
+    to every scope that is not nested inside it, so another function binding
+    the same name, a module global of that name, or a ``global`` declaration
+    elsewhere are all different variables, and none of them blocks this one.
+    What CAN reach it is a scope nested inside the function -- a nested
+    ``def``, a lambda, a generator expression, or a class body, which reads an
+    enclosing function's local as a free variable (``nonlocal`` too) -- so any
+    nested scope mentioning the name at all is refused. That refuses the
+    closure case, which would be sound to inline, for an invariant that is one
+    line to check. A list, set or dict comprehension has no symbol table of
+    its own from Python 3.12 (they are inlined), so its reads are the
+    function's own and are rewritten with them; a comprehension that binds
+    the name is a token the count below does not model, so it refuses.
+    """
+    matches = [
+        scope
+        for scope in _scopes(table)
+        if scope.get_type() == "function"
+        and scope.get_name() == owner.name
+        and scope.get_lineno() == owner.lineno
+    ]
+    if len(matches) != 1:  # pragma: no cover - a def opens its own line
+        return "its function could not be told apart from another"
+    scope = matches[0]
+    try:
+        symbol = scope.lookup(name)
+    except KeyError:  # pragma: no cover - the binding is in this scope
+        return "its function does not bind it"
+    if not (
         symbol.is_local()
         and symbol.is_assigned()
         and not symbol.is_parameter()
         and not symbol.is_global()
         and not symbol.is_free()
+        and not symbol.is_nonlocal()
         and not symbol.is_imported()
         # Bound to a `def`/`class` of the same name somewhere in the scope.
         and not symbol.is_namespace()
-    )
+    ):
+        return "it is a parameter, an import, a def, or declared global or nonlocal"
+    for nested in _scopes(scope)[1:]:
+        if name in nested.get_identifiers():
+            return (
+                "a nested function, lambda, generator expression or class "
+                "inside the same function also uses the name"
+            )
+    return None
+
+
+def _span_lines(owner: ast.AST) -> tuple[int, int]:
+    """The physical lines ``owner`` occupies, its decorators included.
+
+    Lines are exact here: a ``def`` always opens its own logical line, and
+    nothing but a comment can follow its last statement on the last one.
+    """
+    first = min([owner.lineno] + [d.lineno for d in owner.decorator_list])
+    return first, owner.end_lineno
 
 
 def _scopes(table: symtable.SymbolTable) -> list[symtable.SymbolTable]:
@@ -369,16 +525,16 @@ def _unrelated_uses(tree: ast.AST, name: str) -> int:
     )
 
 
-def _name_token_counts(source: str) -> dict[str, int] | None:
-    """How many NAME tokens spell each identifier; ``None`` if untokenisable."""
-    counts: dict[str, int] = {}
+def _name_tokens(source: str) -> list[tuple[str, int]] | None:
+    """``(spelling, line)`` of every NAME token; ``None`` if untokenisable."""
+    found: list[tuple[str, int]] = []
     try:
         for token in tokenize.generate_tokens(io.StringIO(source).readline):
             if token.type == tokenize.NAME:
-                counts[token.string] = counts.get(token.string, 0) + 1
+                found.append((token.string, token.start[0]))
     except (tokenize.TokenError, SyntaxError):  # pragma: no cover - see above
         return None
-    return counts
+    return found
 
 
 def _whole_lines(data: bytes, lines: list[int], node: ast.AST) -> tuple[int, int] | None:

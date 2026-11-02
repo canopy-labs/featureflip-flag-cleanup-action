@@ -39,6 +39,8 @@ from __future__ import annotations
 import tree_sitter_kotlin
 from tree_sitter import Language, Node, Parser
 
+from flag_cleanup.tree_walk import preorder
+
 _LANGUAGE = Language(tree_sitter_kotlin.language())
 _PARSER = Parser(_LANGUAGE)
 
@@ -77,9 +79,7 @@ def literal_subjects(source: str) -> int:
 
 
 def _iter(node: Node):
-    yield node
-    for child in node.children:
-        yield from _iter(child)
+    return preorder(node)
 
 
 def _is_subjectless(node: Node) -> bool:

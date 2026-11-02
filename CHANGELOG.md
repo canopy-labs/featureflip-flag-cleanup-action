@@ -5,7 +5,213 @@ What changes for you in each release. The newest is first.
 A release takes its section from this file: the section for the version being
 released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
-been released yet collect under **Unreleased**.
+been released yet are kept as separate notes and gathered into the version's
+section when it is released.
+
+## 2.2.0
+
+### Added
+
+- **Java and Kotlin:** a private field the removal leaves assigned `true` or
+  `false` in the constructor (`this.allowScottish = true;` in Java's only
+  constructor, `allowScottish = true` in a Kotlin `init` block) is now inlined
+  into its readers and removed, as one initialized at its declaration already
+  was. It happens only when nothing can read the field before the assignment
+  runs: no superclass, and no method of the class called, no `this` used and
+  no anonymous object or class of the file constructed earlier in
+  construction.
+- **Java, Kotlin and Go:** a parameter of a private helper (a Java `private`
+  method, a Kotlin `private fun`, a Go unexported function) is removed when
+  every call now passes it the same `true` or `false` the removal wrote
+  (`buildQuery(true)`): from each call and from the helper, and what it
+  guarded inside is simplified, as TypeScript and JavaScript already did. In
+  Go the calls are proven across every file of the package. A helper whose
+  name is spelled any other way, or reachable by name from a string or a
+  configuration file, is left alone.
+- **Python:** a decorator gate named in `accessors`, such as
+  `@waffle_flag("k")` or `@method_decorator(flag_required("k"), name="dispatch")`,
+  is deleted when the flag is removed serving `true`, and a removal serving
+  `false` is refused with the decorator named. Before this release the
+  decorator became `@True`, which raises `TypeError` when the module is
+  imported. A decorator passing more than the key, or the same call outside a
+  decorator (`flag_required("k")(view)`), is refused instead of rewritten.
+- **Python:** an accessor can name the index of its key argument, so
+  django-waffle's `flag_is_active(request, "k")` is matched with
+  `accessors: flag_is_active[1]`. Only that slot matches; a call with the key
+  anywhere else is untouched. Before this release such a read was not matched
+  at all and the run made no change.
+- **Python:** django-waffle test pins of the removed flag (`override_flag`,
+  `override_switch` and `override_sample`, as a decorator or a `with`) are
+  handled like other test doubles. A pin of the kept value is deleted and its
+  test stays; a test pinned to the removed value is deleted and named in the
+  pull request. A pin of the removed value on a class or in a fixture refuses
+  the flag, naming where it is. Before this release every pin stayed, so a test
+  pinned to the removed branch failed after the merge.
+- **New input `side-effect-free-calls`:** name the functions whose call does
+  nothing you need, such as a getter that only returns your flag client
+  (`GetClient, getClient`). A call to one that the removal left running only as
+  a discard (`_ = getClient(p)` in Go, `getClient(p);` elsewhere) is deleted
+  instead of kept, when every argument is a name, a literal or a member read,
+  and the pull request names each one. Anything only that call used, such as
+  its import, goes too. Every language.
+
+### Changed
+
+- **Python:** a read stored into a dict or list entry, as a Django view does
+  with `context["new_checkout"] = flag_is_active(...)`, now becomes
+  `context["new_checkout"] = True` instead of refusing every file of the flag.
+  A read stored into an attribute (`self.enabled = <read>`) is still refused,
+  and the reason now says it is an attribute.
+- **Python:** a keyless wrapper may now hold locals before its `return` that
+  only feed the read's arguments, such as `context = {"schema": schema}`; it
+  is inlined and deleted like a one-line wrapper. A function whose `return`
+  is the read but that does anything else first (a log line, a call, a
+  branch) is still left alone, and the run now logs which statement stopped
+  it.
+- **Python:** when a removed wrapper's import would be kept as
+  `import app.flags as _flags  # noqa: F401` for its module load, it is now
+  deleted instead if another top-level import of the file already loads that
+  module, above it or directly below it.
+- **Python:** a refusal because the flag's value was left bound to a name now
+  names the variable, its line and why it was not inlined.
+- **Swift:** a computed property or method listed under "now returns a
+  constant" is now folded into its calls and deleted when every call of it is
+  in its own module and is proven to reach it, and nothing else can (no
+  protocol it may implement, no override, no key path, no `@objc`, not
+  `public` in a library), as a wrapper whose whole body reads the flag already
+  is. Anything short of that keeps the member and every call, and it is listed
+  as before.
+
+### Fixed
+
+- **Dart:** a test of the flag's own value,
+  `expect(AppConfig.isFeatureEnabled('k'), AppConfig.enableK)`, is now deleted
+  and listed in the pull request, with a `test(…)` it leaves empty. Before, it
+  became `expect(true, AppConfig.enableK)`, which fails wherever that setting is
+  `false`, and the pull request did not mention it.
+- **A deeply nested expression in a file that mentions the key no longer ends
+  the run.** A long string concatenation (a generated `docs.go` that writes a
+  whole document as one constant, for one) is a tree thousands of levels deep,
+  and walking it raised `RecursionError` out of the whole run, with a message
+  naming neither the file nor the flag, so every flag after it was lost too.
+  The file is now analysed. If a file still cannot be, only that flag is
+  refused (`unsafe-rewrite`, the build goes red), the refusal names the file
+  and how deep it is, and the next flag runs.
+- **Python:** a removal's pull request passes `black --check` and
+  `ruff format --check` in more places. The blank lines a deleted statement
+  leaves are cut to what the formatters write there: two before a top-level
+  definition, one inside a block, none at the start of a block or the end of
+  the file. Blank lines the removal did not touch stay. A `# type: ignore`,
+  `# noqa`, `# pragma: ...`, `# pyright: ignore` or `# fmt: skip` on the line
+  of a folded `if` goes with the `if` instead of landing alone above the code
+  it kept. A comment directly above a statement deleted after a folded
+  `return` goes with that statement. A condition or call argument the
+  formatter had wrapped in parentheses because it was too long goes back on
+  one line once the removal shortens it enough: `if (\n    x\n):` becomes
+  `if x:`.
+- **TypeScript and JavaScript:** an `// eslint-disable-line` or `// NOSONAR`
+  on the line of a folded `if` goes with the `if`.
+- **Dart:** a declaration's value that `dart format` had moved to the line
+  after its `=` goes back beside it once the removal lets the line fit, so the
+  pull request passes `dart format --set-exit-if-changed`. The width is the
+  `formatter: page_width` of your `analysis_options.yaml`, or 80.
+- **C#:** C# 14 syntax now parses, including `extension` blocks, and so does a
+  local named `partial`, `async` or `required` at the start of a statement, such
+  as `partial.Uris = null;`. Before, one such file could stop key constants
+  resolving across the repository. Several ordinary shapes that were also
+  rejected now parse, including `#if` blocks inside initializers and an `else`
+  inside a directive.
+- **C#:** two C# 14 shapes that now parse are read for what they do. A write
+  through `?.`, such as `fake?.Enabled = false;`, counts as a write, so it keeps
+  the wrapper a test fake serves, and it keeps a method holding a field's last
+  write. A lambda parameter with a modifier, as in `(ref x, y) => …`, hides a
+  field of its name, so a read of it is not taken for a read of that field.
+- **C#:** a flag read testing an `if` whose `else` sits inside `#if … #endif` is
+  refused. That `else` now parses, and folding the `if` would have deleted it
+  with the code it holds, even where it is the branch the flag leaves running.
+- **Go:** `if on := client.BoolVariation(…); on {`, a read bound in an `if`
+  header, is now inlined and folded. It used to make the transform engine
+  abort on the file, so no pull request was opened for the flag and the
+  output named no line. The same read in a `switch` header is refused with the
+  file named instead.
+- **Go:** when the removal strands one name of `x, err := f()` and the other
+  is still read, the stranded one becomes `_` (`_, err := f()`). The flag used
+  to be refused because the local was left declared and unused.
+- **Go:** an unreachable tail removed after a `return` no longer leaves a
+  blank line before the closing `}`, and removed code no longer leaves one
+  just after an opening `{`. `gofmt` accepts both, but `gofumpt` and
+  golangci-lint's `whitespace` check do not.
+- **Go:** a `range` loop over a slice, array or map parameter or `var` is
+  removed when the removal leaves it starting with `continue` or `break`.
+  It used to be left as `for range xs { continue }`.
+- **Go:** a flag is no longer refused because the code the removal deletes
+  holds an `if` with an initializer, such as `if err := run(); err != nil {`
+  in the removed branch or after a `return` the flag made unconditional. That
+  code never ran, so nothing is lost. It used to be refused as `the fold would
+  drop code that runs whatever the flag says`, which still applies to an
+  initializer on the `if` that reads the flag.
+- **Go:** a removal that would leave an `if` or `for` condition such as
+  `strings.HasPrefix(name, "x") && false` (or `track(u) || true`) now refuses
+  the flag and names the file, as TypeScript and JavaScript already do. The
+  call beside the literal cannot be dropped, so the branch the flag made dead
+  stayed, with everything it references, and the pull request did not mention
+  it. With an operand that cannot run code, the condition folds as before.
+- **Go:** a key held in a constant now folds when it is the second argument:
+  OpenFeature's `client.Boolean(ctx, oldCheckout, false, evalCtx)`, or a
+  wrapper you named in `accessors` that takes something else first, such as
+  `flags.IsEnabled(org, oldCheckout)`. Before, only the literal key folded in
+  that position, so the run made no change and said only that the file still
+  named the flag.
+- **Go:** a flag key declared as one entry of a `const ( … )` block now folds,
+  and only that entry's line is removed. Before, a block declaring more than
+  one name was skipped, so its reads stayed and the run made no change. A block
+  that uses `iota` or has an entry with no value is still left alone, since
+  removing one entry could change the others, and the run log now says so.
+  When the removed entry had the block's longest name, run `gofmt -w` on the
+  branch: the others stay padded for it.
+- **Go:** a read through a call that returns `(bool, error)`, such as
+  `on, err := client.BoolVariation("k", ctx, false)` with an SDK that declares
+  it that way, is no longer rewritten into code that does not compile. The run
+  used to write `on, err := true`, or `return true` from a function returning
+  two values, and open the pull request. Such a flag is now refused
+  (`unsafe-rewrite`), and the output names the file and the functions that
+  read it this way, so those reads can be removed by hand.
+- **Go and Python:** a key constant kept because another file names it in
+  something that is not a read, such as a test seeding a store or pinning a
+  setting with it, no longer keeps the reads of it. They fold, the declaration
+  stays, and the pull request lists the mention that kept it. Before, the run
+  made no change for that flag. In Python the reads still stay when any file
+  could write the constant (`keys.NAME = …`, `setattr`, `mock.patch` and the
+  like).
+- **Python:** a flag read bound to a local is now inlined in a file that also
+  uses Python 3.14 syntax elsewhere, an unparenthesised `except A, B:` or a
+  template string `t"…"`. Before, one such line anywhere in the file refused
+  the flag with a reason that did not mention it. Other syntax newer than the
+  Action's Python still refuses, and the reason now says so.
+- **Python:** a flag read bound to a local name (`res = client.is_enabled(…)`)
+  is inlined when other functions in the same file use the same name. Before,
+  the whole flag was refused with "the removal stopped part-way" as soon as a
+  second function said `res`.
+- **PHP:** Laravel's `abort_unless`, `abort_if`, `throw_unless` and `throw_if`
+  are decided when the fold makes their condition a literal. A guard that
+  passes is deleted, provided its other arguments are literals, names,
+  `Foo::class` or a `new` of a class with literal arguments, so nothing with an
+  effect goes with it, and never as the body of a braceless `if`. One that
+  always stops becomes the call it was (`abort_unless(false, 404)` is
+  `abort(404)`, `throw_if(true, new E())` is `throw new E();`). The pull request
+  lists each, and says that code after a stopping guard is unreachable. A guard
+  with an argument that can have an effect is left as written.
+- **PHP:** Pest assertions get the same treatment PHPUnit's do. `expect(true)->toBeTrue()`
+  and the other literal forms the fold made trivially true (`toBeTruthy`,
+  `toBeFalse`, `toBeFalsy`, `toBe(<literal>)`, `toEqual(<literal>)`, with or
+  without `->not`) are deleted, and one the fold made fail
+  (`expect(true)->toBeFalse()`) is listed in the pull request as an assertion
+  that can only fail. Before, both stayed with no mention.
+- **PHP, Kotlin and Ruby:** a wrapper named after its own flag, such as
+  `boops()` reading `enabled('boops')`, was kept by that read's key. The
+  string is the flag's key, not a call by name, so the wrapper is now removed
+  and its callers inlined, and the pull request no longer lists lines it
+  removed itself. A string that names the wrapper anywhere else still keeps it.
 
 ## 2.1.0
 

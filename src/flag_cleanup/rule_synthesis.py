@@ -31,6 +31,7 @@ one flag's guard from another's. Accessor support for Kotlin lives in
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 __all__ = [
@@ -170,11 +171,13 @@ def _split_blocks(text: str) -> list[str]:
     return [parts[0]] + [f"{_RULE_HEADER}\n{part}" for part in parts[1:]]
 
 
-def without_rule(rules_text: str, name: str) -> str:
-    """``rules_text`` without the rule called ``name``, and its filters."""
+def without_rules(rules_text: str, prefix: str) -> str:
+    """``rules_text`` without every rule whose name starts with ``prefix``, and
+    their filters. At least one must go: a prefix matching nothing means a
+    rule was renamed and the caller would keep what it meant to drop."""
     blocks = _split_blocks(rules_text)
-    kept = [block for block in blocks if f'\nname = "{name}"\n' not in block]
-    assert len(kept) == len(blocks) - 1, name
+    kept = [block for block in blocks if f'\nname = "{prefix}' not in block]
+    assert len(kept) < len(blocks), prefix
     return "\n".join(kept) + "\n"
 
 
@@ -203,13 +206,25 @@ _NO_ACCESSOR_TEMPLATE_MARKER = re.compile(
 )
 
 
-def _seed_blocks(blocks: list[str]) -> list[_Block]:
+#: A ``[[rules]]`` block carrying this is the template for an accessor named
+#: with the index of its key (``flag_is_active[1]``), and only for one: its
+#: ``__KEY_POSITION__`` becomes an anchored wildcard per argument before the
+#: key. Written inside the block, for the reason the marker above is.
+_KEY_POSITION_TEMPLATE_MARKER = re.compile(
+    r"^#\s*accessor-template:\s*key-position\b", re.MULTILINE
+)
+_KEY_POSITION = "__KEY_POSITION__"
+
+
+def _seed_blocks(blocks: list[str], *, key_position: bool = False) -> list[_Block]:
     seeds = []
     for block in blocks[1:]:
         match = _SDK_FN_PREDICATE.search(block)
         if match is None or _HOLE.match(match.group(1)):
             continue
         if _NO_ACCESSOR_TEMPLATE_MARKER.search(block) is not None:
+            continue
+        if (_KEY_POSITION_TEMPLATE_MARKER.search(block) is not None) != key_position:
             continue
         name = re.search(r'^name = "(.*)"$', block, flags=re.MULTILINE)
         if name is None:
@@ -242,8 +257,16 @@ def with_accessors(
     *,
     templates_text: str | None = None,
     before_trailing_rules: bool = False,
+    key_positions: Mapping[str, int] | None = None,
 ) -> str:
     """Return ``rules_text`` plus one cloned rule per accessor per shape.
+
+    ``key_positions`` maps an accessor to the index of its key argument when
+    that is not 0 (``flag_is_active[1]`` in the input). Such an accessor is
+    cloned from the source's ``accessor-template: key-position`` block alone,
+    with one anchored wildcard per argument before the key; a source with no
+    such block (every language but Python, and Python's const file) clones
+    nothing for it, so no rule anywhere matches it with the key first.
 
     ``accessors`` empty returns the input unchanged and byte-identical -- the
     historical path stays exactly the historical path.
@@ -290,11 +313,22 @@ def with_accessors(
         if seed.shape not in seen_shapes:
             seen_shapes.add(seed.shape)
             templates.append(seed)
+    positions = dict(key_positions or {})
+    positional = _seed_blocks(blocks, key_position=True) if positions else []
 
     generated = []
     for accessor in accessors:
-        names = generated_rule_names(accessor, len(templates))
-        for new_name, template in zip(names, templates, strict=True):
+        index = positions.get(accessor, 0)
+        chosen = [
+            _Block(
+                text=template.text.replace(_KEY_POSITION, "(_) . " * index),
+                name=template.name,
+                callee=template.callee,
+            )
+            for template in positional
+        ] if index else templates
+        names = generated_rule_names(accessor, len(chosen))
+        for new_name, template in zip(names, chosen, strict=True):
             clone = re.sub(
                 r'^name = ".*"$',
                 f'name = "{new_name}"',
@@ -388,6 +422,7 @@ def with_accessor_const_rules(
     accessors: tuple[str, ...],
     *,
     templates_text: str | None = None,
+    key_positions: Mapping[str, int] | None = None,
 ) -> str:
     """Return ``const_rules_text`` plus one cloned rule per accessor per shape.
 
@@ -424,6 +459,7 @@ def with_accessor_const_rules(
         accessors,
         templates_text=templates_text,
         before_trailing_rules=True,
+        key_positions=key_positions,
     )
 
 

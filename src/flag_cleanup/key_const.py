@@ -55,6 +55,7 @@ from typing import Callable
 from tree_sitter import Node
 
 from flag_cleanup import dead_branches, kotlin_sentinel, ts_syntax
+from flag_cleanup.tree_walk import preorder
 
 __all__ = ["KeyConst", "path_is_safe", "supported_languages", "key_consts"]
 
@@ -153,9 +154,8 @@ def key_consts(root: Node, source_bytes: bytes, language: str, flag_key: str) ->
 
 
 def _walk(node: Node):
-    yield node
-    for child in node.children:
-        yield from _walk(child)
+    """Every node under ``node``, parents first, in source order."""
+    return preorder(node)
 
 
 def path_is_safe(
@@ -743,6 +743,12 @@ def _csharp_is_binding(node: Node) -> bool:
 
 _GO_FLAG_READ_CALLEES = frozenset({"BoolVariation"})
 
+#: The SHIPPED Go call names whose SECOND argument is the key: the OpenFeature
+#: client's ``Boolean(ctx, key, default, evalCtx)``. A configured accessor is
+#: read in either position, because ``go_const.toml`` is cloned for it from
+#: both templates, as ``go.toml``'s literal rules are.
+_GO_SECOND_ARGUMENT_READ_CALLEES = frozenset({"Boolean"})
+
 #: Parents whose ``name`` field introduces a Go name.
 _GO_NAME_FIELD_PARENTS = (
     "const_spec",
@@ -765,25 +771,25 @@ _GO_LEFT_FIELD_PARENTS = ("short_var_declaration", "range_clause", "assignment_s
 def _go_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
     """Every ``const`` spec whose value is ``flag_key``.
 
-    Requires EXACTLY ONE ``const_spec`` in the declaration and exactly one name
-    in that spec. BOTH halves are mirrored in ``go_const.toml``, by two
-    different anchors, and it is worth naming which does which because getting
-    that wrong is what #2700 was: ``. (const_spec ...) .`` bounds the number of
-    SPECS, while ``value: (expression_list . (...) .)`` bounds the number of
-    VALUES — and a Go const spec binds as many names as it has values, so the
-    second is what makes "one name" true on the rule side.
+    Requires exactly one name in the spec, alone in its declaration or one
+    entry of a ``const ( ... )`` group. The rules mirror both: the read rules'
+    scope and the two delete rules in ``go_const.toml`` match any spec of a
+    declaration, and ``value: (expression_list . (...) .)`` bounds the number
+    of VALUES -- a Go const spec binds as many names as it has values, so that
+    anchor is what makes "one name" true on the rule side.
 
-    Before that second anchor existed the two halves disagreed on exactly that
+    Before that anchor existed the two halves disagreed on exactly that
     dimension: ``const a, b = "old-checkout", "other"`` is one spec, so the
     rules matched it, while this function skipped it for having two names. A
     file whose only key const is skipped here looks EMPTY to
     :func:`path_is_safe`, which reports it trivially safe -- so the rules ran
-    with no gate at all and the delete rule took ``b`` with it.
+    with no gate at all and the delete rule took ``b`` with it (#2700).
 
-    A grouped ``const ( a = "x"; b = "y" )`` is unmatchable on both sides for
-    the first reason: the delete rule removes the whole ``const_declaration``
-    and would take constants it was never asked about. Both fail closed to a
-    silent no-op rather than to a broken build.
+    A spec of a group whose entries depend on their position (``iota``, or an
+    entry with no value repeating the one above it) is still RETURNED here, so
+    the file is not mistaken for one with no key constant; :func:`_go_withholds`
+    then keeps the whole file. Deciding it here instead would make such a file
+    look empty and run the rules ungated, the same inversion.
 
     ``var_declaration`` is a different node type in this grammar, so a mutable
     ``var`` key is structurally excluded rather than needing a guard.
@@ -792,42 +798,79 @@ def _go_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyCo
     for node in _walk(root):
         if node.type != "const_declaration":
             continue
-        specs = [c for c in node.named_children if c.type == "const_spec"]
-        if len(specs) != 1:
-            continue
-        spec = specs[0]
-        names = [c for c in spec.named_children if c.type == "identifier"]
-        value = spec.child_by_field_name("value")
-        if len(names) != 1 or value is None or value.type != "expression_list":
-            continue
-        literals = [
-            c for c in value.named_children if c.type == "interpreted_string_literal"
-        ]
-        if len(literals) != 1:
-            continue
-        # The gate's grammar exposes `interpreted_string_literal_content`; the
-        # ENGINE's bundled Go grammar does not, which is why the rules match it
-        # through a wildcard child instead. Read the content here, and fall
-        # back to stripping the quotes so a grammar that drops the child node
-        # cannot silently make this gate vacuous.
-        content = next(
-            (c for c in literals[0].named_children if "content" in c.type), None
-        )
-        text = (
-            _text(content, source_bytes)
-            if content is not None
-            else _text(literals[0], source_bytes)[1:-1]
-        )
-        if text != flag_key:
-            continue
-        found.append(
-            KeyConst(
-                name=_text(names[0], source_bytes),
-                declaration=node,
-                name_nodes=(names[0],),
+        for spec in (c for c in node.named_children if c.type == "const_spec"):
+            names = [c for c in spec.named_children if c.type == "identifier"]
+            value = spec.child_by_field_name("value")
+            if len(names) != 1 or value is None or value.type != "expression_list":
+                continue
+            literals = [
+                c for c in value.named_children if c.type == "interpreted_string_literal"
+            ]
+            if len(literals) != 1:
+                continue
+            # The gate's grammar exposes `interpreted_string_literal_content`; the
+            # ENGINE's bundled Go grammar does not, which is why the rules match it
+            # through a wildcard child instead. Read the content here, and fall
+            # back to stripping the quotes so a grammar that drops the child node
+            # cannot silently make this gate vacuous.
+            content = next(
+                (c for c in literals[0].named_children if "content" in c.type), None
             )
-        )
+            text = (
+                _text(content, source_bytes)
+                if content is not None
+                else _text(literals[0], source_bytes)[1:-1]
+            )
+            if text != flag_key:
+                continue
+            found.append(
+                KeyConst(
+                    name=_text(names[0], source_bytes),
+                    declaration=node,
+                    name_nodes=(names[0],),
+                )
+            )
     return found
+
+
+def go_group_is_positional(declaration: Node, source_bytes: bytes) -> bool:
+    """Whether removing one spec of this ``const ( ... )`` group can change the
+    others: an entry with no value repeats the expression above it, and
+    ``iota`` counts entries. Either anywhere in the group keeps every entry.
+    A declaration of one spec is never positional: it is deleted whole."""
+    specs = [c for c in declaration.named_children if c.type == "const_spec"]
+    if len(specs) < 2:
+        return False
+    if any(spec.child_by_field_name("value") is None for spec in specs):
+        return True
+    return any(
+        n.type == "iota" or (n.type == "identifier" and _text(n, source_bytes) == "iota")
+        for n in _walk(declaration)
+    )
+
+
+def go_positional_key_consts(source: str, flag_key: str) -> list[str]:
+    """The names of the file's key constants that :func:`_go_withholds` keeps
+    for sitting in a positional group, so the run can say why."""
+    from flag_cleanup import syntax
+
+    data = source.encode("utf-8")
+    return [
+        const.name
+        for const in _go_key_consts(syntax._parse(source, "go"), data, flag_key)
+        if go_group_is_positional(const.declaration, data)
+    ]
+
+
+def _go_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bool:
+    """Keep the file when a key constant sits in a positional group (see
+    :func:`go_group_is_positional`), or when one group holds the key twice:
+    the delete rule for a group entry needs another entry beside it, so the
+    second would be left as the group's last."""
+    groups = [const.declaration.id for const in consts]
+    return len(groups) != len(set(groups)) or any(
+        go_group_is_positional(const.declaration, source_bytes) for const in consts
+    )
 
 
 def _go_is_binding(node: Node) -> bool:
@@ -854,14 +897,35 @@ def _go_is_binding(node: Node) -> bool:
 
 
 def _go_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
-    """First argument of a ``BoolVariation`` call -- what ``go_const.toml`` removes.
+    """A read ``go_const.toml`` removes: the first argument of a
+    ``BoolVariation`` call or the second of a ``Boolean`` call.
 
     ``accessors`` are the run's own wrapper names, matched on the same terms:
-    the const rules are cloned for each of them, so a wrapper's read is one
-    this file removes. See :func:`path_is_safe`.
+    the const rules are cloned for each of them from both templates, so a
+    wrapper's read with the key in either position is one this file removes.
+    See :func:`path_is_safe`.
     """
-    call = _first_argument_of(identifier, "identifier", "argument_list")
-    if call is None or call.type != "call_expression":
+    first = _first_argument_of(identifier, "identifier", "argument_list")
+    if first is not None:
+        return _go_callee_in(first, _GO_FLAG_READ_CALLEES | accessors)
+    second = _go_second_argument_of(identifier)
+    return second is not None and _go_callee_in(second, _GO_SECOND_ARGUMENT_READ_CALLEES | accessors)
+
+
+def _go_second_argument_of(identifier: Node) -> Node | None:
+    """The call whose SECOND argument is ``identifier``, or ``None``: the
+    ``. (_) . (identifier)`` anchor of ``go_const.toml``'s ``Boolean`` rules."""
+    argument_list = identifier.parent
+    if argument_list is None or argument_list.type != "argument_list":
+        return None
+    arguments = argument_list.named_children
+    if len(arguments) < 2 or arguments[1].id != identifier.id:
+        return None
+    return argument_list.parent
+
+
+def _go_callee_in(call: Node, callees: frozenset[str]) -> bool:
+    if call.type != "call_expression":
         return False
     function = call.child_by_field_name("function")
     if function is None:
@@ -870,8 +934,7 @@ def _go_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
         function = function.child_by_field_name("field")
     if function is None or function.type not in ("identifier", "field_identifier"):
         return False
-    callee = function.text.decode("utf-8")
-    return callee in _GO_FLAG_READ_CALLEES or callee in accessors
+    return function.text.decode("utf-8") in callees
 
 
 # ===========================================================================
@@ -2185,6 +2248,7 @@ _PROFILES.update(
             is_reference=lambda n, b, name: _is_named_identifier(n, b, name, ("identifier",)),
             is_binding=_go_is_binding,
             is_removable_read=_go_is_removable_read,
+            withholds=_go_withholds,
         ),
         **{
             language: _Profile(

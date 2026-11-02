@@ -69,6 +69,8 @@ from dataclasses import dataclass
 import tree_sitter_php
 from tree_sitter import Language, Node, Parser
 
+from flag_cleanup.tree_walk import preorder
+
 _LANGUAGE = Language(tree_sitter_php.language_php())
 _PARSER = Parser(_LANGUAGE)
 
@@ -185,9 +187,7 @@ def _iter(node: Node):
     moment later — or worse, an offset into text the outer rewrite has already
     moved.
     """
-    yield node
-    for child in node.children:
-        yield from _iter(child)
+    return preorder(node)
 
 
 def _literal(condition: Node | None) -> bool | None:

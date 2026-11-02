@@ -84,10 +84,13 @@ parses as intended, and a wrong rewrite can pass that. It is a net, not a proof
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import re
+import sys
+import warnings
 
 import tree_sitter_c_sharp
 import tree_sitter_dart
@@ -409,7 +412,11 @@ _PROFILES: dict[str, _Profile] = {
         #
         # `pair` (a dict value) is absent for the opposite reason: `{"k": True}`
         # is a COMPLETE fold, not a half-finished one. There is nothing further
-        # to clean once the read becomes a constant in that position.
+        # to clean once the read becomes a constant in that position. An
+        # assignment to a SUBSCRIPT (`context["k"] = True`) is the same thing
+        # written as a statement, and is skipped by `_literal_residues` for
+        # that reason; one to a name or an attribute (`self.k = True`) is a
+        # binding whose readers still test it, and still counts.
         #
         # `match <read>:` folds to `match True:`, every `case` left comparing
         # against the literal: the same stopped fold, spelled as a match.
@@ -1253,7 +1260,11 @@ def _native_parse_fails(source: str, language: str) -> bool:
     if not _PROFILES[language].native_parser:
         return False
     try:
-        compile(source, "<gate>", "exec")
+        # A candidate the gate may yet refuse (`True(view)`) draws a
+        # SyntaxWarning; it is the gate's business, not the run log's.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            compile(source, "<gate>", "exec")
     except (SyntaxError, ValueError):
         return True
     return False
@@ -1301,6 +1312,8 @@ def _literal_residues(source: str, language: str) -> int:
     # with the literal in the SECOND clause.
     count = 0
     for node in _walk(_parse(source, language)):
+        if node.type in _ENTRY_ASSIGNMENTS and _assigns_an_entry(node):
+            continue
         if node.type in wanted:
             count += sum(
                 1 for condition in node.children_by_field_name(wanted[node.type])
@@ -1311,6 +1324,41 @@ def _literal_residues(source: str, language: str) -> int:
         ):
             count += 1
     return count
+
+
+#: Python's assignment statements, whose target may be an entry of a
+#: container rather than a binding.
+_ENTRY_ASSIGNMENTS = frozenset({"assignment", "augmented_assignment"})
+
+
+def _attribute_residues(source: str, language: str) -> int:
+    """Python boolean literals assigned to an attribute: ``self.on = True``.
+
+    Counted by :func:`_literal_residues` as well. Asked first only so that the
+    refusal names what is left, since nothing here inlines an attribute.
+    """
+    if language != "python":
+        return 0
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type not in _ENTRY_ASSIGNMENTS:
+            continue
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        if left is not None and left.type == "attribute" and right is not None:
+            count += _through_wrappers(right, _PROFILES[language]).type in _BOOLEAN_LITERALS
+    return count
+
+
+def _assigns_an_entry(assignment: Node) -> bool:
+    """Whether ``assignment`` stores into a subscript: ``context["k"] = True``.
+
+    That is a dict entry written as a statement, a complete fold for the same
+    reason a ``pair`` value is. Nothing in the file reads it back by name, so
+    there is nothing left to inline or to fold.
+    """
+    left = assignment.child_by_field_name("left")
+    return left is not None and left.type == "subscript"
 
 
 def _go_tagless_alternatives(source: str) -> int:
@@ -1332,6 +1380,39 @@ def _go_tagless_alternatives(source: str) -> int:
             if values is None or values.type != "expression_list" or values.named_child_count < 2:
                 continue
             count += sum(1 for value in values.named_children if value.type in _BOOLEAN_LITERALS)
+    return count
+
+
+def _go_literal_decided_conditions(source: str) -> int:
+    """How many Go ``if`` and ``for`` conditions a literal OPERAND decides:
+    ``x && false``, ``x || true``, through parentheses and nested chains of
+    the same operator (``ts_dead_code._constant_truth``'s set).
+
+    The engine folds such a condition when ``x`` cannot run code (names,
+    literals, operators) and keeps it when ``x`` holds a call, since folding
+    would drop the call. What it keeps is the flag half-removed: the branch
+    the literal makes dead (the body under ``&& false``, the ``else`` under
+    ``|| true``) stays with everything it references, and nothing downstream
+    says so, because it builds and ``go vet`` is clean. A bare literal is not
+    counted here; ``literal_residues`` counts it.
+    """
+    count = 0
+    for node in _walk(_parse(source, "go")):
+        if node.type in ("if_statement", "for_clause"):
+            condition = node.child_by_field_name("condition")
+        elif node.type == "for_statement":
+            # `for cond { … }`: the condition is an unfielded child.
+            condition = next(
+                (c for c in node.named_children if c.type not in ("for_clause", "range_clause", "block", "comment")),
+                None,
+            )
+        else:
+            continue
+        inner = condition
+        while inner is not None and inner.type == "parenthesized_expression" and inner.named_child_count == 1:
+            inner = inner.named_children[0]
+        if inner is not None and inner.type == "binary_expression" and ts_dead_code._constant_truth(condition) is not None:
+            count += 1
     return count
 
 
@@ -2517,6 +2598,48 @@ def _literal_members(source: str, language: str) -> int:
     )
 
 
+def _called_literals(source: str, language: str) -> int:
+    """Python boolean literals used where a callable must be: ``@True``,
+    ``True(view)`` and ``method_decorator(True, …)``.
+
+    A read named in ``accessors`` that is really a decorator factory folds to
+    one. It parses, so nothing else here sees it, and the module raises
+    ``TypeError`` when it is imported, or the call when it runs.
+    """
+    if language != "python":
+        return 0
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type == "decorator":
+            inner = [c for c in node.named_children if c.type != "comment"]
+            count += len(inner) == 1 and _bare(inner[0]).type in ("true", "false")
+        elif node.type == "call":
+            function = node.child_by_field_name("function")
+            if function is None:
+                continue
+            if _bare(function).type in ("true", "false"):
+                count += 1
+                continue
+            name = function.child_by_field_name("attribute") if function.type == "attribute" else function
+            arguments = node.child_by_field_name("arguments")
+            if (
+                name is not None
+                and name.text == b"method_decorator"
+                and arguments is not None
+                and arguments.named_children
+                and _bare(arguments.named_children[0]).type in ("true", "false")
+            ):
+                count += 1
+    return count
+
+
+def _bare(node: Node) -> Node:
+    """``node`` without the parentheses around it."""
+    while node.type == "parenthesized_expression" and len(node.named_children) == 1:
+        node = node.named_children[0]
+    return node
+
+
 def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     """Whether rewriting ``before`` into ``after`` produced invalid source.
 
@@ -2539,7 +2662,9 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     return refusal_reason(before, after, language) is not None
 
 
-def refusal_reason(before: str, after: str, language: str) -> str | None:
+def refusal_reason(
+    before: str, after: str, language: str, *, excused_initializers: int = 0
+) -> str | None:
     """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
 
     The same checks in the same order, each worded for the person reading the
@@ -2547,6 +2672,10 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
     bound to a name parses perfectly well — and a refusal that said only
     "syntax check" sent the reader looking for a parse error that was never
     there.
+
+    ``excused_initializers`` is how many Go ``if`` initializers the engine
+    removed along with code that could not run; the lost-initializer count
+    allows for exactly that many.
     """
     # Ahead of the ts delegation, which returns wholesale: these checks cover
     # the TS family too, and putting either after the branch would silently
@@ -2595,10 +2724,48 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
         return "a keyword was left stranded where an expression is read"
     if _native_parse_fails(after, language) and not _native_parse_fails(before, language):
         return "the language's own compiler rejects the result"
-    if _literal_residues(after, language) > _literal_residues(before, language):
+    if _attribute_residues(after, language) > _attribute_residues(before, language):
         return (
+            "the removal stopped part-way: the flag read became a literal stored in an "
+            "attribute (self.x = True), and the reads of that attribute are not folded"
+        )
+    if _called_literals(after, language) > _called_literals(before, language):
+        return (
+            "the flag read is used as a decorator or called, so it is not a boolean read: "
+            "the result would fail when it runs"
+        )
+    if _literal_residues(after, language) > _literal_residues(before, language):
+        if language == "python":
+            # Name the binding the inliner declined, and why: "still bound to
+            # a name" alone reads as a defect in the fold when the cause is a
+            # shape the reader can change.
+            from flag_cleanup import python_fold
+
+            unresolved = python_fold.unresolved_bindings(before, after)
+            if unresolved:
+                name, line, why = unresolved[0]
+                return (
+                    f"the removal stopped part-way: the flag read became a literal "
+                    f"bound to `{name}` (line {line}), which was not inlined because {why}"
+                )
+        reason = (
             "the removal stopped part-way: the flag read became a literal that is "
             "still bound to a name or still tested"
+        )
+        if _native_parse_fails(before, language):
+            # The inliner asks this interpreter's own parser, and syntax newer
+            # than it anywhere in the file leaves the binding unproven.
+            reason += (
+                f"; the file uses syntax Python {sys.version_info.major}.{sys.version_info.minor} "
+                "cannot parse, so the binding could not be analysed"
+            )
+        return reason
+    if language == "go" and _go_literal_decided_conditions(after) > _go_literal_decided_conditions(before):
+        # The TS family refuses the same shape in `constant_condition_ifs`.
+        return (
+            "an if or for was left testing a condition a literal operand decides "
+            "(`x && false`, `x || true`): the other operand runs code, so the "
+            "branch the flag made dead could not be removed"
         )
     if _literal_statements(after, language) > _literal_statements(before, language):
         return "a boolean literal was left standing as a statement"
@@ -2608,11 +2775,42 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
         return "a boolean literal is now compared with null"
     if _constant_guards(after, language) > _constant_guards(before, language):
         return "a case guard became a constant: it hides a later case or does not compile"
-    if _lost_side_effects(after, language) < _lost_side_effects(before, language):
+    # Initializers the engine removed with code that could not run (a deleted
+    # branch, an unreachable tail) are not lost work: see
+    # :mod:`flag_cleanup.go_initializers`.
+    if _lost_side_effects(after, language) + excused_initializers < _lost_side_effects(
+        before, language
+    ):
         return "the fold would drop code that runs whatever the flag says"
+    if _directive_else_conditions(before, language) - _directive_else_conditions(after, language):
+        return "the fold changed an if whose else sits in a preprocessor block, which it does not see"
     if _stranded_template_reads(before, after, language):
         return "a string template still reads a variable the rewrite deleted"
     return None
+
+
+def _directive_else_conditions(source: str, language: str) -> Counter[str]:
+    """The condition of each C# ``if`` whose ``else`` a preprocessor block
+    holds: ``if (c) { } #if X else { } #endif``.
+
+    Such an ``if`` has no ``alternative`` for a fold to see, or one that skips
+    the block. ``if (false)`` is then deleted with the block inside it, and
+    that is the code the flag leaves running. It parses, so nothing else here
+    objects. A block that IS the ``if``'s body hides no branch and is not one.
+    """
+    if language != "csharp" or "#if" not in source:
+        return Counter()
+    found: Counter[str] = Counter()
+    for node in _walk(_parse(source, language)):
+        if node.type != "if_statement":
+            continue
+        condition = node.child_by_field_name("condition")
+        body = node.child_by_field_name("consequence")
+        if condition is None or body is None or condition.text is None:
+            continue
+        if any(c.type == "preproc_if" and c.id != body.id for c in node.children):
+            found[" ".join(condition.text.decode("utf-8", "replace").split())] += 1
+    return found
 
 
 #: The string nodes a ``$name`` template can sit in, per grammar.

@@ -1781,6 +1781,12 @@ def resolve(
         return _resolve_ruby_wrappers(source, language, treatment, wrapper, targets or {})
     if wrapper is None and language == "php":
         return _resolve_pennant(source, flag_key, treatment)
+    if wrapper is None and language == "python":
+        # A Django test pins the flag with waffle's `override_flag`; the SDK
+        # read itself is not stubbed in a form this module reads.
+        from flag_cleanup import python_overrides
+
+        return python_overrides.resolve(source, flag_key, treatment, key_texts)
     if wrapper is not None and language == "python":
         from flag_cleanup import python_patches
 

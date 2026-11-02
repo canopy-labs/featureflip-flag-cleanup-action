@@ -387,16 +387,11 @@ def _declared_local(at: Node, name: str, data: bytes) -> bool:
             if left is not None and left.type == "identifier" and _text(left, data) == name:
                 return True
         elif parent.type in ("method_declaration", "local_function_statement", "lambda_expression", "constructor_declaration"):
-            parameters = parent.child_by_field_name("parameters")
-            # `x => …`: the lambda's one parameter is the field itself.
-            if parameters is not None and parameters.type == "identifier" and _text(parameters, data) == name:
-                return True
-            for item in _walk(parameters) if parameters is not None else ():
-                if item.type in ("parameter", "implicit_parameter"):
-                    label = item.child_by_field_name("name") if item.type == "parameter" else item
-                    if label is not None and _text(label, data) == name:
-                        return True
-                elif item.type == "identifier" and item.parent is parameters and _text(item, data) == name:
+            from flag_cleanup import cross_file_csharp as xcs
+
+            for item in xcs.parameter_nodes(parent):
+                label = item.child_by_field_name("name") if item.type == "parameter" else item
+                if label is not None and _text(label, data) == name:
                     return True
         node = parent
     return False

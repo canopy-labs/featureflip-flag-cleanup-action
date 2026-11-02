@@ -126,6 +126,48 @@ def _entries(path: str, source: str, flag_key: str) -> tuple[list[xk.KeyDeclarat
     return enums.entries(path, source, flag_key, root, tree)
 
 
+def _write_pattern(name: str) -> re.Pattern[str]:
+    """A spelling of ``name`` that can give a module's attribute another value:
+    an attribute assignment or augmented assignment (``m.NAME = …``,
+    ``m.NAME += …``), a ``del m.NAME``, the name as a string in a call that
+    writes an attribute by name (``setattr``, ``delattr``, ``mock.patch``,
+    ``patch.object``, ``monkeypatch.setattr``), or a namespace written by key
+    (``vars(m)["NAME"] = …``). Textual on purpose, like Ruby's ``const_set``
+    scan: it may count a harmless spelling, which only keeps the reads as
+    before. A plain string holding the name is not a write: a key constant is
+    often named after its own key (``NAME = "NAME"``)."""
+    word = re.escape(name)
+    quoted = rf"[\"'](?:[\w.]*\.)?{word}[\"']"
+    return re.compile(
+        rf"\.\s*{word}\s*(?:\*\*|//|>>|<<|[-+*/%&|^@])?=(?!=)"
+        rf"|\bdel\b[^\n]*\.\s*{word}\b"
+        rf"|\b(?:setattr|delattr|patch|object)\s*\([^)]*{quoted}"
+        rf"|{quoted}\s*\]\s*=(?!=)"
+    )
+
+
+def constant_writes(repo_dir: str, names: set[str]) -> set[str]:
+    """Which of ``names`` some Python file of the checkout may write
+    (:func:`_write_pattern`). A key constant no file writes holds its key
+    wherever it is read, so a reference that keeps its declaration does not
+    have to keep its reads."""
+    from flag_cleanup import source_index
+
+    if not names:
+        return set()
+    patterns = {name: _write_pattern(name) for name in names}
+    written: set[str] = set()
+    for source in source_index.files(repo_dir, (".py",)):
+        try:
+            text = source.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return set(names)  # unreadable: it may write any of them
+        written |= {name for name, pattern in patterns.items() if name not in written and pattern.search(text)}
+        if written == names:
+            break
+    return written
+
+
 def home_constant_names(path: str, source: str, flag_key: str) -> set[str]:
     """The names of the file's constants holding ``flag_key`` when nothing in
     the file can give one of them another value; empty otherwise.
@@ -329,7 +371,10 @@ xk.register(
         constant_module_pattern=proofs.constant_module_pattern,
         escapes_void_readers=True,
         # Any module can write a constant's attribute, and no rule tells such
-        # a write from a harmless mention: a kept declaration keeps every read.
+        # a write from a harmless mention: a kept declaration keeps every read,
+        # unless no file of the checkout spells a write of its name and only
+        # mentions that spell it keep it (`constant_writes`).
         readers_need_deletable=True,
+        constant_writes=constant_writes,
     ),
 )

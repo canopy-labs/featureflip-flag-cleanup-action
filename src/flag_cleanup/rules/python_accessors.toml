@@ -73,3 +73,74 @@ replace_node = "call"
 replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
+
+# A decorator gate (`@flag_required("KEY")`, or the same call handed to
+# Django's `method_decorator`) is not a boolean read, whatever `accessors`
+# says: the call returns a decorator. Folded, it becomes `@True`, which parses
+# and raises TypeError when the module is imported. So a read inside a
+# decorator that calls this same accessor, or inside a `method_decorator`, is
+# left for `python_gates`, which removes the gate or refuses the flag. Two
+# filters, because Piranha ANDs them and each says "no such ancestor".
+# `@sdk_fn` is this rule's own capture, which the engine substitutes into its
+# filters. A read inside any OTHER decorator (`@skipif(not <read>)`) is a
+# value and still folds.
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @gate_fn)
+                     (identifier) @gate_fn])) @gate
+  (#eq? @gate_fn "@sdk_fn")
+)"""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @adapter_fn)
+                     (identifier) @adapter_fn])) @adapted
+  (#eq? @adapter_fn "method_decorator")
+)"""
+
+# --- <callee>(<arg>, ..., "KEY", ...) -> @treated, the key at a declared index
+#
+# For an accessor named with the index of its key, `flag_is_active[1]`:
+# django-waffle's `flag_is_active(request, "KEY")` takes the request first.
+# Cloned ONLY for such an accessor, in place of the template above, and never
+# for a plain one: matching the key at any position would fold every call
+# that happens to pass the key string, which the first-argument anchor exists
+# to prevent. `__KEY_POSITION__` becomes one anchored wildcard per argument
+# before the key, so the key is pinned to exactly the declared slot.
+[[rules]]
+name = "accessor_template__key_at_position"
+# accessor-template: key-position
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . __KEY_POSITION__(string (string_start) . (string_content) @flag_name . (string_end)))
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# The same two decorator-gate filters as the template above, for the same
+# reason: an indexed accessor used as a decorator must never become `@True`.
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @gate_fn)
+                     (identifier) @gate_fn])) @gate
+  (#eq? @gate_fn "@sdk_fn")
+)"""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @adapter_fn)
+                     (identifier) @adapter_fn])) @adapted
+  (#eq? @adapter_fn "method_decorator")
+)"""

@@ -5,8 +5,8 @@
 
 A version's section runs from its `## 1.7.0` heading to the next `## `
 heading. Its text, without the heading, is printed to stdout. Unreleased
-changes collect under `## Unreleased`, and cutting a release renames that
-heading to the version in the same change that bumps `pyproject.toml`.
+changes are notes in `changelog.d/`, and `changelog_release.py` gathers them
+into the version's section in the same change that bumps `pyproject.toml`.
 
 A release whose version has no section, or an empty one, is refused: exit 1,
 with the reason on stderr. The release job runs this before it builds
@@ -53,8 +53,9 @@ def main(argv: list[str]) -> int:
     body = section(CHANGELOG.read_text(encoding="utf-8"), version)
     if body is None:
         print(
-            f"CHANGELOG.md has no '## {version}' section. Rename '## Unreleased' "
-            f"to '## {version}' in the change that bumps the version.",
+            f"CHANGELOG.md has no '## {version}' section. Run "
+            f"'scripts/changelog_release.py {version}' in the change that bumps "
+            f"the version.",
             file=sys.stderr,
         )
         return 1

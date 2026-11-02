@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, inert_load, prerequisite_hold, report_paths, ruby_owner_reach, source_index
+from flag_cleanup import git_ops, github_ops, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, ruby_owner_reach, source_index
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -468,12 +468,21 @@ def run(
         # flag's changes are undone before the next starts, so no candidate
         # adds or removes a file another one would see. See `source_index`.
         # The declared side-effect-free modules hold for the same span.
-        with source_index.run_scope(), inert_load.declaring(config.side_effect_free_modules):
+        with source_index.run_scope(), inert_load.declaring(
+            config.side_effect_free_modules
+        ), inert_calls.declaring(config.side_effect_free_calls):
             proposed = 0
             for candidate in resolved_client.removal_candidates(
                 config.org, config.project, config.staleness
             ):
-                result = process(candidate)
+                try:
+                    result = process(candidate)
+                except RecursionError:
+                    # One file nested deeper than the interpreter can walk must
+                    # not end the run, or cost every later flag its turn. The
+                    # tree is already restored: the transform's own unwinding
+                    # ran as this propagated.
+                    result = _too_deep_result(candidate, config)
                 results.append(result)
                 if reporter is not None:
                     reporter.report(result)
@@ -998,6 +1007,11 @@ def _process_candidate_for_pr(
         logger.error("aborting: could not reset the worktree after %s", candidate.key)
         _record_aborting_flag(exc, candidate, action, pr_url)
         raise
+    except RecursionError:
+        # Not "a bug in this tool" like the rest: a file nested past what the
+        # interpreter can walk. `run` turns it into a refusal that names the
+        # file, once the cleanup below has put the checkout back.
+        raise
     except Exception as exc:  # noqa: BLE001 - one bad flag must not end the run
         # An expected refusal (GitHub said no, git said no) is one clear line.
         # Anything else is a bug in this tool and needs its stack.
@@ -1393,6 +1407,39 @@ def _refusal_result(candidate: Candidate, error: TransformRefusal) -> FlagResult
     )
 
 
+def _too_deep_result(candidate: Candidate, config: Config) -> FlagResult:
+    """A refusal for a flag whose analysis ran out of stack, naming the files.
+
+    ``unsafe-rewrite`` and not ``no-changes``: nothing was decided about this
+    flag, and the build goes red until a person looks.
+    """
+    found = nesting.deep_files(config.directories, config.languages, candidate.key)
+    reasons = tuple(
+        (
+            path,
+            f"nested {depth} levels deep, more than the analysis can follow "
+            "(a very long chain of operators, usually in generated code). Leave "
+            "the file out of the scanned directories or split the expression",
+        )
+        for path, depth in found
+    )
+    logger.error(
+        "abandoning the removal of %s: analysis ran out of stack on %s. No pull "
+        "request will be opened for this flag until that is resolved",
+        candidate.key,
+        ", ".join(path for path, _ in found) or "a file that names it",
+    )
+    return FlagResult(
+        candidate.key,
+        candidate.treatment,
+        candidate.status,
+        "",
+        "unsafe-rewrite",
+        refused_files=tuple(path for path, _ in found),
+        refusal_reasons=reasons,
+    )
+
+
 def _record_aborting_flag(
     exc: BaseException, candidate: Candidate, action: str, pr_url: str = ""
 ) -> None:
@@ -1778,6 +1825,7 @@ def _run_plan(
             flag_default=flag_default,
             read_elsewhere=any(d == directory and lang != language for d, lang in reads),
             entries=entries,
+            key_positions=config.key_positions,
         )
         outcomes.append(
             replace(

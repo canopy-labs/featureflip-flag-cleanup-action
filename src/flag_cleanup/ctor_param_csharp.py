@@ -249,15 +249,13 @@ def _declared_by(node: Node, header_only: bool = False) -> set[str]:
     """The names ``node`` declares: its variable declarators (in its header
     only, with ``header_only``), parameters, implicit lambda parameter,
     ``foreach`` variable and ``catch`` variable."""
+    from flag_cleanup import cross_file_csharp as xcs
+
     found: set[str] = set()
-    parameters = node.child_by_field_name("parameters")
-    if parameters is not None:
-        if parameters.type in ("identifier", "implicit_parameter"):
-            found.add(_text(parameters))
-        for p in parameters.named_children:
-            label = p.child_by_field_name("name") if p.type == "parameter" else (p if p.type == "implicit_parameter" else None)
-            if label is not None:
-                found.add(_text(label))
+    for p in xcs.parameter_nodes(node):
+        label = p.child_by_field_name("name") if p.type == "parameter" else p
+        if label is not None:
+            found.add(_text(label))
     left = node.child_by_field_name("left") if node.type == "foreach_statement" else None
     if left is not None and left.type == "identifier":
         found.add(_text(left))

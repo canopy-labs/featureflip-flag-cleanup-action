@@ -3,7 +3,7 @@
 A wrapper is a module-level function, or a method of a module-level class
 (an instance method, a ``@staticmethod``, a ``@classmethod`` or a
 ``@property``), whose whole body is ``return <read>``, after an optional
-docstring. The read is one ``rules/python.toml`` folds in this run:
+docstring and locals that only feed the read's arguments. The read is one ``rules/python.toml`` folds in this run:
 ``variation(key, ctx, <bool literal>)`` (or ``default=<bool literal>``),
 ``get_boolean_value(key, ...)`` or a named accessor, with the key as a
 literal, a same-file constant where Gate 2 let the const rules run, or a
@@ -178,20 +178,121 @@ def read_test(
             )
         return name == _GET_BOOLEAN or name in accessors
 
+    # A loose test is the undo snapshot's superset, judged before the real
+    # one: `discover` stays quiet under it so each verdict is logged once.
+    is_read.loose = loose  # type: ignore[attr-defined]
     return is_read
 
 
-def _body_read(definition: Node, is_read: Callable[[Node], bool]) -> bool:
-    """Whether the body is ``return <read>``, after an optional docstring."""
+def _body_read(definition: Node, is_read: Callable[[Node], bool]) -> bool | str:
+    """Whether the body is ``return <read>``, after an optional docstring and
+    any number of locals that only feed the read's arguments.
+
+    ``True`` when it is. A function that ends in ``return <read>`` but has a
+    statement before it that inlining would drop answers with the reason, so
+    the run can say why it was not inlined; any other body is ``False``.
+
+    A preceding local qualifies when it is ``name = <value>`` with a value
+    whose evaluation cannot do anything (literals, names and displays of
+    them), and ``name`` is spelled exactly once more in the function, inside
+    the read's arguments. Inlining replaces the wrapper's calls with the
+    read's value and deletes the wrapper, so the local goes with the read it
+    fed, exactly as the same value written inline in the read would. Any
+    other statement -- a call such as a log line, a branch, a value that
+    calls something -- runs on every call of the wrapper, and inlining would
+    drop it.
+    """
     statements = _named(definition.child_by_field_name("body"))
-    if statements and statements[0].type == "expression_statement" and len(statements) == 2:
-        only = _named(statements[0])
-        if len(only) == 1 and only[0].type == "string":
-            statements = statements[1:]
-    if len(statements) != 1 or statements[0].type != "return_statement":
+    if not statements or statements[-1].type != "return_statement":
         return False
-    returned = _named(statements[0])
-    return len(returned) == 1 and is_read(returned[0])
+    returned = _named(statements[-1])
+    if len(returned) != 1 or not is_read(returned[0]):
+        return False
+    read = returned[0]
+    preceding = statements[:-1]
+    if preceding and _docstring_statement(preceding[0]):
+        preceding = preceding[1:]
+    for statement in preceding:
+        why = _argument_local(definition, statement, read)
+        if why is not None:
+            return why
+    return True
+
+
+def _docstring_statement(statement: Node) -> bool:
+    only = _named(statement) if statement.type == "expression_statement" else []
+    return len(only) == 1 and only[0].type in ("string", "concatenated_string")
+
+
+#: Expression nodes whose evaluation runs no code: no call, no operator
+#: (an operator can be overloaded), no attribute or subscript (a property or
+#: ``__getitem__`` can), no interpolation (``__format__`` can). A bare name
+#: IS here, unlike the stranded-local pass's set: that pass deletes a local
+#: from a function that goes on running, which can end an object's life
+#: early, while here the whole call goes, so no object the function held
+#: lives any shorter than it did.
+_INERT_VALUES = frozenset(
+    {
+        "string", "string_start", "string_content", "string_end", "escape_sequence",
+        "concatenated_string", "integer", "float", "true", "false", "none",
+        "identifier", "dictionary", "pair", "list", "tuple", "set",
+        "parenthesized_expression", "comment",
+    }
+)
+
+
+def _argument_local(definition: Node, statement: Node, read: Node) -> str | None:
+    """Why ``statement`` stops the function being a wrapper; ``None`` when it
+    is a local that only feeds ``read``'s arguments (see :func:`_body_read`)."""
+    shown = wi.text_of(statement)
+    if len(shown) > 60:
+        shown = shown[:57] + "..."
+    only = _named(statement) if statement.type == "expression_statement" else []
+    assignment = only[0] if len(only) == 1 and only[0].type == "assignment" else None
+    if assignment is None:
+        return f"`{shown}` before the return runs on every call, and inlining would drop it"
+    left = assignment.child_by_field_name("left")
+    value = assignment.child_by_field_name("right")
+    if (
+        left is None
+        or left.type != "identifier"
+        or value is None
+        or assignment.child_by_field_name("type") is not None
+    ):
+        return f"`{shown}` is not a plain local that only feeds the read"
+    if any(node.type not in _INERT_VALUES for node in cross_file_keys.walk(value)):
+        return f"`{shown}` computes its value with code that inlining would drop"
+    name = _text(left)
+    arguments = read.child_by_field_name("arguments")
+    spelled = sorted(
+        (
+            node
+            for node in cross_file_keys.walk(definition)
+            if node.type == "identifier" and _text(node) == name and not _label(node)
+        ),
+        key=lambda node: node.start_byte,
+    )
+    if (
+        len(spelled) != 2
+        or spelled[0] != left
+        or arguments is None
+        or not arguments.start_byte <= spelled[1].start_byte < arguments.end_byte
+    ):
+        return f"`{name}` is used somewhere other than the read's arguments"
+    return None
+
+
+def _label(node: Node) -> bool:
+    """Whether an identifier only labels something: a keyword argument's
+    name, or the member name of an attribute."""
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "keyword_argument":
+        return parent.child_by_field_name("name") == node
+    if parent.type == "attribute":
+        return parent.child_by_field_name("attribute") == node
+    return False
 
 
 def _defaults_do_work(definition: Node) -> bool:
@@ -238,7 +339,19 @@ def discover(path: str, source: str, is_read: Callable[[Node], bool]) -> list[wi
     found: list[wi.Wrapper] = []
 
     def add(statement: Node, definition: Node, owner: str, kind: str, static: bool, decorators: list[str]) -> None:
-        if not _body_read(definition, is_read) or _defaults_do_work(definition):
+        verdict = _body_read(definition, is_read)
+        if isinstance(verdict, str):
+            if getattr(is_read, "loose", False):
+                return
+            logger.info(
+                "%s:%d: `%s` returns the flag read but is not inlined as a keyless wrapper: %s",
+                path,
+                wi.line_of(statement),
+                _text(definition.child_by_field_name("name")),
+                verdict,
+            )
+            return
+        if not verdict or _defaults_do_work(definition):
             return
         found.append(
             wi.Wrapper(

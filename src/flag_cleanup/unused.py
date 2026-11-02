@@ -113,7 +113,7 @@ import tree_sitter_swift
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import cross_file_ts, dart_namespace, inert_load
+from flag_cleanup import cross_file_csharp, cross_file_ts, dart_namespace, inert_load
 
 #: ``js`` maps to the TSX grammar deliberately, for the same reason
 #: ``ts_syntax._parser`` does: the engine rewrote with it, and JSX in a ``.js``
@@ -4846,7 +4846,8 @@ def _method_references(source: str, name: str, language: str) -> int | None:
 
 
 def _csharp_field_access(node: Node) -> Node:
-    """The expression a field's name stands for: ``this._x`` for its ``_x``."""
+    """The expression a field's name stands for: ``this._x`` for its ``_x``,
+    and ``other?._x`` likewise, which C# 14 can write as well as read."""
     parent = node.parent
     if (
         parent is not None
@@ -4855,7 +4856,7 @@ def _csharp_field_access(node: Node) -> Node:
         and name.id == node.id
     ):
         return parent
-    return node
+    return cross_file_csharp.null_conditional_access(node) or node
 
 
 def _csharp_reads_and_writes(access: Node) -> tuple[bool, bool]:
