@@ -1,0 +1,48 @@
+# Private-property and constructor-parameter removal for Kotlin, rendered per
+# run by `ctor_param_model.render_rules`. Never loaded as shipped.
+#
+# Every block is an `argument` block, rendered once with __CTOR_SENTINEL__: the
+# caller has already replaced everything to delete with a form of that name
+# (`ctor_param_model.JVM_FORMS["kt"]`), so deletion is by identity and the
+# engine's apply-until-no-match loop stops after the marked spans. Matching by
+# position would re-fire on the argument that shifts into the deleted slot.
+#
+# - a call argument, a named one with its name, became the bare name;
+# - a property declaration of the class body became `val <name> = 0`;
+# - a primary-constructor parameter, with its modifiers, its `val`/`var` and
+#   its default value, became `<name>: Any`.
+#
+# No holes and no edges: every rule is a seed that matches on its own.
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_argument"
+query = """(
+  (value_argument . (identifier) @argument .) @value
+  (#eq? @argument "__CTOR_SENTINEL__")
+)"""
+replace_node = "value"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_member"
+query = """(
+  (property_declaration (variable_declaration (identifier) @name)) @member
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "member"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_parameter"
+query = """(
+  (class_parameter (identifier) @name) @parameter
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "parameter"
+replace = ""
+is_seed_rule = true

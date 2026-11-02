@@ -1,0 +1,61 @@
+# Private-field and constructor-parameter removal for Java, rendered per run by
+# `ctor_param_model.render_rules`. Never loaded as shipped.
+#
+# Every block is an `argument` block, rendered once with __CTOR_SENTINEL__: the
+# caller has already replaced everything to delete with a form of that name
+# (`ctor_param_model.JVM_FORMS["java"]`), so deletion is by identity and the
+# engine's apply-until-no-match loop stops after the marked spans. Matching by
+# position would re-fire on the argument that shifts into the deleted slot.
+#
+# - a call argument became the bare name;
+# - a field declaration became a method of that name, which owns no `;` the
+#   engine could leave behind;
+# - a constructor statement assigning the field became a call `<name>();`;
+# - a constructor parameter became `Object <name>`.
+#
+# No holes and no edges: every rule is a seed that matches on its own.
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_argument"
+query = """(
+  (argument_list (identifier) @argument)
+  (#eq? @argument "__CTOR_SENTINEL__")
+)"""
+replace_node = "argument"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_member"
+query = """(
+  (method_declaration name: (identifier) @name) @member
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "member"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_statement"
+query = """(
+  (expression_statement
+    (method_invocation name: (identifier) @name) @call) @statement
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "statement"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "delete_ctor_marked_parameter"
+query = """(
+  (formal_parameter name: (identifier) @name) @parameter
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "parameter"
+replace = ""
+is_seed_rule = true

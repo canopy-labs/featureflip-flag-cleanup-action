@@ -125,6 +125,92 @@ replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
+# --- <recv>&.bool_variation("KEY", ...) in a condition
+#
+# The same as the accessor templates in `ruby_accessors.toml`, which say why.
+[[rules]]
+name = "safe_nav_condition_served_false"
+query = """(
+  [
+    (if condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (elsif condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (if_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (conditional condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unary operand: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary left: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary right: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+  ]
+  (#eq? @sdk_fn "bool_variation")
+  (#eq? @flag_name "@safe_nav_false_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "safe_nav_false_flag_name"]
+
+[[rules]]
+name = "safe_nav_condition_served_true"
+query = """(
+  [
+    (if condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (elsif condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (if_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (conditional condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unary operand: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary left: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary right: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+  ]
+  (#eq? @sdk_fn "bool_variation")
+  (#eq? @flag_name "@safe_nav_true_flag_name")
+)"""
+replace_node = "call"
+replace = "@receiver"
+holes = ["safe_nav_true_flag_name"]
+
+# `elsif false` with a live rung after it — promote that rung in place of the
+# dead one. Covers both `elsif false … else …` and `elsif false … elsif … `,
+# since the following rung is the same `alternative:` child either way.
+
 # --- the elsif gap ----------------------------------------------------------
 #
 # The engine's built-ins carry `replace_elsif_true` and nothing for the FALSE
@@ -157,9 +243,6 @@ holes = ["treated", "stale_flag_name"]
 # correct rather than an oversight: everything after an `elsif true` is
 # unreachable, so discarding the nested alternative is the right answer there.
 
-# `elsif false` with a live rung after it — promote that rung in place of the
-# dead one. Covers both `elsif false … else …` and `elsif false … elsif … `,
-# since the following rung is the same `alternative:` child either way.
 [[rules]]
 name = "promote_alternative_over_dead_elsif"
 groups = ["if_cleanup"]

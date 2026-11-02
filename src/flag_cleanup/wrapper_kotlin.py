@@ -324,6 +324,11 @@ def discover(path: str, source: str, is_read: Callable[[Node], bool]) -> list[wi
 
 #: Factories whose single type argument is the type of the double they return.
 _MOCK_FACTORIES = frozenset({"mockk", "spyk", "mock", "spy"})
+#: A call whose arguments it asserts on: `assertThat(x)`, `assertTrue(x)`, and
+#: Strikt's `expectThat(x)`.
+_ASSERTION = re.compile(r"assert[A-Z]\w*|expectThat")
+#: What builds a mock, whose read is the stub's answer and not the member's.
+_MOCK_ANNOTATIONS = re.compile(r"@(?:\w+\.)*(?:Mock|MockK|RelaxedMockK|MockBean|MockitoBean)\b")
 #: What the scope walk found for a name.
 _STOP = "stop"  # a scope it cannot see through: an inherited member may bind it
 _UNTYPED = "untyped"
@@ -413,6 +418,32 @@ def _property_type(declaration: Node, constructors: frozenset[str]) -> str:
 
 def _named_by(node: Node, name: str) -> bool:
     return any(c.type == "identifier" and _text(c) == name for c in node.named_children)
+
+
+def _asserted(call: Node) -> bool:
+    """Whether ``call`` is what an assertion in its statement is about."""
+    node = call.parent
+    while node is not None and node.type not in ("block", "statements"):
+        if node.type == "call_expression" and _ASSERTION.fullmatch(_text(node.named_children[0])):
+            return True
+        node = node.parent
+    return False
+
+
+def _mocked(root: Node, name: str) -> bool:
+    """Whether the file declares ``name`` as a mock anywhere: a name, so a
+    second binding of it can only keep a test."""
+    for node in cross_file_keys.walk(root):
+        declared = _child(node, "variable_declaration") if node.type == "property_declaration" else None
+        if declared is None or not _named_by(declared, name):
+            continue
+        modifiers = _child(node, "modifiers")
+        if modifiers is not None and _MOCK_ANNOTATIONS.search(_text(modifiers)):
+            return True
+        values = [c for c in node.named_children if c.type == "call_expression"]
+        if any(_text(v.named_children[0]) in _MOCK_FACTORIES for v in values):
+            return True
+    return False
 
 
 def _class_binding(scope: Node, name: str, constructors: frozenset[str]) -> str | None:
@@ -656,6 +687,8 @@ def occurrences(
         if parent.type == "navigation_expression" and parent.named_children[-1].id == node.id:
             callee = parent
             receiver = _unbang(parent.named_children[0])
+        else:
+            callee = _negation_of(node)  # `!m()` parses as `(!m)()`
         call = callee.parent
         line = wi.line_of(node)
         if (
@@ -686,6 +719,13 @@ def occurrences(
             )
         if reason is None and _argument_has_call(call):
             reason = wi.ARGUMENT_HAS_CALL
+        if reason is None and name is not None and not double and _asserted(call) and not _mocked(root, name):
+            test = mock_stubs.test_around(call, data, "kt")
+            if test is not None:
+                # The wrapper's own unit test: what it asserts about the
+                # member goes with it, and folded it would assert a literal.
+                found.append(wi.Occurrence(path, line, text, None, wi.SIBLING_RECEIVER, name, True, scope=test))
+                continue
         span = (kotlin_sentinel._callee_start(callee), callee.end_byte) if reason is None else None
         found.append(wi.Occurrence(path, line, text, span, reason, name, double))
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
@@ -800,8 +840,7 @@ def _function_occurrence(
     callee: Node = node
     parent = node.parent
     # `!f()` parses as `(!f)()`: the `!` stays in the source, the mark goes on `f`.
-    if parent is not None and parent.type == "unary_expression" and parent.children[0].type == "!":
-        callee = parent
+    callee = _negation_of(node)
     call = callee.parent
     if (
         call is None
@@ -987,6 +1026,26 @@ def _receiver_reason(
         bound = _binding(anchor, name, constructors, class_only=True)
         return (wi.RECEIVER_UNPROVEN if bound in (None, _STOP, _UNTYPED) else resolves(bound)), name
     return wi.RECEIVER_UNPROVEN, None
+
+
+def _negation_of(node: Node) -> Node:
+    """The outermost ``!`` the wheel grammar hangs on a bare callee, or the node.
+
+    ``!m()`` means ``!(m())``, but the tree is ``call(unary(! m), args)``: the
+    call's head is the negation, not the name. The mark still starts at the
+    name (:func:`kotlin_sentinel._callee_start` skips the ``!``), so the
+    negation stays in the source for the engine to fold.
+    """
+    while (
+        (parent := node.parent) is not None
+        and parent.type == "unary_expression"
+        and parent.children
+        and parent.children[0].type == "!"
+        and parent.named_children
+        and parent.named_children[-1].id == node.id
+    ):
+        node = parent
+    return node
 
 
 def _unbang(node: Node) -> Node:

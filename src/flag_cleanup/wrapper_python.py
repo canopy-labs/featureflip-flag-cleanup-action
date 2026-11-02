@@ -37,7 +37,8 @@ A file that names ``globals``, ``vars``, ``locals``, ``exec``, ``eval``,
 ``__dict__`` or ``__getattribute__`` proves nothing. A test double --
 ``patch("pkg.mod.name")``, ``patch.object(obj, "name")``,
 ``MagicMock(name=...)``, ``m.name.return_value = ...``, or a mock of the
-owner class for a method -- refuses the whole wrapper (``test-double``).
+owner class for a method -- refuses the whole wrapper (``test-double``), unless
+:mod:`flag_cleanup.python_patches` resolves every one.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, key_const, syntax
+from flag_cleanup import cross_file_keys, key_const, mock_stubs, syntax
 from flag_cleanup import wrapper_inline as wi
 
 logger = logging.getLogger(__name__)
@@ -483,6 +484,48 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     if wrapper.kind != "function" and len(index.owners) != 1:
         return None, wi.NAME_NOT_UNIQUE
     return wrapper, None
+
+
+def _patch_target(dotted: str, path: str, wrapper: wi.Wrapper, repo_dir: str) -> bool:
+    """Whether ``patch("<dotted>")`` replaces ``wrapper``: the module it names
+    is the wrapper's own, or one whose top-level import binds it under its own
+    name, which is where a caller there finds it."""
+    from flag_cleanup.cross_file_python_imports import _resolve
+    from flag_cleanup.cross_file_python_syntax import _Module
+
+    *parts, last = dotted.split(".")
+    files = _resolve(repo_dir, path, _Module(0, tuple(parts))) if parts and last == wrapper.name else []
+    if len(files) != 1:
+        return False
+    if files[0] == wrapper.path:
+        return True
+    source = _read(files[0])
+    if source is None:
+        return False
+    bindings = _file(files[0], source, wrapper, repo_dir).bindings
+    bare = [b for b in bindings if b.kind == "bare" and b.local == wrapper.name and _top_level(b.statement)]
+    return len(bare) == 1 and not bare[0].ambiguous
+
+
+def stub_targets(wrapper: wi.Wrapper, index: Index) -> dict[str, mock_stubs.StubTargets]:
+    """resolved path -> the dotted targets each patch of ``wrapper`` there is
+    proven to replace, for the test-double pass. A method is patched on its
+    class, which nothing here proves."""
+    if wrapper.kind != "function":
+        return {}
+    found: dict[str, mock_stubs.StubTargets] = {}
+    for path in sorted({path for path, _, _ in index.doubles}):
+        source = _read(path)
+        if source is None:
+            continue
+        spelled = {
+            _text(node) for node in cross_file_keys.walk(parse(source))
+            if node.type == "string_content" and _mock_callee(node) == "patch"
+        }
+        proven = frozenset(s for s in spelled if _patch_target(s, path, wrapper, index.repo_dir))
+        if proven:
+            found[path] = mock_stubs.StubTargets(receivers=proven)
+    return found
 
 
 # --- Call sites -----------------------------------------------------------------
@@ -935,5 +978,6 @@ wi.register(
         string_mentions=string_mentions,
         leftovers=leftovers,
         imports=imports,
+        stub_targets=stub_targets,
     )
 )

@@ -71,6 +71,9 @@ _listings: dict[str, tuple[SourceFile, ...]] | None = None
 _forgotten: set[str] | None = None
 _roots: dict[str, str] | None = None
 _links: dict[str, tuple[Path, ...]] | None = None
+#: Named per-run memos another module keeps (:func:`run_memo`), or ``None``
+#: outside :func:`run_scope`.
+_memos: dict[str, dict] | None = None
 
 #: Single-file components: Vue, Svelte and Astro files, and MDX documents,
 #: script inside markup that no profile parses. Listed, but only for a caller
@@ -81,8 +84,8 @@ COMPONENT_SUFFIXES = frozenset({".vue", ".svelte", ".astro", ".mdx"})
 #: ``.htm`` is listed only for a caller that asks for it, as above.
 PAGE_SUFFIXES = frozenset({".html", ".htm"})
 #: Ruby under a suffix neither the ruby nor the erb language claims: views
-#: (``.jbuilder``, ``.jb``, ``.builder``, ``.rabl``, ``.arb``, ``.axlsx`` and
-#: ``.prawn`` are Ruby; ``.haml``, ``.slim`` and ``.rhtml`` hold it inside a
+#: (``.jbuilder``, ``.jb``, ``.builder``, ``.rabl``, ``.arb``, ``.axlsx``,
+#: ``.prawn`` and ``.ruby`` are Ruby; ``.haml``, ``.slim`` and ``.rhtml`` hold it inside a
 #: template) and project files (``config.ru``, a ``.gemspec``, ``.podspec`` or
 #: Appraisal ``.gemfile``, a ``.thor``, ``.rbw`` or Capistrano ``.cap`` script)
 #: and type signatures (Sorbet ``.rbi``, RBS ``.rbs``). Listed only for a
@@ -93,6 +96,8 @@ RUBY_SUFFIXES = frozenset(
         ".haml", ".slim", ".rhtml",
         ".gemspec", ".podspec", ".gemfile", ".ru", ".thor", ".rbw", ".cap",
         ".rbi", ".rbs",
+        # Rails' `.ruby` template handler: a view that is plain Ruby.
+        ".ruby",
     }
 )
 #: Files with no suffix at all: a ``Rakefile``, a ``Gemfile``, a script under
@@ -104,15 +109,25 @@ NO_SUFFIX = frozenset({""})
 @contextmanager
 def run_scope() -> Iterator[None]:
     """Reuse one listing per checkout until the outermost scope exits."""
-    global _listings, _roots, _links
+    global _listings, _roots, _links, _memos
     if _listings is not None:
         yield
         return
-    _listings, _roots, _links = {}, {}, {}
+    _listings, _roots, _links, _memos = {}, {}, {}, {}
     try:
         yield
     finally:
-        _listings, _roots, _links = None, None, None
+        _listings, _roots, _links, _memos = None, None, None, None
+
+
+def run_memo(name: str) -> dict | None:
+    """A dictionary that lives as long as the outermost :func:`run_scope`,
+    one per ``name``; ``None`` outside a scope, where the caller computes
+    afresh. File contents change mid-flag, so whatever is kept in it must be
+    checked against the text it was derived from before it is reused."""
+    if _memos is None:
+        return None
+    return _memos.setdefault(name, {})
 
 
 @contextmanager

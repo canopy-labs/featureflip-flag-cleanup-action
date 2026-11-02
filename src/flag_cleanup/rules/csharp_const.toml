@@ -159,15 +159,23 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))]
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @nameof_fn "nameof")
+  (#eq? @nameof_key "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -181,6 +189,22 @@ not_contains = [
   """((prefix_unary_expression) @prefix_mutation)""",
   """((assignment_expression) @assignment)""",
 ]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 # The OpenFeature half. Rooted at the `expression_statement` and requiring the
 # `await` inside it, for the same reason `csharp.toml`'s is: a bare
@@ -220,15 +244,23 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))]
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @nameof_fn "nameof")
+  (#eq? @nameof_key "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -242,6 +274,22 @@ not_contains = [
   """((prefix_unary_expression) @prefix_mutation)""",
   """((assignment_expression) @assignment)""",
 ]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 # --- fold the read: `BoolVariation(FlagKey, …)` -> @treated ------------------
 # Declared BEFORE the delete rule. Seed rules fire in declaration order, and the
@@ -280,15 +328,23 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))]
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @nameof_fn "nameof")
+  (#eq? @nameof_key "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -351,15 +407,23 @@ contains = """(
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))
    (local_declaration_statement
      (modifier) @const_modifier
      (variable_declaration
        type: (_) . (variable_declarator
          name: (identifier) @decl_name
-         (string_literal . (string_literal_content) @flag_name .)) .))]
+         [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .))]
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @nameof_fn "nameof")
+  (#eq? @nameof_key "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -387,16 +451,24 @@ query = """(
        (variable_declaration
          type: (_) . (variable_declarator
            name: (identifier) @variable_name
-           (string_literal . (string_literal_content) @flag_name .)) .)) @declaration)
+           [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .)) @declaration)
    (block
      (local_declaration_statement
        (modifier) @const_modifier
        (variable_declaration
          type: (_) . (variable_declarator
            name: (identifier) @variable_name
-           (string_literal . (string_literal_content) @flag_name .)) .)) @declaration)] @scope
+           [(string_literal . (string_literal_content) @flag_name .)
+            (invocation_expression
+              function: (identifier) @nameof_fn
+              arguments: (argument_list . (argument (identifier) @nameof_key) .))]) .)) @declaration)] @scope
   (#eq? @const_modifier "const")
   (#eq? @flag_name "@stale_flag_name")
+  (#eq? @nameof_fn "nameof")
+  (#eq? @nameof_key "@stale_flag_name")
 )"""
 replace_node = "declaration"
 replace = ""
@@ -413,8 +485,10 @@ holes = ["stale_flag_name"]
 enclosing_node = """((compilation_unit) @container)"""
 not_contains = ["""(
   (invocation_expression
+    function: (_) @surviving_fn
     arguments: (argument_list
       . (argument [(identifier) @first_arg
                    (member_access_expression name: (identifier) @first_arg)]))) @surviving_read
   (#eq? @first_arg "@variable_name")
+  (#not-eq? @surviving_fn "nameof")
 )"""]

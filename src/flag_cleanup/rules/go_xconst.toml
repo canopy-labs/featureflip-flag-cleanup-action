@@ -1,0 +1,107 @@
+# Reader rules for a Go flag key held in a `const` declared in ANOTHER file:
+# `flags.NewCheckout` from another package, or a bare `NewCheckout` in another
+# file of the declaring package.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `q.NAME` (`q` an import's binding); one
+# marked `# xconst: bare` for a `NAME` of the reader's own package.
+#
+# The shapes are `go_const.toml`'s: the discarded statement first (seed rules
+# fire in declaration order, and the read rule below rewrites the CALL inside
+# that statement, which would leave a bare `true` Go does not compile), then
+# the read, with the key slot widened from an identifier to a selector.
+# `cross_file_go.references` proves only these shapes and refuses every other
+# mention in the file, a shadowed `q.NAME` or `NAME` included, because the
+# owner and member are compared as text here.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_delete_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (selector_expression
+            operand: (identifier) @key_owner
+            field: (field_identifier) @key_member)))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+holes = []
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_boolvariation_read"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (selector_expression
+          operand: (identifier) @key_owner
+          field: (field_identifier) @key_member))) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_delete_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (call_expression
+      function: [(selector_expression field: (field_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list . (identifier) @key_member))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "statement"
+replace = ""
+holes = []
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = ["""((unary_expression) @receive_or_negation)"""]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_boolvariation_read"
+query = """(
+  (call_expression
+    function: [(selector_expression field: (field_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list . (identifier) @key_member)) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]

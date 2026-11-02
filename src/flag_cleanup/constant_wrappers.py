@@ -31,11 +31,15 @@ inside it and it now returns one boolean literal on every path. A predicate
 that already returned a constant before this run, and that the transform
 never touched, is not this flag's business and is not reported.
 
-**C# and Java only.** Those are the languages where the shape is idiomatic and
-where a declaration names the types it implements, which is what makes the
+**C#, Java and Swift.** Those are the languages where the shape is idiomatic
+and where a declaration names the types it implements, which is what makes the
 siblings and callers findable. A free function in the other languages has no
 declared type to search by, and reporting it with no callers would read as
-"nothing calls this", which would be false.
+"nothing calls this", which would be false. Swift's is a computed property or a
+method of a type (`var showInvite: Bool { !viewed && <read> }`, folded to
+`{ false }`), and its callers are listed like the others: by the type's name
+and a ``.member`` access in another file, so a bare use inside the type itself
+is not one of them.
 """
 
 from __future__ import annotations
@@ -96,7 +100,18 @@ _JAVA = _Dialect(
     literals=frozenset({"true", "false"}),
 )
 
-_DIALECTS = {ext: dialect for dialect in (_CSHARP, _JAVA) for ext in dialect.extensions}
+_SWIFT = _Dialect(
+    language="swift",
+    extensions=(".swift",),
+    # Every struct, class, enum, actor and extension is a `class_declaration`.
+    types=frozenset({"class_declaration", "protocol_declaration"}),
+    scopes=frozenset({"lambda_literal", "function_declaration", "class_declaration"}),
+    literals=frozenset({"boolean_literal"}),
+)
+
+_DIALECTS = {
+    ext: dialect for dialect in (_CSHARP, _JAVA, _SWIFT) for ext in dialect.extensions
+}
 
 
 @dataclass(frozen=True)
@@ -334,10 +349,39 @@ def _predicate_body(node: Node, dialect: _Dialect) -> Node | None:
                         None,
                     )
         return None
+    if dialect is _SWIFT:
+        return _swift_predicate_body(node)
     if node.type == "method_declaration":
         if _text(node.child_by_field_name("type")) != "boolean":
             return None
         return node.child_by_field_name("body")
+    return None
+
+
+def _swift_predicate_body(node: Node) -> Node | None:
+    """The ``statements`` of a Swift ``Bool`` computed property's getter or method.
+
+    The grammar reuses ``name:`` for a function's return type, so the type is
+    the node after ``->``, not a field lookup.
+    """
+    if node.type == "property_declaration":
+        annotation = next((c for c in node.named_children if c.type == "type_annotation"), None)
+        computed = node.child_by_field_name("computed_value")
+        if annotation is None or computed is None:
+            return None
+        if _text(annotation.child_by_field_name("name")) != "Bool":
+            return None
+        getter = next((c for c in computed.named_children if c.type == "computed_getter"), None)
+        holder = getter if getter is not None else computed
+        return next((c for c in holder.named_children if c.type == "statements"), None)
+    if node.type == "function_declaration":
+        arrow = next((i for i, c in enumerate(node.children) if c.type == "->"), None)
+        if arrow is None or arrow + 1 >= len(node.children):
+            return None
+        if _text(node.children[arrow + 1]) != "Bool":
+            return None
+        body = node.child_by_field_name("body")
+        return next((c for c in body.named_children if c.type == "statements"), None) if body else None
     return None
 
 
@@ -359,6 +403,11 @@ def _constant_value(body: Node, dialect: _Dialect) -> bool | None:
     """The one boolean literal ``body`` returns on every path, if there is one."""
     if body.type == "arrow_expression_clause":
         return _literal(_only_named_child(body), dialect)
+    if dialect is _SWIFT:
+        # A single-expression body returns its expression implicitly.
+        implicit = _literal(_only_named_child(body), dialect)
+        if implicit is not None:
+            return implicit
     values = {
         _literal(_only_named_child(ret), dialect)
         for ret in _returns(body, dialect)
@@ -372,7 +421,11 @@ def _returns(node: Node, dialect: _Dialect) -> Iterator[Node]:
     for child in node.named_children:
         if child.type in dialect.scopes:
             continue
-        if child.type == "return_statement":
+        if child.type == "return_statement" or (
+            child.type == "control_transfer_statement"
+            and child.children
+            and child.children[0].type == "return"
+        ):
             yield child
         else:
             yield from _returns(child, dialect)
@@ -406,6 +459,16 @@ def _base_types(declaration: Node, language: str) -> tuple[str, ...]:
     """The simple names of the types ``declaration`` derives from or implements."""
     if language == "csharp":
         lists = [c for c in declaration.named_children if c.type == "base_list"]
+    elif language == "swift":
+        return tuple(
+            dict.fromkeys(
+                name
+                for spec in declaration.named_children
+                if spec.type == "inheritance_specifier"
+                for name in [_simple_name(spec.child_by_field_name("inherits_from"))]
+                if name
+            )
+        )
     else:
         lists = [
             c
@@ -433,8 +496,14 @@ def _type_entries(node: Node) -> Iterator[Node]:
 
 def _simple_name(node: Node) -> str:
     """``Gate`` for ``Gate``, ``Gate<T>``, ``Ns.Gate`` and ``Ns.Gate<T>``."""
+    if node is None:
+        return ""
     if node.type in {"identifier", "type_identifier"}:
         return _text(node)
+    if node.type == "user_type":
+        # Swift: `Gate`, `Gate<T>` and `Module.Gate` all end in the type's name.
+        names = [c for c in node.named_children if c.type == "type_identifier"]
+        return _text(names[-1]) if names else ""
     if node.type in {"generic_name", "generic_type"}:
         return _simple_name(node.named_children[0])
     if node.type in {"qualified_name", "scoped_type_identifier"}:
@@ -519,9 +588,11 @@ def _siblings(
 def _declares(declaration: Node, member: str, dialect: _Dialect) -> bool:
     body = declaration.child_by_field_name("body")
     for child in body.named_children if body else ():
-        if child.type in {"method_declaration", "property_declaration"} and _text(
-            child.child_by_field_name("name")
-        ) == member:
+        if child.type in {
+            "method_declaration",
+            "property_declaration",
+            "function_declaration",
+        } and _text(child.child_by_field_name("name")) == member:
             return True
     return False
 

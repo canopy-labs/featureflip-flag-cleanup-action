@@ -126,6 +126,17 @@ _DOUBLES = frozenset({
     "object_double", "instance_spy", "class_spy", "object_spy", "double", "spy", "stub_const",
     "stub", "stubs", "expects", "any_instance", "mock", "stub_any_instance", "unstub",
 })
+#: The calls a stub's expectation hangs off, and whether each stubs any instance.
+_STUB_HEADS = {
+    "allow": False, "expect": False, "allow_any_instance_of": True, "expect_any_instance_of": True,
+}
+_EXPECTATIONS = frozenset({"to", "not_to", "to_not"})
+_MOCHA_STUBS = frozenset({"stubs", "expects"})
+_RSPEC_STUBS = frozenset({"receive", "receive_messages", "receive_message_chain", "have_received"})
+#: Calls whose first string is a title, when they take a block.
+_SPEC_TITLED = frozenset({"describe", "context", "it", "specify", "example", "feature", "scenario", "test"})
+#: Stubbed, these hand a test something other than the owner.
+_CONSTRUCTORS = frozenset({"new", "allocate", "instance", "dup", "clone"})
 #: Where an identifier names a local or a parameter rather than reads one.
 _BINDERS = frozenset({
     "method_parameters", "block_parameters", "lambda_parameters", "optional_parameter",
@@ -208,11 +219,15 @@ def read_test(
     )
     callees = _READ_CALLEES | set(accessors)
 
-    def key_matches(value: Node | None) -> bool:
+    def key_matches(value: Node | None, symbol_ok: bool = False) -> bool:
         if value is None:
             return False
         if value.type == "string":
             return _plain_string(value) == flag_key
+        if value.type in ("simple_symbol", "delimited_symbol"):
+            # A declared accessor's symbol key, as `rules/ruby_accessors.toml`
+            # matches it. Never the SDK's: it takes a string.
+            return symbol_ok and _symbol_text(value) == flag_key
         return value.type == "constant" and (loose or _text(value) in consts)
 
     def is_read(expression: Node) -> bool:
@@ -226,7 +241,7 @@ def read_test(
         if expression.child_by_field_name("block") is not None or not arguments:
             return False
         if method in callees:
-            return key_matches(arguments[0])
+            return key_matches(arguments[0], symbol_ok=method in accessors)
         if method == _OPENFEATURE:
             return any(
                 a.type == "pair"
@@ -602,6 +617,52 @@ def _in_double(node: Node) -> bool:
     return False
 
 
+def _named_stubs(call: Node) -> bool:
+    """Whether a stub's arguments spell every method it replaces, none of them
+    one that hands out something other than the owner."""
+    arguments = _named(call.child_by_field_name("arguments"))
+    names = [
+        _symbol_text(a.child_by_field_name("key")) if a.type == "pair" else _symbol_text(a) or _plain_string(a)
+        for a in arguments
+    ]
+    return bool(names) and all(name is not None and name not in _CONSTRUCTORS for name in names)
+
+
+def _leaves_wrapper_alone(call: Node) -> bool:
+    """Whether a call on the owner is a partial double, or a plain expectation,
+    of what it names: ``allow(Flags).to receive(:other)`` and
+    ``Flags.any_instance.stubs(:other)`` replace ``other`` alone, and a stub
+    spelling the wrapper is found by its symbol."""
+    outer = call.parent
+    if _call_method(call) == "any_instance":
+        return outer is not None and _call_method(outer) in _MOCHA_STUBS and _named_stubs(outer)
+    if _call_method(call) in _MOCHA_STUBS:
+        return _named_stubs(call)
+    if _call_method(call) not in _STUB_HEADS or outer is None or _call_method(outer) not in _EXPECTATIONS:
+        return False
+    arguments = outer.child_by_field_name("arguments")
+    return arguments is not None and all(
+        _named_stubs(n) for n in _walk(arguments) if _call_method(n) in _RSPEC_STUBS
+    )
+
+
+def _spec_title(content: Node) -> bool:
+    """Whether a string's text is the title of a test or a group: the runner
+    only prints it, so it neither defines nor calls what it spells. An
+    interpolation may spell anything, so a title holding one is not."""
+    string = content.parent
+    if string is None or string.type != "string" or len(_named(string)) != 1:
+        return False
+    arguments = string.parent
+    call = arguments.parent if arguments is not None and arguments.type == "argument_list" else None
+    return (
+        call is not None
+        and _call_method(call) in _SPEC_TITLED
+        and call.child_by_field_name("block") is not None
+        and _named(arguments)[0] == string
+    )
+
+
 def _last_segment(node: Node | None) -> str:
     if node is None:
         return ""
@@ -741,7 +802,7 @@ class Index:
                 into.append((path, line_of(node), wi.text_of(node.parent or node)))
             elif kind in ("string_content", "heredoc_content") and (
                 word.search(_text(node)) or _owner_string(_text(node), wrapper)
-            ):
+            ) and not _spec_title(node):
                 into = self.doubles if _in_double(node) else self.named
                 into.append((path, line_of(node), wi.text_of(node.parent or node)))
             elif kind in ("class", "module"):
@@ -765,7 +826,7 @@ class Index:
                     self.opened.append((path, line_of(node), wi.text_of(node).split("\n", 1)[0]))
                 elif method in _DOUBLES and (
                     _last_segment(receiver) == owner or any(_last_segment(a) == owner for a in arguments)
-                ):
+                ) and not _leaves_wrapper_alone(node):
                     self.doubles.append((path, line_of(node), wi.text_of(node).split("\n", 1)[0]))
 
     def subclasses_of(self, wrapper: wi.Wrapper) -> list[tuple[str, Node]]:
@@ -1147,6 +1208,84 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
 
 
+# --- Stubs ---------------------------------------------------------------------
+
+
+def _names_wrapper(call: Node, name: str) -> bool:
+    arguments = call.child_by_field_name("arguments")
+    return arguments is not None and any(
+        _symbol_text(n) == name or (n.type == "string_content" and _text(n) == name) for n in _walk(arguments)
+    )
+
+
+def _stub_receivers(root: Node, name: str) -> Iterable[tuple[Node, bool]]:
+    """``(receiver, through any instance)`` of each stub spelling ``name``."""
+    for node in _walk(root):
+        if node.type != "call" or not _names_wrapper(node, name):
+            continue
+        method = _call_method(node)
+        receiver = node.child_by_field_name("receiver")
+        if method in _EXPECTATIONS and receiver is not None and _call_method(receiver) in _STUB_HEADS:
+            handed = _named(receiver.child_by_field_name("arguments"))
+            if len(handed) == 1:
+                yield handed[0], _STUB_HEADS[_call_method(receiver)]
+        elif method in _MOCHA_STUBS and receiver is not None:
+            if _call_method(receiver) == "any_instance":
+                yield receiver.child_by_field_name("receiver"), True
+            else:
+                yield receiver, False
+
+
+def _described_class(node: Node) -> Node | None:
+    """The class the innermost group around ``node`` describes, as RSpec's
+    ``described_class`` reads it."""
+    for ancestor in _ancestors(node):
+        if _call_method(ancestor) in ("describe", "context"):
+            arguments = _named(ancestor.child_by_field_name("arguments"))
+            if arguments and arguments[0].type in ("constant", "scope_resolution"):
+                return arguments[0]
+    return None
+
+
+def _proven_stub(receiver: Node, any_instance: bool, wrapper: wi.Wrapper) -> bool:
+    """Whether a stub on ``receiver`` replaces the wrapper: a class method on
+    its owner, an instance method on any instance of it."""
+    if any_instance == wrapper.static:
+        return False
+    if _text(receiver) == "described_class":
+        receiver = _described_class(receiver)
+    return (
+        receiver is not None
+        and receiver.type in ("constant", "scope_resolution")
+        and _constant_reaches(receiver, wrapper)
+    )
+
+
+def stub_targets(wrapper: wi.Wrapper, index: Index) -> dict[str, mock_stubs.StubTargets]:
+    """resolved path -> the receivers each stub of ``wrapper`` there is proven
+    on, for the test-double pass. The pass matches a receiver by its spelling,
+    so a spelling is kept only when every stub written that way is proven."""
+    found: dict[str, mock_stubs.StubTargets] = {}
+    # A file that only stubs the wrapper spells it as a symbol, no word of it.
+    for path in sorted({*index.parsed, *(path for path, _, _ in index.doubles)}):
+        if path.endswith(".erb"):
+            continue
+        cached = index.file(path)
+        if cached is None:
+            continue
+        proven: dict[tuple[str, bool], bool] = {}
+        for receiver, any_instance in _stub_receivers(cached[1], wrapper.name):
+            spelling = ("".join(_text(receiver).split()), any_instance)
+            proven[spelling] = proven.get(spelling, True) and _proven_stub(receiver, any_instance, wrapper)
+        spelled = [spelling for spelling, ok in proven.items() if ok]
+        if spelled:
+            found[path] = mock_stubs.StubTargets(
+                receivers=frozenset(s for s, any_instance in spelled if not any_instance),
+                instances=frozenset(s for s, any_instance in spelled if any_instance),
+            )
+    return found
+
+
 def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
     """None: a string or a symbol spelling the name refuses the wrapper at
     qualification."""
@@ -1179,7 +1318,11 @@ def leftovers(
             if (
                 (node.type == "identifier" and _text(node) == wrapper.name and not names_only(node))
                 or _symbol_text(node) == wrapper.name
-                or (node.type in ("string_content", "heredoc_content") and word.search(_text(node)))
+                or (
+                    node.type in ("string_content", "heredoc_content")
+                    and word.search(_text(node))
+                    and not _spec_title(node)
+                )
             ):
                 found.append((path, wi.line_of(node), wi.text_of(node.parent or node)))
     return found
@@ -1210,5 +1353,6 @@ wi.register(
         inert_annotations=frozenset(),
         string_mentions=string_mentions,
         leftovers=leftovers,
+        stub_targets=stub_targets,
     )
 )

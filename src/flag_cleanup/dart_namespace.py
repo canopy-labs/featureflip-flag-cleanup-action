@@ -60,6 +60,8 @@ from pathlib import Path
 import tree_sitter_dart
 from tree_sitter import Language, Node, Parser
 
+from flag_cleanup import source_index
+
 #: Bounds the export chain. Real libraries re-export a level or two; a chain
 #: this long is far more likely a cycle the ``seen`` set has not caught, and
 #: giving up costs only a missed tidy.
@@ -118,6 +120,7 @@ AUDITED_SDK: dict[str, frozenset[str]] = {
 AUDITED_SDK_VERSIONS = frozenset({
     "0.1.0", "1.0.3", "1.0.4", "2.0.0", "2.1.0", "2.2.0", "2.3.0", "2.4.0",
     "2.4.1", "2.5.0", "2.6.0", "2.6.1", "2.6.2", "2.6.3", "2.7.0", "2.8.0",
+    "2.8.1",
 })
 
 #: The hosts a lock entry may name for the SDK: pub.dev and its old name. Any
@@ -184,11 +187,54 @@ def resolver(importer: str, root: str) -> Callable[[str], Namespace | None]:
             cache[uri] = (
                 audited_sdk(uri, importer_path, root_path)
                 if target is None
-                else _library_names(target, root_path, set(), 0)
+                else _remembered_library_names(target, root_path)
             )
         return cache[uri]
 
     return resolve
+
+
+#: One list per :func:`_remembered_library_names` in progress, collecting
+#: every file :func:`read` was asked for and the bytes it found.
+_recording: list[list[tuple[Path, bytes | None]]] = []
+
+
+def _remembered_library_names(path: Path, root: Path) -> Namespace | None:
+    """:func:`_library_names`, kept for the run and reused while every file
+    it read still holds the same bytes.
+
+    Each file that imports a library resolves it again, and a widely
+    imported one (the app's configuration, its localisations, the
+    re-exports in front of them) is resolved dozens of times per flag:
+    parsing it and everything it exports each time was most of a run's
+    time. A run edits files as it goes, so a remembered answer is checked
+    against the text of every file it was read from, and recomputed when one
+    differs or has gone.
+    """
+    memo = source_index.run_memo("dart_namespace.library_names")
+    if memo is None:
+        return _library_names(path, root, set(), 0)
+    key = (path, root)
+    remembered = memo.get(key)
+    if remembered is not None and all(
+        _bytes_of(file) == contents for file, contents in remembered[0]
+    ):
+        return remembered[1]
+    reads: list[tuple[Path, bytes | None]] = []
+    _recording.append(reads)
+    try:
+        names = _library_names(path, root, set(), 0)
+    finally:
+        _recording.pop()
+    memo[key] = (tuple(reads), names)
+    return names
+
+
+def _bytes_of(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
 def audited_sdk(uri: str, importer: Path, root: Path) -> Namespace | None:
@@ -399,7 +445,11 @@ def read(path: Path) -> Node | None:
     try:
         source = path.read_bytes()
     except OSError:
+        for reads in _recording:
+            reads.append((path, None))
         return None
+    for reads in _recording:
+        reads.append((path, source))
     program = parse(source)
     return None if program.has_error else program
 

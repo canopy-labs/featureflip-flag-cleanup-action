@@ -957,10 +957,27 @@ def _dry_run_caveats(
     dart_members = sum(
         1 for path, kind, _ in bindings if kind == "unread member" and path.endswith(".dart")
     )
-    if unread_members - dart_members:
+    jvm_members = sum(
+        1
+        for path, kind, _ in bindings
+        if kind in ("unread member", "unread constructor parameter")
+        and path.endswith((".java", ".kt", ".kts"))
+    )
+    jvm_ctor = sum(
+        1
+        for path, kind, _ in bindings
+        if kind == "unread constructor parameter" and path.endswith((".java", ".kt", ".kts"))
+    )
+    unread_ctor -= jvm_ctor
+    if unread_members - dart_members - (jvm_members - jvm_ctor):
         notes.append(
-            f"{unread_members - dart_members} TypeScript/JavaScript private member(s) would be "
-            "left unread (TS6133/TS6138)"
+            f"{unread_members - dart_members - (jvm_members - jvm_ctor)} TypeScript/JavaScript "
+            "private member(s) would be left unread (TS6133/TS6138)"
+        )
+    if jvm_members:
+        notes.append(
+            f"{jvm_members} Java/Kotlin private member(s) or constructor parameter(s) would be "
+            "left unread"
         )
     if dart_members:
         notes.append(f"{dart_members} Dart private field(s) would be left unread (unused_field)")

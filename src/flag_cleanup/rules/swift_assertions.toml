@@ -1,0 +1,141 @@
+# Assertions the fold made trivially true, for swift. Appended to the rules
+# whenever `swift_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `swift.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `XCTAssertTrue(client.boolVariation("k", default: false))` in a test folds
+# to `XCTAssertTrue(true)`: a check the removal made meaningless. Reached ONLY
+# from the fold's own literal (swift_edges.toml, Parent scope from the groups
+# that write one), never as a seed, so an `XCTAssertTrue(true)` the customer
+# wrote stays. The assertion APIs are policy: XCTest's `XCTAssertTrue`,
+# `XCTAssert`, `XCTAssertFalse` and `XCTAssertEqual`, and Swift Testing's
+# `#expect`, called bare, with at most one string literal as a message. An assertion folded to the
+# FAILING literal (`XCTAssertTrue(false)`) is never matched; the Action
+# reports it. The failing forms are listed again, as text, in the Action's
+# failing-assertion check: the two lists are kept in step by hand.
+#
+# Rooted at the CALL: Swift has no statement node, a call is a direct child of
+# `statements`. The `value_argument` and `call_suffix` around the literal span
+# the same text as their child and the Parent walk skips them, so literal ->
+# `value_arguments` -> call is three of the walk's four nodes. The filter keeps
+# the call a statement: its innermost ancestor that is a `statements` holding
+# an assertion-shaped call with only literal arguments is its own list, as no
+# other ancestor can hold it. The `.` anchors around each `boolean_literal`
+# keep out a labelled argument.
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  [
+    (call_expression
+      (simple_identifier) @assert_fn
+      (call_suffix [
+        (value_arguments . (value_argument . (boolean_literal) @asserted .) .)
+        (value_arguments . (value_argument . (boolean_literal) @asserted .) . (value_argument . (line_string_literal) .) .)
+      ]))
+    (macro_invocation
+      (simple_identifier) @assert_fn
+      (call_suffix [
+        (value_arguments . (value_argument . (boolean_literal) @asserted .) .)
+        (value_arguments . (value_argument . (boolean_literal) @asserted .) . (value_argument . (line_string_literal) .) .)
+      ]))
+  ] @statement
+  (#match? @assert_fn "^(XCTAssertTrue|XCTAssert|expect)$")
+  (#eq? @asserted "true")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """[
+  (statements
+    (call_expression
+      (simple_identifier)
+      (call_suffix [
+        (value_arguments . (value_argument . (boolean_literal) .) .)
+        (value_arguments . (value_argument . (boolean_literal) .) . (value_argument . (line_string_literal) .) .)
+      ])))
+  (statements
+    (macro_invocation
+      (simple_identifier)
+      (call_suffix [
+        (value_arguments . (value_argument . (boolean_literal) .) .)
+        (value_arguments . (value_argument . (boolean_literal) .) . (value_argument . (line_string_literal) .) .)
+      ])))
+] @asserted_statements"""
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (call_expression
+    (simple_identifier) @assert_fn
+    (call_suffix [
+        (value_arguments . (value_argument . (boolean_literal) @asserted .) .)
+        (value_arguments . (value_argument . (boolean_literal) @asserted .) . (value_argument . (line_string_literal) .) .)
+      ])) @statement
+  (#eq? @assert_fn "XCTAssertFalse")
+  (#eq? @asserted "false")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(statements
+  (call_expression
+    (simple_identifier)
+    (call_suffix [
+        (value_arguments . (value_argument . (boolean_literal) .) .)
+        (value_arguments . (value_argument . (boolean_literal) .) . (value_argument . (line_string_literal) .) .)
+      ]))) @asserted_statements"""
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (call_expression
+    (simple_identifier) @assert_fn
+    (call_suffix [
+      (value_arguments
+        .
+        (value_argument . (boolean_literal) @expected .)
+        .
+        (value_argument . (boolean_literal) @actual .)
+        .)
+      (value_arguments
+        .
+        (value_argument . (boolean_literal) @expected .)
+        .
+        (value_argument . (boolean_literal) @actual .)
+        .
+        (value_argument . (line_string_literal) .)
+        .)
+    ])) @statement
+  (#eq? @assert_fn "XCTAssertEqual")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(statements
+  (call_expression
+    (simple_identifier)
+    (call_suffix [
+      (value_arguments
+        .
+        (value_argument . (boolean_literal) .)
+        .
+        (value_argument . (boolean_literal) .)
+        .)
+      (value_arguments
+        .
+        (value_argument . (boolean_literal) .)
+        .
+        (value_argument . (boolean_literal) .)
+        .
+        (value_argument . (line_string_literal) .)
+        .)
+    ]))) @asserted_statements"""

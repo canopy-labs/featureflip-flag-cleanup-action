@@ -44,6 +44,19 @@
 #        exist), so a static call of that name is somebody else's method.
 #    Neither needs a filter; the node types simply do not match.
 #
+#    THE STATIC CALL IS AN ACCESSOR-ONLY ARM. A project's own read is very
+#    often static: Laravel Pennant's primary form is `Feature::active('k')`,
+#    and a facade over any client is spelled the same way. A customer naming
+#    `active` in `accessors` asserts that a call of that name is a boolean read
+#    of the key, whatever its receiver, exactly as they do for
+#    `$x->active('k')`. So the `scoped_call_expression` arm below is written as
+#    a `; accessor-arm:` comment: the seed (the SDK's own name) never matches
+#    it, and `rule_synthesis` uncomments it in every accessor clone. The scope
+#    is not constrained, for the same reason a member call's receiver is not.
+#    Only a STRING first argument matches, so `Feature::someAreActive(['k',
+#    …])` (an array of keys) never folds: which key decided it is not
+#    something this rule can know.
+#
 # 4. THE BOOLEAN NODE IS `(boolean)`, NOT `(true)`/`(false)`. Java and Go have
 #    separate node types per literal and their rules match `(false)` directly;
 #    copying that shape here fails at query-compile time with
@@ -67,7 +80,13 @@ query = """(
       function: (name) @sdk_fn
       arguments: (arguments
         . (argument [(string . (string_content) @flag_name .)
-                     (encapsed_string . (string_content) @flag_name .)])))] @call
+                     (encapsed_string . (string_content) @flag_name .)])))
+   ; accessor-arm: (scoped_call_expression
+   ; accessor-arm:    name: (name) @sdk_fn
+   ; accessor-arm:    arguments: (arguments
+   ; accessor-arm:      . (argument [(string . (string_content) @flag_name .)
+   ; accessor-arm:                   (encapsed_string . (string_content) @flag_name .)])))
+   ] @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""

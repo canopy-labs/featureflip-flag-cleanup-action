@@ -38,10 +38,8 @@ allow-list there does NOT cover for this module, because this module runs
 whatever it is handed. The queries are constant; the key and the value are
 compared in Python against the captured text.
 
-Java and Swift have no entry rules at all (their map entries cannot be deleted
-with their separator in one edit until the fork ships ``replace_node_end``), so
-they have nothing to decline and no table row here. The TypeScript family has
-entry rules and declines nothing either: see the note above ``_DETECTORS``.
+The TypeScript family has entry rules and declines nothing: see the note
+above ``_DETECTORS``.
 """
 
 from __future__ import annotations
@@ -54,10 +52,12 @@ from functools import lru_cache
 import tree_sitter_c_sharp
 import tree_sitter_dart
 import tree_sitter_go
+import tree_sitter_java
 import tree_sitter_kotlin
 import tree_sitter_php
 import tree_sitter_python
 import tree_sitter_ruby
+import tree_sitter_swift
 from tree_sitter import Language, Parser, Query, QueryCursor
 
 from flag_cleanup import syntax
@@ -70,9 +70,11 @@ class _Detector:
     """How to find a flag-keyed boolean entry in one language.
 
     ``queries`` are CONSTANT — see the module docstring for why nothing is
-    interpolated into them. Each must capture ``@entry`` (the node whose text
-    the body prints), ``@flag_name`` (the key, compared against the flag) and
-    ``@value`` (the boolean literal). More than one query where a language
+    interpolated into them. Each must capture ``@flag_name`` (the key, compared
+    against the flag), ``@value`` (the boolean literal) and the text the body
+    prints: either ``@entry``, one node, or, where an entry is not one node
+    (Java's ``Map.of("k", true)`` argument pairs, Swift's dictionary literal),
+    ``@entry_start`` and, when it does not end at the value, ``@entry_end``. More than one query where a language
     spells the same idea two ways — C#'s collection initializer and its indexer
     form — rather than one query with an alternation, because the two shapes do
     not share a parent node.
@@ -100,6 +102,12 @@ class _Detector:
     case_sensitive: bool = True
     quoted_key: bool = False
     operator: str | None = None
+    #: Java's ``Map.of`` takes its keys and values as ONE flat argument list,
+    #: so whether a string is a key depends on its position. The rules decline
+    #: a list that does not strictly alternate a string key with a non-string
+    #: value, starting with a key (see ``java_entries.toml``); a query that
+    #: captures ``@pairs`` (that argument list) is held to the same test here.
+    pair_parity: bool = False
 
 
 # No row for `ts`, `tsx` or `js`. Their entry rules strip a pin instead of
@@ -134,14 +142,26 @@ _DETECTORS: dict[str, _Detector] = {
 )""",),
         case_sensitive=False,
     ),
+    # The map literal's entry, and its statement form `m["k"] = true`. The
+    # statement query is weaker than the rule (any operand, any position) for
+    # the reason in the module docstring: both prongs decline this value.
     "go": _Detector(
         tree_sitter_go.language,
-        ("""(
+        (
+            """(
   (keyed_element
     . (literal_element
         (interpreted_string_literal . (interpreted_string_literal_content) @flag_name .))
     . (literal_element [(true) (false)]) @value) @entry
-)""",),
+)""",
+            """(
+  (assignment_statement
+    left: (expression_list
+      . (index_expression
+          index: (interpreted_string_literal . (interpreted_string_literal_content) @flag_name .)) .)
+    right: (expression_list . [(true) (false)] @value .)) @entry
+)""",
+        ),
     ),
     # Kotlin parses `true`/`false` in this position as a plain `identifier`
     # rather than as their own node types, which is why the rule compares the
@@ -166,6 +186,71 @@ _DETECTORS: dict[str, _Detector] = {
   (pair . (string_literal) @flag_name . [(true) (false)] @value) @entry
 )""",),
         quoted_key=True,
+    ),
+    # Four shapes, mirroring the four rule families in `java_entries.toml`.
+    # The callee and receiver predicates are CONSTANT text, never the key.
+    "java": _Detector(
+        tree_sitter_java.language,
+        (
+            """(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      (string_literal . (string_fragment) @flag_name .) @entry_start
+      . [(true) (false)] @value) @pairs)
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\\\.util\\\\.)?Map|(com\\\\.google\\\\.common\\\\.collect\\\\.)?Immutable(Sorted)?Map)$")
+)""",
+            """(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .)) @entry))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\\\.util\\\\.)?Map$")
+)""",
+            """(
+  (block
+    (expression_statement
+      (method_invocation
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .))) @entry)
+  (#eq? @method "put")
+)""",
+            """(
+  (method_invocation
+    object: (method_invocation
+      "." @entry_start
+      name: (identifier) @method
+      arguments: (argument_list
+        . (string_literal . (string_fragment) @flag_name .)
+        . [(true) (false)] @value .) @entry_end)
+    name: (identifier) @outer_method)
+  (#eq? @method "put")
+  (#match? @outer_method "^(put|build|buildOrThrow|buildKeepingLast)$")
+)""",
+        ),
+        pair_parity=True,
+    ),
+    # A dictionary literal has no pair node: the key and value are siblings
+    # under their `key:`/`value:` fields, which is also what keeps a string
+    # VALUE from being read as a key.
+    "swift": _Detector(
+        tree_sitter_swift.language,
+        ("""(
+  (dictionary_literal
+    key: (line_string_literal . (line_str_text) @flag_name .) @entry_start
+    . value: (boolean_literal) @value)
+)""",),
     ),
     "csharp": _Detector(
         tree_sitter_c_sharp.language,
@@ -224,6 +309,26 @@ def _text(node, data: bytes) -> str:
     return data[node.start_byte : node.end_byte].decode("utf-8", "replace")
 
 
+def _alternates(pairs, key, data: bytes) -> bool:
+    """Whether ``key`` sits in a KEY position of a flat key/value argument list.
+
+    The test the Java rules' parity filter makes: every argument at an even
+    position is a string literal, every other one is not, and the key is at an
+    even position. Judged by TEXT (a leading ``"``), as the rules judge it.
+    Comments are not arguments, here as there.
+    """
+    arguments = [
+        child
+        for child in pairs.named_children
+        if child.type not in ("line_comment", "block_comment")
+    ]
+    for index, argument in enumerate(arguments):
+        if _text(argument, data).startswith('"') != (index % 2 == 0):
+            return False
+    starts = [argument.start_byte for argument in arguments]
+    return key.start_byte in starts and starts.index(key.start_byte) % 2 == 0
+
+
 def _entries_in(source: str, language: str, flag_key: str, untreated: str) -> list[str]:
     """Text of every flag-keyed entry in ``source`` valued ``untreated``."""
     detector = _DETECTORS[language]
@@ -237,8 +342,13 @@ def _entries_in(source: str, language: str, flag_key: str, untreated: str) -> li
             entry = (captures.get("entry") or (None,))[0]
             name = (captures.get("flag_name") or (None,))[0]
             value = (captures.get("value") or (None,))[0]
-            if entry is None or name is None or value is None:
+            start = entry or (captures.get("entry_start") or (None,))[0]
+            end = entry or (captures.get("entry_end") or (value,))[0]
+            if start is None or end is None or name is None or value is None:
                 continue
+            if detector.pair_parity and "pairs" in captures:
+                if not _alternates(captures["pairs"][0], start, data):
+                    continue
             if _text(name, data) not in keys:
                 continue
             if detector.operator is not None:
@@ -253,9 +363,8 @@ def _entries_in(source: str, language: str, flag_key: str, untreated: str) -> li
             # The engine's own match range for a deleted entry includes the
             # trailing separator, and `_flag_keyed_entries` strips it for the
             # same reason this does: the body is for a reviewer, not a diff.
-            found[entry.start_byte] = (
-                _text(entry, data).strip().strip(",;").strip()
-            )
+            text = data[start.start_byte : end.end_byte].decode("utf-8", "replace")
+            found[start.start_byte] = text.strip().strip(",;").strip()
     # Source order, and keyed by position: C#'s two queries cannot match the
     # same node today, but a future third shape might, and a PR body that names
     # one entry twice reads as two problems.

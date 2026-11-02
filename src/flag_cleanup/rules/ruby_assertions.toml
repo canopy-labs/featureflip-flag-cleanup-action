@@ -1,0 +1,1080 @@
+# Assertions the fold made trivially true, for ruby. Appended to the rules
+# whenever `ruby_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `ruby.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the call is deleted
+#
+# `expect(client.bool_variation("k", ctx, false)).to be(true)` in a spec folds
+# to `expect(true).to be(true)`: a check the removal made meaningless. Reached
+# ONLY from the fold's own literal (ruby_edges.toml, Parent scope from the
+# groups that write one), never as a seed, so an `expect(true).to be(true)` the
+# customer wrote stays. The assertion APIs are policy: RSpec's
+# `expect(<literal>).to be|eq(<literal>)` (with or without parentheses),
+# `expect(true).to be_truthy` and `expect(false).to be_falsey`; minitest's
+# `assert true`, `refute false`, `assert_not false` and
+# `assert_equal <literal>, <literal>`. Every
+# call is receiverless (the leading `.` anchor makes `method` the first named
+# child) and carries at most ONE string literal as a message: anything else could
+# be the last reader of a local. An assertion folded to the FAILING
+# literal (`expect(false).to be(true)`) is never matched; the Action reports
+# it. The failing forms are listed again, as text, in the Action's
+# failing-assertion check: the two lists are kept in step by hand.
+#
+# Ruby has no statement node: a call in statement position is a direct child
+# of its statement list, so the rules are rooted at the CALL. From either
+# literal of `expect(true).to be(true)` the walk reaches it in four nodes (an
+# `argument_list` without parentheses spans the same text as its child, and
+# the walk skips it). The filters are what keep the call a statement, and each
+# API needs two rules because the two cases resolve differently:
+#
+# * Among other statements (`delete_trivially_*`): `enclosing_node` resolves
+#   to the innermost ancestor with an assertion-shaped call as a DIRECT child,
+#   which is the call's own parent (the call itself has no such child: its
+#   receiver is `expect`, not a minitest name). `contains` then requires that
+#   parent to be a statement list (a method or `do` body, a `{ }` block body)
+#   holding such a call directly. So `ok = expect(true).to be(true)` stays,
+#   its parent being the `assignment`, even beside a hand-written
+#   `expect(true).to be(true)` statement. Asking the nearest statement list
+#   instead deleted the right-hand side there (measured).
+# * The ONLY statement (`delete_sole_trivially_*`): a statement list of one
+#   statement spans that statement's text, and the engine resolves a filter's
+#   ancestor to the smallest node over its range, which is the call itself, so
+#   the first filter can never see the list (measured: `it { expect(true).to
+#   be(true) }` stayed). Here the list is matched with the call as its only
+#   child, anchored, which no other statement list can be.
+#
+# Capture names inside a filter must differ from the rule's: the engine fills
+# a filter's `@name` from the match before parsing it (measured, an
+# `@assert_fn` in the filter became the bare word `assert`). Statements under
+# `then`/`else` or at the top of a file are not matched; they stay.
+
+[[rules]]
+name = "delete_trivially_equal_expect"
+query = """(
+  (call
+    receiver: (call
+      .
+      method: (identifier) @expect_fn
+      arguments: (argument_list . [(true) (false)] @actual .))
+    method: (identifier) @to
+    arguments: (argument_list
+      .
+      (call
+        .
+        method: (identifier) @matcher
+        arguments: (argument_list . [(true) (false)] @expected .))
+      .)) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @to "to")
+  (#match? @matcher "^(be|eq)$")
+  (#eq? @actual @expected)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  (_
+    [
+      (call
+        receiver: (call
+          .
+          method: (identifier) @any_expect
+          arguments: (argument_list . [(true) (false)] .))
+        method: (identifier) @any_to
+        arguments: (argument_list
+          .
+          [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+          .))
+      (call
+        .
+        method: (identifier) @any_assert
+        arguments: [
+          (argument_list . [(true) (false)] .)
+          (argument_list . [(true) (false)] . [(true) (false)] .)
+          (argument_list . [(true) (false)] . (string) .)
+          (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+        ])
+    ]) @parent
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+contains = """(
+  [
+    (body_statement
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+    (block_body
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_sole_trivially_equal_expect"
+query = """(
+  (call
+    receiver: (call
+      .
+      method: (identifier) @expect_fn
+      arguments: (argument_list . [(true) (false)] @actual .))
+    method: (identifier) @to
+    arguments: (argument_list
+      .
+      (call
+        .
+        method: (identifier) @matcher
+        arguments: (argument_list . [(true) (false)] @expected .))
+      .)) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @to "to")
+  (#match? @matcher "^(be|eq)$")
+  (#eq? @actual @expected)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  [
+    (body_statement
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+    (block_body
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_trivially_truthy_expect"
+query = """(
+  (call
+    receiver: (call
+      .
+      method: (identifier) @expect_fn
+      arguments: [(argument_list . (true) .) (argument_list . (true) . (string) .)])
+    method: (identifier) @to
+    arguments: (argument_list . (identifier) @matcher .)) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @to "to")
+  (#eq? @matcher "be_truthy")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  (_
+    [
+      (call
+        receiver: (call
+          .
+          method: (identifier) @any_expect
+          arguments: (argument_list . [(true) (false)] .))
+        method: (identifier) @any_to
+        arguments: (argument_list
+          .
+          [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+          .))
+      (call
+        .
+        method: (identifier) @any_assert
+        arguments: [
+          (argument_list . [(true) (false)] .)
+          (argument_list . [(true) (false)] . [(true) (false)] .)
+          (argument_list . [(true) (false)] . (string) .)
+          (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+        ])
+    ]) @parent
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+contains = """(
+  [
+    (body_statement
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+    (block_body
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_sole_trivially_truthy_expect"
+query = """(
+  (call
+    receiver: (call
+      .
+      method: (identifier) @expect_fn
+      arguments: [(argument_list . (true) .) (argument_list . (true) . (string) .)])
+    method: (identifier) @to
+    arguments: (argument_list . (identifier) @matcher .)) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @to "to")
+  (#eq? @matcher "be_truthy")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  [
+    (body_statement
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+    (block_body
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_trivially_falsy_expect"
+query = """(
+  (call
+    receiver: (call
+      .
+      method: (identifier) @expect_fn
+      arguments: [(argument_list . (false) .) (argument_list . (false) . (string) .)])
+    method: (identifier) @to
+    arguments: (argument_list . (identifier) @matcher .)) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @to "to")
+  (#eq? @matcher "be_falsey")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  (_
+    [
+      (call
+        receiver: (call
+          .
+          method: (identifier) @any_expect
+          arguments: (argument_list . [(true) (false)] .))
+        method: (identifier) @any_to
+        arguments: (argument_list
+          .
+          [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+          .))
+      (call
+        .
+        method: (identifier) @any_assert
+        arguments: [
+          (argument_list . [(true) (false)] .)
+          (argument_list . [(true) (false)] . [(true) (false)] .)
+          (argument_list . [(true) (false)] . (string) .)
+          (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+        ])
+    ]) @parent
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+contains = """(
+  [
+    (body_statement
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+    (block_body
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_sole_trivially_falsy_expect"
+query = """(
+  (call
+    receiver: (call
+      .
+      method: (identifier) @expect_fn
+      arguments: [(argument_list . (false) .) (argument_list . (false) . (string) .)])
+    method: (identifier) @to
+    arguments: (argument_list . (identifier) @matcher .)) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @to "to")
+  (#eq? @matcher "be_falsey")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  [
+    (body_statement
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+    (block_body
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (call
+    .
+    method: (identifier) @assert_fn
+    arguments: [(argument_list . (true) .) (argument_list . (true) . (string) .)]) @statement
+  (#eq? @assert_fn "assert")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  (_
+    [
+      (call
+        receiver: (call
+          .
+          method: (identifier) @any_expect
+          arguments: (argument_list . [(true) (false)] .))
+        method: (identifier) @any_to
+        arguments: (argument_list
+          .
+          [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+          .))
+      (call
+        .
+        method: (identifier) @any_assert
+        arguments: [
+          (argument_list . [(true) (false)] .)
+          (argument_list . [(true) (false)] . [(true) (false)] .)
+          (argument_list . [(true) (false)] . (string) .)
+          (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+        ])
+    ]) @parent
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+contains = """(
+  [
+    (body_statement
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+    (block_body
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_sole_trivially_true_assertion"
+query = """(
+  (call
+    .
+    method: (identifier) @assert_fn
+    arguments: [(argument_list . (true) .) (argument_list . (true) . (string) .)]) @statement
+  (#eq? @assert_fn "assert")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  [
+    (body_statement
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+    (block_body
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (call
+    .
+    method: (identifier) @assert_fn
+    arguments: [(argument_list . (false) .) (argument_list . (false) . (string) .)]) @statement
+  (#match? @assert_fn "^(refute|assert_not)$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  (_
+    [
+      (call
+        receiver: (call
+          .
+          method: (identifier) @any_expect
+          arguments: (argument_list . [(true) (false)] .))
+        method: (identifier) @any_to
+        arguments: (argument_list
+          .
+          [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+          .))
+      (call
+        .
+        method: (identifier) @any_assert
+        arguments: [
+          (argument_list . [(true) (false)] .)
+          (argument_list . [(true) (false)] . [(true) (false)] .)
+          (argument_list . [(true) (false)] . (string) .)
+          (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+        ])
+    ]) @parent
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+contains = """(
+  [
+    (body_statement
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+    (block_body
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_sole_trivially_false_assertion"
+query = """(
+  (call
+    .
+    method: (identifier) @assert_fn
+    arguments: [(argument_list . (false) .) (argument_list . (false) . (string) .)]) @statement
+  (#match? @assert_fn "^(refute|assert_not)$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  [
+    (body_statement
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+    (block_body
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (call
+    .
+    method: (identifier) @assert_fn
+    arguments: [
+      (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)
+      (argument_list . [(true) (false)] @expected . [(true) (false)] @actual . (string) .)
+    ]) @statement
+  (#eq? @assert_fn "assert_equal")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  (_
+    [
+      (call
+        receiver: (call
+          .
+          method: (identifier) @any_expect
+          arguments: (argument_list . [(true) (false)] .))
+        method: (identifier) @any_to
+        arguments: (argument_list
+          .
+          [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+          .))
+      (call
+        .
+        method: (identifier) @any_assert
+        arguments: [
+          (argument_list . [(true) (false)] .)
+          (argument_list . [(true) (false)] . [(true) (false)] .)
+          (argument_list . [(true) (false)] . (string) .)
+          (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+        ])
+    ]) @parent
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+contains = """(
+  [
+    (body_statement
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+    (block_body
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ])
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""
+
+[[rules]]
+name = "delete_sole_trivially_equal_assertion"
+query = """(
+  (call
+    .
+    method: (identifier) @assert_fn
+    arguments: [
+      (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)
+      (argument_list . [(true) (false)] @expected . [(true) (false)] @actual . (string) .)
+    ]) @statement
+  (#eq? @assert_fn "assert_equal")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(
+  [
+    (body_statement
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+    (block_body
+      .
+      [
+        (call
+          receiver: (call
+            .
+            method: (identifier) @any_expect
+            arguments: (argument_list . [(true) (false)] .))
+          method: (identifier) @any_to
+          arguments: (argument_list
+            .
+            [(call . method: (identifier) arguments: (argument_list . [(true) (false)] .)) (identifier)]
+            .))
+        (call
+          .
+          method: (identifier) @any_assert
+          arguments: [
+            (argument_list . [(true) (false)] .)
+            (argument_list . [(true) (false)] . [(true) (false)] .)
+            (argument_list . [(true) (false)] . (string) .)
+            (argument_list . [(true) (false)] . [(true) (false)] . (string) .)
+          ])
+      ]
+      .)
+  ] @statement_list
+  (#eq? @any_expect "expect")
+  (#eq? @any_to "to")
+  (#match? @any_assert "^(assert|refute|assert_not|assert_equal)$")
+)"""

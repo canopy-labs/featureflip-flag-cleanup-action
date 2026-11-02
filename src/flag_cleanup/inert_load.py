@@ -19,8 +19,9 @@ did not bind earlier in the file (a global may not exist, and an import may be
 in its temporal dead zone in a cycle), and any operator that can call
 ``valueOf``/``toString`` on an object or throw on a primitive.
 
-A load the module makes in turn is followed: every non-type import and every
-``export … from``. A package specifier cannot be read without
+A load the module makes in turn is followed: every non-type import, every
+``export … from``, and in a CommonJS module every top-level ``require`` of a
+string. A package specifier cannot be read without
 ``node_modules``, which the checkout does not have, so it is never inert,
 except for the Featureflip SDKs in :data:`SIDE_EFFECT_FREE_PACKAGES`. Neither
 is a specifier the resolver cannot pin to one file, a declaration file
@@ -57,6 +58,8 @@ from tree_sitter import Language, Node, Parser
 from flag_cleanup import cross_file_ts
 
 _DECLARATION_FILES = (".d.ts", ".d.mts", ".d.cts")
+#: The left side of a CommonJS export.
+_COMMONJS_EXPORT = re.compile(r"module\.exports(?:\.[\w$]+)?|exports\.[\w$]+")
 
 #: The Featureflip SDK specifiers whose load does nothing: every file each one
 #: exports, under every published version and every ``exports`` condition, adds
@@ -239,10 +242,31 @@ def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: se
     except (OSError, UnicodeDecodeError):
         raise _NotInert from None
     root = _parser(_grammar(str(resolved))).parse(source.encode("utf-8")).root_node
-    if root.has_error or _declaring_script(root):
+    commonjs = _commonjs(resolved, stop)
+    if root.has_error or _declaring_script(root, commonjs):
         raise _NotInert
-    for loaded in _module_loads(root):
+    for loaded in _module_loads(root, commonjs):
         _check_load(str(resolved), loaded, repo_dir, stop, seen)
+
+
+def _commonjs(path: Path, stop: Path) -> bool:
+    """Whether Node runs ``path`` as a CommonJS module: a ``.cjs`` file, or a
+    ``.js`` one whose nearest ``package.json`` does not say ``"type": "module"``.
+    Anywhere else ``module`` is no binding, and a write to it throws."""
+    if path.suffix == ".cjs":
+        return True
+    if path.suffix != ".js":
+        return False
+    for directory in path.parents:
+        manifest = directory / "package.json"
+        if manifest.is_file():
+            try:
+                return json.loads(manifest.read_text(encoding="utf-8")).get("type") != "module"
+            except (OSError, ValueError, AttributeError):
+                return False
+        if directory == stop:
+            break
+    return True
 
 
 def _sdk(reader: str, specifier: str, repo_dir: str, stop: Path) -> bool:
@@ -663,7 +687,7 @@ def _manifest_substitutes(path: str) -> bool:
     return any(package in text for package in _SDK_PACKAGES)
 
 
-def _declaring_script(root: Node) -> bool:
+def _declaring_script(root: Node, commonjs: bool = False) -> bool:
     """A file with no ``import`` or ``export`` is a global SCRIPT to the
     compiler, so whatever it declares is global, and this import may be the
     only thing putting it in the program. One that declares nothing (what a
@@ -674,11 +698,44 @@ def _declaring_script(root: Node) -> bool:
         and not (c.type == "expression_statement" and [n.type for n in c.named_children] == ["string"])
     ]
     return bool(statements) and not any(
-        c.type in {"import_statement", "export_statement"} for c in statements
+        c.type in {"import_statement", "export_statement"} or (commonjs and _commonjs_export(c) is not None)
+        for c in statements
     )
 
 
-def _module_loads(root: Node) -> list[str]:
+def _commonjs_export(statement: Node) -> Node | None:
+    """The value of ``module.exports = v``, ``module.exports.x = v`` or
+    ``exports.x = v``: Node's module wrapper binds both names, so such a
+    file is a module, and a write to them reaches nothing outside it."""
+    if statement.type != "expression_statement" or len(statement.named_children) != 1:
+        return None
+    assignment = statement.named_children[0]
+    if assignment.type != "assignment_expression":
+        return None
+    target = assignment.child_by_field_name("left")
+    if target is None or target.type != "member_expression":
+        return None
+    written = target.text.decode("utf-8", "replace")
+    if _COMMONJS_EXPORT.fullmatch(written) is None:
+        return None
+    return assignment.child_by_field_name("right")
+
+
+def _required(node: Node | None) -> str | None:
+    """The specifier of ``require("<string>")``."""
+    if node is None or node.type != "call_expression":
+        return None
+    callee = node.child_by_field_name("function")
+    arguments = node.child_by_field_name("arguments")
+    named = [] if arguments is None else [c for c in arguments.named_children if c.type != "comment"]
+    if callee is None or callee.type != "identifier" or callee.text != b"require":
+        return None
+    if len(named) != 1 or named[0].type != "string":
+        return None
+    return named[0].text.decode("utf-8", "replace")[1:-1]
+
+
+def _module_loads(root: Node, commonjs: bool = False) -> list[str]:
     """The specifiers ``root`` loads, raising if any top-level statement runs."""
     bound = {
         _name(statement)
@@ -688,7 +745,7 @@ def _module_loads(root: Node) -> list[str]:
     primitive: set[str] = set()
     loads: list[str] = []
     for statement in root.named_children:
-        loads.extend(_statement(statement, bound, primitive))
+        loads.extend(_statement(statement, bound, primitive, commonjs))
     return loads
 
 
@@ -713,7 +770,7 @@ def _source(node: Node) -> str:
     return node.child_by_field_name("source").text.decode("utf-8", "replace")[1:-1]
 
 
-def _statement(node: Node, bound: set[str], primitive: set[str]) -> list[str]:
+def _statement(node: Node, bound: set[str], primitive: set[str], commonjs: bool = False) -> list[str]:
     kind = node.type
     if kind == "comment":
         if node.text.startswith(b"///") and node.text[3:].lstrip().startswith(b"<reference"):
@@ -725,6 +782,14 @@ def _statement(node: Node, bound: set[str], primitive: set[str]) -> list[str]:
         # A directive prologue entry ("use strict", "use client").
         if [c.type for c in node.named_children] == ["string"]:
             return []
+        if not commonjs:
+            raise _NotInert
+        value = _commonjs_export(node)
+        if value is not None and not {"module", "exports"} & bound and _kind(value, bound, primitive) is not None:
+            return []
+        loaded = _required(node.named_children[0]) if len(node.named_children) == 1 else None
+        if loaded is not None and "require" not in bound:
+            return [loaded]
         raise _NotInert
     if kind == "import_statement":
         if any(c.type == "type" for c in node.children):
@@ -739,8 +804,7 @@ def _statement(node: Node, bound: set[str], primitive: set[str]) -> list[str]:
         bound.add(_name(node))
         return []
     if kind in {"lexical_declaration", "variable_declaration"}:
-        _variables(node, bound, primitive)
-        return []
+        return _variables(node, bound, primitive, commonjs)
     if kind == "enum_declaration":
         _enum(node, bound, primitive)
         bound.add(_name(node))
@@ -788,16 +852,26 @@ def _class(node: Node, bound: set[str], primitive: set[str]) -> None:
             raise _NotInert
 
 
-def _variables(node: Node, bound: set[str], primitive: set[str]) -> None:
+def _variables(node: Node, bound: set[str], primitive: set[str], commonjs: bool = False) -> list[str]:
+    """The specifiers the declaration ``require``s, recording what it binds."""
+    loads: list[str] = []
     for declarator in node.named_children:
         if declarator.type == "comment":
             continue
         if declarator.type != "variable_declarator":
             raise _NotInert
         name = declarator.child_by_field_name("name")
+        value = declarator.child_by_field_name("value")
+        loaded = _required(value) if commonjs and "require" not in bound else None
+        if loaded is not None and name is not None and _plain_binding(name):
+            loads.append(loaded)
+            # Whatever the module exports: a value, as far as this file can say.
+            for bound_name in _plain_names(name):
+                bound.add(bound_name)
+                primitive.discard(bound_name)
+            continue
         if name is None or name.type != "identifier":
             raise _NotInert
-        value = declarator.child_by_field_name("value")
         text = name.text.decode("utf-8", "replace")
         if value is None:
             # `var x;` again keeps whatever `x` already holds.
@@ -811,6 +885,22 @@ def _variables(node: Node, bound: set[str], primitive: set[str]) -> None:
             primitive.add(text)
         else:
             primitive.discard(text)
+    return loads
+
+
+def _plain_binding(name: Node) -> bool:
+    """A name, or an object pattern of names, which reads one property of the
+    exports object each, as an import binding does."""
+    return name.type == "identifier" or (
+        name.type == "object_pattern"
+        and all(c.type in {"shorthand_property_identifier_pattern", "comment"} for c in name.named_children)
+    )
+
+
+def _plain_names(name: Node) -> list[str]:
+    if name.type == "identifier":
+        return [name.text.decode("utf-8", "replace")]
+    return [c.text.decode("utf-8", "replace") for c in name.named_children if c.type != "comment"]
 
 
 def _enum(node: Node, bound: set[str], primitive: set[str]) -> None:

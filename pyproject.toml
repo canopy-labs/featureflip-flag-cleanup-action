@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.0.0"
+version = "2.1.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -502,7 +502,37 @@ dependencies = [
     # TypeScript-family engine run now hands a file whose compiler config
     # sets the automatic runtime. No grammar rev moved, so `+canopy.3` and
     # `+canopy.1` stay.
-    "polyglot-piranha==0.41.0",
+    #
+    # 0.42.0. A folded Kotlin, Swift, Dart or Go branch that declares locals
+    # is spliced under the same "nothing else spells those names" condition
+    # (Kotlin and Swift used to refuse the flag; Dart and Go kept a bare
+    # block). A header the fold leaves wrapped in redundant parentheses is
+    # unwrapped where each language's formatter would strip them (Go, TS/JS,
+    # Python, Ruby, Swift). Python deletes statements a folded jump left
+    # unreachable, a bare trailing `return` the fold leaves last in a
+    # void function is deleted, and TS/JS and Python fold `E && false` /
+    # `E || true` in a condition when E is pure. Ancestor-filter matches are
+    # memoised per `get_matches` call, which takes large TS files from tens
+    # of seconds to about two. No grammar rev moved, so `+canopy.3` and
+    # `+canopy.1` stay.
+    #
+    # 0.43.0. Swift: a condition list whose `false` comes before a binding
+    # folds; a comment on a `return`'s own line survives the dead-code
+    # cleanup; a labelled `if` settles its label before folding; a condition
+    # list a `true` clause left is laid out as swift-format writes it. Dart:
+    # a private method or function the fold stranded is deleted, and a
+    # folded `return` takes its whole dead tail. Go: a spliced block keeps
+    # the comments at its edges. Python: `*([…])`, `**({…})` and
+    # `bool(<literal>)` the fold leaves are cleaned up. Ruby: a folded
+    # `return` takes every dead statement and comment after it. C#/Java: a
+    # kept branch holding `#pragma`/preprocessor lines re-indents correctly.
+    # All languages: a blank-line run is collapsed only where an edit touched
+    # it. TS/JS: a folded conditional spread and a `.filter(…)` whose
+    # predicate folded to true are resolved. ERB: a `case` split across tags
+    # parses, a deleted tag line goes entirely, and a rewritten tag keeps
+    # its trim marker and layout. No grammar rev moved, so `+canopy.3` and
+    # `+canopy.1` stay.
+    "polyglot-piranha==0.43.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

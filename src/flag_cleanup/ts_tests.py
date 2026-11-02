@@ -280,9 +280,6 @@ def rename_kept_titles(
     """
     data = source.encode("utf-8")
     root = _parse(source, language)
-    clauses = _kept_clauses(flag_key, kept)
-    key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", re.IGNORECASE)
-    removed = _removed_state_pattern(flag_key, "true" if kept == "false" else "false")
     edits: list[tuple[int, int, bytes]] = []
     renamed: list[tuple[str, str]] = []
     for node, _callee, title in _titled_tests(root, data):
@@ -291,23 +288,34 @@ def rename_kept_titles(
             continue
         literal = arguments.named_children[0]
         raw = data[literal.start_byte + 1 : literal.end_byte - 1].decode("utf-8")
-        if raw != title or "\n" in title or not key.search(title) or _HEDGES.search(title):
-            continue
-        new = _drop_kept_clause(title, clauses)
-        if (
-            new is None
-            or not new.strip()
-            or key.search(new)
-            or removed.search(new)
-            # Never cut through an escape sequence.
-            or new.count("\\") != title.count("\\")
-        ):
+        new = reworded_title(title, flag_key, kept) if raw == title else None
+        if new is None:
             continue
         edits.append((literal.start_byte + 1, literal.end_byte - 1, new.encode("utf-8")))
         renamed.append((title, new))
     for start, end, text in sorted(edits, reverse=True):
         data = data[:start] + text + data[end:]
     return data.decode("utf-8"), renamed
+
+
+def reworded_title(title: str, flag_key: str, kept: str) -> str | None:
+    """``title`` with the flag's condition dropped, or ``None`` when it does not
+    pass the bar :func:`rename_kept_titles` sets."""
+    key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", re.IGNORECASE)
+    if "\n" in title or not key.search(title) or _HEDGES.search(title):
+        return None
+    new = _drop_kept_clause(title, _kept_clauses(flag_key, kept))
+    removed = _removed_state_pattern(flag_key, "true" if kept == "false" else "false")
+    if (
+        new is None
+        or not new.strip()
+        or key.search(new)
+        or removed.search(new)
+        # Never cut through an escape sequence.
+        or new.count("\\") != title.count("\\")
+    ):
+        return None
+    return new
 
 
 def _kept_clauses(flag_key: str, kept: str) -> list[tuple[re.Pattern[str], str]]:

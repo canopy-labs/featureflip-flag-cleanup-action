@@ -32,10 +32,10 @@ import tokenize
 _MAX_ROUNDS = 200
 
 #: Shared verbatim with :data:`flag_cleanup.kotlin_sentinel._SENTINEL_PREFIX`,
-#: and deliberately not imported from it: the two mark different things at
-#: different times (that one rewrites a CALLEE before the engine runs, this one
-#: stands in for a NAME after it) and only the "no real codebase contains this"
-#: property is common. They can never meet — one language each.
+#: and it has to be here: a Python wrapper call is replaced whole by
+#: ``<sentinel>(True)``, which the marker rule folds to that argument. A language
+#: whose sentinel keeps the call's own arguments must not share this identifier:
+#: see :func:`flag_cleanup.ts_fold.marker_for`.
 _MARKER_PREFIX = "__ff_cleanup_"
 
 

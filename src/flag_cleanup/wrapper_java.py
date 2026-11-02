@@ -8,6 +8,7 @@ by a text the cross-file resolution proved.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 
 from tree_sitter import Node
@@ -16,6 +17,11 @@ from flag_cleanup import cross_file_keys, key_const, mock_stubs, syntax, wrapper
 from flag_cleanup import wrapper_inline as wi
 
 EXTENSIONS = (".java",)
+#: A call whose arguments it asserts on: `assertThat(x)`, `assertTrue(x)`, and
+#: BDD's `then(x)`.
+_ASSERTION = re.compile(r"assert[A-Z]\w*|then")
+#: What builds a mock, whose read is the stub's answer and not the member's.
+_MOCK_ANNOTATIONS = frozenset({"Mock", "MockBean", "MockitoBean"})
 _COMMENTS = frozenset({"line_comment", "block_comment"})
 
 
@@ -320,6 +326,45 @@ def _pattern_binds(call: Node, name: str) -> bool:
     return False
 
 
+def _asserted(call: Node) -> bool:
+    """Whether ``call`` is what an assertion in its statement is about."""
+    node = call.parent
+    while node is not None and node.type != "block":
+        if node.type == "assert_statement":
+            return True
+        if node.type == "method_invocation" and _ASSERTION.fullmatch(_text(node.child_by_field_name("name"))):
+            return True
+        node = node.parent
+    return False
+
+
+def _mocked(root: Node, name: str) -> bool:
+    """Whether the file declares ``name`` as a mock anywhere: a name, so a
+    second binding of it can only keep a test."""
+    for node in cross_file_keys.walk(root):
+        if node.type not in ("field_declaration", "local_variable_declaration"):
+            continue
+        declared = [
+            c for c in node.named_children
+            if c.type == "variable_declarator" and _text(c.child_by_field_name("name")) == name
+        ]
+        if not declared:
+            continue
+        modifiers = next((c for c in node.children if c.type == "modifiers"), None)
+        annotations = [
+            _text(c.child_by_field_name("name")).rsplit(".", 1)[-1]
+            for c in (modifiers.named_children if modifiers is not None else ())
+            if c.type in ("marker_annotation", "annotation")
+        ]
+        values = [c.child_by_field_name("value") for c in declared]
+        if _MOCK_ANNOTATIONS.intersection(annotations) or any(
+            v is not None and v.type == "method_invocation" and _text(v.child_by_field_name("name")) == "mock"
+            for v in values
+        ):
+            return True
+    return False
+
+
 def _binding(call: Node, name: str, class_only: bool) -> str | None:
     """The type ``name`` is bound to at ``call``: a type text, ``_UNTYPED``,
     ``_STOP``, or ``None`` when nothing in the file binds it."""
@@ -484,6 +529,15 @@ def occurrences(
             reason = wi.RECEIVER_UNPROVEN
         if reason is None and _argument_has_call(call):
             reason = wi.ARGUMENT_HAS_CALL
+        if reason is None and name is not None and not double and _asserted(call) and not _mocked(root, name):
+            test = mock_stubs.test_around(call, data, "java")
+            if test is not None:
+                # The wrapper's own unit test: what it asserts about the
+                # member goes with it, and folded it would assert a literal.
+                found.append(
+                    wi.Occurrence(path, line, wi.text_of(call), None, wi.SIBLING_RECEIVER, name, True, scope=test)
+                )
+                continue
         span = (call.start_byte, node.end_byte) if reason is None else None
         found.append(wi.Occurrence(path, line, wi.text_of(call), span, reason, name, double))
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))

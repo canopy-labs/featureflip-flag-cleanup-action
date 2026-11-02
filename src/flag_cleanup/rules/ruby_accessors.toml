@@ -1,0 +1,207 @@
+# Accessor TEMPLATES for Ruby (and ERB, which takes `ruby.toml`). Never handed
+# to the engine.
+#
+# `piranha_runner` stages only canonically-named files, so this one is a source
+# of blocks to CLONE, not a rule set: `rule_synthesis.with_accessors` emits one
+# clone per block per name in `accessors` into the generated `ruby.toml`, and
+# the templates themselves never appear in it.
+#
+# WHY RUBY HAS ONE
+#
+# Without this file the clones come from `ruby.toml`'s seed rules, which take
+# the key as a STRING only, and must: the SDK's `bool_variation` takes a
+# string, so a symbol there is a different call (see that file's header). A
+# project's own predicate is another matter. Ruby flag libraries and wrappers
+# commonly name a flag with a symbol (`Flipper.enabled?(:new_checkout)`,
+# `Feature.enabled?(:new_checkout)`), and a customer naming such a method in
+# `accessors` is asserting that its first argument names the flag, in
+# whichever literal form the code writes it.
+#
+# So the first two blocks are the two seed shapes, unchanged, and the last two
+# add the symbol forms. A symbol can only equal a key exactly:
+#
+#   enabled?(:new_checkout)      key `new_checkout`   simple_symbol `:new_checkout`
+#   enabled?(:"new-checkout")    key `new-checkout`   delimited_symbol, one string_content
+#   enabled?(:new_checkout_v2)   not the key
+#   enabled?(:"new-#{x}")        never: interpolated, like a string key
+#
+# A key that is not a valid bare symbol (`new-checkout`) cannot be the text of
+# a `simple_symbol` at all (`:new-checkout` parses as a subtraction), so only
+# its quoted form can match.
+#
+# The callee name is a placeholder. `rule_synthesis` substitutes it per
+# accessor, and this file is never loaded, so the value only has to be
+# something no real rule uses. `groups` is load-bearing in every block: the
+# cleanup cascade is wired on the group, never on a rule name.
+
+
+# --- <callee>("KEY", ...) -> @treated
+#
+# `ruby.toml`'s `bool_variation` seed, verbatim but for the callee. The `"."`
+# anchor excludes `&.`; the leading `.` in the second arm admits a
+# receiverless call without letting `&.` back in; `(string . (string_content) .)`
+# excludes an interpolated key.
+[[rules]]
+name = "accessor_template__string_key"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list . (string . (string_content) @flag_name .)))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list . (string . (string_content) @flag_name .)))] @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- <callee>(flag_key: "KEY", ...) -> @treated
+#
+# `ruby.toml`'s OpenFeature keyword seed, verbatim but for the callee: cloned
+# for every accessor before this file existed, so kept.
+[[rules]]
+name = "accessor_template__keyword_key"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list
+       (pair key: (hash_key_symbol) @kw value: (string . (string_content) @flag_name .))))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list
+       (pair key: (hash_key_symbol) @kw value: (string . (string_content) @flag_name .))))] @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @kw "flag_key")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- <callee>(:KEY, ...) -> @treated
+#
+# The whole `simple_symbol` is compared, colon included: the hole is
+# substituted inside the longer string, so `:new_checkout_v2` and
+# `:new_checkout?` are different texts and never match.
+[[rules]]
+name = "accessor_template__symbol_key"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list . (simple_symbol) @flag_name))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list . (simple_symbol) @flag_name))] @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name ":@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- <callee>(:"KEY", ...) -> @treated
+#
+# Anchored on both sides of the one `string_content`, like a string key, so an
+# interpolated `:"new-#{x}"` is excluded.
+[[rules]]
+name = "accessor_template__quoted_symbol_key"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list . (delimited_symbol . (string_content) @flag_name .)))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list . (delimited_symbol . (string_content) @flag_name .)))] @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+# --- <recv>&.<callee>("KEY", ...) in a condition
+#
+# Safe navigation is `nil` when the receiver is, so as a value it is no boolean
+# and stays. As a condition, where `nil` and `false` are both falsy, it is one:
+# served false it is `false`, and served true it is truthy exactly when the
+# receiver is not `nil`, so it is the receiver. Which of the two applies is the
+# run's treatment, which a rule cannot ask, so each compares the key against a
+# hole that holds it in that treatment and is empty in the other, which no key
+# equals. The receiver is no literal, so that rule starts no cascade.
+
+[[rules]]
+name = "accessor_template__safe_nav_condition_served_false"
+query = """(
+  [
+    (if condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (elsif condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (if_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (conditional condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unary operand: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary left: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary right: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+  ]
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name "@safe_nav_false_flag_name")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "safe_nav_false_flag_name"]
+
+[[rules]]
+name = "accessor_template__safe_nav_condition_served_true"
+query = """(
+  [
+    (if condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (elsif condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (if_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unless_modifier condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (conditional condition: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (unary operand: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary left: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+    (binary right: (call
+      receiver: (_) @receiver operator: "&." method: (identifier) @sdk_fn
+      arguments: (argument_list . (string . (string_content) @flag_name .))) @call)
+  ]
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @flag_name "@safe_nav_true_flag_name")
+)"""
+replace_node = "call"
+replace = "@receiver"
+holes = ["safe_nav_true_flag_name"]

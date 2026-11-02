@@ -43,7 +43,15 @@ query = """(
         . (argument
             . (class_constant_access_expression
                 . [(name) (qualified_name) (relative_name)] @key_owner
-                (name) @key_member .) .)))] @call
+                (name) @key_member .) .)))
+   ; accessor-arm: (scoped_call_expression
+   ; accessor-arm:    name: (name) @sdk_fn
+   ; accessor-arm:    arguments: (arguments
+   ; accessor-arm:      . (argument
+   ; accessor-arm:          . (class_constant_access_expression
+   ; accessor-arm:              . [(name) (qualified_name) (relative_name)] @key_owner
+   ; accessor-arm:              (name) @key_member .) .)))
+   ] @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
@@ -71,7 +79,11 @@ query = """(
       arguments: (arguments . (argument . (name) @key_member .)))
    (function_call_expression
       function: (name) @sdk_fn
-      arguments: (arguments . (argument . (name) @key_member .)))] @call
+      arguments: (arguments . (argument . (name) @key_member .)))
+   ; accessor-arm: (scoped_call_expression
+   ; accessor-arm:    name: (name) @sdk_fn
+   ; accessor-arm:    arguments: (arguments . (argument . (name) @key_member .)))
+   ] @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -116,7 +128,17 @@ query = """(
                 object: (class_constant_access_expression
                   . [(name) (qualified_name) (relative_name)] @key_owner
                   (name) @key_member .)
-                name: (name) @key_accessor) .)))] @call
+                name: (name) @key_accessor) .)))
+   ; accessor-arm: (scoped_call_expression
+   ; accessor-arm:    name: (name) @sdk_fn
+   ; accessor-arm:    arguments: (arguments
+   ; accessor-arm:      . (argument
+   ; accessor-arm:          . (member_access_expression
+   ; accessor-arm:              object: (class_constant_access_expression
+   ; accessor-arm:                . [(name) (qualified_name) (relative_name)] @key_owner
+   ; accessor-arm:                (name) @key_member .)
+   ; accessor-arm:              name: (name) @key_accessor) .)))
+   ] @call
   (#eq? @sdk_fn "boolVariation")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")

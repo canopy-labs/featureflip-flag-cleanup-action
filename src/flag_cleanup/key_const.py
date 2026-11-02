@@ -54,7 +54,7 @@ from typing import Callable
 
 from tree_sitter import Node
 
-from flag_cleanup import kotlin_sentinel, ts_syntax
+from flag_cleanup import dead_branches, kotlin_sentinel, ts_syntax
 
 __all__ = ["KeyConst", "path_is_safe", "supported_languages", "key_consts"]
 
@@ -164,6 +164,7 @@ def path_is_safe(
     language: str,
     flag_key: str,
     accessors: tuple[str, ...] | frozenset[str] = (),
+    treatment: bool | None = None,
 ) -> bool:
     """Whether the key-const rules may run over this file.
 
@@ -179,6 +180,11 @@ def path_is_safe(
     Files with no hoisted key at all are trivially safe -- the const rules match
     nothing in them. That is also the overwhelmingly common case, so this
     returns after one walk for almost every file the runner hands it.
+
+    ``treatment``, when given, leaves out a reference inside a block the fold
+    of one of the file's own removable reads deletes (see
+    :func:`dead_references`): it goes with the block. The runner must then
+    check the rewritten file, since this only predicts the fold.
     """
     accessor_names = frozenset(accessors)
     profile = _PROFILES.get(language)
@@ -189,6 +195,11 @@ def path_is_safe(
         return True
     if profile.withholds is not None and profile.withholds(root, source_bytes, consts):
         return False
+    blocks = (
+        _dead_blocks(root, source_bytes, language, consts, profile, accessor_names, treatment)
+        if treatment is not None and dead_branches.supported(language)
+        else []
+    )
 
     declared_ids = {node.id for const in consts for node in const.name_nodes}
     # Computed once for the whole file rather than per candidate node.
@@ -215,10 +226,118 @@ def path_is_safe(
         if bindings != 1:
             return False
         if not all(
-            profile.is_removable_read(node, accessor_names) for node in references
+            profile.is_removable_read(node, accessor_names) or dead_branches.inside(node, blocks)
+            for node in references
         ):
             return False
     return True
+
+
+def dead_references(
+    root: Node,
+    source_bytes: bytes,
+    language: str,
+    flag_key: str,
+    accessors: tuple[str, ...] | frozenset[str],
+    treatment: bool,
+) -> dict[str, list[Node]]:
+    """Per hoisted key's name, the references the gate leaves out under
+    ``treatment``: neither a binding nor a removable read, and inside a block
+    the fold of a removable read deletes. The runner asks it of the original
+    file, then checks none of those names is still referenced once the
+    declaration is gone (:func:`dangling_names`)."""
+    profile = _PROFILES.get(language)
+    if profile is None or not dead_branches.supported(language):
+        return {}
+    consts = profile.key_consts(root, source_bytes, flag_key)
+    if not consts:
+        return {}
+    blocks = _dead_blocks(root, source_bytes, language, consts, profile, frozenset(accessors), treatment)
+    if not blocks:
+        return {}
+    accessor_names = frozenset(accessors)
+    found: dict[str, list[Node]] = {}
+    for const in consts:
+        for node in _walk(root):
+            # A binding inside the block is no concern here: it already
+            # withholds the file in `path_is_safe`, whose count it breaks.
+            if (
+                dead_branches.inside(node, blocks)
+                and profile.is_reference(node, source_bytes, const.name)
+                and not profile.is_removable_read(node, accessor_names)
+            ):
+                found.setdefault(const.name, []).append(node)
+    return found
+
+
+def dangling_names(
+    root: Node, source_bytes: bytes, language: str, flag_key: str, names: set[str]
+) -> set[str]:
+    """Which of ``names`` the file still references although it no longer
+    declares them as a hoisted key: what a deleted declaration left behind."""
+    profile = _PROFILES.get(language)
+    if profile is None or not names:
+        return set()
+    declared = {const.name for const in profile.key_consts(root, source_bytes, flag_key)}
+    return {
+        name
+        for name in names - declared
+        if any(profile.is_reference(node, source_bytes, name) for node in _walk(root))
+    }
+
+
+def dead_reference_survived(
+    original: str,
+    rewritten: str,
+    language: str,
+    flag_key: str,
+    accessors: tuple[str, ...] | frozenset[str],
+    treatment: bool,
+) -> bool:
+    """Whether a name :func:`path_is_safe` let go with a deleted block is
+    still referenced in ``rewritten`` while its declaration is gone. The
+    check that makes leaving it out safe."""
+    if not dead_branches.supported(language) or flag_key not in original:
+        return False
+    from flag_cleanup import syntax
+
+    left_out = dead_references(
+        syntax._parse(original, language), original.encode("utf-8"), language, flag_key,
+        accessors, treatment,
+    )
+    if not left_out:
+        return False
+    data = rewritten.encode("utf-8")
+    return bool(
+        dangling_names(syntax._parse(rewritten, language), data, language, flag_key, set(left_out))
+    )
+
+
+def _dead_blocks(
+    root: Node,
+    source_bytes: bytes,
+    language: str,
+    consts: list[KeyConst],
+    profile: _Profile,
+    accessor_names: frozenset[str],
+    treatment: bool,
+) -> list[tuple[int, int]]:
+    """The blocks the fold of a removable read of one of ``consts`` deletes:
+    the read must be the call that is an ``if``'s whole condition, not one
+    nested inside it."""
+
+    def is_read(call: Node) -> bool:
+        for node in _walk(call):
+            if (
+                any(profile.is_reference(node, source_bytes, const.name) for const in consts)
+                and profile.is_removable_read(node, accessor_names)
+                and dead_branches.nearest_call(node, language) is not None
+                and dead_branches.nearest_call(node, language).id == call.id
+            ):
+                return True
+        return False
+
+    return dead_branches.dead_blocks(root, language, treatment, is_read)
 
 
 def _text(node: Node, source_bytes: bytes) -> str:
@@ -286,7 +405,8 @@ _CSHARP_BINDING_PARENTS = (
 
 
 def _csharp_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
-    """Every ``const string`` whose value is ``flag_key``.
+    """Every ``const string`` whose value is ``flag_key``, as a literal or as
+    ``nameof(flag_key)``.
 
     Both `field_declaration` (class level) and `local_declaration_statement`
     (inside a method) qualify, matching the two shapes ``csharp_const.toml``
@@ -325,11 +445,16 @@ def _csharp_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[K
             (c for c in declarator.named_children if name is None or c.id != name.id),
             None,
         )
-        if name is None or value is None or value.type != "string_literal":
+        if name is None or value is None:
             continue
-        content = next(
-            (c for c in value.named_children if c.type == "string_literal_content"), None
-        )
+        if value.type == "invocation_expression":
+            content = _csharp_nameof_argument(value)
+        elif value.type == "string_literal":
+            content = next(
+                (c for c in value.named_children if c.type == "string_literal_content"), None
+            )
+        else:
+            continue
         # `""` has no content child. Not a key we could match either way.
         if content is None or _text(content, source_bytes) != flag_key:
             continue
@@ -341,6 +466,20 @@ def _csharp_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[K
             )
         )
     return found
+
+
+def _csharp_nameof_argument(invocation: Node) -> Node | None:
+    """The plain name ``nameof(NAME)`` takes, None for any other call."""
+    function = invocation.child_by_field_name("function")
+    arguments = invocation.child_by_field_name("arguments")
+    if function is None or function.type != "identifier" or function.text != b"nameof":
+        return None
+    if arguments is None or len(arguments.named_children) != 1:
+        return None
+    argument = arguments.named_children[0]
+    if len(argument.named_children) != 1 or argument.named_children[0].type != "identifier":
+        return None
+    return argument.named_children[0]
 
 
 def _csharp_lambda_parameter_name(lambda_node: Node) -> str | None:
@@ -398,6 +537,48 @@ def _csharp_is_mock_expression_read(invocation: Node) -> bool:
     return receiver.text.decode("utf-8") == _csharp_lambda_parameter_name(lambda_node)
 
 
+def _csharp_attribute_name(attribute: Node) -> str:
+    """An attribute's name as an ``accessors`` entry spells it: ``FeatureGate``
+    for ``Mvc.FeatureGateAttribute``."""
+    name = attribute.child_by_field_name("name")
+    assert name is not None and name.text is not None
+    last = name.text.decode("utf-8").rsplit(".", 1)[-1]
+    return last.removesuffix("Attribute") or last
+
+
+def _csharp_is_gate_argument(argument: Node, accessors: frozenset[str]) -> bool:
+    """Whether ``argument``, an ``attribute_argument``, is all that an attribute
+    gate takes. :mod:`flag_cleanup.csharp_gates` removes such a gate."""
+    arguments = argument.parent
+    attribute = arguments.parent if arguments is not None else None
+    return (
+        attribute is not None
+        and attribute.type == "attribute"
+        and len(argument.named_children) == 1
+        and len(arguments.named_children) == 1
+        and _csharp_attribute_name(attribute) in accessors
+    )
+
+
+def _csharp_names_itself(identifier: Node) -> bool:
+    """Whether ``identifier`` is the ``Beta`` in ``Beta = nameof(Beta)``, which
+    goes with the declaration."""
+    current = identifier
+    for _ in range(3):  # argument, argument_list, invocation_expression
+        current = current.parent if current is not None else None
+    if current is None or current.parent is None or current.type != "invocation_expression":
+        return False
+    declarator = current.parent
+    argument = _csharp_nameof_argument(current)
+    name = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+    return (
+        argument is not None
+        and argument.id == identifier.id
+        and name is not None
+        and name.text == identifier.text
+    )
+
+
 def _csharp_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     """Whether ``identifier`` is a key argument ``csharp_const.toml`` removes.
 
@@ -407,13 +588,16 @@ def _csharp_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bo
     withhold a file the rules could have cleaned.
 
     A name in ``accessors`` is matched like `BoolVariation` -- plain, not
-    awaited-only -- because that is the shape its clone takes.
+    awaited-only -- because that is the shape its clone takes. It may also name
+    an attribute gate, which a pass after the rules removes.
 
     The key may also be spelled ``Owner.NAME`` when the owner is declared in
     this file (:func:`_csharp_qualified_by_owner`), which the rules match too.
     """
     argument = identifier
     parent = identifier.parent
+    if _csharp_names_itself(identifier):
+        return True
     if (
         parent is not None
         and parent.type == "member_access_expression"
@@ -423,6 +607,8 @@ def _csharp_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bo
         if not _csharp_qualified_by_owner(parent):
             return False
         argument = parent
+    if argument.parent is not None and argument.parent.type == "attribute_argument":
+        return _csharp_is_gate_argument(argument.parent, accessors)
     invocation = _first_argument_of(argument, "argument", "argument_list")
     if invocation is None or invocation.type != "invocation_expression":
         return False
@@ -1025,18 +1211,24 @@ def _php_is_removable_read(name_node: Node, accessors: frozenset[str]) -> bool:
 def _php_is_removable_argument(value: Node, accessors: frozenset[str]) -> bool:
     """Whether ``value`` is the first argument of a read the PHP rules fold:
     a ``boolVariation`` (or configured accessor) call, outside string
-    interpolation."""
+    interpolation. A static call (``Feature::active(…)``) is a read only for a
+    configured accessor: the rules carry that arm in accessor clones alone
+    (see the `; accessor-arm:` lines in ``php.toml``)."""
     call = _first_argument_of(value, "argument", "arguments")
     if call is None or call.type not in (
         "member_call_expression",
         "function_call_expression",
+        "scoped_call_expression",
     ):
         return False
     callee = call.child_by_field_name("name") or call.child_by_field_name("function")
     if callee is None or callee.type != "name":
         return False
     name = callee.text.decode("utf-8")
-    if name not in _PHP_FLAG_READ_CALLEES and name not in accessors:
+    if call.type == "scoped_call_expression":
+        if name not in accessors:
+            return False
+    elif name not in _PHP_FLAG_READ_CALLEES and name not in accessors:
         return False
     # The rules never fold a read inside string interpolation (`"{$c->...}"`
     # would become `"{true}"`), so it stays, and so must the const it reads.
@@ -1133,6 +1325,38 @@ def _ruby_is_binding(node: Node) -> bool:
         if name is not None and name.id == node.id:
             return True
     return False
+
+
+def _ruby_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bool:
+    """Whether the name is spelled somewhere no ``constant`` node covers.
+
+    `private_constant :FLAG_KEY`, `deprecate_constant`, `public_constant`,
+    `const_get(:FLAG_KEY)` and `const_defined?("FLAG_KEY")` all name the
+    constant through a SYMBOL or a STRING, which `is_reference` never sees.
+    Deleting the declaration under such a mention leaves code that raises
+    `NameError` when it runs -- for `private_constant`, when the file loads.
+    So any token spelling of the name outside a comment and outside a
+    `constant` node (those the per-reference loop already judges) withholds
+    the file and keeps the declaration. It is the same token scan the
+    cross-file side runs over a declaring file, so the two agree on what a
+    mention is; an over-count, such as the name inside a log message, only
+    keeps a declaration.
+    """
+    names = sorted({const.name for const in consts})
+    pattern = re.compile(
+        rb"(?<![A-Za-z0-9_])(?:%s)(?![A-Za-z0-9_])"
+        % b"|".join(re.escape(n.encode("utf-8")) for n in names)
+    )
+    covered = [
+        (node.start_byte, node.end_byte)
+        for node in _walk(root)
+        if node.type == "comment"
+        or (node.type == "constant" and _text(node, source_bytes) in names)
+    ]
+    return any(
+        not any(start <= hit.start() < end for start, end in covered)
+        for hit in pattern.finditer(source_bytes)
+    )
 
 
 def _ruby_is_removable_read(constant: Node, accessors: frozenset[str]) -> bool:
@@ -2012,6 +2236,7 @@ _PROFILES.update(
             is_reference=lambda n, b, name: _is_named_identifier(n, b, name, ("constant",)),
             is_binding=_ruby_is_binding,
             is_removable_read=_ruby_is_removable_read,
+            withholds=_ruby_withholds,
         ),
         "php": _Profile(
             key_consts=_php_key_consts,

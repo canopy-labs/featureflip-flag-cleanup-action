@@ -43,8 +43,9 @@ in the rules instead was rejected when the refusals were written: a
 silently. Reading the stub first needs no rule at all.
 
 **Only when this run folded a real read**, which the runner asks after the
-engine (:func:`folded_a_read`); otherwise it undoes the whole transform and
-runs it again without this pass. A stub sits in
+engine (:func:`folded_a_read`), or when another language of the directory
+performs one (:func:`performs_a_read`), as Java does under a Kotlin test;
+otherwise it undoes the whole transform and runs it again without this pass. A stub sits in
 a test while the read it stubs sits in production code, so a repository whose
 read the rules cannot match — a key held in a variable — would otherwise get a
 pull request that deletes its tests and nothing else.
@@ -88,6 +89,9 @@ from flag_cleanup.key_const import (
     _GO_FLAG_READ_CALLEES,
     _JAVA_FLAG_READ_CALLEES,
     _KOTLIN_FLAG_READ_CALLEES,
+    _PHP_FLAG_READ_CALLEES,
+    _PYTHON_FLAG_READ_CALLEES,
+    _RUBY_FLAG_READ_CALLEES,
     _TS_FLAG_READ_CALLEES,
 )
 
@@ -119,6 +123,8 @@ _CHAIN = r"(?:[\w$!?]+(?:\(\s*\))?\s*\.\s*)+"
 #: A bare mock expression, as handed to ``verify(...)`` or ``when(...)``.
 _MOCK = r"[\w$.!?]+"
 _BOOL = r"(?P<value>true|false)"
+#: mockito-kotlin's stub openers, which its infix `doReturn` follows.
+_KOTLIN_WHEN = r"(?:whenever|`when`)"
 #: A C# wrapper stub's value: a literal, or a name a helper's parameter may
 #: hold (:mod:`flag_cleanup.cs_param_pins`).
 _VALUE = r"(?:(?P<value>true|false)|(?P<param>[A-Za-z_]\w*))"
@@ -128,7 +134,7 @@ _VALUE = r"(?:(?P<value>true|false)|(?P<param>[A-Za-z_]\w*))"
 _DSL = re.compile(
     r"\b(?:when|`when`|whenever|given|every|coEvery|verify|coVerify|verifyNever|"
     r"Verify|VerifyGet|Setup|SetupGet|EXPECT|doReturn|Returns|ReturnsAsync|ReturnsForAnyArgs|"
-    r"Received|DidNotReceive|thenReturn|thenResolve|willReturn)\b"
+    r"Received|DidNotReceive|thenReturn|thenResolve|willReturn|withArgs)\b"
 )
 
 
@@ -152,6 +158,9 @@ class _Profile:
     test_name: Callable[[Node, bytes], str | None]
     parse: Callable[[str, str], Node]
     reads: frozenset[str]
+    #: Node types holding statements unless a mocking DSL owns them: Kotlin's
+    #: `every { read }` lambda describes a read, and holds no line of a test.
+    lambda_blocks: frozenset[str] = frozenset()
 
 
 def _text(node: Node, data: bytes) -> str:
@@ -172,8 +181,11 @@ def _simple_name(text: str) -> str:
     return text.rsplit(".", 1)[-1].removesuffix("Attribute")
 
 
-#: Marks a single test. Any PARAMETERISED marker beside it disqualifies the
-#: method: its stub's value may be one row of a table, not the whole test.
+#: Marks a single test. In C# any PARAMETERISED marker beside it disqualifies
+#: the method: its stub's value may be one row of a table, not the whole test.
+#: On the JVM such a method is a test: a stub of a row (`thenReturn(value)`)
+#: matches no recogniser, so it stays unprovable, and a literal holds in every
+#: row.
 _TEST_MARKERS = frozenset({"Test", "Fact", "TestMethod"})
 _PARAMETERISED_MARKERS = frozenset(
     {
@@ -196,6 +208,10 @@ def _marked_test(markers: list[str], node: Node, data: bytes) -> str | None:
     return _text(name, data) if name is not None else None
 
 
+def _jvm_marked(markers: list[str]) -> bool:
+    return bool({_simple_name(m) for m in markers} & (_TEST_MARKERS | _PARAMETERISED_MARKERS))
+
+
 def _java_test(node: Node, data: bytes) -> str | None:
     if node.type != "method_declaration":
         return None
@@ -205,21 +221,43 @@ def _java_test(node: Node, data: bytes) -> str | None:
     markers = [
         _text(c, data) for c in modifiers.children if c.type in ("marker_annotation", "annotation")
     ]
-    return _marked_test(markers, node, data)
+    name = node.child_by_field_name("name")
+    return _text(name, data) if _jvm_marked(markers) and name is not None else None
+
+
+#: minutest, Spek and Kotest: a single test, or a group whose `before {}` a
+#: stub of the removed value sends with every test under it.
+_KOTLIN_TEST_CALLEES = frozenset({"test", "it", "should", "context", "describe"})
+
+
+def _kotlin_call_test(node: Node, data: bytes) -> str | None:
+    """``test("title") { … }``, and the title with no interpolation."""
+    call = node.named_children[0] if node.named_children else None
+    if call is None or call.type != "call_expression" or not any(c.type == "annotated_lambda" for c in node.children):
+        return None
+    callee = call.named_children[0]
+    arguments = next((c for c in call.children if c.type == "value_arguments"), None)
+    if callee.type != "identifier" or _text(callee, data) not in _KOTLIN_TEST_CALLEES or arguments is None:
+        return None
+    values = [c for c in arguments.named_children if c.type == "value_argument"]
+    title = values[0].named_children[0] if len(values) == 1 and values[0].named_children else None
+    if title is None or title.type != "string_literal":
+        return None
+    parts = [c for c in title.named_children if "comment" not in c.type]
+    return _text(parts[0], data) if len(parts) == 1 and parts[0].type == "string_content" else None
 
 
 def _kotlin_test(node: Node, data: bytes) -> str | None:
+    if node.type == "call_expression":
+        return _kotlin_call_test(node, data)
     if node.type != "function_declaration":
         return None
     modifiers = next((c for c in node.children if c.type == "modifiers"), None)
     if modifiers is None:
         return None
     markers = [_text(c, data) for c in modifiers.children if c.type == "annotation"]
-    names = {_simple_name(m) for m in markers}
-    if not names & _TEST_MARKERS or names & _PARAMETERISED_MARKERS:
-        return None
     name = next((c for c in node.children if c.type in ("identifier", "simple_identifier")), None)
-    return _text(name, data) if name is not None else None
+    return _text(name, data) if _jvm_marked(markers) and name is not None else None
 
 
 def _csharp_test(node: Node, data: bytes) -> str | None:
@@ -310,6 +348,75 @@ def _ts_test(node: Node, data: bytes) -> str | None:
     return "".join(_text(c, data) for c in title.named_children)
 
 
+#: RSpec's examples and ActiveSupport's ``test "…" do``, each with its focused
+#: and skipped spellings: a single test.
+_RUBY_TEST_CALLEES = frozenset(
+    {"it", "specify", "example", "scenario", "test", "fit", "fspecify", "fexample", "xit", "xspecify", "xexample"}
+)
+#: A group whose ``before`` a stub of the removed value sends with every test
+#: under it, unless it is the file's outermost: see :func:`_ruby_test`.
+_RUBY_GROUP_CALLEES = frozenset({"context", "describe", "feature", "fcontext", "fdescribe", "xcontext", "xdescribe"})
+
+
+def _ruby_callee(node: Node, data: bytes) -> str | None:
+    """A call's method name, when it takes a block and has no receiver but
+    ``RSpec``."""
+    if node.type != "call" or node.child_by_field_name("block") is None:
+        return None
+    receiver = node.child_by_field_name("receiver")
+    if receiver is not None and _text(receiver, data) != "RSpec":
+        return None
+    method = node.child_by_field_name("method")
+    return _text(method, data) if method is not None else None
+
+
+def _ruby_test(node: Node, data: bytes) -> str | None:
+    """A Minitest method, an example, or a group inside another group.
+
+    The outermost group is not one: it is the file's tests, of whatever they
+    are about, so a ``before`` there stubbing the removed value leaves no one
+    test to delete, as a ``setUp`` does not. Its stub stays, and keeps the
+    wrapper."""
+    if node.type == "method":
+        name = node.child_by_field_name("name")
+        return _text(name, data) if name is not None and _text(name, data).startswith("test_") else None
+    callee = _ruby_callee(node, data)
+    if callee in _RUBY_GROUP_CALLEES:
+        ancestor = node.parent
+        while ancestor is not None and _ruby_callee(ancestor, data) not in _RUBY_GROUP_CALLEES:
+            ancestor = ancestor.parent
+        if ancestor is None:
+            return None
+    elif callee not in _RUBY_TEST_CALLEES:
+        return None
+    arguments = node.child_by_field_name("arguments")
+    title = arguments.named_children[0] if arguments is not None and arguments.named_children else None
+    return _text(title, data).strip("\"'") if title is not None else callee
+
+
+def _php_test(node: Node, data: bytes) -> str | None:
+    """A PHPUnit method, by its name, a ``#[Test]`` or a ``@test`` docblock, or
+    a Pest ``it("…", …)`` or ``test("…", …)``."""
+    if node.type == "method_declaration":
+        name = _text(node.child_by_field_name("name"), data)
+        attributes = [c for c in node.children if c.type == "attribute_list"]
+        docblock = node.prev_named_sibling
+        marked = any(re.search(r"\bTest\b", _text(a, data)) for a in attributes) or (
+            docblock is not None and docblock.type == "comment" and "@test" in _text(docblock, data)
+        )
+        return name if name.startswith("test") or marked else None
+    if node.type != "expression_statement" or not node.named_children:
+        return None
+    call = node.named_children[0]
+    if call.type != "function_call_expression":
+        return None
+    callee = call.child_by_field_name("function")
+    arguments = call.child_by_field_name("arguments")
+    if callee is None or _text(callee, data) not in ("it", "test") or arguments is None or not arguments.named_children:
+        return None
+    return _text(arguments.named_children[0], data).strip("\"'")
+
+
 def _mockito_patterns(read_call: str, read: str, key: str) -> list[tuple[str, str]]:
     """Mockito and BDDMockito, and the Kotlin and Dart ports of them."""
     when = r"(?:(?:Mockito|BDDMockito)\.)?(?:when|`when`|whenever|given)"
@@ -395,8 +502,9 @@ class WrapperStub:
 
 @dataclass(frozen=True)
 class StubTargets:
-    """Where a TypeScript or JavaScript test may stub one keyless wrapper in one
-    file, as the wrapper pass proved it (see :mod:`flag_cleanup.wrapper_ts`).
+    """Where a test may stub one keyless wrapper in one file, as the wrapper
+    pass proved it (see :mod:`flag_cleanup.wrapper_ts` and
+    :mod:`flag_cleanup.wrapper_ruby`).
 
     ``receivers`` are the objects a stub may name, as written with the
     whitespace taken out (``m``, ``flags``, ``Flags.prototype``,
@@ -405,10 +513,15 @@ class StubTargets:
     ``modules`` names every module mock proven to target the wrapper's own
     module; whether a factory there is resolvable is decided by the test-double
     pass. An automock never is.
+
+    In Ruby, ``receivers`` are the constants a class method is stubbed on, and
+    ``instances`` those an instance method is stubbed on through any instance
+    (``allow_any_instance_of(Flags)``, ``Flags.any_instance``).
     """
 
     receivers: frozenset[str] = frozenset()
     modules: frozenset[str] = frozenset()
+    instances: frozenset[str] = frozenset()
 
 
 #: The calls that replace a whole module, with a factory or without one.
@@ -525,6 +638,7 @@ def _wrapper_patterns(language: str, names: str, receivers: str) -> list[tuple[s
     if language == "kt":
         patterns += [
             (STUB, rf"(?:co)?every\s*\{{\s*{read_call}\s*\}}\s*returns\s+{_BOOL}"),
+            (STUB, rf"{_KOTLIN_WHEN}\(\s*{read_call}\s*\)\s+doReturn\s+{_BOOL}"),
             (VERIFICATION, rf"(?:co)?verify\s*(?:\({_BALANCED}\))?\s*\{{\s*{read_call}\s*\}}"),
         ]
     return patterns
@@ -587,6 +701,10 @@ def reads_through(text: str, pattern: re.Pattern[str]) -> bool:
     return False
 
 
+#: Languages whose tests a sibling read deletes.
+_SIBLING_LANGUAGES = frozenset({"csharp", "java", "kt"})
+
+
 def _csharp_any_test(node: Node, data: bytes) -> bool:
     """Whether ``node`` is a C# test method of any kind, parameterised
     included: a read through a sibling deletes the test whatever its rows."""
@@ -602,6 +720,14 @@ def _csharp_any_test(node: Node, data: bytes) -> bool:
     return bool(names & (_TEST_MARKERS | _PARAMETERISED_MARKERS))
 
 
+def _any_test_name(node: Node, data: bytes, language: str, profile: _Profile) -> str | None:
+    """The name of ``node`` when it is a test of any kind."""
+    if language != "csharp":
+        return profile.test_name(node, data)
+    name = node.child_by_field_name("name")
+    return _text(name, data) if name is not None and _csharp_any_test(node, data) else None
+
+
 def _java_patterns(read: str, key: str) -> list[tuple[str, str]]:
     return _mockito_patterns(rf"{_CHAIN}(?:{read})\(\s*{key}{_TAIL}", read, key)
 
@@ -611,6 +737,7 @@ def _kotlin_patterns(read: str, key: str) -> list[tuple[str, str]]:
     return [
         *_mockito_patterns(read_call, read, key),
         (STUB, rf"(?:co)?every\s*\{{\s*{read_call}\s*\}}\s*returns\s+{_BOOL}"),
+        (STUB, rf"{_KOTLIN_WHEN}\(\s*{read_call}\s*\)\s+doReturn\s+{_BOOL}"),
         (VERIFICATION, rf"(?:co)?verify\s*(?:\({_BALANCED}\))?\s*\{{\s*{read_call}\s*\}}"),
     ]
 
@@ -638,6 +765,28 @@ def _ts_patterns(read: str, key: str) -> list[tuple[str, str]]:
         ),
         (VERIFICATION, rf"verify\(\s*{read_call}\s*\)\s*\.\s*\w+\(\s*\d*\s*\)"),
     ]
+
+
+def _sinon_patterns(read: str, key: str, names: Iterable[str]) -> list[tuple[str, str]]:
+    """Sinon's keyed stub of a read: on ``sinon.stub(obj, 'read')`` or a name
+    bound to one in the file."""
+    made = rf"[\w$]+\s*\.\s*stub\(\s*[\w$.]+\s*,\s*['\"`](?:{read})['\"`]\s*\)"
+    bound = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    stub = rf"(?:{made}|{bound})" if bound else made
+    keyed = rf"{stub}\s*\.\s*withArgs\(\s*{key}\s*\)\s*\.\s*"
+    return [
+        (STUB, rf"{keyed}(?:returns|resolves)\(\s*{_BOOL}\s*\)"),
+        (STUB, rf"{keyed}callsFake\(\s*\(\s*\)\s*=>\s*{_BOOL}\s*\)"),
+    ]
+
+
+def _sinon_names(source: str, read: str) -> set[str]:
+    """Names ``source`` binds to a Sinon stub of the read."""
+    return set(
+        re.findall(
+            rf"([\w$.]+)\s*=\s*[\w$]+\s*\.\s*stub\(\s*[\w$.]+\s*,\s*['\"`](?:{read})['\"`]\s*\)", source
+        )
+    )
 
 
 _TS_LANGUAGES = frozenset({"ts", "tsx", "js"})
@@ -682,6 +831,287 @@ def _ts_wrapper_patterns(name: str, receivers: str) -> list[tuple[str, str]]:
             rf"verify\(\s*{target}\s*\.\s*{name}\(\s*{_BALANCED}\)\s*\)\s*\.\s*\w+\(\s*\d*\s*\)",
         ),
     ]
+
+
+#: A Ruby stub's answer. ``nil`` is the false branch of the condition a wrapper
+#: sits in, as is a stub with no answer: such a pattern has no ``value``.
+_RUBY_BOOL = r"(?P<value>true|false|nil)"
+#: Words of a line of a double, beside a symbol or string spelling a wrapper.
+_RUBY_DOUBLE = re.compile(
+    r"\b(?:allow|expect|receive|receive_messages|have_received|stubs|expects|any_instance)\b"
+)
+#: What a stub's chain may say about which calls it answers, and how often.
+_RUBY_CONSTRAINTS = (
+    rf"(?:\s*\.\s*(?:(?:with|exactly|at_least|at_most)\({_BALANCED}\)"
+    r"|once|twice|thrice|times|ordered|at_least_once|at_most_once))*"
+)
+
+
+def _ruby_wrapper_patterns(name: str, receivers: str, instances: str) -> list[tuple[str, str]]:
+    """RSpec's partial doubles and Mocha's, each on a receiver the wrapper pass
+    proved. ``name`` is already escaped; either receiver list may be empty."""
+    symbol = rf"(?::{name}|:?(?P<quote>['\"]){name}(?P=quote))"
+    chain = _RUBY_CONSTRAINTS
+    heads = [rf"(?:allow|expect)\(\s*(?:{receivers})\s*\)"] if receivers else []
+    heads += [rf"(?:allow|expect)_any_instance_of\(\s*(?:{instances})\s*\)"] if instances else []
+    mochas = [rf"(?:{receivers})"] if receivers else []
+    mochas += [rf"(?:{instances})\s*\.\s*any_instance"] if instances else []
+    double = "(?:" + "|".join(heads) + ")"
+    mocha = "(?:" + "|".join(mochas) + r")\s*\.\s*"
+    receive = rf"{double}\s*\.\s*to\s+receive\(\s*{symbol}\s*\){chain}"
+    expected = rf"{mocha}(?:stubs|expects)\(\s*{symbol}\s*\){chain}"
+    return [
+        (STUB, rf"{receive}\s*\.\s*and_return\(\s*{_RUBY_BOOL}\s*\){chain}"),
+        (STUB, rf"{receive}\s*\{{\s*{_RUBY_BOOL}\s*\}}"),
+        (STUB, receive),
+        (STUB, rf"{double}\s*\.\s*to\s+receive_messages\(\s*{name}:\s*{_RUBY_BOOL}\s*\)"),
+        (VERIFICATION, rf"{double}\s*\.\s*(?:not_to|to_not)\s+receive\(\s*{symbol}\s*\){chain}"),
+        (VERIFICATION, rf"{double}\s*\.\s*(?:to|not_to|to_not)\s+have_received\(\s*{symbol}\s*\){chain}"),
+        (STUB, rf"{expected}\s*\.\s*returns\(\s*{_RUBY_BOOL}\s*\){chain}"),
+        (STUB, expected),
+        (STUB, rf"{mocha}stubs\(\s*{name}:\s*{_RUBY_BOOL}\s*\)"),
+        (VERIFICATION, rf"{expected}\s*\.\s*never"),
+    ]
+
+
+def _resolve_ruby_wrappers(
+    source: str, language: str, treatment: bool, wrapper: WrapperStub, targets: Mapping[str, StubTargets]
+) -> tuple[str, list[Removal]]:
+    """:func:`resolve` for Ruby keyless wrappers.
+
+    A stub spells the wrapper as a symbol, a string or a hash key, so that with
+    a word of a double makes a statement a line of one. A real call in a test,
+    ``expect(Flags.on?).to be(true)``, is left to the fold.
+    """
+    names = [n for n in wrapper.names if n in targets]
+    if not names:
+        return source, []
+    words = _alternation(names)
+    mention = re.compile(
+        rf"(?::(?:{words})(?![\w?!=])|['\"](?:{words})['\"]|(?<![\w@$.:])(?:{words}):(?!:))"
+    )
+    if not mention.search(source):
+        return source, []
+
+    def describes(text: str) -> bool:
+        return mention.search(text) is not None and _RUBY_DOUBLE.search(text) is not None
+
+    profile = _PROFILES[language]
+    data = source.encode("utf-8")
+    root = profile.parse(source, language)
+    patterns = [
+        (kind, re.compile(pattern))
+        for name in names
+        if targets[name].receivers or targets[name].instances
+        for kind, pattern in _ruby_wrapper_patterns(
+            re.escape(name),
+            "|".join(_spelled(r) for r in sorted(targets[name].receivers, key=len, reverse=True)),
+            "|".join(_spelled(r) for r in sorted(targets[name].instances, key=len, reverse=True)),
+        )
+    ]
+    return _apply(source, language, profile, root, data, _statements(root, data, profile, describes), patterns, treatment)
+
+
+def _in_ruby_after_hook(statement: Node, data: bytes) -> bool:
+    body = statement.parent
+    hook = body.parent.parent if body is not None and body.parent is not None else None
+    return hook is not None and _ruby_callee(hook, data) == "after"
+
+
+#: What a Laravel Pennant statement sets the flag to.
+_PENNANT_VALUES = {"activate": "true", "deactivate": "false"}
+
+
+#: The PHPUnit and Pest hooks that run around a test: test code, though no test.
+_PHP_HOOKS = frozenset(
+    {"setUp", "setUpBeforeClass", "tearDown", "tearDownAfterClass", "beforeEach", "beforeAll", "afterEach", "afterAll"}
+)
+
+
+def _php_test_code(statement: Node, data: bytes) -> bool:
+    """Whether ``statement`` sits in test code: a Pest ``it``/``test``/hook
+    call, or a method of a class extending a ``*TestCase`` (or ``*Test``) that
+    is a test or a PHPUnit hook. A Pennant write anywhere else is the
+    application's own."""
+    ancestor = statement.parent
+    while ancestor is not None:
+        if ancestor.type == "expression_statement" and ancestor.named_children:
+            call = ancestor.named_children[0]
+            callee = call.child_by_field_name("function") if call.type == "function_call_expression" else None
+            if callee is not None and _text(callee, data) in (_PHP_HOOKS | {"it", "test"}):
+                return True
+        if ancestor.type == "method_declaration":
+            name = _text(ancestor.child_by_field_name("name"), data)
+            owner = ancestor.parent.parent if ancestor.parent is not None else None
+            base = next((c for c in owner.children if c.type == "base_clause"), None) if owner is not None else None
+            extends = _text(base, data).split()[-1].rsplit("\\", 1)[-1] if base is not None else ""
+            if extends.endswith(("TestCase", "Test")) and (name in _PHP_HOOKS or _php_test(ancestor, data) is not None):
+                return True
+        ancestor = ancestor.parent
+    return False
+
+
+#: The hooks that run before each test (or the class): a pin there states the
+#: branch for every test it governs.
+_PHP_BEFORE_HOOKS = frozenset({"setUp", "setUpBeforeClass", "beforeEach", "beforeAll"})
+
+
+def _php_hook_of(statement: Node, data: bytes) -> Node | None:
+    """The before-hook ``statement`` is pinned in, or ``None``: a Pest
+    ``beforeEach``/``beforeAll`` call, or a ``setUp``/``setUpBeforeClass`` of a
+    test class, with no test between them."""
+    ancestor = statement.parent
+    while ancestor is not None:
+        if ancestor.type == "expression_statement" and ancestor.named_children:
+            call = ancestor.named_children[0]
+            callee = call.child_by_field_name("function") if call.type == "function_call_expression" else None
+            name = _text(callee, data) if callee is not None else None
+            if name in _PHP_BEFORE_HOOKS:
+                return ancestor
+            if name in ("it", "test"):
+                return None
+        if ancestor.type == "method_declaration":
+            name = _text(ancestor.child_by_field_name("name"), data)
+            if name in _PHP_BEFORE_HOOKS and _php_test_code(statement, data):
+                return ancestor
+            return None
+        ancestor = ancestor.parent
+    return None
+
+
+def _php_hook_body(hook: Node) -> Node | None:
+    if hook.type == "method_declaration":
+        return hook.child_by_field_name("body")
+    call = hook.named_children[0]
+    for node in _walk(call):
+        if node.type == "anonymous_function":
+            return node.child_by_field_name("body")
+    return None
+
+
+def _php_governed_tests(hook: Node, data: bytes) -> list[Node]:
+    """The tests ``hook`` runs before: those of its class, or those in the
+    block a Pest hook sits in, outermost only."""
+    scope = hook.parent.parent if hook.type == "method_declaration" else hook.parent
+    found: list[Node] = []
+    stack = list(scope.children) if scope is not None else []
+    while stack:
+        node = stack.pop(0)
+        if node.id != hook.id and _php_test(node, data) is not None:
+            found.append(node)
+            continue
+        stack = list(node.children) + stack
+    return found
+
+
+def _php_pinned_hooks(
+    statements: list[Node], data: bytes, pattern: re.Pattern[str], treatment: bool
+) -> tuple[list[Node], list[tuple[int, int, Removal]]]:
+    """``(statements decided here, spans)`` for the pins that sit in a
+    before-hook. A pin of the kept value goes, and the hook with it once nothing
+    else is left in it. A pin of the removed value means every test the hook
+    governs runs the removed branch: those tests go, except ones that pin the
+    kept value themselves, and the pin and the hook with them. A hook pinning
+    both values is left."""
+    hooks: dict[int, tuple[Node, list[tuple[Node, bool]]]] = {}
+    for statement in statements:
+        hook = _php_hook_of(statement, data)
+        if hook is None:
+            continue
+        kind, value, _ = _recognise(_text(statement, data), [(STUB, pattern)])
+        hooks.setdefault(hook.id, (hook, []))[1].append((statement, value == "true" if kind else None))
+    decided: list[Node] = []
+    spans: list[tuple[int, int, Removal]] = []
+    deleted: list[Node] = []
+    for hook, pins in hooks.values():
+        decided += [s for s, _ in pins]
+        values = {v for _, v in pins}
+        body = _php_hook_body(hook)
+        if None in values or len(values) != 1 or body is None:
+            continue
+        removed = values == {not treatment}
+        governed = _php_governed_tests(hook, data) if removed else []
+        doomed = []
+        for test in governed:
+            if any(
+                _recognise(_text(n, data), [(STUB, pattern)])[1] == ("true" if treatment else "false")
+                for n in _walk(test)
+                if n.type == "expression_statement"
+            ):
+                continue
+            doomed.append(test)
+        for test in doomed:
+            if not any(test.id == d.id for d in deleted):
+                deleted.append(test)
+                spans.append(
+                    (_with_leading_comments(test, data), test.end_byte, Removal(TEST, _php_test(test, data) or ""))
+                )
+        pin_ids = {s.id for s, _ in pins}
+        rest = [
+            c
+            for c in body.named_children
+            if c.type != "comment"
+            and c.id not in pin_ids
+            and not re.fullmatch(r"parent::\w+\(\s*\);?", " ".join(_text(c, data).split()))
+        ]
+        text = " ".join(_text(pins[0][0], data).split())
+        if rest:
+            spans += [(*_line_span(s, data), Removal(STUB, " ".join(_text(s, data).split()))) for s, _ in pins]
+        else:
+            spans.append((_with_leading_comments(hook, data), hook.end_byte, Removal(STUB, text)))
+    return decided, spans
+
+
+def _resolve_pennant(source: str, flag_key: str, treatment: bool) -> tuple[str, list[Removal]]:
+    """:func:`resolve` for Laravel Pennant, which a PHP test states its branch
+    through: ``Feature::activate('k');``. PHP's SDK reads are not stubbed in a
+    form this can read, so this is its only recogniser."""
+    if not re.search(r"\bFeature::(?:de)?activate", source):
+        return source, []
+    profile = _PROFILES["php"]
+    data = source.encode("utf-8")
+    root = profile.parse(source, "php")
+    key = _key(flag_key, [k.name for k in key_const.key_consts(root, data, "php", flag_key)])
+    mention = re.compile(rf"\bFeature::(?:de)?activate\w*\(\s*{key}")
+    pattern = re.compile(
+        rf"\\?(?:\w+\\)*Feature::(?P<value>activate|deactivate)(?:ForEveryone)?\(\s*{key}(?:\s*,\s*true)?\s*\)"
+    )
+    statements = [
+        s
+        for s in _statements(root, data, profile, lambda text: mention.search(text) is not None)
+        if _php_test_code(s, data)
+    ]
+    decided, extra = _php_pinned_hooks(statements, data, pattern, treatment)
+    # What the hooks' tests hold is judged with them, not again.
+    gone = [(a, b) for a, b, r in extra if r.kind == TEST]
+    held = {s.id for s in decided} | {
+        s.id for s in statements if any(a <= s.start_byte and s.end_byte <= b for a, b in gone)
+    }
+    statements = [s for s in statements if s.id not in held]
+    return _apply(source, "php", profile, root, data, statements, [(STUB, pattern)], treatment, extra)
+
+
+def _ruby_emptied_hooks(lines: list[tuple[Node, str]], data: bytes) -> list[tuple[Node, str]]:
+    """``lines``, with the statements of a hook that loses them all
+    replaced by the hook, which would otherwise stand empty or be cut in half
+    on its own line."""
+    bodies: dict[int, tuple[Node, list[tuple[Node, str]]]] = {}
+    for line in lines:
+        bodies.setdefault(line[0].parent.id, (line[0].parent, []))[1].append(line)
+    found: list[tuple[Node, str]] = []
+    for body, gone in bodies.values():
+        hook = body.parent.parent if body.parent is not None else None
+        statements = [c for c in body.named_children if c.type != "comment"]
+        if (
+            hook is not None
+            and hook.type == "call"
+            and _ruby_callee(hook, data) in ("before", "after")
+            and len(statements) == len(gone)
+        ):
+            found.append((hook, gone[0][1]))
+        else:
+            found += gone
+    return found
 
 
 def _bool_function(node: Node | None) -> str | None:
@@ -805,7 +1235,7 @@ def _resolve_ts_wrappers(
     profile = _PROFILES[language]
     data = source.encode("utf-8")
     root = profile.parse(source, language)
-    statements = _statements(root, data, _TS_WRAPPER_BLOCKS, describes)
+    statements = _statements(root, data, replace(_TS, blocks=_TS_WRAPPER_BLOCKS), describes)
     patterns = [
         (kind, re.compile(pattern))
         for name in names
@@ -843,6 +1273,11 @@ def _go_patterns(read: str, key: str) -> list[tuple[str, str]]:
     ]
 
 
+#: A C# receiver chain, which may hold a generic call:
+#: ``sutProvider.GetDependency<IFeatures>().``.
+_CSHARP_CHAIN = r"(?:[\w$!?]+(?:<[\w.,\s<>\[\]?]*>)?(?:\(\s*\))?\s*\.\s*)+"
+
+
 def _csharp_patterns(read: str, key: str) -> list[tuple[str, str]]:
     # Moq: the read's receiver must be the lambda's own parameter, as in the
     # seed rules' expression-tree guard. Checked by `_same_parameter` below.
@@ -856,11 +1291,12 @@ def _csharp_patterns(read: str, key: str) -> list[tuple[str, str]]:
         # NSubstitute, which takes the real call.
         (
             STUB,
-            rf"{_CHAIN}(?:{read})\(\s*{key}{_TAIL}\s*\.\s*Returns(?:ForAnyArgs)?\(\s*{_BOOL}\s*\)",
+            rf"{_CSHARP_CHAIN}(?:{read})\(\s*{key}{_TAIL}\s*\.\s*Returns(?:ForAnyArgs)?\(\s*{_BOOL}\s*\)",
         ),
         (
             VERIFICATION,
-            rf"{_MOCK}\.(?:Received\(\s*\d*\s*\)|DidNotReceive\(\s*\))\s*\.\s*(?:{read})\(\s*{key}{_TAIL}",
+            rf"(?:_\s*=\s*)?{_CSHARP_CHAIN}(?:Received\(\s*\d*\s*\)|DidNotReceive\(\s*\))\s*\.\s*"
+            rf"(?:{read})\(\s*{key}{_TAIL}",
         ),
     ]
 
@@ -890,6 +1326,7 @@ _PROFILES: dict[str, _Profile] = {
         _kotlin_test,
         syntax._parse,
         _KOTLIN_FLAG_READ_CALLEES,
+        frozenset({"lambda_literal"}),
     ),
     "dart": _Profile(
         frozenset({"block"}), _dart_patterns, _dart_test, syntax._parse, _DART_FLAG_READ_CALLEES
@@ -914,6 +1351,30 @@ _PROFILES: dict[str, _Profile] = {
     "ts": _TS,
     "tsx": _TS,
     "js": _TS,
+    # A Ruby test stubs an SDK read as `receive(:bool_variation)`, never as a
+    # call, so only a keyless wrapper's stubs are recognised here.
+    "ruby": _Profile(
+        frozenset({"body_statement", "block_body", "program"}),
+        lambda read, key: [],
+        _ruby_test,
+        syntax._parse,
+        _RUBY_FLAG_READ_CALLEES,
+    ),
+    "php": _Profile(
+        frozenset({"compound_statement"}),
+        lambda read, key: [],
+        _php_test,
+        syntax._parse,
+        _PHP_FLAG_READ_CALLEES,
+    ),
+    # A Python patch is a decorator, not a statement: python_patches.
+    "python": _Profile(
+        frozenset({"block", "module"}),
+        lambda read, key: [],
+        lambda node, data: None,
+        syntax._parse,
+        _PYTHON_FLAG_READ_CALLEES,
+    ),
 }
 
 
@@ -930,7 +1391,8 @@ def _key(flag_key: str, consts: Iterable[str]) -> str:
     """The key as a stub can spell it: quoted, a hoisted constant, or inside an
     equality matcher (``eq("k")``, ``gomock.Eq("k")``)."""
     spellings = [re.escape(f'"{flag_key}"'), re.escape(f"'{flag_key}'"), re.escape(f"`{flag_key}`")]
-    spellings += [rf"\b{re.escape(name)}\b" for name in consts]
+    # `(?!\w)`, not `\b`: `nameof(Flags.X)` ends in a bracket.
+    spellings += [rf"\b{re.escape(name)}(?!\w)" for name in consts]
     literal = "|".join(spellings)
     return rf"(?:(?:[\w$]+\.)*(?:eq|Eq)\(\s*(?:{literal})\s*\)|(?:{literal}))"
 
@@ -1295,14 +1757,18 @@ def resolve(
     knob_receivers: frozenset[str] | None = None,
     targets: Mapping[str, StubTargets] | None = None,
     checkout: tuple[str, str] | None = None,
+    key_texts: frozenset[str] = frozenset(),
 ) -> tuple[str, list[Removal]]:
     """``source`` with every decidable test-double line resolved; what went.
 
     With ``wrapper``, the doubles resolved are those of the named keyless
     wrappers instead of the SDK read's: on one of ``receivers`` in Java,
-    Kotlin and C#, and on each name's ``targets`` in TypeScript and
-    JavaScript. C# knob writes are matched on ``knob_receivers`` only, never
+    Kotlin and C#, and on each name's ``targets`` in TypeScript, JavaScript,
+    Ruby and Python. C# knob writes are matched on ``knob_receivers`` only, never
     on a mock's name.
+
+    ``key_texts`` are further spellings of the key in this file: the constants
+    of other files the cross-file resolution proved mean it.
 
     Pure: no file is read or written. See the module docstring for the policy.
     """
@@ -1311,7 +1777,15 @@ def resolve(
         return source, []
     if wrapper is not None and language in _TS_LANGUAGES:
         return _resolve_ts_wrappers(source, language, treatment, wrapper, targets or {})
-    siblings = wrapper.siblings if wrapper is not None and language == "csharp" else frozenset()
+    if wrapper is not None and language == "ruby":
+        return _resolve_ruby_wrappers(source, language, treatment, wrapper, targets or {})
+    if wrapper is None and language == "php":
+        return _resolve_pennant(source, flag_key, treatment)
+    if wrapper is not None and language == "python":
+        from flag_cleanup import python_patches
+
+        return python_patches.resolve(source, treatment, wrapper.names, targets or {})
+    siblings = wrapper.siblings if wrapper is not None and language in _SIBLING_LANGUAGES else frozenset()
     # C# test code: helper pins, fake knobs and fake constructions.
     fakes = wrapper is not None and language == "csharp" and wrapper.test_code
     knob_names = wrapper.knobs if fakes else frozenset()
@@ -1343,14 +1817,21 @@ def resolve(
         )
     else:
         reads = _reads(language, accessors)
-        if not re.search(rf"\b(?:{reads})\b", source):
+        # `(?!\w)`, not `\b`: a Ruby accessor ends in `?`, after which `\b`
+        # needs a word character and so never matches the call. A Sinon stub
+        # names the read in a string, which the same search finds.
+        if not re.search(rf"\b(?:{reads})(?!\w)", source) and "withArgs" not in source:
             return source, []
         data = source.encode("utf-8")
         root = profile.parse(source, language)
         consts = [k.name for k in key_const.key_consts(root, data, language, flag_key)]
-        key = _key(flag_key, consts)
+        key = _key(flag_key, [*consts, *key_texts])
         mention = re.compile(rf"\b(?:{reads})\s*\(\s*{key}")
         patterns = [(kind, re.compile(p)) for kind, p in profile.patterns(reads, key)]
+        if language in _TS_LANGUAGES:
+            sinon = _sinon_patterns(reads, key, _sinon_names(source, reads))
+            patterns += [(kind, re.compile(p)) for kind, p in sinon]
+            mention = re.compile(rf"{mention.pattern}|\bwithArgs\(\s*{key}")
     # C#: a statement naming a fake's knob through a proven receiver is a
     # line of the double too: a write of a literal is resolved like a stub,
     # one of a `[Theory]`'s own parameter by its rows, and anything else (a
@@ -1366,7 +1847,7 @@ def resolve(
     def describes(text: str) -> bool:
         return _describes_read(text, mention) or (knob_mention is not None and bool(knob_mention.search(text)))
 
-    statements = _statements(root, data, profile.blocks, describes)
+    statements = _statements(root, data, profile, describes)
     if language == "csharp" and wrapper is not None:
         statements += [n for n in _constructor_bodies(root, data) if describes(_text(n, data))]
     return _apply(
@@ -1376,15 +1857,31 @@ def resolve(
     )
 
 
-def _statements(root: Node, data: bytes, blocks: frozenset[str], describes: Callable[[str], bool]) -> list[Node]:
-    """The statements of ``blocks`` that describe the read, by their text."""
+def _holds_statements(node: Node, profile: _Profile, data: bytes) -> bool:
+    """Whether ``node``'s named children are statements."""
+    if node.type in profile.blocks:
+        return True
+    if node.type not in profile.lambda_blocks:
+        return False
+    call = node.parent.parent if node.parent is not None else None
+    if call is None or call.type != "call_expression" or not call.named_children:
+        return True
+    callee = call.named_children[0]
+    if callee.type == "call_expression" and callee.named_children:
+        callee = callee.named_children[0]
+    return _DSL.fullmatch(_text(callee, data)) is None
+
+
+def _statements(root: Node, data: bytes, profile: _Profile, describes: Callable[[str], bool]) -> list[Node]:
+    """The statements of ``profile``'s blocks that describe the read, by their
+    text."""
     return [
         node
         for node in _walk(root)
         if node.is_named
         and "comment" not in node.type
         and node.parent is not None
-        and node.parent.type in blocks
+        and _holds_statements(node.parent, profile, data)
         and describes(_text(node, data))
     ]
 
@@ -1411,7 +1908,7 @@ def _apply(
     """Decide each test or statement from its stubs and delete what goes, with
     the ``extra`` spans another recogniser already decided. ``siblings``,
     ``fakes``, ``owners`` and ``knob_writes`` (what a fake's knob write
-    looks like) are C#'s (see :func:`resolve`)."""
+    looks like) are C#'s, and ``siblings`` the JVM's too (see :func:`resolve`)."""
     # A statement holding another such statement — `it(…, () => { when(…) })`
     # — is a container, not a line of the double. Its inner lines are judged.
     inner = {s.id for s in statements}
@@ -1423,7 +1920,7 @@ def _apply(
                 containers.add(ancestor.id)
             ancestor = ancestor.parent
 
-    # A C# test reading the member through a sibling-typed receiver: the
+    # A test reading the member through a sibling-typed receiver: the
     # sibling's member goes with the wrapper, so the test goes, whatever it
     # stubs. A write (`fake.IsXEnabled = true`) is not a read.
     sibling_tests: list[tuple[Node, str, str]] = []
@@ -1431,17 +1928,23 @@ def _apply(
     for method, receiver in siblings:
         by_test.setdefault(method, set()).add(receiver)
     for node in _walk(root) if by_test else ():
-        name = node.child_by_field_name("name")
-        names = by_test.get(_text(name, data)) if name is not None else None
-        if not names or not _csharp_any_test(node, data):
+        test_name = _any_test_name(node, data, language, profile)
+        names = by_test.get(test_name) if test_name is not None else None
+        if not names:
             continue
         text = _text(node, data)
         if not reads_through(text, csharp_receiver_read(names, wrapper.names, reads_only=True)):
             continue
         # Deciding what STAYS: any spelling counts, qualified or not.
-        if wrapper.kept and csharp_receiver_read(names, wrapper.kept, reads_only=False).search(text):
+        # On the JVM the read is through the wrapper's own class, whose body
+        # is a constant whether or not it stays: its test goes either way.
+        if (
+            language == "csharp"
+            and wrapper.kept
+            and csharp_receiver_read(names, wrapper.kept, reads_only=False).search(text)
+        ):
             continue
-        sibling_tests.append((node, _text(name, data), SIBLING_TEST))
+        sibling_tests.append((node, test_name, SIBLING_TEST))
     # A statement naming a wrapper that stays describes a read that still
     # happens, so its whole unit -- stub, verification, test -- is left as is.
     kept_word = (
@@ -1468,6 +1971,10 @@ def _apply(
         if kept_word is not None and kept_word.search(_text(statement, data)):
             unit.kept = True
         kind, value, groups = _recognise(_text(statement, data), patterns)
+        if kind == STUB and language == "ruby" and _in_ruby_after_hook(statement, data):
+            # It runs once the test is over, so it says nothing of the branch
+            # the test ran, and goes whatever that was.
+            kind = VERIFICATION
         if kind == STUB and groups.get("param") is not None:
             # A knob written from a parameter is decided by a theory's rows
             # alone: a helper's knob write is not a stub pin.
@@ -1553,6 +2060,22 @@ def _apply(
                     rf"(?<![\w$@]){re.escape(knob)}\s*=(?!=)", _text(test, data)
                 ):
                     unit.constructions.append(defaults[simple])
+
+    # A group's stub of the removed value sends everything under it, so nothing
+    # under it may answer otherwise: a nested stub of the kept value is a test
+    # of the branch that stays, and one nothing can read may be too.
+    for unit in units.values():
+        if unit.test is None or all(v == treatment for _, v in unit.stubs):
+            continue
+        for other in units.values():
+            if (
+                other is not unit
+                and other.test is not None
+                and unit.test.start_byte <= other.test.start_byte
+                and other.test.end_byte <= unit.test.end_byte
+                and (other.unprovable or any(v == treatment for _, v in other.stubs))
+            ):
+                unit.unprovable = True
 
     sibling_ids = {test.id for test, _, _ in sibling_tests}
     doubles = [s for s in statements if s.id not in containers]
@@ -1684,6 +2207,8 @@ def _apply(
             for other, _, _ in tests
         )
     ]
+    if language == "ruby":
+        lines = _ruby_emptied_hooks(lines, data)
     extra = list(extra)
     # A pin whose every call keeps its test still edits: the parameter, the
     # arguments and a construction's literal.
@@ -2274,7 +2799,7 @@ def in_test_double(node: Node, data: bytes, language: str) -> bool:
     if profile is None:
         return False
     statement = node
-    while statement.parent is not None and statement.parent.type not in profile.blocks:
+    while statement.parent is not None and not _holds_statements(statement.parent, profile, data):
         statement = statement.parent
     text = _text(statement, data)
     for match in _DSL.finditer(text):
@@ -2298,7 +2823,8 @@ def _recognise(
         match = pattern.fullmatch(body)
         if match is not None and _same_parameter(match):
             groups = match.groupdict()
-            return kind, groups.get("value"), groups
+            value = groups.get("value")
+            return kind, _PENNANT_VALUES.get(value, value), groups
     return None, None, {}
 
 
@@ -2310,6 +2836,12 @@ def _enclosing_test(statement: Node, profile: _Profile, data: bytes) -> tuple[No
             return ancestor, name
         ancestor = ancestor.parent
     return None, None
+
+
+def test_around(node: Node, data: bytes, language: str) -> str | None:
+    """The name of the test method ``node`` sits in, or ``None``."""
+    profile = _PROFILES.get(language)
+    return _enclosing_test(node, profile, data)[1] if profile is not None else None
 
 
 def _constructor_bodies(root: Node, data: bytes) -> list[Node]:
@@ -2384,17 +2916,21 @@ def _read_count(source: str, language: str, accessors: tuple[str, ...]) -> int:
     """Reads ``source`` PERFORMS: every call of a read, less those inside a
     statement of a mocking DSL, which describe a read rather than make one."""
     profile = _PROFILES[language]
-    call = re.compile(rf"\b(?:{_reads(language, accessors)})\s*\(")
+    # Ruby may call a read with no parentheses: `flags.enabled? "key"`.
+    opens = r"(?:\s*\(|[ \t]+['\":A-Z])" if language == "ruby" else r"\s*\("
+    call = re.compile(rf"\b(?:{_reads(language, accessors)}){opens}")
     total = len(call.findall(source))
-    if not total:
-        return 0
+    # A Ruby, Python or PHP double names a read in a symbol or a string, or
+    # by another method, and Ruby's `when` is the language's.
+    if not total or language in ("ruby", "python", "php"):
+        return total
     data = source.encode("utf-8")
     described = [
         node
         for node in _walk(profile.parse(source, language))
         if node.is_named
         and node.parent is not None
-        and node.parent.type in profile.blocks
+        and _holds_statements(node.parent, profile, data)
         and _DSL.search(_text(node, data))
         and call.search(_text(node, data))
     ]
@@ -2428,6 +2964,15 @@ def folded_a_read(before: str, after: str, language: str, accessors: tuple[str, 
     if language not in _PROFILES:
         return False
     return _read_count(after, language, accessors) < _read_count(before, language, accessors)
+
+
+def performs_a_read(source: str, language: str, flag_key: str, accessors: tuple[str, ...]) -> bool:
+    """Whether ``source`` reads ``flag_key`` outside a mocking DSL: what makes
+    a pass over another language's tests of it a run that folds a read."""
+    if language not in _PROFILES:
+        return False
+    call = re.compile(rf"\b(?:{_reads(language, accessors)})\s*\(\s*{_key(flag_key, ())}")
+    return call.search(source) is not None and _read_count(source, language, accessors) > 0
 
 
 def _read_exact(path: str) -> str:
@@ -2470,6 +3015,9 @@ class Prepass:
     #: path (as handed to :meth:`apply`) -> wrapper name -> where a TypeScript
     #: test may stub it there.
     targets: dict[str, dict[str, StubTargets]] = field(default_factory=dict)
+    #: path (as handed to :meth:`apply`) -> the key's spellings there through
+    #: a constant of another file.
+    key_texts: dict[str, frozenset[str]] = field(default_factory=dict)
     #: absolute path -> the customer's text before this pass touched it.
     originals: dict[str, str] = field(default_factory=dict)
     #: absolute path -> what was deleted there.
@@ -2505,6 +3053,7 @@ class Prepass:
                 knob_receivers = self.knob_receivers.get(path, frozenset())
             resolved, removed = resolve(
                 source, self.language, self.flag_key, self.treatment, self.accessors,
+                key_texts=self.key_texts.get(path, frozenset()),
                 wrapper=wrapper,
                 receivers=self.receivers.get(path, frozenset()),
                 knob_receivers=knob_receivers,

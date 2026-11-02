@@ -13,7 +13,10 @@ local cannot hide a function or a method. So:
 
 * the wrapper's name must be declared once across the repository's PHP files,
   as a function or a method of any class-like, compared without case as PHP
-  compares it;
+  compares it. A static method is exempt: only a call through its class
+  reaches it, so another class's member of the same name is told apart by the
+  class a call names (``self::`` inside another class, or a class name that
+  resolves elsewhere), and a call that cannot be told apart is refused;
 * a function is called bare where the file's namespace, a ``use function``
   import or the global fallback resolves the name to it, or qualified
   (``\\App\\Flags\\newCheckout()``, ``Flags\\newCheckout()``) where the name
@@ -179,6 +182,13 @@ def read_test(
         elif expression.type == "function_call_expression":
             callee = expression.child_by_field_name("function")
             bare_ok = False
+        elif expression.type == "scoped_call_expression":
+            # `Feature::active('k')`: folded by an accessor's clone only (the
+            # `; accessor-arm:` lines in php.toml), never for the SDK's names.
+            callee = expression.child_by_field_name("name")
+            if callee is None or _text(callee) not in accessors:
+                return False
+            bare_ok = True
         else:
             return False
         if callee is None or callee.type != "name" or _text(callee) not in callees:
@@ -605,7 +615,12 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
             # A package depending on this one may extend the class and hand
             # its own member in.
             return None, wi.INTERFACE_PUBLISHED
-    if len(index.declarations) != 1:
+    # A static method is only ever reached through its class, so another
+    # class's member of the same name cannot be confused with it: each
+    # mention is judged on its own (:func:`binds_elsewhere`), and the ones
+    # that cannot be told apart are refused there. Anything else is found by
+    # name alone.
+    if (top_level(wrapper) or not wrapper.static) and len(index.declarations) != 1:
         return None, wi.NAME_NOT_UNIQUE
     return wrapper, None
 
@@ -891,6 +906,31 @@ def _judge(path: str, node: Node, root: Node, wrapper: wi.Wrapper) -> wi.Occurre
     return _occurrence(path, node, call, None, (head.start_byte, node.end_byte))
 
 
+def binds_elsewhere(node: Node, root: Node, wrapper: wi.Wrapper, path: str) -> bool:
+    """Whether a mention of a static wrapper's name is a static call that
+    provably reaches another class's member: ``self::m()``, ``static::m()`` or
+    ``parent::m()`` inside a class that is not the wrapper's (nothing extends
+    that one, by qualification), or ``Other::m()`` where ``Other`` resolves
+    through the file's namespace and imports to a different class."""
+    if top_level(wrapper) or not wrapper.static:
+        return False
+    call = node.parent
+    if call is None or call.type != "scoped_call_expression" or call.child_by_field_name("name") != node:
+        return False
+    scope = call.child_by_field_name("scope")
+    if scope is None:
+        return False
+    if scope.type == "relative_scope":
+        inside = _enclosing(call, ("class_declaration", "trait_declaration", "enum_declaration", "interface_declaration"))
+        return inside is not None and inside.type == "class_declaration" and not _is_owner(inside, wrapper, path)
+    if scope.type not in ("name", "qualified_name", "relative_name"):
+        return False
+    resolved = cross_file_php._resolve_class(
+        cross_file_php._sections(root), cross_file_php._imports(root), scope
+    )
+    return resolved is not None and resolved != _fqn(wrapper.package, wrapper.owner)
+
+
 def _ancestors(node: Node) -> Iterable[Node]:
     parent = node.parent
     while parent is not None:
@@ -943,6 +983,8 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     found: list[wi.Occurrence] = []
     for node in _walk(root):
         if node.type not in MENTION_TYPES or not _same(_text(node), wrapper.name) or names_only(node):
+            continue
+        if binds_elsewhere(node, root, wrapper, path):
             continue
         judged = _judge(path, node, root, wrapper)
         if judged is not None:
@@ -1000,7 +1042,10 @@ def leftovers(
         found += [
             (path, wi.line_of(n), wi.text_of(n.parent or n))
             for n in _walk(root)
-            if n.type in MENTION_TYPES and _same(_text(n), wrapper.name) and not names_only(n)
+            if n.type in MENTION_TYPES
+            and _same(_text(n), wrapper.name)
+            and not names_only(n)
+            and not binds_elsewhere(n, root, wrapper, path)
         ]
     return found
 

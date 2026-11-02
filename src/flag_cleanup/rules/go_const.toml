@@ -225,6 +225,11 @@ query = """(
 replace_node = "declaration"
 replace = ""
 holes = ["stale_flag_name"]
+# gofmt-clean: the declaration's trailing comment, a heading comment it was
+# alone under, and the blank lines it would leave doubled or at the end of
+# the file go with it. A key file holding nothing else is otherwise left
+# ending `package flags\n\n`, which `gofmt -l` lists.
+delete_whole_lines = true
 
 [[rules.filters]]
 enclosing_node = """([(source_file) (function_declaration) (block)] @container)"""

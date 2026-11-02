@@ -77,29 +77,63 @@ def constant_condition_loops(source: str, language: str) -> int:
     for node in _walk(_parse(source, language)):
         if node.type not in ("for_statement", "do_statement", "while_statement"):
             continue
-        literal = _condition_literal(node)
-        if literal is None:
+        if _constant_truth(node.child_by_field_name("condition")) is None:
             continue
-        if node.type == "while_statement" and literal == "true":
+        if node.type == "while_statement" and _condition_literal(node) == "true":
             continue
         count += 1
     return count
 
 
 def constant_condition_ifs(source: str, language: str) -> int:
-    """``if`` statements whose condition is a boolean literal.
+    """``if`` statements whose condition is constant.
 
-    The engine folds every one it makes, except a dead branch that declares a
-    ``var``: the name is scoped to the function, so deleting the branch could
-    break a read after the ``if``, and the fold declines. What it leaves is the
-    flag half-removed and ``no-constant-condition`` failing, so Gate 1 refuses
-    when this count grows.
+    The engine folds every literal one it makes, except a dead branch that
+    declares a ``var``: the name is scoped to the function, so deleting the
+    branch could break a read after the ``if``, and the fold declines. It also
+    keeps ``f() && false`` (and ``f() || true``) whenever the left operand
+    could run code, since folding it would drop the call. Either way what it
+    leaves is the flag half-removed and ``no-constant-condition`` failing, so
+    Gate 1 refuses when this count grows.
     """
     return sum(
         1
         for node in _walk(_parse(source, language))
-        if node.type == "if_statement" and _condition_literal(node) is not None
+        if node.type == "if_statement"
+        and _constant_truth(node.child_by_field_name("condition")) is not None
     )
+
+
+def _constant_truth(condition: Node | None) -> bool | None:
+    """The truth of a condition decided by a boolean literal, else ``None``.
+
+    Mirrors what ``no-constant-condition`` reports in a condition: a literal,
+    and a ``&&``/``||`` one of whose operands is the literal that decides it
+    (``x && false`` is falsy, ``x || true`` truthy, whatever ``x`` is, and
+    ``true && x`` is ``x``). Parentheses are looked through. ``!false`` is not
+    counted: the engine always folds it, so it never reaches here.
+    """
+    node = condition
+    while node is not None and node.type == "parenthesized_expression":
+        inner = [c for c in node.named_children if c.type != "comment"]
+        node = inner[0] if len(inner) == 1 else None
+    if node is None:
+        return None
+    if node.type in ("true", "false"):
+        return node.type == "true"
+    if node.type != "binary_expression":
+        return None
+    operator = node.child_by_field_name("operator")
+    if operator is None or operator.type not in ("&&", "||"):
+        return None
+    left = _constant_truth(node.child_by_field_name("left"))
+    right = _constant_truth(node.child_by_field_name("right"))
+    deciding = operator.type == "||"
+    if deciding in (left, right):
+        return deciding
+    if left is not None and right is not None:
+        return not deciding
+    return None
 
 
 def _condition_literal(loop: Node) -> str | None:

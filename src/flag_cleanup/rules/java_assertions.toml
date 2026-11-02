@@ -13,13 +13,22 @@
 # import) or on `Assert`/`Assertions`. An assertion folded to the FAILING
 # literal (`assertTrue(false)`) is never matched.
 
+# A trivial assertion that is the whole body of an `if` or a loop stays. Deleting
+# it would hand that body to the next statement, which parses and silently runs
+# conditionally. `not_enclosing_node` asks of every ancestor, so an assertion
+# nested deeper under such a body stays too, which is the safe direction.
+
 [[rules]]
 name = "delete_trivially_true_assertion"
 query = """(
   (expression_statement
     (method_invocation
       name: (identifier) @assert_method
-      arguments: (argument_list . (true) .)) @assert_call) @statement
+      arguments: [
+        (argument_list . (true) .)
+        (argument_list . (true) . (string_literal) .)
+        (argument_list . (string_literal) . (true) .)
+      ]) @assert_call) @statement
   (#eq? @assert_method "assertTrue")
   (#match? @assert_call "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertTrue[[:space:]]*[(]")
 )"""
@@ -28,13 +37,28 @@ replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
 
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (enhanced_for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
 [[rules]]
 name = "delete_trivially_false_assertion"
 query = """(
   (expression_statement
     (method_invocation
       name: (identifier) @assert_method
-      arguments: (argument_list . (false) .)) @assert_call) @statement
+      arguments: [
+        (argument_list . (false) .)
+        (argument_list . (false) . (string_literal) .)
+        (argument_list . (string_literal) . (false) .)
+      ]) @assert_call) @statement
   (#eq? @assert_method "assertFalse")
   (#match? @assert_call "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertFalse[[:space:]]*[(]")
 )"""
@@ -43,13 +67,28 @@ replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
 
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (enhanced_for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
 [[rules]]
 name = "delete_trivially_equal_assertion"
 query = """(
   (expression_statement
     (method_invocation
       name: (identifier) @assert_method
-      arguments: (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)) @assert_call) @statement
+      arguments: [
+        (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)
+        (argument_list . [(true) (false)] @expected . [(true) (false)] @actual . (string_literal) .)
+        (argument_list . (string_literal) . [(true) (false)] @expected . [(true) (false)] @actual .)
+      ]) @assert_call) @statement
   (#eq? @assert_method "assertEquals")
   (#match? @assert_call "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertEquals[[:space:]]*[(]")
   (#eq? @expected @actual)
@@ -58,3 +97,14 @@ replace_node = "statement"
 replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (enhanced_for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""

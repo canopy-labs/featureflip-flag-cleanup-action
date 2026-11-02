@@ -1,0 +1,3676 @@
+# Flag-keyed ENTRIES — the residue a read-anchored rule cannot see: the
+# registry pair (`Map.of(…, "k", false, …)`), a test's override entry
+# (`FeatureflipClient.forTesting(Map.of("k", true))`), a plain flag -> value
+# map keyed the same way.
+# Design notes: CLAUDE.md, "Flag-keyed entries are RULES, not a Python pass".
+#
+# Holes: @stale_flag_name (the flag key) and @known_flag_keys — the project's
+# OTHER flag keys, rendered by `piranha_runner.render_known_flag_keys` as
+# space-separated quoted literals for `#any-of?`. Empty when the list could
+# not be fetched, which makes the registry prong match nothing.
+#
+# `#any-of?` is banned in every other rule file (see java.toml). It is allowed
+# here because the alternatives are runtime data;
+# `test_entry_rules_use_any_of_only_against_the_hole` keeps it to exactly this
+# one use. `#match?` is not banned anywhere: it is applied, and its patterns
+# here are constants.
+#
+# Two prongs per shape. Both may match the same entry; the engine applies one,
+# re-parses, and the other no longer matches. No edges: a deleted entry
+# cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
+# `piranha_runner._flag_keyed_entries` reports them.
+#
+# NEITHER PRONG DELETES AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED.
+# `@treated` is the literal this run keeps; `@untreated` is its complement,
+# and an entry spelled `k -> @untreated` is the customer pinning the flag to
+# the branch the fold is deleting — evidence that the code around it is about
+# to become dead, not evidence the entry is stale. Stripping it would turn a
+# test that asserts the removed branch into one asserting behaviour the code
+# can no longer produce, which is strictly worse than a residual reference the
+# pull-request body names. So the STUB prong requires `(#eq? @value
+# "@treated")` and the REGISTRY prong carries `(#not-eq? @value
+# "@untreated")`, negatively on purpose: a registry value need not be a
+# boolean at all. `contradicting.py` reports what both decline.
+#
+# FOUR SHAPES, chosen by what Java code that builds a flag map actually
+# writes, and what the Featureflip Java SDK's own test client takes
+# (`FeatureflipClient.forTesting(Map<String, Object>)`):
+#
+#   1. `Map.of("k", v, …)` / `ImmutableMap.of(…)` argument PAIRS;
+#   2. `Map.entry("k", v)` inside `Map.ofEntries(…)`;
+#   3. a `values.put("k", v);` statement in a block;
+#   4. a builder `.put("k", v)` link in a `….put(…).build()` chain.
+#
+# Keys are matched whole: `(string_literal . (string_fragment) @flag_name .)`
+# declines a literal an escape splits, and so a key that merely contains the
+# flag's.
+#
+# Not covered, deliberately: a `put` statement that is a braceless body (`if
+# (x) m.put("k", true);` — deleting it would hand the `if` the next
+# statement), one in a constructor body or a `switch` group, a `put` whose
+# result is used, and `new HashMap<>() {{ put(…); }}` double-brace
+# initialisers. Each is left for the residual-reference caveat.
+#
+# A map is emptied ONLY WHERE ITS TYPE COMES FROM THE CONTEXT. `Map.of()` and
+# `Map.ofEntries()` infer their type arguments from the target; with none, they
+# are a `Map<Object, Object>`. Measured with javac: `var m = Map.of()` and
+# `id(Map.of())` (a generic method) both stop the next `Boolean b = m.get(…)`
+# compiling, while a declared `Map<String, Boolean> m = Map.of()` and
+# `forTesting(Map.of())` compile. So a sole `Map.of` pair is deleted in exactly
+# two places — the value of a declaration whose type is not `var`, and the
+# argument of `FeatureflipClient.forTesting` — and a sole `Map.entry` never.
+# Everywhere else the entry stays and is reported like any other kept entry.
+#
+# THE SAME HOLDS FOR A PAIR THAT IS NOT THE LAST ONE. Without a target type,
+# the inferred VALUE type is the common supertype of every value, so deleting a
+# pair can narrow it: `var m = Map.of("k", true, "limit", 5)` is a map of
+# `Serializable & Comparable<...>` and `(Boolean) m.get("x")` compiles; with
+# the pair gone it is a map of `Integer` and that cast does not (measured with
+# javac, and the same through a generic call). So every non-sole pair rule
+# and every `Map.entry` rule comes in THREE copies, each sound on its own:
+#
+#   * `_boolean_map`: anywhere, but only when EVERY value in the call is a
+#     boolean literal, so the inferred value type is `Boolean` before and
+#     after. A filter declines a call holding any argument that is not a
+#     string, a `true`/`false` or a comment (a nested call's arguments count
+#     too, which only ever keeps more);
+#   * `_typed_declaration`: the call is the initializer of a declaration whose
+#     declared type is not `var`, so the variable's type never moves;
+#   * `_for_testing_argument`: the call is the argument of
+#     `FeatureflipClient.forTesting`, whose parameter type is fixed.
+#
+# A mixed-value map anywhere else (under `var`, passed to another method,
+# called on directly) keeps the entry.
+
+# ===========================================================================
+# 1. `Map.of` argument pairs
+# ===========================================================================
+#
+# A pair is TWO sibling arguments, so no single node is the entry. These rules
+# rewrite a SPAN (`replace_node` .. `replace_node_end`), and a spanned match
+# collects no associated comma, so each position carries its own separator:
+#
+#   * after another pair: the span runs from the comma BEFORE the key to the
+#     value, so `, "k", true` goes and the line or the list closes cleanly;
+#   * first of several: the span runs from the key to the NEXT argument and is
+#     rewritten as that argument — the only way to take the whitespace after
+#     the comma with it, since no node owns that whitespace;
+#   * sole: the key and the value go, leaving `Map.of()` — only in the two
+#     typed contexts above (`_typed_declaration`, `_for_testing_argument`).
+#
+# A comment line directly above the pair is ordinary in a registry, and it
+# puts a named node between the comma and the key that the `.` anchors would
+# otherwise trip on. The `_after_comment` variants take ONE such comment, and
+# delete it with the pair it describes; more than one leaves the pair alone.
+#
+# THE KEY'S POSITION IS WHAT MAKES IT A KEY, and that is what the PARITY
+# filter on every pair rule is for. `Map.of` takes keys and values as one flat
+# list, so a string equal to the flag key may be a VALUE
+# (`Map.of("label", "old-checkout", …)`, `Map.of(true, "old-checkout", …)`),
+# and a query cannot count to two. So the rules only act on a list that
+# strictly alternates a string key with a non-string value, starting with a
+# key: the first argument starts with `"`, no two adjacent arguments both do,
+# and no two adjacent arguments both do not. In such a list a string is a key
+# by position, and nothing else is. Judged by TEXT, a comment counting as
+# neither; each adjacency test is repeated across one comment so a commented
+# registry is judged on its arguments, and two comments in a row between the
+# same two arguments are not looked across. Cost: a flag map whose VALUES are
+# strings is left alone. The filter looks at every `Map.of` in the enclosing call, so a
+# nested one that fails declines its parent too, which only ever keeps more.
+#
+# The receiver is matched by `#match?` against `Map` / `ImmutableMap` /
+# `ImmutableSortedMap`, qualified or not; `List.of`, `Set.of` and every other
+# `of` are left alone, and so is the flag read itself (`boolVariation("k",
+# …, true)`), which a callee-free pair query would have matched.
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      "," @lead
+      . (string_literal . (string_fragment) @flag_name .)
+      . [(true) (false)] @value))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          "," @lead
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            "," @lead
+            . (string_literal . (string_fragment) @flag_name .)
+            . [(true) (false)] @value)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      "," @lead
+      . [(line_comment) (block_comment)]
+      . (string_literal . (string_fragment) @flag_name .)
+      . [(true) (false)] @value))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          "," @lead
+          . [(line_comment) (block_comment)]
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            "," @lead
+            . [(line_comment) (block_comment)]
+            . (string_literal . (string_fragment) @flag_name .)
+            . [(true) (false)] @value)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      . (string_literal . (string_fragment) @flag_name .) @key
+      . [(true) (false)] @value
+      . (string_literal) @next))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .) @key
+          . [(true) (false)] @value
+          . (string_literal) @next))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            . (string_literal . (string_fragment) @flag_name .) @key
+            . [(true) (false)] @value
+            . (string_literal) @next)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      . [(line_comment) (block_comment)] @leading_comment
+      . (string_literal . (string_fragment) @flag_name .)
+      . [(true) (false)] @value
+      . (string_literal) @next))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . [(line_comment) (block_comment)] @leading_comment
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value
+          . (string_literal) @next))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            . [(line_comment) (block_comment)] @leading_comment
+            . (string_literal . (string_fragment) @flag_name .)
+            . [(true) (false)] @value
+            . (string_literal) @next)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_sole_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .) @key
+          . [(true) (false)] @value .))))
+  (#not-eq? @declared_type "var")
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "key"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_sole_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            . (string_literal . (string_fragment) @flag_name .) @key
+            . [(true) (false)] @value .)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "key"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      "," @lead
+      . (string_literal . (string_fragment) @flag_name .)
+      . (_) @value))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          "," @lead
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            "," @lead
+            . (string_literal . (string_fragment) @flag_name .)
+            . (_) @value)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      "," @lead
+      . [(line_comment) (block_comment)]
+      . (string_literal . (string_fragment) @flag_name .)
+      . (_) @value))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          "," @lead
+          . [(line_comment) (block_comment)]
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            "," @lead
+            . [(line_comment) (block_comment)]
+            . (string_literal . (string_fragment) @flag_name .)
+            . (_) @value)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      . (string_literal . (string_fragment) @flag_name .) @key
+      . (_) @value
+      . (string_literal) @next))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .) @key
+          . (_) @value
+          . (string_literal) @next))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            . (string_literal . (string_fragment) @flag_name .) @key
+            . (_) @value
+            . (string_literal) @next)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    object: (_) @receiver
+    name: (identifier) @method
+    arguments: (argument_list
+      . [(line_comment) (block_comment)] @leading_comment
+      . (string_literal . (string_fragment) @flag_name .)
+      . (_) @value
+      . (string_literal) @next))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = ['''(
+  (argument_list (_) @other_value)
+  (#not-match? @other_value "^(\"|true$|false$|//|/\\*)")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . [(line_comment) (block_comment)] @leading_comment
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value
+          . (string_literal) @next))))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            . [(line_comment) (block_comment)] @leading_comment
+            . (string_literal . (string_fragment) @flag_name .)
+            . (_) @value
+            . (string_literal) @next)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_sole_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .) @key
+          . (_) @value .))))
+  (#not-eq? @declared_type "var")
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "key"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_sole_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          object: (_) @receiver
+          name: (identifier) @method
+          arguments: (argument_list
+            . (string_literal . (string_fragment) @flag_name .) @key
+            . (_) @value .)) .))
+  (#eq? @method "of")
+  (#match? @receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "key"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(method_invocation) @call"
+not_contains = [
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list . [(line_comment) (block_comment)] . (_) @first_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @first_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (string_literal) . [(line_comment) (block_comment)] . (string_literal)))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+  '''(
+  (method_invocation
+    object: (_) @parity_receiver
+    name: (identifier) @parity_method
+    arguments: (argument_list (_) @left_argument . [(line_comment) (block_comment)] . (_) @right_argument))
+  (#eq? @parity_method "of")
+  (#match? @parity_receiver "^((java\\.util\\.)?Map|(com\\.google\\.common\\.collect\\.)?Immutable(Sorted)?Map)$")
+  (#not-match? @left_argument "^(\"|//|/\\*)")
+  (#not-match? @right_argument "^(\"|//|/\\*)")
+)''',
+]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (argument_list (string_literal . (string_fragment) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+# ===========================================================================
+# 2. `Map.entry("k", v)` inside `Map.ofEntries(…)`
+# ===========================================================================
+#
+# One argument is one entry, so a plain node deletion takes the comma with it.
+# The FIRST entry of several is rewritten up to the next entry instead, for
+# the same whitespace reason as a first pair above. Every rule here needs a
+# SURVIVING `Map.entry` beside the doomed one (the `@next`, or the entry just
+# before it), so a SOLE entry is never deleted: `Map.ofEntries()` takes its
+# types from its context, and under `var` or a generic call it is a
+# `Map<Object, Object>` that the code after it no longer compiles against.
+# The enclosing call must be `ofEntries`: a `Map.entry` bound to a local is
+# not a list element, and deleting it would leave `var e = ;`.
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_first_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .)) @entry
+      . (method_invocation) @next))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "entry"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_first_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . [(true) (false)] @value .)) @entry
+          . (method_invocation) @next))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "entry"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_first_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . [(true) (false)] @value .)) @entry
+            . (method_invocation) @next)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "entry"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_first_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      . [(line_comment) (block_comment)] @leading_comment
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .)) @entry
+      . (method_invocation) @next))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_first_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          . [(line_comment) (block_comment)] @leading_comment
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . [(true) (false)] @value .)) @entry
+          . (method_invocation) @next))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_first_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            . [(line_comment) (block_comment)] @leading_comment
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . [(true) (false)] @value .)) @entry
+            . (method_invocation) @next)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_after_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      (method_invocation)
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .)) @entry))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_after_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          (method_invocation)
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . [(true) (false)] @value .)) @entry))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_after_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            (method_invocation)
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . [(true) (false)] @value .)) @entry)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      (method_invocation)
+      . [(line_comment) (block_comment)]
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .)) @entry))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          (method_invocation)
+          . [(line_comment) (block_comment)]
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . [(true) (false)] @value .)) @entry))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_entry_call_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            (method_invocation)
+            . [(line_comment) (block_comment)]
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . [(true) (false)] @value .)) @entry)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_first_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value .)) @entry
+      . (method_invocation) @next))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "entry"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_first_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . (_) @value .)) @entry
+          . (method_invocation) @next))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "entry"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_first_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . (_) @value .)) @entry
+            . (method_invocation) @next)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "entry"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_first_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      . [(line_comment) (block_comment)] @leading_comment
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value .)) @entry
+      . (method_invocation) @next))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_first_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          . [(line_comment) (block_comment)] @leading_comment
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . (_) @value .)) @entry
+          . (method_invocation) @next))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_first_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            . [(line_comment) (block_comment)] @leading_comment
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . (_) @value .)) @entry
+            . (method_invocation) @next)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_after_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      (method_invocation)
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value .)) @entry))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_after_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          (method_invocation)
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . (_) @value .)) @entry))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_after_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            (method_invocation)
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . (_) @value .)) @entry)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_after_comment_boolean_map"
+query = '''(
+  (method_invocation
+    name: (identifier) @outer_method
+    arguments: (argument_list
+      (method_invocation)
+      . [(line_comment) (block_comment)]
+      . (method_invocation
+        object: (_) @receiver
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value .)) @entry))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @entries"
+not_contains = ['''(
+  (method_invocation
+    name: (identifier) @other_method
+    arguments: (argument_list . (_) . (_) @other_value .))
+  (#eq? @other_method "entry")
+  (#not-match? @other_value "^(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_after_comment_typed_declaration"
+query = '''(
+  (_
+    type: (_) @declared_type
+    declarator: (variable_declarator
+      value: (method_invocation
+        name: (identifier) @outer_method
+        arguments: (argument_list
+          (method_invocation)
+          . [(line_comment) (block_comment)]
+          . (method_invocation
+            object: (_) @receiver
+            name: (identifier) @method
+            arguments: (argument_list
+              . (string_literal . (string_fragment) @flag_name .)
+              . (_) @value .)) @entry))))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#not-eq? @declared_type "var")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_entry_call_after_comment_for_testing_argument"
+query = '''(
+  (method_invocation
+    object: (identifier) @client
+    name: (identifier) @callee
+    arguments: (argument_list
+      . (method_invocation
+          name: (identifier) @outer_method
+          arguments: (argument_list
+            (method_invocation)
+            . [(line_comment) (block_comment)]
+            . (method_invocation
+              object: (_) @receiver
+              name: (identifier) @method
+              arguments: (argument_list
+                . (string_literal . (string_fragment) @flag_name .)
+                . (_) @value .)) @entry)) .))
+  (#eq? @outer_method "ofEntries")
+  (#eq? @method "entry")
+  (#match? @receiver "^(java\\.util\\.)?Map$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(argument_list) @registry"
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .)))
+  (#eq? @sibling_method "entry")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+# ===========================================================================
+# 3. A `put("k", v);` statement in a block
+# ===========================================================================
+#
+# Any receiver: a test's setup map is `values`, `overrides`, `this.flags`. The
+# statement's parent must be a `block`, which keeps a braceless body out. The
+# registry prong's evidence is another `put` of a project flag key in the same
+# block.
+
+[[rules]]
+name = "delete_flag_keyed_boolean_put_statement"
+query = '''(
+  (block
+    (expression_statement
+      (method_invocation
+        object: (_)
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . [(true) (false)] @value .))) @entry)
+  (#eq? @method "put")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_registry_put_statement"
+query = '''(
+  (block
+    (expression_statement
+      (method_invocation
+        object: (_)
+        name: (identifier) @method
+        arguments: (argument_list
+          . (string_literal . (string_fragment) @flag_name .)
+          . (_) @value .))) @entry)
+  (#eq? @method "put")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(block) @registry"
+contains = '''(
+  (expression_statement
+    (method_invocation
+      name: (identifier) @sibling_method
+      arguments: (argument_list . (string_literal . (string_fragment) @sibling .) . (_) .)))
+  (#eq? @sibling_method "put")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+# ===========================================================================
+# 4. A builder `.put("k", v)` link
+# ===========================================================================
+#
+# Rewritten as its own receiver chain (`replace = "@chain"`), so the link and
+# the line break in front of it go together and a one-line chain stays one
+# line. Only a link that is itself the receiver of another `put` or of the
+# chain's `build` / `buildOrThrow` / `buildKeepingLast`: `Map.put` returns the
+# previous value, so `m.put("k", true).toString()` is a use of that value and
+# not a link. The registry prong's evidence is another `put` of a project flag
+# key in the same chain, found from its `build` call — a chain with no build
+# call offers none, and only the stub prong applies there.
+
+[[rules]]
+name = "delete_flag_keyed_boolean_builder_put"
+query = '''(
+  (method_invocation
+    object: (method_invocation
+      object: (_) @chain
+      name: (identifier) @method
+      arguments: (argument_list
+        . (string_literal . (string_fragment) @flag_name .)
+        . [(true) (false)] @value .)) @put
+    name: (identifier) @outer_method)
+  (#eq? @method "put")
+  (#match? @outer_method "^(put|build|buildOrThrow|buildKeepingLast)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "put"
+replace = "@chain"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_registry_builder_put"
+query = '''(
+  (method_invocation
+    object: (method_invocation
+      object: (_) @chain
+      name: (identifier) @method
+      arguments: (argument_list
+        . (string_literal . (string_fragment) @flag_name .)
+        . (_) @value .)) @put
+    name: (identifier) @outer_method)
+  (#eq? @method "put")
+  (#match? @outer_method "^(put|build|buildOrThrow|buildKeepingLast)$")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "put"
+replace = "@chain"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = '''(
+  (method_invocation name: (identifier) @chain_end)
+  (#match? @chain_end "^(build|buildOrThrow|buildKeepingLast)$")
+) @registry'''
+contains = '''(
+  (method_invocation
+    name: (identifier) @sibling_method
+    arguments: (argument_list . (string_literal . (string_fragment) @sibling .) . (_) .))
+  (#eq? @sibling_method "put")
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1

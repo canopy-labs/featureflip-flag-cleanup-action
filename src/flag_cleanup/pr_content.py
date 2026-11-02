@@ -23,6 +23,7 @@ from dataclasses import replace
 from flag_cleanup import report_paths, stale_comments
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
+from flag_cleanup.discarded_calls import DISCARDED_CALL
 from flag_cleanup.cross_file_keys import (
     ENUM_DYNAMIC,
     ENUM_UNPROVEN,
@@ -187,6 +188,7 @@ REPORTED_BINDING_KINDS = frozenset(
         RENAMED_TEST,
         REMOVED_DEFAULT,
         DECLARED_LOAD,
+        DISCARDED_CALL,
     }
 )
 
@@ -444,6 +446,32 @@ def _failing_assertion_lines(failing: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _discarded_call_lines(discarded: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each call the removal kept running as a discard
+    (`_ = getClient(…)`), or nothing.
+
+    Its local was left unread, but the call may do work, so it was not
+    deleted. Often it only fetched a client or built a context for the read
+    that went, which the reviewer can tell and the run cannot.
+    """
+    if not discarded:
+        return []
+    count = len(discarded)
+    noun = "call is" if count == 1 else "calls are"
+    return [
+        f"> **{count} {noun} kept only to be discarded.** "
+        f"{'Its' if count == 1 else 'Each'} result was stored in a variable that "
+        "only the removed flag read used. A call can have side effects, so "
+        f"{'it was' if count == 1 else 'each was'} kept as `_ = …` and still runs. "
+        "If it only fetched a client or built an evaluation context for that read, "
+        "delete the line, and then anything only it used:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in discarded[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def _kept_argument_local_lines(kept: list[tuple[str, str]]) -> list[str]:
     """The callout naming each local whose only reader was an argument this
     pull request removed with a constructor parameter, or nothing.
@@ -497,6 +525,43 @@ def _unread_member_lines(unread: list[tuple[str, str]]) -> list[str]:
         "it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+#: The source files whose unread rows get the JVM callout.
+_JVM_SUFFIXES = (".java", ".kt", ".kts")
+
+
+def _unread_jvm_lines(unread: list[tuple[str, str]], parameters: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Java or Kotlin private member, and each plain
+    Kotlin primary-constructor parameter, the fold left unread, or nothing.
+
+    Neither compiler rejects one; the linters JVM builds commonly gate on
+    do. See :mod:`~flag_cleanup.jvm_unread_members`.
+    """
+    rows = unread + parameters
+    if not rows:
+        return []
+    count = len(rows)
+    noun = "member or constructor parameter is" if count == 1 else "members or constructor parameters are"
+    return [
+        f"> **⚠️ {count} Java/Kotlin private {noun} no longer read.** Every "
+        "read was a flag read this pull request removed. The compiler accepts "
+        "it, but detekt (`UnusedPrivateProperty`, `UnusedParameter`), Error "
+        "Prone (`UnusedVariable`), PMD (`UnusedPrivateField`) and Sonar report "
+        "it, which fails a build that gates on them. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        "removing it changes the constructor that every caller and every "
+        "dependency-injection container or framework calls, and not every "
+        "construction of the class could be proven, or because its "
+        "initializer may do work, an annotation or framework may still use "
+        "it, or something other than a constructor parameter sets it. Remove "
+        f"{'it' if count == 1 else 'each'}, with any argument callers pass for "
+        "it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -814,6 +879,7 @@ def _shown_residue(residue: Residue, show) -> Residue:
         comment_lines=_shown_rows(residue.comment_lines, show),
         path_only=tuple(show(path) for path in residue.path_only),
         literal_only=tuple(show(path) for path in residue.literal_only),
+        namespace_only=tuple(show(path) for path in residue.namespace_only),
     )
 
 
@@ -993,6 +1059,7 @@ def pr_body(
         | set(residue.title_only)
         | set(residue.path_only)
         | set(residue.literal_only)
+        | set(residue.namespace_only)
         | set(held_paths)
     )
     generic = tuple(path for path in unprocessed if path not in sorted_out)
@@ -1039,15 +1106,25 @@ def pr_body(
     # Comments describing the flag's state, those describing the deleted
     # branch first: a kept comment naming the flag moves up here when it
     # does, and is not listed again below.
+    #
+    # Only while nothing still READS the flag. A kept comment sits in a file
+    # this run did not change, so what it describes is whatever reads the
+    # flag elsewhere, and "now false" / "now unconditional" is a claim about
+    # every one of those reads. With one still standing (a file in the generic
+    # caveat above, or an enum entry still holding the key) the claim may be
+    # untrue, so the comment stays in the plain comments-only list below.
+    still_read = bool(unprocessed or held_paths)
     removed_branch = [
         row
         for row in residue.comment_lines
-        if stale_comments.describes_removed(row[2], candidate.key, candidate.treatment)
+        if not still_read
+        and stale_comments.describes_removed(row[2], candidate.key, candidate.treatment)
     ]
     kept_branch = [
         row
         for row in residue.comment_lines
-        if row not in removed_branch
+        if not still_read
+        and row not in removed_branch
         and stale_comments.describes_kept(row[2], candidate.key, candidate.treatment)
     ]
     lines += _flag_state_comment_lines(
@@ -1143,6 +1220,23 @@ def pr_body(
             *(
                 [f"> - ...and {len(residue.literal_only) - len(shown)} more"]
                 if len(residue.literal_only) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.namespace_only:
+        shown = residue.namespace_only[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.namespace_only)} file(s) name this flag's key only "
+            "as a segment of a package, namespace or import path** "
+            "(`package com.example.key`, `import com.example.key.Type`), and "
+            "perhaps in comments. That is code organised under a package named "
+            "after the feature, not a flag read, so they were left alone:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.namespace_only) - len(shown)} more"]
+                if len(residue.namespace_only) > len(shown)
                 else []
             ),
             "",
@@ -1277,16 +1371,28 @@ def pr_body(
     removed_comments = [
         (path, text) for path, kind, text in bindings if kind == "removed comment"
     ]
+    discarded_calls = [
+        (path, text) for path, kind, text in bindings if kind == DISCARDED_CALL
+    ]
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
-    lines += _unread_member_lines([m for m in unread_members if not m[0].endswith(".dart")])
+    lines += _unread_member_lines(
+        [m for m in unread_members if not m[0].endswith((".dart", *_JVM_SUFFIXES))]
+    )
     lines += _unread_dart_field_lines([m for m in unread_members if m[0].endswith(".dart")])
-    lines += _unread_constructor_parameter_lines(unread_constructor_parameters)
+    lines += _unread_jvm_lines(
+        [m for m in unread_members if m[0].endswith(_JVM_SUFFIXES)],
+        [p for p in unread_constructor_parameters if p[0].endswith(_JVM_SUFFIXES)],
+    )
+    lines += _unread_constructor_parameter_lines(
+        [p for p in unread_constructor_parameters if not p[0].endswith(_JVM_SUFFIXES)]
+    )
     lines += _removed_member_lines([m for m in removed_members if not m[0].endswith(".dart")])
     lines += _removed_dart_field_lines([m for m in removed_members if m[0].endswith(".dart")])
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
     lines += _failing_assertion_lines(failing_assertions)
     lines += _kept_argument_local_lines(kept_argument_locals)
+    lines += _discarded_call_lines(discarded_calls)
     lines += _unread_binding_lines(unread_bindings)
     lines += _dropped_argument_lines(dropped_arguments)
     lines += _emptied_override_lines(emptied)
@@ -1501,8 +1607,9 @@ def pr_body(
         noun = "entry was" if count == 1 else "entries were"
         lines += [
             f"> **{count} flag-keyed {noun} removed.** Each was an entry keyed by "
-            "this flag inside a literal that is provably about flags: either "
-            "another key in the same literal is a different flag of this project, "
+            "this flag in a literal (or, in Go, a map assignment) that is "
+            "provably about flags: either "
+            "another key in the same map is a different flag of this project, "
             "or the entry's value is a boolean (a literal, or a name bound only "
             "to one). None is a flag read — these are "
             "the registry and override lines a reviewer used to delete by hand.",

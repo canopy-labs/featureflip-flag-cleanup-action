@@ -50,7 +50,9 @@
 # fragment to be both the FIRST and the LAST named child declines it; the
 # quotes are anonymous nodes, which anchors ignore, so the plain literal still
 # matches. `ESCAPED` in the fixture pins this, `LONGER` pins the un-escaped
-# prefix case. A template literal is a different node and never matched.
+# prefix case. A template literal is a different node and never matched. An
+# unquoted key (`{ oldCheckout: true }`) is a whole node of its own, so it needs
+# no anchor, and a shorthand (`{ oldCheckout }`) is not a pair and never matched.
 #
 # The engine swallows the entry's comma itself (measured in every position);
 # `syntax.collapse_introduced_double_spaces` tidies the space it leaves. It
@@ -71,7 +73,7 @@
 name = "delete_flag_keyed_boolean_pair"
 query = """(
   (pair
-    key: (string . (string_fragment) @flag_name .)
+    key: [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
     value: [(true) (false)] @value) @entry
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -90,7 +92,7 @@ holes = ["stale_flag_name"]
 [[rules]]
 name = "delete_flag_keyed_registry_pair"
 query = """(
-  (pair key: (string . (string_fragment) @flag_name .) value: (_) @value) @entry
+  (pair key: [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name] value: (_) @value) @entry
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "entry"
@@ -101,10 +103,67 @@ holes = ["stale_flag_name", "known_flag_keys"]
 [[rules.filters]]
 enclosing_node = "(object) @registry"
 contains = """(
-  (pair key: (string . (string_fragment) @sibling .))
+  (pair key: [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
+
+# ===========================================================================
+# Unions of literals: `type FlagKey = 'a' | 'k' | 'b'`
+# ===========================================================================
+#
+# A typed resolver takes its key as such a union, so the key's member is what
+# stops a file reading clean. Unions nest to the left, `(('a' | 'k') | 'b')`, so
+# a member that is not the first is the right side of the union ending at it,
+# and that union becomes its left side, whatever follows. The first member is
+# the left side of the innermost one, and a leading `|` is a union of its own.
+# `type K = 'k'` is no union, so nothing here matches it: emptying it would not
+# compile. Each deletes under the rule every entry does: while anything still
+# names the key, the entry is put back.
+[[rules]]
+name = "delete_flag_keyed_union_member"
+query = """(
+  (union_type
+    (_) @left
+    (literal_type (string . (string_fragment) @flag_name .))) @union
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "union"
+replace = "@left"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name"]
+
+[[rules]]
+name = "delete_flag_keyed_first_union_member"
+query = """(
+  (union_type
+    .
+    (literal_type (string . (string_fragment) @flag_name .))
+    .
+    (_) @right) @union
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "union"
+replace = "@right"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name"]
+
+[[rules]]
+name = "delete_flag_keyed_leading_union_member"
+query = """(
+  (union_type
+    .
+    (union_type . "|" . (literal_type (string . (string_fragment) @flag_name .)) .)
+    .
+    "|" @bar
+    .
+    (_) @right) @union
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "union"
+replace = "@bar @right"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name"]
 
 # ===========================================================================
 # Object types: `{ 'k'?: boolean; … }`
@@ -191,7 +250,7 @@ name = "rewrite_flag_keyed_boolean_type_member_separator_with_later_member"
 query = """(
   (object_type
     (property_signature
-      (string . (string_fragment) @flag_name .)
+      [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
       type: (type_annotation (predefined_type) @member_type)) @entry
     . (";") @separator
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
@@ -210,7 +269,7 @@ query = """(
   (object_type
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
     (property_signature
-      (string . (string_fragment) @flag_name .)
+      [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
       type: (type_annotation (predefined_type) @member_type)) @entry
     . (";") @separator)
   (#eq? @flag_name "@stale_flag_name")
@@ -226,7 +285,7 @@ holes = ["stale_flag_name"]
 name = "rewrite_flag_keyed_registry_type_member_separator_with_later_member"
 query = """(
   (object_type
-    (property_signature (string . (string_fragment) @flag_name .)) @entry
+    (property_signature [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]) @entry
     . (";") @separator
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
@@ -239,7 +298,7 @@ holes = ["stale_flag_name", "known_flag_keys"]
 [[rules.filters]]
 enclosing_node = "(object_type) @registry"
 contains = """(
-  (property_signature (string . (string_fragment) @sibling .))
+  (property_signature [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
@@ -250,7 +309,7 @@ name = "rewrite_flag_keyed_registry_type_member_separator_with_earlier_member"
 query = """(
   (object_type
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
-    (property_signature (string . (string_fragment) @flag_name .)) @entry
+    (property_signature [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]) @entry
     . (";") @separator)
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -262,7 +321,7 @@ holes = ["stale_flag_name", "known_flag_keys"]
 [[rules.filters]]
 enclosing_node = "(object_type) @registry"
 contains = """(
-  (property_signature (string . (string_fragment) @sibling .))
+  (property_signature [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
@@ -279,7 +338,7 @@ name = "delete_flag_keyed_boolean_type_member_with_later_member"
 query = """(
   (object_type
     (property_signature
-      (string . (string_fragment) @flag_name .)
+      [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
       type: (type_annotation (predefined_type) @member_type)) @entry
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
@@ -293,7 +352,7 @@ holes = ["stale_flag_name"]
 [[rules.filters]]
 enclosing_node = "(object_type) @host"
 not_contains = ["""(
-  (property_signature (string . (string_fragment) @unseparated_name .))
+  (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
 )"""]
@@ -305,7 +364,7 @@ query = """(
   (object_type
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
     (property_signature
-      (string . (string_fragment) @flag_name .)
+      [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
       type: (type_annotation (predefined_type) @member_type)) @entry)
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @member_type "boolean")
@@ -318,7 +377,7 @@ holes = ["stale_flag_name"]
 [[rules.filters]]
 enclosing_node = "(object_type) @host"
 not_contains = ["""(
-  (property_signature (string . (string_fragment) @unseparated_name .))
+  (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
 )"""]
@@ -328,7 +387,7 @@ not_contains = ["""(
 name = "delete_flag_keyed_registry_type_member_with_later_member"
 query = """(
   (object_type
-    (property_signature (string . (string_fragment) @flag_name .)) @entry
+    (property_signature [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]) @entry
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -340,7 +399,7 @@ holes = ["stale_flag_name", "known_flag_keys"]
 [[rules.filters]]
 enclosing_node = "(object_type) @registry"
 contains = """(
-  (property_signature (string . (string_fragment) @sibling .))
+  (property_signature [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
@@ -348,7 +407,7 @@ at_least = 1
 [[rules.filters]]
 enclosing_node = "(object_type) @host"
 not_contains = ["""(
-  (property_signature (string . (string_fragment) @unseparated_name .))
+  (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
 )"""]
@@ -359,7 +418,7 @@ name = "delete_flag_keyed_registry_type_member_with_earlier_member"
 query = """(
   (object_type
     [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
-    (property_signature (string . (string_fragment) @flag_name .)) @entry)
+    (property_signature [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]) @entry)
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "entry"
@@ -370,7 +429,7 @@ holes = ["stale_flag_name", "known_flag_keys"]
 [[rules.filters]]
 enclosing_node = "(object_type) @registry"
 contains = """(
-  (property_signature (string . (string_fragment) @sibling .))
+  (property_signature [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
@@ -378,7 +437,7 @@ at_least = 1
 [[rules.filters]]
 enclosing_node = "(object_type) @host"
 not_contains = ["""(
-  (property_signature (string . (string_fragment) @unseparated_name .))
+  (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
 )"""]
@@ -415,13 +474,13 @@ query = """(
      type: (type_annotation
        (object_type
          . (property_signature
-             (string . (string_fragment) @flag_name .)
+             [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
              type: (type_annotation (predefined_type) @member_type)) @entry .) @host))
    (optional_parameter
      type: (type_annotation
        (object_type
          . (property_signature
-             (string . (string_fragment) @flag_name .)
+             [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
              type: (type_annotation (predefined_type) @member_type)) @entry .) @host))]
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @member_type "boolean")

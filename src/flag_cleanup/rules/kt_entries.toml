@@ -85,74 +85,921 @@
 # here). Requiring the content to be both the first and the last named child
 # declines every one of them; `interpolated` in the fixture pins it.
 #
-# Emptying a map is accepted here as it is everywhere else: `mutableMapOf("k"
-# to true)` becomes `mutableMapOf()`, which without type arguments may not
-# compile on its own. That is the customer's override object emptied, and the
-# same trade every other language in this directory makes.
-
-# ===========================================================================
-# Map-builder arguments: `mapOf("k" to …)`
-# ===========================================================================
-
-# STUB PRONG — the value is the boolean literal this run KEEPS: a test
-# override, or a plain flag -> value map. May empty its call
-# (`mutableMapOf("k" to true)` -> `mutableMapOf()`), which is the right shape
-# for an override.
+# A SOLE ENTRY IS DELETED ONLY WHERE THE CONTEXT FIXES THE MAP'S TYPE.
+# Emptying a call removes the only thing its type arguments were inferred
+# from: `val m = mutableMapOf("k" to true)` becomes `val m =
+# mutableMapOf()`, which does not compile ("cannot infer type for type
+# parameter 'K'"). Measured with kotlinc 2.2.20, an emptied builder
+# compiles where the expected type supplies both type arguments, and fails
+# as the initializer of an unannotated `val`/`var`, under a declared type
+# with no type arguments (`Any`, `Any?`, and a `typealias` looks the same
+# to a query), under a star projection (`Map<*, *>`), as the argument of a
+# generic function, and as the argument of a call whose overloads differ
+# only in map type. So a sole entry is deleted only in three
+# positions enumerated POSITIVELY, each on a standard-library builder
+# (`mapOf`, `mutableMapOf`, `hashMapOf`, `linkedMapOf`, `sortedMapOf`, all
+# of which have an empty overload) so a project's own non-vararg function
+# never loses its only argument:
 #
-# ONE rule where there used to be two. This grammar parses `true`/`false` in
-# this position as a plain `(identifier)` rather than as their own node types,
-# so the alternation `[(true) (false)]` every other language uses is not
-# available here and the value had to be named by TEXT — which `#eq?` can only
-# do one spelling at a time, hence a `_true` rule and a `_false` one. The
-# #3050 guard collapses that: there is exactly one spelling to accept now, and
-# it is whichever `@treated` holds.
+#   * `_sole_typed_declaration`: the builder is the value of a property or
+#     local whose declared type is `Map`, `MutableMap`, `HashMap`,
+#     `LinkedHashMap` or `SortedMap` (nullable or not) with type arguments
+#     and no `*` in them;
+#   * `_sole_type_arguments`: the builder call carries its own type
+#     arguments (`mutableMapOf<String, Boolean>(…)`);
+#   * `_sole_for_testing_argument`: the builder is the first positional
+#     argument of `FeatureflipClient.forTesting(…)`, whose parameter is a
+#     non-generic `Map<String, …>` in both SDKs and is not overloaded.
+#
+# Any other sole entry is left in place and reported like any other kept
+# entry. A general call argument is NOT on the list even where it would
+# compile: the overload case above is one no query can see.
+#
+# REMOVING ONE OF SEVERAL ENTRIES CAN NARROW THE MAP'S TYPE, so an entry
+# with another argument beside it is not deleted anywhere either. Measured
+# with kotlinc 2.2.20: `val m = mutableMapOf("k" to true, "limit" to 5)` is
+# a `MutableMap<String, {Comparable & Serializable}>`, and `m["x"] = false`
+# compiles; without the flag's entry `m` is `MutableMap<String, Int>` and
+# the assignment fails ("argument type mismatch"). A key does the same
+# (`"k" to true, 1 to false` is keyed by `Any`). And a callee that is not a
+# map builder may not take a vararg at all: `twoPairs("k" to true, "j" to
+# false)` lost an argument. So the `_before` / `_after` rules are anchored
+# on a standard-library builder too, and come in the three typed contexts
+# above (`_typed_declaration`, `_nullable_typed_declaration`,
+# `_type_arguments`, `_for_testing_argument`) plus one more:
+#
+#   * `_boolean_map`: anywhere, but only when EVERY argument of the call is
+#     a plain string key `to` `true`/`false`, so the map is a
+#     `Map<String, Boolean>` before and after. A `not_contains` filter
+#     declines any `value_argument` whose TEXT is not exactly
+#     `"<no quote, backslash or $>" to true|false`; judged by text because
+#     this grammar has no boolean node, and a key that merely STARTS with a
+#     string (`"x".length to false`) must not pass. Interpolated or escaped
+#     keys, named and spread arguments and a comment inside an argument
+#     decline it, which only ever keeps more.
+#
+# The registry prong has no `_boolean_map` rule: with every value a boolean
+# literal and the value not `@untreated`, the value IS `@treated`, so the
+# stub prong's `_boolean_map` already deletes it without sibling evidence.
+#
+# A mixed-value map under an unannotated `val`/`var`, `Any`, `Map<*, *>` or
+# passed to another function keeps the entry, and so does a registry whose
+# values are all integers or all strings (its type would not move, but a
+# query cannot tell that from a mix, so booleans are the one case taken).
+#
+# "Has another argument beside it" is a pattern with an UNANCHORED sibling,
+# `(value_arguments (value_argument …) @entry (value_argument))`, so a
+# comment between the two does not matter. It is two rules, one per
+# direction, because Piranha ANDs the patterns of a multi-pattern query.
+# The registry prong's sibling filter runs `on_capture = "entry"`, so it
+# resolves the entry's own argument list whatever node the rule is rooted
+# at.
+#
+# STUB PRONG (`delete_flag_keyed_boolean_argument_*`) — the value is the
+# boolean literal this run KEEPS: a test override, or a plain flag -> value
+# map. This grammar parses `true`/`false` in this position as a plain
+# `(identifier)` rather than as their own node types, so the value is named
+# by TEXT, and the removed-branch guard above leaves one spelling to accept:
+# whichever `@treated` holds.
+#
+# REGISTRY PRONG (`delete_flag_keyed_registry_argument_*`) — another
+# argument in the SAME call is keyed by a different flag of this project, so
+# the call builds a flag-keyed map. The evidence cannot be satisfied by the
+# target's own key; sibling evidence inside the target's own VALUE is
+# accepted, because `contains` searches the whole subtree and a nested flag
+# map is still a flag map. So a sole entry that nests another flag key
+# passes the filter, and is then deleted only in the three typed positions
+# above, like any other sole entry.
+#
+# `@sibling_operator` rather than `@operator` in the filter, which is NOT
+# cosmetic: a rule's own captures are in scope as substitutions inside its
+# filters, so `@operator` there is rewritten to the matched text `to` before
+# tree-sitter sees the query and the engine panics on `(identifier) to)`
+# (measured). Any filter capture sharing a name with a capture in the rule
+# query has the same problem.
+
 [[rules]]
-name = "delete_flag_keyed_boolean_argument"
+name = "delete_flag_keyed_boolean_argument_before_boolean_map"
 query = """(
-  (value_argument
-    (infix_expression
-      . (string_literal . (string_content) @flag_name .)
-      . (identifier) @operator
-      . (identifier) @value)) @entry
+  (call_expression
+    . (identifier) @builder
+    (value_arguments
+      (value_argument
+        (infix_expression
+          . (string_literal . (string_content) @flag_name .)
+          . (identifier) @operator
+          . (identifier) @value)) @entry
+      (value_argument)))
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @operator "to")
   (#eq? @value "@treated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
 holes = ["stale_flag_name", "treated"]
 
-# REGISTRY PRONG — another argument in the SAME call is keyed by a different
-# flag of this project, so the call builds a flag-keyed map. The evidence
-# cannot be satisfied by the target's own key; sibling evidence inside the
-# target's own VALUE is accepted, because `contains` searches the whole
-# subtree and a nested flag map is still a flag map. So this prong CAN empty a
-# call whose sole argument nests another flag key — measured, and the same
-# trade the stub prong makes.
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @map"
+not_contains = ['''(
+  (value_argument) @map_argument
+  (#not-match? @map_argument "^\"[^\"\\\\$]*\"\\s+to\\s+(true|false)$")
+)''']
+
 [[rules]]
-name = "delete_flag_keyed_registry_argument"
+name = "delete_flag_keyed_boolean_argument_after_boolean_map"
 query = """(
-  (value_argument
-    (infix_expression
-      . (string_literal . (string_content) @flag_name .)
-      . (identifier) @operator
-      . (_) @value)) @entry
+  (call_expression
+    . (identifier) @builder
+    (value_arguments
+      (value_argument)
+      (value_argument
+        (infix_expression
+          . (string_literal . (string_content) @flag_name .)
+          . (identifier) @operator
+          . (identifier) @value)) @entry))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @map"
+not_contains = ['''(
+  (value_argument) @map_argument
+  (#not-match? @map_argument "^\"[^\"\\\\$]*\"\\s+to\\s+(true|false)$")
+)''']
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_before_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (user_type . (identifier) @map_type . (type_arguments) @type_args .))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (identifier) @value)) @entry
+        (value_argument))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_after_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (user_type . (identifier) @map_type . (type_arguments) @type_args .))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument)
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (identifier) @value)) @entry)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_before_nullable_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (nullable_type
+        (user_type . (identifier) @map_type . (type_arguments) @type_args .)))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (identifier) @value)) @entry
+        (value_argument))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_after_nullable_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (nullable_type
+        (user_type . (identifier) @map_type . (type_arguments) @type_args .)))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument)
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (identifier) @value)) @entry)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_before_type_arguments"
+query = """(
+  (call_expression
+    . (identifier) @builder
+    . (type_arguments)
+    (value_arguments
+      (value_argument
+        (infix_expression
+          . (string_literal . (string_content) @flag_name .)
+          . (identifier) @operator
+          . (identifier) @value)) @entry
+      (value_argument)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_after_type_arguments"
+query = """(
+  (call_expression
+    . (identifier) @builder
+    . (type_arguments)
+    (value_arguments
+      (value_argument)
+      (value_argument
+        (infix_expression
+          . (string_literal . (string_content) @flag_name .)
+          . (identifier) @operator
+          . (identifier) @value)) @entry))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_before_for_testing_argument"
+query = """(
+  (call_expression
+    . (navigation_expression . (identifier) @client . (identifier) @callee .)
+    . (value_arguments
+      . (value_argument
+        . (call_expression
+          . (identifier) @builder
+          (value_arguments
+            (value_argument
+              (infix_expression
+                . (string_literal . (string_content) @flag_name .)
+                . (identifier) @operator
+                . (identifier) @value)) @entry
+            (value_argument))))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_after_for_testing_argument"
+query = """(
+  (call_expression
+    . (navigation_expression . (identifier) @client . (identifier) @callee .)
+    . (value_arguments
+      . (value_argument
+        . (call_expression
+          . (identifier) @builder
+          (value_arguments
+            (value_argument)
+            (value_argument
+              (infix_expression
+                . (string_literal . (string_content) @flag_name .)
+                . (identifier) @operator
+                . (identifier) @value)) @entry)))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_sole_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (user_type . (identifier) @map_type . (type_arguments) @type_args .))
+    (call_expression
+      . (identifier) @builder
+      . (value_arguments
+        . (value_argument
+            (infix_expression
+              . (string_literal . (string_content) @flag_name .)
+              . (identifier) @operator
+              . (identifier) @value)) @entry .)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_sole_nullable_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (nullable_type
+        (user_type . (identifier) @map_type . (type_arguments) @type_args .)))
+    (call_expression
+      . (identifier) @builder
+      . (value_arguments
+        . (value_argument
+            (infix_expression
+              . (string_literal . (string_content) @flag_name .)
+              . (identifier) @operator
+              . (identifier) @value)) @entry .)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_sole_type_arguments"
+query = """(
+  (call_expression
+    . (identifier) @builder
+    . (type_arguments)
+    . (value_arguments
+      . (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (identifier) @value)) @entry .))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_argument_sole_for_testing_argument"
+query = """(
+  (call_expression
+    . (navigation_expression . (identifier) @client . (identifier) @callee .)
+    . (value_arguments
+      . (value_argument
+        . (call_expression
+          . (identifier) @builder
+          . (value_arguments
+            . (value_argument
+                (infix_expression
+                  . (string_literal . (string_content) @flag_name .)
+                  . (identifier) @operator
+                  . (identifier) @value)) @entry .)))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#eq? @value "@treated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_before_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (user_type . (identifier) @map_type . (type_arguments) @type_args .))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (_) @value)) @entry
+        (value_argument))))
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @operator "to")
   (#not-eq? @value "@untreated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
 )"""
 replace_node = "entry"
 replace = ""
 groups = ["delete_flag_keyed_entry"]
 holes = ["stale_flag_name", "known_flag_keys", "untreated"]
 
-# `@sibling_operator` rather than `@operator`, which is NOT cosmetic: a rule's
-# own captures are in scope as substitutions inside its filters, so `@operator`
-# here is rewritten to the matched text `to` before tree-sitter sees the query
-# and the engine panics on `(identifier) to)` (measured). Any filter capture
-# sharing a name with a capture in the rule query has the same problem.
 [[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_after_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (user_type . (identifier) @map_type . (type_arguments) @type_args .))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument)
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (_) @value)) @entry)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_before_nullable_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (nullable_type
+        (user_type . (identifier) @map_type . (type_arguments) @type_args .)))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (_) @value)) @entry
+        (value_argument))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_after_nullable_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (nullable_type
+        (user_type . (identifier) @map_type . (type_arguments) @type_args .)))
+    (call_expression
+      . (identifier) @builder
+      (value_arguments
+        (value_argument)
+        (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (_) @value)) @entry)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_before_type_arguments"
+query = """(
+  (call_expression
+    . (identifier) @builder
+    . (type_arguments)
+    (value_arguments
+      (value_argument
+        (infix_expression
+          . (string_literal . (string_content) @flag_name .)
+          . (identifier) @operator
+          . (_) @value)) @entry
+      (value_argument)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_after_type_arguments"
+query = """(
+  (call_expression
+    . (identifier) @builder
+    . (type_arguments)
+    (value_arguments
+      (value_argument)
+      (value_argument
+        (infix_expression
+          . (string_literal . (string_content) @flag_name .)
+          . (identifier) @operator
+          . (_) @value)) @entry))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_before_for_testing_argument"
+query = """(
+  (call_expression
+    . (navigation_expression . (identifier) @client . (identifier) @callee .)
+    . (value_arguments
+      . (value_argument
+        . (call_expression
+          . (identifier) @builder
+          (value_arguments
+            (value_argument
+              (infix_expression
+                . (string_literal . (string_content) @flag_name .)
+                . (identifier) @operator
+                . (_) @value)) @entry
+            (value_argument))))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_after_for_testing_argument"
+query = """(
+  (call_expression
+    . (navigation_expression . (identifier) @client . (identifier) @callee .)
+    . (value_arguments
+      . (value_argument
+        . (call_expression
+          . (identifier) @builder
+          (value_arguments
+            (value_argument)
+            (value_argument
+              (infix_expression
+                . (string_literal . (string_content) @flag_name .)
+                . (identifier) @operator
+                . (_) @value)) @entry)))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_sole_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (user_type . (identifier) @map_type . (type_arguments) @type_args .))
+    (call_expression
+      . (identifier) @builder
+      . (value_arguments
+        . (value_argument
+            (infix_expression
+              . (string_literal . (string_content) @flag_name .)
+              . (identifier) @operator
+              . (_) @value)) @entry .)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_sole_nullable_typed_declaration"
+query = """(
+  (property_declaration
+    (variable_declaration
+      (nullable_type
+        (user_type . (identifier) @map_type . (type_arguments) @type_args .)))
+    (call_expression
+      . (identifier) @builder
+      . (value_arguments
+        . (value_argument
+            (infix_expression
+              . (string_literal . (string_content) @flag_name .)
+              . (identifier) @operator
+              . (_) @value)) @entry .)))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @map_type "^(Map|MutableMap|HashMap|LinkedHashMap|SortedMap)$")
+  (#not-match? @type_args "[*]")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_sole_type_arguments"
+query = """(
+  (call_expression
+    . (identifier) @builder
+    . (type_arguments)
+    . (value_arguments
+      . (value_argument
+          (infix_expression
+            . (string_literal . (string_content) @flag_name .)
+            . (identifier) @operator
+            . (_) @value)) @entry .))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
+enclosing_node = "(value_arguments) @registry"
+contains = """(
+  (infix_expression
+    . (string_literal . (string_content) @sibling .)
+    . (identifier) @sibling_operator)
+  (#any-of? @sibling @known_flag_keys)
+  (#eq? @sibling_operator "to")
+)"""
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_argument_sole_for_testing_argument"
+query = """(
+  (call_expression
+    . (navigation_expression . (identifier) @client . (identifier) @callee .)
+    . (value_arguments
+      . (value_argument
+        . (call_expression
+          . (identifier) @builder
+          . (value_arguments
+            . (value_argument
+                (infix_expression
+                  . (string_literal . (string_content) @flag_name .)
+                  . (identifier) @operator
+                  . (_) @value)) @entry .)))))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @operator "to")
+  (#not-eq? @value "@untreated")
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#match? @builder "^(mapOf|mutableMapOf|hashMapOf|linkedMapOf|sortedMapOf)$")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+on_capture = "entry"
 enclosing_node = "(value_arguments) @registry"
 contains = """(
   (infix_expression

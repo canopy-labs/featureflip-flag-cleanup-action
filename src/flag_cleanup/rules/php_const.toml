@@ -123,7 +123,13 @@ query = """(
       function: (name) @sdk_fn
       arguments: (arguments
         . (argument [(class_constant_access_expression (name) @key_const .)
-                     (name) @key_const])))] @call
+                     (name) @key_const])))
+   ; accessor-arm: (scoped_call_expression
+   ; accessor-arm:    name: (name) @sdk_fn
+   ; accessor-arm:    arguments: (arguments
+   ; accessor-arm:      . (argument [(class_constant_access_expression (name) @key_const .)
+   ; accessor-arm:                   (name) @key_const])))
+   ] @call
   (#eq? @sdk_fn "boolVariation")
 )"""
 replace_node = "call"
@@ -182,7 +188,12 @@ query = """(
    (function_call_expression
       function: (name) @sdk_fn
       arguments: (arguments
-        . (argument (class_constant_access_expression (relative_scope) (name) @key_const .))))] @call
+        . (argument (class_constant_access_expression (relative_scope) (name) @key_const .))))
+   ; accessor-arm: (scoped_call_expression
+   ; accessor-arm:    name: (name) @sdk_fn
+   ; accessor-arm:    arguments: (arguments
+   ; accessor-arm:      . (argument (class_constant_access_expression (relative_scope) (name) @key_const .))))
+   ] @call
   (#eq? @sdk_fn "boolVariation")
 )"""
 replace_node = "call"
@@ -220,7 +231,9 @@ contains = """(
 #
 # The filter is a SEQUENCING guard, not the safety argument (Gate 2 is): while
 # any call still takes this constant as its first argument, the declaration
-# stays. It carries both reference shapes for the same reason the fold does.
+# stays. It carries both reference shapes for the same reason the fold does,
+# and every call shape, the static one included whether or not an accessor
+# clone folds it: callee-agnostic, so over-refusing is the only way it errs.
 [[rules]]
 name = "delete_flag_key_const_declaration"
 query = """(
@@ -253,6 +266,7 @@ holes = ["stale_flag_name"]
 enclosing_node = """((program) @container)"""
 not_contains = ["""(
   [(member_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))
-   (function_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))] @surviving_read
+   (function_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))
+   (scoped_call_expression arguments: (arguments . (argument [(class_constant_access_expression (name) @first_arg .) (name) @first_arg])))] @surviving_read
   (#eq? @first_arg "@variable_name")
 )"""]

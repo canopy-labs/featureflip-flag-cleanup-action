@@ -49,3 +49,17 @@ to = ["php_emptied_else_cleanup"]
 scope = "Parent"
 from = "delete_all_statements_after_return"
 to = ["delete_all_statements_after_return"]
+
+# An assertion the fold made trivially true is deleted (php_assertions.toml,
+# `trivial_assertion`). Only from the groups that write a literal, so only an
+# assertion this run's fold produced is reached: Parent scope walks the
+# literal, its argument list, the call and the statement.
+[[edges]]
+scope = "Parent"
+from = "replace_expression_with_boolean_literal"
+to = ["trivial_assertion"]
+
+[[edges]]
+scope = "Parent"
+from = "boolean_expression_simplify"
+to = ["trivial_assertion"]

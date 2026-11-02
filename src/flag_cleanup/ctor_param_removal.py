@@ -43,6 +43,7 @@ from tree_sitter import Node
 
 from flag_cleanup import (
     ctor_param_csharp,
+    ctor_param_jvm,
     ctor_param_ts,
     dart_field_removal,
     git_ops,
@@ -68,7 +69,7 @@ from flag_cleanup.unused import _parse
 
 logger = logging.getLogger(__name__)
 
-_ARGUMENT_LISTS = frozenset({"arguments", "argument_list"})
+_ARGUMENT_LISTS = frozenset({"arguments", "argument_list", "value_arguments"})
 #: The unread-row kinds each language's report passes write.
 _TS_KINDS = frozenset({"unread member", "unread constructor parameter"})
 _KINDS = {
@@ -77,7 +78,13 @@ _KINDS = {
     "js": _TS_KINDS,
     "csharp": frozenset({"unread parameter", "unread method parameter"}),
     "dart": frozenset({"unread member"}),
+    "java": frozenset({"unread member"}),
+    "kt": _TS_KINDS,
 }
+#: Java and Kotlin: every span a removal deletes is marked, as in Dart. A
+#: removal's files are all in the run's language (a construction from the
+#: other one refuses), so one grammar marks, rules and parses them.
+_JVM = frozenset({"java", "kt"})
 
 Row = tuple[str, str, str]
 
@@ -137,7 +144,7 @@ def _walk(node: Node) -> Iterator[Node]:
 
 
 def _grammar(path: str, language: str) -> str:
-    return language if language in ("csharp", "dart") else ts_scope.grammar(path)
+    return language if language in ("csharp", "dart", "java", "kt") else ts_scope.grammar(path)
 
 
 def _decode(data: bytes) -> str:
@@ -176,6 +183,8 @@ def _plan(summary, kind: str, label: str, language: str, repo_dir: str) -> Remov
             return ctor_param_csharp.plan(summary.path, summary.content, label, repo_dir)
         if language == "dart":
             return dart_field_removal.plan(summary.path, summary.content, label, repo_dir)
+        if language in _JVM:
+            return ctor_param_jvm.plan(summary.path, summary.content, kind, label, repo_dir)
         if kind == "unread constructor parameter":
             return ctor_param_ts.plan_parameter(summary.path, summary.content, label, repo_dir)
         outcome = ctor_param_ts.plan(summary.path, summary.content, label, repo_dir)
@@ -252,7 +261,9 @@ def remove(
             key = _key(removal.declaring_path)
             parameters.setdefault(key, []).extend(_parameter_spans(before[key], removal, language))
     rules = render_rules(
-        language if language in ("csharp", "dart") else "ts", [r for _, r in removals], sentinel
+        language if language in ("csharp", "dart", "java", "kt") else "ts",
+        [r for _, r in removals],
+        sentinel,
     )
     widths = _widths(files, spelling, summaries, before, language, repo_dir)
     # The candidate scan never listed a caller: bring every file this pass
@@ -276,7 +287,9 @@ def remove(
         for key in files:
             engine_out = Path(key).read_bytes()
             tidied = tidy(marked[key], engine_out, named_groups=language == "dart")
-            if any(m[2] == "import" for m in marks.get(key, ())):
+            if any(m[2] == "import" for m in marks.get(key, ())) or (
+                language in _JVM and any(m[2] == "member" for m in marks.get(key, ()))
+            ):
                 # A deleted first import leaves the blank line after it.
                 tidied = tidy_lines(marked[key], tidied)
             if b"\r" in tidied:
@@ -390,8 +403,8 @@ def kept_argument_locals(
 
 def _parameter_spans(data: bytes, removal: Removal, language: str) -> list[tuple[int, int]]:
     """Byte spans of ``removal``'s parameter in ``data``, byte-order mark included."""
-    if language == "dart":
-        return []  # a Dart parameter is one of the removal's marked sites
+    if language == "dart" or language in _JVM:
+        return []  # a Dart, Java or Kotlin parameter is one of the removal's marked sites
     offset = 3 if data.startswith(b"\xef\xbb\xbf") else 0
     source = _decode(data)
     if language == "csharp":
@@ -429,6 +442,14 @@ def _postcondition(
     for _, removal in removals:
         source = _decode(Path(removal.declaring_path).read_bytes())
         grammar = _grammar(removal.declaring_path, language)
+        if language in _JVM:
+            names = (removal.field, removal.param_name if language == "kt" or removal.field is None else None)
+            for name in names:
+                if name is not None and ctor_param_jvm.has_member(
+                    source, removal.declaring_path, removal.class_name, name
+                ):
+                    return f"{removal.declaring_path}: {name} is still declared"
+            continue
         if removal.field is not None and (
             dart_field_removal.has_field(source, removal.class_name, removal.field)
             if language == "dart"

@@ -215,6 +215,54 @@ def _parse(source: str, language: str) -> Node:
     return _parser(language).parse(source.encode("utf-8")).root_node
 
 
+#: How many sources the per-source caches below hold. A round of
+#: :func:`remove_stranded_bindings` reads two (``before`` and the current
+#: text), and a run handles one file at a time.
+_SOURCE_CACHE = 8
+
+
+@lru_cache(maxsize=_SOURCE_CACHE)
+def _shared_parse(source: str, language: str) -> Node:
+    """:func:`_parse`, shared between the callers that only READ a tree.
+
+    The stranded-binding pass asks the same questions of the same two texts
+    once per candidate, and every one of them used to reparse and rewalk the
+    whole file: the cost was a power of the file's length, not a multiple of
+    it. A tree is never edited here, so one parse per text serves them all.
+    """
+    return _parse(source, language)
+
+
+@lru_cache(maxsize=_SOURCE_CACHE)
+def _nodes_by_span(source: str, language: str) -> dict[tuple[int, int], Node]:
+    """The first node :func:`_walk` meets for each byte span of ``source``."""
+    index: dict[tuple[int, int], Node] = {}
+    for node in _walk(_shared_parse(source, language)):
+        index.setdefault((node.start_byte, node.end_byte), node)
+    return index
+
+
+def _covering(root: Node, start: int, end: int) -> Node:
+    """A node whose subtree holds every node of ``root`` that lies inside
+    ``[start, end)`` and has a width, in the order :func:`_walk` meets them.
+
+    The smallest node spanning the range holds every such node below it; the
+    ones above it with the same span are its ancestors, which the climb takes
+    in. A zero-width node outside it can sit at the range's edge, and a
+    caller filtering by span must not care: it has no text to count.
+    """
+    node = root.descendant_for_byte_range(start, end)
+    if node is None or node.start_byte > start or node.end_byte < end:
+        return root
+    while (
+        node.parent is not None
+        and start <= node.parent.start_byte
+        and node.parent.end_byte <= end
+    ):
+        node = node.parent
+    return node
+
+
 def _walk(node: Node) -> Iterator[Node]:
     stack = [node]
     while stack:
@@ -249,20 +297,44 @@ def references(source: str, name: str, language: str) -> int:
     constant's does not, and counting it anyway only costs a missed tidy.
     """
     folded = language == "php"
-    word = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE if folded else 0)
-    wanted = name.casefold() if folded else name
-    total = 0
-    for node in _walk(_parse(source, language)):
-        if node.child_count and not _read_by_words(node, language):
-            continue
-        text = node.text.decode("utf-8", "replace")
-        if _read_by_words(node, language):
-            total += len(word.findall(text))
-        elif not _inside_import(node, language) and (
-            _spelling(text, language).casefold() if folded else _spelling(text, language)
-        ) == wanted:
-            total += 1
+    spellings, prose = _reference_index(source, language)
+    total = spellings.get(name.casefold() if folded else name, 0)
+    if prose:
+        word = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE if folded else 0)
+        total += sum(len(word.findall(text)) for text in prose)
     return total
+
+
+@lru_cache(maxsize=_SOURCE_CACHE)
+def _reference_index(source: str, language: str) -> tuple[dict[str, int], tuple[str, ...]]:
+    """What :func:`references` counts in ``source``, for every name at once:
+    how many leaves outside an import spell each name, and the text of every
+    node read by its words.
+
+    One walk per text. The pass asks about an import once per name its
+    library declares, in both texts, and a Dart library can declare hundreds:
+    a walk per question made a key that strands an import of a widely used
+    library cost minutes.
+    """
+    folded = language == "php"
+    roots = _IMPORT_ROOTS[language]
+    spellings: dict[str, int] = {}
+    prose: list[str] = []
+    # `_walk` yields a node before its children, so marking the children of
+    # an import (or of a node already marked) answers `_inside_import` for
+    # every leaf without climbing.
+    imported: set[int] = set()
+    for node in _walk(_shared_parse(source, language)):
+        if node.child_count and (node.id in imported or node.type in roots):
+            imported.update(child.id for child in node.children)
+        if _read_by_words(node, language):
+            prose.append(node.text.decode("utf-8", "replace"))
+        elif not node.child_count and node.id not in imported:
+            spelled = _spelling(node.text.decode("utf-8", "replace"), language)
+            if folded:
+                spelled = spelled.casefold()
+            spellings[spelled] = spellings.get(spelled, 0) + 1
+    return spellings, tuple(prose)
 
 
 def _spelling(text: str, language: str) -> str:
@@ -1985,6 +2057,9 @@ def _top_level_bindings_are_private(root: Node, language: str) -> bool:
 def _variable_candidates(source: str, language: str) -> list[Candidate]:
     """Every single-name local declaration, with its initializer span.
 
+    Computed once per text (:func:`_variable_candidates_of`): the pass asks
+    for them again for every candidate it counts.
+
     "Local" means inside a function body — with one widening, and the reason
     it is safe is not the reason the guard was written. ``_FUNCTION_BODIES``
     stands in for "not reachable from another file", and for a field, a
@@ -2010,10 +2085,17 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
     unless the value is an object literal, as it keeps ``const x = call()``,
     and the single-name pattern below takes it as it takes that local.
     """
+    return list(_variable_candidates_of(source, language))
+
+
+@lru_cache(maxsize=_SOURCE_CACHE)
+def _variable_candidates_of(source: str, language: str) -> tuple[Candidate, ...]:
+    """:func:`_variable_candidates`, once per text."""
     declaration_type, name_field, value_field = _VARIABLE_DECLARATIONS[language]
     source_bytes = source.encode("utf-8")
-    root = _parse(source, language)
+    root = _shared_parse(source, language)
     top_level_is_private = _top_level_bindings_are_private(root, language)
+    php_memo: dict = {}
     candidates = []
     for node in _walk(root):
         if node.type != declaration_type:
@@ -2037,7 +2119,7 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
         elif language == "swift":
             pair = _swift_declared_name_and_value(node)
         elif language == "php":
-            pair = _php_declared_name_and_value(node)
+            pair = _php_declared_name_and_value(node, php_memo)
         elif language == "ruby":
             pair = _ruby_declared_name_and_value(node)
         else:
@@ -2083,7 +2165,7 @@ def _variable_candidates(source: str, language: str) -> list[Candidate]:
                 binder=(name_node.start_byte, name_node.end_byte),
             )
         )
-    return candidates
+    return tuple(candidates)
 
 
 def _go_var_candidates(declaration: Node, data: bytes) -> list[Candidate]:
@@ -2593,7 +2675,7 @@ def _php_assigned_name(node: Node) -> str | None:
 
 
 def _php_declared_name_and_value(
-    node: Node,
+    node: Node, memo: dict | None = None
 ) -> tuple[Node, tuple[int, int] | None] | None:
     """The one variable a PHP assignment statement writes in a function, and
     the span of the value, or ``None`` when it is not one this pass can judge.
@@ -2618,23 +2700,42 @@ def _php_declared_name_and_value(
     ``use`` imports its own fold stranded first, so this branch is the
     backstop: it acts on what the engine withholds and on strands this side's
     own edits make.
+
+    ``memo`` carries what the answer shares with every other statement of
+    the same tree (the file's reader aliases, and per scope the two facts
+    below), so a caller asking for each statement in turn walks the file and
+    each scope once rather than once per statement.
     """
     scope = node.parent
     while scope is not None and scope.type not in _PHP_SCOPES:
         scope = scope.parent
     if scope is None:
         return None
-    readers = _PHP_NAMESPACE_FUNCTIONS | _php_reader_aliases(node)
-    if any(
-        leaf.type in _PHP_NAMESPACE_READERS
-        or (leaf.type == "name" and leaf.text.lower() in readers)
-        for leaf in _walk(scope)
-    ):
+    if memo is None:
+        memo = {}
+    if "readers" not in memo:
+        memo["readers"] = _PHP_NAMESPACE_FUNCTIONS | _php_reader_aliases(node)
+    readers = memo["readers"]
+    key = (scope.type, scope.start_byte, scope.end_byte)
+    if key not in memo:
+        reads_namespace = False
+        assigned: Counter[str] = Counter()
+        for leaf in _walk(scope):
+            if leaf.type in _PHP_NAMESPACE_READERS or (
+                leaf.type == "name" and leaf.text.lower() in readers
+            ):
+                reads_namespace = True
+            written = _php_assigned_name(leaf)
+            if written is not None:
+                assigned[written] += 1
+        memo[key] = reads_namespace, assigned
+    reads_namespace, assigned = memo[key]
+    if reads_namespace:
         return None
     name = _php_assigned_name(node)
     if name is None or name in _PHP_SUPERGLOBALS:
         return None
-    if sum(1 for other in _walk(scope) if _php_assigned_name(other) == name) > 1:
+    if assigned[name] > 1:
         # `$lock = null;` releasing what `$lock = new Lock();` held: deleting
         # it would move that object's `__destruct` to the end of the function.
         return None
@@ -2948,9 +3049,11 @@ _LEADING_BLANK_IS_MEANINGLESS = frozenset({"ts", "tsx", "js", "csharp", "dart", 
 #: which a deleted line between two blank lines leaves behind: ktlint's
 #: `no-consecutive-blank-lines` and SwiftLint's `vertical_whitespace`, each
 #: in its default rule set, PHP-CS-Fixer's `no_extra_blank_lines`, which
-#: every PSR-12 and Symfony rule set includes, and RuboCop's default
-#: `Layout/EmptyLines`.
-_BLANK_RUN_IS_AN_ERROR = frozenset({"kt", "php", "ruby", "swift"})
+#: every PSR-12 and Symfony rule set includes, RuboCop's default
+#: `Layout/EmptyLines`, and in Java `google-java-format` and in Dart
+#: `dart format`, which rewrite them (`dart format --set-exit-if-changed` is
+#: the usual Flutter CI gate).
+_BLANK_RUN_IS_AN_ERROR = frozenset({"dart", "java", "kt", "php", "ruby", "swift"})
 
 
 def _apply(source: str, candidate: Candidate, language: str) -> str | None:
@@ -3467,6 +3570,28 @@ _REQUIRE_NAMES = frozenset(
 )
 
 
+def _required_again(source: str, candidate: Candidate, language: str, specifier: str) -> bool:
+    """Whether a top-level declaration other than ``candidate`` makes the same
+    ``require``, unconditionally, so this one loads nothing of its own."""
+    kept = _node_at(source, language, *candidate.initializer)
+    root = kept
+    while root.parent is not None:
+        root = root.parent
+    for statement in root.named_children:
+        if statement.type not in ("lexical_declaration", "variable_declaration"):
+            continue
+        for declarator in statement.named_children:
+            value = declarator.child_by_field_name("value") if declarator.type == "variable_declarator" else None
+            if (
+                _is_require(value)
+                and value.id != kept.id
+                and value.child_by_field_name("arguments").named_children[0].text.decode("utf-8", "replace")[1:-1]
+                == specifier
+            ):
+                return True
+    return False
+
+
 def _inert_require(source: str, candidate: Candidate, language: str) -> str | None:
     """The module a CommonJS declaration loads, when deleting it can lose nothing
     but that load; ``None`` otherwise.
@@ -3805,8 +3930,13 @@ def _references_excluding_own_declaration(source: str, name: str, language: str)
     ``_own_binder_spans`` gives: a nested re-bind's initializer is a real
     read of the binding it shadows, and hiding it deletes live code.
     """
+    spans = _own_binder_spans(source, name, language)
+    if not spans:
+        # Nothing to blank, and the text is the one already indexed: an
+        # import is asked this once per name its library declares.
+        return references(source, name, language)
     data = source.encode("utf-8")
-    for start, end in _own_binder_spans(source, name, language):
+    for start, end in spans:
         data = data[:start] + b" " * (end - start) + data[end:]
     return references(data.decode("utf-8", "replace"), name, language)
 
@@ -4139,10 +4269,19 @@ def _php_scope_key(scope: Node) -> str | None:
 
 
 def _node_at(source: str, language: str, start: int, end: int) -> Node | None:
-    for node in _walk(_parse(source, language)):
-        if node.start_byte == start and node.end_byte == end:
-            return node
-    return None
+    return _nodes_by_span(source, language).get((start, end))
+
+
+@lru_cache(maxsize=_SOURCE_CACHE * 4)
+def _scopes_named(
+    source: str, language: str, scope_type: str
+) -> dict[str | None, list[Node]]:
+    """Every ``scope_type`` node of ``source``, grouped by its scope key."""
+    named: dict[str | None, list[Node]] = {}
+    for node in _walk(_shared_parse(source, language)):
+        if node.type == scope_type:
+            named.setdefault(_scope_key(node, language), []).append(node)
+    return named
 
 
 def _matching_scope(
@@ -4177,11 +4316,7 @@ def _matching_scope(
     name = _scope_key(current_scope, language)
     if name is None:
         return None
-    matches = [
-        node
-        for node in _walk(_parse(before, language))
-        if node.type == current_scope.type and _scope_key(node, language) == name
-    ]
+    matches = _scopes_named(before, language, current_scope.type).get(name, [])
     if len(matches) != 1:
         return None
     # A Go header variable is visible only in its own statement, so that is
@@ -4274,17 +4409,53 @@ def _counted_leaves(
         and start <= candidate.binder[0]
         and candidate.binder[1] <= end
     ]
+    spellings, prose = _scope_index(source, language, start, end)
     word = re.compile(rf"\b{re.escape(name)}\b")
-    found: list[tuple[Node, int]] = []
-    for node in _walk(_parse(source, language)):
-        if node.child_count and not _read_by_words(node, language):
-            continue
-        if node.start_byte < start or node.end_byte > end:
-            continue
+    found: list[tuple[int, Node, int]] = [
+        (order, node, 1)
+        for order, node in spellings.get(name, ())
+        if not any(
+            d_start <= node.start_byte and node.end_byte <= d_end
+            for d_start, d_end in own_binders
+        )
+    ]
+    for order, node, text in prose:
         if any(
             d_start <= node.start_byte and node.end_byte <= d_end
             for d_start, d_end in own_binders
         ):
+            continue
+        if count := len(word.findall(text)):
+            found.append((order, node, count))
+    found.sort(key=lambda each: each[0])
+    return [(node, count) for _, node, count in found]
+
+
+@lru_cache(maxsize=_SOURCE_CACHE * 4)
+def _scope_index(
+    source: str, language: str, start: int, end: int
+) -> tuple[dict[str, list[tuple[int, Node]]], list[tuple[int, Node, str]]]:
+    """The leaves :func:`_counted_leaves` could count inside ``[start, end)``
+    of ``source``, for every name at once: each leaf by the name it spells,
+    and each node read by its words with its text, numbered in walk order.
+
+    One walk per scope. The pass counts every candidate in its scope, in both
+    texts, and the variables of one function share that scope: walking it
+    once per candidate made a large function cost the square of its size.
+    """
+    spellings: dict[str, list[tuple[int, Node]]] = {}
+    prose: list[tuple[int, Node, str]] = []
+    roots = _IMPORT_ROOTS[language]
+    top = _covering(_shared_parse(source, language), start, end)
+    # As in `_reference_index`: an import's descendants are marked on the
+    # way down rather than found by climbing from every leaf.
+    imported = {top.id} if _inside_import(top, language) else set()
+    for order, node in enumerate(_walk(top)):
+        if node.child_count and (node.id in imported or node.type in roots):
+            imported.update(child.id for child in node.children)
+        if node.child_count and not _read_by_words(node, language):
+            continue
+        if node.start_byte < start or node.end_byte > end:
             continue
         # `obj.x`'s `x` is a member of `obj`, never a read of a binding
         # spelled `x` — the same distinction `_bound_name_occurs_once_in_own_span`
@@ -4298,11 +4469,10 @@ def _counted_leaves(
             continue
         text = node.text.decode("utf-8", "replace")
         if _read_by_words(node, language):
-            if count := len(word.findall(text)):
-                found.append((node, count))
-        elif _spelling(text, language) == name and not _inside_import(node, language):
-            found.append((node, 1))
-    return found
+            prose.append((order, node, text))
+        elif node.id not in imported:
+            spellings.setdefault(_spelling(text, language), []).append((order, node))
+    return spellings, prose
 
 
 def go_local_reads(source: str, binder: tuple[int, int]) -> list[tuple[int, int]] | None:
@@ -4784,6 +4954,11 @@ def _csharp_method_strands_a_field(source: str, candidate: Candidate) -> bool:
     return False
 
 
+#: A line a Ruby body starts after, which has no brace to tell by: a block's
+#: ``do``, or a ``class`` or ``module`` header.
+_RUBY_BODY_OPENS = re.compile(rb"\bdo(?:\s*\|[^|]*\|)?\s*$|^\s*(?:class|module)\b[^:{]*(?:<[^{]*|::[^{]*)?$")
+
+
 def _delete_method(source: str, candidate: Candidate) -> str:
     """Delete a method's whole lines and the blank line that would be left
     standing beside it.
@@ -4810,10 +4985,12 @@ def _delete_method(source: str, candidate: Candidate) -> str:
     previous_start, previous = line_before(start)
     following_end, following = line_at(end)
     if start > 0 and not previous.strip() and (
-        not following.strip() or following.strip().startswith(b"}")
+        not following.strip() or following.strip().startswith(b"}") or following.strip() == b"end"
     ):
         start = previous_start
-    elif not following.strip() and following and previous.rstrip().endswith(b"{"):
+    elif not following.strip() and following and (
+        previous.rstrip().endswith(b"{") or _RUBY_BODY_OPENS.search(previous)
+    ):
         end = following_end
     return (data[:start] + data[end:]).decode("utf-8")
 
@@ -4842,17 +5019,20 @@ _PHP_MEMBER_ACCESSES = frozenset(
 def _php_member_spellings(source: str, name: str) -> int:
     """How many of the leaves :func:`references` counts for ``name`` are a
     member's name: ``X::NAME``, ``$x->NAME``, ``$x?->NAME``, ``$x->NAME()`` or
-    ``X::NAME()``. No ``use`` binds a member, so none of them reads one, and a
-    fold that removes one strands nothing."""
+    ``X::NAME()``, or a variable's: ``$name``. No ``use`` binds a member or a
+    variable, so none of them reads one, and a fold that removes one strands
+    nothing."""
     wanted = name.casefold()
     total = 0
-    for node in _walk(_parse(source, "php")):
+    for node in _walk(_shared_parse(source, "php")):
         if node.type != "name" or node.text.decode("utf-8", "replace").casefold() != wanted:
             continue
         parent = node.parent
         if parent is None:
             continue
-        if parent.type == "class_constant_access_expression":
+        if parent.type == "variable_name":
+            total += 1
+        elif parent.type == "class_constant_access_expression":
             total += parent.named_children[0].id != node.id
         elif parent.type in _PHP_MEMBER_ACCESSES:
             member = parent.child_by_field_name("name")
@@ -5036,7 +5216,11 @@ def remove_stranded_bindings(
                 specifier = _inert_require(current, candidate, language)
                 if specifier is not None and not inert(specifier) and inert_load.declared(specifier):
                     candidate = replace(candidate, declared=specifier)
-                if specifier is not None and (inert(specifier) or candidate.declared is not None):
+                if specifier is not None and (
+                    inert(specifier)
+                    or candidate.declared is not None
+                    or _required_again(current, candidate, language, specifier)
+                ):
                     # So would the `require("./m");` discard. Without an
                     # initializer the declaration reads as inert, and `_apply`
                     # deletes it. Not yet, though: a `require` call is what

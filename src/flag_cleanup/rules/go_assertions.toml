@@ -1,0 +1,97 @@
+# Assertions the fold made trivially true, for go. Appended to the rules
+# whenever `go_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `go.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `assert.True(t, client.BoolVariation("k", ctx, false))` in a test folds to
+# `assert.True(t, true)`: a check the removal made meaningless. Reached ONLY
+# from the fold's own literal (go_edges.toml, Parent scope from the groups
+# that write one), never as a seed, so an `assert.True(t, true)` the customer
+# wrote stays. Go has no assertion API of its own; the list is policy:
+# testify's `True`/`False`/`Equal` and their `f` forms, on the `assert` and
+# `require` packages, with the test handle first. A trailing message is
+# allowed only as ONE string literal: anything else could be the last reader
+# of a local, and deleting it would strand that local. An assertion folded to
+# the FAILING literal (`assert.True(t, false)`) is never matched; the Action
+# reports it. The failing forms are listed again, as text, in the Action's
+# failing-assertion check: the two lists are kept in step by hand.
+#
+# Rooted at the CALL, not the statement. Go has no `;`, so an
+# `expression_statement` spans exactly its call's text, and the engine's
+# Parent walk skips an ancestor whose text equals the node's: the statement is
+# never offered, and a rule rooted there never fires. The filter is what
+# keeps the call a statement: its innermost `expression_statement` ancestor
+# must hold a call with only literal arguments, which no ancestor but the
+# call's own statement can, so `if assert.True(t, true) {` and
+# `ok := assert.True(t, true)` (testify returns the result) stay.
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (call_expression
+    function: (selector_expression
+      operand: (identifier) @assert_package
+      field: (field_identifier) @assert_method)
+    arguments: [
+      (argument_list . (identifier) . (true) .)
+      (argument_list . (identifier) . (true) . [(interpreted_string_literal) (raw_string_literal)] .)
+    ]) @statement
+  (#match? @assert_package "^(assert|require)$")
+  (#match? @assert_method "^(True|Truef)$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(expression_statement
+  (call_expression
+    arguments: (argument_list . (identifier) . [(true) (false)])))  @asserted_statement"""
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (call_expression
+    function: (selector_expression
+      operand: (identifier) @assert_package
+      field: (field_identifier) @assert_method)
+    arguments: [
+      (argument_list . (identifier) . (false) .)
+      (argument_list . (identifier) . (false) . [(interpreted_string_literal) (raw_string_literal)] .)
+    ]) @statement
+  (#match? @assert_package "^(assert|require)$")
+  (#match? @assert_method "^(False|Falsef)$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(expression_statement
+  (call_expression
+    arguments: (argument_list . (identifier) . [(true) (false)])))  @asserted_statement"""
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (call_expression
+    function: (selector_expression
+      operand: (identifier) @assert_package
+      field: (field_identifier) @assert_method)
+    arguments: [
+      (argument_list . (identifier) . [(true) (false)] @expected . [(true) (false)] @actual .)
+      (argument_list . (identifier) . [(true) (false)] @expected . [(true) (false)] @actual . [(interpreted_string_literal) (raw_string_literal)] .)
+    ]) @statement
+  (#match? @assert_package "^(assert|require)$")
+  (#match? @assert_method "^(Equal|Equalf)$")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+[[rules.filters]]
+enclosing_node = """(expression_statement
+  (call_expression
+    arguments: (argument_list . (identifier) . [(true) (false)])))  @asserted_statement"""

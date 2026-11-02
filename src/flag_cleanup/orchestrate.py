@@ -109,6 +109,7 @@ from flag_cleanup.piranha_runner import (
     candidate_files,
     checkout_root,
     ensure_supported_key,
+    plan_reads,
     plan_registry_default,
     transform_flag,
     source_files,
@@ -1561,16 +1562,20 @@ def piranha_transform(
             with git_ops.guarding_writes(snapshot, ledger):
                 outcomes = _run_plan(plan, candidate, config, known_flag_keys)
             kept_entries: list[tuple[str, str]] = []
-            # A registry entry deleted while something still names the key
-            # turns that mention into a compile error or a crash: the registry
-            # is usually what the key's TYPE is derived from, and what a lookup
-            # by key reads its default out of. So when anything but a comment
-            # (or a TS-family test title) still names the key once the removal
-            # is on disk, the whole removal is undone and run again without the
-            # registry prong, and the entries it would have deleted are
-            # reported as kept. Nothing else changes between the two runs; see
+            # A flag-keyed entry deleted while something still names the key
+            # changes what that mention does. A registry is usually what the
+            # key's TYPE is derived from and what a lookup by key reads its
+            # default out of, so the mention stops compiling or crashes; a
+            # seeded default or a test override is what a read that still runs
+            # gets, so it silently starts answering differently. Either way the
+            # pull request's whole effect can be a behaviour change dressed as
+            # a removal. So when anything but a comment (or a TS-family test
+            # title) still names the key once the removal is on disk, the whole
+            # removal is undone and run again without ANY entry rule (both
+            # prongs), and the entries it would have deleted are reported as
+            # kept. Nothing else changes between the two runs; see
             # `_live_references`.
-            if known_flag_keys and any(o.entries for o in outcomes):
+            if any(o.entries for o in outcomes):
                 live = _live_references(
                     config,
                     candidate.key,
@@ -1580,23 +1585,48 @@ def piranha_transform(
                     first = [entry for o in outcomes for entry in o.entries]
                     _undo_transform(config, snapshot, pending=None)
                     with git_ops.guarding_writes(snapshot, ledger):
-                        outcomes = _run_plan(plan, candidate, config, frozenset())
-                    for entry in (entry for o in outcomes for entry in o.entries):
-                        if entry in first:
-                            first.remove(entry)
+                        outcomes = _run_plan(
+                            plan, candidate, config, known_flag_keys, entries=False
+                        )
                     named = ", ".join((os.path.relpath(p) for p in live[:5])) + (
                         f" and {len(live) - 5} more" if len(live) > 5 else ""
                     )
                     kept_entries = [
                         (
                             path,
-                            f"registry entry {text} kept: {len(live)} file(s) still "
-                            f"name the key outside a comment or test title ({named}), and "
-                            "deleting the entry they are typed against would "
-                            "break them",
+                            f"flag-keyed entry {text} kept: {len(live)} file(s) still "
+                            f"name the key outside a comment or test title ({named}). "
+                            "Deleting the entry would break code typed against it or "
+                            "change the value a read that still runs gets",
                         )
                         for path, text in first
                     ]
+                    if not any(o.diff for o in outcomes):
+                        # The entries WERE the whole removal: every read of the
+                        # key is still there. Withholding them leaves an empty
+                        # diff, which must not be reported as "nothing matched":
+                        # the run found something to remove and declined to.
+                        # Refused, with the reason on each entry's file, so the
+                        # build goes red and the customer is told which reads to
+                        # rewrite (or which accessor to declare).
+                        raise UnsafeRewriteError(
+                            f"every change for {candidate.key!r} was a flag-keyed "
+                            f"entry, and {len(live)} file(s) still name the key "
+                            f"({named})",
+                            refused=sorted({path for path, _text in first}),
+                            reasons={
+                                path: (
+                                    "only flag-keyed entries would change, and "
+                                    f"{len(live)} file(s) still name the key "
+                                    f"outside a comment ({named}): deleting the "
+                                    "entry while the flag is still read is a "
+                                    "behaviour change, not a removal. Rewrite "
+                                    "those reads, or name their wrapper in "
+                                    "`accessors`"
+                                )
+                                for path, _text in first
+                            },
+                        )
             for outcome in outcomes:
                 if outcome.diff:
                     diff_parts.append(outcome.diff)
@@ -1705,6 +1735,8 @@ def _run_plan(
     candidate: Candidate,
     config: Config,
     known_flag_keys: frozenset[str],
+    *,
+    entries: bool = True,
 ) -> list[TransformOutcome]:
     """One transform per ``(directory, language)`` pass in ``plan``, in order.
 
@@ -1728,6 +1760,7 @@ def _run_plan(
     # Read before the first pass writes: a `.ts` registry's pass deletes the
     # entry a later `.tsx` pass's tests rely on. See `plan_registry_default`.
     flag_default = plan_registry_default(plan, candidate.key)
+    reads = plan_reads(plan, candidate.key, config.accessors)
     outcomes: list[TransformOutcome] = []
     for directory, language, files in plan:
         if not files:
@@ -1743,6 +1776,8 @@ def _run_plan(
             gates=config.gates,
             inline_wrappers=config.inline_wrappers,
             flag_default=flag_default,
+            read_elsewhere=any(d == directory and lang != language for d, lang in reads),
+            entries=entries,
         )
         outcomes.append(
             replace(
@@ -1981,14 +2016,30 @@ def _unprocessed_references(config: Config, flag_key: str) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-#: What :func:`_unprocessed_references` reads: every suffix the tool knows, and
-#: the Ruby no language rewrites. That is views (``.haml``, ``.slim``,
-#: ``.jbuilder``), project files (``config.ru``, a ``.gemspec``) and, among
+#: Server-side templates that no language here rewrites: Twig, Latte, Smarty
+#: and Phalcon's Volt (PHP), Jinja and Django's Jinja backend (Python). Their
+#: suffix says what they are, so a mention of the key in one is a read.
+_TEMPLATE_SUFFIXES = frozenset({".twig", ".latte", ".tpl", ".volt", ".j2", ".jinja", ".jinja2"})
+#: ``.html`` and ``.htm`` are templates for Django and for every framework that
+#: renders a page itself, and plain static pages for everyone else. They count
+#: only when the key sits inside a ``{% … %}`` or ``{{ … }}`` tag.
+_PAGE_TEMPLATE_SUFFIXES = frozenset({".html", ".htm"})
+_TEMPLATE_TAG = re.compile(r"\{%.*?%\}|\{\{.*?\}\}", re.DOTALL)
+
+#: What :func:`_unprocessed_references` reads: every suffix the tool knows, the
+#: server templates above, and the Ruby no language rewrites. That is views
+#: (``.haml``, ``.slim``, ``.jbuilder``), project files (``config.ru``, a ``.gemspec``) and, among
 #: files with no suffix, a ``Rakefile``, a ``Gemfile`` or a script with a Ruby
 #: shebang. A read in one of them survives every removal, so this caveat is the
 #: only place it can surface. They stay out of ``KNOWN_EXTENSIONS``, which also
 #: feeds every language's cross-file scans.
-_RESIDUE_SUFFIXES = KNOWN_EXTENSIONS | source_index.RUBY_SUFFIXES | source_index.NO_SUFFIX
+_RESIDUE_SUFFIXES = (
+    KNOWN_EXTENSIONS
+    | source_index.RUBY_SUFFIXES
+    | source_index.NO_SUFFIX
+    | _TEMPLATE_SUFFIXES
+    | _PAGE_TEMPLATE_SUFFIXES
+)
 
 
 def all_unprocessed(
@@ -2171,6 +2222,11 @@ def _files_matching(root: Path, extensions: Iterable[str], flag_key: str) -> lis
             continue
         if not path.suffix and not ruby_owner_reach.is_ruby(path, text):
             continue
-        if _mentions_flag_key(text, flag_key):
-            hits.append(path)
+        if not _mentions_flag_key(text, flag_key):
+            continue
+        if path.suffix in _PAGE_TEMPLATE_SUFFIXES and not any(
+            _mentions_flag_key(tag, flag_key) for tag in _TEMPLATE_TAG.findall(text)
+        ):
+            continue  # a static page, or a template whose tags do not hold the key
+        hits.append(path)
     return hits

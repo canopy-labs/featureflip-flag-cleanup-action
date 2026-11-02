@@ -113,3 +113,104 @@ contains = """(
   (#any-of? @sibling @known_flag_keys)
 )"""
 at_least = 1
+
+# ===========================================================================
+# Index assignments: `flags["k"] = <literal>`
+# ===========================================================================
+#
+# The statement form of the same entry: a map built up one key at a time
+# (`flags := map[string]any{…}` then `flags["k"] = true` under some
+# condition). Deleted under the same two prongs and the same guard against the
+# branch being removed. A condition left with an empty block (`if c {}`) still
+# builds and is gofmt-clean.
+#
+# Narrow on purpose:
+#   - only a statement in a statement list, so an `if`/`switch` initializer or
+#     a `for` post statement is never cut out of its header;
+#   - one target and one value (`m["k"], n = 1, 2` is left);
+#   - the map is a plain identifier, so dropping the statement drops no call
+#     (`load()["k"] = true`, `s.flags["k"] = true` are left);
+#   - the value is a literal, so it drops no call either;
+#   - `=` only: `m["k"] += 1` reads the entry.
+
+# STUB PRONG — a boolean literal equal to the branch being kept.
+[[rules]]
+name = "delete_flag_keyed_boolean_assignment"
+query = """(
+  (statement_list
+    (assignment_statement
+      left: (expression_list
+        . (index_expression
+            operand: (identifier)
+            index: (interpreted_string_literal . (interpreted_string_literal_content) @flag_name .)) .)
+      operator: "="
+      right: (expression_list . [(true) (false)] @value .)) @entry)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+# REGISTRY PRONG — the same map is a flag map somewhere in the file: it is
+# declared or assigned with a literal holding another flag of this project, or
+# another flag of this project is assigned into it by key. Matched by the
+# map's NAME across the file, which can only over-match into a same-named map
+# elsewhere — and the deleted statement must still be keyed by this flag.
+[[rules]]
+name = "delete_flag_keyed_registry_assignment"
+query = """(
+  (statement_list
+    (assignment_statement
+      left: (expression_list
+        . (index_expression
+            operand: (identifier) @keyed_map
+            index: (interpreted_string_literal . (interpreted_string_literal_content) @flag_name .)) .)
+      operator: "="
+      right: (expression_list
+        . [(true) (false) (nil) (int_literal) (float_literal)
+           (interpreted_string_literal) (raw_string_literal)] @value .)) @entry)
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)"""
+replace_node = "entry"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(source_file) @file"
+contains = """(
+  [
+    (short_var_declaration
+      left: (expression_list . (identifier) @evidence_map .)
+      right: (expression_list
+        . (composite_literal
+            body: (literal_value
+              (keyed_element
+                . (literal_element (interpreted_string_literal . (interpreted_string_literal_content) @sibling .))))) .))
+    (var_spec
+      name: (identifier) @evidence_map
+      value: (expression_list
+        . (composite_literal
+            body: (literal_value
+              (keyed_element
+                . (literal_element (interpreted_string_literal . (interpreted_string_literal_content) @sibling .))))) .))
+    (assignment_statement
+      left: (expression_list . (identifier) @evidence_map .)
+      right: (expression_list
+        . (composite_literal
+            body: (literal_value
+              (keyed_element
+                . (literal_element (interpreted_string_literal . (interpreted_string_literal_content) @sibling .))))) .))
+    (assignment_statement
+      left: (expression_list
+        . (index_expression
+            operand: (identifier) @evidence_map
+            index: (interpreted_string_literal . (interpreted_string_literal_content) @sibling .)) .))
+  ]
+  (#eq? @evidence_map "@keyed_map")
+  (#any-of? @sibling @known_flag_keys)
+)"""
+at_least = 1

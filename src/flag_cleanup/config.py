@@ -19,6 +19,7 @@ import httpx
 
 from flag_cleanup.client import token_is_sendable
 from flag_cleanup.piranha_runner import supported_languages
+from flag_cleanup.rule_synthesis import SUFFIXED_ACCESSOR_LANGUAGES
 from flag_cleanup.ts_gates import Gate, parse_gate
 from flag_cleanup.urls import redact_userinfo
 
@@ -232,6 +233,16 @@ class Config:
             )
 
         accessors, gates = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
+        suffixed = [name for name in accessors if name.endswith(("?", "!"))]
+        if suffixed and not SUFFIXED_ACCESSOR_LANGUAGES & set(languages):
+            # Every configured run would drop these (`accessors_for`), so the
+            # input would be read and then silently match nothing.
+            raise ConfigError(
+                f"FEATUREFLIP_ACCESSORS value(s) "
+                f"{', '.join(repr(name) for name in suffixed)} end in ? or !, which "
+                "only a Ruby method name can, but FEATUREFLIP_LANGUAGES includes "
+                "neither ruby nor erb"
+            )
 
         # Lower-cased before the check: the wire value is lowercase, but the
         # API's own `status` field is PascalCase, so "Dead" is an easy thing
@@ -309,14 +320,24 @@ class Config:
 #: legitimately contains `-`; an accessor is a function name in the target
 #: language, so it can be held to the identifier shape every one of those
 #: languages shares — and is, deliberately, at the narrowest point.
-_ACCESSOR_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+#:
+#: The one widening is a single trailing `?` or `!`, which is part of a Ruby
+#: method's name (`enabled?`, `is_enabled?`) and of no other supported
+#: language's. Neither character is special anywhere such a name is written:
+#: a query string literal escapes only `"` and `\`, a TOML basic string the
+#: same, and `#eq?`/`#not-eq?` compare text rather than match a pattern. Every
+#: Python pattern built from a name escapes it. Such a name reaches only the
+#: languages in :data:`~flag_cleanup.rule_synthesis.SUFFIXED_ACCESSOR_LANGUAGES`;
+#: see :func:`~flag_cleanup.rule_synthesis.accessors_for`.
+_ACCESSOR_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*[?!]?\Z")
 
 
 def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
     """Split, validate and de-duplicate ``FEATUREFLIP_ACCESSORS``.
 
     Returns the function names and, separately, the gate components
-    (``Component[prop]``). A gate never reaches the rules: it is matched in
+    (``Component[prop]``, or ``Component[prop?show:otherwise]`` for one that
+    takes a boolean). A gate never reaches the rules: it is matched in
     Python, against the parsed tree, so it is held to its own shape rather than
     to the function-name one.
 
@@ -332,8 +353,10 @@ def _parse_accessors(value: str) -> tuple[tuple[str, ...], tuple[Gate, ...]]:
         raise ConfigError(
             f"unsupported FEATUREFLIP_ACCESSORS value(s): "
             f"{', '.join(repr(name) for name in invalid)}; each must be a function "
-            "name in your source, matching [A-Za-z_][A-Za-z0-9_]*, or a gate "
-            "component and its key prop, like FlagGate[flag]. Function names are "
+            "name in your source, matching [A-Za-z_][A-Za-z0-9_]* with at most one "
+            "trailing ? or ! (Ruby only), a gate component and its key prop, "
+            "like FlagGate[flag], or a boolean gate component and its props, like "
+            "ConditionallyRender[condition?show:elseShow]. Function names are "
             "substituted into the rewrite rules as text, so anything else either "
             "fails the engine or silently changes which calls are matched"
         )

@@ -13,6 +13,11 @@
 # literal is an `identifier` in this grammar (see kt_entries.toml). An
 # assertion folded to the FAILING literal is never matched.
 
+# A trivial assertion that is the whole body of an `if` or a loop stays. Deleting
+# it would hand that body to the next statement, which parses and silently runs
+# conditionally. `not_enclosing_node` asks of every ancestor, so an assertion
+# nested deeper under such a body stays too, which is the safe direction.
+
 [[rules]]
 name = "delete_trivially_true_assertion"
 query = """(
@@ -20,7 +25,11 @@ query = """(
     .
     (_) @assert_callee
     .
-    (value_arguments . (value_argument (identifier) @asserted) .)) @statement
+    [
+      (value_arguments . (value_argument (identifier) @asserted) .)
+      (value_arguments . (value_argument (identifier) @asserted) . (value_argument (string_literal)) .)
+      (value_arguments . (value_argument (string_literal)) . (value_argument (identifier) @asserted) .)
+    ]) @statement
   (#match? @statement "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertTrue[[:space:]]*[(]")
   (#eq? @asserted "true")
 )"""
@@ -29,6 +38,15 @@ replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
 
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_expression ")" . (call_expression))
+  (if_expression "else" . (call_expression))
+  (while_statement ")" . (call_expression))
+  (for_statement ")" . (call_expression))
+  (do_while_statement "do" . (call_expression))
+] @braceless"""
+
 [[rules]]
 name = "delete_trivially_false_assertion"
 query = """(
@@ -36,7 +54,11 @@ query = """(
     .
     (_) @assert_callee
     .
-    (value_arguments . (value_argument (identifier) @asserted) .)) @statement
+    [
+      (value_arguments . (value_argument (identifier) @asserted) .)
+      (value_arguments . (value_argument (identifier) @asserted) . (value_argument (string_literal)) .)
+      (value_arguments . (value_argument (string_literal)) . (value_argument (identifier) @asserted) .)
+    ]) @statement
   (#match? @statement "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertFalse[[:space:]]*[(]")
   (#eq? @asserted "false")
 )"""
@@ -45,6 +67,15 @@ replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
 
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_expression ")" . (call_expression))
+  (if_expression "else" . (call_expression))
+  (while_statement ")" . (call_expression))
+  (for_statement ")" . (call_expression))
+  (do_while_statement "do" . (call_expression))
+] @braceless"""
+
 [[rules]]
 name = "delete_trivially_equal_assertion"
 query = """(
@@ -52,12 +83,11 @@ query = """(
     .
     (_) @assert_callee
     .
-    (value_arguments
-      .
-      (value_argument (identifier) @expected)
-      .
-      (value_argument (identifier) @actual)
-      .)) @statement
+    [
+      (value_arguments . (value_argument (identifier) @expected) . (value_argument (identifier) @actual) .)
+      (value_arguments . (value_argument (identifier) @expected) . (value_argument (identifier) @actual) . (value_argument (string_literal)) .)
+      (value_arguments . (value_argument (string_literal)) . (value_argument (identifier) @expected) . (value_argument (identifier) @actual) .)
+    ]) @statement
   (#match? @statement "^((Assert|Assertions)[[:space:]]*[.][[:space:]]*)?assertEquals[[:space:]]*[(]")
   (#match? @expected "^(true|false)$")
   (#eq? @expected @actual)
@@ -66,3 +96,12 @@ replace_node = "statement"
 replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_expression ")" . (call_expression))
+  (if_expression "else" . (call_expression))
+  (while_statement ")" . (call_expression))
+  (for_statement ")" . (call_expression))
+  (do_while_statement "do" . (call_expression))
+] @braceless"""

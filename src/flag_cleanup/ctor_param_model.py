@@ -31,6 +31,8 @@ _TEMPLATES = {
     "ts": "ts_ctor_param.toml",
     "csharp": "csharp_ctor_param.toml",
     "dart": "dart_ctor_param.toml",
+    "java": "java_ctor_param.toml",
+    "kt": "kt_ctor_param.toml",
 }
 _BLOCK = re.compile(r"^# ctor: (parameter|classic|argument)\n", re.MULTILINE)
 
@@ -63,8 +65,29 @@ CSHARP_FORMS = {
 }
 
 
+#: The same for Java and Kotlin. A Java field becomes a method, which owns no
+#: `;` for the engine to leave behind, and its constructor statement a call; a
+#: Kotlin body property becomes a property, and a constructor parameter (with
+#: its modifiers, `val` and default value) a typed parameter.
+JVM_FORMS = {
+    "java": {
+        "argument": "{}",
+        "member": "void {}(){{}}",
+        "statement": "{}();",
+        "parameter": "Object {}",
+    },
+    "kt": {
+        "argument": "{}",
+        "member": "val {} = 0",
+        "parameter": "{}: Any",
+    },
+}
+
+
 def forms_for(language: str) -> Mapping[str, str]:
     """The :data:`FORMS` table a language's marks are written in."""
+    if language in JVM_FORMS:
+        return JVM_FORMS[language]
     return CSHARP_FORMS if language == "csharp" else FORMS
 
 

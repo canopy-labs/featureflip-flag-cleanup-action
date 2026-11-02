@@ -34,13 +34,34 @@ import re
 from dataclasses import dataclass
 
 __all__ = [
+    "SUFFIXED_ACCESSOR_LANGUAGES",
     "SynthesisError",
+    "accessors_for",
     "cross_file_key_rules",
     "generated_rule_names",
     "with_accessors",
     "with_accessor_const_rules",
     "with_accessor_guards",
 ]
+
+
+#: The languages whose method names may end in `?` or `!`: Ruby, and ERB,
+#: whose code is Ruby. A run of any other language never sees such a name.
+SUFFIXED_ACCESSOR_LANGUAGES = frozenset({"ruby", "erb"})
+
+
+def accessors_for(language: str, accessors: tuple[str, ...]) -> tuple[str, ...]:
+    """``accessors`` as one ``language``'s run takes them.
+
+    A name ending in `?` or `!` cannot be a callee anywhere but Ruby, so it is
+    dropped for every other language rather than handed on to match nothing.
+    Dropped, not merely harmless: those runs build patterns, rule names and
+    stub matchers from the names, and none of that code has to consider a
+    character no identifier of its language can hold.
+    """
+    if language in SUFFIXED_ACCESSOR_LANGUAGES:
+        return accessors
+    return tuple(name for name in accessors if not name.endswith(("?", "!")))
 
 
 class SynthesisError(RuntimeError):
@@ -63,6 +84,24 @@ _SDK_FN_PREDICATE = re.compile(r'\(#eq\? @sdk_fn "([^"]*)"\)')
 _HOLE = re.compile(r"\A@")
 
 _RULE_HEADER = "[[rules]]"
+
+#: A query line opening with this is an ARM only an accessor clone carries.
+#: The seed keeps it as a tree-sitter comment, so the SDK's own name never
+#: matches the shape; :func:`_for_accessor` uncomments it in each clone. A
+#: language reaches for it when a call shape is a flag read for a wrapper the
+#: customer names but somebody else's method for the SDK's own name: PHP's
+#: static call, `Feature::active('k')`, is the case that needed it (the PHP SDK
+#: has no static read, so `Other::boolVariation('k', …)` is not ours).
+_ACCESSOR_ARM = re.compile(r"^([ \t]*); accessor-arm: ", re.MULTILINE)
+
+
+def _for_accessor(block: str, accessor: str) -> str:
+    """``block`` with its callee predicate naming ``accessor`` and every
+    accessor-only arm switched on. The ONE place a callee is swapped, so a
+    seed clone and a cross-file reader clone cannot disagree about the shapes
+    an accessor reaches."""
+    swapped = _SDK_FN_PREDICATE.sub(f'(#eq? @sdk_fn "{accessor}")', block, count=1)
+    return _ACCESSOR_ARM.sub(r"\1", swapped)
 
 
 @dataclass(frozen=True)
@@ -129,6 +168,14 @@ def _split_blocks(text: str) -> list[str]:
     """Split a rules file on ``[[rules]]``, keeping the preamble at index 0."""
     parts = text.split(f"\n{_RULE_HEADER}\n")
     return [parts[0]] + [f"{_RULE_HEADER}\n{part}" for part in parts[1:]]
+
+
+def without_rule(rules_text: str, name: str) -> str:
+    """``rules_text`` without the rule called ``name``, and its filters."""
+    blocks = _split_blocks(rules_text)
+    kept = [block for block in blocks if f'\nname = "{name}"\n' not in block]
+    assert len(kept) == len(blocks) - 1, name
+    return "\n".join(kept) + "\n"
 
 
 #: A ``[[rules]]`` block carrying this is a seed rule that must NOT become an
@@ -255,7 +302,7 @@ def with_accessors(
                 count=1,
                 flags=re.MULTILINE,
             )
-            clone = _SDK_FN_PREDICATE.sub(f'(#eq? @sdk_fn "{accessor}")', clone, count=1)
+            clone = _for_accessor(clone, accessor)
             # A block ends where the next `[[rules]]` begins, so its tail is the
             # comment block written for the rule BELOW it. Carried into a clone
             # appended at the end of the file, that commentary would describe a
@@ -429,7 +476,9 @@ _HOLES_LINE = re.compile(r"^holes = \[(.*)\]$", re.MULTILINE)
 #: into a file after a first pass (and a marker round re-runs the file under
 #: the base rules, not these). `ts.toml`'s marker rule alone made the engine
 #: skip every TypeScript reader.
-_READER_ABSENT_HOLES = frozenset({"stale_flag_name", "marker"})
+_READER_ABSENT_HOLES = frozenset(
+    {"stale_flag_name", "marker", "safe_nav_true_flag_name", "safe_nav_false_flag_name"}
+)
 
 
 def _without_comment_lines(text: str) -> str:
@@ -569,9 +618,7 @@ def cross_file_key_rules(
                 variants += [
                     (
                         f"__accessor_{accessor}",
-                        _SDK_FN_PREDICATE.sub(
-                            f'(#eq? @sdk_fn "{accessor}")', block, count=1
-                        ),
+                        _for_accessor(block, accessor),
                     )
                     for accessor in accessors
                 ]

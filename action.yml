@@ -206,13 +206,20 @@ inputs:
       typed registry — and without this the wrapper is invisible: every flag
       reports no changes, the run goes green, and nothing says why. Give the
       wrapper's name here and it is matched exactly as an SDK call would be.
-      Each name must be a plain function name (`[A-Za-z_][A-Za-z0-9_]*`); the
+      Each name must be a plain function name (`[A-Za-z_][A-Za-z0-9_]*`),
+      optionally ending in one `?` or `!` for a Ruby method such as `enabled?`
+      (applied to Ruby and ERB only); the
       run fails immediately (exit 2) otherwise, because these are substituted
       into the rewrite rules. Names are matched by callee name only — a wrapper
       whose flag key is not a literal at the call site still cannot be matched.
       A JSX gate component is named with its key prop, `FlagGate[flag]`: on a
       `true` removal `<FlagGate flag="my-flag">…</FlagGate>` is replaced by its
-      children, and a `false` removal of a flag it gates is refused.
+      children, and a `false` removal of a flag it gates is refused. One that
+      takes a boolean is named with its props,
+      `ConditionallyRender[condition?show:elseShow]`: once its condition folds
+      to a literal, the element is replaced by the branch it renders. A C#
+      attribute gate is named like a function, `FeatureGate`: a `true` removal
+      deletes it and a `false` removal is refused.
     required: false
     default: ''
   inline-wrappers:

@@ -463,6 +463,17 @@ class _TypeIndex:
     #: A Java file that could not be read, or whose parse has errors: it might
     #: declare anything, and a declaration inside it may be invisible here.
     incomplete: bool
+    #: The words of each file whose parse has errors, the only names it can
+    #: declare anything under; ``None`` when an escape may spell any.
+    unparsed_words: tuple[frozenset[str] | None, ...] = ()
+    #: A Java file could not be read at all.
+    unreadable: bool = True
+
+    def spelled_where_unparsed(self, name: str) -> bool:
+        """Whether a file not seen whole may spell ``name``. Narrower than
+        :attr:`incomplete`, and as sound: a declaration is written under a
+        name its file spells."""
+        return self.unreadable or any(words is None or name in words for words in self.unparsed_words)
 
 
 def _simple_type_names(node: Node) -> list[str]:
@@ -514,8 +525,13 @@ def _members(body: Node) -> tuple[set[str], set[str]]:
     return fields, types
 
 
-def _types_of(text: str) -> tuple[list[tuple[str, _TypeInfo]], bool]:
-    """One Java file's share of the type index, and whether it parsed cleanly."""
+#: A Unicode escape: an identifier may spell any letter with one.
+_UNICODE_ESCAPE = re.compile(r"\\u+[0-9a-fA-F]{4}")
+
+
+def _types_of(text: str) -> tuple[tuple[list[tuple[str, _TypeInfo]], frozenset[str] | None], bool]:
+    """One Java file's share of the type index, with the words it spells when
+    it does not parse whole, and whether it parsed cleanly."""
     tree = syntax._parse(text, "java")
     package = _package(tree)
     types: list[tuple[str, _TypeInfo]] = []
@@ -545,17 +561,27 @@ def _types_of(text: str) -> tuple[list[tuple[str, _TypeInfo]], bool]:
                 ),
             )
         )
-    return types, not tree.has_error
+    words: frozenset[str] | None = frozenset()
+    if tree.has_error:
+        words = None if _UNICODE_ESCAPE.search(text) else frozenset(re.findall(r"\w+", text))
+    return (types, words), not tree.has_error
 
 
 def _combine(
-    shares: list[tuple[str, list[tuple[str, _TypeInfo]]]], incomplete: bool, _unreadable: bool
+    shares: list[tuple[str, tuple[list[tuple[str, _TypeInfo]], frozenset[str] | None]]],
+    incomplete: bool,
+    unreadable: bool,
 ) -> _TypeIndex:
     by_name: dict[str, list[_TypeInfo]] = {}
-    for _path, types in shares:
+    for _path, (types, _words) in shares:
         for name, info in types:
             by_name.setdefault(name, []).append(info)
-    return _TypeIndex({k: tuple(v) for k, v in by_name.items()}, incomplete)
+    return _TypeIndex(
+        {k: tuple(v) for k, v in by_name.items()},
+        incomplete,
+        tuple(words for _path, (_types, words) in shares if words != frozenset()),
+        unreadable,
+    )
 
 
 #: Every Java type in a checkout, by simple name.
@@ -571,7 +597,7 @@ def _package_declares_type(repo_dir: str, package: str, name: str) -> bool:
     file): a wrong "yes" only keeps a declaration.
     """
     index = _type_index(repo_dir)
-    return index.incomplete or any(
+    return index.spelled_where_unparsed(name) or any(
         info.package == package for info in index.by_name.get(name, ())
     )
 
@@ -633,7 +659,7 @@ def _inherited(
     return (
         frozenset(fields),
         frozenset(types),
-        index.incomplete or any(kotlin.may_declare_type(n) for n in seen),
+        any(index.spelled_where_unparsed(n) or kotlin.may_declare_type(n) for n in seen),
     )
 
 
@@ -673,7 +699,7 @@ class _JvmTypes:
         """
         from flag_cleanup import cross_file_kotlin
 
-        return _type_index(self._repo_dir).incomplete or cross_file_kotlin._kotlin_index(
+        return _type_index(self._repo_dir).spelled_where_unparsed(name) or cross_file_kotlin._kotlin_index(
             self._repo_dir
         ).may_declare_type(name)
 

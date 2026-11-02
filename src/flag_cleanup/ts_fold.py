@@ -49,6 +49,7 @@ rewrite that ran before stop running.
 
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 
 from tree_sitter import Node
@@ -100,6 +101,18 @@ _OTHER_NAME_NODES = frozenset(
         "type_identifier",
     }
 )
+
+
+def marker_for(flag_key: str) -> str:
+    """The call standing in for a read of ``flag_key`` this pass inlined.
+
+    Never the sentinel. A wrapper call keeps its arguments under the sentinel,
+    and any call of that folds to the flag's value, while a call of this folds
+    to its argument. Sharing one identifier folded ``isNew(false)``, a wrapper
+    call taking one boolean, to ``false`` whatever the flag was served.
+    """
+    digest = hashlib.sha256(flag_key.encode("utf-8")).hexdigest()[:16]
+    return f"__ff_inlined_{digest}"
 
 
 def inline_literal_bindings(before: str, after: str, language: str, marker: str) -> str:

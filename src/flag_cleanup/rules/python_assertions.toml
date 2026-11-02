@@ -24,7 +24,7 @@
 [[rules]]
 name = "replace_sole_trivially_true_assert_statement_with_pass"
 query = """(
-  (_ (block . (assert_statement . (true) .) @statement .)) @owner
+  (_ (block . [(assert_statement . (true) .) (assert_statement . (true) . (string) .)] @statement .)) @owner
 )"""
 replace_node = "statement"
 replace = "pass"
@@ -42,7 +42,7 @@ query = """(
         function: (attribute
           object: (identifier) @assert_self
           attribute: (identifier) @assert_method)
-        arguments: (argument_list . (true) .))) @statement
+        arguments: [(argument_list . (true) .) (argument_list . (true) . [(string) (keyword_argument name: (identifier) @message_name value: (string))] .)])) @statement
     .)) @owner
   (#eq? @assert_self "self")
   (#eq? @assert_method "assertTrue")
@@ -63,7 +63,7 @@ query = """(
         function: (attribute
           object: (identifier) @assert_self
           attribute: (identifier) @assert_method)
-        arguments: (argument_list . (false) .))) @statement
+        arguments: [(argument_list . (false) .) (argument_list . (false) . [(string) (keyword_argument name: (identifier) @message_name value: (string))] .)])) @statement
     .)) @owner
   (#eq? @assert_self "self")
   (#eq? @assert_method "assertFalse")
@@ -84,7 +84,10 @@ query = """(
         function: (attribute
           object: (identifier) @assert_self
           attribute: (identifier) @assert_method)
-        arguments: (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .))) @statement
+        arguments: [
+          (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)
+          (argument_list . [(true) (false)] @expected . [(true) (false)] @actual . [(string) (keyword_argument name: (identifier) @message_name value: (string))] .)
+        ])) @statement
     .)) @owner
   (#eq? @assert_self "self")
   (#match? @assert_method "^(assertEqual|assertIs)$")
@@ -98,7 +101,7 @@ is_seed_rule = false
 [[rules]]
 name = "delete_trivially_true_assert_statement"
 query = """(
-  (assert_statement . (true) .) @statement
+  [(assert_statement . (true) .) (assert_statement . (true) . (string) .)] @statement
 )"""
 replace_node = "statement"
 replace = ""
@@ -112,7 +115,7 @@ query = """(
       function: (attribute
         object: (identifier) @assert_self
         attribute: (identifier) @assert_method)
-      arguments: (argument_list . (true) .)) @statement
+      arguments: [(argument_list . (true) .) (argument_list . (true) . [(string) (keyword_argument name: (identifier) @message_name value: (string))] .)]) @statement
   (#eq? @assert_self "self")
   (#eq? @assert_method "assertTrue")
 )"""
@@ -128,7 +131,7 @@ query = """(
       function: (attribute
         object: (identifier) @assert_self
         attribute: (identifier) @assert_method)
-      arguments: (argument_list . (false) .)) @statement
+      arguments: [(argument_list . (false) .) (argument_list . (false) . [(string) (keyword_argument name: (identifier) @message_name value: (string))] .)]) @statement
   (#eq? @assert_self "self")
   (#eq? @assert_method "assertFalse")
 )"""
@@ -144,7 +147,10 @@ query = """(
       function: (attribute
         object: (identifier) @assert_self
         attribute: (identifier) @assert_method)
-      arguments: (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)) @statement
+      arguments: [
+          (argument_list . [(true) (false)] @expected . [(true) (false)] @actual .)
+          (argument_list . [(true) (false)] @expected . [(true) (false)] @actual . [(string) (keyword_argument name: (identifier) @message_name value: (string))] .)
+        ]) @statement
   (#eq? @assert_self "self")
   (#match? @assert_method "^(assertEqual|assertIs)$")
   (#eq? @expected @actual)

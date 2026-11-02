@@ -7,6 +7,374 @@ released becomes the body of its GitHub Release, and a release whose version
 has no section here is refused before anything is built. Changes that have not
 been released yet collect under **Unreleased**.
 
+## 2.1.0
+
+### Added
+
+- **Java and Kotlin:** a `private` field or property whose every read was in
+  the removed code, such as the `private final FeatureflipClient flags;` a
+  service was handed only to read the flag, is now removed, with the
+  constructor parameter and statement that only set it and the argument every
+  caller in the repository passed for it. When a framework may construct the
+  class (a Spring stereotype, `@Inject`, `@Bean`, Lombok, reflection) or a
+  caller cannot be proven, it is kept and named in the pull request instead,
+  which before this release did not mention it at all. A plain Kotlin
+  constructor parameter whose only read was in an `init` block the removal
+  emptied is handled the same way.
+- **TypeScript and JavaScript:** a JSX component that takes a boolean instead
+  of a flag key can be named in `accessors` as
+  `ConditionallyRender[condition?show:elseShow]`. When its condition folds to a
+  literal, the element is replaced by the branch it renders, a render function
+  included, so the pull request no longer keeps `condition={true}` and a dead
+  subtree.
+- **Go:** the pull request lists each call the removal kept running only as
+  a discard (`_ = featureflags.GetClient(platform)`), which happens when a
+  local that only the removed flag read used was initialized by a call. The
+  call may have side effects, so it still runs; the note says to delete the
+  line when the call only fetched a client or built a context for that read.
+- **Swift:** a computed property or method of a type that the rewrite reduced
+  to a constant (`var showInvite: Bool { !viewed && <read> }` served off
+  becomes `{ false }`) is listed in the pull request under "now returns a
+  constant", with the types it conforms to, other implementations of them and
+  the files that call it, as C# and Java members already were. It is reported,
+  not inlined.
+
+- **Go:** a flag-keyed map entry written as a statement,
+  `flags["old-checkout"] = true`, is deleted on the same evidence as one in a
+  map literal: its value is a boolean agreeing with the kept branch, or the map
+  is provably a flag map (a literal assigned to it, or another key assigned into
+  it, is another flag of your project). One pinning the removed branch is kept
+  and named in the pull request, as in a literal.
+- **Go, Ruby, PHP, Swift and Dart:** a test assertion the removal turns into
+  one that always passes is deleted, as it already was in C#, Java, Kotlin,
+  Python, TypeScript and JavaScript, and listed in the pull request with the
+  deleted mock lines. The assertions recognised are testify's
+  `assert.True(t, true)`, `assert.False(t, false)` and `assert.Equal(t, b, b)`
+  (and their `f` forms, and the same on `require`), RSpec's
+  `expect(true).to be(true)`, `eq(true)`, `be_truthy` and `be_falsey`,
+  minitest's `assert true`, `refute false` and `assert_equal true, true`,
+  PHPUnit's `assertTrue`, `assertFalse`, `assertSame` and `assertEquals` on
+  `$this`, `self::`, `static::` or `Assert::`, XCTest's `XCTAssertTrue`,
+  `XCTAssert`, `XCTAssertFalse` and `XCTAssertEqual`, Swift Testing's
+  `#expect(true)`, and package:test's `expect(true, isTrue)`,
+  `expect(false, isFalse)`, `expect(b, b)` and `expect(b, equals(b))`. Only an
+  assertion the removal itself produced is touched, and only one that is a
+  statement of its own: one you wrote that way stays, and so does
+  `ok := assert.True(t, true)`. An assertion the removal turns into one that
+  always FAILS is not edited; the pull request names it so you can delete or
+  rewrite the test.
+- PHP: a name in `accessors` is now matched as a static call too, so with
+  `accessors: active` Laravel Pennant's `Feature::active('my-flag')` folds as
+  `Feature::for($user)->active('my-flag')` already did, including through a
+  key constant. `Feature::someAreActive([…])`, `Feature::allAreActive([…])` and
+  `Feature::inactive(…)` are left in place and reported.
+
+- `accessors` takes Ruby predicate and bang method names such as `enabled?`
+  and `is_enabled?`, so `Toggles.enabled?("my-flag")` and an Unleash-style
+  `client.is_enabled?("my-flag", context)` are matched in `.rb` files and ERB
+  templates. Before, a name ending in `?` failed the run at start-up. Such a
+  name applies to Ruby and ERB only, and a run whose `languages` includes
+  neither fails at start-up.
+- A Ruby accessor named in `accessors` is also matched when it takes the key
+  as a symbol, such as `Flipper.enabled?(:my_flag)` or
+  `Feature.enabled?(:"my-flag")`. The SDK's own `bool_variation` still takes
+  only a string.
+- A Ruby flag key held in a constant declared in another file
+  (`module Flags; NEW_CHECKOUT = "new-checkout"; end`, read as
+  `client.bool_variation(Flags::NEW_CHECKOUT, ctx, false)`) is now resolved:
+  each proven read is folded and the declaration is deleted with the last
+  one. A read is proven only where nothing else in the checkout's Ruby could
+  stand for the owner it names. Any other mention, a reflective use of the
+  owner, or a gem's constant spelled elsewhere keeps the declaration and
+  every read of it, each listed in the pull request. See "Declared in another
+  file" in the README.
+- **Java and Swift:** flag-keyed entries are now removed, as they already were
+  in every other language. In Java that is a key/value pair of `Map.of(…)` or
+  `ImmutableMap.of(…)` (including the map passed to
+  `FeatureflipClient.forTesting`), a `Map.entry` argument of `Map.ofEntries`,
+  a `put("old-checkout", true);` statement, and a `.put(…)` link of a builder
+  chain. In Swift it is a pair of a dictionary literal, so
+  `FeatureflipClient.forTesting(["old-checkout": true])` becomes
+  `FeatureflipClient.forTesting([:])`. An entry set to the branch being
+  removed is kept and named in the pull request, as in the other languages.
+
+- **C#:** a key read as `nameof(Flags.Beta)` from an enum is resolved as an
+  enum entry, and a key constant may be written
+  `public const string Beta = nameof(Beta);`. Both were skipped before, because
+  no string in the code holds the key.
+- **C#:** an attribute gate named in `accessors`, such as `FeatureGate` or
+  `RequireFeature`, is deleted when the flag is removed serving `true`, and a
+  removal serving `false` is refused with the attribute named. An attribute
+  naming a key constant no longer stops the reads beside it from folding.
+
+### Changed
+
+- **C# and Java:** a key constant named inside the branch the fold deletes no
+  longer keeps the flag from being removed. A guard such as
+  `if (!features.IsEnabled(FlagKeys.NewCheckout)) { log.Info("…", FlagKeys.NewCheckout); return; }`
+  used to refuse every read in its file, because the logged constant is not a
+  read. Under the treatment whose fold deletes that block, the read now folds
+  and the declaration is deleted; the rewritten file is checked afterwards,
+  and the flag is refused if the mention survived.
+- **Kotlin, Swift, Dart and Go:** when the removal keeps a branch that
+  declares a local, the branch is now flattened into the surrounding code if
+  nothing else in the function uses those names. Before, Kotlin and Swift refused the
+  whole flag and Dart and Go left a bare `{ … }` block.
+- **Python:** code left unreachable after a `return`, `raise`, `continue` or
+  `break` the removal produced is deleted, as it already was in the other
+  languages.
+- A bare `return` the removal leaves as the last statement of a function that
+  returns nothing is deleted (not in Ruby, where it changes the return value).
+- **TypeScript, JavaScript and Python:** a condition the removal reduces to
+  `x && false` or `x || true` is simplified when `x` has no side effects (no
+  calls or property reads).
+- **Go, TypeScript, JavaScript, Python, Ruby and Swift:** parentheses the
+  removal leaves around a whole `if`, `while` or similar condition are dropped
+  where the language's formatter would drop them, so `gofmt`, Prettier, ruff,
+  RuboCop and swift-format stay clean.
+- Large TypeScript and JavaScript files are processed several times faster.
+- **Java and Kotlin:** proving that a constructor parameter can be removed is
+  several times faster in a large repository. It no longer reads every
+  configuration and data file of the checkout to look for the class's name;
+  git finds the files that spell it, and only those are read.
+- A file that names the flag's key only as a segment of a package, namespace
+  or import path (`package com.example.qos`, `import com.example.qos.Policy;`)
+  is listed in a note of its own instead of under "still reference this
+  flag". A short key that is also a package name no longer floods that
+  caveat; a dotted string or code naming the key still stays in it.
+- In a Dart package whose `pubspec.lock` resolves the Featureflip SDK to
+  2.8.1, a plain `import 'package:featureflip/featureflip.dart';` that the
+  removal leaves unused is now deleted, as it already was for 2.8.0 and
+  earlier. Before, the import stayed in place on 2.8.1.
+
+### Fixed
+
+- **ERB:** a template with a `case` and its `when`s in separate tags is no
+  longer skipped. A deleted tag now takes its whole line instead of leaving
+  whitespace behind, which Rails renders the same. Plain `ERB.new` with no trim
+  mode loses the blank line it rendered for that tag. A rewritten tag keeps its
+  `-%>` and `<%-` and the layout of a multi-line tag.
+- **Ruby:** code after a `return` the removal leaves is deleted whole. A comment
+  or a final `if`/`else` used to leave part of it behind, sometimes reading a
+  variable whose assignment had gone.
+- **TypeScript and JavaScript:** a conditional spread no longer leaves
+  `...([a])`, `...([])`, `...({})` or `...(false)`: it's spliced in or deleted,
+  and a spliced-in literal keeps its order. A `.filter((x) => true)` the removal
+  leaves is dropped when it's chained or its receiver is a fresh array. A
+  standalone one stays, because `filter` copies and later code may rely on that.
+- **C#, Java and the other languages that collapse blank lines:** a double blank
+  line away from the removal stays as it was.
+- **C#:** a kept branch holding `#pragma` lines is re-indented correctly.
+- **TypeScript and JavaScript:** a call of a wrapper with no key that took one
+  boolean argument, such as `isNew(false)`, folded to that argument instead of
+  the flag's value, so a pull request could silently invert the code it kept.
+  Check any such removal already merged.
+- **PHP:** a Laravel Pennant write in application code, such as the
+  `Feature::activate('k');` of an admin toggle, was deleted as a test double,
+  which could leave one arm of an `if` empty. Only a write inside a test, a Pest
+  hook or a PHPUnit `setUp` of a `*TestCase` is a test double now; any other
+  stays and is listed as a remaining reference. Check any such removal already
+  merged.
+- **PHP:** a Pennant pin in a `beforeEach`, `beforeAll`, `setUp` or
+  `setUpBeforeClass` is now decided. A pin of the kept value goes, and the hook
+  with it when nothing else is left in it. A pin of the removed value means every
+  test under the hook ran the removed branch, so those tests go, except any that
+  pin the kept value themselves, and the hook with them. Before, the pin stayed
+  and the tests under it failed, or the hook was left empty.
+- **A read whose result is used as an object now refuses the flag, in every
+  language.** `useFeature('k').on` folded to `true.on`, which in JavaScript is
+  `undefined`, so a pull request could silently ship the opposite of the served
+  value. A C# NSubstitute stub that could not be resolved folded the same way, to
+  `true.Returns(v)`, which compiles and only throws when the test runs.
+- A test double whose key is a constant of another file is now resolved like one
+  with a literal key, in every language with double resolution. For C# that
+  includes a receiver like `sutProvider.GetDependency<IFeatures>()`.
+- **Kotlin:** a keyless wrapper called bare and negated inside its own class,
+  as in the early-return guard `if (!enabled()) return`, is now inlined and
+  the wrapper deleted. Before, the negation hid the call from the receiver
+  proof, so the wrapper was kept returning the flag's value and every such
+  caller was reported `receiver-unproven`.
+- **Dart:** a private method or top-level function that only the removed
+  branch called is now deleted, with its doc comment, and listed in the pull
+  request. Before, it stayed, and `dart analyze` failed the pull request on
+  `unused_element`. A private method only the deleted one called goes too.
+- A flag-keyed entry (a seeded default, a test override, a registry line) is
+  no longer deleted while any file still names the flag outside a comment.
+  Before, a boolean entry was deleted even when no read of the flag had been
+  rewritten, so the pull request's only effect was to change the value those
+  reads got. The entry is now kept and listed, and when the entries were the
+  only change the run could make the flag is refused (`unsafe-rewrite`) with
+  the reason on the entry's file.
+- **PHP, Java, C#, Dart and Kotlin:** an assertion the removal made trivially true
+  is kept when it's the whole body of an `if` or a loop with no braces. Deleting
+  it made the next statement run conditionally: `if (c) assertTrue(read); next();`
+  became `if (c) next();`, which compiles. In Java and C# a read discarded as a
+  statement in that position, in any file, did the same, and now refuses the flag.
+  Check any such removal already merged.
+- A TypeScript or JavaScript flag-keyed entry with an unquoted key
+  (`{ oldCheckout: true }`) is now removed like a quoted one.
+- The key's member of a TypeScript string-literal union is now removed, once
+  nothing else names the key. Before, it stayed, and the file was listed as
+  still naming the flag.
+- The pull request no longer says a comment's code "is now unconditional", or
+  describes behaviour "this pull request removed", while a read of the flag is
+  still in place.
+- A Ruby `recv&.read("k")` used as a condition now folds: to `false`, or served
+  true to `recv`, which keeps the nil check. As a value it is still left alone.
+- **C#:** one source file in a legacy encoding, such as a Latin-1 comment in a
+  test, no longer stops every key constant in the repository from being
+  resolved. Such a file is now read like any other. A UTF-16 file still can't
+  be, and still makes those proofs refuse.
+- **Ruby:** a key constant named by `private_constant :NAME`,
+  `deprecate_constant`, `public_constant` or another symbol or string in the
+  file that declares it is no longer deleted. Removing it left
+  `private_constant` naming a constant that no longer exists, so loading the
+  file raised `NameError`. The declaration and the reads it backs now stay,
+  and the pull request lists the mention, as it already did when another file
+  read the constant.
+- **Kotlin and Dart:** a removal is no longer refused because the branch it
+  deletes declares a variable with the same name as one a `$name` string
+  template in the kept code reads. The check that catches a template left
+  reading a deleted variable now looks at which declaration each template
+  reads, so a declaration that goes with its dead branch no longer counts.
+  A template left reading a deleted variable, or reading an outer variable of
+  the same name instead, is still refused.
+- **Kotlin:** removing a map's only flag-keyed entry no longer leaves a call
+  that does not compile. `val overrides = mutableMapOf("k" to true)` used to
+  become `val overrides = mutableMapOf()`, which cannot infer its type
+  arguments. A sole entry is now deleted only where the map's type is fixed
+  without it (a declaration typed as a map with type arguments, a builder with
+  its own type arguments, or the argument of `FeatureflipClient.forTesting`),
+  and is otherwise left in place and listed in the pull request.
+- **Kotlin:** removing one flag-keyed entry from a larger map no longer
+  narrows the map's type. In `val m = mutableMapOf("k" to true, "limit" to 5)`
+  the value type is inferred from both entries, so with the flag's entry gone
+  `m["x"] = false` stopped compiling. Such an entry is now deleted only where
+  the map's type is fixed (the same three places as a sole entry) or where
+  every entry maps a plain string to `true` or `false`, and only from the
+  standard map builders, so a function taking two `Pair` arguments no longer
+  loses one.
+- A `directories` entry relative to the checkout, which is how a workflow
+  normally sets it and what the default `.` is, now gets the same result as an
+  absolute path. Before, a C# file's project could not be found from a
+  relative path, so an unpublished project was treated as published and the
+  removal of a gate's interface and constructor parameters stopped short.
+- In C# and Java, a file that does not parse now stops a read of a key constant
+  only if it could be on that reader's supertype chain. Before, one unrelated
+  file stopped every such read in any class with a base type, across the
+  repository, reported as `import-unresolved`.
+- **PHP:** a static wrapper such as `Features::telegram()` was not inlined
+  when any other class had a method of the same name, which is the normal case
+  for an Eloquent relation. Only a call through its class reaches a static
+  method, so its callers are now folded; a call of the shared name that cannot
+  be told apart from it, such as `$model->telegram()`, is still left and
+  named in the pull request.
+- A C# target-typed `new(…)` is no longer mistaken for a call to a constructor
+  when a literal before its first named argument rules that constructor out,
+  so an unrelated `new(1, name: x)` no longer keeps a gate's constructor
+  parameter.
+- A stranded `require` of a local CommonJS module that only declares and exports
+  is now deleted, as an ES import of such a module already was, and so is one
+  whose load another top-level `require` in the file still makes.
+- Deleting an argument at the end of a line no longer leaves a trailing space
+  on that line.
+- A Ruby key constant kept because another file reaches its owner no longer keeps
+  the reads beside it, unless a file spells `const_set` or `remove_const`, which
+  could replace the constant. Before, a Slim view naming a concern meant no diff
+  at all, which in a Rails app was most key constants.
+- A Java or Kotlin wrapper's own unit test, one that asserts on the member
+  through a real instance of its class, now goes with the member. Before, it
+  was folded to an assertion on a literal such as
+  `assertThat(true).isEqualTo(toggleState)`, and a parameterised one failed for
+  the row of the removed value.
+- An assertion with a string-literal message is now handled in every language,
+  as testify's already was: `assert true, "m"` is deleted, and `assert false, "m"`
+  is named in the pull request. Before, only the form with no message was, so one
+  that could only fail shipped unnamed. Rails' `assert_not` is handled too.
+- A Java or Kotlin parameterised test that stubs a `true` or `false` literal is
+  now decided like any other test, since a literal holds in every row. Before,
+  it was left as it was and could block the removal of its wrapper. A stub of
+  the test's own parameter is still left alone.
+- **Dart:** the lines a removal deletes no longer leave a blank line just
+  above a `}` or two blank lines in a row, which `dart format
+  --set-exit-if-changed` rejects. Both came from deleting a statement that
+  could no longer run, or an import left unused, next to a blank line.
+- **PHP and Python:** a flag read in a server-side template, such as a Twig
+  `{% if isFeatureEnabled('loans') %}` or a Django `{% flag "old-checkout" %}`,
+  is now listed in the pull request among the files that still reference the
+  flag. The Action does not rewrite templates, and it used to say nothing about
+  them, so a pull request could present the removal as complete while the
+  template kept reading a flag that no longer exists. A flag-keyed entry (a
+  PHP `'loans' => true` default, for one) is now kept while a template still
+  names the key, as it already was for a `.php` file. `.twig`, `.latte`,
+  `.tpl`, `.volt`, `.j2`, `.jinja` and `.jinja2` files are checked for the key,
+  and `.html` and `.htm` files only when it sits inside a `{% %}` or `{{ }}`
+  tag, so a static page that mentions it stays quiet.
+- A removal in a large file no longer takes minutes. Cleaning up the
+  variables and imports a removal leaves unused re-read the whole file for
+  every local in it, so its time grew with the square of the file's length,
+  and with the cube in PHP: one flag read in a 2,000-line PHP controller took
+  about ten minutes per treatment. It now takes a few seconds, and the
+  changes it makes are the same.
+- **Dart:** a removal in a large Flutter app no longer takes minutes per
+  flag. Cleaning up what it left unused re-read the file once for every name
+  an imported library declares, re-read a function once for every local in
+  it, and re-read each imported library once for every file importing it.
+  Each is now read once, and the changes are the same.
+- A mockito-kotlin `whenever(…) doReturn true` is now resolved like
+  `whenever(…).thenReturn(true)`. Before, the stub stayed, so a test could go on
+  asserting the removed branch, or the whole flag was refused.
+- Sinon's keyed stub of a read, `stub.withArgs('k').returns(true)`, is now
+  resolved. Before, it stayed, so a test could go on asserting the removed branch.
+- In a repository mixing Java and Kotlin, a test in one language that stubs a
+  read in the other is now resolved. Before, the whole flag was refused.
+- Kotlin stubs inside minutest, Spek and Kotest tests are now resolved, and so
+  are stubs in any other lambda of a test. A stub of the removed value in a
+  `context`'s `before` takes the whole context with it. Before, the whole flag
+  was refused.
+- RSpec and Mocha stubs of a Ruby wrapper are now resolved when the stub stands
+  on the wrapper's own class. A stub of the kept value is deleted, and a test
+  or nested `context` stubbing the removed value goes with it. Before, any stub
+  left the wrapper and its callers in place, with only its body folded.
+- `unittest.mock` patches of a Python function wrapper are now resolved when
+  they state their answer: `@patch(…, return_value=…)`, `with patch(…)` and
+  `mocker.patch(…)`. A patch of the kept value goes with the parameter it
+  injects, and a test patching the removed value goes with it. Before, any patch
+  left the wrapper and its callers in place, with only its body folded.
+- Laravel Pennant's `Feature::activate('k')` and `Feature::deactivate('k')` in a
+  PHP test are now resolved. One setting the kept value is deleted, and a test
+  setting the removed value goes with it. Before, the line stayed, naming a flag
+  that no longer exists.
+- A stub of another method of a Ruby wrapper's class no longer keeps the wrapper.
+- **Java and Kotlin:** a configuration or data file the Action cannot read now
+  keeps a constructor parameter in place, named in the pull request. Before,
+  such a file was skipped as if it did not name the class, though it could be
+  the bean definition or service entry that constructs it.
+- A spec title spelling a Ruby wrapper (`describe ".on?" do`) no longer keeps it.
+- A data file in a legacy encoding no longer counts as naming every wrapper and
+  key constant in the repository. It still does if it spells the name.
+- A Java or Kotlin test class whose last test a removal deleted now goes, with
+  its file when nothing else is declared there, and so does an emptied `@Nested`
+  class. Before, it stayed with only its mock fields, or an empty body. A class
+  that extends or implements anything, or that anything else names, stays.
+- Deleting a Java import group whole no longer leaves two blank lines in a row.
+- A Java or Kotlin test title that names the kept branch by the flag's key now
+  loses that condition, as a TypeScript title does: `@DisplayName("…")`, a Kotlin
+  backtick name, and a Kotest, Spek or minutest `test("…")`. The file then no
+  longer names the key, so it is no longer listed as left unprocessed.
+- **TypeScript and JavaScript:** a removal that would leave a condition such as
+  `if (req.path() !== "/health" && false)` is now refused instead of opening a
+  pull request. ESLint's recommended `no-constant-condition` rule fails on
+  that condition, and it cannot be simplified without dropping the call, so
+  the pull request would have failed your lint. The same applies to
+  `|| true`, and to `while`, `for` and `do` loops.
+- **PHP:** the README now says that a Laravel Blade view is not rewritten. A
+  view that reads the flag was already left untouched and listed under "still
+  reference this flag", but nothing said so.
+- **PHP:** a `use` stranded by a removal stayed when the file had a variable
+  with the same name in another case, such as `use App\\Entity\\Tag;` beside
+  `$tag`. A `use` never binds a variable, so the import is now removed.
+
 ## 2.0.0
 
 This is a new major version, so `@v1` stays on 1.19.0. Change

@@ -1,0 +1,147 @@
+# Assertions the fold made trivially true, for php. Appended to the rules
+# whenever `php_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `php.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `$this->assertTrue($client->boolVariation('k', $ctx, false))` in a test
+# folds to `$this->assertTrue(true)`: a check the removal made meaningless.
+# Reached ONLY from the fold's own literal (php_edges.toml, Parent scope from
+# the groups that write one), never as a seed, so an `$this->assertTrue(true)`
+# the customer wrote stays. The assertion APIs are policy: PHPUnit's
+# `assertTrue`, `assertFalse`, `assertSame` and `assertEquals`, called on
+# `$this`, `self::`, `static::` or `Assert::`, with at most one string literal as a message. An
+# assertion folded to the FAILING literal (`$this->assertTrue(false)`) is never
+# matched; the Action reports it. The failing forms are listed again, as text,
+# in the Action's failing-assertion check: the two lists are kept in step by
+# hand.
+#
+# The `argument` around a literal spans the same text and the Parent walk
+# skips it, so literal -> `arguments` -> call -> `expression_statement` is the
+# walk's four nodes. The receiver is matched by its text: `$this` is a
+# `variable_name`, `self`/`static` a `relative_scope`, `Assert` a `name`.
+# A trivial assertion that is the whole body of an `if` or a loop stays. Deleting
+# it would hand that body to the next statement, which parses and silently runs
+# conditionally. `not_enclosing_node` asks of every ancestor, so an assertion
+# nested deeper under such a body stays too, which is the safe direction.
+
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (expression_statement
+    [
+      (member_call_expression
+        object: (variable_name) @assert_receiver
+        name: (name) @assert_method
+        arguments: [
+          (arguments . (argument (boolean) @asserted) .)
+          (arguments . (argument (boolean) @asserted) . (argument [(string) (encapsed_string)]) .)
+        ])
+      (scoped_call_expression
+        scope: [(relative_scope) (name)] @assert_receiver
+        name: (name) @assert_method
+        arguments: [
+          (arguments . (argument (boolean) @asserted) .)
+          (arguments . (argument (boolean) @asserted) . (argument [(string) (encapsed_string)]) .)
+        ])
+    ]) @statement
+  (#match? @assert_receiver "^([$]this|self|static|Assert)$")
+  (#eq? @assert_method "assertTrue")
+  (#match? @asserted "^[Tt][Rr][Uu][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (expression_statement
+    [
+      (member_call_expression
+        object: (variable_name) @assert_receiver
+        name: (name) @assert_method
+        arguments: [
+          (arguments . (argument (boolean) @asserted) .)
+          (arguments . (argument (boolean) @asserted) . (argument [(string) (encapsed_string)]) .)
+        ])
+      (scoped_call_expression
+        scope: [(relative_scope) (name)] @assert_receiver
+        name: (name) @assert_method
+        arguments: [
+          (arguments . (argument (boolean) @asserted) .)
+          (arguments . (argument (boolean) @asserted) . (argument [(string) (encapsed_string)]) .)
+        ])
+    ]) @statement
+  (#match? @assert_receiver "^([$]this|self|static|Assert)$")
+  (#eq? @assert_method "assertFalse")
+  (#match? @asserted "^[Ff][Aa][Ll][Ss][Ee]$")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (expression_statement
+    [
+      (member_call_expression
+        object: (variable_name) @assert_receiver
+        name: (name) @assert_method
+        arguments: [
+          (arguments . (argument (boolean) @expected) . (argument (boolean) @actual) .)
+          (arguments . (argument (boolean) @expected) . (argument (boolean) @actual) . (argument [(string) (encapsed_string)]) .)
+        ])
+      (scoped_call_expression
+        scope: [(relative_scope) (name)] @assert_receiver
+        name: (name) @assert_method
+        arguments: [
+          (arguments . (argument (boolean) @expected) . (argument (boolean) @actual) .)
+          (arguments . (argument (boolean) @expected) . (argument (boolean) @actual) . (argument [(string) (encapsed_string)]) .)
+        ])
+    ]) @statement
+  (#match? @assert_receiver "^([$]this|self|static|Assert)$")
+  (#match? @assert_method "^(assertSame|assertEquals)$")
+  (#eq? @expected @actual)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement body: (expression_statement))
+  (else_clause body: (expression_statement))
+  (else_if_clause body: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""

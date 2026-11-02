@@ -2242,8 +2242,48 @@ def remove_unreachable_statements(
                 data = data[:start] + replacement + data[end:]
                 continue
             wide_start, wide_end = _expand_to_whole_lines(data, start, end)
+            if language == "dart":
+                wide_start, wide_end = _dart_blank_lines(data, wide_start, wide_end)
             data = data[:wide_start] + data[wide_end:]
     return data.decode("utf-8"), removed
+
+
+_BLANK_LINE = re.compile(rb"[ \t]*\r?\n")
+
+
+def _dart_blank_lines(data: bytes, start: int, end: int) -> tuple[int, int]:
+    """Widen a deleted run of whole Dart lines so ``dart format`` would leave
+    what is left as it is.
+
+    The formatter removes a blank line just inside a block's ``{`` or ``}``
+    and keeps at most one blank line in a row, and Flutter CI commonly runs
+    it with ``--set-exit-if-changed``. Deleting the last statements of a
+    block leaves the blank line above them against the ``}``; deleting one
+    between two blank lines leaves two in a row. Each is closed by taking
+    those blank lines with the deletion. Only ``{``/``}`` count as edges: a
+    statement list also ends at a ``case`` label, which the formatter
+    leaves alone.
+    """
+    if not (start == 0 or data[start - 1 : start] == b"\n") or data[end - 1 : end] != b"\n":
+        return start, end
+    below = end
+    while match := _BLANK_LINE.match(data, below):
+        below = match.end()
+    above = start
+    while (
+        above > 0
+        and (previous := data.rfind(b"\n", 0, above - 1) + 1) < above
+        and not data[previous:above].strip()
+    ):
+        above = previous
+    if data[below:].lstrip(b" \t").startswith(b"}"):
+        return above, end
+    if data[:above].rstrip().endswith(b"{"):
+        return start, below
+    if above < start:
+        # Blank above, so any blank below would make two.
+        return start, below
+    return start, end
 
 
 _PARENTHESES = frozenset({"parenthesized_expression", "tuple_expression"})
@@ -2444,6 +2484,39 @@ def _mock_stubbed_literals(source: str, language: str) -> int:
     return len(pattern.findall(source))
 
 
+#: What follows a value to read a member of it. PHP's `.` joins strings, and
+#: its members are `->`.
+_MEMBER_ACCESS = re.compile(rb"\s*(?:\?\.|&\.|\.(?![.\d])|\[)")
+_PHP_MEMBER_ACCESS = re.compile(rb"\s*(?:\?->|->|::)")
+_BOOLEAN_WORDS = frozenset({b"true", b"false", b"True", b"False"})
+
+
+def _literal_members(source: str, language: str) -> int:
+    """Boolean literals with a member read off them: ``true.on``, ``True.x``.
+
+    A read whose result is an object (GrowthBook's ``useFeature('k').on``, an
+    NSubstitute ``sub.Read("k").Returns(…)``) folds to one. It parses, and in
+    JavaScript it even runs, as ``undefined``, which takes the branch the flag
+    turned off. Asked of the tree's leaves, so a string or a comment spelling
+    one does not count, and a member named ``true`` (``x.true.y``) neither.
+    """
+    if language == "erb":
+        source, language = _code_view(source, language), "ruby"
+    root = ts_syntax._parse(source, language) if language in _TS_LANGUAGES else _parse(source, language)
+    data = source.encode("utf-8")
+    pattern = _PHP_MEMBER_ACCESS if language == "php" else _MEMBER_ACCESS
+    return sum(
+        1
+        for node in _walk(root)
+        if node.child_count == 0
+        and data[node.start_byte : node.end_byte] in _BOOLEAN_WORDS
+        and "string" not in node.type
+        and "comment" not in node.type
+        and data[max(0, node.start_byte - 1) : node.start_byte] != b"."
+        and pattern.match(data, node.end_byte) is not None
+    )
+
+
 def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     """Whether rewriting ``before`` into ``after`` produced invalid source.
 
@@ -2482,6 +2555,8 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
     # `ts`/`tsx`/`js`, which is half of what #2807 was.
     if _mock_stubbed_literals(after, language) > _mock_stubbed_literals(before, language):
         return "a test double now stubs a literal where the flag read was"
+    if _literal_members(after, language) > _literal_members(before, language):
+        return "the flag read's result is used as an object, so it is not a boolean read"
     # Same placement argument: the multi-way guard residue is keyed for the TS
     # family as well as for Kotlin, so it must run ahead of the delegation.
     if _multiway_literal_arms(after, language) > _multiway_literal_arms(before, language):
@@ -2552,8 +2627,9 @@ _TEMPLATE_STRINGS = {
 _SHORT_TEMPLATE = re.compile(r"(?<!\\)\$([^\W\d]\w*)")
 
 
-def _template_names(root: Node, language: str) -> list[str]:
-    """The name each short-form ``$name`` template in ``root`` reads.
+def _template_reads(root: Node, language: str) -> list[tuple[str, Node]]:
+    """Each short-form ``$name`` template in ``root``: the name it reads and
+    the string it sits in.
 
     Read from the string's TEXT, because neither grammar gives the read an
     ordinary name node: Kotlin splits ``"x $ok y"`` across ``string_content``
@@ -2561,33 +2637,97 @@ def _template_names(root: Node, language: str) -> list[str]:
     ``identifier_dollar_escaped`` leaf. A Dart raw string (``r'$ok'``)
     interpolates nothing.
     """
-    names: list[str] = []
+    reads: list[tuple[str, Node]] = []
     stack = [root]
     while stack:
         node = stack.pop()
         if node.type in _TEMPLATE_STRINGS[language]:
             text = node.text.decode("utf-8", "replace")
             if not (language == "dart" and text[:1] in "rR"):
-                names.extend(_SHORT_TEMPLATE.findall(text))
+                reads.extend((name, node) for name in _SHORT_TEMPLATE.findall(text))
             continue
         stack.extend(node.children)
-    return names
+    return reads
 
 
-def _declared_names(root: Node, language: str) -> dict[str, int]:
-    """How many variable declarations in ``root`` bind each name."""
-    counts: dict[str, int] = {}
+def _template_names(root: Node, language: str) -> list[str]:
+    """The name each short-form ``$name`` template in ``root`` reads."""
+    return [name for name, _ in _template_reads(root, language)]
+
+
+#: The nodes a local declared inside them is scoped to, per grammar. A local's
+#: scope is the nearest of these around it, or the whole file.
+_LOCAL_SCOPES = {
+    "dart": frozenset({"block", "for_statement", "function_body", "class_body"}),
+    "kt": frozenset(
+        {"block", "for_statement", "lambda_literal", "function_body", "class_body", "statements"}
+    ),
+}
+
+
+def _declarations(root: Node, language: str) -> list[tuple[str, Node]]:
+    """Each variable declaration in ``root``: the name it binds, and the node
+    whose text is the declaration (with its initializer)."""
+    found: list[tuple[str, Node]] = []
     for node in _walk(root):
         name = None
+        statement = node
         if language == "kt" and node.type == "variable_declaration":
             name = next((c for c in node.named_children if c.type == "identifier"), None)
+            if node.parent is not None and node.parent.type == "property_declaration":
+                statement = node.parent
         elif language == "dart" and node.type == "initialized_variable_definition":
             name = node.child_by_field_name("name")
         elif language == "dart" and node.type == "initialized_identifier":
             name = next((c for c in node.named_children if c.type == "identifier"), None)
         if name is not None:
-            text = name.text.decode("utf-8", "replace").strip("`")
-            counts[text] = counts.get(text, 0) + 1
+            found.append((name.text.decode("utf-8", "replace").strip("`"), statement))
+    return found
+
+
+def _declared_names(root: Node, language: str) -> dict[str, int]:
+    """How many variable declarations in ``root`` bind each name."""
+    counts: dict[str, int] = {}
+    for name, _ in _declarations(root, language):
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _local_scope(node: Node, language: str) -> Node:
+    current = node.parent
+    while current is not None and current.parent is not None:
+        if current.type in _LOCAL_SCOPES[language]:
+            return current
+        current = current.parent
+    return current if current is not None else node
+
+
+def _bound_template_reads(root: Node, language: str) -> dict[tuple[str, str | None], int]:
+    """How many templates read each name through each declaration.
+
+    A read is bound to the innermost declaration of its name that comes before
+    it in a scope holding it, named by the declaration's TEXT so the counts
+    from two versions of a file compare; ``None`` when no local declaration
+    holds it (a parameter, a property, something from another file).
+    """
+    declarations = [
+        (name, statement, _local_scope(statement, language))
+        for name, statement in _declarations(root, language)
+    ]
+    counts: dict[tuple[str, str | None], int] = {}
+    for name, string in _template_reads(root, language):
+        at = string.start_byte
+        bound = None
+        for declared, statement, scope in declarations:
+            if (
+                declared == name
+                and statement.end_byte <= at
+                and scope.start_byte <= at < scope.end_byte
+                and (bound is None or statement.start_byte > bound.start_byte)
+            ):
+                bound = statement
+        key = (name, None if bound is None else bound.text.decode("utf-8", "replace"))
+        counts[key] = counts.get(key, 0) + 1
     return counts
 
 
@@ -2597,18 +2737,24 @@ def _stranded_template_reads(before: str, after: str, language: str) -> bool:
 
     Inlining a local bound to the read deletes its declaration and rewrites
     every read that is a name node. A short-form template is not one (see
-    :func:`_template_names`), so it is left naming a variable that no longer
+    :func:`_template_reads`), so it is left naming a variable that no longer
     exists: ``Undefined name`` to Dart, ``Unresolved reference`` to Kotlin.
+    If an outer variable of the same name is still in scope, the template
+    compiles and reads THAT one instead, which is worse.
     A Kotlin raw string's ``$ok`` IS a name node, and rewriting it gives a raw
     string holding ``$false``, which Kotlin rejects (a keyword is not a
     reference).
-    Both parse, so nothing above sees them. Refused rather than repaired:
-    keeping the binding means leaving the customer's file as it was.
+    All of these parse, so nothing above sees them. Refused rather than
+    repaired: keeping the binding means leaving the customer's file as it was.
 
-    Differential on the declarations: a name only counts when ``after``
-    declares it fewer times than ``before``. Over-refuses when a same-named
-    variable elsewhere in the file is the one the template reads, which is
-    the safe direction.
+    Differential on the declarations, in two steps. A name is a suspect only
+    when ``after`` declares it fewer times than ``before``. A suspect is
+    refused only when some template in ``after`` reads it through a
+    declaration (or through no local declaration at all) more often than any
+    template in ``before`` did: that is a read whose declaration went while
+    the read stayed. A declaration deleted along with a dead branch takes
+    the templates it bound with it, so a kept branch reading a parameter or
+    an outer variable of the same name is not refused for it.
     """
     if language not in _TEMPLATE_STRINGS:
         return False
@@ -2624,8 +2770,17 @@ def _stranded_template_reads(before: str, after: str, language: str) -> bool:
         return True
     declared_before = _declared_names(before_root, language)
     declared_after = _declared_names(after_root, language)
+    suspects = {
+        name for name in set(reads) if declared_after.get(name, 0) < declared_before.get(name, 0)
+    }
+    if not suspects:
+        return False
+    bound_before = _bound_template_reads(before_root, language)
+    bound_after = _bound_template_reads(after_root, language)
     return any(
-        declared_after.get(name, 0) < declared_before.get(name, 0) for name in set(reads)
+        count > bound_before.get(key, 0)
+        for key, count in bound_after.items()
+        if key[0] in suspects
     )
 
 
@@ -2634,6 +2789,7 @@ def const_path_is_safe(
     language: str,
     flag_key: str,
     accessors: tuple[str, ...] = (),
+    treatment: bool | None = None,
 ) -> bool:
     """Whether the const-propagation rules may run over ``source`` (Gate 2).
 
@@ -2664,6 +2820,11 @@ def const_path_is_safe(
     withhold the file. The READ-const question does not take it: a name bound
     to a wrapper's call is already handled by the ``(#not-eq? @callee ...)``
     guard `rule_synthesis.with_accessor_guards` extends, one layer up.
+
+    ``treatment`` reaches the KEY-const question too: a reference inside the
+    block a removable read's fold deletes goes with the block (see
+    :func:`key_const.dead_references`), and the runner checks the rewritten
+    file for it afterwards.
     """
     if language in _TS_LANGUAGES:
         if not ts_syntax.const_path_is_safe(source, language, flag_key):
@@ -2695,7 +2856,7 @@ def const_path_is_safe(
     else:
         return True
     return key_const.path_is_safe(
-        root, source.encode("utf-8"), language, flag_key, accessors
+        root, source.encode("utf-8"), language, flag_key, accessors, treatment
     )
 
 

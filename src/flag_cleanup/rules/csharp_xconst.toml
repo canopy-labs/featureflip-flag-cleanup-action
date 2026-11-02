@@ -64,6 +64,22 @@ not_contains = [
   """((assignment_expression) @assignment)""",
 ]
 
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
 [[rules]]
 # xconst: qualified
 name = "xconst_qualified_discarded_boolvariation_statement"
@@ -93,6 +109,22 @@ not_contains = [
   """((prefix_unary_expression) @prefix_mutation)""",
   """((assignment_expression) @assignment)""",
 ]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 [[rules]]
 # xconst: qualified
@@ -181,6 +213,22 @@ not_contains = [
   """((assignment_expression) @assignment)""",
 ]
 
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
 [[rules]]
 # xconst: bare
 name = "xconst_bare_discarded_boolvariation_statement"
@@ -207,6 +255,22 @@ not_contains = [
   """((prefix_unary_expression) @prefix_mutation)""",
   """((assignment_expression) @assignment)""",
 ]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 [[rules]]
 # xconst: bare
@@ -246,6 +310,174 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated"]
 
 [[rules.filters]]
+not_enclosing_node = """(
+  (lambda_expression
+    parameters: [(implicit_parameter) @lambda_param
+                 (parameter_list (parameter (identifier) @lambda_param .))]
+    body: (invocation_expression
+      function: (member_access_expression
+        expression: (identifier) @lambda_receiver))
+  ) @mock_expression
+  (#eq? @lambda_receiver @lambda_param)
+)"""
+
+# Blocks marked `# xconst: enum-qualified-call` match a read of an enum member's
+# name: `nameof(Owner.Member)` as the key argument. __XCONST_ACCESSOR__ is
+# `nameof`. The four shapes are the `# xconst: qualified` ones.
+
+[[rules]]
+# xconst: enum-qualified-call
+name = "xconst_enum_qualified_discarded_getbooleanvalueasync_statement"
+query = """(
+  (expression_statement
+    (await_expression
+      (invocation_expression
+        function: [(member_access_expression name: (identifier) @sdk_fn)
+                   (identifier) @sdk_fn]
+        arguments: (argument_list
+          . (argument (invocation_expression
+              function: (identifier) @key_accessor
+              arguments: (argument_list . (argument (member_access_expression
+                expression: [(identifier) (member_access_expression)] @key_owner
+                name: (identifier) @key_member)) .))))))) @statement
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "statement"
+replace = ""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
+[[rules]]
+# xconst: enum-qualified-call
+name = "xconst_enum_qualified_discarded_boolvariation_statement"
+query = """(
+  (expression_statement
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (invocation_expression
+              function: (identifier) @key_accessor
+              arguments: (argument_list . (argument (member_access_expression
+                expression: [(identifier) (member_access_expression)] @key_owner
+                name: (identifier) @key_member)) .)))))) @statement
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "statement"
+replace = ""
+
+[[rules.filters]]
+contains = """((argument_list) @arg_list)"""
+at_most = 1
+
+[[rules.filters]]
+not_contains = [
+  """((postfix_unary_expression) @postfix_mutation)""",
+  """((prefix_unary_expression) @prefix_mutation)""",
+  """((assignment_expression) @assignment)""",
+]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
+[[rules]]
+# xconst: enum-qualified-call
+name = "xconst_enum_qualified_getbooleanvalueasync_read"
+query = """(
+  (await_expression
+    (invocation_expression
+      function: [(member_access_expression name: (identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (argument_list
+        . (argument (invocation_expression
+              function: (identifier) @key_accessor
+              arguments: (argument_list . (argument (member_access_expression
+                expression: [(identifier) (member_access_expression)] @key_owner
+                name: (identifier) @key_member)) .)))))
+  ) @await
+  (#eq? @sdk_fn "GetBooleanValueAsync")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: enum-qualified-call
+name = "xconst_enum_qualified_boolvariation_read"
+query = """(
+  (invocation_expression
+    function: [(member_access_expression name: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . (argument (invocation_expression
+              function: (identifier) @key_accessor
+              arguments: (argument_list . (argument (member_access_expression
+                expression: [(identifier) (member_access_expression)] @key_owner
+                name: (identifier) @key_member)) .))))
+  ) @call
+  (#eq? @sdk_fn "BoolVariation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#eq? @key_accessor "__XCONST_ACCESSOR__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+# A call DESCRIBED to a mock (`Setup(c => c.BoolVariation(Keys.X, ...))`) is an
+# expression tree whose text is the payload; see `csharp.toml`. The reader
+# proof refuses the same shape, so the two halves agree. The root capture is
+# load-bearing: an uncaptured root silently guards nothing.
 not_enclosing_node = """(
   (lambda_expression
     parameters: [(implicit_parameter) @lambda_param

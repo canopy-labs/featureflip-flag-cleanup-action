@@ -60,6 +60,19 @@ replace_node = "stmt"
 replace = ""
 holes = ["sentinel"]
 
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (enhanced_for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
 [[rules]]
 name = "replace_sentinel_read_with_boolean_literal"
 query = """(
@@ -146,6 +159,19 @@ not_contains = [
   """((update_expression) @mutation)""",
   """((assignment_expression) @assignment)""",
 ]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (enhanced_for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 
 # --- <obj>.boolVariation("KEY", ...) -> @treated
@@ -243,6 +269,19 @@ not_contains = [
   """((update_expression) @mutation)""",
   """((assignment_expression) @assignment)""",
 ]
+
+# Under a body with no braces the statement cannot simply go: the next one would
+# take its place. Left alone it folds to a literal, which is refused.
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (enhanced_for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 
 # --- <obj>.getBooleanValue("KEY", ...) -> @treated   (OpenFeature Java client)

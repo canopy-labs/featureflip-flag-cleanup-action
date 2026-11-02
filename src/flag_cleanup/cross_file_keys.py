@@ -257,6 +257,14 @@ class Profile:
     #: One whose text spells a constant's name anywhere keeps that
     #: constant's declaration, ``unsupported-form`` at the first such line.
     enum_unparsed_suffixes: frozenset[str] = frozenset()
+    #: ``(path, source, constants, repo_dir)``: for a language whose files
+    #: under :attr:`enum_unparsed_suffixes` are not all its own (Ruby's
+    #: suffix-less scripts, which may be shell), or can spell a constant's
+    #: name without reaching it, the refusals such a file gives the
+    #: constants. Unset, any spelling of a constant's name is one.
+    unparsed_constant_mentions: (
+        Callable[[str, str, tuple[KeyDeclaration, ...], str], list[Refusal]] | None
+    ) = None
     #: ``(path, source, patterns)``: the offset of the first place in such a
     #: file where one of ``patterns`` can mean a use, or None. Unset, any
     #: match anywhere in its text is one.
@@ -397,11 +405,16 @@ class CheckoutIndex(Generic[_Contribution, _Index]):
         parse: Callable[[str], tuple[_Contribution, bool]],
         combine: Callable[[list[tuple[str, _Contribution]], bool, bool], _Index],
         exclude: Callable[[Path], bool] | None = None,
+        legacy_encodings: bool = False,
     ) -> None:
         self._language = language
         self._extensions = extensions
         self._parse = parse
         self._combine = combine
+        #: Whether a file that is not UTF-8 is still a source file here (the
+        #: C# compiler reads the system's code page). Otherwise it is
+        #: unreadable, and may declare anything.
+        self._legacy_encodings = legacy_encodings
         #: Files the index never reads, by resolved path: a language's
         #: third-party tree (PHP's Composer ``vendor/``) that cannot declare
         #: the checkout's own types and would dominate the cost.
@@ -454,8 +467,12 @@ class CheckoutIndex(Generic[_Contribution, _Index]):
             return cached
         try:
             text = source.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except OSError:
             return None
+        except UnicodeDecodeError:
+            text = self._legacy_text(source.path)
+            if text is None:
+                return None
         digest = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
         if cached is not None and cached.digest == digest:
             cached = replace(cached, stamp=stamp)
@@ -464,6 +481,22 @@ class CheckoutIndex(Generic[_Contribution, _Index]):
             cached = _Parsed(stamp, digest, contribution, complete)
         self._files[source.resolved] = cached
         return cached
+
+
+    def _legacy_text(self, path: Path) -> str | None:
+        """A file that is not UTF-8, for a language that allows that.
+
+        Single-byte encodings agree on ASCII, which is what names are spelled
+        in, so ``latin-1`` reads them whatever the file's own encoding is. A
+        NUL byte means UTF-16 or UTF-32, whose names it would hide.
+        """
+        if not self._legacy_encodings:
+            return None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        return None if b"\0" in data else data.decode("latin-1")
 
 
 def walk(node: Node) -> Iterator[Node]:
@@ -512,12 +545,14 @@ def _load_profiles() -> None:
         cross_file_csharp,
         cross_file_dart,
         cross_file_dotnet_guest,
+        cross_file_go,
         cross_file_java,
         cross_file_jvm_guest,
         cross_file_kotlin,
         cross_file_php,
         cross_file_php_guest,
         cross_file_python,
+        cross_file_ruby,
         cross_file_swift,
         cross_file_ts,
     )
@@ -615,9 +650,8 @@ def mention_files(
     for source in source_index.files(repo_dir, suffixes, with_ignored=with_ignored):
         if source.resolved in excluded:
             continue
-        try:
-            text = source.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        text = _searchable_text(source.path, names)
+        if text is None:
             # Cannot tell whether it mentions a name, so it counts as a mention
             # and the caller refuses it rather than letting it vanish.
             found.append(source.resolved)
@@ -626,6 +660,23 @@ def mention_files(
         if spells or (also is not None and also.search(text)):
             found.append(source.resolved)
     return found
+
+
+def _searchable_text(path: Path, names: list[str]) -> str | None:
+    """``path``'s text to search for ``names``, or ``None`` when it cannot be
+    told whether it spells one. A file in a legacy encoding (a Latin-1 data
+    fixture) spells an ASCII name as UTF-8 would. A wide encoding does not, and
+    every other character of one is a NUL."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        if b"\0" in data or not all(name.isascii() for name in names):
+            return None
+        return data.decode("utf-8", "replace")
 
 
 def _case_insensitive(path: str) -> bool:
@@ -663,7 +714,17 @@ def resolve(
     flag_key: str,
     key_files: list[str],
     accessors: Iterable[str],
+    *,
+    treatment: bool | None = None,
 ) -> Resolution:
+    """Which files read the declarations ``key_files`` hold, and which
+    declarations may go.
+
+    ``treatment``, when given, lets a reader's mention inside a block that
+    the fold of its own read deletes go with that block (see
+    :func:`without_dead_blocks`). The runner's post-transform check
+    (:func:`still_mentions`) refuses the flag if one survives.
+    """
     _load_profiles()
     profile = _PROFILES.get(language)
     if profile is None:
@@ -810,6 +871,11 @@ def resolve(
                 if source is None:
                     refusals.append(Refusal(path, 1, UNSUPPORTED_FORM, ""))
                     blocked |= {d.path for d in live_constants}
+                elif profile.unparsed_constant_mentions is not None:
+                    found = profile.unparsed_constant_mentions(path, source, tuple(live_constants), repo_dir)
+                    if found:
+                        refusals.extend(found)
+                        blocked |= spelled_in(source, path)
                 elif hit is not None:
                     line = source.count("\n", 0, hit.start()) + 1
                     refusals.append(Refusal(path, line, UNSUPPORTED_FORM, source.split("\n")[line - 1].strip()))
@@ -862,6 +928,20 @@ def resolve(
         if not visible:
             continue
         reads, refused = profile.references(path, source, visible, accessor_set, repo_dir)
+        if refused and treatment is not None:
+            # Judged again without the blocks a fold deletes, and taken only
+            # when that leaves the file a PROVEN reader: `still_mentions`
+            # re-judges every proven reader's rewritten text, which is what
+            # catches a block that was not deleted. A file left with no read
+            # would never be asked again (its condition may read another
+            # constant of the same name), so it keeps its first verdict.
+            judged = without_dead_blocks(path, source, visible, treatment)
+            if judged != source:
+                dead_reads, dead_refused = profile.references(
+                    path, judged, visible, accessor_set, repo_dir
+                )
+                if dead_reads:
+                    reads, refused = dead_reads, dead_refused
         if reads:
             readers[path] = tuple(reads)
         if refused:
@@ -1298,6 +1378,47 @@ def _competing(
             line, text = _line_of(path, needle)
             refusals.append(Refusal(path, line, reason, text, decl.entry))
     return voided
+
+
+#: The grammar each suffix whose dead blocks are predicted is read with.
+_DEAD_BLOCK_GRAMMARS = {".cs": "csharp", ".java": "java"}
+
+
+def without_dead_blocks(
+    path: str, source: str, visible: tuple[KeyDeclaration, ...], treatment: bool
+) -> str:
+    """``source`` with the inside of each block blanked that the fold of a
+    call naming one of ``visible``'s constants deletes, when that call is an
+    ``if``'s whole condition (see :mod:`flag_cleanup.dead_branches`).
+
+    Whether that call is a read the run folds is the profile's to say, asked
+    of the blanked text: a call it refuses refuses the file as before. A
+    mention blanked here is never judged, so it neither keeps the declaration
+    nor drops the reader. That is only safe because :func:`resolve` takes the
+    blanked verdict only for a file it leaves a proven reader, and every
+    proven reader is asked again, unblanked, by :func:`still_mentions`.
+    """
+    from flag_cleanup import dead_branches, syntax
+
+    language = _DEAD_BLOCK_GRAMMARS.get(Path(path).suffix)
+    names = {d.name for d in visible if d.kind == CONSTANT}
+    if language is None or not names or not any(name in source for name in names):
+        return source
+    root = syntax._parse(source, language)
+
+    def is_read(call: Node) -> bool:
+        stack = [call]
+        while stack:
+            node = stack.pop()
+            if node.type == "identifier" and node.text.decode("utf-8", "replace") in names:
+                owner = dead_branches.nearest_call(node, language)
+                if owner is not None and owner.id == call.id:
+                    return True
+            stack.extend(node.children)
+        return False
+
+    blocks = dead_branches.dead_blocks(root, language, treatment, is_read)
+    return dead_branches.blank(source, blocks) if blocks else source
 
 
 def still_mentions(

@@ -30,27 +30,36 @@ def _either(*pairs: tuple[str, str]) -> list[str]:
     return [r"\s*,\s*".join(pair) for pair in pairs]
 
 
+#: One string literal as a message, as the rules allow: anything else could be
+#: the last reader of a local.
+_STRING = r"""(?:"[^"\n]*"|'[^'\n]*')"""
+_MESSAGE = rf"(?:\s*,\s*{_STRING})?"
+#: JUnit 4 and a Kotlin call of it put the message first.
+_LEADING_MESSAGE = rf"(?:{_STRING}\s*,\s*)?"
 #: The literal pairs an equality assertion fails on.
 _UNEQUAL = ((_T, _F), (_F, _T))
 
 _CSHARP = [
-    _call(r"\bAssert\s*\.\s*(?:True|IsTrue|That)", _F),
-    _call(r"\bAssert\s*\.\s*(?:False|IsFalse)", _T),
+    _call(r"\bAssert\s*\.\s*(?:True|IsTrue|That)", _F + _MESSAGE),
+    _call(r"\bAssert\s*\.\s*(?:False|IsFalse)", _T + _MESSAGE),
     *[_call(r"\bAssert\s*\.\s*(?:Equal|AreEqual)", pair) for pair in _either(*_UNEQUAL)],
 ]
 
 _JVM_PREFIX = r"(?<![\w.])(?:(?:Assert|Assertions)\s*\.\s*)?"
 _JVM = [
-    _call(_JVM_PREFIX + "assertTrue", _F),
-    _call(_JVM_PREFIX + "assertFalse", _T),
-    *[_call(_JVM_PREFIX + "assertEquals", pair) for pair in _either(*_UNEQUAL)],
+    _call(_JVM_PREFIX + "assertTrue", _LEADING_MESSAGE + _F + _MESSAGE),
+    _call(_JVM_PREFIX + "assertFalse", _LEADING_MESSAGE + _T + _MESSAGE),
+    *[
+        _call(_JVM_PREFIX + "assertEquals", _LEADING_MESSAGE + pair + _MESSAGE)
+        for pair in _either(*_UNEQUAL)
+    ],
 ]
 
 _TS = [
-    _call(r"(?<![\w.$])assert", _F),
-    _call(r"(?<![\w.$])assert\s*\.\s*ok", _F),
+    _call(r"(?<![\w.$])assert", _F + _MESSAGE),
+    _call(r"(?<![\w.$])assert\s*\.\s*ok", _F + _MESSAGE),
     *[
-        _call(r"(?<![\w.$])assert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual)", pair)
+        _call(r"(?<![\w.$])assert\s*\.\s*(?:equal|strictEqual|deepEqual|deepStrictEqual)", pair + _MESSAGE)
         for pair in _either(*_UNEQUAL)
     ],
     *[
@@ -62,11 +71,88 @@ _TS = [
 ]
 
 _PY_UNEQUAL = (("True", "False"), ("False", "True"))
+_PY_MESSAGE = rf"(?:\s*,\s*(?:msg\s*=\s*)?{_STRING})?"
 _PYTHON = [
     r"^[ \t]*assert[ \t]+False\b",
-    _call(r"\bself\s*\.\s*assertTrue", "False"),
-    _call(r"\bself\s*\.\s*assertFalse", "True"),
-    *[_call(r"\bself\s*\.\s*(?:assertEqual|assertIs)", pair) for pair in _either(*_PY_UNEQUAL)],
+    _call(r"\bself\s*\.\s*assertTrue", "False" + _PY_MESSAGE),
+    _call(r"\bself\s*\.\s*assertFalse", "True" + _PY_MESSAGE),
+    *[
+        _call(r"\bself\s*\.\s*(?:assertEqual|assertIs)", pair + _PY_MESSAGE)
+        for pair in _either(*_PY_UNEQUAL)
+    ],
+]
+
+#: testify, on `assert` or `require`, test handle first; an optional single
+#: string-literal message, as in the rules.
+_GO_PREFIX = r"(?<![\w.])(?:assert|require)\s*\.\s*"
+_GO_MESSAGE = r'(?:\s*,\s*(?:"(?:[^"\\\n]|\\.)*"|`[^`]*`))?'
+_GO = [
+    _call(_GO_PREFIX + "Truef?", r"\w+", _F + _GO_MESSAGE),
+    _call(_GO_PREFIX + "Falsef?", r"\w+", _T + _GO_MESSAGE),
+    *[_call(_GO_PREFIX + "Equalf?", r"\w+", pair + _GO_MESSAGE) for pair in _either(*_UNEQUAL)],
+]
+
+#: RSpec `expect(<literal>).to be|eq(<literal>)`, parenthesised or not, and the
+#: truthy/falsey matchers; minitest's receiverless `assert`/`refute`/`assert_not`/
+#: `assert_equal`. One string literal as a message, as in the rules.
+_RB_BARE = r"(?<![\w.:@$])"
+_RB_END = r"(?=[ \t]*(?:\)|;|#|$))"
+
+
+def _rb_call(callee: str, *args: str) -> str:
+    inner = r"\s*,\s*".join(args) + _MESSAGE
+    return rf"{_RB_BARE}{callee}(?:\s*\(\s*{inner}\s*\)|[ \t]+{inner}{_RB_END})"
+
+
+def _rb_expect(actual: str, matcher: str) -> str:
+    return (
+        rf"{_RB_BARE}expect\s*\(\s*{actual}\s*\)\s*\.\s*to"
+        rf"(?:\s*\(\s*{matcher}\s*\)|[ \t]+{matcher}{_RB_END})"
+    )
+
+
+_RUBY = [
+    *[
+        _rb_expect(actual, rf"(?:be|eq)(?:\s*\(\s*{expected}\s*\)|[ \t]+{expected}\b)")
+        for actual, expected in _UNEQUAL
+    ],
+    _rb_expect(_F, r"be_truthy\b"),
+    _rb_expect(_T, r"be_falsey\b"),
+    _rb_call("assert", _F),
+    _rb_call("refute", _T),
+    _rb_call("assert_not", _T),
+    *[_rb_call("assert_equal", pair) for pair in _either(*_UNEQUAL)],
+]
+
+#: PHPUnit on `$this->`, `self::`, `static::` or `Assert::`, with at most a
+#: string message; PHP's literals are case-insensitive.
+_PHP_PREFIX = r"(?:\$this\s*->|(?<![\w$\\])(?:self|static|Assert)\s*::)\s*"
+_PHP_T, _PHP_F = r"(?i:true)", r"(?i:false)"
+_PHP = [
+    _call(_PHP_PREFIX + "assertTrue", _PHP_F + _MESSAGE),
+    _call(_PHP_PREFIX + "assertFalse", _PHP_T + _MESSAGE),
+    *[
+        _call(_PHP_PREFIX + "(?:assertSame|assertEquals)", pair + _MESSAGE)
+        for pair in _either((_PHP_T, _PHP_F), (_PHP_F, _PHP_T))
+    ],
+]
+
+#: XCTest, called bare, and Swift Testing's `#expect`; at most a string message.
+_SWIFT = [
+    _call(r"(?<![\w.])XCTAssert(?:True)?", _F + _MESSAGE),
+    _call(r"(?<![\w.])XCTAssertFalse", _T + _MESSAGE),
+    *[_call(r"(?<![\w.])XCTAssertEqual", pair + _MESSAGE) for pair in _either(*_UNEQUAL)],
+    _call(r"#expect", _F + _MESSAGE),
+]
+
+#: package:test / flutter_test `expect`, called bare, at most with a `reason:`.
+_DART_EXPECT = r"(?<![\w.$])expect"
+_DART_REASON = rf"(?:\s*,\s*reason\s*:\s*{_STRING})?"
+_DART = [
+    _call(_DART_EXPECT, _F, "isTrue" + _DART_REASON),
+    _call(_DART_EXPECT, _T, "isFalse" + _DART_REASON),
+    *[_call(_DART_EXPECT, pair) for pair in _either(*_UNEQUAL)],
+    *[_call(_DART_EXPECT, actual, _call("equals", expected)) for actual, expected in _UNEQUAL],
 ]
 
 #: Per language, the failing forms of the assertions the rules delete in
@@ -79,6 +165,11 @@ _PATTERNS = {
     "tsx": _TS,
     "js": _TS,
     "python": _PYTHON,
+    "go": _GO,
+    "ruby": _RUBY,
+    "php": _PHP,
+    "swift": _SWIFT,
+    "dart": _DART,
 }
 
 _COMPILED = {

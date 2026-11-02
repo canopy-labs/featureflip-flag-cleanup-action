@@ -65,6 +65,9 @@ _OWNER_TYPES = frozenset(
 )
 #: Every type-like declaration: what can compete with, or shadow, a name.
 _ALL_TYPES = _OWNER_TYPES | {"enum_declaration", "delegate_declaration"}
+
+#: The accessor of an enum read: ``nameof(Flags.X)`` spells the member's name.
+_NAMEOF = "nameof()"
 _NAMESPACES = ("namespace_declaration", "file_scoped_namespace_declaration")
 #: Members whose ``name`` field declares a name inside a type.
 _NAMED_MEMBERS = frozenset(
@@ -190,9 +193,45 @@ def _type_chain(node: Node, *, strict: bool) -> list[str] | None:
     return list(reversed(names)) or None
 
 
+def _enum_entries(path: str, root: Node, flag_key: str) -> list[xk.KeyDeclaration]:
+    """Each member named ``flag_key`` of an enum that is not nested in a type.
+
+    ``nameof(Enum.Member)`` is the only way to get a key out of a C# enum, so
+    the member's name is the key and nothing further needs proving.
+    """
+    found = []
+    for node in _walk(root):
+        if node.type != "enum_declaration" or "file" in _modifiers(node):
+            continue
+        name = node.child_by_field_name("name")
+        body = node.child_by_field_name("body")
+        if (
+            name is None
+            or body is None
+            or any(a.type in _ALL_TYPES for a in _ancestors(node))
+            or not _plain(_text(name))
+        ):
+            continue
+        for member in body.named_children:
+            member_name = member.child_by_field_name("name")
+            if member.type == "enum_member_declaration" and member_name is not None:
+                if _text(member_name) == flag_key:
+                    found.append(
+                        xk.KeyDeclaration(
+                            path,
+                            flag_key,
+                            _text(name),
+                            _namespace_of(node),
+                            kind=xk.ENUM_ENTRY,
+                            accessors=frozenset({_NAMEOF}),
+                        )
+                    )
+    return found
+
+
 def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaration]:
     root = syntax._parse(source, "csharp")
-    found: list[xk.KeyDeclaration] = []
+    found: list[xk.KeyDeclaration] = _enum_entries(path, root, flag_key)
     for const in key_const.key_consts(root, source.encode("utf-8"), "csharp", flag_key):
         if not key_const_visibility.visible_key_consts([const], "csharp"):
             continue  # private or local: no other file can name it
@@ -560,18 +599,34 @@ class _Index:
 
     def reaches(self, names: Iterable[str], owner_last: str) -> bool:
         """Whether a type of one of these simple names may be, or extend, the
-        type whose simple name is ``owner_last``. Fails closed when incomplete."""
+        type whose simple name is ``owner_last``. Fails closed at a name a file
+        not seen whole may declare."""
         pending = list(names)
-        if pending and self.incomplete:
-            return True
         seen: set[str] = set()
         while pending:
             name = pending.pop()
-            if name == owner_last:
+            if name == owner_last or self.spelled_where_unparsed(name):
                 return True
             if name in seen:
                 continue
             seen.add(name)
+            for info in self.by_last.get(name, ()):
+                pending.extend(info.supertypes)
+        return False
+
+    def chain_may_be_unparsed(self, names: Iterable[str]) -> bool:
+        """Whether a file not seen whole may declare a type up the supertype
+        chains of ``names``. It would have to spell one, so a file that spells
+        none cannot be on the chain, whatever it holds."""
+        pending = list(names)
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            if self.spelled_where_unparsed(name):
+                return True
             for info in self.by_last.get(name, ()):
                 pending.extend(info.supertypes)
         return False
@@ -620,7 +675,7 @@ def _combine(shares: list[tuple[str, _Share]], incomplete: bool, unreadable: boo
 
 
 #: Every C# type in a checkout.
-csharp_index = xk.CheckoutIndex("C#", (".cs",), _share, _combine)
+csharp_index = xk.CheckoutIndex("C#", (".cs",), _share, _combine, legacy_encodings=True)
 
 
 # --- project <Using> items ----------------------------------------------------
@@ -855,9 +910,31 @@ def _canonical(expression: Node) -> list[str] | None:
     return parts
 
 
+def _nameof_of(access: Node) -> Node | None:
+    """The ``nameof(...)`` call ``access`` is the whole argument of."""
+    argument = access.parent
+    arguments = argument.parent if argument is not None else None
+    invocation = arguments.parent if arguments is not None else None
+    if argument is None or argument.type != "argument" or invocation is None:
+        return None
+    function = invocation.child_by_field_name("function")
+    if (
+        invocation.type != "invocation_expression"
+        or function is None
+        or function.type != "identifier"
+        or _text(function) != "nameof"
+        or len(arguments.named_children) != 1
+    ):
+        return None
+    return invocation
+
+
 def _read_call(value: Node, accessors: frozenset[str]) -> bool:
-    """Whether ``value`` is the first argument of a read the reader rules fold."""
+    """Whether ``value`` is the first argument of a read the reader rules fold,
+    or the key of an attribute gate, which :mod:`.csharp_gates` removes."""
     argument = value.parent
+    if argument is not None and argument.type == "attribute_argument":
+        return key_const._csharp_is_gate_argument(argument, accessors)
     if argument is None or argument.type != "argument" or not argument.named_children:
         return False
     if argument.named_children[-1].id != value.id:
@@ -937,7 +1014,7 @@ class _Reader:
         self.supertypes = supertypes
         self.part_members = frozenset(part_members)
         self.inherited = self.index.inherited_members(supertypes)
-        self.inherits_unknown = (bool(supertypes) and self.index.incomplete) or unknown_part
+        self.inherits_unknown = self.index.chain_may_be_unparsed(supertypes) or unknown_part
         self._identifiers: dict[str, list[Node]] = {}
         for node in _walk(root):
             if node.type in ("identifier", "implicit_parameter"):
@@ -1109,6 +1186,9 @@ def _judge(
         namespace, head = resolved
         path = (namespace, ".".join([head, *parts[1:]]))
         if path == target:
+            nameof = _nameof_of(parent)
+            if decl.kind == xk.ENUM_ENTRY and nameof is not None and _read_call(nameof, accessors):
+                return xk.KeyReference("", ".".join(parts), decl.name, _NAMEOF, decl)
             if not _read_call(parent, accessors):
                 return xk.NOT_A_READ
             return xk.KeyReference("", ".".join(parts), decl.name)
@@ -1153,6 +1233,8 @@ def _judge(
     )
     if rebound:
         return xk.REBOUND
+    if decl.kind == xk.ENUM_ENTRY:
+        return xk.UNSUPPORTED_FORM
     if not _read_call(node, accessors):
         return xk.NOT_A_READ
     return xk.KeyReference("", None, decl.name)
@@ -1171,7 +1253,7 @@ def references(
     reads: list[xk.KeyReference] = []
     refused: list[xk.Refusal] = []
     for decl in declarations:
-        if decl.kind != xk.CONSTANT or decl.owner is None:
+        if decl.owner is None:
             continue
         chain = decl.owner.split(".")
         # Skipped mentions in read position, by the text a clone would match.
@@ -1188,7 +1270,7 @@ def references(
                     skipped.append((node, _text(access)))
                 continue
             if isinstance(verdict, xk.KeyReference):
-                reads.append(xk.KeyReference(path, verdict.owner, verdict.member))
+                reads.append(replace(verdict, path=path))
                 proven.add(_text(access))
             else:
                 refused.append(xk.refusal(path, node, verdict, source))
@@ -1206,6 +1288,28 @@ def references(
     if refused:
         return [], refused
     return reads, refused
+
+
+def enum_dynamic_uses(
+    path: str, source: str, entries: tuple[xk.KeyDeclaration, ...], repo_dir: str
+) -> list[xk.Refusal]:
+    """``typeof(Flags)``, ``Enum.GetNames<Flags>()``: a use of the whole enum
+    that can reach an entry without naming it."""
+    owners = {entry.owner for entry in entries}
+    found = []
+    for node in _walk(syntax._parse(source, "csharp")):
+        if node.type == "typeof_expression":
+            spelled = node.child_by_field_name("type")
+        elif node.type == "type_argument_list" and node.parent is not None and node.parent.type == "generic_name":
+            spelled = node.named_children[0] if len(node.named_children) == 1 else None
+            access = node.parent.parent
+            if access is None or access.type != "member_access_expression" or not _text(access).startswith("Enum."):
+                continue
+        else:
+            continue
+        if spelled is not None and _text(spelled).rsplit(".", 1)[-1] in owners:
+            found.append(xk.refusal(path, node, xk.ENUM_DYNAMIC, source))
+    return found
 
 
 # --- the owner taken whole ----------------------------------------------------
@@ -1452,5 +1556,6 @@ xk.register(
         # reflection reaches every constant without spelling one.
         constant_escapes=constant_escapes,
         constant_module_pattern=constant_module_pattern,
+        enum_dynamic_uses=enum_dynamic_uses,
     ),
 )

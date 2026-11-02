@@ -1,0 +1,57 @@
+# Reader rules for a Ruby flag key held in a constant declared in ANOTHER file.
+#
+# Never run as written. `rule_synthesis.cross_file_key_rules` clones each
+# block once per proven reference, replacing __XCONST_OWNER__ and
+# __XCONST_MEMBER__ with the exact text at the read. A block marked
+# `# xconst: qualified` is used for `Owner::NAME` -- the owner as written
+# (`Flags`, `App::Flags`, `::App::Flags`) -- and `# xconst: bare` for a bare
+# `NAME` read inside the owner reopened, or of a top-level constant.
+#
+# The owner is matched by its WHOLE TEXT. The proof accepts only an owner
+# spelled as constants joined by `::`, so the text names nothing else.
+#
+# The receiver arms are `ruby.toml`'s seed rule's, for the same reasons: the
+# `"."` excludes safe navigation (`client&.bool_variation(...)`), whose `nil`
+# the fold would replace, and the leading `.` of the receiverless arm stops it
+# letting `&.` back in. The constant is the argument list's FIRST child, as
+# the proof requires.
+#
+# `holes` deliberately omits `stale_flag_name`. The engine skips every file
+# whose text lacks a seed rule's hole values, and a reader never contains the
+# key -- that is the whole reason it needs these rules. Which reads are this
+# flag's was proven before the engine ran.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_bool_variation_read"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list
+       . (scope_resolution scope: (_) @key_owner name: (constant) @key_member)))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list
+       . (scope_resolution scope: (_) @key_owner name: (constant) @key_member)))] @call
+  (#eq? @sdk_fn "bool_variation")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_bool_variation_read"
+query = """(
+  [(call receiver: (_) "." method: (identifier) @sdk_fn
+     arguments: (argument_list . (constant) @key_member))
+   (call . method: (identifier) @sdk_fn
+     arguments: (argument_list . (constant) @key_member))] @call
+  (#eq? @sdk_fn "bool_variation")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]

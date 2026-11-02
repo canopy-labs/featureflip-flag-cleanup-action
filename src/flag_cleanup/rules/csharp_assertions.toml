@@ -12,6 +12,11 @@
 # wrote as a "reached here" marker stays. The assertion APIs are policy, listed
 # here per test framework (xUnit, NUnit, MSTest); an assertion folded to the
 # FAILING literal (`Assert.True(false)`) is never matched, and is reported.
+# A trivial assertion that is the whole body of an `if` or a loop stays. Deleting
+# it would hand that body to the next statement, which parses and silently runs
+# conditionally. `not_enclosing_node` asks of every ancestor, so an assertion
+# nested deeper under such a body stays too, which is the safe direction.
+
 [[rules]]
 name = "delete_trivially_true_assertion"
 query = """(
@@ -20,7 +25,10 @@ query = """(
       function: (member_access_expression
         expression: (identifier) @assert_class
         name: (identifier) @assert_method)
-      arguments: (argument_list . (argument (boolean_literal) @asserted) .))) @statement
+      arguments: [
+        (argument_list . (argument (boolean_literal) @asserted) .)
+        (argument_list . (argument (boolean_literal) @asserted) . (argument [(string_literal) (verbatim_string_literal)]) .)
+      ])) @statement
   (#eq? @assert_class "Assert")
   (#match? @assert_method "^(True|IsTrue|That)$")
   (#eq? @asserted "true")
@@ -30,6 +38,20 @@ replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
 
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
+
 [[rules]]
 name = "delete_trivially_false_assertion"
 query = """(
@@ -38,7 +60,10 @@ query = """(
       function: (member_access_expression
         expression: (identifier) @assert_class
         name: (identifier) @assert_method)
-      arguments: (argument_list . (argument (boolean_literal) @asserted) .))) @statement
+      arguments: [
+        (argument_list . (argument (boolean_literal) @asserted) .)
+        (argument_list . (argument (boolean_literal) @asserted) . (argument [(string_literal) (verbatim_string_literal)]) .)
+      ])) @statement
   (#eq? @assert_class "Assert")
   (#match? @assert_method "^(False|IsFalse)$")
   (#eq? @asserted "false")
@@ -47,6 +72,20 @@ replace_node = "statement"
 replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""
 
 [[rules]]
 name = "delete_trivially_equal_assertion"
@@ -70,3 +109,17 @@ replace_node = "statement"
 replace = ""
 groups = ["trivial_assertion"]
 is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (foreach_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+  (using_statement body: (expression_statement))
+  (lock_statement (expression_statement))
+  (fixed_statement (expression_statement))
+  (labeled_statement (expression_statement))
+] @braceless"""

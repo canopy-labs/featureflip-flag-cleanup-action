@@ -33,7 +33,8 @@ query = """(
   (expression_statement
     (call_expression
       function: (identifier) @assert_fn
-      arguments: (arguments . (true) .))) @statement
+      arguments: [(arguments . (true) .) (arguments . (true) . (string) .)]))
+    @statement
   (#eq? @assert_fn "assert")
 )"""
 replace_node = "statement"
@@ -49,7 +50,8 @@ query = """(
       function: (member_expression
         object: (identifier) @assert_object
         property: (property_identifier) @assert_method)
-      arguments: (arguments . (true) .))) @statement
+      arguments: [(arguments . (true) .) (arguments . (true) . (string) .)]))
+    @statement
   (#eq? @assert_object "assert")
   (#eq? @assert_method "ok")
 )"""
@@ -66,7 +68,10 @@ query = """(
       function: (member_expression
         object: (identifier) @assert_object
         property: (property_identifier) @assert_method)
-      arguments: (arguments . [(true) (false)] @actual . [(true) (false)] @expected .))) @statement
+      arguments: [
+        (arguments . [(true) (false)] @actual . [(true) (false)] @expected .)
+        (arguments . [(true) (false)] @actual . [(true) (false)] @expected . (string) .)
+      ])) @statement
   (#eq? @assert_object "assert")
   (#match? @assert_method "^(equal|strictEqual|deepEqual|deepStrictEqual)$")
   (#eq? @actual @expected)

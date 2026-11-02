@@ -1,0 +1,136 @@
+# Assertions the fold made trivially true, for dart. Appended to the rules
+# whenever `dart_edges.toml` is the edges file (the only file whose edges
+# reach these rules, which are never seeds), so the rules and the edges always
+# travel together. Kept out of `dart.toml`, which holds seed rules only.
+
+# --- an assertion the fold made trivially true -> the statement is deleted
+#
+# `expect(client.boolVariation('k', defaultValue: false), isTrue);` in a test
+# folds to `expect(true, isTrue);`: a check the removal made meaningless.
+# Reached ONLY from the fold's own literal (dart_edges.toml, Parent scope from
+# the groups that write one), never as a seed, so an `expect(true, isTrue);`
+# the customer wrote stays. The assertion APIs are policy: package:test's (and
+# flutter_test's) bare `expect` with `isTrue`, `isFalse`, a literal, or
+# `equals(<literal>)` as the matcher, and no named argument. An assertion
+# folded to the FAILING literal (`expect(false, isTrue)`) is never matched; the
+# Action reports it. The failing forms are listed again, as text, in the
+# Action's failing-assertion check: the two lists are kept in step by hand.
+#
+# The engine's Dart grammar has no `argument` wrapper, so literal ->
+# `arguments` -> call -> `expression_statement` is the walk's four nodes. A
+# literal inside `equals(...)` is two nodes deeper, so the match-only
+# `trivial_equals_matcher` matches `equals(<literal>)` from the literal, writes
+# nothing, and its own edge walks on to the statement.
+# A trivial assertion that is the whole body of an `if` or a loop stays. Deleting
+# it would hand that body to the next statement, which parses and silently runs
+# conditionally. `not_enclosing_node` asks of every ancestor, so an assertion
+# nested deeper under such a body stays too, which is the safe direction.
+
+[[rules]]
+name = "trivial_equals_matcher"
+query = """(
+  (call_expression
+    function: (identifier) @matcher_fn
+    arguments: (arguments . [(true) (false)] .)) @matcher_call
+  (#eq? @matcher_fn "equals")
+)"""
+groups = ["trivial_equals_matcher"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_true_assertion"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @expect_fn
+      arguments: [
+        (arguments . (true) . (identifier) @matcher .)
+        (arguments . (true) . (identifier) @matcher . (named_argument (label) (string_literal)) .)
+      ])) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @matcher "isTrue")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_false_assertion"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @expect_fn
+      arguments: [
+        (arguments . (false) . (identifier) @matcher .)
+        (arguments . (false) . (identifier) @matcher . (named_argument (label) (string_literal)) .)
+      ])) @statement
+  (#eq? @expect_fn "expect")
+  (#eq? @matcher "isFalse")
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""
+
+[[rules]]
+name = "delete_trivially_equal_assertion"
+query = """(
+  (expression_statement
+    (call_expression
+      function: (identifier) @expect_fn
+      arguments: (arguments
+        .
+        [(true) (false)] @actual
+        .
+        [
+          ([(true) (false)] @expected)
+          (call_expression
+            function: (identifier) @matcher_fn
+            arguments: (arguments . [(true) (false)] @expected .))
+        ]
+        .))) @statement
+  (#eq? @expect_fn "expect")
+  (#match? @matcher_fn "^equals$")
+  (#eq? @actual @expected)
+)"""
+replace_node = "statement"
+replace = ""
+groups = ["trivial_assertion"]
+is_seed_rule = false
+
+[[rules.filters]]
+not_enclosing_node = """[
+  (if_statement consequence: (expression_statement))
+  (if_statement alternative: (expression_statement))
+  (while_statement body: (expression_statement))
+  (for_statement body: (expression_statement))
+  (do_statement body: (expression_statement))
+] @braceless"""

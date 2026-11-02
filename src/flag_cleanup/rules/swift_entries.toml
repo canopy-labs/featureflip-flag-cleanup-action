@@ -1,0 +1,350 @@
+# Flag-keyed ENTRIES — the residue a read-anchored rule cannot see: the
+# registry pair (`"k": false,`), a test's override entry
+# (`FeatureflipClient.forTesting(["k": true])`), a plain flag -> value
+# dictionary keyed the same way.
+# Design notes: CLAUDE.md, "Flag-keyed entries are RULES, not a Python pass".
+#
+# Holes: @stale_flag_name (the flag key) and @known_flag_keys — the project's
+# OTHER flag keys, rendered by `piranha_runner.render_known_flag_keys` as
+# space-separated quoted literals for `#any-of?`. Empty when the list could
+# not be fetched, which makes the registry prong match nothing.
+#
+# `#any-of?` is banned in every other rule file (see swift.toml). It is
+# allowed here because the alternatives are runtime data;
+# `test_entry_rules_use_any_of_only_against_the_hole` keeps it to exactly this
+# one use.
+#
+# Two prongs per shape. Both may match the same entry; the engine applies one,
+# re-parses, and the other no longer matches. No edges: a deleted entry
+# cascades to nothing. Every name carries `delete_flag_keyed_`, which is how
+# `piranha_runner._flag_keyed_entries` reports them.
+#
+# NEITHER PRONG DELETES AN ENTRY WHOSE VALUE IS THE BRANCH BEING REMOVED.
+# `@treated` is the literal this run keeps; `@untreated` is its complement,
+# and an entry spelled `k: @untreated` is the customer pinning the flag to the
+# branch the fold is deleting — evidence that the code around it is about to
+# become dead, not evidence the entry is stale. So the STUB prong requires
+# `(#eq? @value "@treated")` and the REGISTRY prong carries `(#not-eq? @value
+# "@untreated")`, negatively on purpose: a registry value need not be a
+# boolean at all. `contradicting.py` reports what both decline.
+#
+# THE ENTRY IS NOT A NODE. A dictionary literal holds its keys and values as
+# alternating siblings under `key:` and `value:` fields, with no pair node, so
+# these rules rewrite a SPAN (`replace_node` .. `replace_node_end`), and a
+# spanned match collects no associated comma. Each position therefore carries
+# its own separator:
+#
+#   * after another pair: the span runs from the comma BEFORE the key to the
+#     value, so `, "k": true` goes; a trailing comma after it stays where it
+#     was, after the previous pair;
+#   * first of several: the span runs from the key to the NEXT key and is
+#     rewritten as that key — the only way to take the whitespace after the
+#     comma with it, since no node owns that whitespace;
+#   * a comment line directly above the pair puts a named node between the
+#     comma (or the bracket) and the key, so the `_after_comment` variants
+#     take ONE such comment and delete it with the pair it describes; more
+#     than one leaves the pair alone;
+#   * sole: the span runs bracket to bracket and becomes `[:]`. NOT `[]`:
+#     that is an empty ARRAY literal and does not type as a dictionary. A
+#     trailing comma goes with it. See below for WHERE a sole pair may go.
+#
+# The `key:` field is what makes the key a key. The other languages anchor on
+# a pair node; here a string VALUE equal to the flag key sits under `value:`
+# and is never compared. Keys are matched whole:
+# `(line_string_literal . (line_str_text) @flag_name .)` declines a literal an
+# interpolation or an escape splits.
+#
+# A SOLE PAIR IS DELETED ONLY WHERE THE CONTEXT FIXES THE DICTIONARY'S TYPE.
+# `[:]` has no type of its own; `["k": true]` does. Measured with
+# `swiftc -typecheck` (Swift 6.0), `[:]` fails with "empty collection literal
+# requires an explicit type" as the initializer of an UNANNOTATED `let`/`var`
+# (global, local or member), and as the argument of a call whose overloads
+# differ only in their dictionary type — both places where the literal's own
+# type was doing the choosing. So the sole rules are enumerated POSITIVELY,
+# two per prong:
+#
+#   * `_typed_declaration`: the value of a declaration whose binding carries a
+#     type annotation (`let d: [String: Bool] = …`; `[String: Any]?` and `Any`
+#     measured too). The `.` between the `type_annotation` and `value:` is what
+#     keeps `let a: T = […], b = […]` from lending `a`'s annotation to `b`;
+#   * `_for_testing_argument`: the first, unlabelled argument of
+#     `FeatureflipClient.forTesting(…)`, whose parameter is `[String: Any]`.
+#
+# Any other sole pair is left in place and reported like any other kept
+# entry. A general call argument is NOT on the list even though most measured
+# fine (`Any`, generic, `print`): the overload case above is one no query can
+# see.
+#
+# No `?` quantifier anywhere in this file: in tree-sitter it lets an optional
+# child match NOTHING, and in a deletion rule that widens what is deleted.
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after"
+query = '''(
+  (dictionary_literal
+    "," @lead
+    . key: (line_string_literal . (line_str_text) @flag_name .)
+    . value: (boolean_literal) @value)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_after_comment"
+query = '''(
+  (dictionary_literal
+    "," @lead
+    . [(comment) (multiline_comment)]
+    . key: (line_string_literal . (line_str_text) @flag_name .)
+    . value: (boolean_literal) @value)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first"
+query = '''(
+  (dictionary_literal
+    . key: (line_string_literal . (line_str_text) @flag_name .) @flag_key
+    . value: (boolean_literal) @value
+    . key: (_) @next)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "flag_key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_first_after_comment"
+query = '''(
+  (dictionary_literal
+    . [(comment) (multiline_comment)] @leading_comment
+    . key: (line_string_literal . (line_str_text) @flag_name .)
+    . value: (boolean_literal) @value
+    . key: (_) @next)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_sole_typed_declaration"
+query = '''(
+  (property_declaration
+    (type_annotation)
+    . value: (dictionary_literal
+      "[" @open
+      . key: (line_string_literal . (line_str_text) @flag_name .)
+      . value: (boolean_literal) @value .
+      "]" @close))
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "open"
+replace_node_end = "close"
+replace = "[:]"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_boolean_pair_sole_for_testing_argument"
+query = '''(
+  (call_expression
+    (navigation_expression
+      target: (simple_identifier) @client
+      suffix: (navigation_suffix suffix: (simple_identifier) @callee))
+    (call_suffix
+      (value_arguments
+        . (value_argument
+            . value: (dictionary_literal
+              "[" @open
+              . key: (line_string_literal . (line_str_text) @flag_name .)
+              . value: (boolean_literal) @value .
+              "]" @close)))))
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @value "@treated")
+)'''
+replace_node = "open"
+replace_node_end = "close"
+replace = "[:]"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "treated"]
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after"
+query = '''(
+  (dictionary_literal
+    "," @lead
+    . key: (line_string_literal . (line_str_text) @flag_name .)
+    . value: (_) @value)
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary_literal) @registry"
+contains = '''(
+  (dictionary_literal key: (line_string_literal . (line_str_text) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_after_comment"
+query = '''(
+  (dictionary_literal
+    "," @lead
+    . [(comment) (multiline_comment)]
+    . key: (line_string_literal . (line_str_text) @flag_name .)
+    . value: (_) @value)
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "lead"
+replace_node_end = "value"
+replace = ""
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary_literal) @registry"
+contains = '''(
+  (dictionary_literal key: (line_string_literal . (line_str_text) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first"
+query = '''(
+  (dictionary_literal
+    . key: (line_string_literal . (line_str_text) @flag_name .) @flag_key
+    . value: (_) @value
+    . key: (_) @next)
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "flag_key"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary_literal) @registry"
+contains = '''(
+  (dictionary_literal key: (line_string_literal . (line_str_text) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_first_after_comment"
+query = '''(
+  (dictionary_literal
+    . [(comment) (multiline_comment)] @leading_comment
+    . key: (line_string_literal . (line_str_text) @flag_name .)
+    . value: (_) @value
+    . key: (_) @next)
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "leading_comment"
+replace_node_end = "next"
+replace = "@next"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary_literal) @registry"
+contains = '''(
+  (dictionary_literal key: (line_string_literal . (line_str_text) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_sole_typed_declaration"
+query = '''(
+  (property_declaration
+    (type_annotation)
+    . value: (dictionary_literal
+      "[" @open
+      . key: (line_string_literal . (line_str_text) @flag_name .)
+      . value: (_) @value .
+      "]" @close))
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "open"
+replace_node_end = "close"
+replace = "[:]"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary_literal) @registry"
+contains = '''(
+  (dictionary_literal key: (line_string_literal . (line_str_text) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+
+[[rules]]
+name = "delete_flag_keyed_registry_pair_sole_for_testing_argument"
+query = '''(
+  (call_expression
+    (navigation_expression
+      target: (simple_identifier) @client
+      suffix: (navigation_suffix suffix: (simple_identifier) @callee))
+    (call_suffix
+      (value_arguments
+        . (value_argument
+            . value: (dictionary_literal
+              "[" @open
+              . key: (line_string_literal . (line_str_text) @flag_name .)
+              . value: (_) @value .
+              "]" @close)))))
+  (#eq? @client "FeatureflipClient")
+  (#eq? @callee "forTesting")
+  (#eq? @flag_name "@stale_flag_name")
+  (#not-eq? @value "@untreated")
+)'''
+replace_node = "open"
+replace_node_end = "close"
+replace = "[:]"
+groups = ["delete_flag_keyed_entry"]
+holes = ["stale_flag_name", "known_flag_keys", "untreated"]
+
+[[rules.filters]]
+enclosing_node = "(dictionary_literal) @registry"
+contains = '''(
+  (dictionary_literal key: (line_string_literal . (line_str_text) @sibling .))
+  (#any-of? @sibling @known_flag_keys)
+)'''
+at_least = 1
+

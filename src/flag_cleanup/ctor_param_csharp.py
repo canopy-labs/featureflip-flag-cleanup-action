@@ -30,6 +30,7 @@ project does not reach the type's cannot be given it as a target, and a
 
 from __future__ import annotations
 
+import itertools
 import re
 import unicodedata
 from collections.abc import Callable, Iterator
@@ -132,14 +133,14 @@ def _literal_for_an_interface(arguments: Node, interfaces: dict[int, str]) -> st
     literal (:data:`_LITERALS`, a negated number among them) where the
     constructor takes a type no literal converts to (``interfaces``, by
     position; see :func:`_interface_positions`): then it cannot be calling
-    that constructor. Never with a named argument, whose position this does
-    not follow.
+    that constructor. Only the arguments before the first named one are read:
+    those always bind by position, and a named one's position is not followed.
 
     ``None`` when no position rules it out; ``""`` when one does by the
     checkout's own declarations; otherwise the framework type name the proof
     took as the framework's, which the caller still checks no alias defines."""
-    items = _items(arguments)
-    if not interfaces or any(i.child_by_field_name("name") is not None for i in items):
+    items = list(itertools.takewhile(lambda i: i.child_by_field_name("name") is None, _items(arguments)))
+    if not interfaces:
         return None
     assumed: str | None = None
     for position, kind in sorted(interfaces.items()):

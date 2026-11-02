@@ -17,6 +17,10 @@ caveat:
 * a file that names the key only as a URL PATH SEGMENT in a string
   (``/environments/${id}/scheduled-changes``): an endpoint named after the
   feature, which is common and is no flag read, so it is listed apart;
+* a file that names the key only as a SEGMENT OF A PACKAGE, NAMESPACE OR
+  IMPORT PATH (``package com.example.qos``, ``import com.example.qos.Policy``,
+  ``namespace App\\qos;``): code organised under a package named after the
+  feature, which no flag read can be, so it is listed apart;
 * a TypeScript-family file that names it only as a STRING VALUE IN A
   LITERAL, an element of an array that also holds something computed
   (``['scheduled-changes', orgId] as const``, a query cache key): a value
@@ -40,7 +44,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_ts, mock_stubs, syntax, ts_tests, unused
+from flag_cleanup import cross_file_ts, mock_stubs, rule_synthesis, syntax, ts_tests, unused
 
 #: Extension to the grammar this module parses it with. ERB is absent: its
 #: Ruby lives inside a template, and a comment verdict there would need the
@@ -93,6 +97,9 @@ class Residue:
     #: (a query cache key), and the rest comments or test titles; see
     #: :func:`_literal_only`.
     literal_only: tuple[str, ...] = ()
+    #: Files every mention of the flag in which outside comments is a segment
+    #: of a package, namespace or import path; see :func:`_namespace_only`.
+    namespace_only: tuple[str, ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
@@ -208,6 +215,135 @@ def _path_only(root: Node, source: str, mention: re.Pattern[str], language: str)
                 return False
             in_paths += 1
     return in_paths > 0
+
+
+#: Per language: the declarations that NAME the file's own package or
+#: namespace, where the key may be any segment, the last one included.
+_OWN_NAMESPACE = {
+    "java": frozenset({"package_declaration"}),
+    "kt": frozenset({"package_header"}),
+    "csharp": frozenset({"namespace_declaration", "file_scoped_namespace_declaration"}),
+    "go": frozenset({"package_clause"}),
+    "php": frozenset({"namespace_definition"}),
+}
+#: Per language: the declarations that IMPORT something by a path. The
+#: imported name itself (the last segment) can be a constant named like the
+#: key, so there the key must be followed by a separator: a package or a type
+#: that holds what is imported. Python's are judged on their own; see
+#: :func:`_python_module_path`.
+_IMPORT = {
+    "java": frozenset({"import_declaration"}),
+    "kt": frozenset({"import", "import_header"}),
+    "csharp": frozenset({"using_directive"}),
+    "php": frozenset({"namespace_use_declaration"}),
+    "python": frozenset({"import_statement", "import_from_statement"}),
+}
+#: Nodes a path's segment may sit in between it and its declaration. Anything
+#: else on the way (a body, a string, an alias) is not the declared path.
+_PATH_NODES = frozenset({
+    "scoped_identifier",
+    "qualified_identifier",
+    "qualified_name",
+    "dotted_name",
+    "namespace_name",
+    "relative_import",
+    "aliased_import",
+    "namespace_use_clause",
+    "namespace_use_group",
+    "namespace_use_group_clause",
+})
+#: What separates a path's segments: ``.``, and PHP's ``\``.
+_SEPARATORS = frozenset(b".\\")
+
+
+def _scan_mention(flag_key: str) -> re.Pattern[str]:
+    """The key as the residual scan finds it: whole, but with a ``.`` allowed
+    on either side, which :func:`_mention` excludes."""
+    return re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])")
+
+
+def _python_module_path(leaf: Node, declaration: Node) -> bool:
+    """Whether ``leaf`` is a segment of a MODULE path in a Python import:
+    anywhere in ``import a.b`` (but not its alias), or in the module of
+    ``from a.b import c`` (but not in what it imports, which may be a
+    constant)."""
+    dotted = leaf.parent
+    if dotted is None or dotted.type != "dotted_name":
+        return False
+    if declaration.type == "import_statement":
+        return True
+    module = declaration.child_by_field_name("module_name")
+    return module is not None and module.start_byte <= leaf.start_byte < module.end_byte
+
+
+def _go_import_segment(leaf: Node, flag_key: str) -> bool:
+    """Whether ``leaf``, a Go import path's content, names the key only as
+    whole segments after the first: ``"example.com/qos/sub"``, never ``"qos"``
+    (a module named like the key) or ``"example.com/qos-v2"``."""
+    spec = leaf.parent.parent if leaf.parent is not None else None
+    if leaf.type != "interpreted_string_literal_content" or spec is None or spec.type != "import_spec":
+        return False
+    first, *rest = leaf.text.decode("utf-8", "replace").split("/")
+    scan = _scan_mention(flag_key)
+    return (
+        not scan.search(first)
+        and flag_key in rest
+        and all(segment == flag_key or not scan.search(segment) for segment in rest)
+    )
+
+
+def _namespace_segment(leaf: Node, data: bytes, flag_key: str, language: str) -> bool:
+    """Whether ``leaf`` is the key as one segment of the path a package,
+    namespace or import declaration names."""
+    if language == "go" and "str" in leaf.type:
+        return _go_import_segment(leaf, flag_key)
+    if leaf.text.decode("utf-8", "replace") != flag_key:
+        return False
+    own = _OWN_NAMESPACE.get(language, frozenset())
+    imports = _IMPORT.get(language, frozenset())
+    current = leaf.parent
+    while current is not None and current.type in _PATH_NODES:
+        current = current.parent
+    if current is None:
+        return False
+    if current.type in own:
+        return True
+    if current.type not in imports:
+        return False
+    if language == "python":
+        return _python_module_path(leaf, current)
+    return leaf.end_byte < len(data) and data[leaf.end_byte] in _SEPARATORS
+
+
+def _namespace_only(root: Node, source: str, flag_key: str, language: str) -> bool:
+    """Whether every mention of the key outside comments is one segment of a
+    package, namespace or import path, with one such mention found.
+
+    Judged with the residual scan's own match (:func:`_scan_mention`), so a
+    dotted mention anywhere else, ``"pollers.qos"`` or ``qos.enabled``,
+    keeps the file in the generic caveat: a string may hold a key, and code
+    may read one through a property named after it. Only the declaration's
+    PATH counts, never a body it encloses (a C# block namespace) or an alias
+    it introduces."""
+    if language not in _OWN_NAMESPACE and language not in _IMPORT:
+        return False
+    data = source.encode("utf-8")
+    scan = _scan_mention(flag_key)
+    found = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if "comment" in node.type:
+            continue
+        if node.child_count:
+            stack.extend(node.children)
+            continue
+        if not scan.search(node.text.decode("utf-8", "replace")):
+            continue
+        if not _namespace_segment(node, data, flag_key, language):
+            return False
+        found += 1
+    return found > 0
 
 
 def _literal_only(root: Node, source: str, mention: re.Pattern[str], language: str) -> bool:
@@ -398,6 +534,7 @@ def classify(
     comment_lines: list[tuple[str, int, str]] = []
     path_only: list[str] = []
     literal_only: list[str] = []
+    namespace_only: list[str] = []
     for path in paths:
         language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
         if language is None:
@@ -408,7 +545,9 @@ def classify(
         except (OSError, UnicodeDecodeError):
             continue
         if language == "csharp":
-            described = mock_stubs.mock_descriptions(source, flag_key, accessors)
+            described = mock_stubs.mock_descriptions(
+                source, flag_key, rule_synthesis.accessors_for(language, accessors)
+            )
             if described:
                 stubbed.extend((path, text) for text in described)
                 continue
@@ -426,6 +565,9 @@ def classify(
         if _literal_only(root, source, mention, language):
             literal_only.append(path)
             continue
+        if _namespace_only(root, source, flag_key, language):
+            namespace_only.append(path)
+            continue
         held = _enum_held(root, mention, language)
         if held is not None:
             enum_held.append((path, held))
@@ -437,6 +579,7 @@ def classify(
         tuple(comment_lines),
         tuple(path_only),
         literal_only=tuple(literal_only),
+        namespace_only=tuple(namespace_only),
     )
 
 
