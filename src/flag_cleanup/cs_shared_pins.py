@@ -366,6 +366,161 @@ def _receiver_word(
     return None
 
 
+#: Type nodes a type's name may sit inside on its way to its position.
+_TYPE_WRAPPERS = frozenset({"generic_name", "nullable_type", "array_type", "pointer_type", "ref_type", "scoped_type"})
+#: Fields of a parent that hold a type (``right`` only under ``as``/``is``).
+_TYPE_FIELDS = ("type", "returns")
+#: Parents whose every child is a type.
+_TYPE_LISTS = frozenset({"type_argument_list", "base_list", "type_parameter_constraint", "primary_constructor_base_type"})
+
+
+def _in_type_position(node: Node) -> bool:
+    """Whether the identifier ``node`` is a type's name where only a type can
+    stand: a declaration's type, a creation's, a cast's, an ``as``/``is``
+    operand, a type argument, a base or a constraint. A type there creates
+    no value named like it, so it cannot take ``Owner.M(…)``."""
+    current = node
+    parent = current.parent
+    while parent is not None and (
+        parent.type in _TYPE_WRAPPERS or (parent.type == "qualified_name" and parent.child_by_field_name("name") == current)
+    ):
+        current, parent = parent, parent.parent
+    if parent is None:
+        return False
+    if parent.type in _TYPE_LISTS:
+        return True
+    if any(parent.child_by_field_name(f) == current for f in _TYPE_FIELDS):
+        return True
+    if parent.type in ("as_expression", "is_expression") and parent.child_by_field_name("right") == current:
+        return True
+    return parent.type in ("type_pattern", "declaration_pattern", "recursive_pattern") and parent.named_children[:1] == [current]
+
+
+def _named_only_as_owner(repo_dir: str, owner: str, owner_path: str, sources: dict[str, str]) -> bool:
+    """Whether every C# spelling of ``owner``'s simple name in the checkout
+    can only mean the owner class: its own declaration's name (the one class
+    of the name in its file), the whole receiver of a member access
+    (``Owner.M``), the qualifier of a qualified type name, a type position
+    (:func:`_in_type_position`), or a path spelling its full name, rooted at
+    ``global::`` or at a name that can only start a namespace
+    (:func:`_names_a_namespace_only`).
+
+    ``Owner.M(…)`` binds to the class only when nothing nearer has the name:
+    a property, field, local, parameter (a lambda's untyped one included),
+    enum member or pattern variable named ``Owner`` of another type with its
+    own ``M`` takes the call, and so does ``x.Owner.M(…)``. Any spelling
+    outside the positions above (such a declaration, another type of the
+    name, the member of another value, ``nameof``) makes a call's receiver
+    unknowable here, so the caller refuses rather than resolving scopes."""
+    from flag_cleanup import source_index
+    from flag_cleanup import wrapper_csharp as wc
+
+    word = re.compile(rf"(?<![\w@])@?{re.escape(owner)}(?![\w])")
+    for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+        if not f.path.name.endswith(".cs"):
+            continue
+        text = sources.get(f.resolved)
+        if text is None:
+            text = wc._read(f.resolved)
+        if text is None:
+            return False
+        if word.search(text) is None:
+            continue
+        root = wc.parse(text)
+        data = text.encode("utf-8")
+        own = f.resolved == owner_path
+        declarations = 0
+        for node in cs_param_pins._walk(root):
+            if node.type == "implicit_parameter" and _text(node, data).strip().removeprefix("@") == owner:
+                return False  # `Owner => Owner.M(…)`: a lambda's untyped parameter
+            if node.type != "identifier" or _text(node, data).removeprefix("@") != owner:
+                continue
+            parent = node.parent
+            if parent is None:
+                return False
+            # The owner's declaration, matched by file and kind rather than
+            # by span (a caller may hold offsets of a text without its byte
+            # order mark): one class of the name in that file.
+            if own and parent.type == "class_declaration" and parent.child_by_field_name("name") == node:
+                declarations += 1
+                if declarations > 1:
+                    return False
+                continue
+            if parent.type == "member_access_expression" and parent.child_by_field_name("expression") == node:
+                continue
+            if parent.type == "qualified_name" and parent.child_by_field_name("qualifier") == node:
+                continue
+            if _in_type_position(node):
+                continue
+            if parent.type == "member_access_expression" and parent.child_by_field_name("name") == node:
+                receiver = parent.child_by_field_name("expression")
+                root_part = receiver
+                while root_part is not None and root_part.type == "member_access_expression":
+                    root_part = root_part.child_by_field_name("expression")
+                spelled = "".join(_text(parent, data).split())
+                if root_part is not None and root_part.type == "alias_qualified_name" and spelled.startswith("global::"):
+                    if spelled.removeprefix("global::") == _owner_full(owner_path, owner):
+                        continue
+                elif (
+                    root_part is not None
+                    and root_part.type == "identifier"
+                    and spelled == _owner_full(owner_path, owner)
+                    and _names_a_namespace_only(repo_dir, root, data, _text(root_part, data))
+                ):
+                    continue
+            return False
+    return True
+
+
+def _names_a_namespace_only(repo_dir: str, root: Node, data: bytes, first: str) -> bool:
+    """Whether ``first``, the first part of a dotted path, can only start a
+    namespace in this file: no checkout type has the name, and the file
+    spells it only at the head of a dotted name or inside a namespace or
+    ``using`` name (a member or local of the name would take the path). A
+    member of that name inherited from another file is not seen."""
+    from flag_cleanup import cross_file_csharp as xcs
+
+    if xcs.csharp_index(repo_dir).by_last.get(first):
+        return False
+    for node in cs_param_pins._walk(root):
+        if node.type == "implicit_parameter" and _text(node, data).strip().removeprefix("@") == first:
+            return False
+        if node.type != "identifier" or _text(node, data).removeprefix("@") != first:
+            continue
+        parent = node.parent
+        if parent is None:
+            return False
+        if parent.type == "member_access_expression" and parent.child_by_field_name("expression") == node:
+            continue
+        if parent.type == "qualified_name" and parent.child_by_field_name("qualifier") == node:
+            continue
+        holder = parent
+        while holder is not None and holder.type == "qualified_name":
+            holder = holder.parent
+        if holder is not None and holder.type in (
+            "namespace_declaration", "file_scoped_namespace_declaration", "using_directive"
+        ):
+            continue
+        return False
+    return True
+
+
+def _owner_full(path: str, owner: str) -> str | None:
+    """The full name of the class ``owner`` declared in ``path``."""
+    from flag_cleanup import ctor_param_csharp
+    from flag_cleanup import wrapper_csharp as wc
+
+    text = wc._read(path)
+    if text is None:
+        return None
+    for node in cs_param_pins._walk(wc.parse(text)):
+        name = node.child_by_field_name("name") if node.type == "class_declaration" else None
+        if name is not None and name.text.decode("utf-8", "replace").removeprefix("@") == owner:
+            namespace = ctor_param_csharp._namespace_of(node)
+            return f"{namespace}.{owner}" if namespace else owner
+    return None
+
+
 def _calls(
     repo_dir: str,
     owner: str,
@@ -386,6 +541,8 @@ def _calls(
     method = re.compile(rf"(?<![\w@])@?{re.escape(name)}(?![\w])")
     from flag_cleanup import cross_file_csharp as xcs
 
+    if static and not _named_only_as_owner(repo_dir, owner, owner_path, sources):
+        return None  # `x.Owner.M(…)`, or `Owner` naming something nearer
     holders = None if static else _holders(repo_dir, owner)
     readers = None if static else wc._Readers(repo_dir)
 

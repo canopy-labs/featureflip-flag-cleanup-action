@@ -5208,6 +5208,10 @@ def remove_stranded_bindings(
                     # The bare import would keep a load that does nothing, or
                     # one another import of this file already makes.
                     candidate = replace(candidate, replacement=None, loads=None)
+                elif inert_load.released(path, candidate.loads):
+                    # A read-only hook of this package was its last use, and
+                    # the hook only runs where the package is loaded anyway.
+                    candidate = replace(candidate, replacement=None, loads=None)
                 elif inert_load.declared(candidate.loads):
                     # The customer says this load does nothing.
                     candidate = replace(

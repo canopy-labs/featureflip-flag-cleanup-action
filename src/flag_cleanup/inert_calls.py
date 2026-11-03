@@ -371,7 +371,7 @@ def _blank_seam(data: bytes, start: int, end: int, language: str) -> bytes:
     """The rest of ``data`` after deleting ``[start, end)``, without leaving
     two blank lines in a row where the deleted lines sat between two."""
     rest = data[end:]
-    above_blank = start >= 2 and data[start - 2 : start] == b"\n\n" or start == 0
+    above_blank = start == 0 or re.search(rb"\n[ \t]*\r?\n\Z", data[:start]) is not None
     below_blank = re.match(rb"[ \t]*\r?\n", rest) is not None
     if above_blank and below_blank:
         rest = rest[rest.index(b"\n") + 1 :]
@@ -397,3 +397,274 @@ def _go_strands_are_removable(source: str, statement: Node, path: str | None, ro
     if node is None:
         return False
     return wrapper_go._strand_reason([node], file, packages) is None
+
+
+# --- Read-only framework hooks ---------------------------------------------
+#
+# The same deletion without the customer's word, for a short audited list of
+# hooks that read a value and do nothing else. A component that folded its
+# flag read often stops using what one of them returned, and the discard
+# (`useParams<{ orgId: string }>();`) is left behind like any other call.
+
+#: The ``bindings`` kind of a discarded hook call deleted from the built-in list.
+HOOK_CALL = "deleted hook call"
+
+#: The ``bindings`` kind of one kept because a test mocks or spies on the hook.
+HOOK_CALL_KEPT = "kept hook call"
+
+_ROUTER_HOOKS = frozenset({"useParams", "useLocation", "useMatch"})
+
+#: Each package's hooks that only read a context: the router's, React's own
+#: or the Featureflip provider's. None of them holds state another hook can
+#: see, advances a counter, starts an effect or subscribes to anything but
+#: the context it reads, so a call whose result nothing reads does nothing a
+#: later render needs. Deleting one drops that context subscription, which
+#: can only save a re-render whose output nothing read.
+#:
+#: Left out on purpose: React's `useId`, which advances the renderer's id
+#: counter (deleting one renumbers every later id, in snapshots and in aria
+#: attributes); React Router's `useSearchParams`, which keeps refs and, through
+#: `useNavigate`, a layout effect; and the Featureflip React SDK's
+#: `useFeatureFlag`, which evaluates a flag, something the SDK reports.
+#: `useLocation`, `useMatch` and the two Featureflip hooks throw outside their
+#: router or provider, so the only test that notices the deletion is one that
+#: expects that throw from a component that reads nothing the hook returns.
+BUILT_IN_HOOKS: dict[str, frozenset[str]] = {
+    "react": frozenset({"useContext"}),
+    "react-router": _ROUTER_HOOKS,
+    "react-router-dom": _ROUTER_HOOKS,
+    "@featureflip/react": frozenset({"useFeatureflipClient", "useFeatureflipStatus"}),
+}
+
+_HOOK_LANGUAGES = frozenset({"ts", "tsx", "js"})
+
+#: Functions a hook can be called at the top of.
+_FUNCTION_TYPES = frozenset({
+    "function_declaration", "generator_function_declaration", "function_expression",
+    "function", "generator_function", "arrow_function", "method_definition",
+})
+
+
+def remove_hooks(
+    before: str,
+    after: str,
+    language: str,
+    path: str | None = None,
+    root: str | None = None,
+    kept: list[tuple[str, str]] | None = None,
+) -> tuple[str, list[tuple[str, str]]]:
+    """``after`` with each discarded call this run introduced to a hook in
+    :data:`BUILT_IN_HOOKS` deleted, and ``(statement text, package)`` for each.
+
+    The callee has to be that package's own export: a name the file binds
+    once, by an import of the hook from the package, or a member of the
+    package's namespace import (or of React's default import), where no
+    compiler config can read the specifier as anything but the package. The
+    call must be unconditional: a statement of the function body itself, with
+    no statement before it that can return or throw. Deleting such a call
+    changes the hook order the same way on every render, which the rules of
+    hooks allow; one inside a condition, a loop or after an early return is
+    kept. Every argument must be a name, a literal or a member read, and the
+    statement must have its lines to itself, as for a declared call.
+
+    A call to a hook that a test anywhere in the checkout mocks with a
+    factory naming it, or spies on, is kept and appended to ``kept`` as
+    ``(statement text, package)``: that test may count its calls.
+    """
+    if kept is None:
+        kept = []
+    if language not in _HOOK_LANGUAGES or path is None or root is None:
+        return after, []
+    tree = unused._parse(after, language)
+    candidates = _hook_candidates(tree, path, root)
+    if not candidates:
+        return after, []
+    already = Counter(
+        _normalized(n)
+        for n in _walk(unused._parse(before, language))
+        if n.type == "expression_statement"
+    )
+    data = after.encode("utf-8")
+    spans: list[tuple[int, int, str, str]] = []
+    for node, package in candidates:
+        text = _normalized(node)
+        if already[text]:
+            continue
+        if _mocked(package, _hook_name(node), root):
+            kept.append((text, package))
+            continue
+        span = _line_span(data, node)
+        if span is None:
+            continue
+        spans.append((span[0], span[1], text, package))
+    if not spans:
+        return after, []
+    result = data
+    for start, end, _text, _package in sorted(spans, reverse=True):
+        result = result[:start] + _blank_seam(result, start, end, language)
+    text = result.decode("utf-8")
+    if _errors(unused._parse(text, language)) > _errors(tree):
+        return after, []
+    return text, [(t, p) for _s, _e, t, p in sorted(spans)]
+
+
+def _hook_name(statement: Node) -> str:
+    callee = statement.named_children[0].child_by_field_name("function")
+    if callee is not None and callee.type == "member_expression":
+        callee = callee.child_by_field_name("property")
+    return callee.text.decode("utf-8", "replace") if callee is not None else ""
+
+
+_MOCK_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _mocked(package: str, hook: str, root: str) -> bool:
+    """Whether a file in the checkout mocks ``package`` with a factory that
+    names ``hook`` (`vi.mock('react-router-dom', () => ({ useParams: vi.fn() }))`),
+    or spies on ``hook`` (`vi.spyOn(router, 'useParams')`). A file that cannot
+    be read counts."""
+    from flag_cleanup import source_index
+
+    mock = re.compile(
+        r"\b(?:mock|doMock|unstable_mockModule)\s*\(\s*['\"`]" + re.escape(package) + r"['\"`]\s*,"
+    )
+    spy = re.compile(r"\bspyOn\s*\([^)]*['\"`]" + re.escape(hook) + r"['\"`]")
+    word = re.compile(rf"\b{re.escape(hook)}\b")
+    for source in source_index.files(root, _MOCK_SUFFIXES, with_ignored=True):
+        try:
+            text = source.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return True
+        if hook not in text:
+            continue
+        if spy.search(text) or (mock.search(text) and word.search(text)):
+            return True
+    return False
+
+
+def _hook_candidates(tree: Node, path: str, root: str) -> list[tuple[Node, str]]:
+    found = []
+    for node in _walk(tree):
+        if node.type != "expression_statement" or len(node.named_children) != 1:
+            continue
+        call = node.named_children[0]
+        if call.type != "call_expression" or any(c.type in {"optional_chain", "?."} for c in call.children):
+            continue
+        arguments = call.child_by_field_name("arguments")
+        if arguments is None or arguments.type != "arguments":
+            continue  # a tagged template
+        if not all(_inert(a, "ts") for a in arguments.named_children) or _own_call_count(node, "ts") != 1:
+            continue
+        if not _unconditional(node):
+            continue
+        package = _hook_package(tree, call.child_by_field_name("function"), path, root)
+        if package is not None:
+            found.append((node, package))
+    return found
+
+
+def _unconditional(statement: Node) -> bool:
+    """Whether ``statement`` runs every time its function does: a statement
+    of the function's own body with nothing before it that can leave."""
+    block = statement.parent
+    if block is None or block.type != "statement_block":
+        return False
+    function = block.parent
+    if function is None or function.type not in _FUNCTION_TYPES or function.child_by_field_name("body") != block:
+        return False
+    for sibling in block.named_children:
+        if sibling == statement:
+            return True
+        if _may_leave(sibling):
+            return False
+    return False
+
+
+def _may_leave(node: Node) -> bool:
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in {"return_statement", "throw_statement", "break_statement", "continue_statement"}:
+            return True
+        if current.type in _FUNCTION_TYPES or current.type == "class_body":
+            continue
+        stack.extend(current.named_children)
+    return False
+
+
+def _hook_package(tree: Node, callee: Node | None, path: str, root: str) -> str | None:
+    """The package of :data:`BUILT_IN_HOOKS` whose hook ``callee`` provably is."""
+    from flag_cleanup import cross_file_ts, ts_scope
+
+    if callee is None:
+        return None
+    if callee.type == "identifier":
+        local, member = callee.text.decode("utf-8", "replace"), None
+    elif callee.type == "member_expression":
+        target = callee.child_by_field_name("object")
+        prop = callee.child_by_field_name("property")
+        if (
+            target is None or prop is None or target.type != "identifier"
+            or prop.type != "property_identifier"
+            or any(c.type == "optional_chain" for c in callee.children)
+        ):
+            return None
+        local, member = target.text.decode("utf-8", "replace"), prop.text.decode("utf-8", "replace")
+    else:
+        return None
+    binders = ts_scope.bindings(tree, local)
+    if len(binders) != 1:
+        return None
+    imported = _imported(binders[0])
+    if imported is None:
+        return None
+    specifier, name = imported
+    hooks = BUILT_IN_HOOKS.get(specifier)
+    if hooks is None:
+        return None
+    if member is None:
+        if name not in hooks:
+            return None
+    elif not (name == "*" or (name == "default" and specifier == "react")) or member not in hooks:
+        return None
+    if not cross_file_ts.names_package(path, specifier, root):
+        return None
+    if specifier.startswith("@featureflip/"):
+        from flag_cleanup import inert_load
+        from flag_cleanup.piranha_runner import checkout_root
+
+        if inert_load._substituted(str(Path(checkout_root(root)).resolve())):
+            return None
+    return specifier
+
+
+def _imported(binder: Node) -> tuple[str, str] | None:
+    """``(specifier, imported name)`` of a value import binding ``binder``:
+    the exported name, ``"*"`` for a namespace import, ``"default"``."""
+    node = binder.parent
+    if node is None:
+        return None
+    if node.type == "import_specifier":
+        name = node.child_by_field_name("name")
+        if name is None or any(c.type == "type" for c in node.children):
+            return None
+        imported = name.text.decode("utf-8", "replace")
+        clause = node.parent.parent if node.parent is not None else None
+    elif node.type == "namespace_import":
+        imported, clause = "*", node.parent
+    elif node.type == "import_clause":
+        imported, clause = "default", node
+    else:
+        return None
+    statement = clause.parent if clause is not None else None
+    if statement is None or statement.type != "import_statement":
+        return None
+    if any(c.type == "type" for c in statement.children):
+        return None  # `import type`
+    source = statement.child_by_field_name("source")
+    if source is None or source.type != "string":
+        return None
+    fragments = source.named_children
+    if len(fragments) != 1 or fragments[0].type != "string_fragment":
+        return None
+    return fragments[0].text.decode("utf-8", "replace"), imported

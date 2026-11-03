@@ -2878,7 +2878,8 @@ def refusal_reason(
         )
     if _csharp_jump_tails(after, language) > _csharp_jump_tails(before, language):
         return (
-            "the removal left statements after a return, throw, break or continue: "
+            "the removal left statements after a return, throw, break or continue "
+            "(one under a `#if` counts, in the builds that define it): "
             "unreachable code (CS0162), which fails a build that treats warnings as errors"
         )
     if _stranded_template_reads(before, after, language):
@@ -2994,8 +2995,45 @@ def _csharp_literal_conditions(source: str, language: str) -> int:
 
 #: Statements after which nothing in the same list runs.
 _CSHARP_JUMPS = frozenset(
-    {"return_statement", "throw_statement", "break_statement", "continue_statement"}
+    {
+        "return_statement",
+        "throw_statement",
+        "break_statement",
+        "continue_statement",
+        "goto_statement",
+    }
 )
+
+
+def _csharp_is_jump(node: Node) -> bool:
+    """Whether ``node`` is a statement after which nothing in its list runs
+    (``yield break`` among them)."""
+    return node.type in _CSHARP_JUMPS or (
+        node.type == "yield_statement" and re.match(rb"yield\s+break\b", node.text) is not None
+    )
+
+
+def _csharp_list_jumps(node: Node) -> bool:
+    """Whether control cannot leave the statement list ``node`` (a block or a
+    ``#if`` branch) by its end in some build: one of its own statements is a
+    jump, a ``#if`` block with a branch that jumps in this sense, or a braced
+    block that does.
+
+    A jump inside an ``if``, a loop, a ``switch`` or a ``try`` is conditional or
+    leaves only that construct, and is not looked at.
+    """
+    for i, child in enumerate(node.children):
+        if not child.is_named or child.type == "comment":
+            continue
+        if node.field_name_for_child(i) in ("condition", "alternative"):
+            continue
+        if _csharp_is_jump(child):
+            return True
+        if child.type == "block" and _csharp_list_jumps(child):
+            return True
+        if child.type == "preproc_if" and any(_csharp_list_jumps(b) for b in _branches(child)):
+            return True
+    return False
 
 
 def _csharp_jump_tails(source: str, language: str) -> int:
@@ -3009,6 +3047,12 @@ def _csharp_jump_tails(source: str, language: str) -> int:
     not statements; a ``#if`` block holding code is, as are its branches'
     statements. A local function or a label after the jump is reachable (one
     is declared, the other can be jumped to) and is not counted.
+
+    A braced block standing as a statement counts as a jump when it ends in
+    one in some build (:func:`_csharp_list_jumps`): the engine keeps the braces
+    of a kept arm that holds a preprocessor directive, so ``if (read) { …
+    #if X return; #endif }`` becomes a bare block, and the code after it is
+    unreachable in the builds that define ``X``.
     """
     if language != "csharp":
         return 0
@@ -3026,7 +3070,15 @@ def _csharp_jump_tails(source: str, language: str) -> int:
                 continue
             if node.field_name_for_child(i) in ("condition", "alternative"):
                 continue
-            if child.type in _CSHARP_JUMPS:
+            if _csharp_is_jump(child):
+                jumped = True
+                continue
+            # A braced block standing as a statement ends in a jump in the
+            # builds that define the symbols of a directive branch inside it.
+            # The engine keeps the braces of an arm that holds a directive, so
+            # a flag `if` kept this way leaves the code after it unreachable in
+            # those builds.
+            if child.type == "block" and _csharp_list_jumps(child):
                 jumped = True
                 continue
             if not jumped:

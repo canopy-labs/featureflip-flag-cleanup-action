@@ -828,21 +828,24 @@ def names_package(reader_path: str, specifier: str, repo_dir: str) -> bool:
     ``extends`` (:func:`_inheriting`). False when any of them has a ``paths``
     pattern that fits the specifier, whether or not it names a file, or a file
     under its ``baseUrl`` that answers it, and when any of them, or any config
-    it extends, cannot be read for certain: unparseable, delegating
-    (``references``) to another, or extending a package or a file outside the
-    checkout. Also False when a file answers the name in the reader's
-    directory or one above it, which is where classic module resolution looks.
+    it extends, cannot be read for certain: unparseable, extending a package
+    or a file outside the checkout, or delegating (``references``) to configs
+    that cannot be read, that sit outside the checkout, or that read
+    differently for the reader (:func:`_solution_options`). Also False when a
+    file answers the name in the reader's directory or one above it, which is
+    where classic module resolution looks.
     """
     if not specifier or specifier.startswith((".", "/", "#")):
         return False
-    current = Path(reader_path).parent
+    reader = Path(reader_path)
+    current = reader.parent
     stop = _stop_for(repo_dir)
     try:
         while True:
             if _candidates(os.path.normpath(current / specifier)):
                 return False
             for config in sorted(current.iterdir()):
-                if _ANY_CONFIG.match(config.name) and config.is_file() and _answers(config, specifier, stop):
+                if _ANY_CONFIG.match(config.name) and config.is_file() and _answers(config, specifier, stop, reader):
                     return False
             if current == stop or current.parent == current:
                 return True
@@ -888,10 +891,17 @@ def package_scope(reader_path: str, specifier: str, repo_dir: str) -> str | None
         return None
 
 
-def _answers(config: Path, specifier: str, stop: Path) -> bool:
+def _answers(config: Path, specifier: str, stop: Path, reader: Path) -> bool:
     """Whether ``config`` can read ``specifier`` as a file; raises
-    :class:`_Unknown` when that cannot be told."""
-    options = _options(config, stop)
+    :class:`_Unknown` when that cannot be told.
+
+    A solution config (``references``) is read through the configs it names
+    for ``reader`` (:func:`_solution_options`), the way :func:`resolve_specifier`
+    reads it with ``solution``, so the two cannot disagree about it.
+    """
+    options = _solution_options(config, reader, stop)
+    if options is None:
+        options = _options(config, stop)
     if options.targets(specifier) is not None:
         return True
     return options.base_url is not None and bool(_candidates(os.path.normpath(options.base_url / specifier)))

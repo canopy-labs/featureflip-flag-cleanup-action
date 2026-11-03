@@ -205,6 +205,33 @@ def declared(specifier: str) -> bool:
     return specifier in _declared
 
 
+#: ``(resolved path, specifier)`` of each load released by :func:`releasing`.
+_released: frozenset[tuple[str, str]] = frozenset()
+
+
+@contextmanager
+def releasing(loads: Iterable[tuple[str, str]]) -> Iterator[None]:
+    """Treat each ``(path, specifier)`` load as one the file need not keep.
+
+    The run deleted a call in ``path`` to a read-only hook of the package
+    ``specifier`` names (see :data:`flag_cleanup.inert_calls.BUILT_IN_HOOKS`).
+    Such a hook only works inside a tree that package (or, for React, the
+    renderer) already loaded, so this file's own load of it is redundant
+    once nothing in it is used: a bare import of it need not stay."""
+    global _released
+    previous = _released
+    _released = previous | frozenset((str(Path(p).resolve()), s) for p, s in loads)
+    try:
+        yield
+    finally:
+        _released = previous
+
+
+def released(path: str, specifier: str) -> bool:
+    """Whether :func:`releasing` covers ``specifier`` loaded from ``path``."""
+    return bool(_released) and (str(Path(path).resolve()), specifier) in _released
+
+
 def is_inert(reader_path: str, specifier: str, repo_dir: str) -> bool:
     """Whether loading ``specifier`` from ``reader_path`` provably does nothing."""
     from flag_cleanup.piranha_runner import checkout_root

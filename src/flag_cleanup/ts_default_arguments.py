@@ -119,6 +119,24 @@ _MAX_HOPS = 16
 
 
 @dataclass(frozen=True)
+class DroppedOption:
+    """An option a folded value was left out of, by the function declaring it.
+
+    What :mod:`flag_cleanup.ts_unused_options` needs to find the declaration
+    again and prove no call still sets the option.
+    """
+
+    #: The declaring file, as the resolver read it.
+    path: str
+    #: The name the function is declared under in that file.
+    function: str
+    #: The position of the destructured options parameter.
+    position: int
+    #: The option's name.
+    option: str
+
+
+@dataclass(frozen=True)
 class Dropped:
     content: str
     #: The call or JSX element each literal was left out of, on one line, as
@@ -128,6 +146,9 @@ class Dropped:
     #: gives each emptied override this removed, for the caller to take out
     #: of that report.
     lines: tuple[str, ...]
+    #: Each option a value the fold wrote was left out of, for the callee's
+    #: declaration to lose when no call sets it any more.
+    options: tuple[DroppedOption, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -147,6 +168,8 @@ class _Callee:
     #: The block a ``const`` or ``let`` below the top level binds it in, which
     #: a call must be inside to name it; ``None`` at the top level.
     scope: Node | None = None
+    #: The declaring file, as the resolver read it; ``""`` when unknown.
+    path: str = ""
 
 
 def drop_default_arguments(
@@ -173,14 +196,16 @@ def drop_default_arguments(
     root = _parse(after, language)
     after_lines = after.splitlines()
     emptied = _emptied_objects(before, after, language, flag_key, root)
-    produced = emptied | _folded_values(before, after, language, root)
+    folded = _folded_values(before, after, language, root) - emptied
+    produced = emptied | folded
     if not produced:
         return unchanged
     resolver = _Resolver(root, data, path, repo_dir, language)
     # Each edit's bytes, the site to report it under (one per call or element
-    # it shortens, so a second span of the same object has none), and the
-    # emptied-override lines it accounts for.
-    edits: list[tuple[int, int, str | None, tuple[str, ...]]] = []
+    # it shortens, so a second span of the same object has none), the
+    # emptied-override lines it accounts for, and the options a folded value
+    # was left out of.
+    edits: list[_Edit] = []
     objects: dict[int, tuple[Node, list[Node]]] = {}
 
     def report(literal: Node) -> tuple[str, ...]:
@@ -196,39 +221,80 @@ def drop_default_arguments(
         if holder.type == "jsx_expression" and holder.parent.type == "jsx_attribute":
             span = _attribute_span(holder.parent, node, resolver, data)
             if span is not None:
-                edits.append((*span, _one_line(_text(holder.parent.parent, data)), report(node)))
+                edits.append((*span, _one_line(_text(holder.parent.parent, data)), report(node), ()))
         elif holder.type == "pair" and _same(holder.child_by_field_name("value"), node):
             objects.setdefault(holder.parent.id, (holder.parent, []))[1].append(holder)
         elif node.type == "object":
             span = _argument_span(node, resolver)
             if span is not None:
-                edits.append((*span, _one_line(_text(holder.parent, data)), report(node)))
+                edits.append((*span, _one_line(_text(holder.parent, data)), report(node), ()))
     for literal, pairs in objects.values():
+        options = _folded_options(literal, pairs, folded, resolver, data)
         for n, (start, end) in enumerate(_property_spans(literal, pairs, resolver, data)):
-            taken = [p.child_by_field_name("value") for p in pairs if start <= p.start_byte < end]
+            inside = [p for p in pairs if start <= p.start_byte < end]
+            taken = [p.child_by_field_name("value") for p in inside]
             site = _one_line(_text(literal.parent.parent, data)) if n == 0 else None
-            edits.append((start, end, site, tuple(line for v in taken for line in report(v))))
+            edits.append(
+                (
+                    start,
+                    end,
+                    site,
+                    tuple(line for v in taken for line in report(v)),
+                    tuple(options[p.id] for p in inside if p.id in options),
+                )
+            )
     kept = _non_overlapping(edits)
     if not kept:
         return unchanged
-    content = ts_list_join.splice(after, [(s, e) for s, e, _site, _lines in kept], language, width)
+    content = ts_list_join.splice(after, [edit[:2] for edit in kept], language, width)
     return Dropped(
         content,
-        tuple(site for _s, _e, site, _l in kept if site is not None),
-        tuple(line for _s, _e, _site, lines in kept for line in lines),
+        tuple(edit[2] for edit in kept if edit[2] is not None),
+        tuple(line for edit in kept for line in edit[3]),
+        tuple(dict.fromkeys(option for edit in kept for option in edit[4])),
     )
 
 
-def _non_overlapping(
-    edits: list[tuple[int, int, str | None, tuple[str, ...]]],
-) -> list[tuple[int, int, str | None, tuple[str, ...]]]:
+#: An edit's bytes, its report site, the emptied-override lines it accounts
+#: for and the options it leaves a folded value out of.
+_Edit = tuple[int, int, str | None, tuple[str, ...], tuple[DroppedOption, ...]]
+
+
+def _non_overlapping(edits: list[_Edit]) -> list[_Edit]:
     """The edits, by position, less any whose bytes an earlier one takes."""
-    kept: list[tuple[int, int, str | None, tuple[str, ...]]] = []
+    kept: list[_Edit] = []
     for edit in sorted(edits, key=lambda e: (e[0], e[1])):
         if kept and edit[0] < kept[-1][1]:
             continue
         kept.append(edit)
     return kept
+
+
+def _folded_options(
+    literal: Node,
+    pairs: list[Node],
+    folded: set[tuple[int, str]],
+    resolver: _Resolver,
+    data: bytes,
+) -> dict[int, DroppedOption]:
+    """By pair id, the option each of ``pairs`` sets, when its value is a
+    boolean the fold wrote and the callee's declaration is located."""
+    found = _call_parameter(literal, resolver)
+    if found is None:
+        return {}
+    parameter, callee, _last = found
+    name = _declared_name(callee.function, callee.data)
+    if not callee.path or name is None or callee.scope is not None:
+        return {}
+    position = [c.id for c in _parameters(callee.function) if c.type != "comment"].index(parameter.id)
+    options: dict[int, DroppedOption] = {}
+    for pair in pairs:
+        value = pair.child_by_field_name("value")
+        key = _property_name(pair.child_by_field_name("key"), data)
+        if key is None or value.type not in ("true", "false") or (value.start_byte, value.type) not in folded:
+            continue
+        options[pair.id] = DroppedOption(callee.path, name, position, key)
+    return options
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1137,7 @@ def _declared_callee(binder: Node, root: Node, data: bytes, path: str, component
     if untyped and _jsdoc_typed(function, statement):
         # With `allowJs`, TypeScript checks calls against JSDoc types.
         return None
-    return _Callee(function, root, data, untyped, memoized)
+    return _Callee(function, root, data, untyped, memoized, path=path)
 
 
 #: The JSDoc tags that type a function or its parameters.

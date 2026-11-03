@@ -13,6 +13,10 @@
 # would re-fire on the argument that shifts into the deleted slot, and the
 # engine deletes a field without the `;` after it.
 #
+# `ts_readiness_gates` renders the `argument` blocks alone, with no removal,
+# beside `tsx_ctor_param.toml`'s: it marks a readiness guard's statements and
+# the import of a file it deletes.
+#
 # No holes and no edges: every rule is a seed that matches on its own.
 
 # ctor: parameter
@@ -122,6 +126,19 @@ is_seed_rule = true
 name = "delete_ctor_marked_statement"
 query = """(
   (statement_block (expression_statement (identifier) @name) @statement)
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "statement"
+replace = ""
+is_seed_rule = true
+
+# ctor: argument
+# A marked statement at the top of a file: the import of a file
+# `ts_readiness_gates` deletes.
+[[rules]]
+name = "delete_ctor_marked_top_statement"
+query = """(
+  (program (expression_statement (identifier) @name) @statement)
   (#eq? @name "__CTOR_SENTINEL__")
 )"""
 replace_node = "statement"

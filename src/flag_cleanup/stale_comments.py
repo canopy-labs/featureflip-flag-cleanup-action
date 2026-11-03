@@ -605,6 +605,52 @@ def _reaches_change(
     return False
 
 
+#: Nodes that declare a function, method or class, in every grammar: the
+#: declarations a doc comment sits above.
+_DECLARATIONS = frozenset({
+    "function_declaration", "generator_function_declaration", "method_definition",
+    "class_declaration", "abstract_class_declaration", "function_definition",
+    "method_declaration", "constructor_declaration", "local_function_statement",
+    "class_definition", "method", "singleton_method",
+})
+
+#: A function value that is a declaration only when a name is bound to it
+#: (``const Gate = () => …``).
+_FUNCTION_VALUES = frozenset({"arrow_function", "function_expression", "function"})
+
+#: What a declaration can sit inside and still own the comment above it.
+_DECLARATION_WRAPPERS = frozenset({
+    "export_statement", "variable_declarator", "lexical_declaration",
+    "variable_declaration", "decorated_definition",
+})
+
+
+def _enclosing_declaration_rows(
+    data: bytes, root: Node, starts: list[int], ends: list[int], rows: set[int]
+) -> set[int]:
+    """The 0-based first rows of every function, method or class (with what
+    exports or binds it) that encloses one of ``rows``: the row a doc comment
+    on it ends directly above."""
+    found: set[int] = set()
+    row_of = _row_finder(starts)
+    for row in rows:
+        if row >= len(starts):
+            continue
+        line = data[starts[row] : ends[row]]
+        offset = starts[row] + (len(line) - len(line.lstrip()) if line.strip() else 0)
+        node = root.descendant_for_byte_range(offset, offset)
+        while node is not None:
+            if node.type in _DECLARATIONS or node.type in _FUNCTION_VALUES:
+                statement, named = node, node.type in _DECLARATIONS
+                while statement.parent is not None and statement.parent.type in _DECLARATION_WRAPPERS:
+                    statement = statement.parent
+                    named = named or statement.type == "variable_declarator"
+                if named:
+                    found.add(row_of(statement.start_byte))
+            node = node.parent
+    return found
+
+
 def _comment_groups(data: bytes, root: Node, row_of) -> list[list[Node]]:
     """Adjacent own-line comments, grouped as :func:`plan` groups them; a
     comment after code is a group of its own."""
@@ -668,9 +714,11 @@ def flag_state_comments(
     """The comments of ``after`` near a line the run changed that describe a
     flag's state, or what it decided, without naming ``flag_key``.
 
-    Near is on the changed line, directly above it, or above it in the same
+    Near is on the changed line, directly above it, above it in the same
     block with no blank line between (the comment of the statement before a
-    folded ``if``). Describes is a state phrase (:data:`FLAG_STATE`), "the
+    folded ``if``), or directly above a function, method or class that holds
+    a changed line: its doc comment, which describes what the body did,
+    however far down the fold sits. Describes is a state phrase (:data:`FLAG_STATE`), "the
     flag" (:data:`THE_FLAG`), or a local the run removed (see
     :func:`removed_names`).
 
@@ -699,6 +747,11 @@ def flag_state_comments(
     ends = [*(s for s in starts[1:]), len(data)]
     row_of = _row_finder(starts)
 
+    # The first row of each function, method or class around a changed line:
+    # a doc comment directly above one describes the code the run changed,
+    # however far down the change sits.
+    declarations = _enclosing_declaration_rows(data, root, starts, ends, written | below_deletion)
+
     found: list[StateComment] = []
     for group in _comment_groups(data, root, row_of):
         first, last = row_of(group[0].start_byte), row_of(group[-1].end_byte)
@@ -707,25 +760,35 @@ def flag_state_comments(
             continue
         near = any(r in written for r in rows) or last + 1 in written or last + 1 in below_deletion
         own_line = not data[starts[first] : group[0].start_byte].strip()
-        if not near and not (
+        documents = own_line and last + 1 in declarations
+        if not near and not documents and not (
             own_line and _reaches_change(data, starts, ends, first, last, written, below_deletion)
         ):
             continue
         texts, joined, offsets = _group_texts(data, starts, ends, group, first, last)
         # The first phrase on a line that does not name the key: a line naming
         # it is the kept-comment report's, but the group's other lines are not.
-        hit = next(
-            (
-                (row, match)
-                for match in trigger.finditer(joined)
-                for row in [max(i for i, offset in enumerate(offsets) if offset <= match.start())]
-                if not names.search(texts[row].encode("utf-8"))
-            ),
-            None,
-        )
-        if hit is None:
+        hits = [
+            (row, match)
+            for match in trigger.finditer(joined)
+            for row in [max(i for i, offset in enumerate(offsets) if offset <= match.start())]
+            if not names.search(texts[row].encode("utf-8"))
+        ]
+        if not hits:
             continue
-        at, match = hit
+        at, match = hits[0]
+        if documents and not near:
+            # A doc comment covers the whole declaration, so the sentence
+            # that describes a branch is the one to name, wherever it sits.
+            at, match = next(
+                (
+                    (row, m)
+                    for row, m in hits
+                    if describes_removed(_sentence(joined, m.start()), flag_key, treatment)
+                    or describes_kept(_sentence(joined, m.start()), flag_key, treatment)
+                ),
+                (at, match),
+            )
         # Which branch it describes is read off its own sentence, so a hedge
         # in another sentence of the same comment ("whether any key exists")
         # does not cancel it.
@@ -747,7 +810,7 @@ def flag_state_comments(
 
 @dataclass(frozen=True)
 class LeadingComment:
-    """A comment directly above a statement the run deleted outright."""
+    """A comment directly above a statement or entry the run deleted outright."""
 
     #: The whole comment as a removal of its lines in ``after``.
     removal: Removal
@@ -758,31 +821,95 @@ class LeadingComment:
     #: Whether it describes a flag's state (:data:`FLAG_STATE`): such a
     #: comment explained only the statement that went, and goes with it.
     describes_state: bool
+    #: Whether what went was the flag's own: its read, a binding of it, or
+    #: its entry in a registry. Such a comment has lost its subject, whatever
+    #: it says, and goes with it.
+    own: bool = False
+
+    @property
+    def goes(self) -> bool:
+        """Whether the comment is deleted with what it sat above."""
+        return self.describes_state or self.own
 
 
 #: A comment that instructs a tool rather than describing code: never the
 #: deleted statement's prose.
 _DIRECTIVE = re.compile(
-    r"\s*(?:eslint|@ts-|prettier-|istanbul|c8\b|noqa|pylint|type:|nolint|rubocop|swiftlint|#?pragma|#?region|#?endregion)",
+    r"\s*(?:eslint|@ts-|prettier-|istanbul|c8\b|noqa|pylint|type:|nolint|rubocop|swiftlint|#?pragma|#?region"
+    r"|#?endregion|nosonar|biome-ignore|tslint:|deno-lint-ignore|deno-fmt-ignore|@flow\b|fmt:|pyright:|mypy:"
+    r"|frozen_string_literal|ignore:|ignore_for_file|lint:ignore|swift-format-ignore)",
     re.IGNORECASE,
 )
 
-#: The first word of a line that closes the block it sits in.
-_CLOSES = (b"}", b")", b"]", b"end")
+
+def _closes(line: bytes) -> bool:
+    """Whether ``line`` (stripped of its indent) closes the block it sits in:
+    a bracket, or ``end`` as a whole word, not ``endpoint``."""
+    return line.startswith((b"}", b")", b"]")) or re.match(rb"end(?![A-Za-z0-9_])", line) is not None
+
+#: The target of a declaration or assignment of one plain name, up to its
+#: ``=``: keywords and a type before the name (``const``, ``final bool``,
+#: ``var``) or after it (``: boolean``, Go's ``var on bool``), and ``=`` or
+#: ``:=``. A member (``this.on``, ``settings.on``) is not one. Go's form is
+#: its own alternative, tried first: a type after the name without a ``:``
+#: would otherwise read ``const on =`` as a ``const`` of type ``on``.
+_TARGET = (
+    r"(?:var\s+(?P<go>[A-Za-z_]\w*)\s+[\w.\[\]*]+\s*=(?![=>])"
+    r"|(?:[\w$.<>\[\]?,]+\s+)*?(?P<name>\$?[A-Za-z_]\w*)\s*(?::\s*[\w$.<>\[\]?]+\s*)?:?=(?![=>]))"
+)
+#: What may stand before the read's callee for the read to be the statement's
+#: whole value: nothing, or the target, then ``await``/``try`` and a paren.
+_BEFORE_READ = re.compile(r"(?:" + _TARGET + r")?\s*(?:await\s+|try[?!]?\s+)?\(?\s*", re.DOTALL)
+#: A callee, read backwards from the argument list: a chain of names
+#: (``client.boolVariation``, ``$this->client->read``, ``Client::read``).
+_CALLEE = re.compile(r"[\w$.?!:<>-]+$")
+#: What may follow the read's argument list.
+_AFTER_READ = re.compile(r"\s*\)?\s*;?\s*")
+#: A declaration of one name and its value.
+_DECLARATION = re.compile(_TARGET + r"\s*(?P<value>.+?)\s*;?\s*", re.DOTALL)
+#: A value that is already a boolean literal: the engine inlines such a local
+#: too, but it was never a read.
+_LITERAL = re.compile(r"\(?\s*(?:true|false)\s*\)?", re.IGNORECASE)
 
 
-def leading_comments(before: str, after: str, grammar: str, flag_key: str) -> list[LeadingComment]:
-    """Each own-line comment of ``after`` that sat directly above statements
-    the run deleted whole, and that nothing else claims.
+def _normalised(text: str) -> str:
+    """An entry's text with its whitespace collapsed and its separator dropped."""
+    return " ".join(text.split()).strip(",; ")
+
+
+def leading_comments(
+    before: str,
+    after: str,
+    grammar: str,
+    flag_key: str,
+    bound: Iterable[str] = (),
+    entries: Iterable[str] = (),
+) -> list[LeadingComment]:
+    """Each own-line comment of ``before`` that sat directly above statements
+    or entries the run deleted whole, as it stands in ``after``.
 
     Directly above is no blank line between. Whole is a run of complete
     statements of ``before`` (a declaration the run inlined, a guard of the
     removed branch), never part of one: a deleted ``if`` header whose body
-    stayed is not a deleted statement. Nothing else claims it when the
-    deleted statements were followed by a blank line, the end of their
-    block or the end of the file; otherwise the comment may describe the
-    next statement too. A doc comment documents something that survives,
-    and a comment naming the key is :func:`rewrite`'s; both are left out.
+    stayed is not a deleted statement. A doc comment documents something
+    that survives, and a comment naming the key is :func:`rewrite`'s; both
+    are left out.
+
+    A statement's comment is found only when nothing else claims it: the
+    deleted statements were followed by a blank line, the end of their block
+    or the end of the file; otherwise the comment may describe the next
+    statement too. It is the flag's own (:attr:`LeadingComment.own`) when
+    every deleted statement is the flag's read or a binding of one (see
+    :func:`_own_statement`; ``bound`` holds the locals the engine inlined as
+    the flag's value): the read is gone, so the comment explained nothing
+    that is left.
+
+    An entry is one of ``entries``, the flag's entries the run deleted from
+    a literal (``'k': { default: false },``). Entries sit on adjacent lines,
+    so its comment is found whatever follows; it is the entry's own when the
+    deleted lines are followed by a blank line, a closer, the end of the
+    file or the next entry's own comment. Followed by another entry, the
+    comment may be about both, and is reported rather than deleted.
     """
     if before == after:
         return []
@@ -790,39 +917,63 @@ def leading_comments(before: str, after: str, grammar: str, flag_key: str) -> li
     data = after.encode("utf-8")
     try:
         old_root = _parse(old, grammar)
-        root = _parse(data, grammar)
+        _parse(data, grammar)
     except Exception:  # noqa: BLE001 - an unparsable file has no leading comments
         return []
     names = names_pattern(flag_key)
+    bound = frozenset(bound)
+    read = _key_first(flag_key)
+    own_entries = {_normalised(text) for text in entries}
     old_lines = before.split("\n")
-    matcher = difflib.SequenceMatcher(None, old_lines, after.split("\n"), autojunk=False)
+    new_lines = after.split("\n")
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
     old_starts = _line_starts(old)
+    old_ends = [*(s for s in old_starts[1:]), len(old)]
+    old_row_of = _row_finder(old_starts)
     starts = _line_starts(data)
     ends = [*(s for s in starts[1:]), len(data)]
-    row_of = _row_finder(starts)
+    # Read off ``before``: once an entry between two comments goes, the
+    # comments are adjacent in ``after`` and would read as one.
     by_last = {}
-    for group in _comment_groups(data, root, row_of):
-        first, last = row_of(group[0].start_byte), row_of(group[-1].end_byte)
-        if not data[starts[first] : group[0].start_byte].strip():
+    for group in _comment_groups(old, old_root, old_row_of):
+        first, last = old_row_of(group[0].start_byte), old_row_of(group[-1].end_byte)
+        if not old[old_starts[first] : group[0].start_byte].strip():
             by_last[last] = (group, first)
+    comment_rows = {first for _group, first in by_last.values()}
     found: list[LeadingComment] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "delete" or j1 != j2 or i1 == 0 or j1 == 0:
             continue
-        if any(not line.strip() for line in old_lines[i1:i2]):
+        # Only the paragraph directly below the comment: a deletion that runs
+        # on past a blank line (a binding and the guard the fold removed)
+        # holds a paragraph break, and what follows it is not the comment's.
+        i2 = next((i for i in range(i1, i2) if not old_lines[i].strip()), i2)
+        if i2 == i1:
             continue
         following = old_lines[i2].lstrip().encode("utf-8") if i2 < len(old_lines) else b""
-        if following and not following.startswith(_CLOSES):
+        closed = not following or _closes(following)
+        entry = _normalised("\n".join(old_lines[i1:i2])) in own_entries
+        if entry:
+            shared = not closed and i2 not in comment_rows
+            own = not shared
+        else:
+            if not closed:
+                continue
+            covered = _whole_statements(old_root, old, old_starts, i1, i2)
+            if covered is None:
+                continue
+            shared = False
+            own = all(_own_statement(c, old, read, bound) for c in covered)
+        candidate = by_last.get(i1 - 1)
+        if candidate is None:
             continue
-        if not _whole_statements(old_root, old, old_starts, i1, i2):
+        group, first = candidate
+        top = j1 - (i1 - first)
+        # The comment must stand in ``after`` as it did, line for line.
+        if top < 0 or old_lines[first:i1] != new_lines[top:j1]:
             continue
-        entry = by_last.get(j1 - 1)
-        if entry is None:
-            continue
-        group, first = entry
-        last = j1 - 1
-        texts, joined, _offsets = _group_texts(data, starts, ends, group, first, last)
-        raw = data[starts[first] : ends[last]]
+        texts, joined, _offsets = _group_texts(old, old_starts, old_ends, group, first, i1 - 1)
+        raw = old[old_starts[first] : old_ends[i1 - 1]]
         if (
             any(t.encode("utf-8").startswith(_DOC_MARKERS) for t in texts)
             or names.search(raw)
@@ -831,18 +982,71 @@ def leading_comments(before: str, after: str, grammar: str, flag_key: str) -> li
             continue
         found.append(
             LeadingComment(
-                Removal(starts[first], ends[last], first + 1, tuple(range(first, last + 1)), " ".join(texts)),
-                frozenset(range(first + 1, last + 2)),
+                Removal(starts[top], ends[j1 - 1], top + 1, tuple(range(top, j1)), " ".join(texts)),
+                frozenset(range(top + 1, j1 + 1)),
                 texts[0],
-                bool(FLAG_STATE.search(joined)),
+                not shared and bool(FLAG_STATE.search(joined)),
+                own,
             )
         )
     return found
 
 
-def _whole_statements(root: Node, data: bytes, starts: list[int], first: int, end: int) -> bool:
-    """Whether lines ``first`` to ``end`` (exclusive) of ``data`` hold
-    exactly one or more complete statements and nothing else."""
+def _own_statement(node: Node, data: bytes, read: re.Pattern[bytes], bound: frozenset[str]) -> bool:
+    """Whether a deleted statement was the flag's read or a binding of one.
+
+    Judged by shape, around the argument list the parse finds:
+
+    * the read itself, a call whose first argument is the key
+      (``client.boolVariation('k', false);``), alone or as the whole value of
+      a declaration or assignment of one plain name (``const on =
+      useFlag('k');``, ``on := await read("k")``);
+    * or the declaration of a local in ``bound``, one the engine inlined as
+      the flag's value (``var on = _gate.IsEnabled;``), unless its value was
+      already a literal.
+
+    So not a statement that holds the read inside something else (an
+    assertion, an argument, an array or object, an operand), a member
+    (``this.on = …``), an assignment of a bound name, or a compound statement
+    (a dead ``if`` assigning it)."""
+    text = data[node.start_byte : node.end_byte]
+    for arguments in _descendants(node):
+        if "argument" not in arguments.type or not read.match(data[arguments.start_byte : arguments.end_byte]):
+            continue
+        head = data[node.start_byte : arguments.start_byte].decode("utf-8", "replace")
+        callee = _CALLEE.search(head)
+        if (
+            callee is not None
+            and _BEFORE_READ.fullmatch(head[: callee.start()])
+            and _AFTER_READ.fullmatch(data[arguments.end_byte : node.end_byte].decode("utf-8", "replace"))
+        ):
+            return True
+    if not bound or "declaration" not in node.type:
+        return False
+    declared = _DECLARATION.fullmatch(text.decode("utf-8", "replace").strip())
+    return (
+        declared is not None
+        and (declared.group("go") or declared.group("name")) in bound
+        and not _LITERAL.fullmatch(declared.group("value"))
+    )
+
+
+def _descendants(node: Node):
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(current.named_children))
+
+
+def _key_first(flag_key: str) -> re.Pattern[bytes]:
+    """An argument list whose first argument is ``flag_key``, quoted."""
+    return re.compile(rb"\(\s*(['\"`])" + re.escape(flag_key.encode()) + rb"\1\s*[,)]")
+
+
+def _whole_statements(root: Node, data: bytes, starts: list[int], first: int, end: int) -> list[Node] | None:
+    """The statements lines ``first`` to ``end`` (exclusive) of ``data`` hold,
+    when they hold exactly one or more complete statements and nothing else."""
     ends = [*(s - 1 for s in starts[1:]), len(data)]
     begin = starts[first] + (len(data[starts[first] : ends[first]]) - len(data[starts[first] : ends[first]].lstrip()))
     finish = ends[end - 1]
@@ -862,8 +1066,8 @@ def _whole_statements(root: Node, data: bytes, starts: list[int], first: int, en
     else:
         covered = [c for c in node.named_children if c.start_byte >= begin and c.end_byte <= finish]
         if not covered or covered[0].start_byte != begin or covered[-1].end_byte != finish:
-            return False
-    return all(_is_statement(c) for c in covered)
+            return None
+    return covered if all(_is_statement(c) for c in covered) else None
 
 
 def _is_statement(node: Node) -> bool:

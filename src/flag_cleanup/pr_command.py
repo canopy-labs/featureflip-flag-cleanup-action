@@ -44,6 +44,7 @@ from flag_cleanup.failing_assertions import FLAG_VALUE_ASSERTION
 from flag_cleanup import (
     constant_wrappers,
     cross_file_keys,
+    forwarder_csharp,
     git_ops,
     github_ops,
     inert_calls,
@@ -59,9 +60,10 @@ from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
 from flag_cleanup.residue import Residue
 from flag_cleanup.discarded_calls import DISCARDED_CALL
-from flag_cleanup.inert_calls import DECLARED_CALL
+from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
 from flag_cleanup.inert_load import DECLARED_LOAD
-from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
+from flag_cleanup.ts_test_providers import UNWRAPPED_PROVIDER
+from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST, STALE_TITLE, VACUOUS_ASSERTION
 
 logger = logging.getLogger(__name__)
 
@@ -894,13 +896,19 @@ def _dry_run_caveats(
     removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
     removed_comments = sum(1 for _, kind, _ in bindings if kind == "removed comment")
     renamed_tests = sum(1 for _, kind, _ in bindings if kind == RENAMED_TEST)
+    scaffolding = sum(1 for _, kind, _ in bindings if kind in (VACUOUS_ASSERTION, STALE_TITLE))
     removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     failing = sum(1 for _, kind, _ in bindings if kind == "failing assertion")
     declared_loads = sum(1 for _, kind, _ in bindings if kind == DECLARED_LOAD)
     declared_calls = sum(1 for _, kind, _ in bindings if kind == DECLARED_CALL)
+    hook_calls = sum(1 for _, kind, _ in bindings if kind == HOOK_CALL)
+    kept_hooks = sum(1 for _, kind, _ in bindings if kind == HOOK_CALL_KEPT)
+    providers = sum(1 for _, kind, _ in bindings if kind == UNWRAPPED_PROVIDER)
     discarded_calls = sum(1 for _, kind, _ in bindings if kind == DISCARDED_CALL)
+    inlined_forwarders = sum(1 for _, kind, _ in bindings if kind == forwarder_csharp.INLINED)
+    kept_forwarders = sum(1 for _, kind, _ in bindings if kind == forwarder_csharp.KEPT)
     state_comments = sum(
         1 for _, kind, _ in bindings
         if kind
@@ -917,16 +925,34 @@ def _dry_run_caveats(
         - failing
         - state_comments
         - renamed_tests
+        - scaffolding
         - removed_defaults
         - declared_loads
         - declared_calls
+        - hook_calls
+        - kept_hooks
+        - providers
         - discarded_calls
+        - inlined_forwarders
+        - kept_forwarders
     )
+    if inlined_forwarders:
+        notes.append(f"{inlined_forwarders} helper(s) left only forwarding a call would be inlined")
+    if kept_forwarders:
+        notes.append(f"{kept_forwarders} helper(s) left only forwarding a call would be kept (reported)")
     if declared_calls:
         notes.append(
             f"{declared_calls} discarded call(s) to a name listed in side-effect-free-calls "
             "would be deleted"
         )
+    if scaffolding:
+        notes.append(f"{scaffolding} kept test line(s) may still describe the removed branch (reported)")
+    if providers:
+        notes.append(f"{providers} Featureflip test provider(s) would be unwrapped")
+    if kept_hooks:
+        notes.append(f"{kept_hooks} discarded hook call(s) kept because a test mocks the hook (reported)")
+    if hook_calls:
+        notes.append(f"{hook_calls} discarded call(s) to a read-only framework hook would be deleted")
     if discarded_calls:
         notes.append(f"{discarded_calls} call(s) would be kept only as a discard (reported)")
     if declared_loads:
@@ -1025,6 +1051,21 @@ def _dry_run_caveats(
     pinned = sum(1 for _, kind, _ in test_doubles if kind == "pinned parameter")
     phases = sum(1 for _, kind, _ in test_doubles if kind == "test phase")
     flag_value = sum(1 for _, kind, _ in test_doubles if kind == FLAG_VALUE_ASSERTION)
+    false_titles = sum(1 for _, kind, _ in test_doubles if kind == "false title")
+    facts = sum(1 for _, kind, _ in test_doubles if kind == "theory made a fact")
+    renamed_methods = sum(1 for _, kind, _ in test_doubles if kind == "renamed test method")
+    gate_named = sum(1 for _, kind, _ in test_doubles if kind == "named for the gate")
+    rows = sum(1 for _, kind, _ in test_doubles if kind == "test rows")
+    rebuilt = sum(1 for _, kind, _ in test_doubles if kind == "rebuilt with the kept value")
+    if facts:
+        notes.append(f"{facts} [Theory] test(s) left with one row would become [Fact]s")
+    if renamed_methods:
+        notes.append(f"{renamed_methods} kept test(s) would be renamed without the removed gate's state")
+    if gate_named or false_titles:
+        notes.append(
+            f"{gate_named + false_titles} kept test(s) would still be named for the removed gate's "
+            "state (reported, not renamed)"
+        )
     if removed_tests:
         notes.append(
             f"{removed_tests} test(s) whose mock returns the removed value "
@@ -1041,7 +1082,10 @@ def _dry_run_caveats(
         notes.append(f"{phases} part(s) of tests run with a fake at the removed value would be deleted")
     if flag_value:
         notes.append(f"{flag_value} assertion(s) of the flag's own value would be deleted")
-    mock_lines = len(test_doubles) - removed_tests - sibling_tests - pinned - phases - flag_value
+    mock_lines = (
+        len(test_doubles) - removed_tests - sibling_tests - pinned - phases - flag_value
+        - false_titles - facts - renamed_methods - gate_named - rows - rebuilt
+    )
     if mock_lines:
         notes.append(
             f"{mock_lines} mock stub/verification line(s) "

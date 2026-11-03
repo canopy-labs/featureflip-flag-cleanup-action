@@ -31,6 +31,15 @@ Everything that has to hold, and each is checked rather than assumed:
 * **The parameter is the helper's LAST one**, a plain name, and nothing in the
   helper reads it except the entries keyed by this flag. Removing a last
   parameter shifts no other argument.
+* **Or it is one OPTION of a destructured parameter**,
+  ``function renderGate({ ssoFlag = false } = {})``, defaulted to a boolean
+  literal and read by nothing but those entries
+  (:mod:`flag_cleanup.ts_option_params` reads the shape). Each call passes an
+  object literal setting it to a boolean literal or leaving it out, or passes
+  nothing. The option goes from the pattern and from every call; when it was
+  the only one, the parameter must be the last and goes whole, with the
+  argument each call passed for it: ``renderGate({ ssoFlag: true })`` becomes
+  ``renderGate()``.
 * **Every call is visible.** The helper is a ``const`` or a function
   declaration, not exported, declared once, and every other mention of its
   name is the callee of a call — never a value that could be called out of
@@ -49,7 +58,9 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from flag_cleanup import ts_list_join
+from flag_cleanup import ts_list_join, ts_option_params
+from flag_cleanup.ts_option_params import element_span as _element_span
+from flag_cleanup.ts_option_params import elements as _elements
 from flag_cleanup.ts_syntax import _parse, _walk
 
 #: Nodes whose parameters bind names, as the TypeScript grammars spell them.
@@ -81,12 +92,15 @@ class ParameterPin:
 
     ``default`` is the parameter's default literal, ``"true"`` or ``"false"``,
     or ``None`` when it has none — a call passing nothing then pins nothing.
+    With ``option``, ``parameter`` names an option of the destructured
+    parameter at ``index`` instead, and ``default`` is the option's default.
     """
 
     function: str
     parameter: str
     index: int
     default: str | None
+    option: bool = False
 
 
 def find_parameter_pins(source: str, language: str, flag_key: str) -> list[ParameterPin]:
@@ -119,10 +133,7 @@ def pinned_calls(source: str, language: str, flag_key: str) -> dict[tuple[int, i
     calls: dict[tuple[int, int], str] = {}
     for pin in pins:
         for call in _calls(root, data, pin.function):
-            arguments = _elements(call.child_by_field_name("arguments"))
-            value = (
-                arguments[pin.index].type if len(arguments) > pin.index else pin.default
-            )
+            value = _pinned_value(call, data, pin)
             if value in _BOOLEANS:
                 calls[(call.start_byte, call.end_byte)] = value
     return calls
@@ -169,18 +180,35 @@ def _qualify(
     if binder is None:
         return None
     parameters = _elements(binder.child_by_field_name("parameters"))
+    if any(_is_this_parameter(p) for p in parameters):
+        # TypeScript's `this: T` is a parameter in the declaration and no
+        # argument at a call, so every position read here would be off by one.
+        return None
     index = next(
         (n for n, p in enumerate(parameters) if _parameter_name(p, data) == name), None
     )
-    if index is None or index != len(parameters) - 1:
-        return None
-    default = _boolean_evidence(parameters[index], data)
-    if default is False:
-        return None
+    option = index is None
+    if not option:
+        if index != len(parameters) - 1:
+            return None
+        default = _boolean_evidence(parameters[index], data)
+        if default is False:
+            return None
+    else:
+        # Not a plain parameter: an option of a destructured one, defaulted to
+        # a boolean literal. See :mod:`flag_cleanup.ts_option_params`.
+        options = [
+            (n, found)
+            for n, p in enumerate(parameters)
+            if (found := ts_option_params.option(p, name, data)) is not None
+        ]
+        if len(options) != 1 or options[0][1].default.type not in _BOOLEANS:
+            return None
+        index, default = options[0][0], options[0][1].default.type
     function = _helper_name(binder, data)
     if function is None:
         return None
-    pin = ParameterPin(function, name, index, default or None)
+    pin = ParameterPin(function, name, index, default or None, option)
     if _declaration(root, data, pin) != binder:
         return None
     return pin
@@ -199,12 +227,21 @@ def _edits(
     if binder is None:
         return None
     parameters = _elements(binder.child_by_field_name("parameters"))
-    if len(parameters) != pin.index + 1:
+    if len(parameters) <= pin.index:
         return None
     parameter = parameters[pin.index]
-    if _parameter_name(parameter, data) != pin.parameter:
-        return None
-    pattern = parameter.child_by_field_name("pattern")
+    option: ts_option_params.Option | None = None
+    if pin.option:
+        option = ts_option_params.option(parameter, pin.parameter, data)
+        if option is None or option.default.type != pin.default:
+            return None
+        if option.sole and len(parameters) != pin.index + 1:
+            return None
+        pattern = option.binder
+    else:
+        if len(parameters) != pin.index + 1 or _parameter_name(parameter, data) != pin.parameter:
+            return None
+        pattern = parameter.child_by_field_name("pattern")
 
     entries = [
         node.parent
@@ -232,12 +269,29 @@ def _edits(
         if span is None:
             return None
         spans.append((*span, True))
-    span = _element_span(parameter)
-    if span is None:
-        return None
-    spans.append((*span, False))
+    if option is not None:
+        declared = ts_option_params.declaration_spans(option, data)
+        if declared is None:
+            return None
+        spans.extend((*span, False) for span in declared)
+    else:
+        span = _element_span(parameter)
+        if span is None:
+            return None
+        spans.append((*span, False))
     for call in _calls(root, data, pin.function):
         arguments = _elements(call.child_by_field_name("arguments"))
+        if option is not None:
+            passed = ts_option_params.passed(
+                arguments[pin.index] if len(arguments) > pin.index else None,
+                pin.parameter,
+                data,
+            )
+            taken = None if passed is None else ts_option_params.argument_spans(option, passed)
+            if taken is None:
+                return None
+            spans.extend((*span, False) for span in taken)
+            continue
         if len(arguments) <= pin.index:
             continue
         span = _element_span(arguments[pin.index])
@@ -268,6 +322,12 @@ def _binder(pair: Node, name: str, data: bytes) -> Node | None:
                 return ancestor if parameters.type == "formal_parameters" else None
         ancestor = ancestor.parent
     return None
+
+
+def _is_this_parameter(parameter: Node) -> bool:
+    """Whether ``parameter`` is TypeScript's ``this: T``, which no call passes."""
+    pattern = parameter.child_by_field_name("pattern")
+    return pattern is not None and pattern.type == "this"
 
 
 def _parameter_name(parameter: Node, data: bytes) -> str | None:
@@ -329,7 +389,8 @@ def _declaration(root: Node, data: bytes, pin: ParameterPin) -> Node | None:
 
     Every mention of the name that is not the declaration itself must be the
     callee of a call whose arguments are all visible at the parameter's
-    position and before it, and supply a boolean literal there or nothing.
+    position and before it, and supply a boolean literal there or nothing —
+    or, for an option, an object literal setting it to one or leaving it out.
     """
     declarations: list[tuple[Node, Node]] = []
     for node in _walk(root):
@@ -364,9 +425,24 @@ def _declaration(root: Node, data: bytes, pin: ParameterPin) -> Node | None:
         elements = _elements(arguments)
         if any(e.type == "spread_element" for e in elements[: pin.index + 1]):
             return None
-        if len(elements) > pin.index and elements[pin.index].type not in _BOOLEANS:
+        if len(elements) > pin.index and _pinned_value(call, data, pin) not in _BOOLEANS:
             return None
     return binder
+
+
+def _pinned_value(call: Node, data: bytes, pin: ParameterPin) -> str | None:
+    """The literal ``call`` pins the flag to: the boolean it passes for the
+    parameter or option, else the default; ``None`` when it is neither."""
+    arguments = _elements(call.child_by_field_name("arguments"))
+    argument = arguments[pin.index] if len(arguments) > pin.index else None
+    if not pin.option:
+        return argument.type if argument is not None else pin.default
+    passed = ts_option_params.passed(argument, pin.parameter, data)
+    if passed is None:
+        return None
+    if passed.value is None:
+        return pin.default
+    return passed.value.type
 
 
 def _calls(root: Node, data: bytes, function: str) -> list[Node]:
@@ -378,41 +454,6 @@ def _calls(root: Node, data: bytes, function: str) -> list[Node]:
         and callee.type == "identifier"
         and _text(callee, data) == function
     ]
-
-
-def _element_span(node: Node) -> tuple[int, int] | None:
-    """The bytes deleting ``node`` from its comma-separated list removes.
-
-    The separator BEFORE it goes too, or after it when it is the first; the
-    sole element takes the whole interior with it, so ``{ 'k': on }`` becomes
-    ``{}`` as the entry rules leave it. ``None`` when the span holds a comment.
-    """
-    container = node.parent
-    if container is None:
-        return None
-    elements = _elements(container)
-    position = next((n for n, e in enumerate(elements) if e.id == node.id), None)
-    if position is None:
-        return None
-    if len(elements) == 1:
-        start, end = container.children[0].end_byte, container.children[-1].start_byte
-    elif position > 0:
-        start, end = elements[position - 1].end_byte, node.end_byte
-    else:
-        start, end = node.start_byte, elements[1].start_byte
-    if any(
-        child.type == "comment" and start <= child.start_byte and child.end_byte <= end
-        for child in container.children
-    ):
-        return None
-    return start, end
-
-
-def _elements(container: Node | None) -> list[Node]:
-    """A list's elements, without the comments the grammar names alongside them."""
-    if container is None:
-        return []
-    return [child for child in container.named_children if child.type != "comment"]
 
 
 def _keyed(pair: Node, data: bytes, flag_key: str) -> bool:

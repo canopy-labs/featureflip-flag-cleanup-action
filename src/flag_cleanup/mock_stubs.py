@@ -113,6 +113,20 @@ TEST_ROWS = "test rows"
 #: removed value, and now runs with the kept one; carries the member and its
 #: line, for review.
 REBUILT = "rebuilt with the kept value"
+#: A C# test with a phase cut (:data:`TEST_PHASE`) whose name still states
+#: the branch the cut took (``…_UntilTheGateIsOn``); carries the test's name
+#: (:mod:`flag_cleanup.cs_kept_tests`).
+FALSE_TITLE = "false title"
+#: A ``[Theory]`` the run left with one ``[InlineData]`` row, rewritten as a
+#: ``[Fact]`` with each parameter's value written where it was read; carries
+#: the test's name and the values.
+THEORY_FACT = "theory made a fact"
+#: A kept C# test whose name held the removed gate's kept state as a part of
+#: its own (``…_GateOn_…``), renamed without it; carries ``old\nnew``.
+RENAMED_METHOD = "renamed test method"
+#: A kept C# test whose name still states the removed gate's state and was
+#: not renamed; carries the test's name and why.
+GATE_NAMED = "named for the gate"
 
 #: An argument list's tail after the key: balanced to three levels, which
 #: covers matchers such as ``any(Context.class)`` and ``It.IsAny<C>()``.

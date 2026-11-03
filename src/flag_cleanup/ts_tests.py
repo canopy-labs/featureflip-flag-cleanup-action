@@ -435,7 +435,7 @@ def title_nodes(root: Node, data: bytes) -> frozenset[int]:
     the two apart.
     """
     found = set()
-    for node, _callee, _title in _titled_tests(root, data):
+    for node, _callee, _title in _titled_tests(root, data, parametrised=True):
         arguments = node.child_by_field_name("arguments")
         if arguments is not None and hands_callback(arguments):
             found.add(arguments.named_children[0].id)
@@ -477,7 +477,7 @@ def data_mention(source: str, language: str, flag_key: str) -> str | None:
     )
     titles = {
         arguments.named_children[0].id
-        for node, _callee, _title in _titled_tests(root, data)
+        for node, _callee, _title in _titled_tests(root, data, parametrised=True)
         if (arguments := node.child_by_field_name("arguments")) is not None
     }
     for node in _walk(root):
@@ -628,21 +628,61 @@ def _pins(pair: Node, data: bytes, flag_key: str, untreated: str) -> bool:
     )
 
 
-def _titled_tests(root: Node, data: bytes) -> list[tuple[Node, str, str]]:
-    """``(call, callee text, title)`` for every test-shaped call, in source order."""
+def _titled_tests(
+    root: Node, data: bytes, *, parametrised: bool = False
+) -> list[tuple[Node, str, str]]:
+    """``(call, callee text, title)`` for every test-shaped call, in source order.
+
+    ``parametrised`` also admits ``it.each(rows)('title', cb)`` and its
+    spellings. Only the two callers that ask whether a title is INERT pass it
+    (:func:`title_nodes`, :func:`data_mention`). The ones that act on the test,
+    deleting or retitling it (:func:`find_pinned_tests`,
+    :func:`rename_kept_titles`), do not: one declaration stands for several
+    runs, whose titles are filled in from the rows, so nothing here proves the
+    title chosen for the declaration describes each of them.
+    """
     found = []
     for node in _walk(root):
         if node.type != "call_expression":
             continue
         callee = node.child_by_field_name("function")
         arguments = node.child_by_field_name("arguments")
-        if callee is None or arguments is None or not _is_test_callee(callee, data):
+        if callee is None or arguments is None:
+            continue
+        if not _is_test_callee(callee, data) and not (
+            parametrised and _is_parametrised_callee(callee, data)
+        ):
             continue
         first = arguments.named_children[0] if arguments.named_children else None
         title = _literal_text(first, data) if first is not None else None
         if title is not None:
             found.append((node, _text(callee, data), title))
     return sorted(found, key=lambda entry: entry[0].start_byte)
+
+
+def _is_parametrised_callee(callee: Node, data: bytes) -> bool:
+    """``it.each(rows)``, ``test.only.each(rows)`` or ``` it.each`table` ```.
+
+    The callee of a parametrised test's own call is itself a call, whose
+    function is a ``.each`` member chain rooted at a test callee. A chain rooted
+    at anything else (``foo.each(rows)('k', cb)``) is not a test.
+    """
+    if callee.type != "call_expression":
+        return False
+    inner = callee.child_by_field_name("function")
+    if inner is None or inner.type != "member_expression":
+        return False
+    prop = inner.child_by_field_name("property")
+    if prop is None or _text(prop, data) != "each":
+        return False
+    target = inner.child_by_field_name("object")
+    while target is not None and target.type == "member_expression":
+        target = target.child_by_field_name("object")
+    return (
+        target is not None
+        and target.type == "identifier"
+        and _text(target, data) in _TEST_CALLEES
+    )
 
 
 def _is_test_callee(callee: Node, data: bytes) -> bool:
@@ -719,3 +759,211 @@ def _line_before(data: bytes, start: int) -> bytes | None:
 
 def _text(node: Node, data: bytes) -> str:
     return data[node.start_byte : node.end_byte].decode("utf-8")
+
+
+# --- Test scaffolding left describing the removed branch (report only) -----
+
+#: The ``bindings`` kind of a negative assertion on text only the removed
+#: branch rendered: it now holds whatever the code does. Text ``"<line>: <statement>"``.
+VACUOUS_ASSERTION = "vacuous assertion"
+
+#: The ``bindings`` kind of a kept test whose title still describes what the
+#: removed branch did. Text: the title.
+STALE_TITLE = "stale test title"
+
+#: Testing Library queries: ``getByText``, ``queryAllByRole``, ``findByLabelText``…
+_QUERY = re.compile(r"^(get|query|find)(All)?By(Text|Role|LabelText|PlaceholderText|DisplayValue|AltText|Title|TestId)$")
+
+#: Matchers that say an element is there (``not`` turns them around).
+_PRESENT = frozenset({"toBeInTheDocument", "toBeVisible", "toBeTruthy", "toBeDefined"})
+#: Matchers that say it is not.
+_ABSENT = frozenset({"toBeNull", "toBeFalsy", "toBeUndefined"})
+
+#: Words two titles share without being about the same behaviour.
+_TITLE_STOPWORDS = frozenset(
+    """
+    a an the and or but if when while with without to of in on at for from by as is are
+    be it its it's this that these those not no nothing only still even then than
+    render renders rendered rendering show shows shown showing display displays
+    return returns call calls work works should does do doing test tests page
+    component user users value values state data default one two any all some
+    new old instead after before once until
+    """.split()
+)
+
+
+def _stems(title: str) -> set[str]:
+    words = re.findall(r"[a-z]+", title.lower())
+    stems = set()
+    for word in words:
+        if len(word) < 4 or word in _TITLE_STOPWORDS or re.fullmatch(_SUBJECTS, word):
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+                word = word[: -len(suffix)]
+                break
+        if word not in _TITLE_STOPWORDS:
+            stems.add(word)
+    return stems
+
+
+def _query_key(call: Node, data: bytes) -> tuple[str, tuple[str, str, str | None]] | None:
+    """``(verb, (kind, text, name))`` of a Testing Library query call whose
+    text is a plain string: ``queryByText('X')``, ``getByRole('button',
+    { name: 'Add' })``."""
+    callee = call.child_by_field_name("function")
+    if callee is not None and callee.type == "member_expression":
+        callee = callee.child_by_field_name("property")
+    if callee is None or callee.type not in ("identifier", "property_identifier"):
+        return None
+    match = _QUERY.match(_text(callee, data))
+    if match is None:
+        return None
+    arguments = call.child_by_field_name("arguments")
+    named = [] if arguments is None else [c for c in arguments.named_children if c.type != "comment"]
+    first = _literal_text(named[0], data) if named else None
+    if first is None:
+        return None
+    name = None
+    if match.group(3) == "Role" and len(named) > 1 and named[1].type == "object":
+        for pair in named[1].named_children:
+            key = pair.child_by_field_name("key") if pair.type == "pair" else None
+            if key is not None and _key_text(key, data) == "name":
+                value = pair.child_by_field_name("value")
+                name = _literal_text(value, data) if value is not None else None
+                if name is None:
+                    return None
+    return match.group(1), (match.group(3), first, name)
+
+
+def _assertion_sense(call: Node, data: bytes) -> str | None:
+    """``"present"``/``"absent"`` for ``expect(<call>)…<matcher>()``."""
+    arguments = call.parent
+    holder = arguments.parent if arguments is not None and arguments.type == "arguments" else None
+    if holder is None or holder.type != "call_expression":
+        return None
+    callee = holder.child_by_field_name("function")
+    if callee is None or callee.type != "identifier" or _text(callee, data) != "expect":
+        return None
+    negated, node = False, holder
+    while node.parent is not None and node.parent.type == "member_expression":
+        prop = node.parent.child_by_field_name("property")
+        name = _text(prop, data) if prop is not None else ""
+        if name == "not":
+            negated = not negated
+            node = node.parent
+            continue
+        outer = node.parent.parent
+        if outer is None or outer.type != "call_expression":
+            return None
+        if name in _PRESENT:
+            return "absent" if negated else "present"
+        if name in _ABSENT:
+            return "present" if negated else "absent"
+        return None
+    return None
+
+
+def _assertions(root: Node, data: bytes) -> list[tuple[Node, str, tuple[str, str, str | None]]]:
+    """``(call, sense, key)`` for each query call: ``present`` for a
+    ``get``/``find`` (they throw when nothing matches) or an assertion that it
+    is there, ``absent`` for one that it is not."""
+    found = []
+    for node in _walk(root):
+        if node.type != "call_expression":
+            continue
+        query = _query_key(node, data)
+        if query is None:
+            continue
+        verb, key = query
+        sense = "present" if verb in ("get", "find") else _assertion_sense(node, data)
+        if sense is not None:
+            found.append((node, sense, key))
+    return found
+
+
+def removed_texts(before: str, after: str, language: str) -> frozenset[str]:
+    """The JSX text ``before`` rendered that ``after`` no longer holds."""
+    if language == "ts":
+        return frozenset()
+    old = _jsx_texts(_parse(before, language), before.encode("utf-8"))
+    return frozenset(t for t in old if t not in after)
+
+
+def _jsx_texts(root: Node, data: bytes) -> set[str]:
+    texts = set()
+    for node in _walk(root):
+        if node.type == "jsx_text":
+            text = " ".join(_text(node, data).split())
+            if len(text) > 1 and re.search(r"[^\W\d_]", text):
+                texts.add(text)
+    return texts
+
+
+def stale_scaffolding(
+    before: str,
+    after: str,
+    language: str,
+    flag_key: str,
+    deleted: frozenset[str] = frozenset(),
+    renamed: frozenset[str] = frozenset(),
+    gone: frozenset[str] = frozenset(),
+) -> tuple[list[str], list[str]]:
+    """What a changed test file still says about the branch the run removed:
+    ``("<line>: <statement>", …)`` for each negative assertion now vacuous,
+    and each kept title that still describes the removed behaviour.
+
+    A negative assertion (``expect(queryByText('X')).not.toBeInTheDocument()``)
+    is vacuous when only the removed branch could make ``X`` appear: every
+    query that said it was there sat in a test this run deleted (``before``
+    had one, ``after`` has none), or ``X`` is JSX text the run deleted from
+    the code under test (``gone``). A kept title is stale when it speaks of
+    the flag ("waits for flags to load …"), does not name the key (that is
+    :func:`rename_kept_titles`' case), was not just renamed (``renamed``),
+    and either shares a word with the title of a test the run deleted from
+    this file (``deleted``: "… instead of redirecting" beside "redirects a
+    typed URL …") or holds one of the vacuous assertions. Report only: a
+    reviewer pointer, never an edit.
+    """
+    if not covers(language) or before == after:
+        return [], []
+    data = after.encode("utf-8")
+    root = _parse(after, language)
+    titled = _titled_tests(root, data)
+    if not titled:
+        return [], []
+    old_data = before.encode("utf-8")
+    present_before = {k for _n, s, k in _assertions(_parse(before, language), old_data) if s == "present"}
+    current = _assertions(root, data)
+    present_after = {k for _n, s, k in current if s == "present"}
+    vacuous: list[tuple[int, Node]] = []
+    for node, sense, key in current:
+        if sense != "absent" or key in present_after:
+            continue
+        if key in present_before or (key[0] != "TestId" and (key[2] or key[1]) in gone):
+            statement = node
+            while statement.parent is not None and statement.type != "expression_statement":
+                statement = statement.parent
+            vacuous.append((statement.start_point[0] + 1, statement))
+    rows: list[str] = []
+    seen: set[int] = set()
+    for line, statement in vacuous:
+        if statement.id in seen:
+            continue
+        seen.add(statement.id)
+        rows.append(f"{line}: {_text(statement, data).splitlines()[0].strip()}")
+    key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", re.IGNORECASE)
+    subject = re.compile(rf"\b(?:{_SUBJECTS})\b", re.IGNORECASE)
+    deleted_stems = set().union(*(_stems(t) for t in deleted)) if deleted else set()
+    titles: list[str] = []
+    for node, callee, title in titled:
+        if "describe" in callee.split(".")[0]:
+            continue  # a group's title names its subject, not a behaviour
+        if title in renamed or key.search(title) or not subject.search(title):
+            continue
+        holds = any(_contains(node, statement) for _l, statement in vacuous)
+        if holds or _stems(title) & deleted_stems:
+            if title not in titles:
+                titles.append(title)
+    return rows, titles
+

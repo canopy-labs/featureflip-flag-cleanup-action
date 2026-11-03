@@ -3221,6 +3221,52 @@ the default. The pull request lists each call and element it shortened, and
 each emptied override it kept (`<Provider flags={{}}>`), since the prop or
 argument carrying it may now be pointless.
 
+When the value the fold wrote was the last thing setting an option, the
+option goes from the function too. `useRole(id, { enabled: true })` becoming
+`useRole(id)` leaves `{ enabled = true }: { enabled?: boolean } = {}` with no
+call that sets it, so the parameter is removed (or just the member and its
+type, beside other options) and each read gets the default:
+`useMembers(id, { enabled })` becomes `useMembers(id, { enabled: true })`.
+The value is not followed any further. Every call has to be in sight: the
+function is declared once at the top of a module, exported directly or by
+one `export { … }` or not at all, and every other mention of its name in the
+repository is a call, or one plain `import { … }` of it from that file. A
+re-export, a namespace import, an alias, the function passed as a value, its
+name in a string or a markup file, a call that spreads its arguments or its
+options (`{ ...options }`), or one that still sets the option, even to the
+default, leaves the option where it is. So does a read the substitution
+would leave as a constant condition (`if (enabled)`), or one where `true`
+could type as `true` rather than `boolean`: a bare argument (`f(enabled)`),
+an object under `as const`, `satisfies` or a type assertion, or an object
+handed to a function that has type parameters or cannot be found. The
+object must initialize a variable, be what the function returns, or go to a
+function declared without type parameters. An option the run did not set
+itself is left alone too. The pull request lists each one removed.
+
+**A Featureflip test provider left serving nothing is unwrapped** when nothing
+the test renders could read a flag. A test file whose
+`<TestFeatureflipProvider flags={{ 'old-checkout': true }}>` the removal
+emptied (to `flags={{}}`, or to no `flags` at all) gets the provider replaced
+by what it wrapped, and its import goes as any stranded import does. The
+provider is the React SDK's own `TestFeatureflipProvider`, or your wrapper of
+it: an exported function in your repository whose whole body returns the
+SDK's provider around `{children}`. It is unwrapped only when every module the
+test file loads, followed through every module those load in turn (static
+imports, re-exports, `import()` and `require()`), never loads a
+`@featureflip/` package; one component two imports down that reads another
+flag keeps the provider, since the SDK's hooks throw without one. A package
+is not read (the checkout has no `node_modules`): a bare import must be a
+dependency some `package.json` above the file declares with a registry
+version, and is then taken not to load Featureflip, so a package of your own
+that wraps the SDK fails that test loudly rather than silently. A module that
+cannot be resolved or parsed, a file that is neither TypeScript/JavaScript nor
+a stylesheet, image, font, media file or JSON (an `.mdx` or `.vue` file is
+code), a bare name no `package.json` declares (it may
+be a bundler alias), a load not named by a string, a mock of the SDK or an
+automock in the test file, another element of the provider that still serves
+a flag or passes another prop, or the provider's name used other than as an
+element, all keep it. The pull request lists each one unwrapped.
+
 **An entry set to the branch being removed is evidence about the code around
 it**, not just leftover residue. If the flag serves `true` and an entry reads
 `{ 'old-checkout': false }`, it pins the flag to the branch this removal
@@ -3324,6 +3370,20 @@ only a string, so a wrong rewrite cannot break your build, and the pull
 request lists every rewrite, old title and new, under "tests were renamed".
 This happens only in files the run changed.
 
+Two more things a kept test can still say about the removed branch are
+**listed, never edited**, under "test lines may still describe the removed
+branch":
+
+* an assertion that something is *not* shown
+  (`expect(screen.queryByText('Settings')).not.toBeInTheDocument()`, or
+  `.toBeNull()`) on text that only the removed branch could show: every query
+  that found that text sat in a test the run deleted, or the text was JSX the
+  run deleted from the code. It now passes whatever the code does;
+* a title that speaks of the flag without naming it ("waits for flags to load
+  instead of redirecting") and shares a word with a test the run deleted from
+  the same file ("redirects to the settings page while the flag is off"), or
+  that holds such an assertion.
+
 Java and Kotlin titles go the same way, with the same shapes: `@DisplayName("…")`,
 a Kotlin function named in backticks, and a Kotest, Spek or minutest
 `test("…") { }`, `it("…") { }`, `should("…") { }`, `context("…") { }` or
@@ -3356,6 +3416,29 @@ passing a variable, leaves the calls and their tests as written. The override
 itself still goes when the parameter is provably a boolean, as described
 earlier for a value that is a name, and the parameter is then listed under
 "no longer read".
+
+The same goes for an **option of a destructured parameter**:
+
+```ts
+function renderGate({ ssoFlag = false } = {}) {
+  return render(<TestFeatureflipProvider flags={{ 'old-checkout': ssoFlag }}>…);
+}
+
+renderGate({ ssoFlag: true });   // becomes renderGate()
+```
+
+The option has to be a shorthand binding with a `true`/`false` default, read by
+nothing in the helper but the override, in a parameter that defaults to `{}`
+or to nothing and has no `...rest`. Every call has to pass an object literal
+that sets the option to `true`/`false` or leaves it out, with no spread or
+computed key, or pass nothing. A call that leaves it out pins the default. The
+option goes from the pattern, from its member in an inline object type, and
+from every call. When it was the parameter's only option, the parameter (which
+must then be the last) and the argument each call passed for it go too. Beside
+other options, only it goes, and a call left passing `{}` as its last argument
+drops it when the parameter defaults to `{}`. An exported helper, a spread or
+a non-literal value leaves the option and its calls as written, and the
+override goes alone, as for a plain parameter.
 
 **A test file that still hands the key to the code under test is left exactly
 as it was.** Stripping a test's overrides, and deleting its tests about the
@@ -3451,6 +3534,37 @@ A call is matched by the name it ends in (`featureflags.GetClient(…)` matches
 Anything only the deleted call used, such as its import, is then removed as
 any other stranded binding is. The pull request names each call deleted this
 way, as your call rather than a proof.
+
+A few **read-only framework hooks** are deleted the same way without being
+named: React Router's `useParams`, `useLocation` and `useMatch` (from
+`react-router` or `react-router-dom`), React's `useContext`, and the
+Featureflip React SDK's `useFeatureflipClient` and `useFeatureflipStatus`.
+Each only reads a context, so a component whose flag read
+went and that no longer uses what one returned is left with a call that does
+nothing (`useParams<{ orgId: string }>();`). It is deleted when:
+
+* the removal itself left it behind, under the same conditions as above;
+* the name is the package's own export: a name bound once in the file, by an
+  import of that hook from that package (or `React.useContext` on React's
+  default or namespace import), and no `tsconfig`/`jsconfig` `paths` entry can
+  read the package name as one of your files;
+* it runs unconditionally: a statement of its component's own body, with no
+  statement before it that can return or throw. A hook call inside a
+  condition, a loop or a nested block is kept.
+* no test in the repository mocks the hook's package with a factory that
+  names the hook, or spies on it (such a test may count its calls). One that
+  does keeps the call, and the pull request lists it.
+
+`useId` and `useSearchParams` are not on the list: deleting a `useId` call
+renumbers every id React generates after it, and `useSearchParams` keeps
+state of its own.
+
+Deleting an unconditional hook call changes the hook order the same way on
+every render, which React allows. The hook only works inside a tree that
+already loaded its package (a router, a provider, React itself), so when it was
+the file's last use of that import, the import goes too, with no bare
+`import 'react-router-dom';` left to keep the load. The pull request lists each
+call deleted this way.
 
 ## The key hoisted to a constant
 
@@ -4891,6 +5005,37 @@ project file, and no `typeof` of it). Every mention of the method must be a
 call (`Owner.M(…)`, or `M(…)` inside the class) passing an argument that does
 no work for it, and a `public` method must not be in a project that may be
 packed. Otherwise the parameter stays.
+
+When the fold, or that removal, leaves such a static method doing nothing but
+calling one method on one of its parameters, passing its other parameters on
+unchanged (`ForStorage(string secret, IProtector protector) =>
+protector.Protect(secret)`), each call is rewritten to make that call itself
+(`SecretFormat.ForStorage(secret, _protector)` becomes
+`_protector.Protect(secret)`) and the method is deleted with its doc comment.
+Only a method this run reduced is considered: one that already only forwarded
+is left alone, and not reported. The method must meet the conditions above,
+with no parameter carrying a modifier, attribute or default value. Nothing may
+reach it by reflection: no string spells its name and no `cref` names it. A
+non-public one must not be in a project that grants `InternalsVisibleTo` to
+an assembly the repository does not build. The parameter it calls on must be
+typed as a class or interface the repository declares once, with no base list
+and one member of the called name: a `public` instance method with no
+attribute or type parameter whose parameter types and return type are written
+as the helper's. Each call must sit outside every lambda, anonymous method and
+query (an expression tree records the call), and pass one positional argument
+per parameter, each a literal, a name or a chain of member reads, so that
+evaluating the receiver first changes nothing. The receiver argument must be
+known to be of exactly the parameter's type, not of a class implementing it,
+and the calling file must not use `dynamic`. The class's name must mean only
+the class wherever it is spelled: a property, field, local or parameter with
+that name, or `x.Owner.M(…)`, keeps the method (this check also applies to
+the parameter removal above). Any `InternalsVisibleTo` written in a form
+other than a plain string literal or a self-closing project item counts as
+naming an outside assembly. The parameter's type must be declared in the
+helper's own project, and no `#nullable` directive may sit in the helper's
+file, that type's file or a calling file. Otherwise the method stays, and
+the pull request names it with the reason, since its doc comment may still
+describe what was removed.
 
 A type constructed from a name the repository's C# never spells, such as one
 read from configuration and passed to `Type.GetType`, cannot be seen, and
@@ -6353,6 +6498,27 @@ means no PR.
   in the pull request, and every rewrite is checked by parsing the file again:
   its code must be exactly what it was, or the file is left alone.
 
+  **A comment directly above the flag's own read, a variable holding it, or
+  its registry entry goes with it**, whatever it says, once the run deletes
+  that line: the comment explained a line that is gone. Directly above means
+  an own-line comment with no blank line between. Below a read or a variable
+  there must be a blank line, the end of the block or the end of the file,
+  or the comment may describe the next statement too. Registry entries sit on
+  adjacent lines, so an entry's comment also goes when the next entry has a
+  comment of its own. When the next entry follows without one, the comment
+  may be about both, so it is kept and listed. Each removed comment appears
+  in full in the pull request. A comment above any other statement the run
+  deletes is kept and listed, unless it describes the flag's state ("while
+  the flag is off"). A read counts only as the whole statement or the whole
+  value of one plain variable: a statement that uses it inside something
+  else (an assertion, an argument, an object or array, a property of an
+  object) is "any other statement". Doc comments, tool directives
+  (`eslint-disable`, `noqa`, `NOSONAR`, …) and comments naming the flag are
+  never removed this way, and nothing is removed while the flag is still read
+  in that language and directory. In Python and Ruby only the registry-entry
+  half applies so far: a comment above a deleted read or variable there is
+  left in place.
+
   **A comment beside the change that describes a flag's state is reported
   even when it does not name the flag.** A comment on a line the run changed,
   or directly above one, that says "the flag is on/off", "flag is
@@ -6371,7 +6537,11 @@ means no PR.
   phrase, so a hedge in another sentence of the same comment does not count.
   In a comment of several lines, only a line that names the flag is left to
   the paragraph about kept comments; the comment's other lines are still
-  read for a state phrase.
+  read for a state phrase. The doc comment of a function, method, class or
+  component (`/** … */` directly above it, or above the `export` or `const`
+  that names it) counts as beside every change inside it, however far down
+  the body the fold sits, and the sentence of it that describes a branch is
+  the one listed.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift

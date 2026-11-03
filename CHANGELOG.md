@@ -8,6 +8,150 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.5.0
+
+### Added
+
+- **TypeScript and JavaScript:** a discarded call to a read-only framework
+  hook that a removal leaves behind (`useParams<{ orgId: string }>();` once
+  nothing reads the route parameter) is deleted without being listed in
+  `side-effect-free-calls`: React Router's `useParams`, `useLocation` and
+  `useMatch`, React's `useContext`, and the Featureflip React SDK's
+  `useFeatureflipClient` and `useFeatureflipStatus`.
+  Only when the call is that package's own export and runs unconditionally at
+  the top of its component; one inside a condition, a loop or after an early
+  return is kept, and so is one whose hook a test mocks or spies on (it is
+  listed). When it was the file's last use of the import, the import
+  goes with it. The pull request lists each call deleted this way.
+- **TypeScript and JavaScript tests:** a kept test that still describes the
+  removed branch is now listed in the pull request, under "test lines may
+  still describe the removed branch": a negative assertion
+  (`expect(screen.queryByText('X')).not.toBeInTheDocument()`, `.toBeNull()`)
+  on text only the removed branch showed, and a title that speaks of the flag
+  without naming it and shares a word with a test the removal deleted from
+  the same file. Nothing is edited.
+- **TypeScript and JavaScript tests:** a Featureflip test provider whose flag
+  overrides the removal emptied (`<TestFeatureflipProvider flags={{}}>`) is
+  replaced by what it wrapped, and its import removed, when nothing the test
+  renders can read a flag: no module the test file loads, followed through
+  every module those load, loads a `@featureflip/` package. The React SDK's
+  own provider and a wrapper of it in your repository both count. A provider
+  around a tree that reaches a flag read, however deep, is kept, and so is
+  one around a module that cannot be resolved or parsed. The pull request
+  lists each provider unwrapped.
+- **TypeScript and JavaScript (JSX):** a wait for the flags to load that the
+  removal left guarding nothing now goes. When a component waited for the
+  flag client to be ready (`if (!resolved) return <Spinner />;`) only so that
+  its own flag read would not act on the value read before then, and the
+  removal took out the last flag read in it, the early return and the hook
+  call it tests are deleted. The wait is recognised from the React SDK's
+  `useFeatureflipStatus()` (destructured `isReady`) or from a hook of your
+  own that reaches it through named imports and re-exports and does nothing
+  but read the client's status, call its `initialize`, and keep React state.
+  The hook must also return a wait (`isReady`, combined only with its own
+  state and `|| isError`): one returning `!isError` is an error fallback and
+  is left alone. Nothing else left in the component may be able to read a
+  flag: every name left in it, called, rendered or handed on as a value
+  (`createElement(Page)`, `<Route Component={Page} />`), must be bound inside
+  it, an HTML element, or a React or React Router hook or one of a few of
+  their components (`Navigate`, `Outlet`, `Link`, …). The wait is kept, and
+  named in the pull request, when a test file drives it (it names the hook,
+  as a mock does, and imports the component through your modules) and, when
+  the component itself stays (below), while a test file renders the
+  component.
+- When that leaves a component named for a gate (`…Gate`, `…Guard`) that
+  only renders its `children`, every `<Gate>…</Gate>` in the repository is
+  replaced by its one child element, the import of it goes, and the
+  component's file and its own test file (named for it, holding nothing but
+  setup and groups named for the component) are deleted. This needs every use
+  of the component proven, as for a prop removed from an exported component:
+  an element with attributes or with anything but one child element, a
+  re-export, a namespace import, a mention of the component or its file
+  anywhere but the import (a `vi.mock` of its path), or a bare import in its
+  file (`import './theme.css';`) keeps the component and its files.
+- The pull request lists each wait and component removed, and each wait kept
+  with the reason.
+
+### Changed
+
+- **C#:** a static helper that the removal leaves doing nothing but calling
+  one method on one of its parameters
+  (`ForStorage(string secret, IProtector protector) => protector.Protect(secret)`)
+  is inlined: every call becomes the call it forwarded
+  (`_protector.Protect(secret)`) and the helper goes with its doc comment.
+  This happens only for a helper the run itself reduced, when every call in
+  the repository is found and passes plain values, nothing can reach the
+  helper by reflection, a `cref` or a method group, and the called method
+  is the only one of its name on a class or interface the repository
+  declares, taking and returning the same types. A helper that cannot be
+  inlined is kept and listed in the pull request with the reason, since its
+  doc comment may still describe the removed flag.
+- **C#:** when a gate interface's removal leaves an xUnit `[Theory]` with a
+  single `[InlineData]` row, the theory becomes a `[Fact]`: the row and the
+  parameters go, and each parameter's value is written where it was read,
+  with whatever that value makes constant folded like a flag read
+  (`if (false) { … }` goes). This is done for `bool`, `int` and plain
+  `string` parameters, and only when the method carries nothing but
+  `[Theory]`, the row and `[Trait]`. A `string` value is written only
+  where it cannot become part of a constant expression: as an argument, an
+  assigned or initial value, a `return` value or an interpolated value. An
+  `int` value is written only as an assigned or initial value, a method's
+  `return` value or an interpolated value, where its type is fixed: as an
+  argument, an initializer's element or a lambda's result, the constant
+  could choose another overload than the variable did (`F(2)` calls
+  `F(byte)` where `F(n)` called `F(long)`).
+  A theory with `[MemberData]`, `[ClassData]` or any other attribute that can
+  add rows, whose parameter is assigned, passed by `ref`/`out`, read under
+  `nameof`, declared again inside it or used anywhere else, or with a file
+  named for it (a snapshot such as `Tests.Method_on=True.verified.txt`),
+  keeps its one row. The pull request lists each theory rewritten.
+- **C#:** a test kept by a gate interface's removal whose name holds the
+  gate's kept state as a part of its own (`EnsureCanSet_GateOn_Passes`,
+  `Process_WithTheExpirationGateOn`) is renamed without that part
+  (`EnsureCanSet_Passes`, `Process`), when nothing else in the repository
+  spells the method's name (comments and documents included), no file is
+  named for it (a snapshot such as `Tests.Method.verified.txt`), neither the
+  test's class, another part of it nor a class it derives from already has a
+  member with the new name, and the test itself ties the name to the removed
+  gate: the name names the gate (`ExpirationGateOn`), the test's body uses
+  the removed gate, or the removal deleted a test beside it whose name holds
+  the opposite state and shares another part with it (`GateOn_PastExpiry_…`
+  and `GateOff_PastExpiry_…`). A name that also names another gate, or a
+  test whose body uses another gate, is left alone.
+  A name about the removed gate that cannot be renamed, or that names the
+  state the removal deletes, is listed in the pull request for a person to
+  rename.
+- **C#:** when a test is cut down to the part that runs at the kept value, and
+  its name says what happened at the removed one
+  (`Job_DoesNothing_UntilTheEncryptionGateIsOn`, `GateSwitchedOff_…`), the
+  pull request's note about the cut now says the name is false, so a reviewer
+  can rename the test or delete it.
+- **Every language:** the doc comment of the function, method, class or
+  component that holds a folded read (a `/** … */` directly above it, or above
+  the `export`/`const` that names it) is now reported when it describes a
+  flag's state or says "the flag", even when the fold sits far down the body
+  and the comment never names the key. It is listed by the branch it
+  describes, from the sentence that describes one. It is never edited.
+- **TypeScript and JavaScript:** in a repository with several packages, a computed `import(name)` or `require(name)` in an unrelated package no longer blocks removing an unused prop or option from an exported component or function. Such a load still blocks it when the file holding it could load the component's package: a file in the same package (the same nearest `package.json`), in a package that lists the component's package by name in its `dependencies`, `devDependencies`, `peerDependencies` or `optionalDependencies`, or in no package at all. It also still blocks it when a `package.json` on the way cannot be read, or when the component's own file has no `package.json` above it. A bundler glob (`import.meta.glob`, `require.context`) blocks it wherever it is, since its pattern can name another package's files by a relative path.
+- **TypeScript and JavaScript:** when a removal reduces a local to another local's name (`const visible = enabled && canManage;` becoming `const visible = canManage;`), the alias is removed and its reads use the original name, `{ visible }` becoming `{ visible: canManage }`. Both must be `const` declarations of the same block, and neither name may be declared or assigned again there. An alias the removal did not produce is left alone.
+
+### Fixed
+
+- **C#:** a flag `if` whose kept arm holds a `return`, `throw`, `break`,
+  `continue` or `goto` inside a `#if` branch is no longer rewritten when code
+  follows it. The fold keeps the arm's braces because of the directive, so in
+  a build that defines the symbol the code after the `if` became unreachable
+  (CS0162, an error under `TreatWarningsAsErrors`). The flag is refused,
+  rather than left as a pull request that breaks one build, when something
+  follows the arm. A jump that is conditional, that leaves a loop inside the
+  arm, or that has nothing after it is still folded.
+- A comment directly above the flag's own read, a variable holding it, or its registry entry is now deleted with that line instead of being left behind with nothing to explain. Registry entries are covered in every language; reads and variables in every language except Python and Ruby, where such a comment is still left in place. Before, a comment above a deleted read that did not describe the flag's state was only listed, and a comment above a deleted registry entry was not noticed at all: it stayed in place, and in the middle of a registry it then sat above the next flag's entry as if it described that one. Each removed comment appears in full in the pull request. A comment above a registry entry that the next entry may share (the next entry follows with no comment of its own) is kept and listed rather than deleted, as is a comment above any other statement the run deletes, including one that uses the read inside something else, such as an assertion or an argument.
+- **TypeScript:** a parametrised test title, such as `it.each([...])('hides the field when the flag is on', cb)` (also `test.each`, `describe.each`, the `.only.each` and `.skip.each` chains and the tagged-template form), is now treated as a title instead of live data. A title naming the flag no longer keeps its registry entry and every other flag-keyed entry in place, which could leave a test failing because its override no longer did anything. These tests are not deleted or retitled, since one declaration stands for several runs.
+- **TypeScript:** an override deleted because its value is a name that is provably a boolean is no longer also listed under "deliberately left in place" when a registry entry was being kept. It was listed in both places, and the diff showed it removed.
+- **TypeScript:** a test helper that sets a flag override from a destructured option, `function renderGate({ ssoFlag = false } = {})` feeding `flags={{ 'my-flag': ssoFlag }}`, no longer keeps the option after the override is removed, which left an unused binding for ESLint to reject. The option now goes from the helper and from every call, and when it was the only option, the whole parameter and the argument go with it: `renderGate({ ssoFlag: true })` becomes `renderGate()`. Each call pins the flag to the value it passes, or to the option's default, so a test passing the removed value is chosen by its title like any other pinned test. This needs a `true`/`false` default, a helper declared once in the file and not exported, and calls that pass an object literal with a `true`/`false` value or no value for the option. A spread, a computed key or a non-literal value leaves the helper and its calls as written.
+- **TypeScript and JavaScript:** a stranded import of a local module that only loads an audited `@featureflip/*` SDK is now deleted in a project whose root `tsconfig.json` is a solution config (`"files": []` plus `references`, the Vite template's default). Before, such a config made the proof give up, so the import stayed behind as a bare `import './useFlag';`. The configs a solution config names are read the way module resolution already reads them. The import is still kept when the referenced configs disagree, when one cannot be read or sits outside the checkout, or when a referenced config has a `paths` entry or `baseUrl` file that could answer the SDK's name.
+- **TypeScript:** when the removal leaves out the last argument that set an option, `useRole(id, { enabled: true })` becoming `useRole(id)`, the option no longer stays on the function with nothing left to set it. It now goes from the declaration, the whole parameter when it was the only option, and each read inside the function gets the default instead: `useMembers(id, { enabled })` becomes `useMembers(id, { enabled: true })`. This works for an exported function, including a hook called from other files, when every other mention of its name in the repository is a call or a plain named import of it. A re-export, a namespace import, an alias, a call that spreads its options or still sets the option, or a read in a condition leaves the option as written.
+
 ## 2.4.0
 
 ### Added

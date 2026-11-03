@@ -19,8 +19,19 @@ Allowed spellings:
 So a re-export (``export { Row } from``), a default export, a namespace
 import (``M.Row``), ``typeof Row``, ``Row.displayName`` or a mention in an
 ignored file, a ``.vue``/``.svelte``/``.astro``/``.mdx`` or HTML file refuses:
-each is a way to render the component this pass cannot see. A key computed at
-run time (``components[name]``) is never spelled, and cannot be seen.
+each is a way to render the component this pass cannot see.
+
+A module can also reach the component WITHOUT spelling its name:
+``import * as M`` then ``M[name]`` or ``Object.values(M)``, a default import,
+``import()``/``require()``, ``export * as``, or any of these through a barrel
+that ``export *``s the declaring file. So every specifier in the checkout that
+resolves to the declaring file or to such a barrel must be a plain import of
+names, a side-effect import, a named re-export, an ``export *`` (its module
+then counts as a barrel), or a test runner's ``mock(…)``; anything else
+refuses, and so does a bundler glob anywhere, or a computed
+``import()``/``require()`` in a file that could load the component's package:
+the same package, one that depends on it by name, or a file in no package. Specifiers the resolver cannot follow (a package's self-reference,
+``package.json`` ``imports``) are not seen.
 
 Every element across those files then has to pass the prop once as the same
 literal, with no spread, and the output has to pass it at more elements than
@@ -33,6 +44,8 @@ Every file edited must be one this run's engine processes.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -276,9 +289,12 @@ def _source(specifier: Node, data: bytes) -> str | None:
     return "".join(_text(c, data) for c in source.named_children if c.type == "string_fragment")
 
 
-def _exported_function(root: Node, data: bytes, component: str) -> tuple[Node, set[int]] | None:
+def _exported_function(
+    root: Node, data: bytes, component: str, private: bool = False
+) -> tuple[Node, set[int]] | None:
     """The function an exported top-level ``component`` is, with the ids of
-    the name nodes that declare and export it, or None."""
+    the name nodes that declare and export it, or None. With ``private``, a
+    declaration nothing exports qualifies too."""
     found: list[tuple[Node, Node, Node | None]] = []  # (name, function, export specifier)
     exports = [
         n
@@ -325,7 +341,7 @@ def _exported_function(root: Node, data: bytes, component: str) -> tuple[Node, s
     if exported:
         if specifiers:
             return None
-    else:
+    elif specifiers or not private:
         if len(specifiers) != 1 or specifiers[0].child_by_field_name("alias") is not None:
             return None
         allowed.add(specifiers[0].child_by_field_name("name").id)
@@ -348,13 +364,30 @@ def _element_name(node: Node) -> bool:
     )
 
 
-def _users(component, decl, allowed, files, by_resolved, repo_dir, in_run) -> list[_File] | None:
+def _users(
+    component,
+    decl,
+    allowed,
+    files,
+    by_resolved,
+    repo_dir,
+    in_run,
+    use=_element_name,
+    solution=False,
+    exempt=None,
+) -> list[_File] | None:
     """Every file spelling ``component`` (the declaring one first), each
-    proven to spell it only as allowed, or None."""
+    proven to spell it only as allowed, or None. ``use`` says which other
+    spelling is a use the caller can account for: a JSX element name by
+    default. ``solution`` resolves imports through a solution-style
+    ``tsconfig.json`` (see :func:`flag_cleanup.cross_file_ts.resolve_specifier`).
+    ``exempt(file)`` names a file whose spellings need no proof because the
+    caller deletes it whole; it is still returned."""
     word = re.compile(rf"(?<![\w$]){re.escape(component)}(?![\w$])")
     decl_resolved = str(Path(decl.path).resolve())
     users = [decl]
     seen_decl = False
+    sources: list[tuple[str, str]] = []
     for listed in source_index.files(repo_dir, with_ignored=True):
         if not str(listed.path).endswith(_extensions()):
             continue
@@ -362,9 +395,12 @@ def _users(component, decl, allowed, files, by_resolved, repo_dir, in_run) -> li
         if found is None:
             return None
         spelled, original, current = found
+        sources.append((spelled, current))
         if not word.search(current) and not word.search(original):
             continue
         if listed.resolved == decl_resolved:
+            if listed.ignored:
+                return None
             file = decl
             seen_decl = True
         else:
@@ -374,23 +410,323 @@ def _users(component, decl, allowed, files, by_resolved, repo_dir, in_run) -> li
             if root.has_error:
                 return None
             file = _File(spelled, original, current, root, current.encode("utf-8"))
-        if not _accounted(component, file, file is decl, allowed, decl_resolved, repo_dir):
+        if file is not decl and exempt is not None and exempt(file):
+            users.append(file)
+            continue
+        if not _accounted(
+            component, file, file is decl, allowed, decl_resolved, repo_dir, use, solution
+        ):
             return None
         if file is not decl:
             users.append(file)
     if not seen_decl:
         # The declaring file's own spellings went unchecked: outside the listing.
         return None
+    markup: list[tuple[str, str]] = []
     for listed in markup_files(repo_dir):
         try:
-            if word.search(listed.path.read_text(encoding="utf-8", errors="replace")):
-                return None
+            text = listed.path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
+        if word.search(text):
+            return None
+        markup.append((str(listed.path), text))
+    if _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution):
+        return None
     return users
 
 
-def _accounted(component, file, declaring, allowed, decl_resolved, repo_dir) -> bool:
+#: A module specifier as an import or an export spells it, or as the first
+#: argument of any call (``import(…)``, ``require(…)``, ``requireActual(…)``,
+#: ``importActual(…)``, ``mock(…)``). A superset: anything it finds resolving
+#: to a reached module that the parse below does not account for refuses.
+_SPECIFIER = re.compile(r"""(?:\bfrom|\bimport|\()\s*(['"`])([^'"`\s$]+)\1""")
+
+#: Where a computed ``import(…)``/``require(…)`` can be.
+_LOAD = re.compile(r"\b(?:import|require)\s*\(")
+
+#: Bundler globs that load every module a pattern matches.
+_GLOB = re.compile(r"\bimport\.meta\.glob(?:Eager)?\b|\brequire\.context\b")
+
+#: Test-runner calls that name a module and replace it: what they return is
+#: not the module, and a test still calls what it imports by name.
+_MOCKS = frozenset({"mock", "doMock", "unmock", "doUnmock"})
+
+
+def _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution) -> bool:
+    """Whether a module can reach the declaring file's exports without
+    spelling the name the caller proof follows.
+
+    The name scan in :func:`_users` sees every file that SPELLS the name. A
+    file can also reach it unspelled: ``import * as m`` (then ``m[key]`` or
+    ``Object.values(m)``), a default import, ``import()`` or ``require()``,
+    ``export * as``, or any of those through a barrel that ``export *``s the
+    declaring file. So every specifier in the checkout that resolves to the
+    declaring file, or to such a barrel (transitively), must be a plain
+    import of names, a side-effect import, a named re-export, or an
+    ``export *`` (which makes its module a barrel). A computed ``import()``
+    or ``require()`` can reach any module, and refuses too, wherever it could
+    load the declaring file's package (:func:`_may_load_package`). A bundler
+    glob (``import.meta.glob``, ``require.context``) refuses anywhere: its
+    pattern can name another package's files by a relative path.
+    """
+    cache: dict[tuple[str, str], str | None] = {}
+    reached = {decl_resolved}
+    aliases = _exact_aliases(repo_dir)
+
+    def reaches(reader: str, specifier: str) -> bool:
+        if not _plausible(specifier, reached, aliases):
+            return False
+        key = (os.path.dirname(reader), specifier)
+        if key not in cache:
+            target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir, solution=solution)
+            cache[key] = str(Path(target).resolve()) if target is not None else None
+        return cache[key] in reached
+
+    found: list[tuple[str, str, str, list[str]]] = []
+    packages = _Packages(repo_dir)
+    for path, text in sources:
+        if _GLOB.search(text):
+            return True
+        if _LOAD.search(text) and _computed_load(path, text) and packages.may_load(path, decl_resolved):
+            return True
+        specifiers = [m.group(2) for m in _SPECIFIER.finditer(text)]
+        if specifiers:
+            found.append((str(Path(path).resolve()), path, text, specifiers))
+    while True:
+        barrels: set[str] = set()
+        for resolved, path, text, specifiers in found:
+            hits = sum(1 for spec in specifiers if reaches(path, spec))
+            if not hits:
+                continue
+            verdict = _classify(path, text, lambda spec, p=path: reaches(p, spec))
+            if verdict is None or verdict[0] != hits:
+                # A reaching specifier the parse did not account for.
+                return True
+            if verdict[1]:
+                barrels.add(resolved)
+        if barrels <= reached:
+            break
+        reached |= barrels
+    for path, text in markup:
+        if any(reaches(path, m.group(2)) for m in _SPECIFIER.finditer(text)):
+            return True
+    return False
+
+
+#: What a specifier may end in beyond the module's own name.
+_SPECIFIER_SUFFIXES = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".d.ts")
+
+
+def _plausible(specifier: str, reached: set[str], aliases: frozenset[str] | None) -> bool:
+    """Whether ``specifier`` can resolve to one of ``reached`` at all, decided
+    without the resolver, which is too slow to ask of every string in a
+    checkout. A superset: its last segment names a reached module (``x`` for
+    ``x.ts``, ``dir`` for ``dir/index.ts``), it ends in ``.``, ``..`` or
+    ``/``, or it is an exact ``paths`` alias, which can name any file (all
+    bare specifiers when the configs could not be read)."""
+    last = specifier.rstrip("/").rsplit("/", 1)[-1] if not specifier.endswith("/") else ""
+    if last in ("", ".", ".."):
+        return True
+    for suffix in _SPECIFIER_SUFFIXES:
+        if last.endswith(suffix):
+            last = last[: -len(suffix)]
+            break
+    for target in reached:
+        module = Path(target)
+        stem = module.name.split(".", 1)[0]
+        if last == stem or stem == "index" and last == module.parent.name:
+            return True
+    if specifier.startswith((".", "/")):
+        return False
+    return aliases is None or specifier in aliases
+
+
+def _exact_aliases(repo_dir: str) -> frozenset[str] | None:
+    """Every ``paths`` key without a ``*`` in the checkout's ``tsconfig.json``
+    and ``jsconfig.json`` files (and the files they are named alike), or None
+    when one cannot be read."""
+    root = source_index.checkout_root(repo_dir)
+    keys: set[str] = set()
+    for directory, subdirectories, names in os.walk(root):
+        subdirectories[:] = [d for d in subdirectories if d not in _SKIPPED_DIRECTORIES]
+        for name in names:
+            if not (name.startswith(("tsconfig", "jsconfig")) and name.endswith(".json")):
+                continue
+            try:
+                text = Path(directory, name).read_text(encoding="utf-8")
+                data = json.loads(cross_file_ts._strip_jsonc(text))
+            except (OSError, UnicodeDecodeError, ValueError):
+                return None
+            options = data.get("compilerOptions") if isinstance(data, dict) else None
+            paths = options.get("paths") if isinstance(options, dict) else None
+            if paths is None:
+                continue
+            if not isinstance(paths, dict):
+                return None
+            keys.update(key for key in paths if "*" not in key)
+    return frozenset(keys)
+
+
+#: Directories :func:`_exact_aliases` does not walk into.
+_SKIPPED_DIRECTORIES = frozenset({"node_modules", ".git", "dist", "build", "coverage", ".next"})
+
+
+def _classify(path: str, text: str, reaches) -> tuple[int, bool] | None:
+    """For the statements and calls of ``path`` whose specifier ``reaches``:
+    how many there are and whether one is a plain ``export *`` (the file is
+    a barrel), or None when one can reach an export unspelled."""
+    root = _parse(text, ts_scope.grammar(path))
+    count, barrel = 0, False
+    for node in _walk(root):
+        if node.type == "import_statement":
+            source = node.child_by_field_name("source")
+            spec = _specifier(source)
+            if spec is None or not reaches(spec):
+                continue
+            count += 1
+            clause = next((c for c in node.named_children if c.type == "import_clause"), None)
+            if any(c.type == "import_require_clause" for c in node.named_children):
+                return None
+            if clause is not None and any(c.type != "named_imports" for c in clause.named_children):
+                # A default import or `* as m`.
+                return None
+        elif node.type == "export_statement" and node.child_by_field_name("source") is not None:
+            spec = _specifier(node.child_by_field_name("source"))
+            if spec is None or not reaches(spec):
+                continue
+            count += 1
+            if any(c.type == "namespace_export" for c in node.named_children):
+                return None
+            if not any(c.type == "export_clause" for c in node.named_children):
+                barrel = True
+        elif node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            arguments = node.child_by_field_name("arguments")
+            if callee is None or arguments is None or arguments.type != "arguments":
+                continue
+            passed = [c for c in arguments.named_children if c.type != "comment"]
+            spec = _specifier(passed[0]) if passed else None
+            if spec is None or not reaches(spec):
+                continue
+            count += 1
+            if not (callee.type == "member_expression" and _member_name(callee) in _MOCKS):
+                # `import()`, `require()`, `requireActual()`, `importActual()`
+                # or anything else handed the module: it can index it.
+                return None
+    return count, barrel
+
+
+def _member_name(callee: Node) -> str | None:
+    member = callee.child_by_field_name("property")
+    return member.text.decode("utf-8") if member is not None else None
+
+
+def _specifier(node: Node | None) -> str | None:
+    """A plain string's or substitution-free template's text."""
+    if node is not None and node.type == "template_string":
+        if any(c.type == "template_substitution" for c in node.named_children):
+            return None
+        return node.text.decode("utf-8")[1:-1]
+    return cross_file_ts._string_value(node)
+
+
+_DEPENDENCY_FIELDS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+
+
+class _Packages:
+    """The ``package.json`` each file belongs to, read once per directory.
+
+    A computed ``import()`` loads what its package can name: its own files,
+    and the packages it depends on. One in a sibling package that does not
+    depend on the declaring file's (an SDK's test fixture beside a web app,
+    in a monorepo) cannot load the declaring file."""
+
+    #: A manifest that cannot be read: it could declare anything.
+    UNREADABLE = object()
+
+    def __init__(self, repo_dir: str) -> None:
+        self.root = cross_file_ts._stop_for(repo_dir)
+        self._owner: dict[Path, Path | None] = {}
+        self._manifest: dict[Path, object] = {}
+
+    def owner(self, path: str) -> Path | None:
+        """The directory of the nearest ``package.json`` above ``path``
+        within the checkout, or None."""
+        directory = Path(path).resolve().parent
+        walked: list[Path] = []
+        found: Path | None = None
+        while True:
+            if directory in self._owner:
+                found = self._owner[directory]
+                break
+            walked.append(directory)
+            if (directory / "package.json").is_file():
+                found = directory
+                break
+            if directory == self.root or directory.parent == directory or not directory.is_relative_to(self.root):
+                break
+            directory = directory.parent
+        for each in walked:
+            self._owner[each] = found
+        return found
+
+    def manifest(self, directory: Path) -> object:
+        if directory not in self._manifest:
+            try:
+                data = json.loads((directory / "package.json").read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                data = self.UNREADABLE
+            self._manifest[directory] = data if isinstance(data, dict) else self.UNREADABLE
+        return self._manifest[directory]
+
+    def may_load(self, loader: str, declaring: str) -> bool:
+        """Whether a computed load in ``loader`` may load ``declaring``: the
+        same package, a package depending on the declaring one by name, a
+        file in no package, or anything unreadable on the way. Without a
+        package around the declaring file, anything may."""
+        home = self.owner(declaring)
+        if home is None:
+            return True
+        here = self.owner(loader)
+        if here is None or here == home:
+            return True
+        theirs, ours = self.manifest(home), self.manifest(here)
+        if theirs is self.UNREADABLE or ours is self.UNREADABLE:
+            return True
+        name = theirs.get("name")
+        if not isinstance(name, str):
+            return False
+        for field_name in _DEPENDENCY_FIELDS:
+            section = ours.get(field_name)
+            if section is not None and not isinstance(section, dict):
+                return True
+            if isinstance(section, dict) and name in section:
+                return True
+        return False
+
+
+def _computed_load(path: str, text: str) -> bool:
+    """Whether ``text`` has an ``import(…)`` or ``require(…)`` whose module is
+    computed, which can reach any module."""
+    for node in _walk(_parse(text, ts_scope.grammar(path))):
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        if callee is None or not (
+            callee.type == "import" or callee.type == "identifier" and callee.text == b"require"
+        ):
+            continue
+        arguments = node.child_by_field_name("arguments")
+        passed = [c for c in arguments.named_children if c.type != "comment"] if arguments else []
+        if not passed or _specifier(passed[0]) is None:
+            return True
+    return False
+
+
+def _accounted(
+    component, file, declaring, allowed, decl_resolved, repo_dir, use=_element_name, solution=False
+) -> bool:
     imported = 0
     for node in _walk(file.root):
         if node.type in ("string_fragment", "template_string") and _text(node, file.data) == component:
@@ -398,7 +734,7 @@ def _accounted(component, file, declaring, allowed, decl_resolved, repo_dir) -> 
             return False
         if node.type not in _NAMES or _text(node, file.data) != component:
             continue
-        if _element_name(node):
+        if use(node):
             continue
         if declaring:
             if node.id not in allowed:
@@ -411,7 +747,10 @@ def _accounted(component, file, declaring, allowed, decl_resolved, repo_dir) -> 
             and parent.child_by_field_name("name") == node
             and parent.child_by_field_name("alias") is None
             and (spec := _source(parent, file.data)) is not None
-            and (target := cross_file_ts.resolve_specifier(file.path, spec, repo_dir)) is not None
+            and (
+                target := cross_file_ts.resolve_specifier(file.path, spec, repo_dir, solution=solution)
+            )
+            is not None
             and str(Path(target).resolve()) == decl_resolved
         ):
             imported += 1

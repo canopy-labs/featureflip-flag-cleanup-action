@@ -1524,6 +1524,16 @@ def _discard_pushed_branch(repo_dir: str, branch: str, github: GitHubEnv) -> Non
         )
 
 
+def _removed_anyway(kept_entry: tuple[str, str], removed: set[tuple[str, str]]) -> bool:
+    """Whether a kept entry, ``(path, "flag-keyed entry <text> kept: ...")``, is
+    one the re-run deleted after all, as ``(path, text)``."""
+    path, reason = kept_entry
+    return any(
+        removed_path == path and reason.startswith(f"flag-keyed entry {text} kept:")
+        for removed_path, text in removed
+    )
+
+
 @contextmanager
 def piranha_transform(
     candidate: Candidate,
@@ -1691,7 +1701,12 @@ def piranha_transform(
                 unresolved.extend(outcome.unresolved)
                 enum_findings.extend(outcome.enum_findings)
                 wrapper_findings.extend(outcome.wrapper_findings)
-            kept.extend(kept_entries)
+            # The re-run drops the entry PRONGS, not every pass that deletes an
+            # entry: an override valued at a name provably a boolean is removed
+            # after the engine whatever the prongs did. Such an entry is gone
+            # from the diff, so listing it as kept too would contradict it.
+            removed_by_rerun = set(entries)
+            kept.extend(entry for entry in kept_entries if not _removed_anyway(entry, removed_by_rerun))
         except (PiranhaTransformError, UnsafeRewriteError) as exc:
             # Both are refusals, and both abandon the flag ENTIRELY — note the
             # try wraps the whole directory x language loop, so a refusal in

@@ -1,0 +1,23 @@
+# Marked-span rules for the grammars with JSX (`tsx`, and `js`, which the
+# engine parses with the TSX grammar), rendered by
+# `ctor_param_model.render_rules("tsx", ...)` beside `ts_ctor_param.toml`'s
+# `argument` blocks. Never loaded as shipped. Kept out of `ts_ctor_param.toml`
+# because the plain TypeScript grammar has no JSX node types, and a query
+# naming one does not parse there.
+#
+# No holes and no edges: every rule is a seed that matches on its own.
+
+# ctor: argument
+# An element whose tags are marked, replaced by its one child element: a
+# component `ts_readiness_gates` proved renders only its children.
+[[rules]]
+name = "unwrap_ctor_marked_element"
+query = """(
+  (jsx_element
+    open_tag: (jsx_opening_element name: (identifier) @name)
+    [(jsx_element) (jsx_self_closing_element)] @child) @element
+  (#eq? @name "__CTOR_SENTINEL__")
+)"""
+replace_node = "element"
+replace = "@child"
+is_seed_rule = true

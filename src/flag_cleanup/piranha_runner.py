@@ -69,6 +69,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -83,6 +84,7 @@ from polyglot_piranha import PiranhaArguments, execute_piranha
 
 from flag_cleanup import (
     contradicting,
+    cs_kept_tests,
     csharp_residue,
     ctor_param_removal,
     dart_field_removal,
@@ -95,6 +97,7 @@ from flag_cleanup import (
     discarded_calls,
     failing_assertions,
     inert_calls,
+    inert_load,
     file_deletion,
     git_ops,
     go_dead_code,
@@ -109,6 +112,7 @@ from flag_cleanup import (
     key_const,
     line_width,
     kotlin_sentinel,
+    forwarder_csharp,
     method_param_csharp,
     mock_stubs,
     private_constant_params,
@@ -130,7 +134,10 @@ from flag_cleanup import (
     ts_fold,
     ts_gates,
     ts_param_pins,
+    ts_readiness_gates,
+    ts_unused_options,
     ts_tests,
+    ts_test_providers,
     wrapper_inline,
 )
 from flag_cleanup.kotlin_sentinel import Rewrite
@@ -151,7 +158,7 @@ from flag_cleanup.syntax import (
 )
 from flag_cleanup.primary_constructor import unread_parameters
 from flag_cleanup.ts_unread_members import unread_constructor_parameters, unread_members
-from flag_cleanup.ts_syntax import strip_dangling_type_separators
+from flag_cleanup.ts_syntax import count_syntax_errors, strip_dangling_type_separators
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_bindings
 
@@ -1388,6 +1395,36 @@ def _engine_inlined(summaries) -> dict[str, frozenset[str]]:
     return inlined
 
 
+#: An identifier, as the engine's match of a local's use spells it (``$on``
+#: in PHP).
+_BOUND_NAME = re.compile(r"\$?[A-Za-z_]\w*")
+
+
+def _engine_bound_reads(summaries) -> dict[str, frozenset[str]]:
+    """``{path: names}`` for each local whose uses the engine replaced with a
+    boolean literal: a binding of the folded read, inlined.
+
+    By the edit's shape rather than its rule name, which differs per
+    language (``inline_flag_const_usage``, ``replace_variable_use_with_literal``,
+    ``replace_identifier_with_value``): the matched text is one identifier and
+    what was written for it is ``true`` or ``false``. Read off the engine's
+    summaries under the same constraint as :func:`_engine_stranded`. See
+    :func:`flag_cleanup.stale_comments.leading_comments`, which deletes the
+    comment such a binding leaves behind.
+    """
+    found: dict[str, frozenset[str]] = {}
+    for summary in summaries:
+        names = {
+            edit.p_match.matched_string.strip()
+            for edit in getattr(summary, "rewrites", ())
+            if _BOUND_NAME.fullmatch(edit.p_match.matched_string.strip())
+            and (edit.replacement_string or "").strip().lower() in ("true", "false")
+        }
+        if names:
+            found[summary.path] = frozenset(names)
+    return found
+
+
 def _engine_stranded(summaries, language: str, repo_dir: str) -> tuple[tuple[str, str], ...]:
     """``((relative_path, text), …)`` for each dead loop or unreachable statement the engine deleted.
 
@@ -2305,6 +2342,9 @@ def _transform_flag(
         engine_stranded = list(_engine_stranded(summaries, language, repo_dir))
         engine_assertions = list(_engine_assertions(summaries, repo_dir))
         engine_inlined = _engine_inlined(summaries)
+        engine_bound_reads: dict[str, set[str]] = {
+            path: set(names) for path, names in _engine_bound_reads(summaries).items()
+        }
         engine_dead_inits = _engine_dead_initializers(summaries, language)
         engine_bindings = _engine_bindings(summaries, repo_dir)
 
@@ -2326,6 +2366,7 @@ def _transform_flag(
                 entry_paths=entry_paths,
                 dead_loops=engine_stranded,
                 assertions=engine_assertions,
+                bound_reads=engine_bound_reads,
                 inline_across=_BOUND_ACROSS_FILES.get(language)
                 and partial(
                     _BOUND_ACROSS_FILES[language],
@@ -2523,9 +2564,13 @@ def _transform_flag(
     # A discarded call the customer declared side-effect free is deleted,
     # and what it alone read is offered to the stranded-binding pass again.
     # After that pass, because its own discards are among the candidates.
-    summaries, declared_calls = _delete_declared_calls(summaries, language, repo_dir)
+    # So is a discarded call to one of the read-only framework hooks the
+    # Action knows (`useParams<…>();`), on its own audit rather than theirs;
+    # its package's load goes with it once nothing else in the file uses it.
+    summaries, declared_calls, released = _delete_declared_calls(summaries, language, repo_dir)
     if declared_calls:
-        summaries, called_bindings = _remove_stranded_bindings(summaries, language, repo_dir)
+        with inert_load.releasing(released):
+            summaries, called_bindings = _remove_stranded_bindings(summaries, language, repo_dir)
         bindings = bindings + declared_calls + called_bindings
 
     # Python only, and the same window again: the fallback for a file whose
@@ -2560,6 +2605,17 @@ def _transform_flag(
         # argument (a field, a constructor parameter) is judged unread below.
         summaries, method_rows = _remove_unread_method_parameters(summaries, wrappers, wrapper_rows, repo_dir)
         bindings = bindings + method_rows
+        # A static helper the fold and that removal left doing nothing but
+        # forwarding one call on a parameter: each call makes that call
+        # directly and the helper goes, or it is reported. Before the
+        # residue, which then judges the callers as they are.
+        summaries, forwarder_rows = forwarder_csharp.inline(
+            summaries,
+            repo_dir,
+            Rewrite,
+            engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+        )
+        bindings = bindings + forwarder_rows
         summaries, residue_rows, family_names = csharp_residue.remove(
             wrappers,
             wrapper_rows,
@@ -2570,6 +2626,22 @@ def _transform_flag(
             flag_key=flag_key,
         )
         wrapper_rows = wrapper_rows + residue_rows
+        # What the kept tests still say about a gate this run removed: a
+        # `[Theory]` the row cut left with one row becomes a `[Fact]`, a name
+        # holding the kept state loses it, and the rest is reported. After
+        # the residue pass, whose deletions it must not judge, and before
+        # Gate 1, which judges what it writes.
+        summaries, kept_test_rows = cs_kept_tests.review(
+            wrappers,
+            wrapper_rows,
+            summaries,
+            test_doubles,
+            treatment,
+            repo_dir,
+            Rewrite,
+            engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+        )
+        test_doubles = test_doubles + kept_test_rows
     # A Laravel Pennant feature class named by the key, every read of which
     # was proven and folded: its file goes. Before the split below, which
     # keeps a deleted file away from the passes that rewrite what is on disk.
@@ -2584,6 +2656,32 @@ def _transform_flag(
     # which owns the imports this strands.
     summaries, emptied_tests = jvm_emptied_tests.remove(summaries, language, repo_dir, Rewrite)
     test_doubles = test_doubles + emptied_tests
+    # A wait for the flags to load in a function this run took the last flag
+    # read out of: the guard goes, and a gate component it leaves rendering
+    # only its children goes with its files, unwrapped wherever it is used.
+    # After the stranded passes, which take the folded read's binding and a
+    # discard the customer declared inert, and before the split below, since
+    # it deletes files; the stranded-method pass after it takes the imports
+    # its deletions strand. See :mod:`flag_cleanup.ts_readiness_gates`.
+    deleted_before = {s.path for s in summaries if file_deletion.deleted(s)}
+    summaries, readiness_rows = ts_readiness_gates.remove(
+        summaries,
+        language,
+        flag_key,
+        repo_dir,
+        Rewrite,
+        engine=lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir),
+        in_run=lambda p: _grammar_of(p, language) == language,
+        resolve_wrappers=inline_wrappers,
+    )
+    bindings = bindings + readiness_rows
+    # Its files' paths: what another pass says about one of them (an import
+    # kept bare, a test renamed) describes a file no longer in the change.
+    readiness_gone = {
+        os.path.relpath(s.path, repo_dir)
+        for s in summaries
+        if file_deletion.deleted(s) and s.path not in deleted_before
+    }
     # The passes below parse and rewrite what is on disk: a file this run
     # deleted is not handed to them (one that wrote back the empty text it
     # was given would re-create the file), and rejoins the rest for Gate 1
@@ -2656,8 +2754,50 @@ def _transform_flag(
     # the fold wrote (`{ enabled: true }`). One the callee's declaration proves
     # a no-op is left out; an emptied one that stays is reported. Last, so
     # they read the bytes that stay on disk.
-    summaries, emptied_rows = _drop_default_arguments(summaries, language, flag_key, repo_dir)
+    summaries, emptied_rows, dropped_options = _drop_default_arguments(
+        summaries, language, flag_key, repo_dir
+    )
     bindings = bindings + emptied_rows
+    # An option a value the fold wrote was just left out of, when no call
+    # sets it any more: gone from the declaration, its default written at
+    # each read. See :mod:`flag_cleanup.ts_unused_options`.
+    summaries, option_rows = _remove_unused_options(
+        summaries,
+        flag_key,
+        repo_dir,
+        dropped_options,
+        taken=_taken_by_family(language, flag_key, repo_dir, accessors, inline_wrappers),
+    )
+    bindings = bindings + option_rows
+
+    # A Featureflip test provider the entry deletions left serving nothing,
+    # around a tree that provably never reaches a Featureflip module, is
+    # replaced by what it wrapped; its import is then stranded like any
+    # other. Its emptied `flags={{}}` is no longer there to report.
+    summaries, provider_rows = _unwrap_test_providers(summaries, language, flag_key, repo_dir)
+    if provider_rows:
+        # Its emptied `flags={{}}`, reported or dropped, went with it.
+        tags = {
+            (path, match.group(0))
+            for path, _kind, text in provider_rows
+            if (match := re.match(r"<[\w$.]+", text)) is not None
+        }
+        bindings = tuple(
+            b
+            for b in bindings
+            if not (
+                b[1] in ("emptied override", "dropped default argument")
+                and (match := re.match(r"<[\w$.]+(?=[\s>/])", b[2])) is not None
+                and (b[0], match.group(0)) in tags
+            )
+        )
+        summaries, provider_bindings = _remove_stranded_bindings(summaries, language, repo_dir)
+        bindings = bindings + provider_rows + provider_bindings
+
+    # What a kept test still says about the removed branch: a negative
+    # assertion only that branch could contradict, and a title describing it.
+    # Report only, read off the bytes that stay.
+    bindings = bindings + _test_scaffolding(summaries, language, flag_key, deleted_tests, renamed_tests, repo_dir)
 
     # The comments left describing nothing but what this run removed: the
     # flag, or a C# family type it deleted. Last of the edits, so it judges
@@ -2675,8 +2815,10 @@ def _transform_flag(
     )
     bindings = bindings + comment_rows
 
-    # The comment directly above a statement this run deleted outright: gone
-    # with it when it describes the flag's state, reported otherwise.
+    # The comment directly above a statement or entry this run deleted
+    # outright: gone with it when it describes the flag's state, or when what
+    # went was the flag's own read, a binding of it or its entry; reported
+    # otherwise.
     summaries, leading_rows, leading_reported = _leading_comments(
         summaries,
         paths,
@@ -2685,6 +2827,8 @@ def _transform_flag(
         language,
         flag_key,
         repo_dir,
+        bound=engine_bound_reads,
+        entries=entries,
     )
     bindings = bindings + leading_rows
 
@@ -2707,6 +2851,12 @@ def _transform_flag(
     # `_ = <call>`: reported, so the reviewer can delete a getter that only
     # fed the removed read.
     bindings = bindings + _discarded_calls(summaries, language, repo_dir)
+
+    # Every report row is in by now: drop those about a file the readiness
+    # pass deleted (see where it runs).
+    bindings = tuple(
+        b for b in bindings if b[0] not in readiness_gone or b in readiness_rows
+    )
 
     # GATE 1 — if the transform broke any file, discard ALL of it. A partial
     # rewrite is not an option: the flag would look half-removed, and a diff
@@ -3508,17 +3658,27 @@ def _leading_comments(
     language: str,
     flag_key: str,
     repo_dir: str,
+    *,
+    bound: Mapping[str, frozenset[str]] | None = None,
+    entries: Iterable[tuple[str, str]] = (),
 ) -> tuple[list, tuple[tuple[str, str, str], ...], dict[str, frozenset[int]]]:
-    """Deal with the comment directly above each statement this run deleted
-    outright (see :func:`flag_cleanup.stale_comments.leading_comments`).
+    """Deal with the comment directly above each statement or entry this run
+    deleted outright (see :func:`flag_cleanup.stale_comments.leading_comments`).
 
-    One describing a flag's state explained only that statement, and is
-    deleted with it (a ``removed comment`` row), under the same condition as
-    :func:`_remove_stale_comments`. Any other is reported as describing
-    behaviour this run removed (a ``removed-branch comment`` row). Also
-    returns, per path, the lines of the comments reported, so the flag-state
-    report does not name them twice.
+    One describing a flag's state explained only that statement, and one
+    above the flag's own read, a binding of it (``bound``: per path, the
+    locals the engine inlined as the flag's value) or its entry (``entries``:
+    ``(relative path, text)`` of each flag-keyed entry the run deleted) has
+    lost its subject; both are deleted with it (a ``removed comment`` row),
+    under the same condition as :func:`_remove_stale_comments`. Any other is
+    reported as describing behaviour this run removed (a ``removed-branch
+    comment`` row). Also returns, per path, the lines of the comments
+    reported, so the flag-state report does not name them twice.
     """
+    bound = bound or {}
+    entries_of: dict[str, list[str]] = {}
+    for relative, text in entries:
+        entries_of.setdefault(relative, []).append(text)
     may_delete = not _flag_still_named(summaries, paths, unprocessable, deleted, flag_key)
     result = list(summaries)
     rows: list[tuple[str, str, str]] = []
@@ -3530,8 +3690,11 @@ def _leading_comments(
         if grammar in _TEMPLATE_LANGUAGES or not _LANGUAGES[grammar].owns(summary.path):
             continue
         relative = os.path.relpath(summary.path, repo_dir)
-        found = stale_comments.leading_comments(summary.original_content, summary.content, grammar, flag_key)
-        going = [c for c in found if c.describes_state] if may_delete else []
+        facts = {"bound": bound.get(summary.path, frozenset()), "entries": entries_of.get(relative, ())}
+        found = stale_comments.leading_comments(
+            summary.original_content, summary.content, grammar, flag_key, **facts
+        )
+        going = [c for c in found if c.goes] if may_delete else []
         if going:
             after = stale_comments.remove_leading(summary.content, grammar, going)
             if after is not None:
@@ -3541,8 +3704,8 @@ def _leading_comments(
                 summary = Rewrite(summary.path, summary.original_content, after)
                 result[index] = summary
                 rows.extend((relative, "removed comment", c.removal.text) for c in going)
-                found = stale_comments.leading_comments(summary.original_content, after, grammar, flag_key)
-        kept = [c for c in found if not (may_delete and c.describes_state)]
+                found = stale_comments.leading_comments(summary.original_content, after, grammar, flag_key, **facts)
+        kept = [c for c in found if not (may_delete and c.goes)]
         rows.extend(
             (relative, stale_comments.REMOVED_BRANCH_KIND, f"{c.removal.line}: {c.text}") for c in kept
         )
@@ -3688,7 +3851,7 @@ def _flag_state_comments(
 
 def _drop_default_arguments(
     summaries, language: str, flag_key: str, repo_dir: str
-) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[ts_default_arguments.DroppedOption, ...]]:
     """Leave out each literal this run left equal to the callee's default,
     and report each emptied override that stays; TypeScript family only. See
     :mod:`~flag_cleanup.ts_default_arguments` and
@@ -3696,15 +3859,17 @@ def _drop_default_arguments(
 
     Returns the summaries, a ``(path, "dropped default argument", site)``
     row for each literal left out and a ``(path, "emptied override", line)``
-    row for each emptied literal left. The report is read off the text BEFORE
+    row for each emptied literal left, and the options a value the fold wrote
+    was left out of, for :func:`_remove_unused_options`. The report is read off the text BEFORE
     the drop, less the lines dropped: read after, the hunks still count the
     objects the drop took, and hand those slots to empty literals the
     customer wrote.
     """
     if not ts_tests.covers(language):
-        return summaries, ()
+        return summaries, (), ()
     result = []
     rows: list[tuple[str, str, str]] = []
+    options: list[ts_default_arguments.DroppedOption] = []
     for summary in summaries:
         if summary.original_content == summary.content:
             result.append(summary)
@@ -3729,12 +3894,80 @@ def _drop_default_arguments(
             emptied.remove(line)
         rows.extend((relative, "dropped default argument", site) for site in dropped.sites)
         rows.extend((relative, "emptied override", line) for line in emptied)
+        options.extend(dropped.options)
         if not dropped.sites:
             result.append(summary)
             continue
         Path(summary.path).write_text(dropped.content, encoding="utf-8")
         result.append(Rewrite(summary.path, summary.original_content, dropped.content))
-    return result, tuple(rows)
+    return result, tuple(rows), tuple(options)
+
+
+def _taken_by_family(
+    language: str, flag_key: str, repo_dir: str, accessors: tuple[str, ...], wrappers: bool
+):
+    """Whether another run of this removal in ``language``'s key-constant
+    family takes a file with a given text: it spells the key, or a key
+    constant or candidate wrapper another member declares (what
+    :func:`candidate_files` keeps a sibling reader out of this run for).
+    Every member counts, configured or not; the names are computed on first
+    use."""
+    siblings = sorted(cross_file_keys.family(language) - {language})
+    claims: dict[tuple[str, ...], re.Pattern[str]] = {}
+    accessors = rule_synthesis.accessors_for(language, accessors)
+
+    def taken(text: str) -> bool:
+        if flag_key in text:
+            return True
+        if not siblings:
+            return False
+        pattern = _claimed(claims, Path(repo_dir), siblings, flag_key, accessors, wrappers)
+        return pattern.search(text) is not None
+
+    return taken
+
+
+def _remove_unused_options(
+    summaries,
+    flag_key: str,
+    repo_dir: str,
+    options: tuple[ts_default_arguments.DroppedOption, ...],
+    taken=None,
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Remove each of ``options`` no call sets any more from its declaration;
+    see :mod:`flag_cleanup.ts_unused_options`. A declaring or calling file the
+    run had not changed joins the summaries, as a constructor caller does.
+
+    Returns the summaries and a ``(path, "unused parameter", label)`` row for
+    each option removed.
+    """
+    if not options:
+        return summaries, ()
+    removed = ts_unused_options.remove_unused_options(
+        options,
+        {s.path: (s.original_content, s.content) for s in summaries},
+        flag_key,
+        repo_dir,
+        taken,
+    )
+    if not removed.files:
+        return summaries, ()
+    # The candidate scan never listed a declaring file or a caller the run
+    # did not change: bring every file this pass writes under the running
+    # transform's undo first, as the constructor-parameter removal does.
+    git_ops.before_writing(list(removed.files))
+    result = list(summaries)
+    index = {s.path: n for n, s in enumerate(result)}
+    for path, (previous, content) in removed.files.items():
+        Path(path).write_text(content, encoding="utf-8")
+        if path in index:
+            result[index[path]] = Rewrite(path, result[index[path]].original_content, content)
+        else:
+            result.append(Rewrite(path, previous, content))
+    return result, tuple(
+        (os.path.relpath(path, repo_dir), "unused parameter", label)
+        for path, label in removed.labels
+    )
 
 
 def _restore_tests_using_key_as_data(
@@ -3960,6 +4193,86 @@ def _delete_pinned_tests(
         relative = os.path.relpath(summary.path, repo_dir)
         deleted.extend((relative, title) for title in titles)
     return result, tuple(deleted)
+
+
+def _unwrap_test_providers(
+    summaries, language: str, flag_key: str, repo_dir: str
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+    """Unwrap each Featureflip test provider this run emptied in a changed
+    test file, where nothing the file loads reaches a Featureflip module; a
+    ``(path, "unwrapped test provider", line)`` row for each. See
+    :mod:`flag_cleanup.ts_test_providers`."""
+    if not ts_tests.covers(language):
+        return summaries, ()
+    result = []
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        grammar = _grammar_of(summary.path, language)
+        if (
+            summary.original_content == summary.content
+            or not summary.content
+            or not ts_test_providers.covers(grammar)
+            or not ts_tests.is_test_file(summary.original_content, grammar)
+        ):
+            result.append(summary)
+            continue
+        after, lines = ts_test_providers.unwrap(
+            summary.original_content, summary.content, summary.path, repo_dir, flag_key
+        )
+        if not lines or count_syntax_errors(after, grammar) > count_syntax_errors(
+            summary.content, grammar
+        ):
+            result.append(summary)
+            continue
+        Path(summary.path).write_text(after, encoding="utf-8")
+        result.append(Rewrite(summary.path, summary.original_content, after))
+        relative = os.path.relpath(summary.path, repo_dir)
+        rows.extend((relative, ts_test_providers.UNWRAPPED_PROVIDER, line) for line in lines)
+    return result, tuple(rows)
+
+
+def _test_scaffolding(
+    summaries, language: str, flag_key: str, deleted_tests, renamed_tests, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """A ``(path, kind, text)`` row for each vacuous negative assertion and
+    stale title :func:`flag_cleanup.ts_tests.stale_scaffolding` finds in a
+    test file this run changed; TypeScript family only."""
+    if not ts_tests.covers(language):
+        return ()
+    changed = [s for s in summaries if s.original_content != s.content and s.content]
+    tests, code = [], []
+    for summary in changed:
+        grammar = _grammar_of(summary.path, language)
+        (tests if ts_tests.is_test_file(summary.original_content, grammar) else code).append((summary, grammar))
+    if not tests:
+        return ()
+    gone = frozenset(
+        text
+        for summary, grammar in code
+        for text in ts_tests.removed_texts(summary.original_content, summary.content, grammar)
+        if not any(text in other.content for other in changed)
+    )
+    deleted: dict[str, set[str]] = {}
+    for relative, title in deleted_tests:
+        deleted.setdefault(relative, set()).add(title)
+    renamed: dict[str, set[str]] = {}
+    for relative, _kind, text in renamed_tests:
+        renamed.setdefault(relative, set()).add(text.split("\n", 1)[-1])
+    rows: list[tuple[str, str, str]] = []
+    for summary, grammar in tests:
+        relative = os.path.relpath(summary.path, repo_dir)
+        vacuous, titles = ts_tests.stale_scaffolding(
+            summary.original_content,
+            summary.content,
+            grammar,
+            flag_key,
+            deleted=frozenset(deleted.get(relative, ())),
+            renamed=frozenset(renamed.get(relative, ())),
+            gone=gone,
+        )
+        rows.extend((relative, ts_tests.VACUOUS_ASSERTION, text) for text in vacuous)
+        rows.extend((relative, ts_tests.STALE_TITLE, title) for title in titles)
+    return tuple(rows)
 
 
 def _rename_kept_titles(
@@ -5093,6 +5406,23 @@ _BOUND_ACROSS_FILES = {
 }
 
 
+#: A local bound to a boolean literal on a line of its own, as the inliners
+#: of :func:`_inline_bound_reads` find it: ``const on = true;``, ``on = True``.
+_LITERAL_DECLARATION = re.compile(
+    r"^[ \t]*(?:(?:export[ \t]+)?(?:const|let|var)[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*(?::[^=\n]*)?="
+    r"[ \t]*(?:true|false)[ \t]*;?[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _dropped_literal_bindings(previous: str, inlined: str) -> set[str]:
+    """The names of the literal bindings ``previous`` holds and the inliner's
+    ``inlined`` no longer does: each a binding of the folded read, inlined."""
+    kept = Counter(m.group(1) for m in _LITERAL_DECLARATION.finditer(inlined))
+    held = Counter(m.group(1) for m in _LITERAL_DECLARATION.finditer(previous))
+    return {name for name, count in held.items() if count > kept[name]}
+
+
 def _inline_bound_reads(
     summaries,
     *,
@@ -5106,6 +5436,7 @@ def _inline_bound_reads(
     entry_paths: set[str],
     dead_loops: list[tuple[str, str]] | None = None,
     assertions: list[tuple[str, str, str]] | None = None,
+    bound_reads: dict[str, set[str]] | None = None,
     inline_across=None,
 ):
     """Resolve reads the fold left bound to a local, through the engine (#3029).
@@ -5163,7 +5494,9 @@ def _inline_bound_reads(
       not depend on that staying true. ``dead_loops``, when given, is extended
       the same way with :func:`_engine_stranded`, and there a later round
       matters: ``while use:`` over a bound read only becomes ``while False:``
-      once this pass has inlined it.
+      once this pass has inlined it. ``bound_reads``, when given, gains per
+      path the names whose literal binding a kept round dropped
+      (:func:`_dropped_literal_bindings`), for the leading-comment pass.
     """
     const_group = set(with_const)
     originals = {s.path: s.original_content for s in summaries}
@@ -5201,6 +5534,9 @@ def _inline_bound_reads(
                 },
                 repo_dir,
             )
+            # A file it reaches that the run had not changed is usually
+            # outside the candidate snapshot: under the undo before writing.
+            git_ops.before_writing(list(across))
             for path, (previous, rewritten) in across.items():
                 originals.setdefault(path, previous)
                 staged[path] = (previous, rewritten)
@@ -5261,6 +5597,8 @@ def _inline_bound_reads(
                     originals.pop(path, None)
                 continue
             current[path] = Rewrite(path, originals[path], content)
+            if bound_reads is not None:
+                bound_reads.setdefault(path, set()).update(_dropped_literal_bindings(previous, inlined))
 
         # After the unwind above, not with the entries: a loop the engine
         # deleted in a file this round put back is still on disk.
@@ -5509,30 +5847,45 @@ def _remove_orphans(summaries, language: str) -> list:
     return cleaned
 
 
-def _delete_declared_calls(summaries, language: str, repo_dir: str) -> tuple[list, tuple[tuple[str, str, str], ...]]:
+def _delete_declared_calls(
+    summaries, language: str, repo_dir: str
+) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[tuple[str, str], ...]]:
     """Delete each discarded call this run left behind whose callee the
-    customer listed in ``side-effect-free-calls``; report what went. See
-    :mod:`flag_cleanup.inert_calls`."""
-    if not inert_calls.declared():
-        return list(summaries), ()
+    customer listed in ``side-effect-free-calls``, or that calls a read-only
+    hook of :data:`flag_cleanup.inert_calls.BUILT_IN_HOOKS`; report what went.
+    Also returns ``(path, package)`` for each hook call deleted, whose
+    package's load the file then need not keep (see
+    :func:`flag_cleanup.inert_load.releasing`). See :mod:`flag_cleanup.inert_calls`."""
+    if not inert_calls.declared() and language not in _TS_GRAMMARS:
+        return list(summaries), (), ()
     cleaned_summaries = []
     rows: list[tuple[str, str, str]] = []
+    released: list[tuple[str, str]] = []
     for summary in summaries:
         if summary.original_content == summary.content or file_deletion.deleted(summary):
             cleaned_summaries.append(summary)
             continue
         grammar = _grammar_of(summary.path, language)
-        cleaned, gone = inert_calls.remove(
-            summary.original_content, summary.content, grammar, path=summary.path, root=repo_dir
+        # The built-in hooks first: a call the customer ALSO declared is then
+        # deleted on the audit, which releases its package's load too.
+        kept_hooks: list[tuple[str, str]] = []
+        cleaned, hooks = inert_calls.remove_hooks(
+            summary.original_content, summary.content, grammar, path=summary.path, root=repo_dir, kept=kept_hooks
         )
-        if not gone:
+        relative = os.path.relpath(summary.path, repo_dir)
+        rows.extend((relative, inert_calls.HOOK_CALL_KEPT, text) for text, _package in kept_hooks)
+        cleaned, gone = inert_calls.remove(
+            summary.original_content, cleaned, grammar, path=summary.path, root=repo_dir
+        )
+        if not gone and not hooks:
             cleaned_summaries.append(summary)
             continue
         Path(summary.path).write_text(cleaned, encoding="utf-8")
         cleaned_summaries.append(Rewrite(summary.path, summary.original_content, cleaned))
-        relative = os.path.relpath(summary.path, repo_dir)
         rows.extend((relative, inert_calls.DECLARED_CALL, text) for text in gone)
-    return cleaned_summaries, tuple(rows)
+        rows.extend((relative, inert_calls.HOOK_CALL, text) for text, _package in hooks)
+        released.extend((summary.path, package) for _text, package in hooks)
+    return cleaned_summaries, tuple(rows), tuple(released)
 
 
 def _remove_stranded_bindings(

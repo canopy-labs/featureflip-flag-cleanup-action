@@ -25,7 +25,8 @@ from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
 from flag_cleanup.discarded_calls import DISCARDED_CALL
 from flag_cleanup.failing_assertions import FLAG_VALUE_ASSERTION
-from flag_cleanup.inert_calls import DECLARED_CALL
+from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
+from flag_cleanup.forwarder_csharp import INLINED as INLINED_FORWARDER, KEPT as KEPT_FORWARDER
 from flag_cleanup.cross_file_keys import (
     ENUM_DYNAMIC,
     ENUM_UNPROVEN,
@@ -34,11 +35,25 @@ from flag_cleanup.cross_file_keys import (
     LEFT_COMPETING,
     NAME_NOT_UNIQUE,
 )
-from flag_cleanup.mock_stubs import PINNED_PARAMETER, REBUILT, SIBLING_TEST, TEST, TEST_PHASE, TEST_ROWS
+from flag_cleanup.mock_stubs import (
+    FALSE_TITLE,
+    GATE_NAMED,
+    PINNED_PARAMETER,
+    REBUILT,
+    RENAMED_METHOD,
+    SIBLING_TEST,
+    TEST,
+    TEST_PHASE,
+    TEST_ROWS,
+    THEORY_FACT,
+)
 from flag_cleanup.residue import Residue
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.cross_file_php_features import REMOVED_FEATURE_CLASS
+from flag_cleanup.ts_readiness_gates import KEPT_GUARD, REMOVED_GATE, REMOVED_GUARD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
+from flag_cleanup.ts_test_providers import UNWRAPPED_PROVIDER
+from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST, STALE_TITLE, VACUOUS_ASSERTION
 from flag_cleanup.urls import without_userinfo
 
 if TYPE_CHECKING:
@@ -190,11 +205,21 @@ REPORTED_BINDING_KINDS = frozenset(
         stale_comments.KEPT_BRANCH_KIND,
         stale_comments.FLAG_STATE_KIND,
         RENAMED_TEST,
+        VACUOUS_ASSERTION,
+        STALE_TITLE,
+        UNWRAPPED_PROVIDER,
         REMOVED_DEFAULT,
         DECLARED_LOAD,
         REMOVED_FEATURE_CLASS,
         DISCARDED_CALL,
         DECLARED_CALL,
+        INLINED_FORWARDER,
+        KEPT_FORWARDER,
+        REMOVED_GATE,
+        REMOVED_GUARD,
+        KEPT_GUARD,
+        HOOK_CALL,
+        HOOK_CALL_KEPT,
     }
 )
 
@@ -376,6 +401,41 @@ def _removed_constructor_lines(
     return lines
 
 
+def _forwarder_lines(inlined: list[tuple[str, str]], kept: list[tuple[str, str]]) -> list[str]:
+    """The notes naming each C# method this removal left doing nothing but
+    calling one method on one of its parameters: inlined at every call and
+    deleted, or kept for the reason given. See
+    :mod:`~flag_cleanup.forwarder_csharp`."""
+    lines: list[str] = []
+    if inlined:
+        count = len(inlined)
+        lines += [
+            f"> **{count} helper{' was' if count == 1 else 's were'} inlined.** This "
+            f"removal left {'it' if count == 1 else 'each'} doing nothing but calling "
+            "one method on one of its parameters. Every call in the repository now "
+            f"makes that call directly, and the helper went with its doc comment:",
+            ">",
+            *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in inlined[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if kept:
+        count = len(kept)
+        lines += [
+            f"> **ℹ️ {count} helper{' now only forwards' if count == 1 else 's now only forward'} "
+            "a call.** This removal left "
+            f"{'it' if count == 1 else 'each'} doing nothing but calling one method on "
+            "one of its parameters. It was kept for the reason given, so its callers "
+            "could make that call directly, and its doc comment may still describe "
+            "what was removed:",
+            ">",
+            *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in kept[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    return lines
+
+
 def _removed_member_lines(removed: list[tuple[str, str]]) -> list[str]:
     """The note naming each private field this pull request removed, or nothing.
 
@@ -486,6 +546,142 @@ def _declared_call_lines(declared: list[tuple[str, str]]) -> list[str]:
         "does do work, restore it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in declared[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _readiness_lines(rows: list[tuple[str, str, str]]) -> list[str]:
+    """The callouts for the waits for flags to load that this removal left
+    guarding no flag read: the gate components removed, the waits removed on
+    their own, and the waits kept. Nothing when there are none."""
+    gates = [(path, text) for path, kind, text in rows if kind == REMOVED_GATE]
+    removed = [(path, text) for path, kind, text in rows if kind == REMOVED_GUARD]
+    kept = [(path, text) for path, kind, text in rows if kind == KEPT_GUARD]
+    lines: list[str] = []
+    if gates:
+        lines += [
+            "> **A component that only waited for the flags to load was removed.** "
+            "This removal took out the last flag it read, which left it waiting for "
+            "the flag client to be ready and then rendering its children: a delay "
+            "with nothing to wait for. Every place that rendered it now renders "
+            "its child directly, and its file and its own test file were deleted:",
+            ">",
+            *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in gates[:20]],
+            *([f"> - ...and {len(gates) - 20} more"] if len(gates) > 20 else []),
+            "",
+        ]
+    if removed:
+        count = len(removed)
+        lines += [
+            f"> **{count} wait{'' if count == 1 else 's'} for the flags to load "
+            f"{'was' if count == 1 else 'were'} removed.** This removal took out the "
+            f"last flag read {'it' if count == 1 else 'each'} protected, and nothing "
+            "left beside it can read a flag, so it only delayed the page. Restore "
+            "it if something else depends on the wait:",
+            ">",
+            *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if kept:
+        count = len(kept)
+        lines += [
+            f"> **{count} wait{'' if count == 1 else 's'} for the flags to load "
+            f"{'was' if count == 1 else 'were'} kept.** This removal took out the "
+            f"last flag read {'it' if count == 1 else 'each'} protected, so it now "
+            "delays the page for nothing, but it could not be removed safely for "
+            "the reason given. Delete it by hand if nothing else needs it:",
+            ">",
+            *[f"> - {_md_code(path)}: {text}" for path, text in kept[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    return lines
+def _test_scaffolding_lines(vacuous: list[tuple[str, str]], titles: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each kept test line that may still describe the
+    removed branch, or nothing."""
+    if not vacuous and not titles:
+        return []
+    count = len(vacuous) + len(titles)
+    lines = [
+        f"> **{count} test line{'' if count == 1 else 's'} may still describe the removed "
+        f"branch.** Each is in a test this pull request kept. Check "
+        f"{'it' if count == 1 else 'each'}, and delete or reword it:",
+        ">",
+    ]
+    if vacuous:
+        lines.append(
+            "> - An assertion that something is NOT shown, where only the removed "
+            "branch ever showed it, so it now passes whatever the code does:"
+        )
+        lines += [f">   - {_md_code(path)}: {_md_code(text)}" for path, text in vacuous[:20]]
+        if len(vacuous) > 20:
+            lines.append(f">   - ...and {len(vacuous) - 20} more")
+    if titles:
+        lines.append(
+            "> - A title that still speaks of the flag beside a test about the "
+            "removed branch that this pull request deleted:"
+        )
+        lines += [f">   - {_md_code(path)}: {_md_code(text)}" for path, text in titles[:20]]
+        if len(titles) > 20:
+            lines.append(f">   - ...and {len(titles) - 20} more")
+    return [*lines, ""]
+
+
+def _unwrapped_provider_lines(unwrapped: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Featureflip test provider this run unwrapped,
+    or nothing."""
+    if not unwrapped:
+        return []
+    count = len(unwrapped)
+    noun = "test provider was" if count == 1 else "test providers were"
+    return [
+        f"> **{count} Featureflip {noun} unwrapped.** This pull request emptied "
+        f"{'its' if count == 1 else 'their'} flag overrides, and nothing the test "
+        "renders loads a Featureflip module, even through the modules it imports, "
+        f"so {'it was' if count == 1 else 'each was'} replaced by what it wrapped:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unwrapped[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _kept_hook_call_lines(kept: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each discarded read-only hook call kept because a
+    test mocks or spies on that hook, or nothing."""
+    if not kept:
+        return []
+    count = len(kept)
+    noun = "hook call is" if count == 1 else "hook calls are"
+    return [
+        f"> **{count} discarded {noun} kept.** Nothing reads "
+        f"{'its' if count == 1 else 'their'} result, but a test in this repository "
+        "mocks or spies on the hook and may count its calls. Delete "
+        f"{'it' if count == 1 else 'each'} if that test does not:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in kept[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _hook_call_lines(hooks: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each discarded call to a read-only framework hook
+    the removal left behind and then deleted, or nothing."""
+    if not hooks:
+        return []
+    count = len(hooks)
+    noun = "hook call was" if count == 1 else "hook calls were"
+    return [
+        f"> **{count} discarded {noun} deleted.** Nothing read "
+        f"{'its' if count == 1 else 'their'} result any more, and "
+        f"{'it is' if count == 1 else 'each is'} a React, React Router or Featureflip "
+        "hook that only reads a value, called unconditionally at the top of its "
+        "component, so deleting it changes nothing the component renders:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in hooks[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -746,10 +942,12 @@ def _removed_comment_lines(removed: list[tuple[str, str]]) -> list[str]:
     noun = "comment was" if count == 1 else "comments were"
     return [
         f"> **{count} {noun} removed.** Each named only this flag (or a type "
-        "this pull request deletes) and said nothing else, or described the "
-        "flag's state directly above a statement this pull request deleted, "
-        "so it described code that is gone. A comment that also says "
-        "something else is kept and listed below:",
+        "this pull request deletes) and said nothing else, sat directly above "
+        "this flag's read, a variable holding it or its registry entry, which "
+        "this pull request deleted, or described the flag's state directly "
+        "above a statement this pull request deleted, so it described code "
+        "that is gone. A comment that names this flag and also says something "
+        "else is kept, and listed further down. The removed comments, in full:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -1452,6 +1650,28 @@ def pr_body(
     declared_calls = [
         (path, text) for path, kind, text in bindings if kind == DECLARED_CALL
     ]
+    inlined_forwarders = [
+        (path, text) for path, kind, text in bindings if kind == INLINED_FORWARDER
+    ]
+    kept_forwarders = [
+        (path, text) for path, kind, text in bindings if kind == KEPT_FORWARDER
+    ]
+    readiness = [b for b in bindings if b[1] in (REMOVED_GATE, REMOVED_GUARD, KEPT_GUARD)]
+    hook_calls = [
+        (path, text) for path, kind, text in bindings if kind == HOOK_CALL
+    ]
+    kept_hook_calls = [
+        (path, text) for path, kind, text in bindings if kind == HOOK_CALL_KEPT
+    ]
+    unwrapped_providers = [
+        (path, text) for path, kind, text in bindings if kind == UNWRAPPED_PROVIDER
+    ]
+    vacuous_assertions = [
+        (path, text) for path, kind, text in bindings if kind == VACUOUS_ASSERTION
+    ]
+    stale_titles = [
+        (path, text) for path, kind, text in bindings if kind == STALE_TITLE
+    ]
     bindings = tuple(b for b in bindings if b[1] not in REPORTED_BINDING_KINDS)
     lines += _unread_parameter_lines(unread_parameters)
     lines += _unread_member_lines(
@@ -1468,10 +1688,16 @@ def pr_body(
     lines += _removed_member_lines([m for m in removed_members if not m[0].endswith(".dart")])
     lines += _removed_dart_field_lines([m for m in removed_members if m[0].endswith(".dart")])
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
+    lines += _forwarder_lines(inlined_forwarders, kept_forwarders)
     lines += _failing_assertion_lines(failing_assertions)
+    lines += _test_scaffolding_lines(vacuous_assertions, stale_titles)
     lines += _constant_guard_lines(constant_guards)
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _declared_call_lines(declared_calls)
+    lines += _readiness_lines(readiness)
+    lines += _hook_call_lines(hook_calls)
+    lines += _kept_hook_call_lines(kept_hook_calls)
+    lines += _unwrapped_provider_lines(unwrapped_providers)
     lines += _discarded_call_lines(discarded_calls)
     lines += _unread_binding_lines(unread_bindings)
     lines += _dropped_argument_lines(dropped_arguments)
@@ -1575,6 +1801,10 @@ def pr_body(
     phases = [(path, text) for path, kind, text in test_doubles if kind == TEST_PHASE]
     rows = [(path, text) for path, kind, text in test_doubles if kind == TEST_ROWS]
     rebuilt = [(path, text) for path, kind, text in test_doubles if kind == REBUILT]
+    false_titles = [(path, text) for path, kind, text in test_doubles if kind == FALSE_TITLE]
+    facts = [(path, text) for path, kind, text in test_doubles if kind == THEORY_FACT]
+    renamed_methods = [(path, *text.split("\n", 1)) for path, kind, text in test_doubles if kind == RENAMED_METHOD and "\n" in text]
+    gate_named = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == GATE_NAMED and ": " in text]
     mock_lines = [
         (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
     ]
@@ -1639,6 +1869,20 @@ def pr_body(
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+    if facts:
+        count = len(facts)
+        noun = "parameterised test was" if count == 1 else "parameterised tests were"
+        lines += [
+            f"> **{count} {noun} left with one row, and {'is' if count == 1 else 'are'} now "
+            f"{'a `[Fact]`' if count == 1 else '`[Fact]`s'}.** Once the rows of the removed value "
+            "went, each `[Theory]` kept a single `[InlineData]` row, so its parameters were "
+            "constants. The parameters are gone, and each value is written where its parameter "
+            "was read:",
+            ">",
+            *[f"> - {_md_code(path)} — {_one_line(text)}" for path, text in facts[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
     if rebuilt:
         count = len(rebuilt)
         noun = "test now runs" if count == 1 else "tests now run"
@@ -1665,6 +1909,45 @@ def pr_body(
             "can no longer produce; the rest of each test still runs:",
             ">",
             *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in phases[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        ]
+        if false_titles:
+            one = len(false_titles) == 1
+            lines += [
+                ">",
+                f"> ⚠️ {'This test is' if one else 'These tests are'} still named for what happened "
+                f"at `{'false' if candidate.treatment else 'true'}`, which no longer runs, so "
+                f"{'its name is' if one else 'their names are'} now false. Rename "
+                f"{'it' if one else 'each'}, or delete {'it' if one else 'it'} if another test "
+                "already covers what is left:",
+                ">",
+                *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in false_titles[:20]],
+                *([f"> - ...and {len(false_titles) - 20} more"] if len(false_titles) > 20 else []),
+            ]
+        lines.append("")
+    if renamed_methods:
+        count = len(renamed_methods)
+        noun = "kept test was" if count == 1 else "kept tests were"
+        lines += [
+            f"> **{count} {noun} renamed.** {'Its' if count == 1 else 'Each'} name said the gate "
+            f"this pull request removes was **{kept}**, the branch it keeps, in a part of the name "
+            "of its own. Once the gate is gone that says nothing, so the part was dropped. Nothing "
+            "else in the repository spells the old name:",
+            ">",
+            *[f"> - {_md_code(path)}: {_md_code(old)} → {_md_code(new)}" for path, old, new in renamed_methods[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if gate_named:
+        count = len(gate_named)
+        noun = "kept test is" if count == 1 else "kept tests are"
+        lines += [
+            f"> **⚠️ {count} {noun} still named for the state of the gate this pull request "
+            f"removes.** {'Its' if count == 1 else 'Each'} name says the gate is on or off, which "
+            "no longer means anything. It was left as written, for the reason given; rename it "
+            "by hand:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(name)}: {reason}" for path, name, reason in gate_named[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -1837,6 +2120,7 @@ _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
     TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
+    FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED,
 )
 
 
@@ -2238,6 +2522,38 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     phases = [(p, t) for p, kind, t in test_doubles if kind == TEST_PHASE]
     rows = [(p, t) for p, kind, t in test_doubles if kind == TEST_ROWS]
     rebuilt = [(p, t) for p, kind, t in test_doubles if kind == REBUILT]
+    false_titles = [(p, t) for p, kind, t in test_doubles if kind == FALSE_TITLE]
+    facts = [(p, t) for p, kind, t in test_doubles if kind == THEORY_FACT]
+    renamed = [(p, t) for p, kind, t in test_doubles if kind == RENAMED_METHOD]
+    gate_named = [(p, t) for p, kind, t in test_doubles if kind == GATE_NAMED]
+    if false_titles:
+        logger.warning(
+            "%d test%s cut to the kept value still named for the removed one: %s",
+            len(false_titles),
+            "" if len(false_titles) == 1 else "s",
+            "; ".join(f"{p}: {t}" for p, t in false_titles),
+        )
+    if facts:
+        logger.warning(
+            "%d [Theory] test%s left with one row rewritten as [Fact]: %s",
+            len(facts),
+            "" if len(facts) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in facts),
+        )
+    if renamed:
+        logger.warning(
+            "%d kept test%s renamed without the removed gate's state: %s",
+            len(renamed),
+            "" if len(renamed) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t.replace(chr(10), ' -> '))}" for p, t in renamed),
+        )
+    if gate_named:
+        logger.warning(
+            "%d kept test%s still named for the removed gate's state: %s",
+            len(gate_named),
+            "" if len(gate_named) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in gate_named),
+        )
     if rebuilt:
         logger.warning(
             "%d test%s now run%s with the kept value through a test helper; review: %s",

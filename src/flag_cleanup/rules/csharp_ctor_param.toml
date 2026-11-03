@@ -122,3 +122,26 @@ query = """(
 replace_node = "param"
 replace = ""
 is_seed_rule = true
+
+# A static method this run left doing nothing but making one call on one of
+# its parameters: each proven call of it becomes that call. Rendered by
+# `forwarder_csharp.render_rules` alone, one clone per method: the pass
+# replaces each proven call's callee (`Owner.M`, or a bare `M`) with the
+# marked name, so the rule matches only the calls it proved, once each. The
+# argument list is anchored at both ends and between every argument, so a
+# call of any other length does not match. The template places each
+# argument where the method passed the parameter it binds, and makes the
+# receiver parameter's argument the receiver. `delete_marked_member` above
+# deletes the method.
+# ctor: forward
+[[rules]]
+name = "forward_marked_call"
+query = """(
+  (invocation_expression
+    function: (identifier) @name
+    arguments: (argument_list __FWD_ARGUMENTS__)) @call
+  (#eq? @name "__FWD_SENTINEL__")
+)"""
+replace_node = "call"
+replace = "__FWD_CALL__"
+is_seed_rule = true

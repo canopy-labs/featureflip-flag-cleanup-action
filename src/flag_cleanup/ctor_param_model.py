@@ -29,12 +29,16 @@ SENTINEL_PREFIX = "__ff_drop_arg_"
 
 _TEMPLATES = {
     "ts": "ts_ctor_param.toml",
+    #: Only the JSX rules, rendered beside the ``ts`` blocks for a TSX file.
+    "tsx": "tsx_ctor_param.toml",
     "csharp": "csharp_ctor_param.toml",
     "dart": "dart_ctor_param.toml",
     "java": "java_ctor_param.toml",
     "kt": "kt_ctor_param.toml",
 }
-_BLOCK = re.compile(r"^# ctor: (parameter|classic|argument)\n", re.MULTILINE)
+#: ``forward`` blocks are rendered only by :mod:`flag_cleanup.forwarder_csharp`,
+#: one per inlined method; :func:`render_rules` leaves them out.
+_BLOCK = re.compile(r"^# ctor: (parameter|classic|argument|forward)\n", re.MULTILINE)
 
 #: What each form of mark writes in place of its span. An argument becomes the
 #: sentinel itself. A field becomes a method of that name, because a method
@@ -316,6 +320,12 @@ def tidy_lines(before: bytes, after: bytes) -> bytes:
     return b"".join(line for index, line in enumerate(lines) if index not in drop)
 
 
+def blocks(language: str, kind: str) -> list[str]:
+    """The text of each ``# ctor: <kind>`` block of ``language``'s template."""
+    template = (RULES_DIR / _TEMPLATES[language]).read_text(encoding="utf-8")
+    return [text for found, text in _blocks(template) if found == kind]
+
+
 def _blocks(template: str) -> list[tuple[str, str]]:
     """``(kind, text)`` for each ``# ctor: <kind>`` block, header excluded."""
     marks = list(_BLOCK.finditer(template))
@@ -339,6 +349,8 @@ def render_rules(language: str, removals: Sequence[Removal], sentinel: str) -> s
     for kind, block in _blocks(template):
         if kind == "argument":
             out.append(block.replace("__CTOR_SENTINEL__", sentinel))
+            continue
+        if kind == "forward":
             continue
         # A `parameter` block deletes a primary (or TypeScript) constructor's
         # parameter, a `classic` block an explicit C# constructor's: the
