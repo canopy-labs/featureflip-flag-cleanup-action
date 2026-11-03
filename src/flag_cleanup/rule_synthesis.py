@@ -50,6 +50,13 @@ __all__ = [
 #: whose code is Ruby. A run of any other language never sees such a name.
 SUFFIXED_ACCESSOR_LANGUAGES = frozenset({"ruby", "erb"})
 
+#: Laravel Pennant's read, `Feature::active('k')`, as the `accessors` input names it.
+PENNANT_ACTIVE = "active"
+#: The function the engine's Blade view reads Pennant's `@feature(...)` directive
+#: family through. No PHP code defines it; the engine refuses a template that
+#: spells it.
+BLADE_FEATURE = "__blade_feature"
+
 
 def accessors_for(language: str, accessors: tuple[str, ...]) -> tuple[str, ...]:
     """``accessors`` as one ``language``'s run takes them.
@@ -62,7 +69,15 @@ def accessors_for(language: str, accessors: tuple[str, ...]) -> tuple[str, ...]:
     """
     if language in SUFFIXED_ACCESSOR_LANGUAGES:
         return accessors
-    return tuple(name for name in accessors if not name.endswith(("?", "!")))
+    kept = tuple(name for name in accessors if not name.endswith(("?", "!")))
+    if language == "blade" and PENNANT_ACTIVE in kept and BLADE_FEATURE not in kept:
+        # Pennant's `@feature('k')` is `Feature::active('k')`, and the engine's
+        # Blade view reads it through `__blade_feature('k')`: a run that folds
+        # `Feature::active` folds the directive too, and one that does not
+        # leaves both. The view has no other spelling of it, so nothing else
+        # can match the name.
+        kept = (*kept, BLADE_FEATURE)
+    return kept
 
 
 class SynthesisError(RuntimeError):

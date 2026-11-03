@@ -338,6 +338,21 @@ class _Language:
     #: fully undocumented, green (see the roster tests there for why prose was
     #: the one part of adding a language that nothing checked).
     display_name: str = field(kw_only=True)
+    #: Suffixes inside ``extensions`` that another language claims ahead of this
+    #: one: ``.blade.php`` ends in ``.php``, and it is the ``blade`` language's.
+    #: A file ending in one is never this language's (:meth:`owns`).
+    excludes: tuple[str, ...] = field(default=(), kw_only=True)
+    #: A template syntax hosted by another language (ERB is Ruby's, Blade is
+    #: PHP's) rather than a programming language of its own. Nothing here
+    #: behaves differently for it; it is how a "supported languages" count is
+    #: told apart from the roster of everything this tool rewrites.
+    template: bool = field(default=False, kw_only=True)
+
+    def owns(self, path: str) -> bool:
+        """Whether ``path`` is one of this language's files."""
+        return path.endswith(self.extensions) and not (
+            self.excludes and path.endswith(self.excludes)
+        )
 
 
 _LANGUAGES: dict[str, _Language] = {
@@ -425,8 +440,15 @@ _LANGUAGES: dict[str, _Language] = {
     # only happens when the file also MENTIONS the flag key (nothing else is
     # handed to the engine), and `_quarantine_and_retry` turns it into a
     # reported skip — at the cost of one engine invocation per candidate file.
+    #
+    # `.blade.php` is excluded: a Laravel Blade view is the `blade` language's
+    # below, and a file is handed to one run only.
     "php": _Language(
-        "php", "php", (".php", ".phtml", ".inc", ".module"), display_name="PHP"
+        "php",
+        "php",
+        (".php", ".phtml", ".inc", ".module"),
+        display_name="PHP",
+        excludes=(".blade.php",),
     ),
     # Ruby rides the engine's built-in cascade the way C# and PHP do, so
     # `rules/ruby.toml` is a seed rule and nothing else — the engine carries
@@ -475,7 +497,24 @@ _LANGUAGES: dict[str, _Language] = {
     # bare Ruby grammar reads a template's markup as damage — 22 false refusals
     # over 324 real engine runs, zero true positives) and judges the host code
     # through a derived code view under Ruby's own profile.
-    "erb": _Language("erb", "ruby", (".erb",), display_name="ERB"),
+    "erb": _Language("erb", "ruby", (".erb",), display_name="ERB", template=True),
+    # Laravel Blade, the SECOND template language, and PHP's the way ERB is
+    # Ruby's: `rule_base="php"` runs `rules/php.toml` and its siblings with no
+    # copy. The engine reads a view through a synthesized PHP view (its
+    # `blade_view`): `@if`/`@elseif`/`@else`/`@endif`, `@unless` and Pennant's
+    # `@feature` family become a braced `if`, `{{ }}`/`{!! !!}` echoes become
+    # calls, and everything else is an opaque placeholder; the template is
+    # rebuilt from the original bytes outside the rewritten spans. Pennant's
+    # `@feature('k')` reads through `__blade_feature('k')` in that view, which
+    # `rule_synthesis.accessors_for` clones a rule for when `active` (Pennant's
+    # `Feature::active`) is a declared accessor.
+    #
+    # `.blade.php` is a COMPOUND suffix, so `source_files` matches it on the
+    # whole name, and `php` excludes it (`_Language.owns`). Gate 1 is split
+    # like ERB's: the profile's grammar is PHP's, to which a view is one inert
+    # `text` node, and the host checks judge a code view under the `php`
+    # profile (see `syntax.py`'s `blade` profile).
+    "blade": _Language("blade", "php", (".blade.php",), display_name="Blade", template=True),
     # Dart rides the engine's built-in cascade (piranha#70/#71) like C#, PHP and
     # Ruby, so `rules/dart.toml` is a seed rule and nothing else.
     #
@@ -508,6 +547,11 @@ _LANGUAGES: dict[str, _Language] = {
     #    rules/swift.toml — read that file before touching either half.
     "swift": _Language("swift", "swift", (".swift",), display_name="Swift"),
 }
+
+#: The languages whose files the engine reads through a synthesized view, and
+#: whose comments are markup or template syntax rather than host-language
+#: comments, so the comment passes leave them alone.
+_TEMPLATE_LANGUAGES = frozenset({"erb", "blade"})
 
 # Every extension a flag read can plausibly live in, across every language
 # family this tool knows about. The complement of whatever the configured
@@ -596,6 +640,7 @@ KNOWN_EXTENSIONS = frozenset(
         ".php", ".phtml", ".inc", ".module",  # claimed by the php language
         ".rb", ".rake",  # claimed by the ruby language
         ".erb",  # claimed by the erb language — the last unclaimed one
+        ".blade.php",  # claimed by the blade language, ahead of php's `.php`
         ".dart",  # claimed by the dart language
     }
 )
@@ -715,7 +760,7 @@ def candidate_files(
         sibling = (bool(sibling_extensions) and mention.endswith(sibling_extensions)) or (
             str(Path(mention).resolve()) in described
         )
-        if not (sibling or mention.endswith(spec.extensions)):
+        if not (sibling or spec.owns(mention)):
             continue
         if not cross_file_keys.within(Path(mention), resolved_root):
             continue  # outside this run; the wrapper pass reports the call instead
@@ -767,8 +812,8 @@ def _own_candidates(root: Path, language: str, flag_key: str) -> list[str]:
     Sibling-type readers are left out on purpose. They are what the caller is
     deciding about, and asking for them here would call back into the sibling.
     """
-    extensions = _LANGUAGES[language].extensions
-    holders = _candidate_files(root, extensions, flag_key)
+    spec = _LANGUAGES[language]
+    holders = _candidate_files(root, spec.extensions, flag_key, spec.excludes)
     if not cross_file_keys.supported(language):
         return holders
     names = _key_const_names(holders, language, flag_key)
@@ -776,7 +821,7 @@ def _own_candidates(root: Path, language: str, flag_key: str) -> list[str]:
     readers = [
         mention
         for mention in cross_file_keys.mention_files(str(root), names, exclude=holders)
-        if mention.endswith(extensions) and cross_file_keys.within(Path(mention), resolved_root)
+        if spec.owns(mention) and cross_file_keys.within(Path(mention), resolved_root)
     ]
     return holders + sorted(set(readers))
 
@@ -798,7 +843,11 @@ def _claimed_by_siblings(
     names: set[str] = set()
     for other in siblings:
         names |= _key_const_names(
-            _candidate_files(root, _LANGUAGES[other].extensions, flag_key), other, flag_key
+            _candidate_files(
+                root, _LANGUAGES[other].extensions, flag_key, _LANGUAGES[other].excludes
+            ),
+            other,
+            flag_key,
         )
         if wrappers:
             names |= wrapper_inline.candidate_names(
@@ -818,7 +867,7 @@ def _candidate_files_without_wrappers(
 ) -> list[str]:
     spec = _language_spec(language)
     root = Path(repo_dir)
-    found = _candidate_files(root, spec.extensions, flag_key)
+    found = _candidate_files(root, spec.extensions, flag_key, spec.excludes)
     if not cross_file_keys.supported(language):
         return found
     names = _key_const_names(found, language, flag_key)
@@ -834,7 +883,7 @@ def _candidate_files_without_wrappers(
     extra: list[str] = []
     for mention in cross_file_keys.mention_files(repo_dir, names, exclude=found):
         sibling = mention.endswith(sibling_extensions)
-        if not (sibling or mention.endswith(spec.extensions)):
+        if not (sibling or spec.owns(mention)):
             continue
         if not cross_file_keys.within(Path(mention), resolved_root):
             continue  # outside this run; the resolution refuses it instead
@@ -880,12 +929,12 @@ def _grammar_of(path: str, language: str) -> str:
     calling a Ruby helper is parsed, rewritten and checked as ERB. Every pass
     that parses a file asks this rather than trusting the run's language.
     """
-    if path.endswith(_language_spec(language).extensions):
+    if _language_spec(language).owns(path):
         return language
     wrappers = wrapper_inline.profile(language)
     callers = frozenset(wrappers.siblings) if wrappers is not None else frozenset()
     for sibling in sorted(cross_file_keys.family(language) | callers):
-        if path.endswith(_LANGUAGES[sibling].extensions):
+        if _LANGUAGES[sibling].owns(path):
             return sibling
     return language
 
@@ -919,7 +968,10 @@ def _is_go_vendor_tree(directory: Path) -> bool:
 
 
 def source_files(
-    root: Path, extensions: Iterable[str], skip_dirs: Iterable[str] = ()
+    root: Path,
+    extensions: Iterable[str],
+    skip_dirs: Iterable[str] = (),
+    exclude: tuple[str, ...] = (),
 ) -> list[Path]:
     """Files under ``root`` with one of ``extensions``, skipped dirs pruned.
 
@@ -941,8 +993,18 @@ def source_files(
     drifted apart in the first place.
     """
     suffixes = frozenset(extensions)
+    # A suffix of two dots (`.blade.php`) is matched on the whole name, since
+    # `Path.suffix` only ever holds the last one. `exclude` drops names another
+    # language claims ahead of these suffixes (`_Language.excludes`).
+    compound = tuple(s for s in suffixes if s.count(".") > 1)
+
+    def wanted(name: str) -> bool:
+        if exclude and name.endswith(exclude):
+            return False
+        return Path(name).suffix in suffixes or bool(compound) and name.endswith(compound)
+
     if root.is_file():
-        return [root] if root.suffix in suffixes else []
+        return [root] if wanted(root.name) else []
     skip = frozenset(skip_dirs)
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -952,13 +1014,13 @@ def source_files(
             for d in dirnames
             if d not in skip and not _is_go_vendor_tree(directory / d)
         ]
-        found.extend(
-            directory / name for name in filenames if Path(name).suffix in suffixes
-        )
+        found.extend(directory / name for name in filenames if wanted(name))
     return sorted(found)
 
 
-def _candidate_files(root: Path, extensions: tuple[str, ...], flag_key: str) -> list[str]:
+def _candidate_files(
+    root: Path, extensions: tuple[str, ...], flag_key: str, exclude: tuple[str, ...] = ()
+) -> list[str]:
     """Source files that could possibly be rewritten for ``flag_key``.
 
     Every seed rule requires the flag key to appear as a string literal in the
@@ -969,7 +1031,7 @@ def _candidate_files(root: Path, extensions: tuple[str, ...], flag_key: str) -> 
     quadratic-ish and takes tens of seconds over a large tree.
     """
     candidates = []
-    for path in source_files(root, extensions, _SKIP_DIRS):
+    for path in source_files(root, extensions, _SKIP_DIRS, exclude):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -1960,7 +2022,7 @@ def _transform_flag(
         # `_inline_bound_reads`.
         "marker": (ts_fold.marker_for if language in ("ts", "tsx", "js") else marker_for)(flag_key),
     }
-    # The sentinel rules of Java, C#, Go, Dart, PHP, Ruby (ERB shares its rules),
+    # The sentinel rules of Java, C#, Go, Dart, PHP (Blade shares its rules), Ruby (ERB shares its rules),
     # Swift and the TS family name the hole
     # whether or not this run marks a wrapper call, and a hole no substitution
     # supplies aborts the engine. Kotlin's is supplied by its pre-pass, which
@@ -2027,7 +2089,8 @@ def _transform_flag(
     # constant may name its key. Its refusal comes before the engine writes
     # anything, as a gate component's does.
     attribute_gates = _check_attribute_gates(
-        sorted({*paths, *reader_paths}), language, flag_key, accessors, resolution, treatment
+        sorted({*paths, *reader_paths}), language, flag_key, accessors, resolution, treatment,
+        key_positions=key_positions,
     )
 
     # A stub may name the key through a constant of another file, and only
@@ -2207,6 +2270,29 @@ def _transform_flag(
                 ", ".join(unprocessable),
             )
 
+        # A template the engine read and declined -- its view met an `@else` it
+        # cannot attribute, or would not reconstruct -- comes back unchanged with
+        # a `skipped_reason`. It still reads the flag, so it is listed with the
+        # files the engine could not process rather than passing as a no-match.
+        # Only a file that names the key as a whole word: the candidate scan is a
+        # substring match, and a view that only says `signupEnabled` is not one
+        # the flag's removal left behind.
+        whole_key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])")
+        for summary in summaries:
+            reason = getattr(summary, "skipped_reason", None)
+            if (
+                reason
+                and summary.path not in unprocessable
+                and whole_key.search(summary.original_content or "")
+            ):
+                logger.warning(
+                    "the transform engine left %s untouched while removing %r: %s",
+                    summary.path,
+                    flag_key,
+                    reason,
+                )
+                unprocessable.append(summary.path)
+
         # Read BEFORE any text pass or the pre-pass rebase: both replace a
         # changed summary with a `Rewrite`, and only the engine's summary
         # carries the rule name each edit came from. Inside this statement
@@ -2325,7 +2411,9 @@ def _transform_flag(
     # Before the whitespace tidy and the stranded-binding pass: the gate's own
     # import is stranded by this edit, and that pass is what removes it.
     summaries = _unwrap_gates(summaries, gate_paths, language, flag_key, gates)
-    summaries = _delete_attribute_gates(summaries, attribute_gates, flag_key, accessors, language)
+    summaries = _delete_attribute_gates(
+        summaries, attribute_gates, flag_key, accessors, language, key_positions=key_positions
+    )
     # The gates that take a boolean, which only the fold above can settle.
     summaries = _unwrap_boolean_gates(summaries, language, gates)
 
@@ -2482,6 +2570,16 @@ def _transform_flag(
             flag_key=flag_key,
         )
         wrapper_rows = wrapper_rows + residue_rows
+    # A Laravel Pennant feature class named by the key, every read of which
+    # was proven and folded: its file goes. Before the split below, which
+    # keeps a deleted file away from the passes that rewrite what is on disk.
+    if language == "php":
+        summaries, feature_rows, feature_kept = _delete_feature_classes(
+            summaries, resolution, reader_paths, unprocessable, repo_dir
+        )
+        bindings = bindings + feature_rows
+        if feature_kept:
+            resolution = replace(resolution, refusals=resolution.refusals + feature_kept)
     # A JVM test class whose last test went. Before the stranded-method pass,
     # which owns the imports this strands.
     summaries, emptied_tests = jvm_emptied_tests.remove(summaries, language, repo_dir, Rewrite)
@@ -3147,10 +3245,13 @@ def _check_attribute_gates(
     accessors: tuple[str, ...],
     resolution: cross_file_keys.Resolution,
     treatment: bool,
+    *,
+    key_positions: dict[str, int] | None = None,
 ) -> dict[str, frozenset[str]]:
     """The files holding a C# attribute gate or a Python decorator gate on this
     flag, with how each spells its key. Raises if ``treatment`` cannot remove
-    one.
+    one. ``key_positions``: the Python accessors whose key is not their first
+    argument, with its index.
     """
     if language not in ("csharp", "python") or not accessors:
         return {}
@@ -3165,10 +3266,10 @@ def _check_attribute_gates(
             continue
         texts = key_texts.get(path, frozenset())
         if language == "python":
-            reason = python_gates.refusal_reason(source, flag_key, names, treatment, texts)
+            reason = python_gates.refusal_reason(source, flag_key, names, treatment, texts, key_positions)
             if reason is not None:
                 reasons[path] = reason
-            elif spelled := python_gates.gate_texts(source, flag_key, names, texts):
+            elif spelled := python_gates.gate_texts(source, flag_key, names, texts, key_positions):
                 found[path] = spelled
             continue
         if treatment:
@@ -3199,6 +3300,8 @@ def _delete_attribute_gates(
     flag_key: str,
     accessors: tuple[str, ...],
     language: str = "csharp",
+    *,
+    key_positions: dict[str, int] | None = None,
 ) -> list:
     """Delete the gates :func:`_check_attribute_gates` found, adding a summary
     for any file the engine did not touch."""
@@ -3207,8 +3310,10 @@ def _delete_attribute_gates(
     for path, texts in attribute_gates.items():
         summary = by_path.get(path)
         before = summary.content if summary is not None else Path(path).read_text(encoding="utf-8")
-        gates = python_gates if language == "python" else csharp_gates
-        after = gates.delete_gates(before, flag_key, frozenset(accessors), texts)
+        if language == "python":
+            after = python_gates.delete_gates(before, flag_key, frozenset(accessors), texts, key_positions)
+        else:
+            after = csharp_gates.delete_gates(before, flag_key, frozenset(accessors), texts)
         Path(path).write_text(after, encoding="utf-8")
         rewrite = Rewrite(path, summary.original_content if summary else before, after)
         if summary is None:
@@ -3422,7 +3527,7 @@ def _leading_comments(
         if summary.original_content == summary.content or not summary.content:
             continue
         grammar = _grammar_of(summary.path, language)
-        if grammar == "erb" or not summary.path.endswith(_LANGUAGES[grammar].extensions):
+        if grammar in _TEMPLATE_LANGUAGES or not _LANGUAGES[grammar].owns(summary.path):
             continue
         relative = os.path.relpath(summary.path, repo_dir)
         found = stale_comments.leading_comments(summary.original_content, summary.content, grammar, flag_key)
@@ -3504,7 +3609,7 @@ def _remove_stale_comments(
     shifts: dict[str, object] = {}
     for path in files:
         grammar = _grammar_of(path, language)
-        if grammar == "erb" or not path.endswith(_LANGUAGES[grammar].extensions):
+        if grammar in _TEMPLATE_LANGUAGES or not _LANGUAGES[grammar].owns(path):
             continue
         before = text_of(path)
         if before is None:
@@ -3559,7 +3664,7 @@ def _flag_state_comments(
         if s.original_content == s.content or not s.content:
             continue
         grammar = _grammar_of(s.path, language)
-        if grammar == "erb" or not s.path.endswith(_LANGUAGES[grammar].extensions):
+        if grammar in _TEMPLATE_LANGUAGES or not _LANGUAGES[grammar].owns(s.path):
             continue
         relative = os.path.relpath(s.path, repo_dir)
         for found in stale_comments.flag_state_comments(
@@ -4129,6 +4234,91 @@ def _resolve_cross_file(
     return resolution, reader_paths, reader_const, regained, with_const, without_const
 
 
+def _delete_feature_classes(
+    summaries: list,
+    resolution: cross_file_keys.Resolution,
+    reader_paths: Iterable[str],
+    unprocessable: Iterable[str],
+    repo_dir: str,
+) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[cross_file_keys.Refusal, ...]]:
+    """Delete the file of each feature class the resolution proved deletable.
+
+    A feature class is deletable once every mention of it in the repository
+    is a proven read (``resolution.deletable``) and every proven reader was
+    rewritten: none of them is one the engine could not process. Its file
+    goes only when the class is all it holds; a class sharing its file is
+    kept and reported at its declaration, so the pull request says why it
+    stayed. Returns the summaries, a ``bindings`` row per deleted class, and
+    the refusals for the classes kept.
+    """
+    from flag_cleanup import cross_file_php_features
+
+    classes = [
+        d
+        for d in resolution.declarations
+        if d.kind == cross_file_keys.FEATURE_CLASS and not d.third_party
+    ]
+    if not classes:
+        return summaries, (), ()
+    stuck = {str(Path(p).resolve()) for p in unprocessable}
+    if stuck & ({str(Path(p).resolve()) for p in reader_paths} | set(resolution.readers)):
+        return summaries, (), ()
+    gone: list[str] = []
+    rows: list[tuple[str, str, str]] = []
+    kept: list[cross_file_keys.Refusal] = []
+    for decl in classes:
+        if decl.path not in resolution.deletable or decl.path in stuck:
+            continue
+        try:
+            source = Path(decl.path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not cross_file_php_features.deletable_alone(source, decl) or _composer_names(
+            decl.path, repo_dir
+        ):
+            line, text = next(
+                (
+                    (number, each.strip())
+                    for number, each in enumerate(source.splitlines(), start=1)
+                    if re.search(rf"\bclass\s+{re.escape(decl.name)}\b", each, re.IGNORECASE)
+                ),
+                (1, ""),
+            )
+            kept.append(
+                cross_file_keys.Refusal(decl.path, line, cross_file_keys.UNSUPPORTED_FORM, text)
+            )
+            continue
+        gone.append(decl.path)
+        rows.append(
+            (
+                os.path.relpath(decl.path, repo_dir),
+                cross_file_php_features.REMOVED_FEATURE_CLASS,
+                f"{decl.name}::class",
+            )
+        )
+    if gone:
+        summaries = file_deletion.delete(summaries, gone, Rewrite)
+    return summaries, tuple(rows), tuple(kept)
+
+
+def _composer_names(path: str, repo_dir: str) -> bool:
+    """Whether a ``composer.json`` between ``path`` and the checkout's root
+    names the file (a ``files`` or ``classmap`` autoload entry), which
+    deleting it would break."""
+    name = Path(path).name
+    root = Path(repo_dir).resolve()
+    for parent in Path(path).resolve().parents:
+        manifest = parent / "composer.json"
+        try:
+            if manifest.is_file() and name in manifest.read_text(encoding="utf-8"):
+                return True
+        except (OSError, UnicodeDecodeError):
+            return True
+        if parent == root:
+            break
+    return False
+
+
 def _is_blocked(resolution: cross_file_keys.Resolution, path: str) -> bool:
     """Whether a refusal keeps a declaration in ``path`` (see ``Resolution.blocked``)."""
     return str(Path(path).resolve()) in resolution.blocked
@@ -4623,7 +4813,7 @@ def _accessor_templates_for(rules_file: Path) -> str | None:
 
 
 #: The languages whose pre-pass exists only to mark keyless-wrapper calls.
-_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart", "php", "ruby", "erb", "swift"})
+_SPAN_ONLY_PREPASS = frozenset({"java", "csharp", "go", "ts", "tsx", "js", "python", "dart", "php", "blade", "ruby", "erb", "swift"})
 
 
 def _sentinel_prepass(
@@ -5168,8 +5358,8 @@ def _inline_constant_members(
         sentinel = constant_inline.sentinel_for(flag_key, member.value)
         for path, found in member.spans.items():
             for span in found:
-                # A span's optional third element is written after the mark
-                # (a property read's `()`).
+                # A `kotlin_sentinel.Mark`: its suffix is written after the
+                # mark (a property read's `()`).
                 spans.setdefault(by_resolved[path], []).append((sentinel, span))
     names = sorted(literals)
     originals: dict[str, str] = {}
@@ -5179,12 +5369,20 @@ def _inline_constant_members(
             if any(name in source for name in names):
                 raise kotlin_sentinel.SentinelCollisionError(path)
             data = source.encode("utf-8")
+            # Every span is checked against these bytes before any is
+            # spliced: one proven on a different text refuses them all.
+            for _sentinel, span in marks:
+                kotlin_sentinel.check_span(data, span)
             for sentinel, span in sorted(marks, key=lambda m: m[1][0], reverse=True):
-                suffix = span[2] if len(span) > 2 else ""
-                data = data[: span[0]] + (sentinel + suffix).encode("utf-8") + data[span[1] :]
+                data = data[: span.start] + (sentinel + span.suffix).encode("utf-8") + data[span.end :]
             originals[path] = source
             mock_stubs._write_exact(path, data.decode("utf-8"))
-    except kotlin_sentinel.SentinelCollisionError:
+    except kotlin_sentinel.SentinelCollisionError as exc:
+        if isinstance(exc, kotlin_sentinel.StaleSpanError):
+            logger.warning(
+                "not inlining members that now return a constant; they are kept: %s",
+                exc,
+            )
         for path, source in originals.items():
             mock_stubs._write_exact(path, source)
         return summaries

@@ -990,14 +990,16 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
     return sorted(found, key=lambda o: (o.line, o.span or (0, 0), o.text))
 
 
-def _named_strings(root: Node, name: str) -> list[tuple[int, str]]:
+def _named_strings(
+    root: Node, name: str, skip: Callable[[Node], bool] | None = None
+) -> list[tuple[int, str]]:
     """Literals whose whole text names the member (``"newCheckout"``,
     ``"newCheckout:"``), as a selector, a key-value key or a reflection
-    lookup does."""
+    lookup does, except those ``skip`` says are no mention."""
     whole = re.compile(rf"{re.escape(name)}(?:[:(].*)?", re.DOTALL)
     found: list[tuple[int, str]] = []
     for node in _walk(root):
-        if node.type in _STRINGS:
+        if node.type in _STRINGS and not (skip is not None and skip(node)):
             parts = node.named_children
             text = "".join(_text(p) for p in parts) if all(p.type in ("line_str_text", "multi_line_str_text", "raw_str_part") for p in parts) else None
             if text is not None and whole.fullmatch(text.strip()):
@@ -1006,8 +1008,12 @@ def _named_strings(root: Node, name: str) -> list[tuple[int, str]]:
 
 
 def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
+    """Strings naming the member, but not the key of a read of the flag: a
+    wrapper named after its key reads that string."""
     cached = index.file(path)
-    return [] if cached is None else _named_strings(cached[1], wrapper.name)
+    if cached is None:
+        return []
+    return _named_strings(cached[1], wrapper.name, wi.key_literal(wrapper, path, cached[0]))
 
 
 def leftovers(

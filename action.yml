@@ -1,7 +1,7 @@
 name: 'Featureflip Flag Cleanup'
 description: >-
   Deterministically remove dead/stale feature flags from TypeScript, TSX,
-  JavaScript, PHP, Ruby, ERB, Dart, Java, C#, Go, Python, Kotlin and Swift
+  JavaScript, PHP, Blade, Ruby, ERB, Dart, Java, C#, Go, Python, Kotlin and Swift
   source
   using
   Featureflip's
@@ -274,7 +274,7 @@ inputs:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
       language this Action currently supports (`ts`, `tsx`, `js`, `php`,
-      `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift` — see README). An unsupported value fails the run immediately (exit 2),
+      `blade`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift` — see README). An unsupported value fails the run immediately (exit 2),
       before
       anything is modified, rather than surfacing deep in the transform engine.
     required: false

@@ -8,6 +8,94 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.3.0
+
+### Added
+
+- Laravel Blade views (`.blade.php`) are rewritten, as the new `blade` language (on by default). A flag read in an `@if`, `@elseif` or `@unless` condition folds the directive and keeps the surviving arm's markup byte for byte; a rung served true in the middle of a chain becomes its `@else`. A read in a `{{ … }}` or `{!! … !!}` echo folds in place, keeping the echo's delimiters. With `accessors: active`, Laravel Pennant's `@feature('KEY')`, `@elsefeature('KEY')` and `@unlessfeature('KEY')` fold the way `Feature::active('KEY')` does. A deleted directive takes its line, so the view renders as before. Left alone: `@feature` with a value or an array, `@verbatim`, `{{-- --}}` comments, `@{{ }}` and `@@` escapes, `@php` blocks, raw `<?php ?>` and the arguments of other directives; a read there is listed under "still reference this flag". Inside `<pre>` and `<textarea>` a deleted directive's indentation stays, since it was rendered. Only Laravel's own, Pennant's and Livewire 3's directives may sit inside a conditional that is folded: a view with a custom `Blade::if` or `Blade::directive` there, or raw PHP or `@php` opening or closing a block there, is left as it is and listed with the files the engine could not process. A rewrite that would reach a custom directive, or leave a Blade block without its opener or closer, is refused.
+- PHP: Laravel Pennant class-based features are removed. A class whose `#[Name('KEY')]` attribute or public `$name` property is the flag's key is read as `Feature::active(Voucher::class)`, `feature(Voucher::class)` or `Feature::for($user)->active(Voucher::class)`; those reads now fold like `Feature::active('KEY')`, the imports they leave unused are removed, and the class's file is deleted once nothing else in the repository names the class. A class something else still names (a test's `Feature::define`, a Blade view, `new`, `extends`, a string) is kept, its proven reads still fold, and the pull request lists the line that kept it. A class that holds the key but cannot be proven to be named by it is listed as `feature-unproven`.
+
+### Changed
+
+- **All languages:** runs are faster. Each rewrite rule is now prepared once
+  per run instead of once per flag, so a run that removes several flags no
+  longer repeats that work for each one. Swift gains the most, since two of
+  its rules took seconds each to prepare.
+- The `php` language no longer takes `.blade.php` files; they are the `blade` language's. A run configured with `languages: php` alone lists a Blade view that reads the flag under "still reference this flag", as before.
+- **All languages:** before a call to a removed wrapper, or to a member the
+  cleanup reduced to a constant, is folded, the Action now checks that the
+  call it proved is still at the position it recorded. If it is not, the flag
+  (or, for a constant member, the member) is left as written and the run
+  reports why, instead of editing whatever code had moved into that position.
+
+### Fixed
+
+- **C#:** a flag read in or under an `if` or loop that a preprocessor
+  directive splits (an `#if … #endif`, `#region` or `#pragma` between its arms
+  or standing as one of them, outside an arm's braces) is now refused instead
+  of rewritten. These shapes used to be rewritten in a way that changed what
+  some build runs, or did not compile:
+  - an `if` alone in a `#if` block after an `else` (`else` / `#if X` /
+    `if (<read>) { … }` / `#endif`): only its first statement stayed under
+    the `else`, or the statement after the `#endif` became the `else`'s body;
+  - an `if` inside a `#if` block followed by an `else` after the `#endif`,
+    which belongs to that `if` in builds defining the symbol;
+  - an `else if (<read>)` inside a `#if` block followed by an `else` after
+    the `#endif`, which was left with no `if` in builds defining the symbol;
+  - an `if` right after an `if` or loop whose arm is a `#if` block with no
+    `#else`: in builds without the symbol that `if` is the arm, and only its
+    first statement stayed under it;
+  - an `if` whose body is a `#if` block with no `#else`: the statement after
+    the `#endif`, which is the body in builds without the symbol, was kept
+    running;
+  - an `else if (<read>)` whose body is a `#if` block, written as
+    `else #if`, which does not compile;
+  - a `#region`, `#pragma` or `#nullable` line between an `if`'s arms, which
+    was deleted with the `if`.
+  - a `#region` pair in the code after a folded `return`: the `#region` line
+    was deleted on its own, leaving an `#endregion` that does not compile.
+
+  If an earlier release opened a pull request removing a flag read in one of
+  these shapes, check its diff against every build configuration you ship.
+- **Go:** removing the longest key constant from a `const ( … )` block, or the
+  longest key from a flag-keyed map literal, no longer leaves the lines around
+  it padded for a name that is gone. They are re-padded the way `gofmt` pads
+  them, so `gofmt -l` stays clean and there is no `gofmt -w` step to run before
+  merging. A block that was not `gofmt`-formatted to begin with is left as it
+  was.
+- **Python:** a decorator gate named with the position of its key
+  (`accessors: flag_required[1]`) is now handled like the first-argument form.
+  `@flag_required(SWITCHES, "old-checkout")` is deleted when the flag is
+  removed serving `true`, and the flag is refused, naming the decorator, when
+  it is removed serving `false`. Before, the decorator was left in place in
+  both directions. A name, attribute or plain literal before the key is
+  allowed; anything else there refuses the flag in both directions.
+- **C#, Dart, Python and Swift:** a wrapper named after its own flag, such as
+  `boops()` reading `boolVariation("boops", …)`, was kept by that read's key,
+  and by the key of any other read of the flag. The string is the flag's key,
+  not a lookup by name, so the wrapper is now removed and its callers inlined,
+  as in PHP, Kotlin and Ruby. A string that names the wrapper anywhere else
+  still keeps it.
+- **Swift:** `if ready(), <read>` (a call ahead of the flag read in a
+  condition list) served false no longer deletes the statement, which dropped
+  the `ready()` call that Swift runs before it reaches the `false`. The file
+  is refused instead, and the same goes for `guard` and `while`. The refusal
+  now says that an earlier clause of the condition list runs code, rather than
+  that the literal is "still bound to a name or still tested". If an earlier
+  release removed a flag served false from such a condition list, check that
+  the call it deleted is not one you need.
+- **Swift:** `while let item = queue.next(), <read>` served false is refused
+  instead of left as `while let item = queue.next(), false`, a loop that still
+  calls `next()` once with the flag key gone from the file.
+- **Swift:** a flag read in a `while` condition list served true is removed
+  from the list, as it already was for `if` and `guard`:
+  `while <read>, let item = queue.next()` becomes
+  `while let item = queue.next()` instead of `while true, let item = …`.
+- **Swift:** a labelled `if` (`outer: if <read> { … } else { … }`) whose
+  `break outer` sits only in the branch the removal deletes keeps the other
+  branch as plain code. It used to be wrapped in `outer: do { … }`, a label
+  nothing jumps to any more.
+
 ## 2.2.0
 
 ### Added

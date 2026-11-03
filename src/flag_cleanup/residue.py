@@ -67,6 +67,15 @@ _GRAMMAR_BY_EXTENSION = {
 }
 
 
+def _grammar_by_extension(path: str) -> str | None:
+    """The grammar for ``path``, or None. A Blade view (``.blade.php``) is absent
+    for ERB's reason: to the PHP grammar it is one text node, so it stays in the
+    generic group."""
+    if path.endswith(".blade.php"):
+        return None
+    return _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
+
+
 @dataclass(frozen=True)
 class Residue:
     #: ``(path, statement)`` for every C# statement still describing a read
@@ -536,7 +545,7 @@ def classify(
     literal_only: list[str] = []
     namespace_only: list[str] = []
     for path in paths:
-        language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
+        language = _grammar_by_extension(path)
         if language is None:
             continue
         try:
@@ -590,7 +599,7 @@ def live_mention(path: str, source: str, flag_key: str) -> bool:
     mention = _mention(flag_key)
     if not mention.search(source):
         return False
-    language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
+    language = _grammar_by_extension(path)
     if language is None:
         return True
     root = _parse(source, language)
@@ -620,7 +629,7 @@ def live_references(paths: tuple[str, ...], flag_key: str) -> tuple[str, ...]:
     mention = _mention(flag_key)
     live: list[str] = []
     for path in paths:
-        language = _GRAMMAR_BY_EXTENSION.get(os.path.splitext(path)[1])
+        language = _grammar_by_extension(path)
         try:
             with open(path, encoding="utf-8") as handle:
                 source = handle.read()

@@ -9,7 +9,7 @@ opens one PR per flag. The setup guide lives at
 
 Supported languages: **TypeScript** (`.ts`, `.mts`, `.cts`), **TSX** (`.tsx`),
 **JavaScript** (`.js`, `.jsx`, `.mjs`, `.cjs`), **PHP** (`.php`, `.phtml`,
-`.inc`, `.module`), **Ruby** (`.rb`, `.rake`), **ERB** (`.erb`), **Dart**
+`.inc`, `.module`), **Blade** (`.blade.php`), **Ruby** (`.rb`, `.rake`), **ERB** (`.erb`), **Dart**
 (`.dart`), **Java** (`.java`), **Go** (`.go`), **Python** (`.py`), **Kotlin**
 (`.kt`, `.kts`), **C#** (`.cs`) and **Swift** (`.swift`).
 
@@ -664,7 +664,7 @@ entries dropped.
 | `deployed-refs` | `FEATUREFLIP_DEPLOYED_REFS` | *(none)* | `archive-sweep` only. Tags, branches or commit shas that stand for what is deployed, one per line or comma-separated. When set, a flag is archived only once its removal is contained in every one of them. See [Only archive what is deployed](#only-archive-what-is-deployed). |
 | `api-url` | `FEATUREFLIP_API_URL` | `https://api.featureflip.io` | Override only for a staging/self-hosted instance. |
 | `staleness` | `FEATUREFLIP_STALENESS` | `dead` | `dead` (ready-for-review PRs) or `stale` (draft PRs). |
-| `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
+| `languages` | `FEATUREFLIP_LANGUAGES` | every language this Action supports (`ts`, `tsx`, `js`, `php`, `blade`, `ruby`, `erb`, `dart`, `java`, `go`, `python`, `kt`, `csharp`, `swift`) | Comma-separated. |
 | `directories` | `FEATUREFLIP_DIRECTORIES` | `.` | Comma-separated, relative to the checkout. |
 | `accessors` | `FEATUREFLIP_ACCESSORS` | *(none)* | Comma-separated function names your own code uses to read a flag, on top of the SDK's, plus any JSX gate components as `Component[prop]` (`FlagGate[flag]`) or, for one that takes a boolean, `Component[condition?show:else]` (`ConditionallyRender[condition?show:elseShow]`). See [Wrapping the SDK](#wrapping-the-sdk). |
 | `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart, PHP, Ruby and Swift: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, Dart function, method or getter, PHP function or class method, Ruby method, or Swift function, method or computed property whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
@@ -2949,6 +2949,15 @@ Served `false`, the flag is **refused**, with the file and line named: the
 view can't be reached any more, and deleting it reaches routes and tests this
 run can't see.
 
+A decorator named with the position of its key (`flag_required[1]`, see
+above) is treated the same way when the key is in that slot:
+`@flag_required(SWITCHES, "old-checkout")` is deleted served `true` and
+refuses the flag served `false`. The arguments before the key may be names,
+attributes and plain literals, which a deletion drops without running
+anything; a call or any other expression there is refused in both
+directions. A decorator with the key in another slot is not a read of the flag
+and stays.
+
 A decorator that passes more than the key (`@waffle_flag("k", redirect_to="/")`,
 a list given to `method_decorator`) is refused in both directions, since what
 the other arguments do is not something the run can read. A read inside any
@@ -4097,6 +4106,7 @@ reason:
 | `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum (outside Swift), a Swift implicit member (`.X`) or a Swift read in a module holding an extension of the enum that declares a member named like the accessor, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries); any use that hands a TypeScript key constant's module on as an object (see Declared in another file); any use that takes a Java or Kotlin key constant's owner whole, by reflection or as a value (see Declared in another file); a Python import of the declaring module nested in a function or a `try`, or a sole-name import whose private alias is already used in the file (or sits beside a submodule of that name in a package `__init__.py` reader), or a relative one through a package `__init__.py` that is not plain, or one whose line cannot take a comment; a Python declaring file with a star import or a route to its own namespace; a Swift file whose module cannot be read from `Package.swift` or an Xcode project; a Go read under `go` or `defer`, a discarded Go read whose arguments call something or receive from a channel, or any Go read in an external test package that declares a named `Example` function, a parenthesised discarded Go read or one in an `if`, `switch` or `for` header, or a Go example function named after the constant; a Go file that does not parse |
 | `declaration-kept` | Python and Ruby only: a read of the constant that would have been folded, left as it is because another refusal listed beside it keeps the declaration it reads. A Python or Ruby constant can be reassigned, so a kept declaration keeps every read of it in another file, unless, in Python, nothing in the checkout spells a write of it and only mentions of its name keep it (see the note on a kept Python declaration above). For an enum entry, a read left because its file also reads a kept constant, or because an escape listed beside it can change the member's value (see Enum entries) |
 | `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name, a PHP enum that is not string-backed (pure or `int`), a PHP case whose value is not the key as a plain string (concatenated, interpolated or a constant expression), a PHP enum file that does not parse, a Python enum whose class is nested, has another base, a metaclass, a decorator other than `@unique`, a `value`, `name` or `label` method or one whose name starts with `_` (`__init__`, `__new__`), `_ignore_`, or a member valued by code, a Python enum its own module hands to other code, a Python member whose value is not the key as a plain string, or a Python enum file with a star import or a route to its own namespace, a Dart enum with more than one constructor (a factory or a second generative one), a field with an initializer or assigned twice, an argument that is not the key as a plain string (interpolated or concatenated), the key at a position the constructor does not store, type arguments on the entry, no public accessor of the field, a private enum or entry, a Dart enum in a part or in a file that does not parse, or a Swift case whose enum (or a type around it) is `private`, `fileprivate`, attributed or inside `#if`, or has a type around it with a supertype, or sits in a file whose module cannot be read or that does not parse, whose clause declares another case or associated values, whose raw type is not `String` (a typealias of it included), whose raw value is not the key as a plain single-line string, whose enum conforms to a protocol outside the list above or may pick up another `rawValue` (any extension in the repository declaring one counts), or could gain members from an attached macro: on an attributed extension anywhere in the repository that extends the enum, a typealias or protocol the repository declares, a type the enum's clause names, `RawRepresentable`, `Encodable`, `Decodable` or a protocol on the list above, or on a member of the enum or of such an extension carrying an attribute outside the built-in list above, or whose switch property is `static`, `private`, `fileprivate`, attributed, inside `#if`, has a setter, is declared in an extension, or has an arm with a binding, `where`, `_` or a name that is not a case of the enum |
+| `feature-unproven` | a PHP class holds the key in Laravel Pennant's `#[Name]` attribute or its `$name` property, but cannot be proven to be named by it: the property is not public or is static, nothing declares `resolve` or `__invoke`, the class is abstract, extends a class or uses a trait, something in it touches `$this->name`, the value is not a plain string, or the class is declared conditionally or in a file that does not parse. Its reads are left, and so is the class |
 | `enum-dynamic` | not a refusal: a Dart, Java, Kotlin, PHP, Python or Swift use of the whole enum that can reach the entry without naming it. Listed so it can be checked before the flag is archived |
 | `kept`, `left`, `left-competing` | not refusals: what happened to an enum entry, reported at its own declaration. `kept`: every read through it found was folded. `left`: a refusal above names it, and those reads stay. `left-competing`: only a competing declaration (`name-not-unique`) names it, so no read through it was resolved, and those reads are not listed |
 
@@ -5760,12 +5770,12 @@ left with nothing to do (`if org == "beta" {}`) stays; it builds and is
 `gofmt`-clean, but delete it by hand. Each statement is listed with the other
 removed entries.
 
-**A flag-keyed map entry and a key constant in a `const ( … )` block are the
-two exceptions, and only when `gofmt` aligned them.** `gofmt` pads a multi-line
-map literal's values, and a block's `=` signs, into a column sized by the
-longest key or name, so deleting the longest one leaves the others padded for
-something that is no longer there — still valid Go, but `gofmt -l` will list
-the file. Run `gofmt -w` on the branch before merging.
+**Removing the longest entry keeps `gofmt`'s columns.** `gofmt` pads a
+multi-line map literal's values, and a `const ( … )` block's types, `=` signs
+and comments, into columns sized by the longest key or name. When a removed
+flag-keyed map entry or key constant was the longest, the lines left are
+re-padded as `gofmt` pads them, so `gofmt -l` stays clean. A block that was not
+`gofmt`-formatted before the run is left as the removal leaves it.
 
 Files under a `go mod vendor` tree are skipped, detected by the
 `vendor/modules.txt` manifest rather than by directory name.
@@ -5792,19 +5802,15 @@ static accessor and a `::` call of that name belongs to somebody else's class;
 and a **namespace-qualified** call such as `\App\Flags\boolVariation(…)`. There
 is no Featureflip OpenFeature provider for PHP.
 
-A Laravel **Blade** view (`.blade.php`) is not rewritten. Its directives and
-echoes are inline HTML to the PHP grammar, so none of `@if (Feature::active('KEY'))`
-… `@endif`, `@feature('KEY')` … `@endfeature`, `{{ Feature::active('KEY') ? 'a' : 'b' }}`
-or a read inside `@php` … `@endphp` folds. A view that names the key is left
-byte for byte and listed under "still reference this flag" in the pull request,
-so the view side of the flag is yours to remove by hand.
+A Laravel **Blade** view (`.blade.php`) is not part of the `php` rule set: it
+is the `blade` language's, described in the next section.
 
 A name you declare in [`accessors`](#wrapping-the-sdk) is matched as a method
 call, a bare call **and a static call**: with `accessors: active`, Laravel
 Pennant's `Feature::active('KEY')` (any scope: `Feature::`, `static::`,
 `\Laravel\Pennant\Feature::`) folds exactly as `Feature::for($user)->active('KEY')`
 does, and so does `Feature::active(self::KEY)` through a key constant. Only a
-string or constant first argument is a key, so `Feature::someAreActive(['KEY',
+string, a constant or a feature class (below) as the first argument is a key, so `Feature::someAreActive(['KEY',
 …])` and `Feature::allAreActive([…])` are never folded: which key decided the
 answer is not something a literal can say. `Feature::inactive('KEY')` is left
 too, unless you declare it, and declaring it would fold it to the served value
@@ -5812,6 +5818,29 @@ rather than its opposite, so rewrite it as `!Feature::active('KEY')` first.
 Whatever is left is listed in the pull request as a file that still references
 the flag, and while it stands no flag-keyed entry of the flag is deleted (see
 "A flag-keyed entry is kept while anything still names the key").
+
+Pennant's **class-based features** are read by class: `Feature::active(Voucher::class)`,
+`feature(Voucher::class)` or `Feature::for($user)->active(Voucher::class)`, with
+the class imported, aliased or fully qualified. Pennant names such a class by its
+`#[Name('KEY')]` attribute, else by its public `$name` property, else by its fully
+qualified class name. A class named `KEY` the first or second way is the flag's
+declaration: its reads fold like `Feature::active('KEY')`, and once every place in
+the repository that names the class was such a read, the class's file is deleted.
+The class has to be a concrete top-level class that declares `resolve` or
+`__invoke` itself, extends nothing, uses no trait, and holds the key as a plain
+string: in the attribute, or as `public $name` (typed or not, or `var $name`)
+with nothing in the class touching `$this->name`. A class that holds the key and
+fails one of these is listed as `feature-unproven` and its reads are left. The
+class is kept, with every read that was proven still folded and the line that
+kept it listed in the pull request, when anything else names it: `new`,
+`extends`, a type, an attribute, a static call, `Feature::define(Voucher::class, …)`
+or `Feature::activate(Voucher::class)` in a test, the class held in a variable,
+`boolVariation(Voucher::class, …)` (the SDK would be handed the class's name, not
+the key), its qualified name or `Voucher::` in a string, docblock or Blade view,
+its file's name in a string, a Symfony or Twig file naming it, a `composer.json`
+that loads the file by path, or other code in the class's file. A class with no
+`#[Name]` and no `$name` is named by its qualified class name, which is never a
+flag key here, so its reads are left as they are.
 
 Reads fold in `if`/`elseif`/`else` — including the two-word `else if`, which
 leaves no residue — `!` negation, `&&`/`||` and their `and`/`or` spellings,
@@ -5904,6 +5933,72 @@ end of the function. Variables are also left alone when they:
 * share a line with another statement, or are the unbraced body of an
   `if`, `else` or `declare`.
 
+## Supported Blade flag-read shapes
+
+Laravel Blade views (`.blade.php`) run the **PHP** rules above, unchanged. Every
+call form and every deliberately-untouched shape in that section applies here
+too; the difference is where the code lives. A read in a directive's condition
+folds like the `if` it compiles to:
+
+```blade
+<div class="cart">
+    @if ($client->boolVariation('old-checkout', $ctx, false))
+        <a href="{{ route('checkout.legacy') }}">Legacy checkout</a>
+    @else
+        <a href="{{ route('checkout') }}">Checkout</a>
+    @endif
+</div>
+```
+
+Removing the flag keeps the surviving arm's markup exactly as it was and
+removes each line that held only a deleted directive. Blade drops the line
+break right after a directive, so a directive deleted from the middle of a
+line takes that line break with it and the view renders exactly as before. A
+deleted directive that stood alone on its line takes the line, indentation
+included; the surviving arm stays at its old indentation. Inside `<pre>` and
+`<textarea>`, where whitespace is content, the indentation in front of a
+deleted directive stays, so those render exactly as before too.
+
+What folds:
+
+* **`@if`, `@elseif`, `@else` and `@unless`.** A read anywhere in a chain
+  settles it: served one way, an `@elseif` rung becomes the chain's `@else`;
+  served the other, it goes, and a rung after it moves up. A condition the read
+  is only part of keeps the rest (`@unless ($read && $user->isGuest())` becomes
+  `@unless ($user->isGuest())`).
+* **Echoes.** `{{ <read> ? 'new' : 'old' }}` becomes `{{ 'new' }}`, and
+  `{!! … !!}` likewise; the echo's own delimiters and spacing come back
+  unchanged.
+* **Laravel Pennant's `@feature`.** With `accessors: active` (see the PHP
+  section), `@feature('KEY')` … `@else` … `@endfeature`, `@elsefeature('KEY')`
+  and `@unlessfeature('KEY')` fold the way `Feature::active('KEY')` does.
+  `@feature('KEY', 'blue')`, which compares a value, and `@feature([...])` are
+  left alone.
+
+Left alone, byte for byte: everything Blade itself does not compile
+(`@verbatim` blocks, `{{-- … --}}` comments, `@{{ … }}` and `@@if` escapes, an
+`@` after a letter, as in an e-mail address), the code inside an `@php` …
+`@endphp` block or raw `<?php … ?>`, and the arguments of every other directive
+(`@checked(…)`, `@class([…])`, `@include('view', […])`, a component attribute
+such as `:active="…"`). A read in one of those stays, and the view is listed
+under "still reference this flag" in the pull request.
+
+Only Laravel's own directives, Pennant's and Livewire 3's may sit inside a
+conditional the Action folds, because only their meaning is known: any other
+directive registered with `Blade::if` or `Blade::directive` could open, close or
+split the block. A few of Laravel's depend on their arguments: `@push('s', $html)`
+or `@section('t', $title)`, whose content is not a literal, counts as unknown. A view
+with any other directive between an `@if`/`@unless`/`@feature` and its closer is
+**left as it is** and listed in the pull request with the files the transform
+engine could not process, even when that conditional is not the flag's. So is a
+view where raw PHP or an `@php` block inside such a conditional opens or closes
+a block (`<?php if ($x): ?>`, `<?php endif; ?>`), or where `<?= … ?>` there has
+no closing `;`. Move the custom directive or the PHP block out of the
+conditional and the next run removes the flag. Alpine and Vue event attributes
+(`@click="…"`, `@submit.prevent="…"`) are markup and are fine anywhere. A
+rewrite that would reach a custom directive, or leave a Blade block without its
+opener or its closer, is **refused**, and the run exits 1 naming the file.
+
 ## Supported Swift flag-read shapes
 
 `client.boolVariation("KEY", default: value)` (swift SDK). The key is the first
@@ -5938,6 +6033,16 @@ meant to keep running, and it stays. Code after that loop is left alone too:
 Swift's compiler only warns that it will never be executed, and statements are
 deleted for being *unreachable* only where a language's standard build rejects
 them.
+
+A read that is one clause of a condition list (`if <read>, let x = lookup()`,
+and the same in a `guard` or `while`): served true, the clause is removed and
+the others stay. Served false, the statement is removed when nothing ahead of
+the read can run code, because Swift stops at the first clause that fails
+(an `if` is replaced by its `else`, a `guard` by its `else` body). When an
+earlier clause calls something (`if ready(), <read>`,
+`if let x = lookup(), <read>`), Swift runs that call before it reaches the
+read, so the statement cannot be removed without dropping it, and the file is
+refused.
 
 A key hoisted to a `let` constant is resolved, and the declaration removed with
 the last read of it — see [The key hoisted to a constant](#the-key-hoisted-to-a-constant),
@@ -6070,7 +6175,7 @@ means no PR.
 | A key held in a REASSIGNABLE binding (C# `static readonly`, a JS `let`, a Kotlin `var`, a non-`final` Java field) | no change at all — its value cannot be read off the declaration, so the flag it names is not knowable |
 | A key hoisted to a constant in a DIFFERENT file, in a language other than C#, Dart, Go, Java, Kotlin, Swift, TypeScript, TSX, JavaScript, Python, PHP or Ruby, or read in a shape outside [Declared in another file](#declared-in-another-file) | no change to the reader, and the declaration is **kept**. The pull request lists each such mention with its reason |
 | A C# read inside an **expression tree** (`mock.Setup(c => c.BoolVariation("KEY", …))`) | no change to the read — the lambda *describes* the call instead of performing it, so the text of the read is the payload a mocking library reads at run time. This one is not detected by naming `Setup`/`Verify`: the tell is that the read's receiver is the lambda's own parameter, so any library taking an `Expression<>` is covered, while a genuine `Func<>` lambda (`list.Where(x => flags.BoolVariation("KEY", …))`, reading off a captured client) is still rewritten. If the key is a `const`, the whole const path is withheld for that file — the mock setup is a live reference to the declaration. Once the run has folded a real read of the key, a `Setup` returning a literal and a `Verify` are resolved first, before this applies (see "Tests that mock the flag read") |
-| A C# read testing an `if` whose `else` sits inside `#if … #endif` | the flag is refused: the `else` is out of the fold's sight, and folding the `if` would delete it, even where it is the branch the flag leaves running |
+| A C# read in or under an `if` or loop that a preprocessor directive splits: an `#if … #endif`, `#region` or `#pragma` between its arms or standing as one of them (`else` followed by `#if X`), outside the braces of an arm, at any depth up to the method body's braces, or in the statement right after such an `if` or loop | **the flag is refused**, whichever way it is served: which code runs there depends on the symbols a build defines (an `else` inside the block runs only when the symbol is defined; a `#if` arm with no `#else` leaves the statement after `#endif` as the arm, so a read there is refused too). The dead code after a `return` is still removed with any `#if … #endif` blocks in it. Directives inside an arm's `{ … }` are fine, and so is an `if` inside a `#if` block that sits in a method body or a `switch` section: those are rewritten as usual. A `#region` pair in the code a folded `return` makes dead also refuses the flag, since that code cannot be removed a line at a time without splitting the pair |
 | A read handed to a **mocking DSL** that takes the call itself — `when(<read>).thenReturn(…)` (Mockito, mockito-kotlin, `package:mockito`, ts-mockito), `given(<read>).willReturn(…)` (BDDMockito), `every { <read> } returns …` (MockK), or `when(() => <read>)` / `verify(() => <read>)` (`package:mocktail`) | when the run folds a real read and the stub returns a literal, **resolved first**: the stub or its whole test is deleted (see "Tests that mock the flag read"). Otherwise **the whole flag is refused**, and the run exits 1 naming the file. These libraries stub by *performing* the call and capturing the invocation it registers, so the text of the read is the payload — the same property that makes the C# row above untouchable. Folding it leaves `when(true).thenReturn(true)`, which **compiles**: the stub silently stops stubbing, and the flag key is gone from the file so no later run looks again. Unlike C#, there is nothing structural to key on — no lambda exists, because the call is real — so the guard is a short list of stubbing entry points by name. mocktail's `() => <read>` form is the exception to the first point: the lambda is there but only wraps the call. Delete or rewrite those lines yourself, scope the run with `directories` to exclude your tests, or add the key to `ignore` |
 | A **Go read inside a gomock expectation** (`m.EXPECT().BoolVariation("KEY", ctx, false).Return(true)`) | resolved first in the same way as the row above, when it can be. Otherwise **the whole flag is refused**, and the run exits 1 naming the file. Same shape as the row above, caught a different way: the fold leaves `true.Return(true)`, and because Go's `bool` is a builtin with no method set, a selector on a boolean literal is broken Go *by construction* — so this one needs no list of library names. Before this was refused it shipped, and the customer's build was what reported it |
 | A **Java field or Kotlin property** bound to the read that is not `private` (`public final boolean enabled = <read>`, a bare `val enabled = <read>`) | read replaced, **declaration kept** → `public final boolean enabled = true;` / `val enabled = true`. Other files read it (`checkout.enabled`), and they do not contain the flag key, so this tool never sees them. Removing the field would break files it never parsed. A `private` one is inlined and removed, read bare or as `this.name`; one also read through another receiver (`other.name`), which may be another instance, keeps its declaration. In Java that holds only for a top-level class: a `private` field of a nested, local or anonymous class is kept the same way, because the enclosing class can read it (`settings.on`). A `private final boolean` assigned the read in the class's only constructor (`this.enabled = <read>;`), or a `private val enabled: Boolean` assigned it in an `init` block, is treated the same way once the literal is moved into the declaration, which happens only when nothing can read the field before that assignment runs: the class has no superclass, implements only interfaces declared in the repository that do not extend `Serializable`, the assignment is a plain statement of the constructor or `init` block and the field's only write, and no field initializer, initializer block or earlier statement calls a method of the class, uses `this`, or constructs an anonymous object or a class the file declares. A field named in a string, by Lombok, or in a `Serializable` or kotlinx-serialized class keeps its assignment. Delete the field yourself once its readers are gone |

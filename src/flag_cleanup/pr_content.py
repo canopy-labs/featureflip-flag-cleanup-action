@@ -37,6 +37,7 @@ from flag_cleanup.cross_file_keys import (
 from flag_cleanup.mock_stubs import PINNED_PARAMETER, REBUILT, SIBLING_TEST, TEST, TEST_PHASE, TEST_ROWS
 from flag_cleanup.residue import Residue
 from flag_cleanup.inert_load import DECLARED_LOAD
+from flag_cleanup.cross_file_php_features import REMOVED_FEATURE_CLASS
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 from flag_cleanup.urls import without_userinfo
 
@@ -191,10 +192,30 @@ REPORTED_BINDING_KINDS = frozenset(
         RENAMED_TEST,
         REMOVED_DEFAULT,
         DECLARED_LOAD,
+        REMOVED_FEATURE_CLASS,
         DISCARDED_CALL,
         DECLARED_CALL,
     }
 )
+
+
+def _removed_feature_class_lines(removed: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Laravel Pennant feature class whose file was
+    deleted, or nothing."""
+    if not removed:
+        return []
+    count = len(removed)
+    return [
+        f"> **{count} feature class{'' if count == 1 else 'es'} deleted.** "
+        f"{'Its' if count == 1 else 'Each'} name is this flag's key, every place "
+        "in the repository that named the class was a read of the flag, and "
+        f"every read was removed above, so the file holding "
+        f"{'it' if count == 1 else 'each'} went with it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
 
 
 def _declared_load_lines(declared: list[tuple[str, str]]) -> list[str]:
@@ -1377,6 +1398,9 @@ def pr_body(
         ]
     bare_imports = [(path, text) for path, kind, text in bindings if kind == "bare import"]
     declared_loads = [(path, text) for path, kind, text in bindings if kind == DECLARED_LOAD]
+    feature_classes = [
+        (path, text) for path, kind, text in bindings if kind == REMOVED_FEATURE_CLASS
+    ]
     marked_imports = [
         (path, text) for path, kind, text in bindings if kind == "marked import"
     ]
@@ -1454,6 +1478,7 @@ def pr_body(
     lines += _emptied_override_lines(emptied)
     lines += _removed_comment_lines(removed_comments)
     lines += _declared_load_lines(declared_loads)
+    lines += _removed_feature_class_lines(feature_classes)
     lines += _bare_import_lines(bare_imports)
     lines += _marked_import_lines(marked_imports)
     lines += _module_marker_lines(module_markers)

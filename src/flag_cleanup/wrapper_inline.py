@@ -911,6 +911,8 @@ def prove_all(
     says whether this run may rewrite a file: a proven call it may not is
     left, and reported, like any other.
     """
+    from flag_cleanup import kotlin_sentinel
+
     plan = WrapperPlan(findings=list(findings))
     lang = profile(language)
     counts = lang.mention_counts if lang is not None else None
@@ -978,6 +980,9 @@ def prove_all(
                 strings = []
             refused += [Finding(path, line, UNPARSED_MENTION, text, wrapper.label) for line, text in strings]
             same, occurrences = _occurrences_in(language, path, wrapper, index)
+            # The bytes each proven span covers, read once the first is
+            # proven: the marking step checks them before it splices.
+            data: bytes | None = None
             for o in occurrences:
                 if not same:
                     reason = OTHER_LANGUAGE
@@ -990,8 +995,9 @@ def prove_all(
                 elif not rewritable(path):
                     reason = OUTSIDE_RUN
                 else:
-                    span = (*o.span, o.suffix) if o.suffix else o.span
-                    marks.append((path, span, o.receiver))
+                    if data is None:
+                        data = (_read(path) or "").encode("utf-8")
+                    marks.append((path, kotlin_sentinel.mark(data, *o.span, o.suffix), o.receiver))
                     continue
                 refused.append(Finding(path, o.line, reason, o.text, wrapper.label))
             if same and lang is not None and lang.doc_references is not None:

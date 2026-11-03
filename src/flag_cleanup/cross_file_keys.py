@@ -55,6 +55,14 @@ DECLARATION_KEPT = "declaration-kept"
 #: a proven read; an enum entry never is (see :func:`enum_findings`).
 CONSTANT = "constant"
 ENUM_ENTRY = "enum-entry"
+#: A class whose feature NAME is the key (a Laravel Pennant class-based
+#: feature), read as ``Owner::class``. Its ``name`` is the class's short name
+#: as written and its ``owner`` that name lowercased. Like a constant, it goes
+#: once every mention in the repository is a proven read, but the profile's
+#: runner deletes its whole file rather than an engine rule deleting a line.
+FEATURE_CLASS = "feature-class"
+#: The kinds a declaring file can lose once every mention is a proven read.
+REMOVABLE = frozenset({CONSTANT, FEATURE_CLASS})
 
 #: An enum entry holds the key, but its accessor cannot be proven to return it.
 ENUM_UNPROVEN = "enum-unproven"
@@ -787,7 +795,7 @@ def resolve(
     for group in by_qualified.values():
         if len(group) > 1:
             for decl in group:
-                if decl.kind == CONSTANT:
+                if decl.kind in REMOVABLE:
                     duplicated.add(decl.path)
                 line, text = _line_of(decl.path, decl.name)
                 refusals.append(Refusal(decl.path, line, NAME_NOT_UNIQUE, text, decl.entry))
@@ -798,7 +806,7 @@ def resolve(
             home_findings=home_findings,
         )
 
-    declaring = {decl.path for decl in unique if decl.kind == CONSTANT}
+    declaring = {decl.path for decl in unique if decl.kind in REMOVABLE}
 
     def spelled_in(source: str, path: str) -> set[str]:
         """The declaring files whose constant ``source`` spells by name.
@@ -812,7 +820,7 @@ def resolve(
         return {
             d.path
             for d in unique
-            if d.kind == CONSTANT
+            if d.kind in REMOVABLE
             and re.compile(mention_pattern([d.name]).pattern, flags).search(source)
         }
 
@@ -857,11 +865,11 @@ def resolve(
     ignored = _ignored(repo_dir, unparsed)
 
     voided = _competing(unique, sources, refusals)
-    blocked |= {decl.path for decl in voided if decl.kind == CONSTANT}
+    blocked |= {decl.path for decl in voided if decl.kind in REMOVABLE}
     # Declaring files kept for something other than a parsed mention that
     # spells the name: their readers are voided whatever `constant_writes`
     # says (see `Profile.constant_writes`).
-    kept_whole: set[str] = {decl.path for decl in voided if decl.kind == CONSTANT}
+    kept_whole: set[str] = {decl.path for decl in voided if decl.kind in REMOVABLE}
     live = [decl for decl in unique if decl not in voided]
 
     # Only a file that spells a constant's NAME can read it. One that names
@@ -875,7 +883,7 @@ def resolve(
     )
     spells_a_name = mention_pattern(names | judged_owners)
     spells_a_name_folded = re.compile(spells_a_name.pattern, re.IGNORECASE)
-    live_constants = [d for d in live if d.kind == CONSTANT]
+    live_constants = [d for d in live if d.kind in REMOVABLE]
     spells_a_constant = mention_pattern({d.name for d in live_constants})
     for path, source in sources.items():
         if unparsed and Path(path).suffix in unparsed:
@@ -914,7 +922,7 @@ def resolve(
             continue
         if source is None:
             entries = sorted({d.entry for d in live if d.kind == ENUM_ENTRY})
-            kinds = ([""] if any(d.kind == CONSTANT for d in live) else []) + entries
+            kinds = ([""] if any(d.kind in REMOVABLE for d in live) else []) + entries
             refusals.extend(Refusal(path, 1, UNSUPPORTED_FORM, "", e) for e in kinds)
             blocked |= declaring
             kept_whole |= declaring
@@ -1270,8 +1278,15 @@ def report_uncovered(
         blocked |= {
             d.path
             for d in resolution.declarations
-            if d.kind == CONSTANT
-            and (not source or mention_pattern([d.name]).search(source))
+            if d.kind in REMOVABLE
+            and (
+                not source
+                or (
+                    _spells(source, path, d.name)
+                    if d.kind == FEATURE_CLASS
+                    else mention_pattern([d.name]).search(source)
+                )
+            )
         }
     if not refusals:
         return resolution
@@ -1304,6 +1319,13 @@ def report_uncovered(
         blocked=frozenset(blocked),
         kept_reads_fold=kept_reads_fold,
     )
+
+
+def _spells(source: str, path: str, name: str) -> bool:
+    """Whether ``source`` spells ``name`` as a token, in any case where the
+    language ignores it (see :func:`_case_insensitive`)."""
+    flags = re.IGNORECASE if _case_insensitive(path) else 0
+    return re.compile(mention_pattern([name]).pattern, flags).search(source) is not None
 
 
 def _escape_hook(profile: Profile, path: str, family: tuple[str, ...]):
@@ -1536,7 +1558,8 @@ def enum_findings(resolution: Resolution) -> tuple[Refusal, ...]:
 
 
 def entry_names(path: str, source: str, language: str, flag_key: str) -> set[str]:
-    """The names of the enum entries ``path`` holds ``flag_key`` in, for the mention scan."""
+    """The names of the enum entries ``path`` holds ``flag_key`` in, and of
+    the feature classes it names, for the mention scan."""
     _load_profiles()
     profile = _PROFILES.get(language)
     if profile is None:
@@ -1545,5 +1568,5 @@ def entry_names(path: str, source: str, language: str, flag_key: str) -> set[str
     return {
         d.name
         for d in profile.declarations(resolved, source, flag_key)
-        if d.kind == ENUM_ENTRY
+        if d.kind in (ENUM_ENTRY, FEATURE_CLASS)
     }

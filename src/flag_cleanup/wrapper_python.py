@@ -982,15 +982,17 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
 
 
 def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
-    """String literals spelling the name, docstrings aside."""
+    """String literals spelling the name, docstrings aside, and the key of a
+    read of the flag aside: a wrapper named after its key reads that string."""
     source = _read(path)
     if source is None:
         return []
     word = _word(wrapper.name)
+    key_literal = wi.key_literal(wrapper, path, source)
     return [
         (wi.line_of(n), wi.text_of(n.parent))
         for n in cross_file_keys.walk(parse(source))
-        if n.type == "string_content" and word.search(_text(n)) and not _docstring(n)
+        if n.type == "string_content" and word.search(_text(n)) and not _docstring(n) and not key_literal(n)
     ]
 
 

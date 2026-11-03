@@ -4913,6 +4913,11 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
             loose or csharp_family.nameof_value(node) == wrapper.name
         )
     ]
+    if found:
+        # The key of a read of the flag is the flag's key, not the member's
+        # name, even when a wrapper is named after its key.
+        key_literal = wi.key_literal(wrapper, path, source)
+        found = [node for node in found if not key_literal(node)]
     family = index.family
     if (
         found

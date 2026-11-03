@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.2.0"
+version = "2.3.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -545,7 +545,32 @@ dependencies = [
     # one line. PHP, TS/JS: a boolean cast left on a literal is dropped. Go,
     # Java, TS/JS: the parentheses of a group the fold reduced to one operand
     # are dropped. TypeScript's rev did not move, so `+canopy.3` stays.
-    "polyglot-piranha==0.44.0",
+    #
+    # 0.45.0. Go: deleting the widest entry of a `const ( … )` / `var ( … )`
+    # group or a one-element-per-line composite literal re-pads the lines left
+    # into gofmt's columns, when they were gofmt's before the edit. Swift: a
+    # call ahead of a `false` clause in an `if`/`guard`/`while` condition list
+    # is kept (the statement stays and the Action refuses the file) instead of
+    # being deleted with it; a `true` clause in a `while` list is dropped; a
+    # labelled `if` whose jump is only in the dead branch loses its label. No
+    # grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
+    #
+    # 0.46.0. Blade: a new `blade` language rewrites `.blade.php` views
+    # through a Blade <-> PHP view over PHP's grammar and cascade; directives
+    # pair through a table of Laravel, Pennant and Livewire built-ins, and any
+    # other directive inside a flag conditional leaves the view as found. All
+    # languages: a query is compiled once per structure and its text
+    # predicates are evaluated by the engine, so a new flag key no longer
+    # recompiles every rule (Swift's slowest rules took seconds each). No
+    # grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
+    #
+    # 0.47.0. C#: a statement fold next to a preprocessor directive happens
+    # only when a braced block contains the directive. An `if` or loop with
+    # a directive between or as its arms, the statement right after one, and
+    # a `#region` pair in a dead tail are declined (the Action refuses them),
+    # while `#if` blocks in a tail after a folded `return` are still deleted.
+    # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
+    "polyglot-piranha==0.47.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

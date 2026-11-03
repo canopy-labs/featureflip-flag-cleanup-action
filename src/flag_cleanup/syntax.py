@@ -84,10 +84,10 @@ parses as intended, and a wrong rewrite can pass that. It is a net, not a proof
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import lru_cache
+import difflib
 import re
 import sys
 import warnings
@@ -104,7 +104,7 @@ import tree_sitter_ruby
 import tree_sitter_swift
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import key_const, kotlin_when_arms, ts_dead_code, ts_switch_arms, ts_syntax
+from flag_cleanup import blade_code, key_const, kotlin_when_arms, ts_dead_code, ts_switch_arms, ts_syntax
 from flag_cleanup.key_const_visibility import VisibleKeyConst, visible_key_consts
 
 #: Languages :mod:`flag_cleanup.ts_syntax` owns outright. `js` is here rather
@@ -205,7 +205,7 @@ class _Profile:
     unreadable_source_is_skipped: bool = False
     #: For a TEMPLATE language, the profile key whose checks judge the HOST
     #: code inside the tags — applied to a derived code view rather than to the
-    #: file's own bytes. See :func:`_code_view`. ``erb`` only.
+    #: file's own bytes. See :func:`_code_view`. ``erb`` and ``blade``.
     #:
     #: Naming ANOTHER PROFILE rather than carrying a second grammar field is
     #: the whole point: it makes "ERB is judged as Ruby" true by construction,
@@ -737,6 +737,24 @@ _PROFILES: dict[str, _Profile] = {
         # folded: loud instead of silent, which is the right side to fail on.
         code_view="ruby",
     ),
+    # Laravel Blade, the second TEMPLATE profile, split the way ERB's is. There
+    # is no Blade grammar, and the structural half needs none: PHP's HTML-aware
+    # grammar reads a view as one inert `text` node (raw `<?php ?>` aside), so
+    # it counts no error on either side of a rewrite and the whitespace passes
+    # find one leaf they never cut into, which is what protects `<pre>` and
+    # `<textarea>` here as the template grammar does for ERB. The host checks
+    # judge `blade_code.code_view` -- the PHP the view compiles to, derived
+    # here rather than read from the engine's own view (see that module) --
+    # under the `php` profile, which brings its `if_statement`/`else_if_clause`
+    # residue entries: a fold that leaves `@if(true)` leaves `if (true):` in
+    # the code view. Measured over several hundred real views from open-source
+    # Laravel projects: every code view parses with zero errors.
+    "blade": _Profile(
+        tree_sitter_php.language_php,
+        frozenset(),
+        frozenset(),
+        code_view="php",
+    ),
     "csharp": _Profile(
         tree_sitter_c_sharp.language,
         # No separate `type_identifier` in this grammar (verified against
@@ -771,8 +789,8 @@ def host_code_view(source: str, language: str) -> tuple[str, str] | None:
 
     The public door onto :func:`_code_view` and the ``code_view`` profile
     field, for callers outside this module that need to ask a question about
-    the code inside a template's tags rather than about the template. ERB is
-    the only language this answers for today.
+    the code inside a template's tags rather than about the template. ERB and
+    Blade are the languages it answers for.
 
     Returning the host TOKEN alongside the string is what keeps the caller
     honest: the derived source is Ruby, and reading it under the ``erb``
@@ -815,6 +833,9 @@ def _parse(source: str, language: str) -> Node:
 def _code_view(source: str, language: str) -> str:
     """The host-language code inside a template's tags, and nothing else.
 
+    For Blade it is :func:`flag_cleanup.blade_code.code_view`, the PHP the view
+    compiles to; the rest of this describes ERB.
+
     Every ``code`` token of ``source``'s template tree, in SOURCE ORDER, joined
     with newlines. Markup vanishes entirely, so the HTML noise that makes a
     bare Ruby grammar unworkable over a template (see the ``erb`` profile) is
@@ -846,6 +867,8 @@ def _code_view(source: str, language: str) -> str:
     :func:`_root_node`: one pass asks three independent questions of one file's
     ``before`` and ``after``.
     """
+    if language == "blade":
+        return blade_code.code_view(source)
     root = _parse(source, language)
     data = source.encode("utf-8")
     tags = sorted(
@@ -1380,6 +1403,34 @@ def _go_tagless_alternatives(source: str) -> int:
             if values is None or values.type != "expression_list" or values.named_child_count < 2:
                 continue
             count += sum(1 for value in values.named_children if value.type in _BOOLEAN_LITERALS)
+    return count
+
+
+def _swift_false_after_a_clause(source: str) -> int:
+    """How many Swift condition-list clauses are a bare ``false`` after another.
+
+    ``if ready(), false`` and ``if let x = lookup(), false`` run the clauses
+    ahead of the ``false`` before the list stops, so the engine leaves the
+    statement standing rather than drop that code. What it leaves is the flag
+    half-removed. ``if`` and ``guard`` are counted by ``literal_residues`` as
+    well; this asks first so the refusal says what is left. ``while`` is
+    counted only here: a lone ``while true`` is a residue that ships, a
+    ``while`` whose list can never pass is not. A ``false`` that is a binding's
+    initialiser (``if let v = false``) follows ``=``, not ``,``, and is not
+    counted.
+    """
+    count = 0
+    for node in _walk(_parse(source, "swift")):
+        if node.type not in ("if_statement", "guard_statement", "while_statement"):
+            continue
+        for clause in node.children_by_field_name("condition"):
+            previous = clause.prev_sibling
+            count += (
+                clause.type == "boolean_literal"
+                and clause.text == b"false"
+                and previous is not None
+                and previous.type == ","
+            )
     return count
 
 
@@ -2581,8 +2632,9 @@ def _literal_members(source: str, language: str) -> int:
     turned off. Asked of the tree's leaves, so a string or a comment spelling
     one does not count, and a member named ``true`` (``x.true.y``) neither.
     """
-    if language == "erb":
-        source, language = _code_view(source, language), "ruby"
+    view = _PROFILES.get(language) and _PROFILES[language].code_view
+    if view is not None:
+        source, language = _code_view(source, language), view
     root = ts_syntax._parse(source, language) if language in _TS_LANGUAGES else _parse(source, language)
     data = source.encode("utf-8")
     pattern = _PHP_MEMBER_ACCESS if language == "php" else _MEMBER_ACCESS
@@ -2682,6 +2734,26 @@ def refusal_reason(
     # exclude the languages it is keyed for. That is not hypothetical — the
     # unreachable-statement count sat below the branch and so never ran for
     # `ts`/`tsx`/`js`, which is half of what #2807 was.
+    if language == "blade" and before != after:
+        # The grammar cannot see a Blade view's blocks: tree-sitter-php reads a
+        # bare `endif;` without an error, so a code view that lost an OPENER still
+        # parses. Counted instead, against the closer names of BOTH sides (a
+        # rewrite that drops `@endx` must not stop `@unlessx` counting). Both
+        # sides must balance, not only match: a view whose blocks this cannot
+        # pair (a `Blade::if` closed by `@endif`) has an `@else` it cannot
+        # attribute either, so a changed one is refused rather than trusted.
+        # A directive that is not a Laravel built-in, inside a span the rewrite
+        # deleted or a conditional it folded, may own the `@else` or the closer
+        # the fold attributed to the flag's conditional. The table is this
+        # module's own (`blade_code.builtin`), not the engine's.
+        outside = blade_code.whitelist_violation(before, after)
+        if outside is not None:
+            return f"the rewrite reached {outside}, which is not a Laravel built-in directive"
+        names = blade_code.closers(before) | blade_code.closers(after)
+        if blade_code.balance(before, names) != 0:
+            return "the Blade view has a block whose opener and closer cannot be paired"
+        if blade_code.balance(after, names) != 0:
+            return "the rewrite left a Blade block without its opener or its closer"
     if _mock_stubbed_literals(after, language) > _mock_stubbed_literals(before, language):
         return "a test double now stubs a literal where the flag read was"
     if _literal_members(after, language) > _literal_members(before, language):
@@ -2734,6 +2806,15 @@ def refusal_reason(
             "the flag read is used as a decorator or called, so it is not a boolean read: "
             "the result would fail when it runs"
         )
+    if language == "swift" and _swift_false_after_a_clause(after) > _swift_false_after_a_clause(
+        before
+    ):
+        return (
+            "the removal stopped part-way: an if, guard or while was left testing "
+            "`false` after an earlier clause of its condition list (`if ready(), false`, "
+            "`if let x = lookup(), false`): Swift runs that clause before it reaches "
+            "the `false`, so the statement could not be removed without dropping it"
+        )
     if _literal_residues(after, language) > _literal_residues(before, language):
         if language == "python":
             # Name the binding the inliner declined, and why: "still bound to
@@ -2782,35 +2863,224 @@ def refusal_reason(
         before, language
     ):
         return "the fold would drop code that runs whatever the flag says"
-    if _directive_else_conditions(before, language) - _directive_else_conditions(after, language):
-        return "the fold changed an if whose else sits in a preprocessor block, which it does not see"
+    if _directive_split_changed(before, after, language):
+        return (
+            "the fold changed a statement a preprocessor directive splits (an `#if`, "
+            "`#region` or `#pragma` between or as its parts, outside braces): which code "
+            "runs there depends on the symbols a build defines"
+        )
+    if _csharp_literal_conditions(after, language) > _csharp_literal_conditions(
+        before, language
+    ):
+        return (
+            "the removal stopped part-way: an if or while was left testing a literal, "
+            "and the fold that would remove it was declined"
+        )
+    if _csharp_jump_tails(after, language) > _csharp_jump_tails(before, language):
+        return (
+            "the removal left statements after a return, throw, break or continue: "
+            "unreachable code (CS0162), which fails a build that treats warnings as errors"
+        )
     if _stranded_template_reads(before, after, language):
         return "a string template still reads a variable the rewrite deleted"
     return None
 
 
-def _directive_else_conditions(source: str, language: str) -> Counter[str]:
-    """The condition of each C# ``if`` whose ``else`` a preprocessor block
-    holds: ``if (c) { } #if X else { } #endif``.
+#: The statements whose parts a preprocessor directive can stand between or
+#: for: an ``if``'s arms, a loop's or a guard statement's body.
+_DIRECTIVE_HOLDERS = frozenset(
+    {
+        "if_statement",
+        "while_statement",
+        "for_statement",
+        "foreach_statement",
+        "do_statement",
+        "lock_statement",
+        "using_statement",
+        "fixed_statement",
+        "labeled_statement",
+    }
+)
 
-    Such an ``if`` has no ``alternative`` for a fold to see, or one that skips
-    the block. ``if (false)`` is then deleted with the block inside it, and
-    that is the code the flag leaves running. It parses, so nothing else here
-    objects. A block that IS the ``if``'s body hides no branch and is not one.
+
+def _directive_split_changed(before: str, after: str, language: str) -> bool:
+    """Whether the rewrite changed any line of a C# statement that a
+    preprocessor directive splits.
+
+    The grammar hangs a directive wherever the text has one, so the tree of
+    such a statement is the truth for no single build: ``if (c) { } #if X
+    else { } #endif`` holds an ``else`` in no field; a ``#if`` arm with no
+    ``#else`` is empty when the symbol is undefined, and the statement after
+    ``#endif`` is the arm then; an ``else`` after ``#endif`` can bind to an
+    ``if`` inside the block. One rule covers them all, independently of what
+    the engine decided: a directive is CONTAINED when a braced block lies
+    between it and the statement (:func:`_holds_uncontained_directive`). A
+    statement holding one that is not is left alone, line for line.
     """
-    if language != "csharp" or "#if" not in source:
-        return Counter()
-    found: Counter[str] = Counter()
+    if language != "csharp" or "#" not in before:
+        return False
+    spans = [
+        (node.start_point[0], _split_span_end(node))
+        for node in _walk(_parse(before, language))
+        if node.type in _DIRECTIVE_HOLDERS and _holds_uncontained_directive(node)
+    ]
+    if not spans:
+        return False
+    matcher = difflib.SequenceMatcher(
+        None, before.splitlines(), after.splitlines(), autojunk=False
+    )
+    for tag, i1, i2, _, _ in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        for first, last in spans:
+            # An insertion lands between lines i1 - 1 and i1.
+            if (i1 <= last and i2 - 1 >= first) if i2 > i1 else (first < i1 <= last):
+                return True
+    return False
+
+
+def _split_span_end(node: Node) -> int:
+    """The last line a split statement can reach in some build.
+
+    An arm a build compiles to nothing (``else #if X a(); #endif``) makes the
+    statement AFTER the split one that arm, so the span runs on through the
+    next statement, past comments and statement-level directives (a ``#if``
+    block on the way is covered too: the next statement may be inside it or
+    after it), and out of a ``#if`` branch the split statement ends. It keeps
+    going while that statement is itself split: one that is not completes the
+    arm.
+    """
+    end = node.end_point[0]
+    current = node
+    while True:
+        following = current.next_named_sibling
+        while following is not None and (
+            following.type == "comment" or following.type.startswith("preproc_")
+        ):
+            end = max(end, following.end_point[0])
+            following = following.next_named_sibling
+        if following is None:
+            parent = current.parent
+            if parent is not None and parent.type.startswith("preproc_"):
+                current = parent
+                continue
+            return end
+        if not following.type.endswith("_statement"):
+            return end
+        end = following.end_point[0]
+        if not (
+            following.type in _DIRECTIVE_HOLDERS and _holds_uncontained_directive(following)
+        ):
+            return end
+        current = following
+
+
+def _csharp_literal_conditions(source: str, language: str) -> int:
+    """How many C# ``if``/``while`` statements test a bare boolean literal.
+
+    The engine leaves the literal standing wherever it declines a fold, a
+    directive-split statement among them. Shipped, that is a removal stopped
+    part-way with the flag key already gone, so a rewrite adding one refuses.
+    """
+    if language != "csharp":
+        return 0
+    count = 0
     for node in _walk(_parse(source, language)):
-        if node.type != "if_statement":
+        if node.type in ("if_statement", "while_statement"):
+            condition = node.child_by_field_name("condition")
+            count += condition is not None and condition.type == "boolean_literal"
+    return count
+
+
+#: Statements after which nothing in the same list runs.
+_CSHARP_JUMPS = frozenset(
+    {"return_statement", "throw_statement", "break_statement", "continue_statement"}
+)
+
+
+def _csharp_jump_tails(source: str, language: str) -> int:
+    """How many C# statement lists hold a statement directly after an
+    unconditional ``return``/``throw``/``break``/``continue``.
+
+    That statement is unreachable (CS0162), a warning that fails any build
+    treating warnings as errors. The engine deletes such a tail after a fold,
+    but not one it cannot delete exactly (a ``#region`` pair in it), so a
+    rewrite adding one refuses. Comments and directive lines in between are
+    not statements; a ``#if`` block holding code is, as are its branches'
+    statements. A local function or a label after the jump is reachable (one
+    is declared, the other can be jumped to) and is not counted.
+    """
+    if language != "csharp":
+        return 0
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type not in ("block", "switch_section") and node.type not in (
+            "preproc_if",
+            "preproc_elif",
+            "preproc_else",
+        ):
             continue
-        condition = node.child_by_field_name("condition")
-        body = node.child_by_field_name("consequence")
-        if condition is None or body is None or condition.text is None:
-            continue
-        if any(c.type == "preproc_if" and c.id != body.id for c in node.children):
-            found[" ".join(condition.text.decode("utf-8", "replace").split())] += 1
-    return found
+        jumped = False
+        for i, child in enumerate(node.children):
+            if not child.is_named or child.type == "comment":
+                continue
+            if node.field_name_for_child(i) in ("condition", "alternative"):
+                continue
+            if child.type in _CSHARP_JUMPS:
+                jumped = True
+                continue
+            if not jumped:
+                continue
+            if child.type.startswith("preproc_") and not (
+                child.type == "preproc_if" and _directive_holds_code(child)
+            ):
+                continue
+            if child.type in ("local_function_statement", "labeled_statement"):
+                continue
+            count += 1
+            break
+    return count
+
+
+def _directive_holds_code(block: Node) -> bool:
+    return any(
+        child.is_named
+        and child.type != "comment"
+        and not child.type.startswith("preproc_")
+        and branch.field_name_for_child(i) != "condition"
+        for branch in _branches(block)
+        for i, child in enumerate(branch.children)
+    )
+
+
+def _branches(block: Node) -> list[Node]:
+    """A ``#if`` block's branches: itself, then each ``#elif``/``#else``."""
+    branches = []
+    branch: Node | None = block
+    while branch is not None and branch.type in ("preproc_if", "preproc_elif", "preproc_else"):
+        branches.append(branch)
+        branch = branch.child_by_field_name("alternative")
+    return branches
+
+
+def _holds_uncontained_directive(node: Node) -> bool:
+    """Whether a ``preproc_*`` node lies in ``node``'s subtree with no braced
+    ``block`` between it and ``node``. A block whose ``#region`` lines and
+    ``#endregion`` lines do not pair up contains neither: the line closing one
+    lies outside it."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type.startswith("preproc_"):
+            return True
+        for child in current.children:
+            if child.type == "block":
+                kinds = [n.type for n in _walk(child)]
+                if kinds.count("preproc_region") != kinds.count("preproc_endregion"):
+                    return True
+            else:
+                stack.append(child)
+    return False
 
 
 #: The string nodes a ``$name`` template can sit in, per grammar.

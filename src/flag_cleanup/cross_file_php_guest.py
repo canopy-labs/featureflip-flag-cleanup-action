@@ -69,9 +69,16 @@ def references(
     names too, case-insensitively as PHP compares class names. A namespace
     constant needs only its name.
     """
+    from flag_cleanup import cross_file_php_features as features
+
+    # A feature class is named by its qualified name in any of these files,
+    # marker or not (a Symfony service id is one).
+    refused: list[xk.Refusal] = [
+        r for d in declarations if d.kind == xk.FEATURE_CLASS for r in features.guest_mentions(path, source, d)
+    ]
+    declarations = tuple(d for d in declarations if d.kind != xk.FEATURE_CLASS)
     if not path.lower().endswith(_ALWAYS) and _CONSTANT_MARKER.search(source) is None:
-        return [], []
-    refused: list[xk.Refusal] = []
+        return [], refused
     lines = source.splitlines()
     for decl in declarations:
         hit = xk.mention_pattern([decl.name]).search(source)

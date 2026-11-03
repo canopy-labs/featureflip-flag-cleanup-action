@@ -62,10 +62,12 @@ def deep_files(
     for directory in directories:
         for language in languages:
             try:
-                extensions = piranha_runner._language_spec(language).extensions
+                spec = piranha_runner._language_spec(language)
             except ValueError:
                 continue
-            for path in piranha_runner._candidate_files(Path(directory), extensions, flag_key):
+            for path in piranha_runner._candidate_files(
+                Path(directory), spec.extensions, flag_key, spec.excludes
+            ):
                 if path in measured:
                     continue
                 grammar = piranha_runner._grammar_of(path, language)

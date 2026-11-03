@@ -1019,16 +1019,19 @@ def test_title(path: str, source: str, string: Node) -> bool:
     )
 
 
-def _named_strings(path: str, source: str, root: Node, name: str) -> list[tuple[int, str]]:
+def _named_strings(
+    path: str, source: str, root: Node, name: str, skip: Callable[[Node], bool] | None = None
+) -> list[tuple[int, str]]:
     """String literals whose whole content is ``name``: a lookup key, which
     can reach the member through a table or a platform channel.
 
     A string that only mentions the name in its prose (``'newCheckout is
     on'``) names nothing; an interpolation of it is an identifier, which
-    the call-site scan judges. A test's description is exempt."""
+    the call-site scan judges. A test's description is exempt, and so is
+    what ``skip`` says is no mention."""
     found: list[tuple[int, str]] = []
     for node in cross_file_keys.walk(root):
-        if node.type not in _STRINGS or test_title(path, source, node):
+        if node.type not in _STRINGS or test_title(path, source, node) or (skip is not None and skip(node)):
             continue
         quoted = key_const._DART_QUOTED.match(_text(node).lstrip("rR"))
         if quoted is not None and quoted.group(2) == name:
@@ -1049,8 +1052,51 @@ def _doc_references(root: Node, name: str) -> list[tuple[int, str]]:
 
 
 def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[int, str]]:
+    """Strings naming the member, but not the key of a read of the flag: a
+    wrapper named after its key reads that string."""
     cached = index.file(path)
-    return [] if cached is None else _named_strings(path, cached[0], cached[1], wrapper.name)
+    if cached is None:
+        return []
+    return _named_strings(path, cached[0], cached[1], wrapper.name, _key_literal(wrapper))
+
+
+def _key_literal(wrapper: wi.Wrapper) -> Callable[[Node], bool]:
+    """Whether a string is the key argument of a read of the wrapper's flag,
+    anywhere in an expression.
+
+    :func:`flag_cleanup.wrapper_inline.key_literal` asks the profile's read
+    test, and Dart's judges a whole body only (``=> <read>;``), so it cannot
+    see a read inside a condition. A Dart call has no node of its own: the
+    string is the first argument of the selector after ``.boolVariation`` (or
+    after an accessor's name), which is the shape the read test accepts."""
+    if not wrapper.flag_key:
+        return lambda node: False
+    names = _READ_CALLEES | set(wrapper.accessors)
+
+    def is_key(node: Node) -> bool:
+        quoted = key_const._DART_QUOTED.match(_text(node))
+        if quoted is None or quoted.group(2) != wrapper.flag_key:
+            return False
+        argument = node.parent
+        arguments = argument.parent if argument is not None and argument.type == "argument" else None
+        if arguments is None or arguments.type != "arguments":
+            return False
+        listed = [c for c in arguments.named_children if "comment" not in c.type]
+        if not listed or listed[0].start_byte != argument.start_byte:
+            return False
+        part = arguments.parent
+        selector = part.parent if part is not None else None
+        if selector is None or _arguments(selector) is None:
+            return False
+        previous = selector.prev_named_sibling
+        while previous is not None and "comment" in previous.type:
+            previous = previous.prev_named_sibling
+        if previous is None:
+            return False
+        callee = previous if previous.type == "identifier" else _member(previous)
+        return callee is not None and _text(callee) in names
+
+    return is_key
 
 
 def leftovers(

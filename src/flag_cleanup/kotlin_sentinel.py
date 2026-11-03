@@ -78,15 +78,34 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 import tree_sitter_kotlin
 from tree_sitter import Language, Node, Parser
 
 logger = logging.getLogger(__name__)
 
+class Mark(NamedTuple):
+    """A byte range proven elsewhere to stand for a read, and what it held.
+
+    ``expected`` is the bytes the range covered when the proof read the file.
+    The range is an offset into THAT text, so it is only meaningful while the
+    file still holds those bytes there; :func:`check_span` refuses a splice
+    when it does not, rather than overwrite whatever has moved into place.
+    """
+
+    start: int
+    end: int
+    #: Written after the sentinel: ``"()"`` for a read with no call of its
+    #: own (a property getter).
+    suffix: str
+    expected: bytes
+
+
 #: A byte range to mark, and optionally the text written after the sentinel:
-#: ``"()"`` for a read with no call of its own (a property getter).
-Span = tuple[int, int] | tuple[int, int, str]
+#: ``"()"`` for a read with no call of its own (a property getter). A range
+#: handed in from outside (``extra_spans``) must be a :class:`Mark`.
+Span = tuple[int, int] | tuple[int, int, str] | Mark
 
 #: The Kotlin SDK's boolean read. One name, matched exactly — the Kotlin/Android
 #: client SDK exposes `boolVariation(key, defaultValue)` and nothing else that
@@ -118,6 +137,37 @@ class SentinelCollisionError(RuntimeError):
     check cannot tell our identifier from theirs, and that check is what stops a
     broken file reaching a pull request.
     """
+
+
+class StaleSpanError(SentinelCollisionError):
+    """A span no longer covers the bytes it was computed from.
+
+    Always a defect upstream: the offsets were taken from a different text
+    than the one being marked (a file rewritten in between, say), so a splice
+    would replace bytes nobody proved anything about. A misplaced identifier
+    often still parses, which is why this is checked here rather than left to
+    the parse gate. A :class:`SentinelCollisionError` so every caller refuses
+    the file the way it already refuses a collision.
+    """
+
+
+def mark(data: bytes, start: int, end: int, suffix: str = "") -> Mark:
+    """The :class:`Mark` for ``data[start:end]``, ``data`` being the encoded
+    text the offsets were taken from."""
+    return Mark(start, end, suffix, data[start:end])
+
+
+def check_span(raw: bytes, span: Span) -> None:
+    """Raise :class:`StaleSpanError` unless ``raw`` still holds the bytes
+    ``span`` was computed from; ``ValueError`` if it does not say."""
+    if not isinstance(span, Mark):
+        raise ValueError(f"the span at byte {span[0]} does not carry the bytes it covers")
+    if raw[span.start : span.end] != span.expected:
+        raise StaleSpanError(
+            f"the span at byte {span.start} was computed from text that has "
+            f"since changed: expected {span.expected!r}, found "
+            f"{raw[span.start : span.end]!r}"
+        )
 
 
 def sentinel_for(flag_key: str) -> str:
@@ -441,13 +491,16 @@ def rewrite(
     ``extra_spans`` are byte ranges proven elsewhere to stand for a read of
     this flag: the callee of a call to a keyless wrapper, see
     :mod:`flag_cleanup.wrapper_inline`. They are marked like a read's callee.
-    A span's optional third element is written after the sentinel.
+    Each is a :class:`Mark`, whose third element is written after the sentinel
+    and whose fourth is the bytes the range covered when it was proven.
     ``marks_reads=False`` marks only those, without parsing the source as
     Kotlin at all — the mode a Java file is marked in.
 
-    Raises :class:`SentinelCollisionError` if ``sentinel`` already occurs, and
-    ``ValueError`` if two spans overlap: a read and a wrapper call never do,
-    so an overlap is a defect upstream, and splicing it would corrupt the file.
+    Raises :class:`SentinelCollisionError` if ``sentinel`` already occurs,
+    :class:`StaleSpanError` if an extra span no longer covers the bytes it was
+    proven on, and ``ValueError`` if two spans overlap: a read and a wrapper
+    call never do, so an overlap is a defect upstream, and splicing it would
+    corrupt the file. Both are checked before anything is spliced.
     """
     if sentinel in source:
         raise SentinelCollisionError(
@@ -459,16 +512,17 @@ def rewrite(
         if marks_reads
         else []
     )
+    raw = source.encode("utf-8")
     marks = {(start, end): "" for start, end in spans}
     for span in extra_spans:
-        marks[(span[0], span[1])] = span[2] if len(span) > 2 else ""
+        check_span(raw, span)
+        marks[(span[0], span[1])] = span[2]
     ordered = sorted(marks, reverse=True)
     for (start, _end), (_start, previous_end) in zip(ordered, ordered[1:]):
         if previous_end > start:
             raise ValueError(f"overlapping sentinel spans at byte {start}")
     if not ordered:
         return None
-    raw = source.encode("utf-8")
     for start, end in ordered:
         raw = raw[:start] + (sentinel + marks[(start, end)]).encode("ascii") + raw[end:]
     return raw.decode("utf-8")

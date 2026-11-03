@@ -348,9 +348,10 @@ not_contains = [
 # the gate must recognise the same declarations (`_go_key_consts` sees every
 # spec this rule matches) and the gate is where a withheld file is reported.
 #
-# `gofmt` aligns a block's `=` into a column sized by its longest name.
-# Deleting the longest name leaves the others padded for it: still valid Go,
-# but `gofmt -l` lists the file, as it does after a flag-keyed map entry goes.
+# `gofmt` aligns a block's `=` into a column sized by its longest name. When
+# the spec deleted was the longest, the engine re-pads the others as `gofmt`
+# would (only when the block was `gofmt`-aligned before), as it does after a
+# flag-keyed map entry goes.
 [[rules]]
 name = "delete_flag_key_const_spec_in_group"
 query = """(

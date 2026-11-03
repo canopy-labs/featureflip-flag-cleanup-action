@@ -376,8 +376,11 @@ def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
     ``constant('self::NAME')`` string) is a read or a second path to the case
     that no rule follows, so it is reported rather than left silently.
     """
+    from flag_cleanup import cross_file_php_features as features
+
     root = syntax._parse(source, "php")
     found, refused = _enum_entries(path, root, source, flag_key)
+    refused = refused + features.classes(path, root, source, flag_key)[1]
     for decl in found:
         token = xk.mention_pattern([decl.name])
         for node in xk.walk(root):
@@ -413,7 +416,10 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
         section = _section_at(sections, node.start_byte)
         if section is not None:
             found.append(xk.KeyDeclaration(path, const.name, owner_name, section.namespace))
+    from flag_cleanup import cross_file_php_features as features
+
     entries, _refused = _enum_entries(path, root, source, flag_key)
+    entries = entries + features.classes(path, root, source, flag_key)[0]
     if vendored(Path(path).resolve()):
         return [replace(d, third_party=True) for d in found + entries]
     return found + entries
@@ -1084,12 +1090,21 @@ def references(
     accessors: frozenset[str],
     repo_dir: str,
 ) -> tuple[list[xk.KeyReference], list[xk.Refusal]]:
+    from flag_cleanup import cross_file_php_features as features
+
     root = syntax._parse(source, "php")
     reader = _Reader(root, path, repo_dir)
-    if vendored(Path(path)):
-        return [], _vendored_mentions(reader, path, source, declarations, accessors)
+    is_vendored = vendored(Path(path))
+    classes = [d for d in declarations if d.kind == xk.FEATURE_CLASS]
+    declarations = tuple(d for d in declarations if d.kind != xk.FEATURE_CLASS)
     reads: list[xk.KeyReference] = []
     refused: list[xk.Refusal] = []
+    for decl in classes:
+        found, kept = features.references(reader, path, source, decl, accessors, vendored=is_vendored)
+        reads.extend(found)
+        refused.extend(kept)
+    if is_vendored:
+        return [], refused + _vendored_mentions(reader, path, source, declarations, accessors)
     for decl in declarations:
         # Skipped mentions in read position, by the text a clone would match.
         skipped: list[tuple[Node, tuple[str | None, str]]] = []

@@ -2348,3 +2348,8 @@ _PROFILES.update(
 # the thing that answers an `erb` question. Anything that calls `key_consts`
 # for `erb` directly owes it the same derivation.
 _PROFILES["erb"] = _PROFILES["ruby"]
+
+# Blade the same way, over PHP: `.blade.php` takes `php_const.toml` through
+# `rule_base`, and `syntax.const_path_is_safe` judges the view's code view
+# (`blade_code.code_view`, the PHP it compiles to) under PHP's profile.
+_PROFILES["blade"] = _PROFILES["php"]
