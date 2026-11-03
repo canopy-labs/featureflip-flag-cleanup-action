@@ -71,8 +71,10 @@ inspected, as for Java. An index that could not read or parse every file fails
 closed for a reader that has any supertype, and for any read that runs with an
 implicit receiver.
 
-Only the first argument of a non-optional ``boolVariation(...)`` or configured
-accessor call is a read -- the calls the pre-pass marks. Every other mention
+Only the first argument of a non-optional ``boolVariation(...)``,
+``getBooleanValue(...)`` or configured accessor call is a read -- the calls the
+pre-pass marks. ``getBooleanValue`` counts in every file here; the pre-pass
+refuses one in a file importing nothing from ``dev.openfeature``. Every other mention
 of the name refuses, and one refusal drops the whole file's reads: an
 assignment, a string template or any string spelling the name, a callable
 reference, a named argument, a qualifier this profile cannot prove (a package
@@ -94,7 +96,16 @@ from tree_sitter import Node
 from flag_cleanup import cross_file_keys as xk
 from flag_cleanup import key_const, key_const_visibility, kotlin_sentinel
 
-_READ_CALLEES = frozenset({kotlin_sentinel.SDK_FUNCTION_NAME})
+#: The callees the pre-pass marks, the same object. OpenFeature's
+#: `getBooleanValue` is a read here in EVERY file, on purpose: its per-file
+#: import gate is the pre-pass's, and the pre-pass can only apply it to a read
+#: of another file's constant once this proof has handed it the reader's
+#: spelling of the key. Proven, an import-less reader is a same-key read there,
+#: which refuses the flag naming the file. Gated here, it would be a
+#: `not-a-read` mention instead: the constant kept, the read live, no refusal.
+#: Every pass that ACTS on a proven read before the pre-pass (the test-double
+#: pass, keyless-wrapper discovery) applies the gate itself.
+_READ_CALLEES = kotlin_sentinel.READ_CALLEES
 
 #: Every node that declares a type with a body and supertypes.
 _TYPE_DECLS = frozenset(

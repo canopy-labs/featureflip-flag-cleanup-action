@@ -1790,15 +1790,19 @@ def _python_is_removable_call(call: Node, accessors: frozenset[str]) -> bool:
 # the modifier check a MUTABLE `var` would be resolved as a constant. `const
 # val` is Kotlin's genuine compile-time constant.
 
-#: The SHIPPED Kotlin callee. The run's ``accessors`` are added on top of it by
-#: :func:`_kotlin_is_removable_read`, and Kotlin is the one language that needed
-#: NOTHING else for that to be safe: its fold is the sentinel pre-pass, not a
-#: rule, and `kotlin_sentinel._callee_spans` has marked
+#: The callees the pre-pass marks (`kotlin_sentinel.READ_CALLEES`), the same
+#: object, so the gate cannot drift from the fold. The run's ``accessors`` are
+#: added on top of it by :func:`_kotlin_is_removable_read`, and Kotlin is the
+#: one language that needed NOTHING else for that to be safe: its fold is the
+#: sentinel pre-pass, not a rule, and `kotlin_sentinel._callee_spans` has marked
 #: `{SDK_FUNCTION_NAME, *accessors}` since accessors existed. So until #2730
 #: this gate was the ONLY thing withholding an accessor's read of a hoisted key
 #: -- the pre-pass would have folded it, `resolve_consts` was just never true
 #: for such a file. The other nine languages needed a rule clone as well.
-_KOTLIN_FLAG_READ_CALLEES = frozenset({"boolVariation"})
+#: `getBooleanValue` is NOT import-gated here, on purpose: an import-less read
+#: of a hoisted key is admitted, and the pre-pass then refuses the flag on it.
+#: Withholding it here would keep the key unresolved, so nothing would refuse.
+_KOTLIN_FLAG_READ_CALLEES = kotlin_sentinel.READ_CALLEES
 
 
 _SWIFT_FLAG_READ_CALLEES = frozenset({"boolVariation"})
@@ -2201,7 +2205,7 @@ def _kotlin_is_binding(node: Node) -> bool:
 
 
 def _kotlin_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
-    """First argument of a ``boolVariation`` call -- what the pre-pass rewrites.
+    """First argument of a read the pre-pass marks (``boolVariation``, ``getBooleanValue``).
 
     ``accessors`` are matched here for a reason unique to Kotlin: the pre-pass
     has ALWAYS marked them (`kotlin_sentinel._callee_spans`), so this gate was

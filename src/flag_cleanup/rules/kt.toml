@@ -1,7 +1,7 @@
 # Piranha flag-cleanup rules for Kotlin (android SDK).
 #
-# ONE rule, and that is the whole file — but only because a Python pre-pass has
-# already done the part the engine cannot. Read
+# Seed rules only, and few of them, because a Python pre-pass has already
+# done the part the engine cannot. Read
 # `src/flag_cleanup/kotlin_sentinel.py` before changing anything here.
 #
 # Holes filled per invocation via substitutions:
@@ -99,6 +99,55 @@ groups = ["replace_expression_with_boolean_literal"]
 holes = ["marker"]
 
 
+# --- @sentinel(…) AS A STATEMENT WHOSE VALUE IS DISCARDED -> deleted
+#
+# A warm-up read made for the SDK's own exposure event, or a wrapper call made
+# only for its value's sake. Kotlin, unlike Java, accepts a bare `true` as an
+# expression statement, so the fold below "works" here and leaves dead code
+# behind instead of a refusal. This rule deletes the statement instead.
+#
+# THE POSITION IS THE WHOLE SAFETY ARGUMENT. In Kotlin the last statement of a
+# lambda, and of an `if`, `when` or `try` branch, is that construct's VALUE, so
+# a read there may flow anywhere. This rule matches only where a statement's
+# value cannot be used:
+#   * a statement of a block or lambda that has another statement AFTER it
+#     (a comment after it does not count: the trailing `(statement)` is a
+#     statement node, and a lambda ending `read() // c` keeps its value);
+#   * any statement of a function body (`{ … }`, never `= …`), an `init`
+#     block or a loop body, none of which has a value;
+#   * a statement of an `if` with no `else`, whose value is `Unit` wherever it
+#     stands.
+# Everywhere else (an argument, an elvis operand, an assignment, a `return`, a
+# condition, an unbraced body) the read is not a direct statement of one of
+# those containers, so the query does not reach it and the fold below runs.
+#
+# The arguments are not checked, unlike Java's rule. Here the alternative to
+# deleting is the fold to a bare literal, which drops the arguments just the
+# same, so a filter would keep `true` standing and save nothing.
+#
+# MUST STAY ABOVE `replace_sentinel_read_with_boolean_literal`: seed rules fire
+# in declaration order, and that rule rewrites the call this one deletes.
+# Declared second, it never fires and the bare literal comes back.
+[[rules]]
+name = "delete_discarded_sentinel_statement"
+query = """(
+  [
+    (block (call_expression (identifier) @sdk_fn) @call (statement))
+    (lambda_literal (call_expression (identifier) @sdk_fn) @call (statement))
+    (function_body (block (call_expression (identifier) @sdk_fn) @call))
+    (anonymous_initializer (block (call_expression (identifier) @sdk_fn) @call))
+    (for_statement (block (call_expression (identifier) @sdk_fn) @call))
+    (while_statement (block (call_expression (identifier) @sdk_fn) @call))
+    (do_while_statement (block (call_expression (identifier) @sdk_fn) @call))
+    (if_expression condition: (_) . (block (call_expression (identifier) @sdk_fn) @call) .)
+  ]
+  (#eq? @sdk_fn "@sentinel")
+)"""
+replace_node = "call"
+replace = ""
+holes = ["sentinel"]
+
+
 # --- @sentinel(…) -> @treated
 #
 # GRAMMAR UPDATE (0.5.0: tree-sitter-kotlin-ng replaces the danieltrt fork —
@@ -193,9 +242,9 @@ holes = ["treated", "sentinel"]
 #     `ts_const.toml` plus Gate 2 do by hand for TypeScript, and the one Swift
 #     does not do at all.
 #
-# So there is no edges file and no cleanup rule of ours: `kt_edges.toml` does
-# not exist, and the seed rule's `replace_expression_with_boolean_literal`
-# group is what the built-in graph already keys off.
+# So no cleanup rule of ours is needed for those: the seed rule's
+# `replace_expression_with_boolean_literal` group is what the built-in graph
+# already keys off, and `kt_edges.toml` adds only a few edges onto it.
 #
 # The `else if (<read>)`-with-no-trailing-else gap that costs Java, Go and
 # TypeScript a bespoke rule has not been reproduced here. Do NOT assume it is

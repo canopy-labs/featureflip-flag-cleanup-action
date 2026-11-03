@@ -94,7 +94,8 @@ def read_test(
     a superset, for widening the undo snapshot before anything is resolved.
 
     The sentinel pre-pass's own decision, call for call: the callee names the
-    SDK read or an accessor, is not reached through ``?.``, carries no ``!``
+    SDK read, OpenFeature's ``getBooleanValue`` in a file importing
+    ``dev.openfeature``, or an accessor, is not reached through ``?.``, carries no ``!``
     the grammar mis-binds into it, and its first argument resolves to the key
     -- through a same-file ``const val`` only where Gate 2 allowed it
     (``const_ok``), and through a constant of another file only by a text the
@@ -102,7 +103,18 @@ def read_test(
     """
     consts = kotlin_sentinel.const_val_keys(parse(source)) if const_ok else {}
     proven = {text: flag_key for text in external}
-    names = {kotlin_sentinel.SDK_FUNCTION_NAME, *accessors}
+    names = {*kotlin_sentinel.READ_CALLEES, *accessors}
+    # The pre-pass's per-file gate on OpenFeature's read: in a file importing
+    # nothing from `dev.openfeature`, `getBooleanValue` is no wrapper's body.
+    # Discovered there, its callers would be marked and its test doubles
+    # resolved before the pre-pass, which refuses that same-key read.
+    of = kotlin_sentinel.OPENFEATURE_FUNCTION_NAME
+    if (
+        of not in accessors
+        and of in source
+        and not kotlin_sentinel.imports_openfeature(parse(source))
+    ):
+        names.discard(of)
 
     def is_read(node: Node) -> bool:
         if node.type != "call_expression" or not node.named_children:

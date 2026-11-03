@@ -82,7 +82,7 @@ from typing import Callable, Iterable, Mapping
 
 from tree_sitter import Node
 
-from flag_cleanup import cs_param_pins, key_const, syntax, ts_syntax, unused
+from flag_cleanup import cs_param_pins, key_const, kotlin_sentinel, syntax, ts_syntax, unused
 from flag_cleanup.key_const import (
     _CSHARP_FLAG_READ_CALLEES,
     _DART_FLAG_READ_CALLEES,
@@ -1382,9 +1382,31 @@ def covers(language: str) -> bool:
     return language in _PROFILES
 
 
-def _reads(language: str, accessors: tuple[str, ...]) -> str:
-    names = sorted(_PROFILES[language].reads | set(accessors), key=len, reverse=True)
-    return "|".join(re.escape(name) for name in names)
+def _reads(language: str, accessors: tuple[str, ...], source: str) -> str:
+    """The read callees of ``source``, as a regex alternation.
+
+    Per FILE, because Kotlin's OpenFeature read is: ``getBooleanValue`` is a
+    read only in a file importing ``dev.openfeature``, exactly as the sentinel
+    pre-pass decides it (:func:`kotlin_sentinel.imports_openfeature`), unless
+    it is a configured accessor. This pass runs BEFORE that pre-pass, so a stub
+    it counted in an import-less file was deleted there, and the pre-pass found
+    nothing left to refuse. Left alone, the stub still holds the same-key call,
+    which the pre-pass then refuses with the file named. The callee SET stays
+    the pre-pass's own object; only its use is gated.
+    """
+    names = _PROFILES[language].reads | set(accessors)
+    of = kotlin_sentinel.OPENFEATURE_FUNCTION_NAME
+    if (
+        language == "kt"
+        and of not in accessors
+        and of in source
+        and not kotlin_sentinel.imports_openfeature(
+            kotlin_sentinel._parser().parse(source.encode("utf-8")).root_node
+        )
+    ):
+        names = names - {of}
+    ordered = sorted(names, key=len, reverse=True)
+    return "|".join(re.escape(name) for name in ordered)
 
 
 def _key(flag_key: str, consts: Iterable[str]) -> str:
@@ -1822,7 +1844,7 @@ def resolve(
             else []
         )
     else:
-        reads = _reads(language, accessors)
+        reads = _reads(language, accessors, source)
         # `(?!\w)`, not `\b`: a Ruby accessor ends in `?`, after which `\b`
         # needs a word character and so never matches the call. A Sinon stub
         # names the read in a string, which the same search finds.
@@ -2924,7 +2946,7 @@ def _read_count(source: str, language: str, accessors: tuple[str, ...]) -> int:
     profile = _PROFILES[language]
     # Ruby may call a read with no parentheses: `flags.enabled? "key"`.
     opens = r"(?:\s*\(|[ \t]+['\":A-Z])" if language == "ruby" else r"\s*\("
-    call = re.compile(rf"\b(?:{_reads(language, accessors)}){opens}")
+    call = re.compile(rf"\b(?:{_reads(language, accessors, source)}){opens}")
     total = len(call.findall(source))
     # A Ruby, Python or PHP double names a read in a symbol or a string, or
     # by another method, and Ruby's `when` is the language's.
@@ -2977,7 +2999,7 @@ def performs_a_read(source: str, language: str, flag_key: str, accessors: tuple[
     a pass over another language's tests of it a run that folds a read."""
     if language not in _PROFILES:
         return False
-    call = re.compile(rf"\b(?:{_reads(language, accessors)})\s*\(\s*{_key(flag_key, ())}")
+    call = re.compile(rf"\b(?:{_reads(language, accessors, source)})\s*\(\s*{_key(flag_key, ())}")
     return call.search(source) is not None and _read_count(source, language, accessors) > 0
 
 
@@ -3211,7 +3233,7 @@ def mock_descriptions(source: str, flag_key: str, accessors: tuple[str, ...]) ->
     data = source.encode("utf-8")
     root = profile.parse(source, "csharp")
     consts = [k.name for k in key_const.key_consts(root, data, "csharp", flag_key)]
-    mention = re.compile(rf"\b(?:{_reads('csharp', accessors)})\s*\(\s*{_key(flag_key, consts)}")
+    mention = re.compile(rf"\b(?:{_reads('csharp', accessors, source)})\s*\(\s*{_key(flag_key, consts)}")
     found: list[str] = []
     for node in _walk(root):
         if not node.type.endswith("statement") or node.type == "block":

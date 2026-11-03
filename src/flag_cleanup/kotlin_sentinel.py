@@ -107,11 +107,33 @@ class Mark(NamedTuple):
 #: handed in from outside (``extra_spans``) must be a :class:`Mark`.
 Span = tuple[int, int] | tuple[int, int, str] | Mark
 
-#: The Kotlin SDK's boolean read. One name, matched exactly — the Kotlin/Android
-#: client SDK exposes `boolVariation(key, defaultValue)` and nothing else that
-#: returns a bare Boolean. `stringVariation`/`variationDetail` must not match,
-#: and an exact comparison is what guarantees that.
+#: The Featureflip Kotlin SDK's own boolean read. One name, matched exactly --
+#: the Kotlin/Android client SDK exposes `boolVariation(key, defaultValue)` and
+#: nothing else that returns a bare Boolean. `stringVariation`/`variationDetail`
+#: must not match, and an exact comparison is what guarantees that.
 SDK_FUNCTION_NAME = "boolVariation"
+
+#: OpenFeature's Kotlin client read. It is synchronous and key-first, so it
+#: lands on the same call-expression shape as `boolVariation`. `getBooleanDetails`
+#: (a details object, not a Boolean) is excluded by the exact comparison. The
+#: name is generic, so a match is import-gated (see `imports_openfeature`);
+#: a configured accessor of the same name is a declared wrapper and is not.
+OPENFEATURE_FUNCTION_NAME = "getBooleanValue"
+
+#: Every callee the pre-pass marks on its own, and the one set every other
+#: Kotlin pass reads (`key_const`, `mock_stubs`, `cross_file_kotlin`,
+#: `wrapper_kotlin`). `getBooleanValue` is gated per file with
+#: `imports_openfeature`, as `_callee_spans` does, by each pass that ACTS on a
+#: read before this one: `mock_stubs` (a stub it resolved in an import-less file
+#: would leave nothing here to refuse) and `wrapper_kotlin` (a wrapper it
+#: discovered would have its callers marked). A pass that only PROVES a key
+#: (Gate 2, `cross_file_kotlin`) is not gated: gating it would hide the read's
+#: key from this pass, which then refuses nothing.
+READ_CALLEES = frozenset({SDK_FUNCTION_NAME, OPENFEATURE_FUNCTION_NAME})
+
+#: The package whose import proves a `getBooleanValue` receiver is OpenFeature's.
+#: Covers both the Kotlin SDK (`dev.openfeature.kotlin.sdk`) and the Java one.
+OPENFEATURE_PACKAGE = "dev.openfeature"
 
 #: Names beyond the SDK's own that count as a flag read here. A project that
 #: wraps `boolVariation` behind its own function is invisible to the rules
@@ -149,6 +171,37 @@ class StaleSpanError(SentinelCollisionError):
     the parse gate. A :class:`SentinelCollisionError` so every caller refuses
     the file the way it already refuses a collision.
     """
+
+
+class UnprovenOpenFeatureReadError(SentinelCollisionError):
+    """A same-key ``getBooleanValue`` read in a file importing no OpenFeature.
+
+    Folding it would rewrite a method nothing proves is OpenFeature's, and
+    skipping it would leave a possibly-real read live under a green run, so the
+    file is refused. A :class:`SentinelCollisionError` for the same reason
+    :class:`StaleSpanError` is: the runner already turns it into an
+    ``UnsafeRewriteError`` naming the file.
+    """
+
+
+def is_openfeature_module(path: str) -> bool:
+    """Whether a dotted import path is ``dev.openfeature`` or beneath it."""
+    return path == OPENFEATURE_PACKAGE or path.startswith(OPENFEATURE_PACKAGE + ".")
+
+
+def imports_openfeature(root: Node) -> bool:
+    """Whether the file has a top-level ``import`` of ``dev.openfeature``.
+
+    Only ``import`` nodes are read, so a comment or a string never counts.
+    Plain, star and alias imports all do: the module is the import's first
+    named child either way.
+    """
+    for node in root.children:
+        if node.type != "import" or not node.named_children:
+            continue
+        if is_openfeature_module("".join(node.named_children[0].text.decode("utf-8", "replace").split())):
+            return True
+    return False
 
 
 def mark(data: bytes, start: int, end: int, suffix: str = "") -> Mark:
@@ -453,19 +506,28 @@ def _callee_spans(
     # exists to prevent.
     consts = const_val_keys(tree.root_node) if resolve_consts else {}
     spans: list[tuple[int, int]] = []
+    openfeature_imported: bool | None = None
     for node in _walk(tree.root_node):
         if node.type != "call_expression" or not node.named_children:
             continue
         callee = node.named_children[0]
-        if _method_name(callee) not in {SDK_FUNCTION_NAME, *accessors} or _is_optional_call(
-            callee
-        ):
+        name = _method_name(callee)
+        if name not in READ_CALLEES | set(accessors) or _is_optional_call(callee):
             continue
         arguments = [c for c in node.named_children if c.type == "value_arguments"]
         if not arguments or not arguments[0].named_children:
             continue
         if _resolved_key(arguments[0].named_children[0], consts, external) != flag_key:
             continue
+        if name == OPENFEATURE_FUNCTION_NAME and name not in accessors:
+            if openfeature_imported is None:
+                openfeature_imported = imports_openfeature(tree.root_node)
+            if not openfeature_imported:
+                raise UnprovenOpenFeatureReadError(
+                    f"`getBooleanValue` reads {flag_key!r} in a file that imports "
+                    f"nothing from `{OPENFEATURE_PACKAGE}`, so nothing proves its "
+                    "receiver is an OpenFeature client"
+                )
         # NOT `callee.start_byte` — see `_callee_start`. That spelling swallowed
         # a leading `!` into the sentinel and inverted every negated read.
         spans.append((_callee_start(callee), callee.end_byte))
@@ -497,10 +559,13 @@ def rewrite(
     Kotlin at all — the mode a Java file is marked in.
 
     Raises :class:`SentinelCollisionError` if ``sentinel`` already occurs,
+    :class:`UnprovenOpenFeatureReadError` if a ``getBooleanValue`` reads the
+    flag in a file with no ``dev.openfeature`` import (unless it is a
+    configured accessor),
     :class:`StaleSpanError` if an extra span no longer covers the bytes it was
     proven on, and ``ValueError`` if two spans overlap: a read and a wrapper
     call never do, so an overlap is a defect upstream, and splicing it would
-    corrupt the file. Both are checked before anything is spliced.
+    corrupt the file. All are checked before anything is spliced.
     """
     if sentinel in source:
         raise SentinelCollisionError(

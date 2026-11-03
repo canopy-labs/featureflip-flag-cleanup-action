@@ -8,6 +8,16 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.4.0
+
+### Added
+
+- **Kotlin:** OpenFeature reads are removed. `client.getBooleanValue("KEY", default)`, with or without an `options` argument (and the OpenFeature Java client's forms when called from Kotlin), folds the way `boolVariation("KEY", default)` does, with the key as a literal or a `const val` in the same file, in a file that imports something from `dev.openfeature`. A test's MockK or Mockito stub of the read is resolved the same way as for `boolVariation`, under the same per-file import rule: in a test file that imports nothing from `dev.openfeature`, a stub is left as it is, and one that names the key directly refuses the flag like any other read. `getBooleanDetails`, the non-boolean accessors and a safe call (`client?.getBooleanValue(…)`) are left alone. A read of the flag through `getBooleanValue` in a file that imports nothing from `dev.openfeature` refuses the flag and names the file, since nothing there proves the receiver is an OpenFeature client. A `getBooleanValue` read of a key constant declared in another file, and a function that only returns the read, are followed as they are for `boolVariation`: the read folds and the constant goes once nothing else mentions it, and the function is inlined at its callers and deleted. A `getBooleanValue` read on a line of its own, whose value is discarded, is deleted as a `boolVariation` one is. The same per-file import rule applies to the file holding the call, so a reader of another file's constant, or a function wrapping the read, in a file that imports nothing from `dev.openfeature` refuses the flag and names that file.
+
+### Fixed
+
+- **Kotlin:** a read whose value is discarded, such as a warm-up call `client.boolVariation("KEY", default)` on a line of its own, is now deleted instead of being left behind as a bare `true` or `false` statement. That happens where the statement's value cannot be used: before another statement, anywhere in a function's `{ … }` body, an `init` block or a loop body, and in an `if` with no `else`. The last statement of a lambda, or of an `if`, `when` or `try` branch, is that construct's value, so a read there still folds to its literal.
+
 ## 2.3.0
 
 ### Added
