@@ -2247,7 +2247,11 @@ def _emptied_namespaces(
         if survivors:
             continue
         if index.spelled_where_unparsed(namespace.rsplit(".", 1)[-1]):
-            raise Kept("", 1, f"the run may empty namespace {namespace}, which a file that does not parse may declare into")
+            raise Kept(
+                "", 1,
+                f"the run may empty namespace {namespace}, which a file not read whole (it does not parse, "
+                "or declares a type inside #if) may declare into",
+            )
         marks += _usings_of(namespace, residue, repo_dir)
     return marks
 

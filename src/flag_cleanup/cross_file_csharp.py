@@ -409,6 +409,13 @@ class _TypeInfo:
     path: str = ""
     #: Declared ``partial``: other parts may add members and bases.
     partial: bool = False
+    #: A static class that declares an extension member, or may: a parameter
+    #: marked ``this`` or an ``extension`` block anywhere inside it. Only a
+    #: static class can hold either (CS1106, and the same for a block); a
+    #: ``partial`` one's other parts are not seen, so ask :attr:`partial` too.
+    extensions: bool = False
+    #: Carries an attribute list, which a source generator can key on.
+    attributed: bool = False
 
     @property
     def last(self) -> str:
@@ -424,9 +431,10 @@ class _Share:
     types: tuple[_TypeInfo, ...]
     namespaces: frozenset[str]
     global_usings: tuple[_Using, ...]
-    #: For a file that does not parse whole, every word it spells, the only
-    #: names it can declare anything under; ``None`` when an escape sequence
-    #: may spell any. Empty for a file that parses.
+    #: For a file that does not parse whole, or declares a type the index
+    #: cannot place (inside a conditional-compilation block), every word it
+    #: spells, the only names it can declare anything under; ``None`` when an
+    #: escape sequence may spell any. Empty for a file the index reads whole.
     unparsed_words: frozenset[str] | None = frozenset()
     #: For a file that does not parse whole, the names it may declare a TYPE
     #: under (:func:`_declarable_words`); ``None`` when it may be any.
@@ -525,8 +533,25 @@ def _supertypes(type_node: Node) -> tuple[str, ...]:
     return tuple(names)
 
 
+_EXTENSION_BLOCK = re.compile(rb"\bextension\s*[<(]")
+
+
+def _declares_extensions(type_node: Node) -> bool:
+    """Whether a type may declare an extension member: a parameter marked
+    ``this`` (an extension method) or an ``extension`` block, anywhere in it,
+    or text that may spell a block the grammar did not recognise."""
+    if _EXTENSION_BLOCK.search(type_node.text):
+        return True
+    return any(
+        node.type == "extension_declaration"
+        or (node.type == "parameter" and any(c.text == b"this" for c in node.children))
+        for node in _walk(type_node)
+    )
+
+
 def _share(text: str) -> tuple[_Share, bool]:
     root = syntax._parse(text, "csharp")
+    found = _types(root)
     types = tuple(
         _TypeInfo(
             namespace,
@@ -536,9 +561,17 @@ def _share(text: str) -> tuple[_Share, bool]:
             generic=any(c.type == "type_parameter_list" for c in node.children),
             file_local="file" in _modifiers(node),
             partial="partial" in _modifiers(node),
+            extensions="static" in _modifiers(node) and _declares_extensions(node),
+            attributed=any(c.type == "attribute_list" for c in node.children),
         )
-        for namespace, chain, node in _types(root)
+        for namespace, chain, node in found
     )
+    # A type the walk above cannot place (one inside `#if`/`#elif`/`#else`,
+    # which `_type_chain` does not pass through) is still compiled in some
+    # configuration: the file answers like one that does not parse whole,
+    # from its words, so every question about a name it spells fails closed.
+    indexed = {node.id for _, _, node in found}
+    hidden = any(n.type in _ALL_TYPES and n.id not in indexed for n in _walk(root))
     namespaces: set[str] = set()
     for node in _walk(root):
         if node.type in _NAMESPACES:
@@ -549,8 +582,9 @@ def _share(text: str) -> tuple[_Share, bool]:
     global_usings = tuple(
         u for c in _walk(root) if c.type == "using_directive" for u in (_using(c),) if u.is_global
     )
-    words = _spelled_words(text) if root.has_error else frozenset()
-    declarable = _declarable_words(text) if root.has_error else frozenset()
+    unseen = root.has_error or hidden
+    words = _spelled_words(text) if unseen else frozenset()
+    declarable = _declarable_words(text) if unseen else frozenset()
     return _Share(types, frozenset(namespaces), global_usings, words, declarable), not root.has_error
 
 

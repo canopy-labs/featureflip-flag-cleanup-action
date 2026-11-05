@@ -1067,6 +1067,7 @@ def _dry_run_caveats(
     facts = sum(1 for _, kind, _ in test_doubles if kind == "theory made a fact")
     renamed_methods = sum(1 for _, kind, _ in test_doubles if kind == "renamed test method")
     gate_named = sum(1 for _, kind, _ in test_doubles if kind == "named for the gate")
+    duplicates = sum(1 for _, kind, _ in test_doubles if kind == "may duplicate")
     rows = sum(1 for _, kind, _ in test_doubles if kind == "test rows")
     rebuilt = sum(1 for _, kind, _ in test_doubles if kind == "rebuilt with the kept value")
     if facts:
@@ -1078,6 +1079,8 @@ def _dry_run_caveats(
             f"{gate_named + false_titles} kept test(s) would still be named for the removed gate's "
             "state (reported, not renamed)"
         )
+    if duplicates:
+        notes.append(f"{duplicates} kept test(s) cut down to what a sibling test also does (reported, not deleted)")
     if removed_tests:
         notes.append(
             f"{removed_tests} test(s) whose mock returns the removed value "
@@ -1096,7 +1099,7 @@ def _dry_run_caveats(
         notes.append(f"{flag_value} assertion(s) of the flag's own value would be deleted")
     mock_lines = (
         len(test_doubles) - removed_tests - sibling_tests - pinned - phases - flag_value
-        - false_titles - facts - renamed_methods - gate_named - rows - rebuilt
+        - false_titles - facts - renamed_methods - gate_named - duplicates - rows - rebuilt
     )
     if mock_lines:
         notes.append(

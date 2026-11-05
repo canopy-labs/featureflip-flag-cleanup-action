@@ -85,6 +85,7 @@ from polyglot_piranha import PiranhaArguments, execute_piranha
 from flag_cleanup import (
     contradicting,
     cs_kept_tests,
+    cs_orphan_usings,
     csharp_residue,
     ctor_param_removal,
     dart_field_removal,
@@ -2835,6 +2836,15 @@ def _transform_flag(
     )
     bindings = bindings + leading_rows
 
+    # A C# `using` whose namespace held a type this run deleted, when the
+    # file spells none of the namespace's other types and none of them can
+    # hold an extension member: nothing in the file binds through it any
+    # more. After the comment passes, whose deletions can take the last
+    # spelling, and before Gate 1, which judges the result.
+    if language == "csharp":
+        summaries, using_rows = cs_orphan_usings.remove(summaries, deleted_files, repo_dir, Rewrite)
+        bindings = bindings + using_rows
+
     # Comments beside the changes that describe a flag's state without naming
     # it ("while the flag is off"): reported, never edited. After every edit,
     # so the lines named are the ones that stay on disk.
@@ -4418,11 +4428,22 @@ def _rename_kept_titles(
         return summaries, ()
     result = []
     rows: list[tuple[str, str, str]] = []
+    # The repository's stored snapshot files, listed once and only when a file
+    # is actually a candidate. A test with one is not renamed.
+    snapshots: frozenset[str] | None = None
     for summary in summaries:
         if summary.original_content == summary.content:
             result.append(summary)
             continue
-        content, renamed = rename(summary.content, _grammar_of(summary.path, language), flag_key, kept)
+        def stored(name: str = os.path.basename(summary.path)) -> bool:
+            nonlocal snapshots
+            if snapshots is None:
+                snapshots = ts_tests.stored_snapshot_names(repo_dir)
+            return name in snapshots
+
+        content, renamed = rename(
+            summary.content, _grammar_of(summary.path, language), flag_key, kept, stored
+        )
         if not renamed:
             result.append(summary)
             continue
@@ -5445,12 +5466,16 @@ def _fold_php_literals(summaries) -> list:
 _MAX_MARKER_ROUNDS = 5
 
 
-def _inline_python_bindings(before: str, after: str, marker: str, *, language: str) -> str:
-    del language  # one grammar; the signature matches the TypeScript inliner's
+def _inline_python_bindings(
+    before: str, after: str, marker: str, *, language: str, path: str | None = None, repo_dir: str | None = None
+) -> str:
+    del language, path, repo_dir  # one grammar; the signature matches the TypeScript inliner's
     return inline_literal_bindings(before, after, marker)
 
 
-def _inline_ts_bindings(before: str, after: str, marker: str, *, language: str) -> str:
+def _inline_ts_bindings(
+    before: str, after: str, marker: str, *, language: str, path: str | None = None, repo_dir: str | None = None
+) -> str:
     """A local the fold bound to a literal (:mod:`flag_cleanup.ts_fold`), or,
     when there is none, a JSX prop it made one literal at every call site
     (:mod:`flag_cleanup.ts_constant_props`), or a private function's parameter
@@ -5460,7 +5485,9 @@ def _inline_ts_bindings(before: str, after: str, marker: str, *, language: str) 
     left unread are deleted (:mod:`flag_cleanup.ts_unread_props`,
     :func:`flag_cleanup.ts_constant_params.drop_unread_params`): those write
     no marker, and come last because a round of the others is usually what
-    strands them."""
+    strands them. Last of all, a test helper's parameter every call now
+    passes ``{}`` to (:func:`flag_cleanup.ts_constant_params.drop_empty_object_params`),
+    which leaves ``flags={{}}`` for the passes after the engine."""
     inlined = ts_fold.inline_literal_bindings(before, after, language, marker)
     if inlined != after:
         return inlined
@@ -5473,17 +5500,22 @@ def _inline_ts_bindings(before: str, after: str, marker: str, *, language: str) 
     inlined = ts_unread_props.drop_unread_props(before, after, language)
     if inlined != after:
         return inlined
-    return ts_constant_params.drop_unread_params(before, after, language)
+    inlined = ts_constant_params.drop_unread_params(before, after, language)
+    if inlined != after:
+        return inlined
+    return ts_constant_params.drop_empty_object_params(before, after, language, path, repo_dir)
 
 
 #: The languages whose post-engine inliner hands its result back to the engine
 #: through a marker rule. Each needs that rule in its base rules file; a
 #: language listed here without one would have every marker survive and every
 #: such file unwound, which is safe and useless.
-def _no_single_file_inline(before: str, after: str, marker: str, *, language: str) -> str:
+def _no_single_file_inline(
+    before: str, after: str, marker: str, *, language: str, path: str | None = None, repo_dir: str | None = None
+) -> str:
     """Java, Kotlin and Go have no single-file inliner: their one marker pass,
     a private helper's parameter, is proven across files (``_BOUND_ACROSS_FILES``)."""
-    del before, marker, language
+    del before, marker, language, path, repo_dir
     return after
 
 
@@ -5643,6 +5675,8 @@ def _inline_bound_reads(
                 summary.content,
                 marker,
                 language=_grammar_of(path, language),
+                path=path,
+                repo_dir=repo_dir,
             )
             if inlined != summary.content:
                 staged[path] = (summary.content, inlined)

@@ -47,6 +47,7 @@ under Gate 1 and the same all-or-nothing rollback.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from tree_sitter import Node
@@ -72,6 +73,24 @@ _STATES = {
 #: A title using one of these describes behaviour that holds in BOTH states —
 #: "even when the flag is off", "regardless of the flag" — so the test is not
 #: about the removed branch, and it is kept.
+#: The conjunctions an `even with` clause can leave hanging. Lowercase only:
+#: `AND` / `OR` in capitals is a logic word in the title, not a connective.
+_CONNECTIVES = ("and", "or", "not", "but", "nor", "then", "yet", "also", "so")
+_DANGLING = re.compile(
+    r"\b(?:"
+    + "|".join(f"{w}|{w.capitalize()}" for w in _CONNECTIVES)
+    + r")[\s,.]*$"
+)
+
+#: A result ending in one of these has lost its second half.
+_DANGLING_PUNCTUATION = re.compile(r"[-\u2014\u2013;,:]\s*$")
+
+#: A matcher that stores its expectation outside the file, keyed by the test's
+#: title. The inline variants live in the source and are fine.
+_STORED_SNAPSHOT = re.compile(
+    r"\b(?:toMatch(?!Inline)\w*Snapshot|toThrowError(?!MatchingInline)\w*Snapshot|toHaveScreenshot|toMatchScreenshot)\b"
+)
+
 _HEDGES = re.compile(r"\b(even|regardless|irrespective|whether|either)\b", re.IGNORECASE)
 
 
@@ -258,7 +277,11 @@ RENAMED_TEST = "renamed test"
 
 
 def rename_kept_titles(
-    source: str, language: str, flag_key: str, kept: str
+    source: str,
+    language: str,
+    flag_key: str,
+    kept: str,
+    has_stored_snapshot: Callable[[], bool] | bool = False,
 ) -> tuple[str, list[tuple[str, str]]]:
     """``source`` with the flag's condition dropped from every title naming the
     KEPT branch, and ``(old, new)`` for each title it rewrote.
@@ -278,11 +301,30 @@ def rename_kept_titles(
     title is only a string, so a rewrite cannot break the build, and each one
     is named in the pull request.
     """
+    # Stored snapshots and screenshots are keyed by the full test name, so a
+    # rename orphans them wherever the assertion sits (a helper, an
+    # `afterEach`, a nested describe). A file that uses one is not renamed at
+    # all, and neither is one the repository holds a snapshot file for (a
+    # helper imported from another module).
+    if has_stored_snapshot is True or _STORED_SNAPSHOT.search(source):
+        return source, []
+    # Asked lazily: looking for the repository's snapshot files walks the tree,
+    # which only matters once a title could actually be renamed.
+    checked = not callable(has_stored_snapshot)
     data = source.encode("utf-8")
     root = _parse(source, language)
     edits: list[tuple[int, int, bytes]] = []
     renamed: list[tuple[str, str]] = []
-    for node, _callee, title in _titled_tests(root, data):
+    # `it.each(rows)('title', cb)` is admitted: dropping a clause that names the
+    # removed flag is true of every row, whatever the rows hold. The DELETION
+    # does not admit it, because a title can describe one row and not another.
+    titled = _titled_tests(root, data, parametrised=True)
+    # Every test and describe title in the FILE, by decoded value and with
+    # placeholders as wildcards. Unique leaf titles imply unique full names
+    # (except across describe titles that contain spaces, which this accepts), so a rename is refused when its new
+    # title could equal any other title here, existing or already produced.
+    patterns = _title_patterns(root, data)
+    for node, _callee, title in titled:
         arguments = node.child_by_field_name("arguments")
         if arguments is None or not hands_callback(arguments):
             continue
@@ -291,6 +333,17 @@ def rename_kept_titles(
         new = reworded_title(title, flag_key, kept) if raw == title else None
         if new is None:
             continue
+        if not checked:
+            checked = True
+            if has_stored_snapshot():  # type: ignore[operator]
+                return source, []
+        candidate = _tokens(_decode(new))
+        if any(
+            id_ != literal.id and _could_match(candidate, other)
+            for id_, other in patterns.items()
+        ):
+            continue
+        patterns[literal.id] = candidate
         edits.append((literal.start_byte + 1, literal.end_byte - 1, new.encode("utf-8")))
         renamed.append((title, new))
     for start, end, text in sorted(edits, reverse=True):
@@ -298,17 +351,162 @@ def rename_kept_titles(
     return data.decode("utf-8"), renamed
 
 
+_WILD = "\0"
+_PLACEHOLDER = re.compile(r"%[sdifjoOpc#%]|\$\{[^}]*\}|\$[A-Za-z_][\w.]*")
+
+
+def _tokens(text: str) -> tuple[str, ...]:
+    """``text`` as characters, with each placeholder a single wildcard."""
+    out: list[str] = []
+    last = 0
+    for match in _PLACEHOLDER.finditer(text):
+        out.extend(text[last : match.start()])
+        out.append(_WILD)
+        last = match.end()
+    out.extend(text[last:])
+    return tuple(out)
+
+
+def _decode(text: str) -> str:
+    """A title's value rather than its source: ``\\'`` is ``'``."""
+    return re.sub(r"\\([\\'\"`$/])", r"\1", text)
+
+
+def _title_patterns(root: Node, data: bytes) -> dict[int, tuple[str, ...]]:
+    """Every test or group title in the file, keyed by its first argument's node
+    id, as tokens of its decoded value. A template's substitutions are
+    wildcards, and so is any title that is not a string or template literal
+    (a variable, a concatenation, a call): it could equal anything."""
+    found: dict[int, tuple[str, ...]] = {}
+    for node in _walk(root):
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        arguments = node.child_by_field_name("arguments")
+        if callee is None or arguments is None or not arguments.named_children:
+            continue
+        if not _is_test_callee(callee, data) and not _is_parametrised_callee(callee, data):
+            continue
+        if callee.type == "member_expression":
+            prop = callee.child_by_field_name("property")
+            # `it.each(rows)`: its argument is the rows, and its title is on
+            # the call that follows.
+            if prop is not None and _text(prop, data) == "each":
+                continue
+        first = arguments.named_children[0]
+        if first.type == "string":
+            found[first.id] = _tokens(_decode(_literal_text(first, data) or ""))
+        elif first.type == "template_string":
+            out: list[str] = []
+            for child in first.named_children:
+                if child.type == "template_substitution":
+                    out.append(_WILD)
+                else:
+                    out.extend(_tokens(_decode(_text(child, data))))
+            found[first.id] = tuple(out)
+        elif hands_callback(arguments):
+            found[first.id] = (_WILD,)
+    return found
+
+
+def _could_match(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    """Whether some string matches both ``a`` and ``b``, wildcards standing for
+    any text. Iterative, so a long title cannot exhaust the stack."""
+    if _WILD not in a and _WILD not in b:
+        return a == b
+    la, lb = len(a), len(b)
+    # `below[j]` is meet(i + 1, j); `row[j]` is meet(i, j).
+    below = [False] * (lb + 1)
+    for i in range(la, -1, -1):
+        row = [False] * (lb + 1)
+        for j in range(lb, -1, -1):
+            if i == la and j == lb:
+                row[j] = True
+                continue
+            ok = False
+            if i < la and a[i] == _WILD and below[j]:
+                ok = True
+            elif j < lb and b[j] == _WILD and row[j + 1]:
+                ok = True
+            elif i < la and j < lb:
+                if a[i] == _WILD and b[j] != _WILD and row[j + 1]:
+                    ok = True
+                elif b[j] == _WILD and a[i] != _WILD and below[j]:
+                    ok = True
+                elif a[i] == b[j] != _WILD and below[j + 1]:
+                    ok = True
+            row[j] = ok
+        below = row
+    return below[0]
+
+
+#: Directories pruned at any depth.
+_ALWAYS_SKIPPED = frozenset({"node_modules", ".git"})
+
+#: Output and vendor directories, pruned only directly under the repository
+#: root: nested, `packages/build/` is a package and may hold snapshots.
+_ROOT_SKIPPED = frozenset(
+    {
+        "dist", "build", "out", ".next", ".nuxt", "coverage", "target", "vendor",
+        ".venv", "venv", "Pods", ".turbo", ".cache",
+    }
+)
+
+
+def stored_snapshot_names(repo_dir: str) -> frozenset[str]:
+    """The names of the snapshot files and directories under ``repo_dir``:
+    ``Foo.test.tsx.snap`` as ``Foo.test.tsx``, Playwright's
+    ``Foo.test.tsx-snapshots`` and Vitest's ``__screenshots__/Foo.test.tsx``
+    as the same."""
+    import os
+
+    names: set[str] = set()
+    for here, dirs, files in os.walk(repo_dir):
+        at_root = os.path.abspath(here) == os.path.abspath(repo_dir)
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in _ALWAYS_SKIPPED and not (at_root and d in _ROOT_SKIPPED)
+        ]
+        inside_screenshots = os.path.basename(here) == "__screenshots__"
+        for d in dirs:
+            if d.endswith("-snapshots"):
+                names.add(d[: -len("-snapshots")])
+            if inside_screenshots:
+                names.add(d)
+        for f in files:
+            if f.endswith(".snap"):
+                names.add(f[: -len(".snap")])
+            if inside_screenshots:
+                names.add(f)
+    return frozenset(names)
+
+
 def reworded_title(title: str, flag_key: str, kept: str) -> str | None:
     """``title`` with the flag's condition dropped, or ``None`` when it does not
     pass the bar :func:`rename_kept_titles` sets."""
     key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", re.IGNORECASE)
-    if "\n" in title or not key.search(title) or _HEDGES.search(title):
+    if "\n" in title or not key.search(title):
         return None
-    new = _drop_kept_clause(title, _kept_clauses(flag_key, kept))
+    clauses = _kept_clauses(flag_key, kept)
+    # The one hedge that is not one: `X even with REF STATE` says X holds while
+    # the flag is in the kept state, which stays true once the flag is gone.
+    # Only that exact trailing clause is set aside before the hedge check.
+    even_with = clauses[0][0]
+    dropped_even_with = bool(even_with.search(title))
+    if dropped_even_with:
+        if _HEDGES.search(even_with.sub("", title, count=1)):
+            return None
+    elif _HEDGES.search(title):
+        return None
+    new = _drop_kept_clause(title, clauses)
     removed = _removed_state_pattern(flag_key, "true" if kept == "false" else "false")
     if (
         new is None
         or not new.strip()
+        # A clause cut from after a conjunction leaves it hanging.
+        or (dropped_even_with and _DANGLING.search(new))
+        or _DANGLING_PUNCTUATION.search(new)
         or key.search(new)
         or removed.search(new)
         # Never cut through an escape sequence.
@@ -338,6 +536,15 @@ def _kept_clauses(flag_key: str, kept: str) -> list[tuple[re.Pattern[str], str]]
     default = r"(?:\s*\((?:by\s+)?default\))?"
     flags = re.IGNORECASE
     return [
+        # `renders X even with REF STATE` → `renders X`. First: it is the only
+        # shape allowed to contain a hedge word, and `reworded_title` relies on it.
+        (
+            re.compile(
+                rf"(?:\s*[,\u2014\u2013-])?\s+even\s+with\s+{ref}\s+{state}{default}(?=[\s.]*$)",
+                flags,
+            ),
+            "",
+        ),
         # `renders X when REF is STATE` → `renders X`.
         (re.compile(rf",?\s+{clause}{default}(?=[\s.]*$)", flags), ""),
         # `when REF is STATE and Y` → `when Y`.
@@ -417,7 +624,7 @@ def registry_defaults(source: str, language: str, flag_key: str) -> list[Registr
 
 def is_test_file(source: str, language: str) -> bool:
     """Whether ``source`` declares a test: an ``it``/``test``/``describe`` with a title."""
-    return bool(_titled_tests(_parse(source, language), source.encode("utf-8")))
+    return bool(_titled_tests(_parse(source, language), source.encode("utf-8"), parametrised=True))
 
 
 def title_nodes(root: Node, data: bytes) -> frozenset[int]:
@@ -634,12 +841,13 @@ def _titled_tests(
     """``(call, callee text, title)`` for every test-shaped call, in source order.
 
     ``parametrised`` also admits ``it.each(rows)('title', cb)`` and its
-    spellings. Only the two callers that ask whether a title is INERT pass it
-    (:func:`title_nodes`, :func:`data_mention`). The ones that act on the test,
-    deleting or retitling it (:func:`find_pinned_tests`,
-    :func:`rename_kept_titles`), do not: one declaration stands for several
-    runs, whose titles are filled in from the rows, so nothing here proves the
-    title chosen for the declaration describes each of them.
+    spellings. The callers that ask whether a title is INERT pass it
+    (:func:`title_nodes`, :func:`data_mention`), and so does
+    :func:`rename_kept_titles`, because dropping a clause naming the removed
+    flag is true of every row. :func:`find_pinned_tests` does not: it
+    DELETES the test, and one declaration stands for several runs whose
+    titles are filled in from the rows, so nothing here proves the title
+    chosen for the declaration describes each of them.
     """
     found = []
     for node in _walk(root):

@@ -8,6 +8,55 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.7.0
+
+### Added
+
+- **C#:** a kept test that is renamed because its name held the removed gate's
+  state now takes its references in the same file along: a `nameof(Test)`,
+  `nameof(Type.Test)` or a `///` `cref="Test"` pointing at it is renamed too,
+  where one used to keep the test as it was. Any other spelling of the name
+  (another file, a string, a comment that is not a `cref`, a document, a
+  `nameof` qualified by a different type) still keeps the rename from
+  happening.
+- **C#:** a kept test whose name speaks of several gates (`EitherGateOff_…`,
+  `BothGatesOn_…`) after the run removed one of them is listed in the pull
+  request, since the name no longer says which gate is left.
+- **C#:** a test the run cut down, whose statements begin exactly
+  as a sibling test in the same class does, up to its first assertions, is listed as one that may
+  now duplicate that sibling. Nothing is deleted.
+
+### Changed
+
+- A kept TypeScript or JavaScript test titled `… even with <flag> on` (or `off`, when that is the kept state) now loses that clause, including in an `it.each([…])('…', …)` title. Other `even`, `regardless` and `whether` titles are still left as they were.
+
+### Fixed
+
+- **TypeScript and JavaScript:** a call or parameter list holding one item on
+  its own line with a trailing comma, such as `label(\n  true,\n)`, could be
+  left as `label(\n  ,\n)` when that item was removed. That does not parse, and
+  nothing refused it. The list now collapses to `label()`, and any edit that
+  would leave a comma with nothing before it is refused. Check any such
+  removal already merged.
+- **Kotlin:** two kept tests whose names reduced to the same name were both
+  renamed to it, which does not compile (conflicting overloads). A rename is now
+  refused when its new name is already declared in the file, backticked or not,
+  or was produced earlier in the same run. Check any such removal already
+  merged.
+- **TypeScript and JavaScript:** a kept test could be renamed even though a
+  stored snapshot was keyed by its old title, so the snapshot no longer matched
+  and the test run failed. A file that uses a stored snapshot or screenshot
+  matcher, or whose snapshots are stored in the repository, is no longer
+  renamed, and a rename that could give two tests in a file the same name is
+  refused. Check any such removal already merged.
+- **C#:** when a kept test could not be renamed because its name is spelled
+  elsewhere, the pull request could name the test's own declaration as that other
+  spelling. It now names the spellings that actually keep the rename, up to
+  three and a count of the rest.
+- C#: when a removal deletes a type, such as a gate interface or its test fake, a file that used it no longer keeps a `using` of that type's namespace with nothing left to import. The directive is deleted only when the namespace is your own (under a project's root namespace), the file spells none of the namespace's other types, and nothing in the namespace can add a name the file uses without spelling it (an extension method or block, a `partial` or attributed type a source generator may extend, a type inside `#if`, a Razor component). The pull request lists each one with the other unused bindings, and IDE0005 no longer flags them.
+- C#: a type declared inside `#if` is no longer invisible to the checks that look across files. A file holding one is treated like a file that does not parse, so every question about a name it spells fails safe. In particular, a removal no longer deletes the `using` directives of a namespace it would empty while such a type is declared in it; the leftovers are kept and listed instead. Check any such removal already merged.
+- **TypeScript:** a test helper whose parameter every call now passes `{}` to loses the parameter. After a removal turns `renderWithFlags({ 'old-checkout': true })` into `renderWithFlags({})`, the helper becomes `renderWithFlags()`, each `flags={flags}` it handed the parameter to becomes `flags={{}}`, and that is left out in turn where the provider's declaration defaults it. A parameter typed `Record<string, never>` goes the same way when it sits in a test file the removal changed. The helper can be declared inside a `describe` block. A parameter read more than once, or inside a function the helper builds such as a `wrapper` handed to `render` (including a curried one), goes only when every receiver is the React SDK's `TestFeatureflipProvider` or a component that defaults the prop to `{}` and only passes it on to one, so no component sees a new object where the helper held one. A file that mocks the SDK package (including with a computed name), a setup or shared mocks file that does, a `__mocks__` replacement for it, a config that aliases the package (including by wildcard, or through Babel), or a vendored or patched copy of it, keeps the helper. The reads go to an element with no type arguments and no generic declaration in the file, and an edit that would leave a stray comma such as `f(\n  ,\n)` is refused. The pull request no longer lists these calls as override literals left empty.
+
 ## 2.6.0
 
 ### Added

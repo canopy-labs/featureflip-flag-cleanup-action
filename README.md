@@ -2915,7 +2915,8 @@ with:
 
 When the flag is removed serving `true` the gate is open, so the attribute is
 deleted, along with its `[…]` if nothing else is in it. A `using` it leaves
-unused stays, like any other `using`. The key can be a string or a key constant
+unused stays, like any other `using` the run did not orphan by deleting a type
+(see below). The key can be a string or a key constant
 (`[RequireFeature(FeatureFlagKeys.OldCheckout)]`), and that constant goes too
 once nothing else uses it.
 
@@ -3243,6 +3244,35 @@ object must initialize a variable, be what the function returns, or go to a
 function declared without type parameters. An option the run did not set
 itself is left alone too. The pull request lists each one removed.
 
+**A test helper's parameter that every call now passes `{}` to is removed.**
+When the removal turns `renderWithFlags({ 'old-checkout': true })` into
+`renderWithFlags({})` at every call, the parameter carries nothing: it goes
+from the declaration and from each call (`renderWithFlags()`), and where the
+helper hands it to a JSX attribute (`flags={flags}`) that attribute becomes
+`flags={{}}`, which is then left out as the callee's default where the
+declaration proves it. The helper is a `function`, or a `const` bound to a
+function, declared in a test file (one that declares a titled `it`, `test` or
+`describe`), in a module or inside a block such as `describe(…, () => { … })`;
+its name is used in that scope only as the callee of a plain call; the
+parameter is its last (a `this` parameter does not count), plain, with no
+default or `= {}`; every call passes `{}` or, with the `= {}` default,
+nothing; and every read of the parameter is a whole JSX attribute value. A
+single read outside any nested function goes as it is. Several reads, or a
+read inside a function the helper builds (a `wrapper: ({ children }) => …`
+passed to `render`, or a curried `(flags) => ({ children }) => …`), would
+hand the component a new object each time, so they go only when every one
+lands on the Featureflip React SDK's `TestFeatureflipProvider` (its `flags`),
+or on a component of yours that declares the prop with a `{}` default,
+is left out as that default, and uses the prop for nothing but passing it
+on, unchanged, to the SDK provider or to another component that does the
+same. A component that puts the prop in a hook's dependency list, reads a
+member of it, spreads it, passes it to a call, wraps itself in `memo` or
+`forwardRef`, or has `defaultProps` keeps the helper as it is, and so does a test file (or forwarding module) that mocks `@featureflip/react` (or mocks something it cannot read as a plain string), a non-test file anywhere in the repository that does (a setup file, a shared mocks module), or a `__mocks__` replacement for the package, as a file or as a directory with an `index`. So does a test-time alias of the package: its name in a string in a non-test config or workspace file (`jest.config.js`, `vitest.config.ts`, …), in the `jest` object of a `package.json`, or in the `paths` of a `tsconfig`. A name only in a comment does not count, and neither does a mock in a different test file. A module-mapper or alias pattern that could match the package (a wildcard such as `^@featureflip/(.*)$`, or one that does not compile; an alias of a different `@featureflip/` package does not count) counts too, in jest, vite/vitest and Babel `module-resolver` configuration, as does an SDK dependency that points anywhere but the registry (`file:`, `link:`, `workspace:`, `npm:`, a git URL or a path) and a patch for the package (`patch-package` or pnpm `patchedDependencies`). The pass does not read a configuration file that is not named like a config or workspace file and is loaded with `--config`, nor `.storybook/main.*` aliases; keep the parameter by hand if your tests swap the SDK that way. A read handed to an element with type
+arguments, or to a component declared in the file with type parameters, stays,
+since `{}` would change what the type infers. A parameter typed
+`Record<string, never>` can only ever be `{}`, so it goes whoever wrote it.
+Any other type goes only when the run is what made the calls empty.
+
 **A Featureflip test provider left serving nothing is unwrapped** when nothing
 the test renders could read a flag. A test file whose
 `<TestFeatureflipProvider flags={{ 'old-checkout': true }}>` the removal
@@ -3363,8 +3393,21 @@ key (with or without "the" and "flag") and "is on" (or *enabled*, *true*,
 *turned on*; *off*, *disabled*, *false*, *not enabled* for an off branch),
 `with` followed by the key and the state, each either ending the title, as
 one half of an `and`, or opening it before a comma. A trailing "(default)"
-goes with the clause. A title that only says "the flag", that hedges, whose
-condition is the whole title, or that would still name the key or the
+goes with the clause. A trailing `even with` followed by the key and the kept
+state (`… on the %s plan even with old-checkout on`) is dropped too, with a
+comma or dash before it, since it stays true once the flag is gone; it also
+works in an `it.each([…])('…', …)` title. Every other title using `even`,
+`regardless`, `irrespective`, `whether` or `either` is left. A rename that
+would give a test a title that could equal any other test or group title in
+the file (a `%s` or `${…}` placeholder, or a title that is not a plain string,
+counts as matching anything) is left as
+it was. So is every test in a file that asserts a stored snapshot or
+screenshot (`toMatchSnapshot`, `toMatchFileSnapshot`,
+`toThrowErrorMatchingSnapshot`, `toHaveScreenshot`, `toMatchScreenshot`; inline snapshots are
+fine), and in a file the repository holds a `.snap` file or Playwright
+`-snapshots` or Vitest `__screenshots__` folder for, because those are stored under the
+test's title. A title that only
+says "the flag", that hedges, whose condition is the whole title, or that would still name the key or the
 removed state afterwards is left as it was and reported as before. A title is
 only a string, so a wrong rewrite cannot break your build, and the pull
 request lists every rewrite, old title and new, under "tests were renamed".
@@ -4340,6 +4383,18 @@ class, since what stays is mock fields and setup that test nothing. A class
 stays if it extends or implements anything, is `abstract`, or is named anywhere
 outside its own text. A class that held no test before the run is never touched.
 
+A C# test that a gate interface's removal keeps can still describe the gate.
+A name with a part that is only the kept state (`EnsureCanSet_GateOn_Passes`)
+loses that part (`EnsureCanSet_Passes`), together with the `nameof(…)` and
+`///` `cref` references to it in the same file, when nothing else spells the
+name, no snapshot file is named for it and the type has no member with the new
+name. A name in a string, a comment that is not a `cref`, or another file keeps
+the test as it was, and the pull request lists the test with every spelling that
+stopped the rename. A name that speaks of several gates (`EitherGateOff_…`)
+once one of them is gone is listed, never renamed. A test the run cut down to
+statements that begin exactly as a sibling in its class does, up to the first
+assertions, is listed as one that may now duplicate it, and nothing is deleted.
+
 **Nothing in a test is touched unless the same run folds a real read** of the
 flag, in that directory, in any language of the run: a Kotlin test of a Java
 read counts. If no read could be rewritten — the key held in a field, say — the
@@ -4894,6 +4949,37 @@ file — C# code writes `Console.WriteLine`, never `System.Console.WriteLine` �
 so there is no name for this tool to check references against. Only
 `using Alias = Foo.Bar;`, which does bind a name, can be judged this way, and
 is removed like an import everywhere else.
+
+One plain `using` is removed: one that the run's own deletion of a type left
+with nothing to import. When the run deletes a type (a gate interface, a fake
+of it) declared in namespace `N`, a file it changed that spelled that type
+loses its `using N;` if all of these hold:
+
+- the file spells none of the other types your repository declares directly
+  in `N`, anywhere: in code, in a `cref`, in a comment, or as an attribute
+  without its `Attribute` suffix;
+- no static class in `N` declares an extension method or an `extension`
+  block, since a call to one spells neither the class nor the namespace;
+- no type in `N` is `partial` or carries an attribute, which a source
+  generator could add to or key on;
+- no file that does not parse, cannot be read, or declares a type inside
+  `#if`, may declare into `N`;
+- `N` is your own: it is, or sits under, the root namespace of a project in
+  the repository (its `<RootNamespace>`, else its `<AssemblyName>`, else the
+  project file's name), and is not `System` or `Microsoft` or under them;
+- the repository has no `.razor` or `.cshtml` file, since a Razor component
+  or page compiles to a type no `.cs` file declares;
+- the directive is a plain file-level `using N;` on a line of its own, not
+  `global`, `static` or an alias, not inside a `#region`, and not directly
+  under a comment line (which may be about it) unless a `using` that stays
+  follows it; the file has no `#if`, and spells no name with a `\u` escape.
+
+A `using` directive imports only the types declared directly in its
+namespace and the extension members of its static classes, so nothing in such
+a file binds through it any more. Like the removal of a `using` of a namespace
+a run empties, this assumes no package or other assembly outside your
+repository declares types in your own namespace. The pull request lists each
+one removed with the other unused bindings.
 
 A `private` method the fold leaves with no caller is deleted too, along with a
 doc comment directly above it — typically the helper a gate class used to build

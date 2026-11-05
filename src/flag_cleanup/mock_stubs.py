@@ -127,6 +127,10 @@ RENAMED_METHOD = "renamed test method"
 #: A kept C# test whose name still states the removed gate's state and was
 #: not renamed; carries the test's name and why.
 GATE_NAMED = "named for the gate"
+#: A kept C# test the run shrank whose remaining statements begin
+#: the way a sibling test's do (:mod:`flag_cleanup.cs_kept_tests`); carries the
+#: test's name and why, as ``name: reason``.
+DUPLICATE_TEST = "may duplicate"
 
 #: An argument list's tail after the key: balanced to three levels, which
 #: covers matchers such as ``any(Context.class)`` and ``It.IsAny<C>()``.

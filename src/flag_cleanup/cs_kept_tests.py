@@ -12,6 +12,9 @@ describe the branch that is gone:
   names a condition that no longer exists. A name whose part is nothing but
   the gate's KEPT state is renamed without that part, when nothing else in the
   repository names the method; any other is reported (:func:`review_names`).
+* **A test the run cut down to what a sibling does** (``_duplicates``), and a
+  name that speaks of several gates once one is gone (``_several_gates``):
+  both reported, never edited.
 * **A test a phase cut shortened** (``TEST_PHASE``) whose name says what
   happened while the gate held the removed value
   (``Job_DoesNothing_UntilTheEncryptionGateIsOn``): the name is now false,
@@ -28,10 +31,13 @@ shares another part with it (``GateOn_PastExpiry_…`` beside a deleted
 names no other gate type, but one can be reached through a type declared
 elsewhere), the name is reported, never renamed.
 
-A rename is also refused when anything else in the checkout spells the old
-name (prose included), a file is named for it (a snapshot library's
-``Class.Method.verified.txt``), or the test's type, another part of it or a
-type it derives from already declares the new one. A theory with a file
+A ``nameof`` argument or a ``///`` ``cref`` naming the method, in its own file
+(bare inside its type, or qualified by the type), is renamed with it. A rename
+is refused when anything else in the checkout spells the old name (prose and
+strings included; the row names the spellings, never the declaration), a file
+is named for it (a snapshot library's ``Class.Method.verified.txt``), or the
+test's type, another part of it or a type it derives from already declares the
+new one. A theory with a file
 named for it keeps its row for the same reason. A ``string``
 value is written only where it cannot join a constant expression (an
 argument, an assignment's or initializer's value, a ``return``, an
@@ -61,7 +67,7 @@ from tree_sitter import Node
 
 from flag_cleanup import file_deletion, git_ops, syntax
 from flag_cleanup.ctor_param_model import choose_sentinel, tidy, tidy_lines
-from flag_cleanup.mock_stubs import FALSE_TITLE, GATE_NAMED, RENAMED_METHOD, TEST, TEST_PHASE, THEORY_FACT
+from flag_cleanup.mock_stubs import DUPLICATE_TEST, FALSE_TITLE, GATE_NAMED, RENAMED_METHOD, TEST, TEST_PHASE, THEORY_FACT
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +577,8 @@ _ON, _OFF = frozenset({"On", "Enabled"}), frozenset({"Off", "Disabled"})
 _VERBS = frozenset({"Is", "Was", "Switched", "Turned", "Set", "Stays", "Goes", "Flipped"})
 #: Words that make a state a change over time: the test ran both.
 _TRANSITIONS = frozenset({"Until", "Unless", "Before", "After", "Once", "Only", "Then", "Switched", "Turned", "Flipped"})
+#: Words that make a name speak of several gates at once: ``EitherGateOff``.
+_QUANTIFIERS = frozenset({"Either", "Both", "Any", "All", "Neither", "Each", "Every"})
 #: Words that may come with the state in a part of a name that goes whole.
 _FILLERS = frozenset({"With", "When", "While", "If", "The"})
 #: Prefixes a test double's type name adds to the gate it fakes.
@@ -616,12 +624,15 @@ class _Token:
         return self.words[self.at - 1] if self.at > 0 else None
 
 
-def _tokens(name: str, noun: str) -> list[_Token]:
+def _tokens(name: str, noun: str, plural: bool = False) -> list[_Token]:
+    """The gate-state tokens of ``name``. ``plural`` also reads ``Gates`` right
+    after a quantifier (``BothGatesOn``), which only :func:`_several_gates`
+    asks for."""
     found: list[_Token] = []
     for index, segment in enumerate(name.split("_")):
         words = _words(segment)
         for at, word in enumerate(words):
-            if word != noun:
+            if word != noun and not (plural and word == noun + "s" and at > 0 and words[at - 1] in _QUANTIFIERS):
                 continue
             rest = words[at + 1 :]
             verb = rest[0] if rest and rest[0] in _VERBS else None
@@ -762,6 +773,105 @@ def _renamed(name: str, tokens: list[_Token], fam: Family) -> str | None:
     return new
 
 
+def _several_gates(name: str, method: Node, scans: list[_File]) -> str | None:
+    """Why ``name`` is now false, when it speaks of several gates
+    (``EitherGateOff``) in a test the run edited, and the test named a gate of
+    the family it removed. A rename would have to invent the surviving gate's
+    name, so it is reported."""
+    for scan in scans:
+        original = scan.methods.get(name)
+        if original is None or _norm(original) == _norm(method):
+            continue
+        for token in _tokens(name, scan.family.noun, plural=True):
+            before = token.before
+            if before in _QUANTIFIERS and _mentions(_text(original), scan.family.names | scan.family_receivers):
+                return (
+                    f"it says `{before}` gate, and this run removed one of the gates the test used, "
+                    "so the name no longer says which one is left"
+                )
+    return None
+
+
+def _norm(node: Node) -> str:
+    """``node``'s text as its tokens alone: whitespace and comments gone."""
+    return " ".join(_text(n) for n in _walk(node) if n.child_count == 0 and n.type != "comment")
+
+
+def _statements(method: Node) -> list[str] | None:
+    body = method.child_by_field_name("body")
+    if body is None or body.type != "block":
+        return None
+    return [_norm(c) for c in body.named_children if c.type != "comment"]
+
+
+#: Fewest statements two tests must share before the first assertion for the
+#: shorter one to be reported: a lone ``var x = Service();`` is every test's.
+_SHARED_STATEMENTS = 3
+
+
+def _signature(method: Node) -> tuple[str, ...]:
+    """A test's attributes and parameters, token for token: two tests that
+    differ in either (``[InlineData]`` rows, a ``[Trait]``) are not one test."""
+    parameters = method.child_by_field_name("parameters")
+    return (*(_norm(a) for _, a in _attributes(method)), _norm(parameters) if parameters is not None else "")
+
+
+_SIMPLE_STATEMENTS = ("expression_statement", "local_declaration_statement")
+
+
+def _kinds(method: Node) -> list[str]:
+    body = method.child_by_field_name("body")
+    return [c.type for c in body.named_children if c.type != "comment"] if body is not None else []
+
+
+def _duplicates(relative: str, root: Node, original: Node) -> list[tuple[str, str, str]]:
+    """A test the run cut down (fewer statements than before) whose statements
+    before its first assertion are, token for token, the first ones of a
+    sibling test of the same type with the same attributes and parameters, and
+    which began with a different arrangement before the run. A simple
+    statement holding an assertion may hold the act (``var e =
+    Assert.Throws(() => svc.Run());``), so it and the simple assertions after
+    it must match the sibling's too.
+    It may now say what the sibling says: that is reported once per pair, and
+    nothing is deleted."""
+    before = _methods(original)
+    tests = {key: method for key, method in _methods(root).items() if _is_test(method)}
+    rows: list[tuple[str, str, str]] = []
+    pairs: set[frozenset[str]] = set()
+    for (chain, name), method in tests.items():
+        old = before.get((chain, name))
+        mine, was = _statements(method), _statements(old) if old is not None else None
+        if mine is None or was is None or len(mine) >= len(was):
+            continue
+        asserting = next((i for i, s in enumerate(mine) if "Assert" in s), len(mine))
+        if asserting < _SHARED_STATEMENTS:
+            continue
+        if asserting == len(mine):
+            continue
+        # A simple statement holding an assertion may hold the act too
+        # (`var e = Assert.Throws(() => svc.Run());`), so it and the simple
+        # assertions after it are compared. A compound one (`using (...) {
+        # Assert... }`) is not: what it asserts is what the row asks to compare.
+        upto = asserting
+        kinds = _kinds(method)
+        while upto < len(mine) and kinds[upto] in _SIMPLE_STATEMENTS and "Assert" in mine[upto]:
+            upto += 1
+        for (other_chain, other), sibling in sorted(tests.items(), key=lambda kv: kv[0][1]):
+            pair = frozenset((name, other))
+            if other_chain != chain or other == name or pair in pairs:
+                continue
+            theirs = _statements(sibling)
+            theirs_was = _statements(before[(chain, other)]) if (chain, other) in before else None
+            if theirs is None or theirs_was is None or theirs[:upto] != mine[:upto]:
+                continue
+            if _signature(sibling) != _signature(method) or theirs_was[:asserting] == was[:asserting]:
+                continue
+            pairs.add(pair)
+            rows.append((relative, DUPLICATE_TEST, f"{name}: it now begins exactly as `{other}` does, up to its first assertions; compare what each asserts"))
+            break
+    return rows
+
+
 def review_names(
     summaries: list,
     families: list[Family],
@@ -786,6 +896,8 @@ def review_names(
     #: ``path -> [(identifier start, end, old, new)]``, and every old name.
     renames: dict[str, list[tuple[int, int, str, str]]] = {}
     planned: list[tuple[str, int, str, str]] = []
+    #: ``(path, identifier start) -> (type name, type start, type end)``.
+    owners: dict[tuple[str, int], tuple[str, int, int]] = {}
     for index, summary in enumerate(summaries):
         if file_deletion.deleted(summary) or not str(summary.path).endswith(".cs"):
             continue
@@ -803,8 +915,16 @@ def review_names(
         if not scans:
             continue
         members = _member_names(root)
+        try:
+            rows += _duplicates(relative, root, _parse(summary.original_content.removeprefix(_BOM)))
+        except Exception as exc:  # noqa: BLE001 - reporting never refuses the flag
+            logger.info("duplicates in %s not judged: %s: %s", summary.path, type(exc).__name__, exc)
         for (chain, name), method in _methods(root).items():
             if not _is_test(method):
+                continue
+            several = _several_gates(name, method, scans)
+            if several is not None:
+                rows.append((relative, GATE_NAMED, f"{name}: {several}"))
                 continue
             judged = [(t, how) for scan in scans for t in _tokens(name, scan.family.noun) if (how := _attributed(name, t, scan))]
             tokens = [t for t, _ in judged]
@@ -829,24 +949,48 @@ def review_names(
                 rows.append((relative, GATE_NAMED, f"{name}: `{new}` is already taken"))
                 continue
             identifier = method.child_by_field_name("name")
+            owner = method.parent.parent if method.parent is not None else None
+            if owner is not None and owner.type in _TYPE_DECLARATIONS and owner.child_by_field_name("name") is not None:
+                owners[(resolved, identifier.start_byte)] = (_text(owner.child_by_field_name("name")), owner.start_byte, owner.end_byte)
             planned.append((resolved, index, name, new))
             renames.setdefault(resolved, []).append((identifier.start_byte, identifier.end_byte, name, new))
     if not planned:
         return summaries, rows
     olds = {old for _, _, old, _ in planned}
-    elsewhere = _named_elsewhere(olds, repo_dir)
+    spelled = _spellings(olds, repo_dir)
     named_files = _files_named(olds, repo_dir)
     summaries = list(summaries)
     for resolved, edits in renames.items():
         index = next(i for p, i, _, _ in planned if p == resolved)
         summary = summaries[index]
         relative = os.path.relpath(resolved, repo_dir)
+        try:
+            raw = Path(resolved).read_bytes()
+            bom = 3 if raw.startswith(b"\xef\xbb\xbf") else 0
+            tree = _parse(raw[bom:].decode("utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            # Judged before anything is written, so a file that cannot be read
+            # as it was judged leaves every file as it was.
+            logger.info("references to renamed tests in %s not judged: %s: %s", relative, type(exc).__name__, exc)
+            continue
         go: list[tuple[int, int, str, str]] = []
+        #: The method's own references (``nameof``, ``cref``) that move with it.
+        along: list[tuple[int, int, str, str]] = []
         for start, end, old, new in edits:
-            where = elsewhere.get(old)
+            owner, owner_start, owner_end = owners.get((resolved, start), ("", -1, -1))
+            blockers: list[str] = []
+            moving: list[tuple[int, int, str, str]] = []
+            for where, line, spelled_path, at, to in spelled.get(old, []):
+                if spelled_path == resolved and at == start + bom:
+                    continue  # the declaration being renamed
+                if spelled_path == resolved and owner and _own_reference(tree, at - bom, to - bom, owner, owner_start + bom <= at < owner_end + bom):
+                    moving.append((at - bom, to - bom, old, new))
+                else:
+                    blockers.append(f"{where}:{line}")
             taken = _declared_in_hierarchy(resolved, start, new, repo_dir)
-            if where is not None:
-                rows.append((relative, GATE_NAMED, f"{old}: the name is also spelled at {where}"))
+            if blockers:
+                more = f", and {len(blockers) - 3} more" if len(blockers) > 3 else ""
+                rows.append((relative, GATE_NAMED, f"{old}: the name is also spelled at {', '.join(blockers[:3])}{more}"))
             elif old in named_files:
                 # A snapshot library finds its file by the test's name.
                 rows.append((relative, GATE_NAMED, f"{old}: a file is named for it: {named_files[old]}"))
@@ -855,6 +999,7 @@ def review_names(
                 rows.append((relative, GATE_NAMED, f"{old}: `{new}` is already declared at {taken}"))
             else:
                 go.append((start, end, old, new))
+                along += moving
         if not go:
             continue
         git_ops.before_writing([resolved])
@@ -862,7 +1007,7 @@ def review_names(
         offset = 3 if data.startswith(b"\xef\xbb\xbf") else 0
         if data[offset:].decode("utf-8") != summary.content.removeprefix(_BOM):
             continue  # not what was judged
-        for start, end, old, new in sorted(go, reverse=True):
+        for start, end, old, new in sorted(go + along, reverse=True):
             data = data[: start + offset] + new.encode() + data[end + offset :]
         Path(resolved).write_bytes(data)
         summaries[index] = rewrite(summary.path, summary.original_content, data.decode("utf-8"))
@@ -962,15 +1107,16 @@ def _members(declaration: Node) -> list[tuple[str, int]]:
     return found
 
 
-def _spellings(names: set[str], repo_dir: str) -> dict[str, list[str]]:
-    """``name -> ["path:line", …]`` for each spelling of each name in the
-    checkout's text files, paths from the checkout's root."""
+def _spellings(names: set[str], repo_dir: str) -> dict[str, list[tuple[str, int, str, int, int]]]:
+    """``name -> [(path, line, resolved path, start, end), …]`` for each
+    spelling of each name in the checkout's text files, paths from the
+    checkout's root and offsets in the file's bytes."""
     from flag_cleanup import source_index
     from flag_cleanup.csharp_residue import _text_files
 
     root = source_index.checkout_root(repo_dir)
-    pattern = re.compile(rb"(?<![\w@])(" + b"|".join(re.escape(n.encode()) for n in sorted(names)) + rb")(?!\w)")
-    seen: dict[str, list[str]] = {}
+    pattern = re.compile(rb"(?<!\w)@?(" + b"|".join(re.escape(n.encode()) for n in sorted(names)) + rb")(?!\w)")
+    seen: dict[str, list[tuple[str, int, str, int, int]]] = {}
     for path in _text_files(repo_dir):
         try:
             data = path.read_bytes()
@@ -980,8 +1126,55 @@ def _spellings(names: set[str], repo_dir: str) -> dict[str, list[str]]:
             continue
         for match in pattern.finditer(data):
             line = data.count(b"\n", 0, match.start()) + 1
-            seen.setdefault(match.group(1).decode(), []).append(f"{os.path.relpath(path, root)}:{line}")
+            seen.setdefault(match.group(1).decode(), []).append(
+                (os.path.relpath(path, root), line, str(path.resolve()), match.start(1), match.end(1))
+            )
     return seen
+
+
+_CREF_BEFORE = re.compile(r'cref\s*=\s*"((?:@?[A-Za-z_]\w*\.)*)@?$')
+_CREF_AFTER = re.compile(r'(?:\([^()"]*\))?"')
+
+
+def _own_reference(root: Node, at: int, to: int, owner: str, inside: bool) -> bool:
+    """Whether the spelling at bytes ``[at, to)`` of ``root``'s source is a
+    reference the compiler checks that moves with the method: the argument of
+    a ``nameof`` (``nameof(Name)``, written bare it must lie ``inside`` the
+    owner's own span; ``nameof(Owner.Name)``, qualified by the owner) or the
+    ``cref`` of a ``///`` comment. Everything else (a string, a raw string, an
+    interpolated string's text, any other comment) is prose and blocks."""
+    node = root.descendant_for_byte_range(at, to)
+    if node is None:
+        return False
+    if node.type == "comment":
+        # Offsets are bytes, so slice bytes: a multi-byte letter earlier in the
+        # line moves the match in characters but not in bytes.
+        text = node.text or b""
+        if not text.startswith(b"///"):
+            return False
+        offset = at - node.start_byte
+        found = _CREF_BEFORE.search(text[:offset].decode("utf-8", "ignore"))
+        if found is None or _CREF_AFTER.match(text[offset + (to - at) :].decode("utf-8", "ignore")) is None:
+            return False
+        qualifier = [q.lstrip("@") for q in found.group(1).split(".") if q]
+        return inside if not qualifier else qualifier[-1] == owner
+    if node.type != "identifier" or node.start_byte not in (at, at - 1) or node.end_byte != to:
+        return False
+    parent = node.parent
+    qualifier: list[str] = []
+    if parent is not None and parent.type == "member_access_expression" and parent.child_by_field_name("name") == node:
+        qualifier = [q.strip().lstrip("@") for q in _text(parent.child_by_field_name("expression")).split(".")]
+        parent = parent.parent
+    if parent is None or parent.type != "argument":
+        return False
+    arguments = parent.parent
+    call = arguments.parent if arguments is not None and arguments.type == "argument_list" else None
+    if call is None or call.type != "invocation_expression" or len(arguments.named_children) != 1:
+        return False
+    function = call.child_by_field_name("function")
+    if function is None or _text(function) != "nameof":
+        return False
+    return inside if not qualifier else qualifier[-1] == owner
 
 
 def _files_named(names: set[str], repo_dir: str) -> dict[str, str]:
@@ -1002,15 +1195,6 @@ def _files_named(names: set[str], repo_dir: str) -> dict[str, str]:
         for match in pattern.finditer(path.name):
             found.setdefault(match.group(1), os.path.relpath(path, root))
     return found
-
-
-def _named_elsewhere(names: set[str], repo_dir: str) -> dict[str, str]:
-    """``name -> "path:line"`` of a spelling of each name other than its one
-    declaration, anywhere in the checkout: in another file, or a second time
-    in its own. A comment or a document counts, since a person wrote the name
-    there and a rename would leave it stale. The path is the checkout's. A
-    name spelled nowhere at all (a new name) maps to nothing."""
-    return {name: where[1] if len(where) > 1 else where[0] for name, where in _spellings(names, repo_dir).items() if len(where) != 1}
 
 
 def review(

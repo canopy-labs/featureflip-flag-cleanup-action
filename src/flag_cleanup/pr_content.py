@@ -36,6 +36,7 @@ from flag_cleanup.cross_file_keys import (
     NAME_NOT_UNIQUE,
 )
 from flag_cleanup.mock_stubs import (
+    DUPLICATE_TEST,
     FALSE_TITLE,
     GATE_NAMED,
     PINNED_PARAMETER,
@@ -1873,6 +1874,7 @@ def pr_body(
     facts = [(path, text) for path, kind, text in test_doubles if kind == THEORY_FACT]
     renamed_methods = [(path, *text.split("\n", 1)) for path, kind, text in test_doubles if kind == RENAMED_METHOD and "\n" in text]
     gate_named = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == GATE_NAMED and ": " in text]
+    duplicates = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == DUPLICATE_TEST and ": " in text]
     mock_lines = [
         (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
     ]
@@ -2016,6 +2018,19 @@ def pr_body(
             "by hand:",
             ">",
             *[f"> - {_md_code(path)} — {_md_code(name)}: {reason}" for path, name, reason in gate_named[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if duplicates:
+        count = len(duplicates)
+        noun = "kept test" if count == 1 else "kept tests"
+        lines += [
+            f"> **⚠️ {count} {noun} may now duplicate another test.** The run cut "
+            f"{'it' if count == 1 else 'each'} down, and what is left begins the way a "
+            "sibling test does. Nothing was deleted; compare what each asserts, and delete one "
+            "only if the other covers it:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(name)}: {reason}" for path, name, reason in duplicates[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -2188,7 +2203,7 @@ _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
     TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
-    FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED,
+    FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST,
 )
 
 
@@ -2614,6 +2629,14 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     facts = [(p, t) for p, kind, t in test_doubles if kind == THEORY_FACT]
     renamed = [(p, t) for p, kind, t in test_doubles if kind == RENAMED_METHOD]
     gate_named = [(p, t) for p, kind, t in test_doubles if kind == GATE_NAMED]
+    duplicates = [(p, t) for p, kind, t in test_doubles if kind == DUPLICATE_TEST]
+    if duplicates:
+        logger.warning(
+            "%d kept test%s cut down to what a sibling test also does: %s",
+            len(duplicates),
+            "" if len(duplicates) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in duplicates),
+        )
     if false_titles:
         logger.warning(
             "%d test%s cut to the kept value still named for the removed one: %s",

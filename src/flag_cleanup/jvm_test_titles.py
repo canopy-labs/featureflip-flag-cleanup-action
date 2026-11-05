@@ -8,6 +8,8 @@ A Java method name is left: renaming it is an edit a build can see.
 
 from __future__ import annotations
 
+import re
+
 from tree_sitter import Node
 
 from flag_cleanup import mock_stubs, syntax, ts_tests
@@ -57,7 +59,9 @@ def _titles(root: Node, data: bytes, language: str) -> list[tuple[int, int]]:
     return found
 
 
-def rename_kept_titles(source: str, language: str, flag_key: str, kept: str) -> tuple[str, list[tuple[str, str]]]:
+def rename_kept_titles(
+    source: str, language: str, flag_key: str, kept: str, has_stored_snapshot: object = False
+) -> tuple[str, list[tuple[str, str]]]:
     """``source`` with the condition dropped from each title naming the KEPT
     branch, and ``(old, new)`` for each it rewrote."""
     if flag_key not in source:
@@ -65,12 +69,20 @@ def rename_kept_titles(source: str, language: str, flag_key: str, kept: str) -> 
     data = source.encode("utf-8")
     edits: list[tuple[int, int, bytes]] = []
     renamed: list[tuple[str, str]] = []
+    produced: set[str] = set()
     for start, end in _titles(syntax._parse(source, language), data, language):
         title = data[start:end].decode("utf-8", "replace")
         new = ts_tests.reworded_title(title, flag_key, kept)
         # A function's name must stay its own, and a title with `$` is a template.
-        if new is None or "$" in title or f"`{new}`" in source:
+        if (
+            new is None
+            or "$" in title
+            or f"`{new}`" in source
+            or new in produced
+            or re.search(rf"\bfun\s+{re.escape(new)}\s*\(", source)
+        ):
             continue
+        produced.add(new)
         edits.append((start, end, new.encode("utf-8")))
         renamed.append((title, new))
     for start, end, text in sorted(edits, reverse=True):
