@@ -84,6 +84,8 @@ class MergedPullRequest:
     repository: str = ""
     base_ref: str = ""
     default_branch: str = ""
+    #: The pull request's web address, quoted in the archive's change reason.
+    html_url: str = ""
 
 
 def merged_pull_request(env: Mapping[str, str] | None = None) -> MergedPullRequest | None:
@@ -158,6 +160,7 @@ def merged_pull_request(env: Mapping[str, str] | None = None) -> MergedPullReque
             _text(base_repo.get("default_branch"))
             or _text(repository.get("default_branch"))
         ),
+        html_url=_text(pull_request.get("html_url")),
     )
 
 

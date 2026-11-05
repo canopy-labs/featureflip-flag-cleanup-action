@@ -6498,6 +6498,48 @@ means no PR.
   in the pull request, and every rewrite is checked by parsing the file again:
   its code must be exactly what it was, or the file is left alone.
 
+  **A comment that names the flag and says more is cut down to the rest.**
+  ``// Gated on the `k` flag. Retries twice.`` becomes `// Retries twice.`.
+  The comment is split into sentences (at `.`, `!` or `?` and whitespace; `e.g.`,
+  `i.e.`, `etc.`, decimals and initials are not ends), and a sentence never
+  crosses a blank comment line or an XML tag of a C# doc comment (`<summary>`,
+  `<param>`, …); a list item, a JSDoc tag, a `word:` lead-in or a change of indent
+  is a boundary only after a line that ends in `.`, `!`, `?` or `:`, and after a
+  line that is still mid-sentence it makes the comment unreadable, so it is left
+  alone. A sentence is deleted only when it names the key (or a
+  type this run deleted) **and says nothing else**: the same word test as for a
+  whole comment above, applied to that sentence alone. A sentence with a fact, a
+  condition, a warning or another name in it is never cut (so is one with `no`, `not`,
+  `never`, `still`, `true`, `false` or `check` in it), so a key that is an
+  ordinary word (`checkout`, `search`) cannot take prose with it. The comment is
+  left exactly as it was, and listed as before, unless all of these also hold:
+
+  - nothing is cut inside a numbered or lettered list (`1.`, `a)`; the numbering would skip) or from a list item that has indented children; a bullet's marker goes with its item; a `Why:` lead-in survives only when the cut item and the next one that stays are items of the same list;
+  - a sentence stays in every unit that held one, so a `<summary>`, a
+    `<param>` or a JSDoc tag is never left empty. A plain comment's own
+    paragraph or list item may go whole, with the blank line beside it;
+  - the sentence that stays right after a cut does not start in lower case; the next sentence that stays does not open with `This`, `It`, `However`,
+    `Also`, … (even in another paragraph); the one before the cut does not end
+    with `,`, and does not end with `:` unless the cut sentence sits in a
+    unit of its own and something after it stays;
+  - every full stop in the comment can be told from a sentence end (a full stop
+    before a lowercase word cannot), and brackets and quotes still pair up in
+    the cut text and in what is left;
+  - no line of the comment is a tool directive (`eslint-disable`, `noqa`,
+    `//go:generate`, `//go:embed`, `// +build`, `//export`, a coding or
+    shebang line, `SPDX`, a licence header, …): one such line anywhere makes the
+    whole comment off limits;
+  - the comment is on lines of its own (a comment after code is never reworded),
+    and nothing is reworded while a file of that language and directory still
+    names the key outside a comment.
+
+  Line prefixes, indentation, CRLF line endings and a byte-order mark are kept,
+  and nothing but the cut sentences changes. A sentence that spans lines is cut
+  from each of them, and a line left empty goes with its terminator. This runs
+  in every language the paragraph above covers. The pull request lists each
+  reworded comment, before and after, and the file is parsed again afterwards:
+  its code must be exactly what it was.
+
   **A comment directly above the flag's own read, a variable holding it, or
   its registry entry goes with it**, whatever it says, once the run deletes
   that line: the comment explained a line that is gone. Directly above means
@@ -6542,6 +6584,23 @@ means no PR.
   that names it) counts as beside every change inside it, however far down
   the body the fold sits, and the sentence of it that describes a branch is
   the one listed.
+
+  **A comment at a call of a function that lost a flag read is reported.** When
+  the body of a named function read the flag and no longer does (`return
+  useFlag('k') && plan` became `return plan`), a comment on the same line as a
+  call to it, or directly above the statement holding the call, that contains
+  the word `flag` or a form of `gate` is listed in the pull request, because it
+  may describe a condition the function no longer checks. The calls did not
+  change and the comment names no key, so it is never edited. Only functions
+  called by their bare name count (a declaration, or a `const` holding an arrow
+  function; a method is skipped, since its receiver cannot be resolved), a read
+  that only a comment mentions is not a read, a call counts only in the function's
+  own file or in a file that imports it from that module (a relative path, or an
+  `@/` or `~/` alias that is the directory's own source root, `<dir>/x` or `<dir>/src/x`; also under an `as` alias, or read off a namespace import,
+  but not a type-only import or a package of the same name), not where a
+  parameter or local of the same name stands in for it, and
+  only files under the directory being processed are searched. TypeScript and
+  JavaScript only.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift

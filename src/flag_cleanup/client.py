@@ -244,6 +244,54 @@ _REMOVAL_PR_PATH = "/api/v1/orgs/{org}/projects/{project}/flags/{flag}/removal-p
 
 READ_ONLY_CODE = "organization_read_only"
 
+#: The 422 an archive meets when an environment in the project requires a
+#: change reason and the request carried none the platform would accept.
+CHANGE_REASON_REQUIRED_CODE = "change_reason_required"
+
+#: The platform keeps at most this many characters of a reason, counted the
+#: way it counts them (UTF-16 code units), and refuses one it would have to
+#: cut inside a character. Capped here instead, at a character boundary.
+MAX_REASON_LENGTH = 2048
+
+
+def _is_control(ch: str) -> bool:
+    """C0, DEL and C1 control characters, and lone surrogates."""
+    code = ord(ch)
+    return code < 0x20 or 0x7F <= code < 0xA0 or 0xD800 <= code <= 0xDFFF
+
+
+def change_reason_header(reason: str) -> str:
+    """``reason`` as an ``X-Intent-Reason`` header value, or ``""`` if nothing is left.
+
+    The platform reads the header as percent-encoded UTF-8, so every byte that
+    is not unreserved ASCII is encoded and the value is always sendable. Before
+    that, every run of whitespace or control characters becomes one space,
+    because the platform refuses a control character with a 400, and the
+    reason is capped at :data:`MAX_REASON_LENGTH`. A reason that is blank after
+    that is not sent: the platform would count it as missing anyway.
+    """
+    printable = "".join(" " if _is_control(ch) else ch for ch in reason)
+    text = " ".join(printable.split())
+    kept: list[str] = []
+    units = 0
+    for ch in text:
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > MAX_REASON_LENGTH:
+            break
+        kept.append(ch)
+    return quote("".join(kept).strip(), safe="")
+
+
+def _is_change_reason_refusal(response: httpx.Response) -> bool:
+    """True for a 422 whose error envelope carries ``change_reason_required``."""
+    if response.status_code != 422:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") == CHANGE_REASON_REQUIRED_CODE
+
 READ_ONLY_MESSAGE = (
     "Your Featureflip organization is read-only because it's over its plan's "
     "limits, so removal PRs weren't linked to their flags. Clean up or choose "
@@ -737,8 +785,12 @@ class FeatureflipClient:
             keys.append(key)
         return tuple(keys)
 
-    def archive_flag(self, org: str, project: str, key: str) -> None:
+    def archive_flag(self, org: str, project: str, key: str, *, reason: str | None = None) -> None:
         """Archive one flag. Returns on success, raises on anything else.
+
+        ``reason`` travels as ``X-Intent-Reason`` and lands in the project's
+        audit log. A project with a critical environment refuses an archive
+        without one, so every caller in this Action passes it.
 
         Idempotent by the backend's own construction: ``FeatureFlag.Archive()``
         returns early when the flag is already archived, so a redelivered
@@ -773,6 +825,9 @@ class FeatureflipClient:
           show every dependent is itself being removed may defer instead.
           All three are surfaced verbatim from ``fields`` — see
           :func:`_envelope_detail`.
+        * **422** ``change_reason_required`` — an environment in the project
+          requires a reason and none arrived. Its own sentence, because the
+          remedy is the request path, not the flag or the token.
         """
         path = _ARCHIVE_PATH.format(
             org=quote(org, safe=""),
@@ -782,13 +837,28 @@ class FeatureflipClient:
             # 404 against a resource nobody asked for.
             flag=quote(key, safe=""),
         )
-        response = self._client.post(path)
+        header = change_reason_header(reason) if reason is not None else ""
+        headers = {"X-Intent-Reason": header} if header else None
+        response = self._client.post(path, headers=headers)
         if response.status_code == 204:
             return
 
         safe_url = without_userinfo(str(response.request.url))
         detail = _envelope_detail(response)
         suffix = f" {detail}" if detail else ""
+
+        if _is_change_reason_refusal(response):
+            sent = (
+                "This Action sent one, so something between the runner and "
+                "FEATUREFLIP_API_URL may be dropping the X-Intent-Reason header."
+                if header
+                else "This archive was sent without one."
+            )
+            raise FeatureflipApiError(
+                f"Featureflip refused to archive flag {key!r}: an environment in "
+                f"this project requires a change reason for every change, and "
+                f"the request carried none it accepted. {sent}{suffix}"
+            )
 
         if response.status_code == 404:
             raise FeatureflipApiError(

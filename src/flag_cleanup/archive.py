@@ -140,6 +140,25 @@ def dependents_deferred_detail(exc: FlagHasDependentsError) -> str:
     )
 
 
+def archive_reason(*, url: str = "", number: int | None = None, branch: str = "") -> str:
+    """The change reason an archive carries into the project's audit log.
+
+    Names the merged removal as precisely as the evidence allows: its address,
+    else its number, else its branch. A project with a critical environment
+    refuses an archive without a reason, and this one tells whoever reads the
+    audit log where the code went.
+    """
+    if url:
+        where = url
+    elif number:
+        where = f"pull request #{number}"
+    elif branch:
+        where = f"the pull request from {branch}"
+    else:
+        where = "a merged pull request"
+    return f"Archived by the Featureflip flag cleanup Action: the flag's removal merged in {where}."
+
+
 def run_archive(
     config: Config,
     env: Mapping[str, str] | None = None,
@@ -236,7 +255,16 @@ def _archive_for(
     owned = client is None
     active = client or FeatureflipClient(config.api_url, config.api_token)
     try:
-        active.archive_flag(config.org, config.project, key)
+        active.archive_flag(
+            config.org,
+            config.project,
+            key,
+            reason=archive_reason(
+                url=pull_request.html_url,
+                number=pull_request.number,
+                branch=pull_request.head_ref,
+            ),
+        )
     except FlagRecentlyEvaluatedError as exc:
         # Caught NARROWLY, by type, rather than by inspecting a 400's text:
         # the sibling refusals travel as the same status code through the same

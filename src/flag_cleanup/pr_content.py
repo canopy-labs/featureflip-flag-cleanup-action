@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 from dataclasses import replace
 
-from flag_cleanup import report_paths, stale_comments
+from flag_cleanup import call_site_comments, comment_sentences, report_paths, stale_comments
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
 from flag_cleanup.discarded_calls import DISCARDED_CALL
@@ -201,6 +201,8 @@ REPORTED_BINDING_KINDS = frozenset(
         "emptied override",
         "dropped default argument",
         "removed comment",
+        comment_sentences.REWORDED_KIND,
+        call_site_comments.CALL_SITE_KIND,
         stale_comments.REMOVED_BRANCH_KIND,
         stale_comments.KEPT_BRANCH_KIND,
         stale_comments.FLAG_STATE_KIND,
@@ -924,8 +926,10 @@ def _dropped_argument_lines(dropped: list[tuple[str, str]]) -> list[str]:
         f"> **{count} {noun} left out as the callee's default.** Removing this "
         f"flag left {'it' if count == 1 else 'each'} equal to the value the "
         "function or component it was passed to already defaults that "
-        "parameter or prop to: an override this removal emptied to `{}`, or a "
-        "value it folded. The call passes the same value without it:",
+        "parameter or prop to: an override this removal emptied to `{}`, a "
+        "value it folded, or the default it wrote in where a function it "
+        "removed an option from used to read that option. The call passes "
+        "the same value without it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in dropped[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -950,6 +954,51 @@ def _removed_comment_lines(removed: list[tuple[str, str]]) -> list[str]:
         "else is kept, and listed further down. The removed comments, in full:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in removed[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _reworded_comment_lines(reworded: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each comment cut down to its remaining sentences:
+    the ones naming this flag (or a type this pull request deletes) went, the
+    rest stays as written."""
+    if not reworded:
+        return []
+    count = len(reworded)
+    noun = "comment was" if count == 1 else "comments were"
+    rows = []
+    for path, text in reworded[:20]:
+        line, before, after = comment_sentences.decode(text)
+        before, after = comment_sentences.preview(before, after)
+        rows.append(f"> - {_md_code(f'{path}:{line}')}: {_md_code(before)} became {_md_code(after)}")
+    return [
+        f"> **{count} {noun} reworded.** Each had a sentence that names this "
+        "flag (or a type this pull request deletes) and was cut down to the "
+        "sentences that do not. Nothing else in the comment was touched, "
+        "and no cut sentence named anything that stays, but read each result "
+        "once, since a comment is prose and nothing checks it:",
+        ">",
+        *rows,
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _call_site_comment_lines(rows: list[tuple[str, int, str]]) -> list[str]:
+    """The callout naming each comment at a call of a function that lost a
+    read of this flag and still mentions a flag or a gate. Nothing was edited."""
+    if not rows:
+        return []
+    count = len(rows)
+    noun = "comment" if count == 1 else "comments"
+    return [
+        f"> **{count} {noun} at {'a call' if count == 1 else 'calls'} of a function that lost a read of "
+        "this flag still mention a flag or a gate.** The calls did not change, "
+        "so these were not edited. They may describe a condition the function no "
+        "longer checks:",
+        ">",
+        *[f"> - {_md_code(f'{path}:{line}')}: {_md_code(text)}" for path, line, text in rows[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -1644,6 +1693,10 @@ def pr_body(
     removed_comments = [
         (path, text) for path, kind, text in bindings if kind == "removed comment"
     ]
+    reworded_comments = [
+        (path, text) for path, kind, text in bindings if kind == comment_sentences.REWORDED_KIND
+    ]
+    call_site_rows = _state_rows(bindings, call_site_comments.CALL_SITE_KIND)
     discarded_calls = [
         (path, text) for path, kind, text in bindings if kind == DISCARDED_CALL
     ]
@@ -1703,6 +1756,8 @@ def pr_body(
     lines += _dropped_argument_lines(dropped_arguments)
     lines += _emptied_override_lines(emptied)
     lines += _removed_comment_lines(removed_comments)
+    lines += _reworded_comment_lines(reworded_comments)
+    lines += _call_site_comment_lines(call_site_rows)
     lines += _declared_load_lines(declared_loads)
     lines += _removed_feature_class_lines(feature_classes)
     lines += _bare_import_lines(bare_imports)
@@ -1724,7 +1779,10 @@ def pr_body(
         import_count = sum(1 for _, kind, _ in bindings if kind == "import")
         method_count = sum(1 for _, kind, _ in bindings if kind == "private method")
         parameter_count = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
-        variable_count = len(bindings) - import_count - method_count - parameter_count
+        option_count = sum(1 for _, kind, _ in bindings if kind == "unused option")
+        variable_count = (
+            len(bindings) - import_count - method_count - parameter_count - option_count
+        )
 
         def _plural(n: int, noun: str) -> str:
             return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
@@ -1738,6 +1796,8 @@ def pr_body(
             counted.append(_plural(method_count, "private method"))
         if parameter_count:
             counted.append(_plural(parameter_count, "parameter"))
+        if option_count:
+            counted.append(_plural(option_count, "function option"))
 
         sentences = [
             # Go is the only unconditionally-true claim here: javac has no
@@ -1777,6 +1837,14 @@ def pr_body(
                 "its last reader, it is the last parameter of a function that "
                 "nothing outside its file can call, and no remaining call "
                 "passes it."
+            )
+        if option_count:
+            sentences.append(
+                "A function option is deleted only when the fold's literal was "
+                "the last thing setting it: every call in the checkout, in any "
+                "file, was read and none passes it, the function is reached "
+                "only through plain imports and direct calls, and its default "
+                "is written where the function read it."
             )
 
         lines += [
@@ -2449,6 +2517,26 @@ def note_removed_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:
             len(removed),
             "; ".join(f"{path}: {text}" for path, text in removed),
         )
+
+
+def note_reworded_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the comments this run cut down to their remaining sentences; the
+    dry run's only outlet besides the diff."""
+    rows = []
+    for path, kind, text in bindings:
+        if kind == comment_sentences.REWORDED_KIND:
+            line, before, after = comment_sentences.decode(text)
+            rows.append(f"{path}:{line}: {before} -> {after}")
+    if rows:
+        logger.info("%d comment(s) reworded, the sentences naming this flag cut: %s", len(rows), "; ".join(rows))
+
+
+def note_call_site_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:
+    """Log the comments at calls of a function that lost a read of the flag;
+    the dry run's only outlet. Nothing was edited for them."""
+    rows = [f"{path}:{text}" for path, kind, text in bindings if kind == call_site_comments.CALL_SITE_KIND]
+    if rows:
+        logger.info("%d comment(s) at calls of a function that lost a flag read (kept): %s", len(rows), "; ".join(rows))
 
 
 def note_flag_state_comments(bindings: tuple[tuple[str, str, str], ...]) -> None:

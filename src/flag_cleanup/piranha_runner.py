@@ -122,6 +122,8 @@ from flag_cleanup import (
     residue,
     ruby_owner_reach,
     source_index,
+    call_site_comments,
+    comment_sentences,
     stale_comments,
     ts_bound_overrides,
     ts_constant_params,
@@ -2767,6 +2769,7 @@ def _transform_flag(
         repo_dir,
         dropped_options,
         taken=_taken_by_family(language, flag_key, repo_dir, accessors, inline_wrappers),
+        language=language,
     )
     bindings = bindings + option_rows
 
@@ -2838,6 +2841,10 @@ def _transform_flag(
     bindings = bindings + _flag_state_comments(
         summaries, language, flag_key, treatment, repo_dir, leading_reported
     )
+
+    # The comment at a call of a function whose body lost a read of the flag
+    # ("release flag + Pro plan"): reported, never edited.
+    bindings = bindings + _call_site_comments(summaries, language, flag_key, repo_dir)
 
     # An assertion the fold made one that can only fail (`Assert.True(false)`)
     # tested the branch this removal deletes: reported, never edited.
@@ -3778,7 +3785,10 @@ def _remove_stale_comments(
         if before is None:
             continue
         after, removals = stale_comments.rewrite(before, grammar, names)
-        if not removals:
+        # What is left of a comment that says more than the removed name:
+        # its other sentences, once the ones naming it are cut.
+        after, rewords = comment_sentences.reword(after, grammar, names)
+        if not removals and not rewords:
             continue
         git_ops.before_writing([path])
         with open(path, "w", encoding="utf-8", newline="") as handle:
@@ -3791,7 +3801,11 @@ def _remove_stale_comments(
             result[result.index(summary)] = rewrite
         relative = os.path.relpath(path, repo_dir)
         rows.extend((relative, "removed comment", r.text) for r in removals)
-        shifts[str(Path(path).resolve())] = (after, removals)
+        rows.extend(
+            (relative, comment_sentences.REWORDED_KIND, comment_sentences.encode(r.line, r.before, r.after))
+            for r in rewords
+        )
+        shifts[str(Path(path).resolve())] = (after, [*removals, *rewords])
     if shifts:
         # The residue's prose rows are found again by their text: a row
         # whose comment went is dropped, and the rest are pointed at the line
@@ -3807,6 +3821,58 @@ def _remove_stale_comments(
                 moved.append(replace(row, line=line) if line else row)
         wrapper_rows = moved
     return result, tuple(rows), wrapper_rows
+
+
+def _call_site_comments(
+    summaries, language: str, flag_key: str, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """A ``(path, "call-site comment", "<line>: <comment>")`` row for each
+    comment at a call of a function that lost a read of the flag, TypeScript
+    family only. Report only. See :mod:`flag_cleanup.call_site_comments`."""
+    if not ts_tests.covers(language):
+        return ()
+    names = stale_comments.names_pattern(flag_key)
+    by_path = {str(Path(s.path).resolve()): s for s in summaries}
+    changed = []
+    for s in summaries:
+        if s.original_content == s.content or not s.content:
+            continue
+        grammar = _grammar_of(s.path, language)
+        if grammar in _TEMPLATE_LANGUAGES or not _LANGUAGES[grammar].owns(s.path):
+            continue
+        changed.append((s.path, s.original_content, s.content, grammar))
+    if not changed:
+        return ()
+
+    scope = Path(repo_dir).resolve()
+
+    def files():
+        # Streamed, one file at a time, and only inside the directory this
+        # pass was configured for.
+        grammars = [g for g in ("ts", "tsx", "js") if g in _LANGUAGES]
+        suffixes = {suffix for g in grammars for suffix in _LANGUAGES[g].extensions}
+        for listed in source_index.files(repo_dir, suffixes):
+            if not Path(listed.resolved).is_relative_to(scope):
+                continue
+            path = str(listed.path)
+            grammar = next((g for g in grammars if _LANGUAGES[g].owns(path)), None)
+            if grammar is None:
+                continue
+            summary = by_path.get(listed.resolved)
+            if summary is not None:
+                text = summary.content
+            else:
+                try:
+                    text = Path(path).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+            yield path, text, grammar
+
+    found = call_site_comments.report(changed, files, names, repo_dir)
+    return tuple(
+        (os.path.relpath(c.path, repo_dir), call_site_comments.CALL_SITE_KIND, f"{c.line}: {c.text}")
+        for c in found
+    )
 
 
 def _flag_state_comments(
@@ -3927,47 +3993,106 @@ def _taken_by_family(
     return taken
 
 
+#: How many rounds the option removal runs before it stops and says so.
+#: Each round must remove an option to be followed by another, so the real
+#: bound is the number of options in the checkout; this only caps a bug.
+_OPTION_ROUNDS = 8
+
+
 def _remove_unused_options(
     summaries,
     flag_key: str,
     repo_dir: str,
     options: tuple[ts_default_arguments.DroppedOption, ...],
     taken=None,
+    language: str = "",
 ) -> tuple[list, tuple[tuple[str, str, str], ...]]:
     """Remove each of ``options`` no call sets any more from its declaration;
     see :mod:`flag_cleanup.ts_unused_options`. A declaring or calling file the
     run had not changed joins the summaries, as a constructor caller does.
 
-    Returns the summaries and a ``(path, "unused parameter", label)`` row for
-    each option removed.
+    The default the removal writes where the function read the option can
+    itself equal what the next callee defaults to (``{ enabled }`` becoming
+    ``{ enabled: true }`` into a callee declaring ``enabled = true``), a
+    literal made after :func:`_drop_default_arguments` ran. So each file this
+    removal wrote is offered back to
+    :func:`~flag_cleanup.ts_default_arguments.drop_default_arguments`, as the
+    text before and after the removal, which makes the written literals and
+    the properties holding them its candidates and nothing the customer wrote.
+    An option that drop leaves out of one more call joins the candidates.
+
+    A removal can also make an option removable that was refused before: it
+    took the last call that set it. So every option not yet removed is offered
+    again after any round that removed something, and the loop ends when a
+    round removes nothing. A round only follows one that removed an option, so
+    the loop is bounded by the options there are; :data:`_OPTION_ROUNDS` caps
+    a defect and logs when it does.
+
+    Returns the summaries, a ``(path, "unused option", label)`` row for each
+    option removed, and a ``(path, "dropped default argument", site)`` row for
+    each literal left out of the written-in defaults.
     """
-    if not options:
-        return summaries, ()
-    removed = ts_unused_options.remove_unused_options(
-        options,
-        {s.path: (s.original_content, s.content) for s in summaries},
-        flag_key,
-        repo_dir,
-        taken,
-    )
-    if not removed.files:
-        return summaries, ()
-    # The candidate scan never listed a declaring file or a caller the run
-    # did not change: bring every file this pass writes under the running
-    # transform's undo first, as the constructor-parameter removal does.
-    git_ops.before_writing(list(removed.files))
+    rows: list[tuple[str, str, str]] = []
+    candidates = list(dict.fromkeys(options))
     result = list(summaries)
-    index = {s.path: n for n, s in enumerate(result)}
-    for path, (previous, content) in removed.files.items():
-        Path(path).write_text(content, encoding="utf-8")
-        if path in index:
-            result[index[path]] = Rewrite(path, result[index[path]].original_content, content)
-        else:
-            result.append(Rewrite(path, previous, content))
-    return result, tuple(
-        (os.path.relpath(path, repo_dir), "unused parameter", label)
-        for path, label in removed.labels
-    )
+    for _round in range(_OPTION_ROUNDS):
+        if not candidates:
+            break
+        removed = ts_unused_options.remove_unused_options(
+            tuple(candidates),
+            {s.path: (s.original_content, s.content) for s in result},
+            flag_key,
+            repo_dir,
+            taken,
+        )
+        if not removed.files:
+            break
+        candidates = [o for o in candidates if o not in removed.options]
+        # The candidate scan never listed a declaring file or a caller the run
+        # did not change: bring every file this pass writes under the running
+        # transform's undo first, as the constructor-parameter removal does.
+        git_ops.before_writing(list(removed.files))
+        index = {s.path: n for n, s in enumerate(result)}
+        for path, (previous, content) in removed.files.items():
+            Path(path).write_text(content, encoding="utf-8")
+            if path in index:
+                result[index[path]] = Rewrite(path, result[index[path]].original_content, content)
+            else:
+                index[path] = len(result)
+                result.append(Rewrite(path, previous, content))
+        rows.extend(
+            (os.path.relpath(path, repo_dir), "unused option", label)
+            for path, label in removed.labels
+        )
+        if not ts_tests.covers(language):
+            continue
+        for path, (previous, content) in removed.files.items():
+            n = index[path]
+            dropped = ts_default_arguments.drop_default_arguments(
+                previous,
+                content,
+                _grammar_of(path, language),
+                flag_key,
+                path,
+                repo_dir,
+                # As the main pass: the width the customer's own file asks for.
+                width=ts_list_join.line_limit(path, result[n].original_content, repo_dir),
+            )
+            if not dropped.sites:
+                continue
+            Path(path).write_text(dropped.content, encoding="utf-8")
+            result[n] = Rewrite(path, result[n].original_content, dropped.content)
+            relative = os.path.relpath(path, repo_dir)
+            rows.extend((relative, "dropped default argument", site) for site in dropped.sites)
+            candidates.extend(o for o in dropped.options if o not in candidates)
+    else:
+        if candidates:
+            logger.warning(
+                "the unused-option removal stopped after %d rounds with %d option(s) still offered",
+                _OPTION_ROUNDS,
+                len(candidates),
+            )
+    return result, tuple(rows)
 
 
 def _restore_tests_using_key_as_data(

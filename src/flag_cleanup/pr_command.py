@@ -52,6 +52,8 @@ from flag_cleanup import (
     orchestrate,
     pr_content,
     source_index,
+    call_site_comments,
+    comment_sentences,
     stale_comments,
 )
 from flag_cleanup.client import Candidate, FeatureflipClient
@@ -891,10 +893,11 @@ def _dry_run_caveats(
     unread_bindings = sum(1 for _, kind, _ in bindings if kind == "unread binding")
     emptied = sum(1 for _, kind, _ in bindings if kind == "emptied override")
     left_out = sum(1 for _, kind, _ in bindings if kind == "dropped default argument")
-    dropped = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
+    dropped = sum(1 for _, kind, _ in bindings if kind in ("unused parameter", "unused option"))
     removed_ctor = sum(1 for _, kind, _ in bindings if kind == "removed parameter")
     removed_members = sum(1 for _, kind, _ in bindings if kind == "removed member")
     removed_comments = sum(1 for _, kind, _ in bindings if kind == "removed comment")
+    reworded_comments = sum(1 for _, kind, _ in bindings if kind == comment_sentences.REWORDED_KIND)
     renamed_tests = sum(1 for _, kind, _ in bindings if kind == RENAMED_TEST)
     scaffolding = sum(1 for _, kind, _ in bindings if kind in (VACUOUS_ASSERTION, STALE_TITLE))
     removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
@@ -918,12 +921,14 @@ def _dry_run_caveats(
             stale_comments.FLAG_STATE_KIND,
         )
     )
+    call_site = sum(1 for _, kind, _ in bindings if kind == call_site_comments.CALL_SITE_KIND)
     cleaned = (
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
         - left_out
-        - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments
+        - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments - reworded_comments
         - failing
         - state_comments
+        - call_site
         - renamed_tests
         - scaffolding
         - removed_defaults
@@ -980,10 +985,17 @@ def _dry_run_caveats(
         notes.append(f"{removed_members} private field(s) would be removed")
     if removed_comments:
         notes.append(f"{removed_comments} comment(s) naming only this flag would be removed")
+    if reworded_comments:
+        notes.append(f"{reworded_comments} comment(s) would be reworded, the sentences naming this flag cut")
     if state_comments:
         notes.append(
             f"{state_comments} comment(s) beside the changes would describe a flag's state "
             "(reported, not edited)"
+        )
+    if call_site:
+        notes.append(
+            f"{call_site} comment(s) at calls of a function that lost a flag read "
+            "would be reported (not edited)"
         )
     if renamed_tests:
         notes.append(

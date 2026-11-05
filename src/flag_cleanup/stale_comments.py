@@ -432,7 +432,14 @@ def follow(row_text: str, source: str, removals: list[Removal]) -> int | None:
         i for i, line in enumerate(lines)
         if (line.strip() == needle if exact else needle in line)
     ]
-    if not hits and any(needle in r.text or (r.text and r.text in needle) for r in removals):
+    if not hits and any(
+        needle in r.text
+        or (r.text and r.text in needle)
+        # A reword names each original line, so a row for one of them is
+        # found even though the comment's joined text is not on any line.
+        or any(needle in raw for raw in getattr(r, "raw", ()))
+        for r in removals
+    ):
         return None
     return hits[0] + 1 if len(hits) == 1 else 0
 
@@ -840,6 +847,30 @@ _DIRECTIVE = re.compile(
     r"|frozen_string_literal|ignore:|ignore_for_file|lint:ignore|swift-format-ignore)",
     re.IGNORECASE,
 )
+#: More directive SHAPES, for the pass that rewrites a comment's words. Each is
+#: the exact spelling a tool reads, never a bare word: ``Licensed seats get
+#: it.`` or ``Webpack bundles it lazily.`` is prose, and ``_DIRECTIVE`` above
+#: (which decides what a deleted statement's comment may be taken with) stays
+#: as it was.
+_SHAPED_DIRECTIVE = re.compile(
+    r"\s*(?:\+build\b|-\*-|<reference\b|<amd-|@phpstan|@psalm|noinspection\s+(?-i:[A-Z])|jshint\s+[\w-]+"
+    r"|spdx-license-identifier:|copyright\s*(?:\(c\)|\u00a9|\d{4})|all rights reserved"
+    r"|(?-i:webpack[A-Z])\w*\s*:|licen[sc]e\b[^.\n]*\b(?:header|notice)\b|(?:licensed|released)\s+under\b)",
+    re.IGNORECASE,
+)
+#: A directive written with no space after the marker: Go's ``//go:embed``,
+#: ``//go:generate``, ``//nolint:x``, cgo's ``//export Name`` and ``//line``.
+#: Any ``//word:`` spelling is one, since prose is written with a space.
+_BARE_DIRECTIVE = re.compile(rb"[ \t]*(?:/{2,}|#+)(?:\w[\w.-]*:\S|export\s|line\s|\+build)|[ \t]*#!")
+
+
+def is_directive_line(raw: bytes, content: str) -> bool:
+    """Whether one comment line (``raw``, its text with the marker and
+    ``content``, the words after it) is a tool directive. Shared by the
+    passes that rewrite a comment's words: one such line makes the whole
+    comment off limits, since a directive's neighbours are often its
+    arguments or its subject."""
+    return bool(_DIRECTIVE.match(content) or _SHAPED_DIRECTIVE.match(content) or _BARE_DIRECTIVE.match(raw))
 
 
 def _closes(line: bytes) -> bool:

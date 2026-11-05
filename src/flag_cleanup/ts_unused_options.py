@@ -97,6 +97,8 @@ class Removed:
     #: ``(declaring path, label)`` for each option removed: the parameter
     #: when it went whole, else the pattern member.
     labels: tuple[tuple[str, str], ...]
+    #: The options removed, for a caller offering the rest again.
+    options: tuple[DroppedOption, ...] = ()
 
 
 def remove_unused_options(
@@ -119,6 +121,7 @@ def remove_unused_options(
     state = dict(files)
     rewritten: dict[str, tuple[str, str]] = {}
     labels: list[tuple[str, str]] = []
+    done: list[DroppedOption] = []
     for option in dict.fromkeys(options):
         by_resolved = {str(Path(p).resolve()): p for p in state}
         planned = _plan(option, state, by_resolved, files, taken, repo_dir)
@@ -132,7 +135,8 @@ def remove_unused_options(
             previous = rewritten.get(file.path, (file.current, ""))[0]
             rewritten[file.path] = (previous, text)
         labels.append((declaring, label))
-    return Removed(rewritten, tuple(labels))
+        done.append(option)
+    return Removed(rewritten, tuple(labels), tuple(done))
 
 
 def _plan(option, state, by_resolved, run_files, taken, repo_dir):

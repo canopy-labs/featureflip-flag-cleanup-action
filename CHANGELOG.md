@@ -8,6 +8,40 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.6.0
+
+### Added
+
+- **Comments:** a comment that names the flag (or a type the run deleted) and
+  also says something else is now cut down to what is still true instead of
+  being kept for you to reword: ``// Gated on the `k` flag. Retries twice.``
+  becomes `// Retries twice.`. Only a sentence that names the flag and says
+  nothing else is deleted (the same word test as for a whole comment, applied to
+  that sentence), so a fact, a condition, a warning or another name in the
+  sentence keeps it, and so does `no`, `not`, `never`, `still`, `true`, `false` or `check`, or two of `enabled`, `disabled`, `on`, `off`. Nothing is cut inside a numbered list or from an item with indented children. The comment is also left alone when the cut would leave a
+  `<summary>`, `<param>` or JSDoc tag empty, when the next sentence leans on the
+  cut one (`This …`, `It …`, or a common dependent phrasing such as `Only for admins.`, `Off by default.`, `Rolls out to 10% of users.` or `Remove after launch.`; this is a list of common phrasings, not a proof that a sentence stands alone, and a dependent sentence worded some other way, like `Users see the new UI.`, can still stay), when a lead-in or a comma is left hanging, when
+  brackets or quotes would stop pairing, when a full stop cannot be told from a
+  sentence end, and when any line is a tool directive (`//go:embed`,
+  `eslint-disable`, `noqa`, a licence header, …). Line prefixes, indentation,
+  line endings and a byte-order mark are kept, and the pull request lists each
+  reworded comment, before and after. This covers every language the comment
+  removal covers.
+- **TypeScript and JavaScript:** when a function called by its bare name read the
+  flag in its body and no longer does, a comment at a call of it that contains
+  "flag" or "gate" (a trailing `// release flag + Pro plan`, or the comment
+  directly above the statement) is listed in the pull request. It is only
+  reported, never edited: the call did not change and the comment names no key.
+  A call counts in the function's own file or a file that imports it from that
+  module (also under an `as` alias), within the directory being processed, and
+  not where a parameter or local of the same name stands in for it; methods are
+  skipped.
+
+### Fixed
+
+- Archiving a flag now sends a change reason, so `archive-on-merge`, `archive-sweep` and `archive-on-deploy` work in a Featureflip project with a critical environment that requires one. The reason names the merged removal pull request and appears in the project's audit log. If Featureflip still refuses an archive for a missing reason (`422 change_reason_required`), the run reports that directly instead of a generic error.
+- **TypeScript:** when a removal takes an option off an exported function and writes its default where the function read it, a literal that now equals the next callee's own default is left out too. `useThing(id, { enabled })` forwarding to a callee declared `{ enabled = true }` becomes `useThing(id)` instead of `useThing(id, { enabled: true })`. Every existing check on a left-out default still applies, including the refusal when a test mocks the callee's module. The pull request now describes such an option as removed because every call in the checkout was read, not as a parameter of a function that nothing outside its file can call.
+
 ## 2.5.0
 
 ### Added

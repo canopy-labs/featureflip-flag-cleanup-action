@@ -56,7 +56,12 @@ from collections import deque
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
-from flag_cleanup.archive import ArchiveResult, deferred_detail, dependents_deferred_detail
+from flag_cleanup.archive import (
+    ArchiveResult,
+    archive_reason,
+    deferred_detail,
+    dependents_deferred_detail,
+)
 from flag_cleanup.client import (
     ArchivePermissionError,
     ArchiveReadOnlyError,
@@ -425,7 +430,16 @@ def archive_outstanding(
             continue
 
         try:
-            client.archive_flag(config.org, config.project, candidate.key)
+            client.archive_flag(
+                config.org,
+                config.project,
+                candidate.key,
+                reason=archive_reason(
+                    url=candidate.pull_request_url,
+                    number=candidate.pull_request,
+                    branch=candidate.branch,
+                ),
+            )
         except FlagRecentlyEvaluatedError as exc:
             results.append(
                 ArchiveResult(

@@ -128,6 +128,8 @@ from flag_cleanup.pr_content import (
     note_kept,
     note_flag_state_comments,
     note_removed_comments,
+    note_call_site_comments,
+    note_reworded_comments,
     note_removed_entries,
     note_removed_defaults,
     note_renamed_tests,
@@ -769,6 +771,8 @@ def _process_candidate(
 
     _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
     note_removed_comments(_bindings)
+    note_reworded_comments(_bindings)
+    note_call_site_comments(_bindings)
     note_flag_state_comments(_bindings)
     note_renamed_tests(_bindings)
     note_removed_defaults(_bindings)
@@ -1131,6 +1135,8 @@ def _process_candidate_for_pr(
     if action in {"pr-opened", "no-changes"}:
         _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
         note_removed_comments(bindings)
+        note_reworded_comments(bindings)
+        note_call_site_comments(bindings)
         note_flag_state_comments(bindings)
         note_renamed_tests(bindings)
         note_removed_defaults(bindings)
