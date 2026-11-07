@@ -46,3 +46,9 @@ tests/smoke
 # The CircleCI orb's source. The orb is published from the public repository,
 # and its registry page links back there as the orb's source.
 orb
+
+# The GitLab CI/CD template and the Bitbucket Pipelines example. Customers pull
+# the template with `include: remote:` from this repository's `v2` tag, and copy
+# the pipeline from it, so a missing entry is a pipeline that cannot start.
+gitlab
+bitbucket

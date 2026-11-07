@@ -1,0 +1,105 @@
+# Featureflip Flag Cleanup as a GitLab CI/CD component.
+#
+# Runs the same image as the GitHub Action and the CircleCI orb, and opens one
+# merge request per stale flag. Store two masked CI/CD variables on the
+# project: FEATUREFLIP_API_TOKEN (your Featureflip API token) and GITLAB_TOKEN
+# (a project access token with the api scope and at least the Developer role).
+# The pipeline's own job token cannot open merge requests and is never used.
+#
+# Every input below has the same meaning and default as the Action's input of
+# the same name; see README.md.
+spec:
+  inputs:
+    stage:
+      default: test
+      description: The stage the job runs in.
+    image:
+      default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
+      description: The cleanup image. Pin a full version or a digest to stop it moving.
+    org:
+      description: Featureflip organization slug.
+    project:
+      description: Featureflip project slug.
+    mode:
+      default: remove
+      description: remove or archive-sweep. The event-driven modes need GitHub.
+      options: [remove, archive-sweep]
+    deployed-refs:
+      default: ''
+      description: The Action's `deployed-refs` input; see README.md.
+    api-url:
+      default: 'https://api.featureflip.io'
+      description: Featureflip API base URL.
+    staleness:
+      default: dead
+      description: The Action's `staleness` input; see README.md.
+    languages:
+      default: ''
+      description: The Action's `languages` input; see README.md.
+    accessors:
+      default: ''
+      description: The Action's `accessors` input; see README.md.
+    inline-wrappers:
+      default: 'true'
+      description: The Action's `inline-wrappers` input; see README.md.
+    side-effect-free-modules:
+      default: ''
+      description: The Action's `side-effect-free-modules` input; see README.md.
+    side-effect-free-calls:
+      default: ''
+      description: The Action's `side-effect-free-calls` input; see README.md.
+    directories:
+      default: '.'
+      description: Directories to scan (comma-separated), relative to the checkout.
+    ignore:
+      default: ''
+      description: Flag keys never to propose (comma-separated).
+    flags:
+      default: ''
+      description: Only propose these flag keys (comma-separated).
+    base-branch:
+      default: ''
+      description: The branch merge requests target. Defaults to the project's default branch.
+    pr-labels:
+      default: ''
+      description: Labels for each merge request (comma-separated).
+    max-prs:
+      default: '10'
+      description: The most merge requests one run opens.
+    dry-run:
+      default: 'false'
+      description: Print the diffs and open nothing.
+---
+featureflip-flag-cleanup:
+  stage: $[[ inputs.stage ]]
+  image:
+    name: $[[ inputs.image ]]
+    entrypoint: [""]
+  variables:
+    # The full history, so the base-branch check and the push see real commits.
+    GIT_DEPTH: "0"
+    FEATUREFLIP_ORG: $[[ inputs.org ]]
+    FEATUREFLIP_PROJECT: $[[ inputs.project ]]
+    FEATUREFLIP_API_URL: $[[ inputs.api-url ]]
+    FEATUREFLIP_MODE: $[[ inputs.mode ]]
+    FEATUREFLIP_DEPLOYED_REFS: $[[ inputs.deployed-refs ]]
+    FEATUREFLIP_STALENESS: $[[ inputs.staleness ]]
+    FEATUREFLIP_LANGUAGES: $[[ inputs.languages ]]
+    FEATUREFLIP_ACCESSORS: $[[ inputs.accessors ]]
+    FEATUREFLIP_INLINE_WRAPPERS: $[[ inputs.inline-wrappers ]]
+    FEATUREFLIP_SIDE_EFFECT_FREE_MODULES: $[[ inputs.side-effect-free-modules ]]
+    FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: $[[ inputs.side-effect-free-calls ]]
+    FEATUREFLIP_DIRECTORIES: $[[ inputs.directories ]]
+    FEATUREFLIP_IGNORE: $[[ inputs.ignore ]]
+    FEATUREFLIP_FLAGS: $[[ inputs.flags ]]
+    FEATUREFLIP_BASE_BRANCH: $[[ inputs.base-branch ]]
+    FEATUREFLIP_PR_LABELS: $[[ inputs.pr-labels ]]
+    FEATUREFLIP_MAX_PRS: $[[ inputs.max-prs ]]
+    FEATUREFLIP_DRY_RUN: $[[ inputs.dry-run ]]
+  script:
+    - python -m flag_cleanup
+  rules:
+    # Removal branches are cut from the checkout, so run on the base branch:
+    # from a schedule, or by hand from the pipeline page.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"

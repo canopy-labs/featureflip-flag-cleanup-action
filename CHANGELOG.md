@@ -8,6 +8,12 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.8.1
+
+### Fixed
+
+- The GitLab CI/CD template (`gitlab/templates/flag-cleanup.yml`) and the Bitbucket Pipelines example (`bitbucket/bitbucket-pipelines.yml`) are now published in this repository. In 2.8.0 they were missing, so the README's `include: remote:` URL returned 404 and a GitLab pipeline using it could not start.
+
 ## 2.8.0
 
 ### Added

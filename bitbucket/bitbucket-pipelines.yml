@@ -1,0 +1,44 @@
+# Featureflip Flag Cleanup on Bitbucket Pipelines: copy this into your
+# repository's bitbucket-pipelines.yml (merging `pipelines.custom` with your own).
+#
+# It runs the same image as the GitHub Action and opens one pull request per
+# stale flag. Add these as secured repository variables:
+#
+#   FEATUREFLIP_API_TOKEN   your Featureflip API token
+#   BITBUCKET_ACCESS_TOKEN  a repository access token with the pullrequest:write
+#                           and repository:write scopes
+#
+# and these as plain repository variables:
+#
+#   FEATUREFLIP_ORG         your Featureflip organization slug
+#   FEATUREFLIP_PROJECT     your Featureflip project slug
+#
+# Then add a schedule for the `flag-cleanup` pipeline on your main branch
+# (Pipelines -> Schedules). The variables below have the Action's defaults and
+# can be changed when the pipeline is run by hand; see README.md for each one.
+clone:
+  # The full history, so the base-branch check and the push see real commits.
+  depth: full
+
+pipelines:
+  custom:
+    flag-cleanup:
+      - variables:
+          - name: FEATUREFLIP_MODE
+            default: remove
+            allowed-values:
+              - remove
+              - archive-sweep
+          - name: FEATUREFLIP_DRY_RUN
+            default: "false"
+          - name: FEATUREFLIP_MAX_PRS
+            default: "10"
+          - name: FEATUREFLIP_STALENESS
+            default: dead
+          - name: FEATUREFLIP_DIRECTORIES
+            default: .
+      - step:
+          name: Featureflip flag cleanup
+          image: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
+          script:
+            - python -m flag_cleanup
