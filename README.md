@@ -622,8 +622,9 @@ with an exit code:
 
 The same image ships as a CircleCI orb,
 [`featureflip/flag-cleanup`](https://circleci.com/developer/orbs/orb/featureflip/flag-cleanup),
-built from [`orb/orb.yml`](orb/orb.yml) in this repository. The repository
-still has to be hosted on GitHub, because the pull requests are opened there.
+built from [`orb/orb.yml`](orb/orb.yml) in this repository. The pull
+requests open wherever the repository is hosted, which is GitHub unless you
+set `forge`.
 
 ```yaml
 version: 2.1
@@ -645,6 +646,153 @@ workflow in the project settings. Its parameters are the inputs below, under
 the same names, and it offers two modes: `remove` and `archive-sweep`. `archive-on-merge`,
 `archive-on-deploy` and `pr-command` read a GitHub Actions event payload, which
 a CircleCI pipeline does not have.
+
+For a CircleCI project that builds a repository hosted on GitLab or
+Bitbucket, set `forge`:
+
+```yaml
+      - featureflip/cleanup:
+          context: featureflip
+          org: my-org
+          project: my-project
+          forge: gitlab
+```
+
+Put the forge's token in the context as `FLAG_CLEANUP_FORGE_TOKEN` (or name
+another variable with `forge-token`). It is the same token the
+[GitLab](#on-gitlab) and [Bitbucket](#on-bitbucket) sections below describe:
+a GitLab project access token with the `api` scope, or a Bitbucket repository
+access token with `pullrequest:write` and `repository:write`. The repository's
+path, including a GitLab subgroup, is read from the project's clone URL, and
+the run stops with exit `2` if that URL is not on the forge you named. A
+self-managed GitLab also needs `forge-server-url` and `forge-api-url`, both
+or neither.
+
+### On GitLab
+
+On a project hosted on GitLab (gitlab.com or self-managed), the same image
+opens merge requests instead of pull requests. It ships as a CI/CD template,
+[`gitlab/templates/flag-cleanup.yml`](gitlab/templates/flag-cleanup.yml),
+that takes the inputs below under the same names:
+
+```yaml
+include:
+  - remote: https://raw.githubusercontent.com/canopy-labs/featureflip-flag-cleanup-action/v2/gitlab/templates/flag-cleanup.yml
+    inputs:
+      org: my-org
+      project: my-project
+      dry-run: "true"
+```
+
+Add two masked CI/CD variables to the project:
+
+- `FEATUREFLIP_API_TOKEN`: your Featureflip API token.
+- `GITLAB_TOKEN`: a project access token with the `api` scope and at least the
+  Developer role. The `api` scope is broad: it can do anything the role can
+  do through the API, so keep the token to this one project. A pipeline that
+  only runs `archive-sweep` writes nothing to GitLab, and can use the
+  `read_api` scope with the Reporter role instead. The pipeline's own
+  `CI_JOB_TOKEN` cannot open merge requests, and is never used.
+
+Then add a pipeline schedule on the default branch (Build → Pipeline
+schedules). The job runs on scheduled and manually started pipelines only,
+because removal branches are cut from the checkout and the checkout has to be
+the base branch. Self-managed instances need nothing extra: the API and
+server URLs come from the pipeline (`CI_API_V4_URL`, `CI_SERVER_URL`).
+
+Two modes work on GitLab, `remove` and `archive-sweep` (with or without
+`deployed-refs`). `archive-on-merge`, `archive-on-deploy` and `pr-command`
+are driven by GitHub events, and exit `2` with a message saying so.
+
+Merge requests behave the way pull requests do on GitHub:
+
+- One per flag, from the same `featureflip/remove-flag/…` branch.
+- A stale flag's removal opens as a draft, through the `Draft:` title prefix.
+- A merge request you closed counts as handled, so it is never opened again.
+- Only merge requests from the project itself count as merged removals.
+  A fork's merge request from a branch of the same name does not.
+
+Building a GitHub-hosted repository from GitLab CI still works the way it
+always did: pass `GITHUB_TOKEN` and `GITHUB_REPOSITORY`, and the run opens
+pull requests on GitHub.
+
+### On Bitbucket
+
+On a repository hosted on Bitbucket Cloud, the same image runs as a
+Bitbucket Pipelines step and opens pull requests there. Copy
+[`bitbucket/bitbucket-pipelines.yml`](bitbucket/bitbucket-pipelines.yml) into
+your `bitbucket-pipelines.yml`. It defines a custom pipeline, `flag-cleanup`,
+whose variables are the inputs below under their `FEATUREFLIP_*` names (the
+image reads, for example, `max-prs` as `FEATUREFLIP_MAX_PRS`).
+
+Add these repository variables:
+
+- `FEATUREFLIP_API_TOKEN` (secured): your Featureflip API token.
+- `BITBUCKET_ACCESS_TOKEN` (secured): a repository access token with the
+  `pullrequest:write` and `repository:write` scopes. A pipeline that only runs
+  `archive-sweep` writes nothing to Bitbucket, and can use the read scopes
+  `pullrequest` and `repository` instead.
+- `FEATUREFLIP_ORG` and `FEATUREFLIP_PROJECT`: your Featureflip slugs.
+
+Then add a schedule for the `flag-cleanup` pipeline on your main branch
+(Pipelines → Schedules). Removal branches are cut from the checkout, so it has
+to run on the base branch.
+
+Two modes work on Bitbucket, `remove` and `archive-sweep` (with or without
+`deployed-refs`). `archive-on-merge`, `archive-on-deploy` and `pr-command` are
+driven by GitHub events, and exit `2` with a message saying so.
+
+Pull requests behave the way they do on GitHub, with two differences:
+
+- **No labels.** Bitbucket pull requests have none, so `pr-labels` is logged
+  and ignored.
+- **Drafts.** A stale flag's removal opens as a draft. If Bitbucket does not
+  hold it as one, the description starts with a "Not ready to merge" notice
+  instead, and a hold on a pull request that other flags still need uses the
+  same notice. It is removed again when the hold is released.
+
+As everywhere, one pull request per flag, a pull request you declined is
+never opened again, and only pull requests from the repository itself count
+as merged removals.
+
+### On any other CI
+
+The image runs anywhere Docker does: Jenkins, Buildkite, Azure Pipelines, a
+cron job on your own machine. Mount a full clone of the base branch as its
+working directory, and name the forge with these variables:
+
+- `FLAG_CLEANUP_FORGE`: `github`, `gitlab` or `bitbucket`.
+- `FLAG_CLEANUP_REPOSITORY`: the repository's path, such as `owner/name`,
+  `workspace/name`, or `group/sub/project` on GitLab.
+- `FLAG_CLEANUP_FORGE_TOKEN`: the forge's token, with the permissions listed
+  in [Required permissions](#required-permissions).
+- `FLAG_CLEANUP_API_URL` and `FLAG_CLEANUP_SERVER_URL`: only for GitHub
+  Enterprise Server or a self-managed GitLab, the API and web origins. Set
+  both or neither. On GitLab and Bitbucket the run refuses one without the
+  other; on GitHub the missing one falls back to `GITHUB_API_URL` or
+  `GITHUB_SERVER_URL`, then to github.com.
+
+The inputs below are read from their `FEATUREFLIP_*` variables, as on every
+other CI. Pass every variable to `docker run` by name, so no token appears
+on a command line:
+
+```sh
+export FLAG_CLEANUP_FORGE=gitlab
+export FLAG_CLEANUP_REPOSITORY=my-group/my-app
+export FEATUREFLIP_ORG=my-org
+export FEATUREFLIP_PROJECT=my-project
+# FLAG_CLEANUP_FORGE_TOKEN and FEATUREFLIP_API_TOKEN come from your CI's secret store.
+
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  -e FLAG_CLEANUP_FORGE -e FLAG_CLEANUP_REPOSITORY -e FLAG_CLEANUP_FORGE_TOKEN \
+  -e FEATUREFLIP_API_TOKEN -e FEATUREFLIP_ORG -e FEATUREFLIP_PROJECT \
+  ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
+```
+
+`FLAG_CLEANUP_FORGE` takes precedence over anything the CI exports itself, so
+it also works inside GitHub Actions, GitLab CI or Bitbucket Pipelines when the
+repository is hosted somewhere else. Two modes work this way, `remove` and
+`archive-sweep`. The event-driven modes need GitHub Actions.
 
 ### Inputs
 
@@ -992,6 +1140,17 @@ reporting the failure. That matters because a branch on the remote with no PR
 is indistinguishable from "already proposed" — leaving one would retire the
 flag silently and permanently. In the rare case the delete *also* fails, the
 log names the exact branch to remove by hand.
+
+On GitLab, `remove` needs a `GITLAB_TOKEN` with the `api` scope and at least
+the Developer role (see [On GitLab](#on-gitlab)). `archive-sweep` only reads,
+so a pipeline that runs nothing else can use a token with the narrower
+`read_api` scope and the Reporter role. A token without the rights a mode
+needs stops the run at the first flag, the same way as on GitHub.
+
+On Bitbucket, `remove` needs a `BITBUCKET_ACCESS_TOKEN` repository access
+token with the `pullrequest:write` and `repository:write` scopes (see
+[On Bitbucket](#on-bitbucket)); `archive-sweep` alone needs only the read
+scopes.
 
 ### Your checkout is left exactly as it was found
 
@@ -2457,7 +2616,46 @@ every call to which (in its file, with no method group, qualified call,
 overload or string naming the method) passes a constant, or of an xunit
 `[Theory]` fed only `[InlineData]` constants and called from nowhere; or a
 `foreach` variable over an array of constants, written in place or held by a
-local nothing writes, passes or returns. Those constants then count where the
+local nothing writes, passes or returns. The array may also be held by a
+`private` field of the class that declares the loop (not a `partial` one),
+with no attribute, when every other mention of the field in that class only
+iterates it or reads its `Length`, no file in your repository other than its
+own spells the field's name, and no string in its own file does. No lookup
+anywhere in your repository, in any project, that can return a non-public
+field (`GetField`, `GetMember`, `InvokeMember`, `GetRuntimeField`,
+`GetDeclaredField`, `FindMembers`, an expression tree's `Field` or
+`PropertyOrField`, `[UnsafeAccessor]`, or a field list such as `GetFields`
+indexed or filtered rather than looped over) may take a computed name, a
+`"…*"` pattern, `IgnoreCase`, flags not written in the call, or a constant
+naming the field, unless it is called on `typeof(` another class `)` that
+neither is nor derives from that one, with no `using` alias in your
+repository spelled like any part of its name. A lookup is taken to return
+public fields only when its flags are written in the call as members of the
+framework's `BindingFlags` without `NonPublic` (and no type, alias or
+extension block of yours could shadow `BindingFlags`), or when it is
+`GetField(…)`/`GetMember(…)` with one string on a plain `System.Type`
+(`typeof(…)`, `GetType()`, a `Type` parameter or local). `GetStaticField`,
+`SetStaticField` and `GetFieldOrProperty` count as lookups too; a library's
+by-name accessor of private state under any other name is not seen. A file
+where a `/*` sits on a preprocessor line (`#region /*`), or where a comment
+as the parser reads it holds a line starting with `#` (a `/*` in a skipped
+`#if` branch swallows the directive that ends it), is read as a lookup of
+any name, because the compiler and the parser disagree about what it holds. A list looped over whole
+(`foreach (var f in t.GetFields(…))`) is not followed: reflection by
+enumeration stays a known limit. The array must be a `string[]` (`new[] { … }`,
+`new string[] { … }`, or a collection expression such as `["A", "B"]` for a
+field or local declared `string[]`), held by a local declared `var` or
+`string[]`, and the loop variable declared `var` or `string`: any other type
+may convert each string by a conversion of yours, and `var` counts only while
+no file or project `<Using Alias="var">` of yours declares a type named
+`var` (one from a referenced assembly is not seen). A local array, too, may only be
+iterated or have its `Length` read: `Count` on an array is an extension of
+yours, which may write it. Names are read as the compiler reads them, so a
+`\u0061` escape or a soft hyphen inside a name, or a `\u`/`\x` escape in a
+string, spells the name it decodes to; a file that does not parse whole proves
+nothing. A by-name lookup whose binding flags are not written in the call
+(`GetProperty(name, Flags.Loose)`, a local, a `using static`) may ignore case,
+so every string of its file is then matched in any case. Those constants then count where the
 lookup's own would. A lookup on `typeof(C)`, or on a `foreach` variable over
 such a local `Dictionary<K, Type>` (its values) or array of `typeof(…)`, takes
 any name without counting, when no `C` is, derives from or otherwise leads to
@@ -3280,7 +3478,8 @@ emptied (to `flags={{}}`, or to no `flags` at all) gets the provider replaced
 by what it wrapped, and its import goes as any stranded import does. The
 provider is the React SDK's own `TestFeatureflipProvider`, or your wrapper of
 it: an exported function in your repository whose whole body returns the
-SDK's provider around `{children}`. It is unwrapped only when every module the
+SDK's provider around `{children}`, imported directly or through an
+`export { name } from './module'` barrel. It is unwrapped only when every module the
 test file loads, followed through every module those load in turn (static
 imports, re-exports, `import()` and `require()`), never loads a
 `@featureflip/` package; one component two imports down that reads another
@@ -3396,7 +3595,24 @@ one half of an `and`, or opening it before a comma. A trailing "(default)"
 goes with the clause. A trailing `even with` followed by the key and the kept
 state (`… on the %s plan even with old-checkout on`) is dropped too, with a
 comma or dash before it, since it stays true once the flag is gone; it also
-works in an `it.each([…])('…', …)` title. Every other title using `even`,
+works in an `it.each([…])('…', …)` title. The same trailing phrase without
+the key (`… even with the gate on`, `… when the flag is on`) is dropped when
+that test's own body pinned this flag to the kept value (an entry the run
+stripped) and nothing else in the test's reach can set state. The check covers
+the test body, the rows of an `it.each`, the hooks and group bodies around it,
+module-level statements, every helper in the same file that the test calls
+(resolved to the nearest declaration, and refused when that is ambiguous or
+cannot be seen), and the file's mock factories. Any other boolean-like value
+there, an object spread, a name bound to an object or boolean, or a call or
+attribute named for flags that carries more than this flag's pin, keeps the
+title. A test with no stripped pin keeps its title too.
+
+One limit: a helper imported from another file is trusted only when the test
+passes this flag's pin to it literally (`renderPage({ 'old-checkout': true })`).
+The tool does not read the other file, so what that helper does with the object,
+or whether it also sets another flag, is not examined. If a helper in another
+file sets other flags, review the renamed title.
+Every other title using `even`,
 `regardless`, `irrespective`, `whether` or `either` is left. A rename that
 would give a test a title that could equal any other test or group title in
 the file (a `%s` or `${…}` placeholder, or a title that is not a plain string,
@@ -3422,10 +3638,13 @@ branch":
   `.toBeNull()`) on text that only the removed branch could show: every query
   that found that text sat in a test the run deleted, or the text was JSX the
   run deleted from the code. It now passes whatever the code does;
-* a title that speaks of the flag without naming it ("waits for flags to load
-  instead of redirecting") and shares a word with a test the run deleted from
-  the same file ("redirects to the settings page while the flag is off"), or
-  that holds such an assertion.
+* a title that speaks of a flag's state or readiness without naming it
+  ("waits for flags to load instead of redirecting", "… while the flag is
+  off") and shares a word with a test the run deleted from the same `describe`
+  group ("redirects to the settings page while the flag is off"), or that
+  holds such an assertion. A title that only mentions flags as the subject of
+  the product ("should filter flags by name"), or names another flag
+  (`web-other-flag`, `dead-flag`), is not listed.
 
 Java and Kotlin titles go the same way, with the same shapes: `@DisplayName("…")`,
 a Kotlin function named in backticks, and a Kotest, Spek or minutest
@@ -4394,6 +4613,34 @@ stopped the rename. A name that speaks of several gates (`EitherGateOff_…`)
 once one of them is gone is listed, never renamed. A test the run cut down to
 statements that begin exactly as a sibling in its class does, up to the first
 assertions, is listed as one that may now duplicate it, and nothing is deleted.
+
+One case of that is folded instead. When a test whose middle the run cut out
+(it set the fake to the removed value and back) is left named for what
+happened at the removed value (`Job_DoesNothing_UntilTheGateIsOn`), and what is
+left of it is, token for token and ignoring comments, the arrangement and act
+of exactly one sibling in its class up to its first assertion, the test goes
+into that sibling. Both must be a bare `[Fact]` with no parameters, declared
+alike, and both must end in nothing but assertions: `Assert.X(…);` statements
+that write nothing, declare nothing and pass no lambda, or a `using (…)` around
+only those. Its assertions the sibling does not already make are added at the
+end of the sibling, and the test is deleted with its attributes and the
+comments directly above it. Those assertions now run after the sibling's own,
+so the sibling's may hold only names, literals, member reads, reads that change
+nothing (`ToString`, `Contains`, `Count`, `Any`, `All`, `Equals`, `First`,
+`Single` and their `OrDefault` forms on a name rather than a call's result, and
+names that ask: `Is…`, `Has…`, `Can…`, `Contains…`, and a `Try…` lookup other
+than `TryDequeue`, `TryRead`, `TryTake`, `TryPop`, `TryReceive`, `TryAdd`,
+`TryRemove`, `TryUpdate` and `TryGetNext`), an awaited lookup
+`(await Load(…))[key]`, and a `using` around a scope the moved assertions open
+too, as long as they read no member of what opens it (after a second
+`using (svc.Scope("v"))`, `Assert.Single(svc.OpenedScopes)` would see two). A `Drain()`, `Dequeue()`, `ReadAsync()` or any other
+call keeps the test as it was, since it may take what the moved assertions
+then look for. So does a preprocessor directive (`#if`, `#region`, `#pragma`) around
+one of the two and not the other, inside either or between them, a spelling of
+its name in any file but prose (`.md`, `.mdx`, `.txt`, `.rst`), since a
+workflow, a `.runsettings` filter or a script may select the test by name, and
+a file named for it. The pull request lists each fold, counting the assertions
+the sibling did not already make.
 
 **Nothing in a test is touched unless the same run folds a real read** of the
 flag, in that directory, in any language of the run: a Kotlin test of a Java
@@ -6556,6 +6803,46 @@ means no PR.
   alias named like the key or a Go import path that starts with it keeps the
   file in the generic list. This, too, only changes how the file is reported.
 
+  In C#, so is a file that names the key **only as plain string arguments of
+  calls that read no flag** (and perhaps in comments): a Quartz job identity
+  (`j.WithIdentity("my-flag")`, `.ForJob("my-flag")`), a scope or log name
+  (`BeginSystemScope("my-flag")`), a test's `Assert.Contains("my-flag", …)`.
+  The paragraph lists each line, as `path:line` with its text, so you need not
+  search for them. The string must be the whole of a plain `"…"` literal passed
+  as an argument to a method or constructor called by a plain name, and:
+
+  - nothing may use the call's value. It is a statement of its own (or ends a
+    builder chain that is: `t.ForJob("my-flag").WithIdentity(…)`), the
+    resource of a `using`, a `using var` read nowhere else, or a lambda's
+    result that configures the lambda's own parameter with a builder verb
+    (`j => j.WithIdentity(…)`, `t => t.ForJob(…)…`; `With`, `For`, `Named`,
+    `Set`, `Use`, `Configure`, `Add`, `Map`, `Has`) in a call whose value is not
+    used either (`sp => sp.Resolve("my-flag")` is a factory, and keeps the file). A local, a field, a `return`, a
+    condition or another call's argument (`BoolVariation(Keys.Normalize("my-flag"), …)`,
+    `new Key("my-flag").Value`) keeps the file in the generic list;
+  - neither that call nor any call around it may be an SDK read, an accessor you
+    named, a method or local function of the same file that hands a parameter
+    on to a call (a wrapper), another vendor's read (`Decide`,
+    `GetStringAssignment`, `GetLayer`, `Variable`, `Evaluate…`, `IsEnabled`,
+    `Get<T>`, a bare `Get`, …) or a mocking call (`Setup`, `Returns`, `Received`,
+    an `Arg.…` matcher, anywhere in its receiver);
+  - no method name or name in its receiver may hold a word that suggests a flag
+    or a lookup (`flag`, `feature`, `gate`, `toggle`, `variation`, `enabled`,
+    `value`, `config`, `setting`, `option`, …), and a named argument's label may
+    not say `key`;
+  - a call with no receiver, or through `this`, must be to a method the same
+    file declares, and never through `base`: `Require("my-flag")` may be a
+    guard a base class declares elsewhere;
+  - every other argument is a name, a member read or a string
+    (`overrides.Add("my-flag", true)` and `registry.Add("my-flag", new Flag(…))`
+    are entries).
+
+  Anything else in the file (a constant, a dictionary entry, an attribute's
+  argument, an interpolated or verbatim string, an unparsed file) keeps it in
+  the generic list. A method declared in another file that reads flags by key
+  under a name with none of those words is listed here too, so check the calls
+  this paragraph names.
+
   The list covers only `directories`. When you narrow them, one `git grep`
   of the rest of the checkout looks for the key too, and the pull request
   names each file it finds in a paragraph of its own: "N file(s) outside the
@@ -6671,13 +6958,25 @@ means no PR.
   the body the fold sits, and the sentence of it that describes a branch is
   the one listed.
 
-  **A comment at a call of a function that lost a flag read is reported.** When
+  **A comment at a call of a function that lost a flag read is reported, or cut.** When
   the body of a named function read the flag and no longer does (`return
   useFlag('k') && plan` became `return plan`), a comment on the same line as a
   call to it, or directly above the statement holding the call, that contains
   the word `flag` or a form of `gate` is listed in the pull request, because it
   may describe a condition the function no longer checks. The calls did not
-  change and the comment names no key, so it is never edited. Only functions
+  change and the comment names no key, so it is edited only in one plain shape and
+  otherwise listed as it is: when the flag served `true`, the whole comment is a
+  binary conjunction of a flag phrase (`release flag`, `feature flag` or one that
+  names the key) and plain words (`release flag + Pro plan`, `Pro plan and the
+  release flag`) and the function now reads no flag at all, the flag half goes
+  (`// Pro plan`). An `or`, a third conjunct, a negation, another key, or a
+  function that still reads another flag keeps the comment as it is, listed. The
+  function's parameters must all be typed as a primitive other than `boolean`
+  (a boolean, untyped, `any`, object or defaulted parameter could be handed a
+  flag value by its caller), and no call may pass a boolean literal or a value
+  read from a flag. The check that the function's file loads no flag client sees
+  imports only: a home-grown flag source that is not an imported client, or a
+  global such as `window.__flags`, is not seen, so review such comments yourself. Only functions
   called by their bare name count (a declaration, or a `const` holding an arrow
   function; a method is skipped, since its receiver cannot be resolved), a read
   that only a comment mentions is not a read, a call counts only in the function's
@@ -6687,6 +6986,36 @@ means no PR.
   parameter or local of the same name stands in for it, and
   only files under the directory being processed are searched. TypeScript and
   JavaScript only.
+
+  **A C# comment loses the clause only the removed gate made true.** In a `//` or
+  `///` comment (XML documentation included) that names the key, or a type this
+  run deleted (bare, in `<c>` or in `<see cref>`), for a flag that served `true`:
+  `, once <gate> is on`, ` only once that gate is on`, `so that turning the flag on
+  takes effect without a redeploy, and so <rest>` (leaving `so that <rest>`),
+  `once <gate> is on and the <noun> has run` (leaving `once the <noun> has run`) and
+  `, gated on <gate>, so flipping that flag takes effect without a redeploy`. "That
+  gate" or "the flag" counts only when such a name comes earlier in the same
+  comment and no other gate or flag type is named in it. Only these shapes are
+  cut. A gate named with no gate-like word and no key ("the paywall decides", "the v2
+  switchover") is not seen, so "that gate" next to one can still be cut; review such
+  comments. The paragraph is filled again no wider than its longest line was, the XML
+  must still parse, and a comment with a tool directive or another state word
+  stays and is listed.
+
+  **The flag's half of a condition, or its item of a list, is cut from a comment.**
+  `* Whether to show the editor: the `k` release flag AND a Pro plan.` becomes
+  `* Whether to show the editor: a Pro plan.`, and `FORCE_FLAGS=k=true,a=1`
+  becomes `FORCE_FLAGS=a=1`. Only these shapes are edited, everything else is
+  left as it is and listed. The condition must be a whole line of the form
+  `<flag phrase> + <plain words>` (or the words first; `+`, `&`, `&&`, `and`,
+  `AND`), optionally after a lead-in that introduces a condition (`Whether to
+  show …:`, `Requires`, `Gated on`, `Shown when`, `Only when`, …), with no verb
+  after it and the flag served `true`. A flag phrase is `[the] [<key>]
+  [release|feature] flag|gate|toggle` and names the key or `release` or
+  `feature`; a bare "the flag" is not one. A list item is a `key=value` item in
+  a comma-separated list written without spaces whose value is the treatment the
+  run kept (`k=true` for `true`, `k=false` for `false`), next to another such
+  item, not the last one left. Each cut is listed among the reworded comments.
 
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift

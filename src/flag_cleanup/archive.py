@@ -71,14 +71,13 @@ from flag_cleanup.client import (
     FlagRecentlyEvaluatedError,
 )
 from flag_cleanup.config import Config
+from flag_cleanup.forge import ForgeApiError, ForgeConfigError
+from flag_cleanup.github_forge import github_forge
+from flag_cleanup.run_context import github_env_from
 from flag_cleanup.github_ops import (
     GitHubApi,
-    GitHubApiError,
-    GitHubConfigError,
-    GitHubEnv,
     UnsafeFlagKeyError,
     flag_key_from_branch,
-    merged_removal,
     removal_branch,
 )
 from flag_cleanup.pr_event import (
@@ -337,19 +336,18 @@ def _dependents_all_removed(
     never quiet a refusal a person may need to act on.
     """
     try:
-        github = GitHubEnv.from_env(env)
-    except GitHubConfigError:
+        github = github_env_from(env)
+    except ForgeConfigError:
         return False
-    active = gh if gh is not None else GitHubApi(github.token, api_url=github.api_url)
+    forge = github_forge(github, gh)
     try:
         for dependent in dependents:
             branch = removal_branch(dependent)
-            if merged_removal(active, github.repository, branch, base=base) is None:
+            if forge.merged_removal(branch, base=base) is None:
                 return False
         return True
-    except (UnsafeFlagKeyError, GitHubApiError, httpx.HTTPError) as exc:
+    except (UnsafeFlagKeyError, ForgeApiError, httpx.HTTPError) as exc:
         logger.warning("could not check the removals of %s: %s", ", ".join(dependents), exc)
         return False
     finally:
-        if gh is None:
-            active.close()
+        forge.close()

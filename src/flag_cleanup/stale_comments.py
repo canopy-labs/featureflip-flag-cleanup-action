@@ -575,10 +575,15 @@ def removed_names(before: str, after: str, root: Node) -> frozenset[str]:
     )
 
 
-def _trigger(names: frozenset[str]) -> re.Pattern[str]:
+def _only_the_flag(text: str) -> bool:
+    """Whether a trigger match is nothing but "the flag" (no state phrase)."""
+    return THE_FLAG.fullmatch(text) is not None and FLAG_STATE.search(text) is None
+
+
+def _trigger(names: frozenset[str], *, the_flag: bool = True) -> re.Pattern[str]:
     """What makes a comment near the run's changes worth reporting: a state
     phrase, "the flag", or a name the run removed."""
-    parts = [FLAG_STATE.pattern, THE_FLAG.pattern]
+    parts = [FLAG_STATE.pattern, *([THE_FLAG.pattern] if the_flag else [])]
     if names:
         parts.append(r"(?-i:\b(?:" + "|".join(sorted(map(re.escape, names))) + r")\b)")
     return re.compile("|".join(f"(?:{part})" for part in parts), re.IGNORECASE)
@@ -745,7 +750,18 @@ def flag_state_comments(
         root = _parse(data, grammar)
     except Exception:  # noqa: BLE001 - report only; an unparsable file reports nothing
         return []
-    trigger = _trigger(removed_names(before, after, root))
+    removed = removed_names(before, after, root)
+    if grammar == "csharp":
+        # A name counts only when it is an identifier of the CODE that went: the
+        # words of a deleted comment ("the", "summary") name nothing, and "the
+        # flag" alone is a role, not a state.
+        in_code = {
+            word
+            for _type, text in _code_tokens(_parse(before.encode("utf-8"), grammar))
+            for word in _IDENTIFIER.findall(text.decode("utf-8", "replace"))
+        }
+        removed = frozenset(name for name in removed if name in in_code)
+    trigger = _trigger(removed)
     if not trigger.search(after):
         return []
     names = names_pattern(flag_key)
@@ -773,6 +789,7 @@ def flag_state_comments(
         ):
             continue
         texts, joined, offsets = _group_texts(data, starts, ends, group, first, last)
+        attached = any(r in written for r in rows) or last + 1 in written
         # The first phrase on a line that does not name the key: a line naming
         # it is the kept-comment report's, but the group's other lines are not.
         hits = [
@@ -780,6 +797,9 @@ def flag_state_comments(
             for match in trigger.finditer(joined)
             for row in [max(i for i, offset in enumerate(offsets) if offset <= match.start())]
             if not names.search(texts[row].encode("utf-8"))
+            # C#: "the flag" alone is a role, so it counts only for a comment
+            # attached to a changed line (trailing it, or directly above it).
+            and (grammar != "csharp" or attached or not _only_the_flag(match.group(0)))
         ]
         if not hits:
             continue

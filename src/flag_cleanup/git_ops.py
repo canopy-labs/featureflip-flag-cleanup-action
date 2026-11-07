@@ -71,6 +71,14 @@ logger = logging.getLogger(__name__)
 BOT_NAME = "featureflip-flag-cleanup[bot]"
 BOT_EMAIL = "featureflip-flag-cleanup[bot]@users.noreply.github.com"
 
+#: The basic-auth user name a push sends beside the token. Each forge names its
+#: own; this is GitHub's, the default for every caller that does not say.
+DEFAULT_BASIC_USER = "x-access-token"
+
+#: Every forge's push user name, so redaction can recognise the encoded header
+#: whichever forge built it.
+_BASIC_USERS = ("x-access-token", "oauth2", "x-token-auth")
+
 _REDACTED = "***"
 
 #: What git prints when a ``--force-with-lease`` expectation is not met:
@@ -1029,7 +1037,14 @@ def _staged_files(directory: str, pathspecs: Sequence[str]) -> list[str]:
     return [os.path.join(top, name) for name in output.split("\0") if name]
 
 
-def push_branch(directory: str, branch: str, push_url: str, token: str) -> None:
+def push_branch(
+    directory: str,
+    branch: str,
+    push_url: str,
+    token: str,
+    *,
+    basic_user: str = DEFAULT_BASIC_USER,
+) -> None:
     """Push ``branch`` to ``push_url``, authenticating via a per-call header.
 
     ``push_url`` carries no credential, so a push failure echoes a clean URL.
@@ -1048,13 +1063,19 @@ def push_branch(directory: str, branch: str, push_url: str, token: str) -> None:
     _git(
         ["push", "--quiet", push_url, f"refs/heads/{branch}:refs/heads/{branch}"],
         cwd=directory,
-        env=_authenticated_env(token),
+        env=_authenticated_env(token, basic_user),
         secret=token,
     )
 
 
 def force_push_branch(
-    directory: str, branch: str, push_url: str, token: str, expect_sha: str
+    directory: str,
+    branch: str,
+    push_url: str,
+    token: str,
+    expect_sha: str,
+    *,
+    basic_user: str = DEFAULT_BASIC_USER,
 ) -> None:
     """Replace ``branch`` on the remote, leased against ``expect_sha``.
 
@@ -1116,7 +1137,7 @@ def force_push_branch(
             f"refs/heads/{branch}:refs/heads/{branch}",
         ],
         cwd=directory,
-        env=_authenticated_env(token),
+        env=_authenticated_env(token, basic_user),
         secret=token,
         on_failure=_classify,
     )
@@ -1172,7 +1193,14 @@ def _untracked_or_ignored(directory: str, pathspecs: Sequence[str]) -> list[str]
     ]
 
 
-def delete_remote_branch(directory: str, branch: str, push_url: str, token: str) -> None:
+def delete_remote_branch(
+    directory: str,
+    branch: str,
+    push_url: str,
+    token: str,
+    *,
+    basic_user: str = DEFAULT_BASIC_USER,
+) -> None:
     """Delete ``branch`` from the remote. Undoes a push whose PR never opened.
 
     Without this, a run that pushed successfully but then failed to open the
@@ -1189,7 +1217,7 @@ def delete_remote_branch(directory: str, branch: str, push_url: str, token: str)
     _git(
         ["push", "--quiet", push_url, f":refs/heads/{branch}"],
         cwd=directory,
-        env=_authenticated_env(token),
+        env=_authenticated_env(token, basic_user),
         secret=token,
     )
 
@@ -1235,8 +1263,8 @@ def tracked_files(directory: str) -> frozenset[str]:
     )
 
 
-def _authenticated_env(token: str) -> dict[str, str]:
-    header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+def _authenticated_env(token: str, user: str = DEFAULT_BASIC_USER) -> dict[str, str]:
+    header = base64.b64encode(f"{user}:{token}".encode()).decode()
     env = dict(os.environ)
 
     # Append to whatever env-based config the workflow already set rather than
@@ -1320,5 +1348,8 @@ def _redact(text: str, secret: str | None) -> str:
     """
     if not secret:
         return text
-    encoded = base64.b64encode(f"x-access-token:{secret}".encode()).decode()
-    return text.replace(secret, _REDACTED).replace(encoded, _REDACTED)
+    text = text.replace(secret, _REDACTED)
+    for user in _BASIC_USERS:
+        encoded = base64.b64encode(f"{user}:{secret}".encode()).decode()
+        text = text.replace(encoded, _REDACTED)
+    return text

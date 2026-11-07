@@ -93,13 +93,20 @@ from flag_cleanup.client import (
     RemovalPrPermissionError,
 )
 from flag_cleanup.config import Config
+from flag_cleanup.forge import (
+    Forge,
+    ForgeApiError,
+    ForgeAuthError,
+    ForgeConfigError,
+    HandledPullRequest,
+    OpenPullRequest,
+)
 from flag_cleanup.github_ops import (
     GitHubApi,
-    GitHubConfigError,
     GitHubEnv,
-    HandledPullRequest,
     UnsafeFlagKeyError,
 )
+from flag_cleanup.run_context import resolve_forge
 from flag_cleanup.piranha_runner import (
     KNOWN_EXTENSIONS,
     PiranhaTransformError,
@@ -117,6 +124,7 @@ from flag_cleanup.piranha_runner import (
 from flag_cleanup.pr_content import (
     _GENERATED_DIRS,
     commit_message,
+    deleted_files,
     is_dead,
     note_declined_entries,
     note_enum_findings,
@@ -354,13 +362,16 @@ def run(
     client: _Client | None = None,
     github: GitHubEnv | None = None,
     gh: GitHubApi | None = None,
+    forge: Forge | None = None,
 ) -> list[FlagResult]:
     """Fetch removal candidates and, unless dry-running, open a PR per flag.
 
     ``client`` defaults to a real :class:`FeatureflipClient` built from
     ``config``; ``github``/``gh`` default to the runner's ``GITHUB_*``
     environment and an authenticated :class:`GitHubApi`. All three are
-    injectable so tests never touch the network.
+    injectable so tests never touch the network. ``forge``, when given, is
+    used as is in place of ``github``/``gh`` (see
+    :func:`~flag_cleanup.run_context.resolve_forge`).
 
     With ``config.dry_run`` set, nothing is written to GitHub. ``github``/``gh``
     (or a ``GITHUB_TOKEN`` in the environment) are used only for the read-only
@@ -381,34 +392,24 @@ def run(
         client if client is not None else FeatureflipClient(config.api_url, config.api_token)
     )
 
-    resolved_github: GitHubEnv | None = None
-    resolved_gh: GitHubApi | None = None
-    owns_gh = False
+    resolved_forge: Forge | None = None
+    owns_forge = False
     if not config.dry_run:
         # Resolved before the first API call so a missing GITHUB_TOKEN fails
         # immediately rather than after a page of candidates has been fetched.
-        resolved_github = github if github is not None else GitHubEnv.from_env()
+        resolved_forge, owns_forge = resolve_forge(forge=forge, github=github, gh=gh)
     else:
         # Optional here: a dry run with no token still previews every diff, it
         # just cannot tell which flags a real run would skip as already handled.
-        resolved_github = github
-        if resolved_github is None:
-            try:
-                resolved_github = GitHubEnv.from_env()
-            except GitHubConfigError as exc:
-                logger.info(
-                    "dry run: %s — not checking for existing removal pull "
-                    "requests, so a flag that already has one is previewed as "
-                    "if it had none",
-                    exc,
-                )
-    if resolved_github is not None:
-        owns_gh = gh is None
-        resolved_gh = (
-            gh
-            if gh is not None
-            else GitHubApi(resolved_github.token, api_url=resolved_github.api_url)
-        )
+        try:
+            resolved_forge, owns_forge = resolve_forge(forge=forge, github=github, gh=gh)
+        except ForgeConfigError as exc:
+            logger.info(
+                "dry run: %s — not checking for existing removal pull "
+                "requests, so a flag that already has one is previewed as "
+                "if it had none",
+                exc,
+            )
 
     # Accumulated (not built as a comprehension) so an abort mid-run — a
     # failed reset on candidate 3 — does not also destroy the record of what
@@ -445,9 +446,7 @@ def run(
                 ledger=ledger,
                 known_flag_keys=known_flag_keys,
                 lookup=(
-                    _ReadOnlyLookup(resolved_gh, resolved_github.repository)
-                    if resolved_gh is not None and resolved_github is not None
-                    else None
+                    _ReadOnlyLookup(resolved_forge) if resolved_forge is not None else None
                 ),
             )
             # Never in dry-run: no pull request has actually been opened, so
@@ -457,9 +456,8 @@ def run(
             process = partial(
                 _process_candidate_for_pr,
                 config=config,
-                gh=resolved_gh,
-                github=resolved_github,
-                base=_resolve_base(config, resolved_gh, resolved_github),
+                forge=resolved_forge,
+                base=_resolve_base(config, resolved_forge),
                 seen_branches=seen_branches,
                 ledger=ledger,
                 known_flag_keys=known_flag_keys,
@@ -530,8 +528,8 @@ def run(
         git_ops.restore_repository_ownership(config.directories)
         if owns_client:
             resolved_client.close()  # type: ignore[union-attr]
-        if owns_gh and resolved_gh is not None:
-            resolved_gh.close()
+        if owns_forge and resolved_forge is not None:
+            resolved_forge.close()
     return results
 
 
@@ -621,7 +619,7 @@ def preflight(config: Config) -> None:
         raise
 
 
-def _resolve_base(config: Config, gh: GitHubApi, github: GitHubEnv) -> str:
+def _resolve_base(config: Config, forge: Forge) -> str:
     """Settle which branch every pull request targets, and check we can cut from HEAD.
 
     Two failures this closes, both of which used to be guaranteed on a first
@@ -638,10 +636,8 @@ def _resolve_base(config: Config, gh: GitHubApi, github: GitHubEnv) -> str:
     """
     base = config.base_branch.strip()
     if not base:
-        base = github_ops.default_branch(gh, github.repository)
-    github_ops.ensure_head_on_base(
-        gh,
-        github.repository,
+        base = forge.default_branch()
+    forge.ensure_head_on_base(
         base,
         git_ops.head_sha(git_ops.work_dir(config.directories[0])),
     )
@@ -816,8 +812,7 @@ def _duplicate_result(
 def _process_candidate_for_pr(
     candidate: Candidate,
     config: Config,
-    gh: GitHubApi,
-    github: GitHubEnv,
+    forge: Forge,
     base: str,
     seen_branches: set[str],
     ledger: git_ops.OwnershipLedger,
@@ -856,7 +851,7 @@ def _process_candidate_for_pr(
 
     if candidate.blocked_by:
         return _blocked_result(
-            candidate, _hold_open_removal(candidate, gh, github.repository, branch)
+            candidate, _hold_open_removal(candidate, forge, branch)
         )
 
     # Not `config.directories[0]` raw: a configured entry may name a single
@@ -892,12 +887,12 @@ def _process_candidate_for_pr(
         # PR an earlier Action version opened all leave exactly this shape
         # (#3201 F4), and the result's `pr_url` is what lets the reporter
         # below link it again.
-        handled = github_ops.already_handled_pull_request(gh, github.repository, branch)
+        handled = forge.handled(branch)
         if handled.handled:
             if handled.open_pull is not None:
                 # Not blocked any more (that check ran above): undo a hold an
                 # earlier run placed. A no-op when the PR is not on hold.
-                _release_hold(gh, github.repository, handled.open_pull, candidate.key)
+                _release_hold(forge, handled.open_pull, candidate.key)
             return _already_handled_result(candidate, handled)
 
         original_ref = git_ops.current_ref(repo_dir)
@@ -948,11 +943,15 @@ def _process_candidate_for_pr(
                 git_ops.commit_changes(
                     repo_dir, config.directories, commit_message(candidate)
                 )
-                git_ops.push_branch(repo_dir, branch, github.push_url, github.token)
+                git_ops.push_branch(
+                    repo_dir,
+                    branch,
+                    forge.push_url,
+                    forge.token,
+                    basic_user=forge.git_basic_user,
+                )
                 pushed = True
-                pr_url = github_ops.open_pr(
-                    gh,
-                    github.repository,
+                pr_url = forge.open_change(
                     branch=branch,
                     base=base,
                     title=pr_title(candidate),
@@ -973,6 +972,7 @@ def _process_candidate_for_pr(
                         wrapper_findings=wrapper_findings,
                         wrappers=wrappers,
                         left_in_place=kept,
+                        deleted_files=deleted_files(diff),
                     ),
                     labels=config.pr_labels,
                     draft=not is_dead(candidate.status),
@@ -983,16 +983,15 @@ def _process_candidate_for_pr(
                 # close the pull request we just opened.
                 pr_created = True
                 action = "pr-opened"
-    except github_ops.GitHubAuthError as exc:
+    except ForgeAuthError as exc:
         # Not a bad flag: this token cannot do this for ANY flag, so failing
         # each one in turn would produce N identical errors (and, before the
         # cleanup below, N orphan branches). Abort with the one real message.
         logger.error(
-            "aborting: GitHub refused this token while processing %s. Check the "
-            "workflow's permissions (contents: write, pull-requests: write) and, "
-            "for pull-request creation, the repository setting 'Allow GitHub "
-            "Actions to create and approve pull requests'",
+            "aborting: %s refused this token while processing %s. %s",
+            forge.display_name,
             candidate.key,
+            forge.token_refused_hint,
         )
         _record_aborting_flag(exc, candidate, "failed")
         raise
@@ -1019,7 +1018,7 @@ def _process_candidate_for_pr(
     except Exception as exc:  # noqa: BLE001 - one bad flag must not end the run
         # An expected refusal (GitHub said no, git said no) is one clear line.
         # Anything else is a bug in this tool and needs its stack.
-        expected = isinstance(exc, (github_ops.GitHubApiError, git_ops.GitCommandError))
+        expected = isinstance(exc, (ForgeApiError, git_ops.GitCommandError))
         logger.error(
             "failed to propose removal of %s: %s",
             candidate.key,
@@ -1044,9 +1043,9 @@ def _process_candidate_for_pr(
             # branch CLOSES it — so this used to destroy the PR the other run
             # had just opened, and `already_handled` counts closed PRs, so the
             # flag was then retired forever. Ask before deleting.
-            existing = _existing_pull_request(gh, github.repository, branch)
+            existing = _existing_pull_request(forge, branch)
             if existing is None:
-                _discard_pushed_branch(repo_dir, branch, github)
+                _discard_pushed_branch(repo_dir, branch, forge)
             elif existing.confirmed:
                 logger.info(
                     "%s already has a pull request (%s) — keeping the branch "
@@ -1291,7 +1290,7 @@ def _note_blocked(candidate: Candidate, prior: str, prior_url: str) -> None:
 
 
 def _hold_open_removal(
-    candidate: Candidate, gh: GitHubApi, repo: str, branch: str
+    candidate: Candidate, forge: Forge, branch: str
 ) -> HandledPullRequest | None:
     """Look up ``branch``'s removal pull request and put an open one on hold.
 
@@ -1302,9 +1301,9 @@ def _hold_open_removal(
     """
     handled: HandledPullRequest | None = None
     try:
-        handled = github_ops.already_handled_pull_request(gh, repo, branch)
+        handled = forge.handled(branch)
         if handled.open_pull is not None:
-            prerequisite_hold.hold(gh, repo, handled.open_pull, candidate.key, candidate.blocked_by)
+            prerequisite_hold.hold(forge, handled.open_pull, candidate.key, candidate.blocked_by)
     except Exception as exc:  # noqa: BLE001 - a hold must never end the run
         # Broad on purpose, and that includes an auth error the PR path would
         # stop on: nothing is being proposed here, so there is nothing to stop.
@@ -1359,17 +1358,16 @@ class _ReadOnlyLookup:
     than warning per flag.
     """
 
-    def __init__(self, gh: GitHubApi, repo: str) -> None:
-        self._gh = gh
-        self._repo = repo
+    def __init__(self, forge: Forge) -> None:
+        self._forge = forge
         self._enabled = True
 
     def find(self, branch: str) -> HandledPullRequest | None:
         if not self._enabled:
             return None
         try:
-            return github_ops.already_handled_pull_request(self._gh, self._repo, branch)
-        except github_ops.GitHubAuthError as exc:
+            return self._forge.handled(branch)
+        except ForgeAuthError as exc:
             self._enabled = False
             logger.warning(
                 "dry run: not checking for existing removal pull requests for "
@@ -1387,14 +1385,14 @@ class _ReadOnlyLookup:
         return None
 
 
-def _release_hold(gh: GitHubApi, repo: str, pull: github_ops.OpenPullRequest, key: str) -> None:
+def _release_hold(forge: Forge, pull: OpenPullRequest, key: str) -> None:
     """:func:`prerequisite_hold.release`, as a warning rather than a failed flag.
 
     The flag is already handled whatever happens here; a hold left in place
     is retried on the next run.
     """
     try:
-        prerequisite_hold.release(gh, repo, pull, key)
+        prerequisite_hold.release(forge, pull, key)
     except Exception as exc:  # noqa: BLE001 - a release must never fail the flag
         logger.warning(
             "could not release the hold on pull request #%s: %s", pull.number, exc, exc_info=True
@@ -1482,9 +1480,7 @@ class _ExistingPullRequest:
     url: str = ""
 
 
-def _existing_pull_request(
-    gh: GitHubApi, repo: str, branch: str
-) -> _ExistingPullRequest | None:
+def _existing_pull_request(forge: Forge, branch: str) -> _ExistingPullRequest | None:
     """Is there already a pull request from ``branch``? ``None`` = provably not.
 
     ``None`` is the ONLY answer that permits deleting the pushed branch, which
@@ -1496,7 +1492,7 @@ def _existing_pull_request(
     smaller one.
     """
     try:
-        url = github_ops.existing_pull_request(gh, repo, branch)
+        url = forge.existing_change(branch)
     except Exception as exc:  # noqa: BLE001 - the caller cannot act on the type
         logger.warning(
             "could not check whether %s already has a pull request: %s", branch, exc
@@ -1507,7 +1503,7 @@ def _existing_pull_request(
     return _ExistingPullRequest(confirmed=True, url=url)
 
 
-def _discard_pushed_branch(repo_dir: str, branch: str, github: GitHubEnv) -> None:
+def _discard_pushed_branch(repo_dir: str, branch: str, forge: Forge) -> None:
     """Delete a pushed branch whose pull request never opened. Never raises.
 
     Runs inside a ``finally`` that may already be propagating a failure, so it
@@ -1516,7 +1512,9 @@ def _discard_pushed_branch(repo_dir: str, branch: str, github: GitHubEnv) -> Non
     itself fails is reported at ERROR naming exactly what a human must remove.
     """
     try:
-        git_ops.delete_remote_branch(repo_dir, branch, github.push_url, github.token)
+        git_ops.delete_remote_branch(
+            repo_dir, branch, forge.push_url, forge.token, basic_user=forge.git_basic_user
+        )
     except Exception as exc:  # noqa: BLE001 - reported, never raised from here
         logger.error(
             "pushed %s but could not open a pull request for it, AND could not "
@@ -1526,7 +1524,7 @@ def _discard_pushed_branch(repo_dir: str, branch: str, github: GitHubEnv) -> Non
             branch,
             exc,
             branch,
-            github.repository,
+            forge.repository,
         )
 
 

@@ -10,7 +10,7 @@ is put back the way it was.
 The comment is the state. Its hidden marker records whether the pull request
 was already a draft, so a release restores exactly that. It is written only
 once the pull request IS a draft, so a hold on record always means the
-conversion happened; a conversion GitHub refused leaves nothing behind, and the
+conversion happened; a conversion the forge refused leaves nothing behind, and the
 next run simply tries again.
 
 Only comments by the pull request's own author, or by a GitHub App's bot
@@ -28,8 +28,9 @@ import logging
 import re
 from dataclasses import dataclass
 
-from flag_cleanup import github_ops
-from flag_cleanup.github_ops import GitHubApi, OpenPullRequest
+from collections.abc import Sequence
+
+from flag_cleanup.forge import Comment, Forge, OpenPullRequest
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +46,13 @@ class Hold:
     was_draft: bool
 
 
-def active_hold(comments: list[dict], author: str) -> Hold | None:
+def active_hold(comments: Sequence[Comment], author: str) -> Hold | None:
     """The hold the latest trusted marker describes, or ``None`` if none is active."""
     trusted = [c for c in comments if _trusted(c, author)]
-    trusted.sort(key=lambda c: str(c.get("created_at") or ""))
+    trusted.sort(key=lambda c: c.created_at)
     current: Hold | None = None
     for comment in trusted:
-        body = str(comment.get("body") or "")
+        body = comment.body
         match = _HOLD.search(body)
         if match:
             current = Hold(was_draft=match.group(1) == "true")
@@ -60,11 +61,9 @@ def active_hold(comments: list[dict], author: str) -> Hold | None:
     return current
 
 
-def hold(
-    gh: GitHubApi, repo: str, pull: OpenPullRequest, key: str, blocked_by: tuple[str, ...]
-) -> None:
+def hold(forge: Forge, pull: OpenPullRequest, key: str, blocked_by: tuple[str, ...]) -> None:
     """Convert ``pull`` to a draft and say why. Best effort; never raises on API refusals."""
-    comments = github_ops.issue_comments(gh, repo, pull.number)
+    comments = forge.comments(pull.number)
     if comments is None:
         logger.warning(
             "could not read the comments on pull request #%s, so it was not put on "
@@ -84,21 +83,21 @@ def hold(
     # happened. A refused conversion records nothing: the next run tries again,
     # rather than reading its own hold on a ready pull request as a human's
     # decision to mark it ready.
-    if not pull.draft and not github_ops.set_draft(gh, pull, draft=True):
+    if not pull.draft and not forge.set_draft(pull, draft=True):
         return
-    if not github_ops.comment_on_pull_request(
-        gh, repo, pull.number, _hold_body(key, blocked_by, was_draft=pull.draft)
+    if not forge.comment(
+        pull.number, _hold_body(key, blocked_by, was_draft=pull.draft)
     ):
         if not pull.draft:
             # The comment is the record of what to restore; a draft without it
             # is one nothing knows to undo.
-            github_ops.set_draft(gh, pull, draft=False)
+            forge.set_draft(pull, draft=False)
         return
 
 
-def release(gh: GitHubApi, repo: str, pull: OpenPullRequest, key: str) -> None:
+def release(forge: Forge, pull: OpenPullRequest, key: str) -> None:
     """Undo an active hold on ``pull``. A no-op when it is not on hold."""
-    comments = github_ops.issue_comments(gh, repo, pull.number)
+    comments = forge.comments(pull.number)
     if comments is None:
         return
     current = active_hold(comments, pull.author)
@@ -106,18 +105,15 @@ def release(gh: GitHubApi, repo: str, pull: OpenPullRequest, key: str) -> None:
         return
     marked_ready = False
     if not current.was_draft and pull.draft:
-        if not github_ops.set_draft(gh, pull, draft=False):
+        if not forge.set_draft(pull, draft=False):
             # The hold stays recorded, so the next run tries again.
             return
         marked_ready = True
-    github_ops.comment_on_pull_request(gh, repo, pull.number, _release_body(key, marked_ready))
+    forge.comment(pull.number, _release_body(key, marked_ready))
 
 
-def _trusted(comment: dict, author: str) -> bool:
-    user = comment.get("user")
-    if not isinstance(user, dict):
-        return False
-    return user.get("login") == author or user.get("type") == "Bot"
+def _trusted(comment: Comment, author: str) -> bool:
+    return (bool(comment.author) and comment.author == author) or comment.is_bot
 
 
 def _names(keys: tuple[str, ...]) -> str:

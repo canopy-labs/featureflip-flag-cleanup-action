@@ -38,6 +38,7 @@ from flag_cleanup.cross_file_keys import (
 from flag_cleanup.mock_stubs import (
     DUPLICATE_TEST,
     FALSE_TITLE,
+    FOLDED_TEST,
     GATE_NAMED,
     PINNED_PARAMETER,
     REBUILT,
@@ -51,7 +52,7 @@ from flag_cleanup.mock_stubs import (
 from flag_cleanup.residue import Residue
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.cross_file_php_features import REMOVED_FEATURE_CLASS
-from flag_cleanup.ts_readiness_gates import KEPT_GUARD, REMOVED_GATE, REMOVED_GUARD
+from flag_cleanup.ts_readiness_gates import EDITED_COMMENT, KEPT_GUARD, NAMED_IN_COMMENT, REMOVED_GATE, REMOVED_GUARD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 from flag_cleanup.ts_test_providers import UNWRAPPED_PROVIDER
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST, STALE_TITLE, VACUOUS_ASSERTION
@@ -221,6 +222,8 @@ REPORTED_BINDING_KINDS = frozenset(
         REMOVED_GATE,
         REMOVED_GUARD,
         KEPT_GUARD,
+        NAMED_IN_COMMENT,
+        EDITED_COMMENT,
         HOOK_CALL,
         HOOK_CALL_KEPT,
     }
@@ -600,6 +603,34 @@ def _readiness_lines(rows: list[tuple[str, str, str]]) -> list[str]:
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+    edited = [(path, *comment_sentences.decode(text)) for path, kind, text in rows if kind == EDITED_COMMENT]
+    if edited:
+        count = len(edited)
+        lines += [
+            f"> **{count} comment{' was' if count == 1 else 's were'} edited.** "
+            f"{'It' if count == 1 else 'Each'} compared its own code with a component this "
+            "pull request deleted, in a clause opening a sentence (`Like X, …`). The "
+            "clause was cut and the next word capitalised; nothing else was touched:",
+            ">",
+            *[
+                f"> - {_md_code(f'{path}:{line}')}: {_md_code(before)} became {_md_code(after)}"
+                for path, line, before, after in edited[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    named = _state_rows(rows, NAMED_IN_COMMENT)
+    if named:
+        count = len(named)
+        lines += [
+            f"> **ℹ️ {count} comment{' names' if count == 1 else 's name'} a component "
+            "this pull request deleted.** Comments are never edited by this tool; "
+            f"reword or delete {'it' if count == 1 else 'each'}:",
+            ">",
+            *[f"> - {_md_code(path)} line {line}: {_md_code(text)}" for path, line, text in named[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
     return lines
 def _test_scaffolding_lines(vacuous: list[tuple[str, str]], titles: list[tuple[str, str]]) -> list[str]:
     """The callout naming each kept test line that may still describe the
@@ -974,11 +1005,12 @@ def _reworded_comment_lines(reworded: list[tuple[str, str]]) -> list[str]:
         before, after = comment_sentences.preview(before, after)
         rows.append(f"> - {_md_code(f'{path}:{line}')}: {_md_code(before)} became {_md_code(after)}")
     return [
-        f"> **{count} {noun} reworded.** Each had a sentence that names this "
-        "flag (or a type this pull request deletes) and was cut down to the "
-        "sentences that do not. Nothing else in the comment was touched, "
-        "and no cut sentence named anything that stays, but read each result "
-        "once, since a comment is prose and nothing checks it:",
+        f"> **{count} {noun} reworded.** Each had text that named this flag "
+        "(or a type this pull request deletes, or was the flag's half of a "
+        "condition such as `release flag + Pro plan`, or a `key=value` item "
+        "in a list) and was cut down to the rest. Nothing else in the comment "
+        "was touched, but read each result once, since a comment is prose and "
+        "nothing checks it:",
         ">",
         *rows,
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -1177,6 +1209,16 @@ def _marked_import_lines(marked: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _folded_detail(moved: int, new: int, repeated: int) -> str:
+    """What a fold moved into the sibling, counted in ``Assert`` calls."""
+    if not moved:
+        return "the sibling already made each of its assertions"
+    text = f"{new} assertion(s) the sibling did not make, moved in {moved} statement(s)"
+    if repeated:
+        text += f", which also repeat {repeated} the sibling already makes"
+    return text
+
+
 def _shown_rows(rows: tuple[tuple, ...], show) -> tuple[tuple, ...]:
     """``rows`` with each row's leading path spelled by ``show``."""
     return tuple((show(row[0]), *row[1:]) for row in rows)
@@ -1196,6 +1238,8 @@ def _shown_residue(residue: Residue, show) -> Residue:
         path_only=tuple(show(path) for path in residue.path_only),
         literal_only=tuple(show(path) for path in residue.literal_only),
         namespace_only=tuple(show(path) for path in residue.namespace_only),
+        plain_strings=tuple(show(path) for path in residue.plain_strings),
+        plain_string_lines=_shown_rows(residue.plain_string_lines, show),
     )
 
 
@@ -1207,6 +1251,27 @@ def _shown_wrapper(wrapper: ConstantWrapper, show) -> ConstantWrapper:
         siblings=tuple((name, show(path)) for name, path in wrapper.siblings),
         callers=tuple(show(path) for path in wrapper.callers),
     )
+
+
+#: ``bindings`` kinds that announce a file's deletion: kept for a file the
+#: pull request deletes, which :func:`pr_body` otherwise names no more.
+ANNOUNCES_DELETION = frozenset({REMOVED_GATE, REMOVED_FEATURE_CLASS})
+
+
+def deleted_files(diff: str) -> frozenset[str]:
+    """The paths ``diff`` deletes outright: a ``--- a/<path>`` header whose
+    ``+++`` side is ``/dev/null``."""
+    found: set[str] = set()
+    previous = ""
+    for line in diff.splitlines():
+        if line == "+++ /dev/null" and previous.startswith("--- a/"):
+            found.add(previous[len("--- a/") :])
+        previous = line
+    return frozenset(found)
+
+
+def _outside(rows, gone: frozenset[str]):
+    return tuple(row for row in rows if row[0] not in gone)
 
 
 def pr_body(
@@ -1226,6 +1291,7 @@ def pr_body(
     unresolved: tuple[tuple[str, int, str, str], ...] = (),
     enum_findings: tuple[tuple[str, int, str, str], ...] = (),
     wrapper_findings: tuple[tuple[str, int, str, str, str], ...] = (),
+    deleted_files: frozenset[str] = frozenset(),
 ) -> str:
     """The PR description: what was removed, why, and which branch survived.
 
@@ -1332,6 +1398,17 @@ def pr_body(
     unresolved = _shown_rows(unresolved, show)
     enum_findings = _shown_rows(enum_findings, show)
     wrapper_findings = _shown_rows(wrapper_findings, show)
+    # A file the pull request deletes outright is named once, by the callout
+    # that says why it went; what other passes said about its lines (an entry
+    # removed, a test deleted or renamed) describes a file no longer there.
+    if deleted_files:
+        gone = frozenset(deleted_files) | {show(path) for path in deleted_files}
+        stranded = _outside(stranded, gone)
+        bindings = tuple(b for b in bindings if b[0] not in gone or b[1] in ANNOUNCES_DELETION)
+        entries = _outside(entries, gone)
+        declined = _outside(declined, gone)
+        deleted_tests = _outside(deleted_tests, gone)
+        left_in_place = _outside(left_in_place, gone)
     served = "true" if candidate.treatment else "false"
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
     renamed_tests = _renamed_tests(bindings)
@@ -1377,6 +1454,7 @@ def pr_body(
         | set(residue.path_only)
         | set(residue.literal_only)
         | set(residue.namespace_only)
+        | set(residue.plain_strings)
         | set(held_paths)
     )
     generic = tuple(path for path in unprocessed if path not in sorted_out)
@@ -1558,6 +1636,25 @@ def pr_body(
             ),
             "",
         ]
+    if residue.plain_strings:
+        count = len(residue.plain_strings)
+        plain_lines = residue.plain_string_lines[:30]
+        lines += [
+            f"> **ℹ️ {count} file(s) still name this flag's key, but only as a plain string in "
+            "no flag read** (and perhaps in comments). Each string below is an argument of a "
+            "call that is not a flag read: no SDK call, accessor or wrapper this run knows, "
+            "and no stub of one. That is usually a job, scope or log name spelled like the "
+            "flag, so they were left alone; look again only if one of these calls reads flags "
+            "by key:",
+            ">",
+            *[f"> - {_md_code(f'{path}:{line}')}: {_md_code(text)}" for path, line, text in plain_lines],
+            *(
+                [f"> - ...and {len(residue.plain_string_lines) - len(plain_lines)} more"]
+                if len(residue.plain_string_lines) > len(plain_lines)
+                else []
+            ),
+            "",
+        ]
     if residue.outside:
         shown = residue.outside[:20]
         lines += [
@@ -1710,7 +1807,9 @@ def pr_body(
     kept_forwarders = [
         (path, text) for path, kind, text in bindings if kind == KEPT_FORWARDER
     ]
-    readiness = [b for b in bindings if b[1] in (REMOVED_GATE, REMOVED_GUARD, KEPT_GUARD)]
+    readiness = [
+        b for b in bindings if b[1] in (REMOVED_GATE, REMOVED_GUARD, KEPT_GUARD, NAMED_IN_COMMENT, EDITED_COMMENT)
+    ]
     hook_calls = [
         (path, text) for path, kind, text in bindings if kind == HOOK_CALL
     ]
@@ -1875,6 +1974,7 @@ def pr_body(
     renamed_methods = [(path, *text.split("\n", 1)) for path, kind, text in test_doubles if kind == RENAMED_METHOD and "\n" in text]
     gate_named = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == GATE_NAMED and ": " in text]
     duplicates = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == DUPLICATE_TEST and ": " in text]
+    folded = [(path, *text.split("\n")) for path, kind, text in test_doubles if kind == FOLDED_TEST and text.count("\n") == 4]
     mock_lines = [
         (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
     ]
@@ -2018,6 +2118,24 @@ def pr_body(
             "by hand:",
             ">",
             *[f"> - {_md_code(path)} — {_md_code(name)}: {reason}" for path, name, reason in gate_named[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if folded:
+        count = len(folded)
+        lines += [
+            f"> **{count} cut-down {'test was' if count == 1 else 'tests were'} folded into "
+            f"{'its sibling' if count == 1 else 'their siblings'}.** After the cut, what was left "
+            "arranged and acted, token for token, as a sibling test in the same class does, and "
+            "then only asserted, under a name that described the removed value. Its assertions "
+            "the sibling did not already make now run at the end of the sibling, and the test "
+            "was deleted:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(name)} into {_md_code(sibling)}: "
+                + _folded_detail(int(moved), int(new), int(repeated))
+                for path, name, sibling, moved, new, repeated in folded[:20]
+            ],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -2203,7 +2321,7 @@ _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
     TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
-    FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST,
+    FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST, FOLDED_TEST,
 )
 
 
@@ -2630,6 +2748,14 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     renamed = [(p, t) for p, kind, t in test_doubles if kind == RENAMED_METHOD]
     gate_named = [(p, t) for p, kind, t in test_doubles if kind == GATE_NAMED]
     duplicates = [(p, t) for p, kind, t in test_doubles if kind == DUPLICATE_TEST]
+    folded = [(p, t) for p, kind, t in test_doubles if kind == FOLDED_TEST]
+    if folded:
+        logger.warning(
+            "%d cut-down test%s folded into a sibling: %s",
+            len(folded),
+            "" if len(folded) == 1 else "s",
+            "; ".join(f"{p}: {' -> '.join(t.split(chr(10))[:2])}" for p, t in folded),
+        )
     if duplicates:
         logger.warning(
             "%d kept test%s cut down to what a sibling test also does: %s",

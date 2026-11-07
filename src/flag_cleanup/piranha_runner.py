@@ -124,6 +124,8 @@ from flag_cleanup import (
     ruby_owner_reach,
     source_index,
     call_site_comments,
+    comment_clauses,
+    comment_conjuncts,
     comment_sentences,
     stale_comments,
     ts_bound_overrides,
@@ -256,7 +258,7 @@ class UnsupportedFlagKeyError(ValueError):
 # engine; and a `"` is a query-injection surface into rules that run over the
 # customer's own source.
 #
-# This is exactly the alphabet `github_ops._SAFE_BRANCH_CHARS` keeps verbatim,
+# This is exactly the alphabet `branches._SAFE_BRANCH_CHARS` keeps verbatim,
 # and a strict superset of the Featureflip canonical key format (lowercase
 # alphanumeric segments joined by single `-`/`_`), so no key a customer can
 # create today is refused. It is deliberately NOT the branch-name rule itself:
@@ -2806,6 +2808,7 @@ def _transform_flag(
     # The comments left describing nothing but what this run removed: the
     # flag, or a C# family type it deleted. Last of the edits, so it judges
     # the bytes that stay on disk; before Gate 1, which judges its output too.
+    cut_rows: dict[str, set[str]] = {}
     summaries, comment_rows, wrapper_rows = _remove_stale_comments(
         summaries,
         paths,
@@ -2816,8 +2819,19 @@ def _transform_flag(
         family_names,
         wrapper_rows,
         repo_dir,
+        treatment=treatment,
+        cut_rows=cut_rows,
     )
     bindings = bindings + comment_rows
+
+    # A clause of a C# comment that only the removed gate made true ("once
+    # the gate is on"): cut, comments only. Independent of the stale-comment
+    # gate above: it edits prose and never decides whether the flag is read.
+    summaries, clause_rows, wrapper_rows = _cut_comment_clauses(
+        summaries, paths, {s.path for s in deleted_files}, language, flag_key, family_names, treatment,
+        wrapper_rows, repo_dir, frozenset(known_flag_keys),
+    )
+    bindings = bindings + clause_rows
 
     # The comment directly above a statement or entry this run deleted
     # outright: gone with it when it describes the flag's state, or when what
@@ -2848,13 +2862,31 @@ def _transform_flag(
     # Comments beside the changes that describe a flag's state without naming
     # it ("while the flag is off"): reported, never edited. After every edit,
     # so the lines named are the ones that stay on disk.
+    # A comment this run cut a conjunct or list item from is settled, and is
+    # not read again as a comment beside a changed line.
+    settled = dict(leading_reported)
+    for summary in summaries:
+        texts = cut_rows.get(summary.path)
+        if texts:
+            rows = {
+                number
+                for number, line in enumerate(summary.content.split("\n"), 1)
+                if comment_conjuncts.is_cut_line(line, texts)
+            }
+            settled[summary.path] = frozenset(settled.get(summary.path, frozenset()) | rows)
+    # A comment the readiness pass edited is that file's only change, and is
+    # reported as edited: it is not a comment beside a change either.
     bindings = bindings + _flag_state_comments(
-        summaries, language, flag_key, treatment, repo_dir, leading_reported
+        summaries, language, flag_key, treatment, repo_dir,
+        ts_readiness_gates.with_edited_comments(settled, readiness_rows, summaries, repo_dir),
     )
 
     # The comment at a call of a function whose body lost a read of the flag
     # ("release flag + Pro plan"): reported, never edited.
-    bindings = bindings + _call_site_comments(summaries, language, flag_key, repo_dir)
+    summaries, call_site_rows = _call_site_comments(
+        summaries, language, flag_key, repo_dir, treatment, cut_rows
+    )
+    bindings = bindings + call_site_rows
 
     # An assertion the fold made one that can only fail (`Assert.True(false)`)
     # tested the branch this removal deletes: reported, never edited.
@@ -2874,6 +2906,9 @@ def _transform_flag(
     bindings = tuple(
         b for b in bindings if b[0] not in readiness_gone or b in readiness_rows
     )
+    # And a note that code was KEPT must still be true of the bytes that stay:
+    # a later pass may have deleted that code after all.
+    bindings = _without_stale_kept_rows(bindings, summaries, repo_dir)
 
     # GATE 1 — if the transform broke any file, discard ALL of it. A partial
     # rewrite is not an option: the flag would look half-removed, and a diff
@@ -3741,6 +3776,9 @@ def _remove_stale_comments(
     family_names: frozenset[str],
     wrapper_rows: list,
     repo_dir: str,
+    *,
+    treatment: bool = True,
+    cut_rows: dict[str, set[str]] | None = None,
 ) -> tuple[list, tuple[tuple[str, str, str], ...], list]:
     """Delete each comment that only described the flag or a deleted family
     type, with a ``(path, "removed comment", text)`` row for each. See
@@ -3798,6 +3836,13 @@ def _remove_stale_comments(
         # What is left of a comment that says more than the removed name:
         # its other sentences, once the ones naming it are cut.
         after, rewords = comment_sentences.reword(after, grammar, names)
+        # A comment that names the key inside a sentence that stays true:
+        # the flag's half of a conjunction, or its item of a list.
+        if ts_tests.covers(language):
+            after, cut = comment_conjuncts.cut(after, grammar, flag_key, treatment=treatment)
+            rewords = [*rewords, *cut]
+            if cut and cut_rows is not None:
+                cut_rows.setdefault(path, set()).update(r.after for r in cut)
         if not removals and not rewords:
             continue
         git_ops.before_writing([path])
@@ -3833,14 +3878,89 @@ def _remove_stale_comments(
     return result, tuple(rows), wrapper_rows
 
 
+def _cut_comment_clauses(
+    summaries,
+    paths: list[str],
+    deleted: set[str],
+    language: str,
+    flag_key: str,
+    family_names: frozenset[str],
+    treatment: bool,
+    wrapper_rows: list,
+    repo_dir: str,
+    known_keys: frozenset[str] = frozenset(),
+) -> tuple[list, tuple[tuple[str, str, str], ...], list]:
+    """Cut the whitelisted flag clauses out of C# comments (see
+    :mod:`flag_cleanup.comment_clauses`); a ``reworded comment`` row for each.
+    Files are read byte for byte, so a CRLF file stays CRLF."""
+    if language != "csharp" or not treatment:
+        return summaries, (), wrapper_rows
+    by_path = {s.path: s for s in summaries}
+    result = list(summaries)
+    rows: list[tuple[str, str, str]] = []
+    shifts: dict[str, object] = {}
+    for path in (p for p in paths if p not in deleted):
+        grammar = _grammar_of(path, language)
+        if grammar in _TEMPLATE_LANGUAGES or not _LANGUAGES[grammar].owns(path):
+            continue
+        summary = by_path.get(path)
+        try:
+            if summary is not None:
+                before = summary.content
+            else:
+                with open(path, encoding="utf-8", newline="") as handle:
+                    before = handle.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        after, cuts = comment_clauses.cut(
+            before, grammar, flag_key, family_names, treatment=treatment, known_keys=known_keys
+        )
+        if not cuts:
+            continue
+        git_ops.before_writing([path])
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(after)
+        rewrite = Rewrite(path, summary.original_content if summary else before, after)
+        if summary is None:
+            result.append(rewrite)
+        else:
+            result[result.index(summary)] = rewrite
+        relative = os.path.relpath(path, repo_dir)
+        rows.extend(
+            (relative, comment_sentences.REWORDED_KIND, comment_sentences.encode(r.line, r.before, r.after))
+            for r in cuts
+        )
+        shifts[str(Path(path).resolve())] = (after, cuts)
+    if shifts:
+        moved = []
+        for row in wrapper_rows:
+            edited = shifts.get(row.path) if row.reason == wrapper_inline.RESIDUE_PROSE else None
+            if edited is None:
+                moved.append(row)
+                continue
+            line = stale_comments.follow(row.text, *edited)
+            if line is not None:
+                moved.append(replace(row, line=line) if line else row)
+        wrapper_rows = moved
+    return result, tuple(rows), wrapper_rows
+
+
 def _call_site_comments(
-    summaries, language: str, flag_key: str, repo_dir: str
-) -> tuple[tuple[str, str, str], ...]:
+    summaries,
+    language: str,
+    flag_key: str,
+    repo_dir: str,
+    treatment: bool = False,
+    cut_rows: dict[str, set[str]] | None = None,
+) -> tuple[list, tuple[tuple[str, str, str], ...]]:
     """A ``(path, "call-site comment", "<line>: <comment>")`` row for each
     comment at a call of a function that lost a read of the flag, TypeScript
-    family only. Report only. See :mod:`flag_cleanup.call_site_comments`."""
+    family only. Reported, and when the flag served ``true`` the flag's half of
+    a plain ``<flag> + <words>`` comment is cut (a reworded-comment row
+    instead). See :mod:`flag_cleanup.call_site_comments` and
+    :mod:`flag_cleanup.comment_conjuncts`."""
     if not ts_tests.covers(language):
-        return ()
+        return summaries, ()
     names = stale_comments.names_pattern(flag_key)
     by_path = {str(Path(s.path).resolve()): s for s in summaries}
     changed = []
@@ -3852,7 +3972,7 @@ def _call_site_comments(
             continue
         changed.append((s.path, s.original_content, s.content, grammar))
     if not changed:
-        return ()
+        return summaries, ()
 
     scope = Path(repo_dir).resolve()
 
@@ -3879,10 +3999,52 @@ def _call_site_comments(
             yield path, text, grammar
 
     found = call_site_comments.report(changed, files, names, repo_dir)
-    return tuple(
+    result = list(summaries)
+    edited: set[tuple[str, int]] = set()
+    rows: list[tuple[str, str, str]] = []
+    if treatment:
+        by_file: dict[str, dict[int, str]] = {}
+        for c in found:
+            if c.clean and c.args_ok:
+                by_file.setdefault(c.path, {})[c.line] = c.text
+        for path, lines in by_file.items():
+            summary = by_path.get(str(Path(path).resolve()))
+            try:
+                if summary is not None:
+                    current = summary.content
+                else:
+                    # Byte for byte: a CRLF file must stay CRLF.
+                    with open(path, encoding="utf-8", newline="") as handle:
+                        current = handle.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            grammar = _grammar_of(path, language)
+            after, cuts = comment_conjuncts.cut(current, grammar, flag_key, treatment=True, linked=lines)
+            if not cuts:
+                continue
+            git_ops.before_writing([path])
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(after)
+            original = summary.original_content if summary is not None else current
+            rewrite = Rewrite(path, original, after)
+            if summary is None:
+                result.append(rewrite)
+            else:
+                result[result.index(summary)] = rewrite
+            relative = os.path.relpath(path, repo_dir)
+            for r in cuts:
+                edited.add((path, r.line))
+                if cut_rows is not None:
+                    cut_rows.setdefault(path, set()).add(r.after)
+                rows.append(
+                    (relative, comment_sentences.REWORDED_KIND, comment_sentences.encode(r.line, r.before, r.after))
+                )
+    rows.extend(
         (os.path.relpath(c.path, repo_dir), call_site_comments.CALL_SITE_KIND, f"{c.line}: {c.text}")
         for c in found
+        if (c.path, c.line) not in edited
     )
+    return result, tuple(rows)
 
 
 def _flag_state_comments(
@@ -4441,8 +4603,9 @@ def _rename_kept_titles(
                 snapshots = ts_tests.stored_snapshot_names(repo_dir)
             return name in snapshots
 
+        extra = {"before": summary.original_content} if rename is ts_tests.rename_kept_titles else {}
         content, renamed = rename(
-            summary.content, _grammar_of(summary.path, language), flag_key, kept, stored
+            summary.content, _grammar_of(summary.path, language), flag_key, kept, stored, **extra
         )
         if not renamed:
             result.append(summary)
@@ -6006,6 +6169,55 @@ def _remove_orphans(summaries, language: str) -> list:
     return cleaned
 
 
+#: ``bindings`` kinds that say code was kept, whose text is that code.
+_KEPT_CODE_KINDS = frozenset({inert_calls.HOOK_CALL_KEPT, "bare import"})
+
+
+def _without_stale_kept_rows(bindings, summaries, repo_dir: str):
+    """``bindings`` less each :data:`_KEPT_CODE_KINDS` row whose code is no
+    longer a whole statement of its file's final text, compared with
+    whitespace collapsed (``useParams();`` is not kept by a remaining
+    ``const { id } = useParams();``). A file this run did not change, no
+    longer holds, or that does not parse keeps its rows."""
+    from flag_cleanup import ts_scope, unused
+
+    statements: dict[str, frozenset[str] | None] = {}
+
+    def final(path: str) -> frozenset[str] | None:
+        if path not in statements:
+            found = None
+            for s in summaries:
+                if os.path.relpath(s.path, repo_dir) == path and not file_deletion.deleted(s):
+                    grammar = ts_scope.grammar(s.path)
+                    root = unused._parse(s.content, grammar) if grammar in _TS_GRAMMARS else None
+                    if root is not None and not root.has_error:
+                        found = frozenset(
+                            " ".join(n.text.decode("utf-8", "replace").split())
+                            for n in _walk_nodes(root)
+                            if n.type.endswith(("statement", "declaration"))
+                        )
+                    break
+            statements[path] = found
+        return statements[path]
+
+    kept = []
+    for b in bindings:
+        if b[1] in _KEPT_CODE_KINDS:
+            held = final(b[0])
+            if held is not None and " ".join(b[2].split()) not in held:
+                continue
+        kept.append(b)
+    return tuple(kept)
+
+
+def _walk_nodes(root):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(node.children)
+
+
 def _delete_declared_calls(
     summaries, language: str, repo_dir: str
 ) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[tuple[str, str], ...]]:
@@ -6032,10 +6244,17 @@ def _delete_declared_calls(
             summary.original_content, summary.content, grammar, path=summary.path, root=repo_dir, kept=kept_hooks
         )
         relative = os.path.relpath(summary.path, repo_dir)
-        rows.extend((relative, inert_calls.HOOK_CALL_KEPT, text) for text, _package in kept_hooks)
         cleaned, gone = inert_calls.remove(
             summary.original_content, cleaned, grammar, path=summary.path, root=repo_dir
         )
+        # A hook call the audit kept for a test's mock that the customer's
+        # word then deleted has one outcome, deleted; and its package's load
+        # is released as the audit's own deletion would release it.
+        for text, package in kept_hooks:
+            if text in gone:
+                released.append((summary.path, package))
+            else:
+                rows.append((relative, inert_calls.HOOK_CALL_KEPT, text))
         if not gone and not hooks:
             cleaned_summaries.append(summary)
             continue

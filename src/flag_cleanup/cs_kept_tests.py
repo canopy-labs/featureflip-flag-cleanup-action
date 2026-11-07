@@ -17,8 +17,12 @@ describe the branch that is gone:
   both reported, never edited.
 * **A test a phase cut shortened** (``TEST_PHASE``) whose name says what
   happened while the gate held the removed value
-  (``Job_DoesNothing_UntilTheEncryptionGateIsOn``): the name is now false,
-  and it is reported beside the cut, never edited.
+  (``Job_DoesNothing_UntilTheGateIsOn``): the name is now false.
+  When what is left arranges and acts, token for token, as exactly one
+  sibling ``[Fact]`` of the same class does, and both then only assert, it is
+  folded into that sibling (:func:`fold`): the assertions the sibling does
+  not already make go at its end, and the test goes. Otherwise it is
+  reported beside the cut, never edited.
 
 Which gate a name means is decided per token (:func:`_attributed`): a word
 before the gate's noun that belongs to the family's name (``EncryptionGate``)
@@ -67,7 +71,16 @@ from tree_sitter import Node
 
 from flag_cleanup import file_deletion, git_ops, syntax
 from flag_cleanup.ctor_param_model import choose_sentinel, tidy, tidy_lines
-from flag_cleanup.mock_stubs import DUPLICATE_TEST, FALSE_TITLE, GATE_NAMED, RENAMED_METHOD, TEST, TEST_PHASE, THEORY_FACT
+from flag_cleanup.mock_stubs import (
+    DUPLICATE_TEST,
+    FALSE_TITLE,
+    FOLDED_TEST,
+    GATE_NAMED,
+    RENAMED_METHOD,
+    TEST,
+    TEST_PHASE,
+    THEORY_FACT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -872,6 +885,572 @@ def _duplicates(relative: str, root: Node, original: Node) -> list[tuple[str, st
     return rows
 
 
+# --- A cut-down test folded into its sibling ----------------------------------------
+
+
+def _is_false_title(name: str, method: Node, scans: list[_File], phases: set[str], kept: frozenset[str]) -> bool:
+    """Whether :func:`review_names` would report ``name`` as a false title:
+    a test a phase cut shortened whose name says what happened at the
+    removed value. The same questions, asked in the same order."""
+    if name not in phases or _several_gates(name, method, scans) is not None:
+        return False
+    tokens = [t for scan in scans for t in _tokens(name, scan.family.noun) if _attributed(name, t, scan)]
+    return bool(tokens) and _false_title(tokens, kept)
+
+
+#: What an assertion's arguments, or the resource of a ``using`` around
+#: assertions, may not hold: a write, a name it declares (an ``out var`` or a
+#: pattern variable is in scope to the end of the enclosing block), or code
+#: deferred to a delegate (``Assert.Throws(() => svc.Run())`` holds the act).
+_NOT_INERT = frozenset({
+    "assignment_expression", "lambda_expression", "anonymous_method_expression",
+    "declaration_expression", "declaration_pattern", "var_pattern", "local_function_statement",
+})
+
+
+def _inert(node: Node) -> bool:
+    for n in _walk(node):
+        if n.type in _NOT_INERT:
+            return False
+        if n.type in ("prefix_unary_expression", "postfix_unary_expression") and any(
+            not c.is_named and _text(c) in ("++", "--") for c in n.children
+        ):
+            return False
+        if n.type == "argument" and any(not c.is_named and _text(c) in ("ref", "out", "in") for c in n.children):
+            return False
+        if n.type == "recursive_pattern" and n.child_by_field_name("name") is not None:
+            return False
+    return True
+
+
+def _assertion_call(expression: Node | None) -> bool:
+    """``Assert.X(…)`` (or ``Xunit.Assert.X(…)``), not awaited, whose
+    arguments are inert."""
+    if expression is None or expression.type != "invocation_expression":
+        return False
+    function = expression.child_by_field_name("function")
+    if function is None or function.type != "member_access_expression":
+        return False
+    receiver = function.child_by_field_name("expression")
+    if receiver is None or _text(receiver) not in ("Assert", "Xunit.Assert"):
+        return False
+    arguments = expression.child_by_field_name("arguments")
+    return arguments is not None and _inert(arguments)
+
+
+def _is_assertion(statement: Node) -> bool:
+    """Whether ``statement`` only asserts: ``Assert.X(…);``, or a plain
+    ``using (expression)`` whose body is one or a block of those."""
+    if statement.type == "expression_statement":
+        return len(statement.named_children) == 1 and _assertion_call(statement.named_children[0])
+    if statement.type != "using_statement" or any(not c.is_named and _text(c) == "await" for c in statement.children):
+        return False
+    body = statement.child_by_field_name("body")
+    resources = [c for c in statement.named_children if body is None or (c.id != body.id and c.type != "comment")]
+    if body is None or len(resources) != 1 or resources[0].type == "variable_declaration" or not _inert(resources[0]):
+        return False
+    if body.type == "expression_statement":
+        return _is_assertion(body)
+    if body.type != "block":
+        return False
+    inner = [c for c in body.named_children if c.type != "comment"]
+    return bool(inner) and all(c.type == "expression_statement" and _is_assertion(c) for c in inner)
+
+
+def _body_statements(method: Node) -> list[Node] | None:
+    body = method.child_by_field_name("body")
+    if body is None or body.type != "block":
+        return None
+    return [c for c in body.named_children if c.type != "comment"]
+
+
+def _bare_fact(method: Node) -> bool:
+    """One ``[Fact]``, bare (no ``Skip``, no ``Trait``, no other attribute),
+    and no parameters."""
+    attributes = _attributes(method)
+    lists = [c for c in method.children if c.type == "attribute_list"]
+    if len(attributes) != 1 or len(lists) != 1:
+        return False
+    _, attribute = attributes[0]
+    spelled = attribute.child_by_field_name("name")
+    if spelled is None or spelled.type != "identifier" or _text(spelled) != "Fact":
+        return False
+    if any(c.type == "attribute_argument_list" for c in attribute.named_children):
+        return False
+    parameters = method.child_by_field_name("parameters")
+    return parameters is not None and not [c for c in parameters.named_children if c.type != "comment"]
+
+
+def _shape(method: Node) -> tuple[str, ...]:
+    """Modifiers, return type and parameters, token for token."""
+    name = method.child_by_field_name("name")
+    return tuple(
+        _norm(c) for c in method.children
+        if c.type not in ("attribute_list", "block", "comment", "arrow_expression_clause") and not (name is not None and c.id == name.id)
+    )
+
+
+@dataclass
+class _Fold:
+    name: str
+    sibling: str
+    method: Node
+    #: The sibling's last statement, after which the assertions go.
+    anchor: Node
+    #: The cut-down test's assertion statements the sibling does not already make.
+    appended: list[Node]
+    #: The ``Assert`` calls in ``appended`` the sibling does not make, and
+    #: those it does (a moved ``using`` block keeps both).
+    new: int = 0
+    repeated: int = 0
+
+
+def _fold_plan(method: Node, chain: tuple[str, ...], tests: dict[tuple[tuple[str, ...], str], Node]) -> _Fold | str:
+    """How the cut-down test ``method`` folds into its one sibling, or why it
+    does not."""
+    name = _text(method.child_by_field_name("name"))
+    if not _bare_fact(method):
+        return "it is not a bare [Fact] with no parameters"
+    mine = _body_statements(method)
+    if not mine:
+        return "it has no statements"
+    first = next((i for i, s in enumerate(mine) if _is_assertion(s)), None)
+    if first is None:
+        return "it holds no assertion"
+    if first == 0:
+        return "it arranges nothing before its first assertion"
+    if not all(_is_assertion(s) for s in mine[first:]):
+        return "it does more than assert after its first assertion"
+    prefix = [_norm(s) for s in mine[:first]]
+    matches = []
+    for (other_chain, other), sibling in tests.items():
+        if other_chain != chain or other == name:
+            continue
+        theirs = _body_statements(sibling)
+        if theirs is not None and len(theirs) >= first and [_norm(s) for s in theirs[:first]] == prefix:
+            matches.append((other, sibling, theirs))
+    if not matches:
+        return "no sibling arranges and acts as it does"
+    if len(matches) > 1:
+        return "more than one sibling arranges and acts as it does: " + ", ".join(sorted(m[0] for m in matches))
+    other, sibling, theirs = matches[0]
+    if not _bare_fact(sibling):
+        return f"its sibling `{other}` is not a bare [Fact] with no parameters"
+    if _shape(sibling) != _shape(method):
+        return f"its sibling `{other}` is declared differently (modifiers or return type)"
+    if not all(_is_assertion(s) for s in theirs[first:]):
+        return f"its sibling `{other}` does more than assert after the statements they share"
+    if mine[first].start_point[1] != theirs[0].start_point[1] or mine[0].start_point[1] != theirs[0].start_point[1]:
+        return f"its sibling `{other}` is indented differently"
+    apart = _preprocessor_apart(method, sibling)
+    if apart:
+        return apart
+    made = {_norm(s) for s in theirs[first:]}
+    appended = [s for s in mine[first:] if _norm(s) not in made]
+    # The moved assertions now run after the sibling's own: those may not
+    # call, await or construct anything the moved ones do not themselves.
+    resources = {
+        _norm(c) for s in appended if s.type == "using_statement"
+        for c in s.named_children if c.id != (s.child_by_field_name("body") or s).id
+    }
+    if appended and not all(_quiet(s, resources) for s in theirs[first:]):
+        return (
+            f"its sibling `{other}` calls, awaits or builds something in its assertions that is not "
+            "a plain read, and the moved ones would run after it"
+        )
+    shared = _shared_receivers(theirs[first:], resources)
+    if appended and _reads_receiver(appended, shared, resources):
+        return (
+            f"its sibling `{other}` opens the same scope first, and the moved assertions read a "
+            "member of what opens it, which may now count it twice"
+        )
+    asserted = {_norm(c) for s in theirs[first:] for c in _assert_calls(s)}
+    calls = [_norm(c) for s in appended for c in _assert_calls(s)]
+    new_calls = sum(1 for c in calls if c not in asserted)
+    return _Fold(name, other, method, theirs[-1], appended, new_calls, len(calls) - new_calls)
+
+
+#: Nodes that run code of the test's own: a call, an ``await``, a
+#: construction, an indexer.
+_EFFECTS = frozenset({
+    "invocation_expression", "await_expression", "object_creation_expression",
+    "implicit_object_creation_expression", "element_access_expression",
+})
+
+
+def _assert_calls(statement: Node) -> list[Node]:
+    """The statement-level ``Assert.X(…)`` calls of an assertion statement."""
+    if statement.type == "expression_statement":
+        return [c for c in statement.named_children if c.type == "invocation_expression"]
+    body = statement.child_by_field_name("body")
+    if body is None:
+        return []
+    if body.type == "expression_statement":
+        return _assert_calls(body)
+    return [call for c in body.named_children if c.type == "expression_statement" for call in _assert_calls(c)]
+
+
+#: Calls a sibling's assertions may make before the moved ones run: reads
+#: that leave what they read as it was. ``Drain``, ``Dequeue`` or a channel's
+#: ``ReadAsync`` would take what the moved assertions then look for.
+_PURE_READS = frozenset({
+    "ToString", "Contains", "Count", "Any", "All", "First", "FirstOrDefault", "Single",
+    "SingleOrDefault", "Equals", "GetHashCode",
+})
+#: Names that ask rather than take: ``IsValid``, ``HasRows``, ``CanRead``,
+#: ``ContainsKey``, and a ``Try…`` lookup, except the ones that remove or add
+#: what they find.
+_PURE_PREFIX = re.compile(r"(?:Is|Has|Can|Contains|Try)(?=[A-Z]|$)")
+_TAKING_TRIES = frozenset({
+    "TryDequeue", "TryRead", "TryTake", "TryPop", "TryReceive", "TryAdd", "TryRemove",
+    "TryUpdate", "TryGetNext",
+})
+
+
+def _pure_read(name: str) -> bool:
+    return name in _PURE_READS or (bool(_PURE_PREFIX.match(name)) and name not in _TAKING_TRIES)
+
+
+def _shared_receivers(statements: list[Node], resources: set[str]) -> set[str]:
+    """The receivers (``svc``, ``factory.TenantContext``) of each ``using``
+    resource in ``statements`` that the moved statements open too."""
+    found: set[str] = set()
+    for statement in statements:
+        if statement.type != "using_statement":
+            continue
+        body = statement.child_by_field_name("body")
+        for child in statement.named_children:
+            if (body is None or child.id != body.id) and _norm(child) in resources and child.type == "invocation_expression":
+                _, receiver = _method_name(child)
+                if receiver is not None:
+                    found.add(_norm(receiver))
+    return found
+
+
+def _reads_receiver(statements: list[Node], receivers: set[str], resources: set[str]) -> bool:
+    """Whether the moved statements read a member of a shared scope's
+    receiver (``Assert.Single(svc.OpenedScopes)`` after a second
+    ``using (svc.Scope("v"))``), beside the shared resource itself."""
+    if not receivers:
+        return False
+    stack = list(statements)
+    while stack:
+        node = stack.pop()
+        if node.parent is not None and node.parent.type == "using_statement" and _norm(node) in resources:
+            continue  # the resource the sibling opens too
+        if node.type == "member_access_expression":
+            expression = node.child_by_field_name("expression")
+            if expression is not None and _norm(expression) in receivers:
+                return True
+        stack.extend(node.children)
+    return False
+#: Of those, the ones that read a sequence, which must not be a call's
+#: result: ``svc.Drain().First()`` drains.
+_ON_PLAIN_RECEIVER = frozenset({"First", "FirstOrDefault", "Single", "SingleOrDefault", "Any", "All", "Count", "Contains"})
+
+
+def _method_name(call: Node) -> tuple[str, Node | None]:
+    function = call.child_by_field_name("function")
+    receiver = None
+    if function is not None and function.type == "member_access_expression":
+        receiver = function.child_by_field_name("expression")
+        function = function.child_by_field_name("name")
+    if function is not None and function.type == "generic_name":
+        function = next((c for c in function.named_children if c.type == "identifier"), None)
+    return (_text(function) if function is not None and function.type == "identifier" else ""), receiver
+
+
+def _awaited_lookup(node: Node) -> Node | None:
+    """The call in ``(await M(…))[x]``: a value fetched once and indexed."""
+    if node.type != "element_access_expression":
+        return None
+    inner = node.child_by_field_name("expression")
+    if inner is None or inner.type != "parenthesized_expression" or len(inner.named_children) != 1:
+        return None
+    awaited = inner.named_children[0]
+    if awaited.type != "await_expression" or len(awaited.named_children) != 1:
+        return None
+    call = awaited.named_children[0]
+    return call if call.type == "invocation_expression" else None
+
+
+def _quiet(statement: Node, resources: set[str]) -> bool:
+    """Whether an assertion statement of the sibling, now run before the
+    moved ones, can leave alone what they read: beside its ``Assert`` calls
+    it holds names, literals and member reads, calls on the
+    :data:`_PURE_READS` list or :func:`_pure_read`'s prefixes, awaited lookups ``(await M(…))[x]``, and a
+    ``using`` resource the moved statements open too. Anything else (a
+    ``Drain()``, ``Dequeue()``, ``await reader.ReadAsync()``, a construction)
+    refuses."""
+    own = {c.id for c in _assert_calls(statement)}
+    allowed: set[int] = set()
+    if statement.type == "using_statement":
+        body = statement.child_by_field_name("body")
+        allowed = {
+            c.id for c in statement.named_children
+            if (body is None or c.id != body.id) and _norm(c) in resources
+        }
+    stack = [statement]
+    while stack:
+        node = stack.pop()
+        if node.id in allowed:
+            continue
+        if node.id in own:
+            stack.extend(node.children)
+            continue
+        lookup = _awaited_lookup(node)
+        if lookup is not None:
+            stack.extend(lookup.children)
+            subscript = node.child_by_field_name("subscript")
+            if subscript is not None:
+                stack.append(subscript)
+            continue
+        if node.type == "invocation_expression":
+            name, receiver = _method_name(node)
+            if not _pure_read(name):
+                return False
+            if name in _ON_PLAIN_RECEIVER and receiver is not None and receiver.type in _EFFECTS:
+                return False
+            stack.extend(node.children)
+            continue
+        if node.type in _EFFECTS:
+            return False
+        stack.extend(node.children)
+    return True
+
+
+def _preprocessor_apart(method: Node, sibling: Node) -> str | None:
+    """Why the two tests are not under the same preprocessor conditions: a
+    different enclosing directive, or a directive inside either or between
+    them (``#if`` around one of them, ``#region``, ``#pragma``)."""
+    def enclosing(node: Node) -> tuple[int, ...]:
+        found = []
+        parent = node.parent
+        while parent is not None:
+            if parent.type.startswith("preproc"):
+                found.append(parent.id)
+            parent = parent.parent
+        return tuple(found)
+
+    if enclosing(method) != enclosing(sibling):
+        return "it and its sibling sit under different preprocessor directives"
+    root = method
+    while root.parent is not None:
+        root = root.parent
+    lo = min(method.start_byte, sibling.start_byte)
+    hi = max(method.end_byte, sibling.end_byte)
+    for node in _walk(root):
+        if node.end_byte <= lo or node.start_byte >= hi:
+            continue
+        if node.type.startswith("preproc") and lo <= node.start_byte:
+            return "a preprocessor directive lies inside or between it and its sibling"
+    return None
+
+
+#: Files whose spelling of a test's name is prose, which a fold may leave
+#: stale. Any other file (a CI workflow, a ``.runsettings`` filter, a script)
+#: may select the test by name, and keeps it.
+_PROSE = (".md", ".mdx", ".txt", ".rst")
+
+
+def _line_start(data: bytes, at: int) -> int:
+    return data.rfind(b"\n", 0, at) + 1
+
+
+def _line_end(data: bytes, at: int) -> int:
+    """The byte after the newline ending the line ``at`` is on."""
+    end = data.find(b"\n", at)
+    return len(data) if end < 0 else end + 1
+
+
+def _blank(data: bytes, start: int, end: int) -> bool:
+    return not data[start:end].strip()
+
+
+def _fold_edits(data: bytes, plan: _Fold, newline: bytes) -> list[tuple[int, int, bytes]] | str:
+    """The byte edits of one fold over ``data`` (the parsed text, no BOM)."""
+    method = plan.method
+    start = method.start_byte
+    # Its leading comments: each on the line directly above the next, none
+    # trailing the member before it.
+    previous = method.prev_named_sibling
+    while previous is not None and previous.type == "comment" and previous.end_point[0] == _row(data, start) - 1:
+        before = previous.prev_named_sibling
+        if before is not None and before.end_point[0] == previous.start_point[0]:
+            break
+        start = previous.start_byte
+        previous = before
+    start = _line_start(data, start)
+    end = _line_end(data, method.end_byte)
+    if not _blank(data, _line_start(data, method.start_byte), method.start_byte):
+        return "its declaration shares a line with other code"
+    if not _blank(data, method.end_byte, end):
+        return "its closing brace shares a line with other code"
+    # One blank line goes with it, so none is left doubled.
+    above = _line_start(data, max(start - 1, 0))
+    if start > 0 and _blank(data, above, start):
+        start = above
+    elif end < len(data) and _blank(data, end, _line_end(data, end)):
+        end = _line_end(data, end)
+    edits = [(start, end, b"")]
+    if plan.appended:
+        chunks = [data[_line_start(data, s.start_byte) : s.end_byte] for s in plan.appended]
+        if any(not _blank(data, _line_start(data, s.start_byte), s.start_byte) for s in plan.appended):
+            return "an assertion it keeps shares a line with other code"
+        # After the sibling's last statement, or after a comment trailing it
+        # on its line, which stays with it.
+        at = plan.anchor.end_byte
+        line_end = _line_end(data, at)
+        rest = data[at:line_end].rstrip(b"\r\n")
+        if not rest.strip() or rest.strip().startswith(b"//"):
+            at += len(rest)
+        edits.append((at, at, newline + newline + newline.join(chunks)))
+    return edits
+
+
+def _row(data: bytes, at: int) -> int:
+    return data.count(b"\n", 0, at)
+
+
+def fold(
+    summaries: list,
+    families: list[Family],
+    test_doubles: Iterable[tuple[str, str, str]],
+    treatment: bool,
+    repo_dir: str,
+    rewrite: Callable,
+) -> tuple[list, list[tuple[str, str, str]]]:
+    """Fold each test a phase cut left with a false name into the one sibling
+    that arranges and acts token for token as it now does, when both end in
+    nothing but assertions: its assertions the sibling does not already make
+    go at the end of the sibling, and the test goes with its attributes and
+    leading comment. Anything else is left for :func:`review_names` to
+    report. Returns the summaries and the rows."""
+    if not families:
+        return summaries, []
+    kept = _ON if treatment else _OFF
+    deleted_by_path: dict[str, list[str]] = {}
+    phases_by_path: dict[str, set[str]] = {}
+    for path, kind, text in test_doubles:
+        if kind == TEST:
+            deleted_by_path.setdefault(path, []).append(text)
+        elif kind == TEST_PHASE:
+            phases_by_path.setdefault(path, set()).add(text.split(":", 1)[0])
+    planned: list[tuple[int, str, str, list[_Fold]]] = []
+    for index, summary in enumerate(summaries):
+        if file_deletion.deleted(summary) or not str(summary.path).endswith(".cs"):
+            continue
+        if summary.original_content == summary.content:
+            continue
+        resolved = str(Path(summary.path).resolve())
+        relative = os.path.relpath(resolved, repo_dir)
+        phases = phases_by_path.get(relative, set())
+        if not phases:
+            continue
+        try:
+            root = _parse(summary.content.removeprefix(_BOM))
+            original = summary.original_content.removeprefix(_BOM)
+            scans = [s for f in families if (s := _scan(original, f, deleted_by_path.get(relative, ()))) is not None]
+            tests = {key: m for key, m in _methods(root).items() if _is_test(m)}
+            folds: list[_Fold] = []
+            for (chain, name), method in tests.items():
+                if not _is_false_title(name, method, scans, phases, kept):
+                    continue
+                plan = _fold_plan(method, chain, tests)
+                if isinstance(plan, str):
+                    logger.info("%s: %s keeps its false name, not folded: %s", relative, name, plan)
+                    continue
+                folds.append(plan)
+        except Exception as exc:  # noqa: BLE001 - never refuses the flag
+            logger.info("cut-down tests of %s not folded: %s: %s", summary.path, type(exc).__name__, exc)
+            continue
+        # A test folded into is never itself folded, and two folds never
+        # share a sibling.
+        targets = [f.sibling for f in folds]
+        folds = [
+            f for f in folds
+            if f.name not in targets and targets.count(f.sibling) == 1
+        ]
+        if folds:
+            planned.append((index, resolved, relative, folds))
+    if not planned:
+        return summaries, []
+    names = {f.name for _, _, _, folds in planned for f in folds}
+    spelled = _spellings(names, repo_dir)
+    named_files = _files_named(names, repo_dir)
+    rows: list[tuple[str, str, str]] = []
+    summaries = list(summaries)
+    for index, resolved, relative, folds in planned:
+        summary = summaries[index]
+        go: list[_Fold] = []
+        for plan in folds:
+            declaration = plan.method.child_by_field_name("name")
+            others = [
+                f"{where}:{line}" for where, line, path, at, _ in spelled.get(plan.name, [])
+                if not where.lower().endswith(_PROSE) and not (path == resolved and at - (3 if summary.content.startswith(_BOM) else 0) in (declaration.start_byte, declaration.start_byte + 1))
+            ]
+            if others:
+                logger.info("%s: %s not folded: a file that is not prose names it at %s", relative, plan.name, ", ".join(others[:3]))
+            elif plan.name in named_files:
+                logger.info("%s: %s not folded: a file is named for it: %s", relative, plan.name, named_files[plan.name])
+            else:
+                go.append(plan)
+        if not go:
+            continue
+        try:
+            raw = Path(resolved).read_bytes()
+        except OSError as exc:
+            logger.info("%s: cut-down tests not folded: %s", relative, exc)
+            continue
+        try:
+            done = _apply_folds(resolved, raw, summary, go, relative)
+        except Exception as exc:  # noqa: BLE001 - put the file back
+            logger.warning("cut-down tests of %s not folded: %s: %s", relative, type(exc).__name__, exc)
+            Path(resolved).write_bytes(raw)
+            continue
+        if done is None:
+            continue
+        text, done_plans = done
+        summaries[index] = rewrite(summary.path, summary.original_content, text)
+        rows += [(relative, FOLDED_TEST, f"{p.name}\n{p.sibling}\n{len(p.appended)}\n{p.new}\n{p.repeated}") for p in done_plans]
+    return summaries, rows
+
+
+def _apply_folds(resolved: str, raw: bytes, summary, go: list[_Fold], relative: str) -> tuple[str, list[_Fold]] | None:
+    """Write the folds ``go`` into ``resolved``, whose bytes are ``raw``:
+    the new text (byte-order mark kept) and the folds made, or ``None`` when
+    the file is left as it was."""
+    bom = 3 if raw.startswith(b"\xef\xbb\xbf") else 0
+    data = raw[bom:]
+    if data.decode("utf-8") != summary.content.removeprefix(_BOM):
+        return None  # not what was judged
+    newline = b"\r\n" if b"\r\n" in data else b"\n"
+    edits: list[tuple[int, int, bytes]] = []
+    done: list[_Fold] = []
+    for plan in go:
+        made = _fold_edits(data, plan, newline)
+        if isinstance(made, str):
+            logger.info("%s: %s not folded: %s", relative, plan.name, made)
+            continue
+        edits += made
+        done.append(plan)
+    if not done:
+        return None
+    spans = sorted((s, e) for s, e, _ in edits if e > s)
+    if any(a_end > b_start for (_, a_end), (b_start, _) in zip(spans, spans[1:])):
+        return None
+    out = data
+    for start, end, replacement in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        out = out[:start] + replacement + out[end:]
+    text = out.decode("utf-8")
+    if _errors(_parse(text)) > _errors(_parse(data.decode("utf-8"))):
+        logger.warning("cut-down tests of %s not folded: the result does not parse", relative)
+        return None
+    git_ops.before_writing([resolved])
+    Path(resolved).write_bytes(raw[:bom] + out)
+    return (_BOM if bom else "") + text, done
+
+
 def review_names(
     summaries: list,
     families: list[Family],
@@ -1223,6 +1802,11 @@ def review(
         if w.language == "csharp" and w.interface is not None and w.label in complete
         and (f := family(w.interface.name, [w.owner, *(s.owner for s in w.siblings)])) is not None
     ]
+    try:
+        summaries, folded = fold(summaries, families, test_doubles, treatment, repo_dir, rewrite)
+        rows += folded
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cut-down tests left as they were: %s: %s", type(exc).__name__, exc)
     try:
         summaries, named = review_names(summaries, families, test_doubles, treatment, repo_dir, rewrite)
         rows += named

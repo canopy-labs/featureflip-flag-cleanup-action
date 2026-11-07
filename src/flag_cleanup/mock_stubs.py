@@ -131,6 +131,11 @@ GATE_NAMED = "named for the gate"
 #: the way a sibling test's do (:mod:`flag_cleanup.cs_kept_tests`); carries the
 #: test's name and why, as ``name: reason``.
 DUPLICATE_TEST = "may duplicate"
+#: A :data:`FALSE_TITLE` test whose arrangement and act were, token for
+#: token, a sibling's, and which then only asserted: its assertions moved to
+#: the end of the sibling and the test was deleted; carries
+#: ``name\nsibling\nassertions moved``.
+FOLDED_TEST = "folded into a sibling"
 
 #: An argument list's tail after the key: balanced to three levels, which
 #: covers matchers such as ``any(Context.class)`` and ``It.IsAny<C>()``.

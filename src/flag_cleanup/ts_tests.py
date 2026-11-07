@@ -47,6 +47,7 @@ under Gate 1 and the same all-or-nothing rollback.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -80,6 +81,12 @@ _DANGLING = re.compile(
     r"\b(?:"
     + "|".join(f"{w}|{w.capitalize()}" for w in _CONNECTIVES)
     + r")[\s,.]*$"
+)
+
+#: A qualifier whose condition was the clause just dropped: "renders the banner
+#: only when the flag is on" must not become "renders the banner only".
+_QUALIFIERS = re.compile(
+    r"\b(?:only|except|unless|just|solely|exclusively|also|even|too|first|as\s+well)[\s,.]*$", re.IGNORECASE
 )
 
 #: A result ending in one of these has lost its second half.
@@ -282,6 +289,7 @@ def rename_kept_titles(
     flag_key: str,
     kept: str,
     has_stored_snapshot: Callable[[], bool] | bool = False,
+    before: str | None = None,
 ) -> tuple[str, list[tuple[str, str]]]:
     """``source`` with the flag's condition dropped from every title naming the
     KEPT branch, and ``(old, new)`` for each title it rewrote.
@@ -300,13 +308,20 @@ def rename_kept_titles(
     other title is left exactly as it was, and reported as it was before. A
     title is only a string, so a rewrite cannot break the build, and each one
     is named in the pull request.
+
+    ``before`` is the file as it stood before the run. With it, a title that
+    does not spell the key but ends in ``even with the gate on`` (or ``when the
+    flag is on``) is rewritten too, when its OWN test pinned this flag to the
+    kept value there and pinned no other flag: the "gate" is then this flag,
+    and the entry that made the phrase true was stripped. See
+    :func:`reworded_pinned_title`.
     """
     # Stored snapshots and screenshots are keyed by the full test name, so a
     # rename orphans them wherever the assertion sits (a helper, an
     # `afterEach`, a nested describe). A file that uses one is not renamed at
     # all, and neither is one the repository holds a snapshot file for (a
     # helper imported from another module).
-    if has_stored_snapshot is True or _STORED_SNAPSHOT.search(source):
+    if has_stored_snapshot is True or _STORED_SNAPSHOT.search(source) or kept not in _STATES:
         return source, []
     # Asked lazily: looking for the repository's snapshot files walks the tree,
     # which only matters once a title could actually be renamed.
@@ -324,6 +339,8 @@ def rename_kept_titles(
     # (except across describe titles that contain spaces, which this accepts), so a rename is refused when its new
     # title could equal any other title here, existing or already produced.
     patterns = _title_patterns(root, data)
+    pinned_titles = _pinned_titles(before, language, flag_key, kept) if before else frozenset()
+    after_counts = Counter(title for _n, _c, title in titled)
     for node, _callee, title in titled:
         arguments = node.child_by_field_name("arguments")
         if arguments is None or not hands_callback(arguments):
@@ -331,6 +348,8 @@ def rename_kept_titles(
         literal = arguments.named_children[0]
         raw = data[literal.start_byte + 1 : literal.end_byte - 1].decode("utf-8")
         new = reworded_title(title, flag_key, kept) if raw == title else None
+        if new is None and raw == title and title in pinned_titles and after_counts[title] == 1:
+            new = reworded_pinned_title(title, flag_key, kept)
         if new is None:
             continue
         if not checked:
@@ -349,6 +368,663 @@ def rename_kept_titles(
     for start, end, text in sorted(edits, reverse=True):
         data = data[:start] + text + data[end:]
     return data.decode("utf-8"), renamed
+
+
+#: Words that make a call, a JSX attribute or a name "about flags". A call
+#: named with one of them must carry nothing but this flag's own stripped pin.
+_FLAG_WORDS = frozenset(
+    {"flag", "flags", "feature", "features", "toggle", "toggles", "gate", "gates", "override", "overrides"}
+)
+#: Words of a call that can set state a flag read depends on.
+_STATEFUL = _FLAG_WORDS | frozenset(
+    {"set", "mock", "return", "value", "spy", "stub", "use", "enable", "disable", "enabled", "disabled",
+     "configure", "config", "init", "initialize", "setup", "store", "state", "context"}
+)
+_HOOKS = frozenset({"beforeEach", "beforeAll", "afterEach", "afterAll"})
+_FUNCTIONS = ("arrow_function", "function_expression", "function", "function_declaration")
+
+
+def _words(text: str) -> list[str]:
+    """``renderFlagRow`` -> ``["render", "flag", "row"]``."""
+    return [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", text)]
+
+
+def _callee_words(call: Node, data: bytes) -> list[str]:
+    callee = call.child_by_field_name("function") or call.child_by_field_name("constructor")
+    if callee is not None and callee.type == "member_expression":
+        callee = callee.child_by_field_name("property")
+    return _words(_text(callee, data)) if callee is not None else []
+
+
+def _plain(node: Node) -> list[Node]:
+    return [c for c in node.named_children if c.type != "comment"]
+
+
+def _only_pair(obj: Node, allowed: set[int]) -> bool:
+    """``obj`` is ``{}`` or holds exactly one pair, one of ``allowed``."""
+    if obj.type != "object":
+        return False
+    members = _plain(obj)
+    return not members or (len(members) == 1 and members[0].id in allowed)
+
+
+def _boolean_like(node: Node, data: bytes) -> bool:
+    """``true``/``false``, ``!<literal>`` or the strings ``'true'``/``'false'``."""
+    if node.type in ("true", "false"):
+        return True
+    if node.type == "parenthesized_expression" and _plain(node):
+        return _boolean_like(_plain(node)[0], data)
+    if node.type == "unary_expression":
+        operand = node.child_by_field_name("argument")
+        op = node.child_by_field_name("operator")
+        return (
+            op is not None
+            and _text(op, data) == "!"
+            and operand is not None
+            and (operand.type in ("true", "false", "number") or _boolean_like(operand, data))
+        )
+    if node.type == "string":
+        return _literal_text(node, data) in ("true", "false")
+    return False
+
+
+#: Names a test file may use without declaring.
+_GLOBALS = frozenset({"undefined", "NaN", "Infinity", "window", "document", "globalThis", "expect", "vi", "jest",
+                      "console", "process", "Math", "JSON", "Date", "Promise", "Object", "Array"})
+
+
+class _File:
+    """What the whole file says about names: bindings and same-file helpers."""
+
+    def __init__(self, root: Node, data: bytes) -> None:
+        self.data = data
+        self.bad_bindings: dict[str, str] = {}  # name -> "boolean" | "object"
+        self.local_functions: set[str] = set()
+        self.imported: set[str] = set()
+        self.module_state = False
+        #: Every name the file binds: declarations, parameters, imports.
+        self.declared: set[str] = set(_GLOBALS)
+        for node in _walk(root):
+            if node.type == "import_statement":
+                for inner in _walk(node):
+                    if inner.type == "identifier":
+                        self.imported.add(_text(inner, data))
+            if node.type in ("formal_parameters", "import_clause", "namespace_import", "import_specifier",
+                             "catch_clause"):
+                for inner in _walk(node):
+                    if inner.type in ("identifier", "shorthand_property_identifier_pattern"):
+                        self.declared.add(_text(inner, data))
+            elif node.type in ("function_declaration", "class_declaration", "function_expression"):
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    self.declared.add(_text(name, data))
+            elif node.type == "arrow_function":
+                param = node.child_by_field_name("parameter")
+                if param is not None:
+                    self.declared.add(_text(param, data))
+            if node.type == "variable_declarator":
+                target = node.child_by_field_name("name")
+                if target is not None:
+                    for inner in _walk(target):
+                        if inner.type in ("identifier", "shorthand_property_identifier_pattern"):
+                            self.declared.add(_text(inner, data))
+            if node.type == "variable_declarator":
+                name = node.child_by_field_name("name")
+                value = node.child_by_field_name("value")
+                if name is None or name.type != "identifier" or value is None:
+                    continue
+                text = _text(name, data)
+                if value.type in _FUNCTIONS:
+                    self.local_functions.add(text)
+                elif _boolean_like(value, data):
+                    self.bad_bindings[text] = "boolean"
+                elif value.type == "object":
+                    self.bad_bindings.setdefault(text, "object")
+            elif node.type == "function_declaration":
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    self.local_functions.add(_text(name, data))
+            elif node.type == "call_expression":
+                callee = node.child_by_field_name("function")
+                text = _text(callee, data) if callee is not None else ""
+                if text in ("vi.hoisted", "jest.hoisted"):
+                    self.module_state = True
+
+
+def _is_hook(call: Node, data: bytes) -> bool:
+    callee = call.child_by_field_name("function")
+    return callee is not None and _text(callee, data).split(".")[-1] in _HOOKS
+
+
+def _is_describe(node: Node, data: bytes) -> bool:
+    if node.type != "call_expression":
+        return False
+    callee = node.child_by_field_name("function")
+    return callee is not None and "describe" in _text(callee, data).split(".")[0]
+
+
+def _clean_scope(
+    scope: Node,
+    file: _File,
+    pairs: dict[int, Node],
+    calls: dict[int, Node],
+    skipped: set[int],
+    flag_key: str,
+    *,
+    helper: bool = False,
+) -> bool:
+    """Whether everything in ``scope`` that could set a flag is accounted for.
+
+    ``pairs`` are this flag's own stripped pins and ``calls`` the helper calls
+    that pinned it. In a STRICT scope (the test, its rows, its hooks) every
+    boolean-like value must sit inside one of them, and there may be no object
+    spread. In a ``helper`` body, which is full of ordinary options
+    (``retry: false``), a boolean-like only matters where it can set state: as
+    an argument of a call named for flags or for setting. In both, a call or
+    JSX attribute named for flags may carry nothing but this pin, the object
+    holding this flag's pair holds only that pair, and a name bound anywhere
+    in the file to a boolean-like value (or, as an argument, an object) is
+    refused.
+    """
+    data = file.data
+    accounted: list[Node] = [*pairs.values(), *calls.values()]
+    allowed = set(pairs)
+    if helper:
+        # In a helper the pin is the pair keyed by this flag, whatever feeds it.
+        allowed |= {n.id for n in _walk(scope) if n.type == "pair" and _keyed_by(n, data, flag_key)}
+    in_accounted = lambda n: any(_contains(a, n) for a in accounted)  # noqa: E731
+    params: set[str] = set()
+    if helper:
+        for n in _walk(scope):
+            if n.type in ("identifier", "shorthand_property_identifier_pattern") and n.parent is not None and (
+                n.parent.type in ("required_parameter", "optional_parameter", "formal_parameters", "object_pattern",
+                                  "object_assignment_pattern", "assignment_pattern", "arrow_function")
+            ):
+                params.add(_text(n, data))
+    for node in _walk(scope):
+        if node.id in skipped:
+            continue
+        t = node.type
+        if _boolean_like(node, data) and not helper and not in_accounted(node):
+            return False
+        if t == "spread_element":
+            return False
+        if t == "object":
+            members = _plain(node)
+            has_pin = any(
+                m.type == "pair" and _keyed_by(m, data, flag_key) for m in members
+            )
+            if has_pin and len(members) != 1:
+                return False
+            # A computed key can spell any flag.
+            if any(
+                m.type == "pair" and (k := m.child_by_field_name("key")) is not None
+                and k.type == "computed_property_name"
+                for m in members
+            ):
+                return False
+        if t == "identifier" and node.parent is not None and node.parent.type not in (
+            "property_identifier", "function_declaration", "variable_declarator", "required_parameter",
+            "optional_parameter", "formal_parameters",
+        ):
+            text = _text(node, data)
+            kind = file.bad_bindings.get(text)
+            if kind == "boolean":
+                return False
+            # A name nothing in the file declares could be anything.
+            if text not in file.declared and node.parent.type in ("arguments", "jsx_expression"):
+                return False
+            if kind == "object" and node.parent.type in ("arguments", "jsx_expression", "pair"):
+                return False
+        if t == "number" and _text(node, data) in ("0", "1"):
+            call = node.parent.parent if node.parent is not None and node.parent.type == "arguments" else None
+            if call is not None and call.type == "call_expression" and _STATEFUL & set(_callee_words(call, data)):
+                return False
+        if helper and _boolean_like(node, data) and not in_accounted(node):
+            # climb to the call whose argument it is
+            holder = node
+            while holder is not None and holder.type != "arguments":
+                if holder.type in ("statement_block", "variable_declarator"):
+                    holder = None
+                    break
+                holder = holder.parent
+            if holder is not None and holder.parent is not None and holder.parent.type == "call_expression":
+                if _STATEFUL & set(_callee_words(holder.parent, data)):
+                    return False
+        if helper:
+            if t in ("assignment_expression", "augmented_assignment_expression"):
+                right = node.child_by_field_name("right")
+                if right is not None and any(_boolean_like(n, data) for n in _walk(right)):
+                    return False
+            if t == "pair":
+                key = node.child_by_field_name("key")
+                value = node.child_by_field_name("value")
+                if (
+                    key is not None and key.type == "string" and value is not None
+                    and _boolean_like(value, data) and not _keyed_by(node, data, flag_key)
+                ):
+                    return False
+            if t == "jsx_attribute" and node.parent is not None and node.parent.type in (
+                "jsx_opening_element", "jsx_self_closing_element"
+            ):
+                element = node.parent.child_by_field_name("name")
+                if element is not None and _text(element, data)[:1].isupper():
+                    value = [c for c in node.named_children[1:] if c.type != "comment"]
+                    direct = [
+                        (_plain(v)[0] if v.type == "jsx_expression" and _plain(v) else v) for v in value
+                    ]
+                    # A bare attribute (`<Beta enabled>`) or a boolean-like value.
+                    if not value or any(_boolean_like(v, data) for v in direct):
+                        return False
+        if t == "jsx_attribute":
+            name = node.named_children[0] if node.named_children else None
+            if name is not None and _FLAG_WORDS & set(_words(_text(name, data))):
+                holder = [c for c in node.named_children if c.type == "jsx_expression"]
+                inner = _plain(holder[0]) if holder else []
+                ok = len(inner) == 1 and (
+                    _only_pair(inner[0], allowed)
+                    or (helper and inner[0].type == "identifier" and _text(inner[0], data) in params)
+                )
+                if not ok:
+                    return False
+        if t in ("call_expression", "new_expression") and _FLAG_WORDS & set(_callee_words(node, data)):
+            if node.id in calls:
+                continue
+            arguments = node.child_by_field_name("arguments")
+            args = _plain(arguments) if arguments is not None else []
+            if args and not (len(args) == 1 and _only_pair(args[0], allowed)):
+                return False
+        if helper and t in ("object_assignment_pattern", "assignment_pattern", "required_parameter", "optional_parameter"):
+            default = node.child_by_field_name("right") or node.child_by_field_name("value")
+            target = node.child_by_field_name("left") or node.child_by_field_name("pattern")
+            if default is not None and default.type == "object" and not _only_pair(default, allowed):
+                return False
+            if (
+                default is not None and target is not None and default.type != "object"
+                and not _boolean_like(default, data)
+            ):
+                name = _text(target, data)
+                for use in _walk(scope):
+                    if use.type != "identifier" or _text(use, data) != name or use.id == target.id:
+                        continue
+                    if any(use.id == n.id for n in _walk(target)):
+                        continue
+                    chain = list(_ancestors(use, scope))
+                    for up in chain:
+                        if up.type == "pair" and up.child_by_field_name("value") is not None:
+                            value = up.child_by_field_name("value")
+                            if _contains(value, use) and not _keyed_by(up, data, flag_key):
+                                return False
+                            break
+                    for up in chain:
+                        if up.type == "jsx_attribute" and up.named_children and (
+                            _FLAG_WORDS & set(_words(_text(up.named_children[0], data)))
+                        ):
+                            if not any(
+                                p.type == "pair" and _keyed_by(p, data, flag_key) and _contains(p, use)
+                                for p in chain
+                            ):
+                                return False
+            if default is not None and target is not None and _boolean_like(default, data):
+                name = _text(target, data)
+                used = any(
+                    p.type == "pair"
+                    and _keyed_by(p, data, flag_key)
+                    and (v := p.child_by_field_name("value")) is not None
+                    and v.type == "identifier"
+                    and _text(v, data) == name
+                    for p in _walk(scope)
+                )
+                if not used:
+                    return False
+    return True
+
+
+def _spells(scope: Node, data: bytes, noun: str, skipped: set[int]) -> bool:
+    """Whether code or text in ``scope`` outside ``skipped`` spells ``noun``:
+    an identifier, a property key, a string or JSX text."""
+    for node in _walk(scope):
+        if node.type in (
+            "identifier", "property_identifier", "shorthand_property_identifier",
+            "shorthand_property_identifier_pattern", "type_identifier", "string_fragment", "jsx_text",
+        ):
+            if node.id in skipped or any(a.id in skipped for a in _ancestors(node, scope)):
+                continue
+            if {noun, noun + "s"} & set(_words(_text(node, data))):
+                return True
+    return False
+
+
+def _ancestors(node: Node, stop: Node):
+    parent = node.parent
+    while parent is not None:
+        yield parent
+        if parent.id == stop.id:
+            return
+        parent = parent.parent
+
+
+def _pinned_clause(kept: str) -> re.Pattern[str]:
+    noun = r"(?P<noun>flag|feature|toggle|gate)"
+    state = rf"(?:{_STATES[kept]})"
+    return re.compile(
+        rf"(?:\s*[,—–-])?\s+(?:even\s+)?(?:with|when)\s+the\s+{noun}"
+        rf"(?:\s+(?:is|are))?\s+{state}(?:\s*\((?:by\s+)?default\))?(?=[\s.]*$)",
+        re.IGNORECASE,
+    )
+
+
+_AMBIGUOUS = object()
+
+
+def _declared_here(container: Node, name: str, data: bytes) -> list[Node]:
+    """The functions ``container`` directly declares under ``name``."""
+    found: list[Node] = []
+    for child in container.named_children:
+        if child.type == "export_statement":
+            child = child.child_by_field_name("declaration") or child
+        if child.type == "function_declaration":
+            target = child.child_by_field_name("name")
+            if target is not None and _text(target, data) == name:
+                found.append(child)
+        elif child.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in child.named_children:
+                target = declarator.child_by_field_name("name")
+                value = declarator.child_by_field_name("value")
+                if (
+                    target is not None and value is not None and value.type in _FUNCTIONS
+                    and target.type == "identifier" and _text(target, data) == name
+                ):
+                    found.append(value)
+    return found
+
+
+def _resolve(name: str, at: Node, data: bytes):
+    """The function ``name`` means at ``at``: the nearest enclosing lexical
+    declaration. ``_AMBIGUOUS`` when that scope declares it twice, ``None``
+    when no enclosing scope does."""
+    node = at.parent
+    while node is not None:
+        if node.type in ("program", "statement_block"):
+            found = _declared_here(node, name, data)
+            if len(found) > 1:
+                return _AMBIGUOUS
+            if found:
+                return found[0]
+        node = node.parent
+    return None
+
+
+def _helper_closure(roots: list[Node], file: _File, skip: set[int]) -> list[Node] | None:
+    """Every same-file function the scopes call, transitively, each resolved to
+    its nearest enclosing declaration. ``None`` when a call is ambiguous (two
+    declarations in one scope) or names a helper the call cannot see: a
+    same-named helper in another group is not the one that runs."""
+    found: dict[int, Node] = {}
+    queue = list(roots)
+    while queue:
+        scope = queue.pop()
+        for node in _walk(scope):
+            if node.type not in ("call_expression", "new_expression"):
+                continue
+            callee = node.child_by_field_name("function") or node.child_by_field_name("constructor")
+            if callee is None or callee.type != "identifier":
+                continue
+            name = _text(callee, file.data)
+            fn = _resolve(name, node, file.data)
+            if fn is _AMBIGUOUS:
+                return None
+            if fn is None:
+                # An imported or global name is another file's business.
+                if name in file.local_functions and name not in file.imported:
+                    return None
+                continue
+            if fn.id not in found:
+                found[fn.id] = fn
+                queue.append(fn)
+    return list(found.values())
+
+
+def _factories_clean(root: Node, file: _File) -> bool:
+    """No ``vi.mock``/``jest.mock`` factory in the file sets a boolean-like value
+    or reads a name bound to one. Spreading the real module is fine."""
+    data = file.data
+    for node in _walk(root):
+        if node.type != "call_expression":
+            continue
+        callee = node.child_by_field_name("function")
+        if callee is None or _text(callee, data) not in ("vi.mock", "jest.mock", "vi.doMock", "jest.doMock"):
+            continue
+        for inner in _walk(node):
+            if _boolean_like(inner, data):
+                return False
+            if inner.type == "identifier" and file.bad_bindings.get(_text(inner, data)) == "boolean":
+                return False
+            # A literal a function in the factory returns is a value a read can see.
+            if inner.type in ("arrow_function", "function_expression", "function"):
+                body = inner.child_by_field_name("body")
+                if body is not None and body.type in ("number", "string", "template_string", "true", "false"):
+                    return False
+            if inner.type == "return_statement" and _plain(inner) and _plain(inner)[0].type in (
+                "number", "string", "template_string", "true", "false"
+            ):
+                return False
+    return True
+
+
+_MOCKS = ("vi.mock", "jest.mock", "vi.doMock", "jest.doMock")
+
+
+def _enclosing_statements(test: Node, root: Node, data: bytes) -> list[Node]:
+    """The statements at module scope and directly in each enclosing group's
+    body that can set state: not function declarations, imports, mock
+    factories (scanned on their own) or the test, group and hook calls
+    themselves (scanned through their own paths)."""
+    containers: list[Node] = [root]
+    ancestor = test.parent
+    while ancestor is not None:
+        if _is_group(ancestor, data):
+            args = ancestor.child_by_field_name("arguments")
+            for part in (_plain(args)[1:] if args is not None else []):
+                body = part.child_by_field_name("body")
+                if body is not None and body.type == "statement_block":
+                    containers.append(body)
+        ancestor = ancestor.parent
+    statements: list[Node] = []
+    for container in containers:
+        for child in container.named_children:
+            if child.type in ("import_statement", "function_declaration", "comment"):
+                continue
+            if child.type in ("lexical_declaration", "variable_declaration") and all(
+                (d.child_by_field_name("value") is not None and d.child_by_field_name("value").type in _FUNCTIONS)
+                for d in child.named_children if d.type == "variable_declarator"
+            ):
+                continue
+            if child.type == "expression_statement":
+                inner = _plain(child)[0] if _plain(child) else None
+                if inner is not None and inner.type == "await_expression":
+                    inner = _plain(inner)[0] if _plain(inner) else None
+                if inner is not None and inner.type == "call_expression":
+                    fn = inner.child_by_field_name("function")
+                    text = _text(fn, data) if fn is not None else ""
+                    if text in _MOCKS or _is_hook(inner, data) or _is_group(inner, data):
+                        continue
+                    first = _plain(inner.child_by_field_name("arguments"))[:2] if inner.child_by_field_name("arguments") is not None else []
+                    declares = len(first) == 2 and first[0].type in ("string", "template_string") and first[1].type in _FUNCTIONS
+                    if declares and fn is not None and (_is_test_callee(fn, data) or _is_parametrised_callee(fn, data)):
+                        continue
+            statements.append(child)
+    return statements
+
+
+def _is_group(node: Node, data: bytes) -> bool:
+    if node.type != "call_expression":
+        return False
+    callee = node.child_by_field_name("function")
+    if callee is None:
+        return False
+    if callee.type == "call_expression":  # describe.each(rows)('t', cb)
+        callee = callee.child_by_field_name("function")
+        if callee is None:
+            return False
+    parts = _text(callee, data).split(".")
+    return any(p in ("describe", "fdescribe", "xdescribe", "suite") for p in parts) and parts[-1] != "configure"
+
+
+def _pinned_titles(before: str, language: str, flag_key: str, kept: str) -> frozenset[str]:
+    """Titles of the tests in ``before`` that pinned THIS flag to ``kept`` and
+    nothing else that could set state, and whose code never spells the title's
+    subject.
+
+    The whitelist covers the COMPLETE scope that can set state for the test:
+    its callback, the ``.each`` rows, every enclosing hook (any callee ending
+    in ``beforeEach``/``beforeAll``/``afterEach``/``afterAll``), the body of
+    every same-file helper any of those calls, and the module: a file with a
+    ``vi.hoisted`` call, or a ``vi.mock`` factory that sets a boolean-like
+    value, is refused. See :func:`_clean_scope` for what each scope may hold.
+    A title shared by two tests is left out.
+    """
+    data = before.encode("utf-8")
+    root = _parse(before, language)
+    file = _File(root, data)
+    if file.module_state or not _factories_clean(root, file):
+        return frozenset()
+    helper_calls = pinned_calls(before, language, flag_key)
+    titled = _titled_tests(root, data, parametrised=True)
+    counts = Counter(title for _n, _c, title in titled)
+    clause = _pinned_clause(kept)
+    found = set()
+    for node, callee_text, title in titled:
+        match = clause.search(title)
+        if counts[title] != 1 or match is None or "describe" in callee_text.split(".")[0]:
+            continue
+        # A nested test is its own test: only an innermost one has a body.
+        if any(o is not node and _contains(node, o) for o, _c, _t in titled):
+            continue
+        arguments = node.child_by_field_name("arguments")
+        callback = _plain(arguments)[1:] if arguments is not None else []
+        function = node.child_by_field_name("function")
+        rows = []
+        if function is not None and function.type == "call_expression":
+            row_args = function.child_by_field_name("arguments")
+            if row_args is not None:
+                rows.append(row_args)
+        hooks: list[Node] = []
+        groups: list[Node | None] = [None]
+        ancestor = node.parent
+        while ancestor is not None:
+            if _is_group(ancestor, data):
+                groups.append(ancestor)
+            ancestor = ancestor.parent
+        for hook in _walk(root):
+            if hook.type == "call_expression" and _is_hook(hook, data):
+                owner = hook.parent
+                while owner is not None and not _is_group(owner, data):
+                    owner = owner.parent
+                if any((g is None and owner is None) or (g is not None and owner is not None and g.id == owner.id) for g in groups):
+                    hooks.append(hook)
+        for g in groups:
+            if g is not None:
+                gf = g.child_by_field_name("function")
+                if gf is not None and gf.type == "call_expression":
+                    gr = gf.child_by_field_name("arguments")
+                    if gr is not None:
+                        rows.append(gr)
+        strict = [*callback, *rows, *hooks]
+        pairs: dict[int, Node] = {}
+        calls: dict[int, Node] = {}
+        for scope in callback:
+            for inner in _walk(scope):
+                if _pins(inner, data, flag_key, kept):
+                    pairs[inner.id] = inner
+                elif (
+                    inner.type == "call_expression"
+                    and helper_calls.get((inner.start_byte, inner.end_byte)) == kept
+                    # The one boolean the call passes is the pin: a call
+                    # passing two could be pinning another flag as well.
+                    and sum(1 for n in _walk(inner) if n.type in ("true", "false")) == 1
+                ):
+                    calls[inner.id] = inner
+        if not pairs and not calls:
+            continue
+        # The pin must be alone in its object.
+        if any(pair.parent is None or len(_plain(pair.parent)) != 1 for pair in pairs.values()):
+            continue
+        # The stripped pin and the call that delivers it are not "spelling".
+        skipped: set[int] = set(pairs) | set(calls)
+        for pair in pairs.values():
+            holder = pair.parent.parent if pair.parent is not None else None
+            if holder is not None and holder.type == "arguments" and holder.parent is not None:
+                skipped.add(holder.parent.id)
+        helpers = _helper_closure(strict, file, skipped)
+        if helpers is None:
+            continue
+        if not all(_clean_scope(st, file, {}, {}, set(), flag_key) for st in _enclosing_statements(node, root, data)):
+            continue
+        if not all(_clean_scope(scope, file, pairs, calls, skipped, flag_key) for scope in strict):
+            continue
+        if not all(
+            _clean_scope(fn, file, pairs, calls, skipped, flag_key, helper=True) for fn in helpers
+        ):
+            continue
+        # What CARRIES the pin to the provider is not "spelling": the helper's
+        # own name and parameters, the flag-named JSX attribute, this flag's pair.
+        spell_skip = set(skipped)
+        for fn in helpers:
+            holder = fn.parent
+            if holder is not None and holder.type == "variable_declarator":
+                target = holder.child_by_field_name("name")
+                if target is not None:
+                    spell_skip.add(target.id)
+            for part in ("name", "parameters", "parameter"):
+                child = fn.child_by_field_name(part)
+                if child is not None:
+                    spell_skip.add(child.id)
+            for inner in _walk(fn):
+                if inner.type == "jsx_attribute" and inner.named_children and (
+                    _FLAG_WORDS & set(_words(_text(inner.named_children[0], data)))
+                ):
+                    spell_skip.add(inner.id)
+                elif inner.type == "pair" and _keyed_by(inner, data, flag_key):
+                    spell_skip.add(inner.id)
+        noun = match.group("noun").lower()
+        if any(_spells(scope, data, noun, spell_skip) for scope in [*strict, *helpers]):
+            continue
+        found.add(title)
+    return frozenset(found)
+
+
+def reworded_pinned_title(title: str, flag_key: str, kept: str) -> str | None:
+    """``title`` without a trailing ``even with the gate on`` / ``when the flag
+    is on`` naming the KEPT state, or ``None``.
+
+    Only called for a test that pinned this flag to ``kept`` itself, which is
+    what makes "the gate" this flag. The same bar as :func:`reworded_title`
+    applies to the result: no hedge left, no dangling conjunction, never empty,
+    no removed state.
+    """
+    clause = _pinned_clause(kept)
+    if "\n" in title or key_in(title, flag_key) or _HEDGES.search(clause.sub("", title, count=1)):
+        return None
+    new, count = clause.subn("", title, count=1)
+    removed = _removed_state_pattern(flag_key, "true" if kept == "false" else "false")
+    if (
+        not count
+        or not new.strip()
+        or _DANGLING.search(new)
+        or _QUALIFIERS.search(new)
+        or _DANGLING_PUNCTUATION.search(new)
+        or removed.search(new)
+        or new.count("\\") != title.count("\\")
+    ):
+        return None
+    return new
+
+
+def key_in(title: str, flag_key: str) -> bool:
+    return bool(
+        re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", title, re.IGNORECASE)
+    )
 
 
 _WILD = "\0"
@@ -506,6 +1182,7 @@ def reworded_title(title: str, flag_key: str, kept: str) -> str | None:
         or not new.strip()
         # A clause cut from after a conjunction leaves it hanging.
         or (dropped_even_with and _DANGLING.search(new))
+        or _QUALIFIERS.search(new)
         or _DANGLING_PUNCTUATION.search(new)
         or key.search(new)
         or removed.search(new)
@@ -1108,6 +1785,81 @@ def _jsx_texts(root: Node, data: bytes) -> set[str]:
     return texts
 
 
+#: A subject word followed by one of the words for a flag's state: "the flag is
+#: off", "with the gate on", "the feature enabled". `on` is not a state before
+#: a capitalised word or an article ("the toggle on Free", "toggle on the page").
+_STATE_WORDS = (
+    r"(?:(?:turned\s+)?(?:off|disabled|enabled|false|true)"
+    r"|(?:turned\s+)?on(?!\s+(?:the|a|an|this|that|every|each|any|(?-i:[A-Z]))))"
+)
+_SPEAKS_OF_STATE = re.compile(
+    rf"(?<![\w-])(?:{_SUBJECTS})(?![\w-])\s+(?:(?:is|are|was|were|being|stays?|remains?|gets?|has|have)\s+)*{_STATE_WORDS}\b",
+    re.IGNORECASE,
+)
+#: Readiness: "waits for flags to load", "until flags are fetched", "before the
+#: flags have not loaded".
+_SPEAKS_OF_READINESS = re.compile(
+    rf"(?<![\w-])(?:{_SUBJECTS})(?![\w-])\s+"
+    r"(?:(?:to|have|has|had|are|is|were|was|get|got|been|not|yet|finish(?:es|ed)?|still|already|all|finally)\s+)*"
+    r"(?:load|loads|loaded|loading|resolve|resolves|resolved|ready|settle|settles|settled"
+    r"|initiali[sz]e[sd]?|fetch|fetched|fetching|arrive|arrived)\b",
+    re.IGNORECASE,
+)
+#: A hyphenated compound ("web-flag-permanence", "dead-flag") is a NAME: the
+#: title is about some other flag. A compound made only of subject words
+#: ("feature-flag", "feature-gated") is the subject itself, written as one word.
+_FLAG_NAME = re.compile(r"[\w]+(?:-[\w]+)+")
+_SUBJECT_PART = re.compile(r"(?:flags?|features?|toggles?|toggled|gates?|gated|flagged)", re.IGNORECASE)
+
+
+def speaks_of_a_flag(title: str) -> bool:
+    """Whether ``title`` says something about a flag's STATE or readiness.
+
+    A flag product's tests say "flags" about their domain ("should filter
+    flags by name", "the flag cleanup toggle"), which is not a statement about
+    the flag this run removed. Only a subject word inside a state phrase
+    ("when the flag is off") or a readiness phrase ("waits for flags to
+    load") counts, and a title naming a hyphenated compound with a subject
+    word in it ("web-flag-permanence", "dead-flag") is about another flag.
+    """
+    for name in _FLAG_NAME.findall(title):
+        parts = name.split("-")
+        if all(_SUBJECT_PART.fullmatch(part) for part in parts):
+            title = title.replace(name, "flag", 1)
+        elif any(_SUBJECT_PART.fullmatch(part) for part in parts):
+            return False
+    return bool(_SPEAKS_OF_STATE.search(title) or _SPEAKS_OF_READINESS.search(title))
+
+
+def _chain_in_before(
+    title: str, before_chains: dict[str, set[tuple[str, ...]]], after_chain: tuple[str, ...]
+) -> tuple[str, ...]:
+    """The describe chain a kept test had BEFORE the run, when its title says
+    where: the run may have renamed a group around it."""
+    chains = before_chains.get(title, set())
+    return next(iter(chains)) if len(chains) == 1 else after_chain
+
+
+def _describe_chain(node: Node, data: bytes) -> tuple[str, ...]:
+    """The titles of the ``describe`` groups enclosing ``node``, outermost first."""
+    chain: list[str] = []
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type == "call_expression":
+            callee = ancestor.child_by_field_name("function")
+            arguments = ancestor.child_by_field_name("arguments")
+            if (
+                callee is not None
+                and arguments is not None
+                and "describe" in _text(callee, data).split(".")[0]
+                and arguments.named_children
+            ):
+                title = _literal_text(arguments.named_children[0], data)
+                chain.append(title if title is not None else "\0")
+        ancestor = ancestor.parent
+    return tuple(reversed(chain))
+
+
 def stale_scaffolding(
     before: str,
     after: str,
@@ -1126,10 +1878,11 @@ def stale_scaffolding(
     query that said it was there sat in a test this run deleted (``before``
     had one, ``after`` has none), or ``X`` is JSX text the run deleted from
     the code under test (``gone``). A kept title is stale when it speaks of
-    the flag ("waits for flags to load …"), does not name the key (that is
+    the flag's state or readiness (:func:`speaks_of_a_flag`: "waits for flags
+    to load …"), does not name the key (that is
     :func:`rename_kept_titles`' case), was not just renamed (``renamed``),
     and either shares a word with the title of a test the run deleted from
-    this file (``deleted``: "… instead of redirecting" beside "redirects a
+    the same ``describe`` group (``deleted``: "… instead of redirecting" beside "redirects a
     typed URL …") or holds one of the vacuous assertions. Report only: a
     reviewer pointer, never an edit.
     """
@@ -1161,16 +1914,44 @@ def stale_scaffolding(
         seen.add(statement.id)
         rows.append(f"{line}: {_text(statement, data).splitlines()[0].strip()}")
     key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])", re.IGNORECASE)
-    subject = re.compile(rf"\b(?:{_SUBJECTS})\b", re.IGNORECASE)
-    deleted_stems = set().union(*(_stems(t) for t in deleted)) if deleted else set()
+    # The stems of each deleted title, by the describe chain it sat in. A kept
+    # title shares a word with a deleted one only when both are in the same
+    # innermost group; the same word elsewhere is another behaviour. A group
+    # the run emptied is matched one level up, so a sibling group ("with the
+    # flag on" beside the emptied "with the flag off") still counts. Every
+    # chain is taken from `before`, so a group the run renamed is still the
+    # same group.
+    old_titled = _titled_tests(_parse(before, language), old_data)
+    before_chains: dict[str, set[tuple[str, ...]]] = {}
+    for n, _c, t in old_titled:
+        before_chains.setdefault(t, set()).add(_describe_chain(n, old_data))
+    kept_chains = [
+        _chain_in_before(t, before_chains, _describe_chain(n, data)) for n, c, t in titled
+        if "describe" not in c.split(".")[0]
+    ]
+    deleted_stems: list[tuple[tuple[str, ...], bool, set[str]]] = []
+    if deleted:
+        for n, _c, t in old_titled:
+            if t not in deleted:
+                continue
+            chain = _describe_chain(n, old_data)
+            # A group the run emptied: a kept test counts when its own innermost
+            # group is a direct SIBLING of it.
+            emptied = len(chain) > 1 and not any(k[: len(chain)] == chain for k in kept_chains)
+            deleted_stems.append((chain, emptied, _stems(t)))
     titles: list[str] = []
     for node, callee, title in titled:
         if "describe" in callee.split(".")[0]:
             continue  # a group's title names its subject, not a behaviour
-        if title in renamed or key.search(title) or not subject.search(title):
+        if title in renamed or key.search(title) or not speaks_of_a_flag(title):
             continue
         holds = any(_contains(node, statement) for _l, statement in vacuous)
-        if holds or _stems(title) & deleted_stems:
+        chain = _chain_in_before(title, before_chains, _describe_chain(node, data))
+        shares = any(
+            _stems(title) & stems and (chain == at or (emptied and len(chain) == len(at) and chain[:-1] == at[:-1]))
+            for at, emptied, stems in deleted_stems
+        )
+        if holds or shares:
             if title not in titles:
                 titles.append(title)
     return rows, titles

@@ -232,14 +232,21 @@ def released(path: str, specifier: str) -> bool:
     return bool(_released) and (str(Path(path).resolve()), specifier) in _released
 
 
-def is_inert(reader_path: str, specifier: str, repo_dir: str) -> bool:
-    """Whether loading ``specifier`` from ``reader_path`` provably does nothing."""
+def is_inert(
+    reader_path: str, specifier: str, repo_dir: str, packages: frozenset[str] = frozenset()
+) -> bool:
+    """Whether loading ``specifier`` from ``reader_path`` provably does nothing.
+
+    ``packages`` names more packages the caller already knows are loaded
+    wherever the reader runs, or whose load it does not need: a load of one
+    that no compiler config reads as a file ends the walk there, as an
+    audited SDK does."""
     from flag_cleanup.piranha_runner import checkout_root
 
     stop = Path(checkout_root(repo_dir)).resolve()
     seen: set[str] = set()
     try:
-        _check_load(reader_path, specifier, repo_dir, stop, seen)
+        _check_load(reader_path, specifier, repo_dir, stop, seen, packages)
     except (_NotInert, RecursionError, OSError):
         # Recursion follows the data (an operand chain, an import chain), and
         # generated code can outrun it; a directory may not be readable.
@@ -248,12 +255,16 @@ def is_inert(reader_path: str, specifier: str, repo_dir: str) -> bool:
     return True
 
 
-def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: set[str]) -> None:
+def _check_load(
+    reader: str, specifier: str, repo_dir: str, stop: Path, seen: set[str], packages: frozenset[str] = frozenset()
+) -> None:
     if (
         specifier in SIDE_EFFECT_FREE_PACKAGES
         and cross_file_ts.names_package(reader, specifier, repo_dir)
         and not _substituted(str(stop))
     ):
+        return
+    if specifier in packages and cross_file_ts.names_package(reader, specifier, repo_dir):
         return
     target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir, solution=True)
     if target is None or target.endswith(_DECLARATION_FILES):
@@ -273,7 +284,7 @@ def _check_load(reader: str, specifier: str, repo_dir: str, stop: Path, seen: se
     if root.has_error or _declaring_script(root, commonjs):
         raise _NotInert
     for loaded in _module_loads(root, commonjs):
-        _check_load(str(resolved), loaded, repo_dir, stop, seen)
+        _check_load(str(resolved), loaded, repo_dir, stop, seen, packages)
 
 
 def _commonjs(path: Path, stop: Path) -> bool:
@@ -310,7 +321,9 @@ def coverage(reader_path: str, repo_dir: str) -> Callable[[str, tuple[int, int],
 
     ``covered(source, own, specifier)`` asks it of the import statement
     spanning the bytes ``own`` of ``source``, the file as it now stands, which
-    loads ``specifier``. Covered means dropping that statement drops no
+    loads ``specifier`` (or, given ``importer``, whose dropping also drops the
+    file ``importer``, which loads ``specifier``). Covered means dropping that
+    statement drops no
     module that may do work when it loads: every such module its load reaches
     is loaded anyway by another import that ``source`` keeps
     (:func:`_certain_loads`), directly or through the files those load.
@@ -406,9 +419,12 @@ def coverage(reader_path: str, repo_dir: str) -> Callable[[str, tuple[int, int],
         for load in _module_loads(file):
             check(target, load, loaded, seen)
 
-    def covered(source: str, own: tuple[int, int], specifier: str) -> bool:
+    def covered(source: str, own: tuple[int, int], specifier: str, importer: str | None = None) -> bool:
+        # ``importer``: the file whose load of ``specifier`` is in question,
+        # when it is not the reader itself but a module the reader's dropped
+        # statement loaded (a file deleted with that statement).
         try:
-            check(reader, specifier, reached(source, own), set())
+            check(importer or reader, specifier, reached(source, own), set())
         except (_NotInert, RecursionError, OSError, UnicodeDecodeError):
             return False
         return True

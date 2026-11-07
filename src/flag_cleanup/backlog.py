@@ -71,17 +71,10 @@ from flag_cleanup.client import (
     FlagRecentlyEvaluatedError,
 )
 from flag_cleanup.config import Config
-from flag_cleanup.github_ops import (
-    GitHubApi,
-    GitHubApiError,
-    GitHubEnv,
-    UnsafeFlagKeyError,
-    commit_is_contained,
-    default_branch,
-    merged_removal,
-    removal_branch,
-    short_ref,
-)
+from flag_cleanup.branches import UnsafeFlagKeyError, removal_branch, short_ref
+from flag_cleanup.forge import Forge, ForgeApiError
+from flag_cleanup.github_ops import GitHubApi
+from flag_cleanup.run_context import resolve_forge
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +96,9 @@ class OutstandingArchive:
     #: strength of the merge itself, and the merge-triggered mode never gets
     #: here.
     merge_commit_sha: str = ""
+    #: The forge's ``name``, so a report line calls the merge what that forge
+    #: calls it (a GitLab merge request is ``!N``, not ``#N``).
+    forge: str = "github"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,8 +126,7 @@ class ContainmentGate:
 
 def outstanding_archives(
     config: Config,
-    gh: GitHubApi,
-    repo: str,
+    forge: Forge,
     *,
     client: FeatureflipClient,
 ) -> list[OutstandingArchive]:
@@ -171,8 +166,8 @@ def outstanding_archives(
             continue
 
         if not base:
-            base = default_branch(gh, repo)
-        merged = merged_removal(gh, repo, branch, base=base)
+            base = forge.default_branch()
+        merged = forge.merged_removal(branch, base=base)
         if merged is None:
             continue
 
@@ -183,6 +178,7 @@ def outstanding_archives(
                 pull_request=merged.number,
                 pull_request_url=merged.html_url,
                 merge_commit_sha=merged.merge_commit_sha,
+                forge=forge.name,
             )
         )
     return outstanding
@@ -194,6 +190,7 @@ def run_archive_sweep(
     *,
     client: FeatureflipClient | None = None,
     gh: GitHubApi | None = None,
+    forge: Forge | None = None,
 ) -> list[ArchiveResult]:
     """Re-attempt every outstanding archive; return one result per flag.
 
@@ -205,16 +202,14 @@ def run_archive_sweep(
     ``archive-on-merge``, genuinely needs it, and ``__main__`` renders that as
     exit 2 ("the run could not start") alongside the other wiring faults.
     """
-    github = GitHubEnv.from_env(env)
+    active_forge, owned_forge = resolve_forge(forge=forge, gh=gh, env=env)
 
-    owned_gh = gh is None
     owned_client = client is None
-    active_gh = gh if gh is not None else GitHubApi(github.token, api_url=github.api_url)
     active = (
         client if client is not None else FeatureflipClient(config.api_url, config.api_token)
     )
     try:
-        candidates = outstanding_archives(config, active_gh, github.repository, client=active)
+        candidates = outstanding_archives(config, active_forge, client=active)
         if not config.deployed_refs:
             return archive_outstanding(config, candidates, active)
 
@@ -223,7 +218,7 @@ def run_archive_sweep(
             ", ".join(config.deployed_refs),
         )
         deployed, pending = partition_by_containment(
-            active_gh, github.repository, candidates, _sweep_gate(config.deployed_refs)
+            active_forge, candidates, _sweep_gate(config.deployed_refs)
         )
         # The WHOLE outstanding set as merge evidence, not the gated part: a
         # dependent still waiting on a deploy is still on its way out, so its
@@ -236,8 +231,8 @@ def run_archive_sweep(
             merged_removals={candidate.key for candidate in candidates},
         )
     finally:
-        if owned_gh:
-            active_gh.close()
+        if owned_forge:
+            active_forge.close()
         if owned_client:
             active.close()
 
@@ -256,8 +251,7 @@ def _sweep_gate(refs: tuple[str, ...]) -> ContainmentGate:
 
 
 def partition_by_containment(
-    gh: GitHubApi,
-    repo: str,
+    forge: Forge,
     candidates: list[OutstandingArchive],
     gate: ContainmentGate,
 ) -> tuple[list[OutstandingArchive], list[ArchiveResult]]:
@@ -310,7 +304,7 @@ def partition_by_containment(
             )
             continue
 
-        held = _hold_back(gh, repo, candidate, gate)
+        held = _hold_back(forge, candidate, gate)
         if held is None:
             deployed.append(candidate)
         else:
@@ -320,13 +314,13 @@ def partition_by_containment(
 
 
 def _hold_back(
-    gh: GitHubApi, repo: str, candidate: OutstandingArchive, gate: ContainmentGate
+    forge: Forge, candidate: OutstandingArchive, gate: ContainmentGate
 ) -> ArchiveResult | None:
     """The line holding ``candidate`` back, or ``None`` when every ref has it."""
     for ref in gate.refs:
         try:
-            contained = commit_is_contained(gh, repo, candidate.merge_commit_sha, within=ref)
-        except GitHubApiError as exc:
+            contained = forge.commit_is_contained(candidate.merge_commit_sha, within=ref)
+        except ForgeApiError as exc:
             # Reported as `failed` rather than `pending-deploy`, deliberately:
             # the run goes red and this flag is named, because "I could not
             # tell" is not the same as "not yet" and may not clear by itself.
@@ -544,6 +538,7 @@ def archive_outstanding(
 
 def _merge_reference(candidate: OutstandingArchive) -> str:
     """How to name the merge in a report line, however degraded the response."""
+    noun, sigil = ("merge request", "!") if candidate.forge == "gitlab" else ("pull request", "#")
     if candidate.pull_request is not None:
-        return f"after pull request #{candidate.pull_request} merged"
-    return f"after the pull request from {candidate.branch} merged"
+        return f"after {noun} {sigil}{candidate.pull_request} merged"
+    return f"after the {noun} from {candidate.branch} merged"

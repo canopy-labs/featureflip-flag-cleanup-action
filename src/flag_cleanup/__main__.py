@@ -105,13 +105,9 @@ from flag_cleanup.config import (
 )
 from flag_cleanup.deploy import SKIPPED_ACTIONS, run_archive_on_deploy
 from flag_cleanup.git_ops import ForceWithLeaseRejected, GitCommandError, PreflightError
-from flag_cleanup.github_ops import (
-    BaseRefError,
-    GitHubApi,
-    GitHubApiError,
-    GitHubConfigError,
-    GitHubEnv,
-)
+from flag_cleanup import run_context
+from flag_cleanup.forge import BaseRefError, ForgeApiError, ForgeConfigError
+from flag_cleanup.github_ops import GitHubApi, GitHubEnv  # noqa: F401 - kept importable from here
 from flag_cleanup.orchestrate import (
     PARTIAL_RESULTS_ATTR,
     RUN_STARTED_ATTR,
@@ -170,6 +166,29 @@ def _label_engine_records(record: logging.LogRecord) -> bool:
     return True
 
 
+#: Modes driven by an event only GitHub delivers: a pull-request close, a
+#: comment, a deployment status. Elsewhere they refuse to start rather than
+#: wait for an event that never comes.
+GITHUB_ONLY_MODES = (MODE_ARCHIVE_ON_MERGE, MODE_ARCHIVE_ON_DEPLOY, MODE_PR_COMMAND)
+
+
+def _require_github_for_event_modes(mode: str) -> None:
+    """Refuse a GitHub-only mode on another forge, before anything is called.
+
+    Decided from which forge the run names, never from whether its token is
+    there: a GitLab runner with no token is still a GitLab runner. An override
+    naming no known forge is left to the mode, which reports it in its own
+    words.
+    """
+    if mode not in GITHUB_ONLY_MODES:
+        return
+    forge = run_context.detect_forge()
+    if forge not in (None, "github"):
+        raise ForgeConfigError(
+            f"mode {mode!r} needs GitHub; on {forge} use one of: remove, archive-sweep"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     del argv  # no CLI flags yet — everything comes from the environment
     log_handler = logging.StreamHandler()
@@ -192,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         config = Config.from_env()
         dry_run = config.dry_run
         show = report_paths.displayer(config.directories)
+        _require_github_for_event_modes(config.mode)
         if config.mode == MODE_ARCHIVE_ON_MERGE:
             # Returns from inside the `try` so the handler below still maps its
             # two failure types: a misconfigured trigger to exit 2 (nothing was
@@ -249,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                 exc,
                 (
                     ConfigError,
-                    GitHubConfigError,
+                    ForgeConfigError,
                     PreflightError,
                     BaseRefError,
                     PullRequestEventError,
@@ -296,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         # modified" would be a lie. Its message is already credential-stripped
         # and actionable, so it needs no traceback either.
         expected = isinstance(
-            exc, (GitHubApiError, GitCommandError, FeatureflipApiError)
+            exc, (ForgeApiError, GitCommandError, FeatureflipApiError)
         )
         logger.error("run aborted: %s", exc, exc_info=not expected)
         print(f"flag-cleanup: run aborted: {exc}", file=sys.stderr)
@@ -518,7 +538,7 @@ def _reply_to_pr_command_failure(exc: Exception) -> None:
         comment = commented_pull_request()
         if comment is None:
             return
-        github = GitHubEnv.from_env()
+        github = run_context.github_env_from()
         gh = GitHubApi(github.token, api_url=github.api_url)
         try:
             github_ops.comment_on_pull_request(

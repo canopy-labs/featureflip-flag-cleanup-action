@@ -60,6 +60,7 @@ from flag_cleanup.client import Candidate, FeatureflipClient
 from flag_cleanup.config import Config, STALENESS_VALUES
 from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
+from flag_cleanup.run_context import github_env_from
 from flag_cleanup.residue import Residue
 from flag_cleanup.discarded_calls import DISCARDED_CALL
 from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
@@ -299,7 +300,7 @@ def run_pr_command(
             pull_request=comment.number,
         )
 
-    resolved_github = github if github is not None else GitHubEnv.from_env(env)
+    resolved_github = github if github is not None else github_env_from(env)
     owns_gh = gh is None
     resolved_gh = (
         gh
@@ -757,6 +758,7 @@ def _regenerate(
                 unresolved=unresolved,
                 enum_findings=enum_findings,
                 wrapper_findings=wrapper_findings,
+                deleted_files=pr_content.deleted_files(diff),
             )
             draft_note = _draft_note(pull, candidate)
             github_ops.update_pull_request(
@@ -877,9 +879,17 @@ def _dry_run_caveats(
     """
     notes: list[str] = []
     # A file naming the flag only in kept comments is counted as what it is.
-    unprocessed = tuple(path for path in unprocessed if path not in set(residue.comment_only))
+    # So is one naming its key only as plain strings in no flag read.
+    unprocessed = tuple(
+        path for path in unprocessed if path not in {*residue.comment_only, *residue.plain_strings}
+    )
     if unprocessed:
         notes.append(f"{len(unprocessed)} file(s) would still reference this flag")
+    if residue.plain_strings:
+        notes.append(
+            f"{len(residue.plain_strings)} file(s) would still name its key, only as a plain "
+            "string in no flag read"
+        )
     if residue.comment_lines:
         notes.append(
             f"{len(residue.comment_lines)} comment line(s) would still name this flag, "
@@ -1068,6 +1078,7 @@ def _dry_run_caveats(
     renamed_methods = sum(1 for _, kind, _ in test_doubles if kind == "renamed test method")
     gate_named = sum(1 for _, kind, _ in test_doubles if kind == "named for the gate")
     duplicates = sum(1 for _, kind, _ in test_doubles if kind == "may duplicate")
+    folded = sum(1 for _, kind, _ in test_doubles if kind == "folded into a sibling")
     rows = sum(1 for _, kind, _ in test_doubles if kind == "test rows")
     rebuilt = sum(1 for _, kind, _ in test_doubles if kind == "rebuilt with the kept value")
     if facts:
@@ -1079,6 +1090,8 @@ def _dry_run_caveats(
             f"{gate_named + false_titles} kept test(s) would still be named for the removed gate's "
             "state (reported, not renamed)"
         )
+    if folded:
+        notes.append(f"{folded} cut-down test(s) would be folded into a sibling that arranges and acts the same way")
     if duplicates:
         notes.append(f"{duplicates} kept test(s) cut down to what a sibling test also does (reported, not deleted)")
     if removed_tests:
@@ -1099,7 +1112,7 @@ def _dry_run_caveats(
         notes.append(f"{flag_value} assertion(s) of the flag's own value would be deleted")
     mock_lines = (
         len(test_doubles) - removed_tests - sibling_tests - pinned - phases - flag_value
-        - false_titles - facts - renamed_methods - gate_named - duplicates - rows - rebuilt
+        - false_titles - facts - renamed_methods - gate_named - duplicates - folded - rows - rebuilt
     )
     if mock_lines:
         notes.append(

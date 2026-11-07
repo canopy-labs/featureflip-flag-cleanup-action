@@ -26,8 +26,10 @@ expression container (``{/* gate */}``, which has code before it on its line),
 a default import or an alias of an alias, and a hook in one configured
 directory with a caller in another (each directory is its own pass).
 
-Report only. Nothing here edits a byte: what such a comment should say instead
-is for a person to decide. TypeScript and JavaScript only, since the engine's
+This module only finds them and edits nothing: what such a comment should say
+instead is for a person to decide, except for the one plain shape
+:mod:`flag_cleanup.comment_conjuncts` cuts (``release flag + Pro plan``) when
+the flag served ``true``. TypeScript and JavaScript only, since the engine's
 per-language rules decide what a "read" looks like elsewhere and this needs
 only the key as the read's argument.
 """
@@ -38,7 +40,7 @@ import os
 import re
 from pathlib import Path
 from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tree_sitter import Node
 
@@ -81,6 +83,11 @@ class CallSiteComment:
     line: int
     text: str
     function: str
+    #: Whether the function's body, as it stands, reads no flag at all (see
+    #: :func:`reads_no_flag`): the only case a comment may be edited.
+    clean: bool = False
+    #: Whether the call hands the function no value that could be a flag.
+    args_ok: bool = True
 
 
 def _strip_bom(source: str) -> str:
@@ -152,6 +159,179 @@ def functions_that_lost_the_read(before: str, after: str, grammar: str, names: r
         if not inner and name in now and not _reads(now[name], names):
             lost.add(name)
     return lost
+
+
+#: Callee names that read a flag: the SDK hooks and accessors of every
+#: Featureflip, OpenFeature and common vendor client.
+_READER = re.compile(
+    r"variation|flagvalue|featureflag|usefeature|usegate|isenabled|isfeatureenabled|getflag|useflag"
+    r"|(?:boolean|string|number|object|int|double|float)(?:value|details)|treatment|experiment|toggle",
+    re.IGNORECASE,
+)
+_FLAG_KEY = re.compile(r"""^['"`][a-z0-9]+(?:[-_.][a-z0-9]+)+['"`]$""")
+_FLAG_MODULES = re.compile(
+    r"featureflip|openfeature|launchdarkly|flagsmith|unleash|growthbook|statsig|optimizely|posthog|split|flags?(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+def _flag_import_names(root: Node) -> set[str]:
+    """The local names a file imports from a flag-client module."""
+    names: set[str] = set()
+    for statement in root.children:
+        if statement.type != "import_statement":
+            continue
+        source = statement.child_by_field_name("source")
+        if source is not None and _FLAG_MODULES.search(source.text.decode("utf-8", "replace")):
+            names |= {n.text.decode("utf-8", "replace") for n in _walk(statement) if n.type == "identifier"}
+    return names
+
+
+#: Parameter types that cannot carry a boolean flag: primitives other than
+#: ``boolean``, in a union with ``undefined`` or ``null``, or a literal.
+_SAFE_TYPE = re.compile(
+    r"^(?:string|number|bigint|undefined|null|'[^']*'|\"[^\"]*\"|-?\d+)(?:\s*\|\s*(?:string|number|bigint|undefined|null|'[^']*'|\"[^\"]*\"|-?\d+))*$"
+)
+
+
+def params_cannot_carry_a_flag(function: Node) -> bool:
+    """Whether every parameter of ``function`` is typed as a primitive that is
+    not ``boolean`` (``string``, ``number``, a union with ``undefined`` or
+    ``null``, a literal). An untyped, boolean, ``any``, ``unknown``, object or
+    destructured parameter can be handed a flag value by the caller, which would
+    make a comment about "the flag" true of the caller's flag, not the removed
+    one."""
+    if function.type == "variable_declarator":
+        function = function.child_by_field_name("value") or function
+    parameters = function.child_by_field_name("parameters")
+    if parameters is None:
+        return function.child_by_field_name("parameter") is None
+    for parameter in parameters.named_children:
+        if parameter.type not in ("required_parameter", "optional_parameter"):
+            return False
+        pattern = parameter.child_by_field_name("pattern")
+        if pattern is None or pattern.type != "identifier":
+            return False
+        if parameter.child_by_field_name("value") is not None:
+            return False  # a default value
+        annotation = next((c for c in parameter.named_children if c.type == "type_annotation"), None)
+        if annotation is None:
+            return False
+        text = annotation.text.decode("utf-8", "replace").lstrip(":").strip()
+        if not _SAFE_TYPE.match(text):
+            return False
+    return True
+
+
+def _holds_flag_call(node: Node, flag_names: set[str]) -> bool:
+    for call in _walk(node):
+        if call.type != "call_expression":
+            continue
+        callee = call.child_by_field_name("function")
+        if callee is not None and callee.type == "member_expression":
+            callee = callee.child_by_field_name("property")
+        text = callee.text.decode("utf-8", "replace") if callee is not None else ""
+        if text in flag_names or _READER.search(text):
+            return True
+    return False
+
+
+def flag_bindings(root: Node) -> tuple[set[str], set[str]]:
+    """``(flag client names, names the file binds to a flag read)``, read once
+    per file."""
+    flag_names = _flag_import_names(root)
+    bound: set[str] = set()
+    for node in _walk(root):
+        if node.type == "variable_declarator":
+            value = node.child_by_field_name("value")
+            name = node.child_by_field_name("name")
+            if value is not None and name is not None and _holds_flag_call(value, flag_names):
+                bound |= {n.text.decode("utf-8", "replace") for n in _walk(name) if "identifier" in n.type}
+    return flag_names, bound
+
+
+def arguments_hand_over_no_flag(call: Node, facts: tuple[set[str], set[str]]) -> bool:
+    """Whether ``call`` passes no boolean literal, no flag read, and no
+    identifier the file binds to a flag read (``facts`` from
+    :func:`flag_bindings`)."""
+    arguments = call.child_by_field_name("arguments")
+    if arguments is None:
+        return True
+    flag_names, bound = facts
+    for argument in arguments.named_children:
+        if argument.type in ("true", "false"):
+            return False
+        if _holds_flag_call(argument, flag_names):
+            return False
+        if any(
+            n.type == "identifier" and n.text.decode("utf-8", "replace") in bound for n in _walk(argument)
+        ):
+            return False
+    return True
+
+
+def _loads_no_flag_client(path: str, source: str, repo_dir: str) -> bool:
+    """Whether the file, as it stands after the run, loads no flag-client module
+    through its whole import closure (see
+    :func:`flag_cleanup.ts_test_providers.loads_no_flag_client`)."""
+    from flag_cleanup import ts_test_providers
+
+    return ts_test_providers.loads_no_flag_client(path, _strip_bom(source), repo_dir)
+
+
+def _in_type(leaf: Node, stop: Node) -> bool:
+    node = leaf.parent
+    while node is not None and node is not stop:
+        if node.type in ("type_annotation", "type_alias_declaration", "interface_declaration"):
+            return True
+        node = node.parent
+    return False
+
+
+def reads_no_flag(function: Node) -> bool:
+    """Whether the CODE of ``function`` holds no flag read at all: no call of
+    a hook or accessor that reads a flag, no identifier bound by an import of
+    a flag client, and no string that is shaped like a flag key. A function
+    that still reads ANOTHER flag is never one a comment about "the flag" can
+    be cut for. Deliberately wider than any single SDK."""
+    root = function
+    while root.parent is not None:
+        root = root.parent
+    flag_names = _flag_import_names(root)
+    imported: set[str] = set()
+    for statement in root.children:
+        if statement.type == "import_statement":
+            imported |= {n.text.decode("utf-8", "replace") for n in _walk(statement) if n.type == "identifier"}
+    # A context value can carry a flag from elsewhere.
+    for call in _walk(function):
+        if call.type != "call_expression":
+            continue
+        callee = call.child_by_field_name("function")
+        if callee is not None and callee.type == "member_expression":
+            callee = callee.child_by_field_name("property")
+        if callee is None or callee.text.decode("utf-8", "replace") not in ("useContext", "use"):
+            continue
+        arguments = call.child_by_field_name("arguments")
+        if arguments is not None and any(
+            n.type == "identifier" and n.text.decode("utf-8", "replace") in imported for n in _walk(arguments)
+        ):
+            return False
+    declared = function.child_by_field_name("name")
+    for leaf in _code_leaves(function):
+        if declared is not None and leaf.start_byte == declared.start_byte:
+            continue  # the function's own name says nothing about its body
+        if _in_type(leaf, function):
+            continue  # a type declares a read, it does not make one
+        text = leaf.text.decode("utf-8", "replace")
+        if leaf.type == "identifier" and (text in flag_names or _READER.search(text)):
+            return False
+        if leaf.type in ("property_identifier",) and _READER.search(text):
+            return False
+        if leaf.type == "string_fragment":
+            quoted = leaf.parent.text.decode("utf-8", "replace") if leaf.parent is not None else text
+            if _FLAG_KEY.match(quoted):
+                return False
+    return True
 
 
 def _statement(call: Node) -> Node:
@@ -319,6 +499,7 @@ def comments_at_calls(
 
     found: list[CallSiteComment] = []
     seen: set[int] = set()
+    facts = flag_bindings(root)
     for call in _walk(root):
         if call.type != "call_expression":
             continue
@@ -361,7 +542,7 @@ def comments_at_calls(
         key = min((c.start_point[0] for c in picked), default=-1)
         if picked and _MENTIONS.search(text) and key not in seen:
             seen.add(key)
-            found.append(CallSiteComment(path, key + 1, text, name))
+            found.append(CallSiteComment(path, key + 1, text, name, args_ok=arguments_hand_over_no_flag(call, facts)))
     return found
 
 
@@ -379,9 +560,22 @@ def report(
         (str(Path(repo_dir).resolve()), str(Path(repo_dir).resolve() / "src")) if repo_dir is not None else ()
     )
     lost: dict[str, set[str]] = {}
+    clean: dict[str, bool] = {}
     for path, before, after, grammar in changed:
-        for name in functions_that_lost_the_read(before, after, grammar, names):
+        lost_here = functions_that_lost_the_read(before, after, grammar, names)
+        if not lost_here:
+            continue
+        bodies = dict(_plain_functions(unused._parse(_strip_bom(after), grammar)))
+        loads_nothing = repo_dir is not None and _loads_no_flag_client(path, after, repo_dir)
+        for name in lost_here:
             lost.setdefault(name, set()).add(str(Path(path).resolve()))
+            clean[name] = (
+                clean.get(name, True)
+                and loads_nothing
+                and name in bodies
+                and reads_no_flag(bodies[name])
+                and params_cannot_carry_a_flag(bodies[name])
+            )
     if not lost:
         return []
     found: list[CallSiteComment] = []
@@ -393,7 +587,14 @@ def report(
             found += comments_at_calls(text, grammar, here, path)
         for name, defined in elsewhere.items():
             found += comments_at_calls(text, grammar, name, path, defined=defined, importer=resolved, roots=roots)
-    return found
+    return [replace(c, clean=clean.get(c.function, False)) for c in found]
 
 
-__all__ = ["CALL_SITE_KIND", "CallSiteComment", "comments_at_calls", "functions_that_lost_the_read", "report"]
+__all__ = [
+    "CALL_SITE_KIND",
+    "CallSiteComment",
+    "comments_at_calls",
+    "functions_that_lost_the_read",
+    "reads_no_flag",
+    "report",
+]

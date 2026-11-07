@@ -66,12 +66,18 @@ declaration, one unaliased import of it, or a JSX element name. Each element
 must have no attributes and exactly one child element. Its file must hold
 nothing but imports and the component, and nothing may name that file but the
 import this pass deletes in each file (a ``vi.mock`` of the path in a file
-that renders it keeps the component). A file that loaded a module for its
-effects (``import './theme.css';``) keeps its file, unless the module is an
-audited SDK or declared ``side-effect-free-modules``. A test file goes when it
+that renders it keeps the component). A file that names it only in comments
+is no use: a sentence-leading ``Like <it>, `` is cut from them
+(:func:`_cut_comparisons`) and any other mention is named in the pull
+request; nor is a file
+whose spellings all mean a same-named component of its own or of another
+file (:func:`flag_cleanup.ts_exported_props.homonym`), nor prose or source
+of another language. Every module the component's file imports must still
+load wherever the component was rendered (:func:`_unproven_load`), or the
+file stays. A test file goes when it
 is named for the component's file and holds, beside imports, declarations and
 ``vi``/``jest``/``before*``/``after*`` setup, only ``describe('<Component>',
-…)`` groups.
+…)`` groups; any other test file that renders the component keeps it.
 
 A test file that spells the readiness hook (a mock of it does) and reaches
 the guard's file through its imports drives the wait, so the wait stays, on
@@ -101,7 +107,7 @@ from tree_sitter import Node
 from flag_cleanup import cross_file_ts, file_deletion, git_ops, inert_load, source_index, ts_scope, ts_tests
 from flag_cleanup.ctor_param_model import choose_sentinel, mark, render_rules
 from flag_cleanup.inert_load import SIDE_EFFECT_FREE_PACKAGES
-from flag_cleanup.ts_exported_props import _File, _exported_function, _users
+from flag_cleanup.ts_exported_props import _File, _exported_function, _users, is_directive, only_in_comments
 from flag_cleanup.ts_syntax import _parse, _walk
 
 logger = logging.getLogger(__name__)
@@ -113,6 +119,12 @@ LANGUAGES = frozenset({"tsx", "js"})
 REMOVED_GATE = "removed gate component"
 REMOVED_GUARD = "removed readiness guard"
 KEPT_GUARD = "kept readiness guard"
+#: A comment elsewhere naming a removed gate component or its file; its text
+#: is ``"<line>: <comment line>"``.
+NAMED_IN_COMMENT = "comment names a removed gate"
+#: A comment elsewhere whose sentence-leading ``Like <removed gate>, `` was
+#: cut; its text is :func:`comment_sentences.encode`'s ``line, before, after``.
+EDITED_COMMENT = "comment comparing a removed gate edited"
 
 Row = tuple[str, str, str]
 
@@ -137,6 +149,14 @@ _ELEMENTS = frozenset({"jsx_element", "jsx_self_closing_element"})
 _TAGS = frozenset({"jsx_opening_element", "jsx_self_closing_element"})
 _TEST_SUFFIX = re.compile(r"\.(?:test|spec)\Z")
 _TS_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+#: Files that cannot load a TypeScript or JavaScript module by naming it:
+#: prose, and source a compiler of another language builds. Templates of
+#: those languages (``.erb``, ``.php``, ``.html``) are not here: they can
+#: name a script.
+_CANNOT_LOAD = (
+    ".md", ".markdown", ".txt", ".rst", ".adoc",
+    ".py", ".cs", ".java", ".kt", ".kts", ".go", ".rs", ".swift", ".dart", ".scala",
+)
 
 
 def _text(node: Node | None) -> str:
@@ -814,23 +834,37 @@ def _extra(guard: _Guard) -> str:
     return ""
 
 
-def _loads_for_effect(original: Node) -> bool:
-    """Whether the customer's file has a bare ``import './theme.css';``.
+def _unproven_load(path: str, original: Node, uses: list[_Use], repo_dir: str) -> str | None:
+    """The first module the customer's file at ``path`` loads that may stop
+    loading where it was used once the file is deleted, or None.
 
-    It is there for its load, which deleting the file would stop, unless the
-    module is an audited Featureflip SDK or declared
-    ``side-effect-free-modules``. Asked of the customer's text: a bare import
-    the run left (an import whose names the fold took) loaded nothing the
-    customer asked for by itself."""
+    Every import loads its module, named or bare, and that module's top-level
+    code runs (registering icons, creating a store, a stylesheet). Each must
+    be one of: declared ``side-effect-free-modules``; React or React Router,
+    which a gate component rendered in a router tree runs under anyway; a
+    module :func:`inert_load.is_inert` proves does nothing, its walk ending
+    at an audited SDK, React or React Router; or a module every file that
+    renders the component loads anyway through the imports it keeps
+    (:func:`inert_load.coverage`), so it still loads wherever this file did.
+    Only ``import type`` is skipped: it loads nothing. Asked of the
+    customer's text, since that is what loaded on the route."""
+    covers = [(inert_load.coverage(u.file.path, repo_dir), u) for u in uses]
     for statement in original.named_children:
-        if statement.type != "import_statement" or any(
-            c.type in ("import_clause", "import_require_clause") for c in statement.named_children
-        ):
+        if statement.type != "import_statement" or any(c.type == "type" for c in statement.children):
             continue
         specifier = cross_file_ts._string_value(statement.child_by_field_name("source"))
-        if specifier is None or not (specifier in SIDE_EFFECT_FREE_PACKAGES or inert_load.declared(specifier)):
-            return True
-    return False
+        if specifier is None:
+            return "a module"
+        if inert_load.declared(specifier):
+            continue
+        if specifier in _FLAGLESS_PACKAGES and cross_file_ts.names_package(path, specifier, repo_dir):
+            continue
+        if inert_load.is_inert(path, specifier, repo_dir, packages=_FLAGLESS_PACKAGES):
+            continue
+        if all(covered(u.file.current, u.own, specifier, importer=path) for covered, u in covers):
+            continue
+        return specifier
+    return None
 
 
 def _declares_only(root: Node, function: Node) -> bool:
@@ -870,10 +904,14 @@ class _Use:
     #: ``(start, end, form)`` spans for :func:`ctor_param_model.mark`.
     marks: list[tuple[int, int, str]]
     elements: int
+    #: The byte span of its import of the component, which this deletes.
+    own: tuple[int, int] = (0, 0)
 
 
-def _own_test(file: _File, component: str, declaring: str) -> bool:
-    """Whether ``file`` is the component's own test file, deleted with it."""
+def _own_test(file: _File, component: str, declaring: str, repo_dir: str) -> bool:
+    """Whether ``file`` is the component's own test file, deleted with it:
+    named for the component's file, holding only its setup and groups named
+    for the component, and testing nothing but it (:func:`_tests_only`)."""
     path = Path(file.path)
     stem = path.name
     for extension in sorted(_TS_EXTENSIONS, key=len, reverse=True):
@@ -912,7 +950,136 @@ def _own_test(file: _File, component: str, declaring: str) -> bool:
         if callee.type != "identifier" or _text(callee) != "describe" or title != component:
             return False
         groups += 1
-    return groups > 0
+    return groups > 0 and _tests_only(file, declaring, repo_dir)
+
+
+#: Modules a component's own test may load beside the component: the test
+#: runner and libraries, React and React Router. Featureflip SDKs
+#: (:data:`SIDE_EFFECT_FREE_PACKAGES`) too.
+_TEST_LIBRARIES = frozenset({"vitest", "@jest/globals", "react", "react-dom", "react-router", "react-router-dom"})
+_TEST_LIBRARY_PREFIXES = ("@testing-library/", "react/", "react-dom/")
+#: Calls that load a module as the test sees it; a mock (``vi.mock``) does not.
+_ACTUAL_LOADS = frozenset({"importActual", "requireActual"})
+#: Wrappers tree-sitter may put around a callee: `await vi.importActual<T>(…)`
+#: parses with the ``await`` as the call's function.
+_CALLEE_WRAPPERS = frozenset({
+    "await_expression", "parenthesized_expression", "as_expression", "non_null_expression",
+    "satisfies_expression",
+})
+
+
+def _callee(call: Node) -> Node | None:
+    callee = call.child_by_field_name("function")
+    while callee is not None and callee.type in _CALLEE_WRAPPERS:
+        callee = next((c for c in callee.named_children if c.type != "comment"), None)
+    return callee
+
+
+def _tests_only(file: _File, declaring: str, repo_dir: str) -> bool:
+    """Whether every module ``file`` loads is the component's own file, a
+    test library, React or React Router, a Featureflip SDK, or a module
+    declared ``side-effect-free-modules`` whose every name the test uses is a
+    Featureflip test provider (:func:`ts_test_providers._is_provider`)
+    rendered as an element. Then every component it renders is the gate, an
+    HTML element, one it declares itself or one of theirs, and deleting it
+    with the gate deletes no test of anything else. ``vi.mock`` targets are
+    free: a mock tests nothing, and its factory's ``importOriginal()`` loads
+    the mocked module itself; called with a module, it is a load like
+    ``importActual``. ``import type`` loads nothing."""
+    from flag_cleanup import ts_test_providers
+
+    gate = _key(declaring)
+
+    def allowed(specifier: str | None, names: list[tuple[str, str]]) -> bool:
+        if specifier is None:
+            return False
+        if specifier in _TEST_LIBRARIES or specifier.startswith(_TEST_LIBRARY_PREFIXES):
+            return True
+        if specifier in SIDE_EFFECT_FREE_PACKAGES:
+            return True
+        target = _resolve(file.path, specifier, repo_dir)
+        if target is not None and _key(target) == gate:
+            return True
+        return inert_load.declared(specifier) and all(
+            imported is not None
+            and ts_test_providers._is_provider(specifier, imported, file.path, repo_dir)
+            and _rendered_only(file.root, local)
+            for imported, local in names
+        )
+
+    for statement in file.root.named_children:
+        if statement.type != "import_statement" or any(c.type == "type" for c in statement.children):
+            continue
+        names: list[tuple[str | None, str]] = []
+        for n in _walk(statement):
+            if n.type != "identifier" or n.parent is None:
+                continue
+            if n.parent.type in ("import_clause", "namespace_import"):
+                names.append((None, _text(n)))  # a default or namespace import: no provider
+            elif n.parent.type == "import_specifier":
+                imported = n.parent.child_by_field_name("name")
+                local = n.parent.child_by_field_name("alias") or imported
+                if n == local:
+                    names.append((_text(imported), _text(local)))
+        if not allowed(cross_file_ts._string_value(statement.child_by_field_name("source")), names):
+            return False
+    for node in _walk(file.root):
+        if node.type != "call_expression" or _in_type(node):
+            continue
+        callee = _callee(node)
+        arguments = node.child_by_field_name("arguments")
+        given = [c for c in arguments.named_children if c.type != "comment"] if arguments is not None else []
+        if callee is not None and callee.type == "identifier" and _text(callee) == "importOriginal":
+            if given:
+                return False
+            continue
+        loads = callee is not None and (
+            callee.type == "import"
+            or (callee.type == "identifier" and _text(callee) == "require")
+            or (callee.type == "member_expression" and _text(callee.child_by_field_name("property")) in _ACTUAL_LOADS)
+            or (callee.type == "identifier" and _text(callee) in _ACTUAL_LOADS)
+        )
+        if not loads:
+            continue
+        first = given[0] if given else None
+        if first is None or first.type != "string" or not allowed(cross_file_ts._string_value(first), []):
+            return False
+    return True
+
+
+#: Where a call is a type (`typeof import('./m')`), which loads nothing.
+_TYPE_CONTEXTS = frozenset({"type_query", "type_arguments", "type_annotation", "type_alias_declaration"})
+
+
+def _in_type(node: Node) -> bool:
+    node = node.parent
+    while node is not None:
+        if node.type in _TYPE_CONTEXTS:
+            return True
+        node = node.parent
+    return False
+
+
+def _rendered_only(root: Node, name: str) -> bool:
+    """Whether every use of the import ``name`` is an element's tag name."""
+    for node in _walk(root):
+        if node.type != "identifier" or _text(node) != name:
+            continue
+        parent = node.parent
+        if parent is None or _in_import(node):
+            continue
+        if parent.type in (*_TAGS, "jsx_closing_element") and parent.child_by_field_name("name") == node:
+            continue
+        return False
+    return True
+
+
+def _in_import(node: Node) -> bool:
+    while node is not None:
+        if node.type == "import_statement":
+            return True
+        node = node.parent
+    return False
 
 
 def _use(file: _File, component: str, stem: str) -> _Use | str:
@@ -974,7 +1141,7 @@ def _use(file: _File, component: str, stem: str) -> _Use | str:
     ):
         return f"{Path(file.path).name} imports more than {component} from its file"
     marks.append((statement.start_byte, statement.end_byte, "statement"))
-    return _Use(file, marks, elements)
+    return _Use(file, marks, elements, (statement.start_byte, statement.end_byte))
 
 
 def _remove_gate(guard: _Guard, summaries, language, repo_dir, rewrite, engine, in_run):
@@ -989,9 +1156,6 @@ def _remove_gate(guard: _Guard, summaries, language, repo_dir, rewrite, engine, 
     if not _declares_only(guard.root, guard.function):
         guard.kept.append(f"its file declares more than {name}")
         return summaries, None
-    if _loads_for_effect(_parse(guard.summary.original_content, ts_scope.grammar(guard.path))):
-        guard.kept.append("its file loads a module for its effects")
-        return summaries, None
     declared = _exported_function(guard.root, guard.data, name)
     if declared is None or declared[0].start_byte != guard.function.start_byte:
         guard.kept.append(f"{name} is not exported in a way this tool can follow")
@@ -999,10 +1163,14 @@ def _remove_gate(guard: _Guard, summaries, language, repo_dir, rewrite, engine, 
     files = {s.path: (s.original_content, s.content) for s in summaries if not file_deletion.deleted(s)}
     by_resolved = {_key(p): p for p in files}
     decl = _File(guard.path, guard.summary.original_content, guard.summary.content, guard.root, guard.data)
+    commented: list[str] = []
+    homonyms: list[str] = []
     users = _users(
         name, decl, declared[1], files, by_resolved, repo_dir, in_run,
-        exempt=lambda f: _own_test(f, name, guard.path),
+        exempt=lambda f: _own_test(f, name, guard.path, repo_dir),
         solution=True,
+        commented=commented,
+        homonyms=homonyms,
     )
     if users is None:
         guard.kept.append(f"a file uses {name} in a way this tool cannot follow")
@@ -1010,9 +1178,14 @@ def _remove_gate(guard: _Guard, summaries, language, repo_dir, rewrite, engine, 
     deleted = [guard.path]
     uses: list[_Use] = []
     for user in users[1:]:
-        if _own_test(user, name, guard.path):
+        if _own_test(user, name, guard.path, repo_dir):
             deleted.append(user.path)
             continue
+        if ts_tests.is_test_file(user.current, ts_scope.grammar(user.path)):
+            # Only the component's own test goes with it; another that
+            # renders it may check the wait.
+            guard.kept.append(f"the test file {Path(user.path).name} renders it, and may test the wait itself")
+            return summaries, None
         # The proof read a file outside the run as text, with its line
         # endings translated; the marks are byte offsets into what is on disk.
         raw = Path(user.path).read_bytes().decode("utf-8")
@@ -1026,11 +1199,21 @@ def _remove_gate(guard: _Guard, summaries, language, repo_dir, rewrite, engine, 
             guard.kept.append(use)
             return summaries, None
         uses.append(use)
+    unproven = _unproven_load(
+        guard.path, _parse(guard.summary.original_content, ts_scope.grammar(guard.path)), uses, repo_dir
+    )
+    if unproven is not None:
+        guard.kept.append(
+            f"its file loads {unproven}, which may do work when it loads, and not every file "
+            f"that renders {name} loads it too"
+        )
+        return summaries, None
     driving = _wait_tested(guard, deleted, repo_dir)
     if driving is not None:
         guard.kept.append(driving)
         return summaries, None
-    if not _rest_of_repo_ignores(guard.path, name, {_key(p) for p in deleted} | {_key(u.file.path) for u in uses}, repo_dir):
+    accounted = {_key(p) for p in deleted} | {_key(u.file.path) for u in uses}
+    if not _rest_of_repo_ignores(guard.path, name, accounted, repo_dir, commented):
         guard.kept.append(f"another file names {name}'s file")
         return summaries, None
     if uses:
@@ -1055,12 +1238,141 @@ def _remove_gate(guard: _Guard, summaries, language, repo_dir, rewrite, engine, 
         (os.path.relpath(u.file.path, repo_dir), REMOVED_GATE, f"<{name}> replaced by its child ({u.elements})")
         for u in uses
     ]
+    # Only the component's name is reported or cut: a file named for
+    # something else (`gates/Gate.tsx`) has a stem every prose comment uses.
+    # A same-named component that stays in the directory this run sweeps may
+    # be the one a comparison means: then every comparison is left and
+    # reported. One outside it (another app, this tool's own fixtures) is not
+    # a component the swept code renders.
+    swept = Path(repo_dir).resolve()
+    if not any(Path(h).resolve().is_relative_to(swept) for h in homonyms):
+        summaries, edited = _cut_comparisons(summaries, commented, (name,), repo_dir, rewrite, in_run)
+        rows += edited
+    rows += _comment_rows(commented, (name,), repo_dir)
     return summaries, rows
 
 
-def _rest_of_repo_ignores(declaring: str, name: str, accounted: set[str], repo_dir: str) -> bool:
+def _comparison(names: tuple[str, ...]) -> re.Pattern[bytes]:
+    """``Like <name>, `` at the start of a sentence in a comment, the name
+    spelled bare, in backticks, as ``{@link …}`` or as ``<see cref="…"/>``,
+    and the first letter after it (group ``next``), when the word it starts
+    is lowercase ASCII letters only: capitalising ``iOS``, ``jQuery`` or
+    ``useX`` would misspell it, so that comparison is left and reported."""
+    alternatives = b"|".join(re.escape(n.encode("utf-8")) for n in dict.fromkeys(names))
+    spelled = (
+        rb"(?:`(?:" + alternatives + rb")`|(?:" + alternatives + rb")(?![\w$])"
+        rb"|\{@link\s+(?:" + alternatives + rb")\}|<see\s+cref=\"(?:" + alternatives + rb")\"\s*/>)"
+    )
+    # A sentence starts after `.`/`!`/`?` and whitespace, or where a comment
+    # line's text starts (after `//`, `/*`, `/**` or a JSDoc `*`).
+    start = rb"(?:^|(?<=[.!?][ \t])|(?<=[.!?][ \t]{2})|(?<=//[ \t])|(?<=\*[ \t]))"
+    return re.compile(start + rb"Like " + spelled + rb", (?P<next>[a-z])(?=[a-z]*(?:[\s,.;:!?)]|\Z))", re.MULTILINE)
+
+
+def with_edited_comments(reported, rows, summaries, repo_dir: str) -> dict[str, frozenset[int]]:
+    """``reported`` (1-based comment lines per summary path, left out of the
+    flag-state comment report) plus each line an :data:`EDITED_COMMENT` row
+    names: the edit is not a change beside which a comment is judged."""
+    edited: dict[str, set[int]] = {}
+    for path, kind, text in rows:
+        line = text.partition(": ")[0]
+        if kind == EDITED_COMMENT and line.isdigit():
+            edited.setdefault(_key(os.path.join(repo_dir, path)), set()).add(int(line))
+    merged = dict(reported or {})
+    for summary in summaries:
+        lines = edited.get(_key(summary.path))
+        if lines:
+            merged[summary.path] = frozenset(merged.get(summary.path, frozenset()) | lines)
+    return merged
+
+
+def _cut_comparisons(summaries, paths: list[str], names: tuple[str, ...], repo_dir: str, rewrite, in_run):
+    """``(summaries, rows)`` after cutting each sentence-leading ``Like
+    <name>, `` from the comments of ``paths`` (files naming ``names`` only in
+    comments), the next word capitalised: ``Like `Gate`, it waits`` becomes
+    ``It waits``. Only in a file this run's engine processes; a file whose
+    code tokens would change, or that would not parse, is left as it was.
+    Each line edited is a :data:`EDITED_COMMENT` row."""
+    from flag_cleanup import comment_sentences, stale_comments
+
+    pattern = _comparison(names)
+    rows: list[Row] = []
+    result = list(summaries)
+    index = {_key(s.path): i for i, s in enumerate(result)}
+    for path in sorted({_key(p): p for p in paths}.values()):
+        if not in_run(path):
+            continue
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            continue
+        grammar = ts_scope.grammar(path)
+        root = stale_comments._parse(data, grammar)
+        if root.has_error:
+            continue
+        edits: list[tuple[int, int, bytes]] = []
+        for comment in stale_comments._comments(root):
+            body = data[comment.start_byte : comment.end_byte]
+            for match in pattern.finditer(body):
+                start = comment.start_byte + match.start()
+                end = comment.start_byte + match.start("next")
+                edits.append((start, end + 1, match.group("next").upper()))
+        if not edits:
+            continue
+        after = data
+        for start, end, replacement in sorted(edits, reverse=True):
+            after = after[:start] + replacement + after[end:]
+        new_root = stale_comments._parse(after, grammar)
+        if new_root.has_error or stale_comments._code_tokens(new_root) != stale_comments._code_tokens(root):
+            continue
+        text = after.decode("utf-8")
+        git_ops.before_writing([path])
+        Path(path).write_bytes(after)
+        before_lines = data.decode("utf-8").splitlines()
+        after_lines = text.splitlines()
+        rel = os.path.relpath(path, repo_dir)
+        for number, (old, new) in enumerate(zip(before_lines, after_lines), 1):
+            if old != new:
+                rows.append((rel, EDITED_COMMENT, comment_sentences.encode(number, old.strip(), new.strip())))
+        at = index.get(_key(path))
+        if at is None:
+            result.append(rewrite(path, data.decode("utf-8"), text))
+        else:
+            result[at] = rewrite(result[at].path, result[at].original_content, text)
+    return result, rows
+
+
+def _comment_rows(paths: list[str], names: tuple[str, ...], repo_dir: str) -> list[Row]:
+    """A :data:`NAMED_IN_COMMENT` row for each line of ``paths`` (files that
+    spell ``names`` only in comments) spelling one of them."""
+    words = [_word(n) for n in dict.fromkeys(names)]
+    rows: list[Row] = []
+    for path in sorted({_key(p): p for p in paths}.values()):
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = os.path.relpath(path, repo_dir)
+        for number, line in enumerate(text.splitlines(), 1):
+            if any(w.search(line) for w in words):
+                rows.append((rel, NAMED_IN_COMMENT, f"{number}: {line.strip()}"))
+    return rows
+
+
+def _rest_of_repo_ignores(
+    declaring: str, name: str, accounted: set[str], repo_dir: str, commented: list[str]
+) -> bool:
     """Whether no file outside ``accounted`` spells the declaring file's
-    name, which would be a way to load it this pass cannot see."""
+    name, which would be a way to load it this pass cannot see.
+
+    Prose, and source in a language whose own toolchain builds it
+    (:data:`_CANNOT_LOAD`), is no part of the program that loads the file:
+    naming it there loads nothing. In a TypeScript or JavaScript file only a
+    string can load a file: one whose every spelling is in a comment, a name,
+    a test's title, or a string that resolves as a module specifier to some
+    other file loads nothing of this one, and a file spelling it only in
+    comments is appended to ``commented``. Any other listed file naming it
+    (markup that can import a component, ``.mdx``, ``.html``) keeps it."""
     stem = Path(declaring).name.split(".")[0]
     word = _word(stem)
     for listed in source_index.files(repo_dir, with_ignored=True):
@@ -1071,6 +1383,43 @@ def _rest_of_repo_ignores(declaring: str, name: str, accounted: set[str], repo_d
         except OSError:
             return False
         if word.search(text):
+            path = str(listed.path)
+            if path.lower().endswith(_CANNOT_LOAD):
+                continue
+            if not path.endswith(_TS_EXTENSIONS):
+                return False
+            if only_in_comments(path, (text,), stem):
+                commented.append(path)
+                continue
+            if not _loads_other_files(path, text, stem, _key(declaring), repo_dir):
+                return False
+    return True
+
+
+def _loads_other_files(path: str, text: str, stem: str, declaring: str, repo_dir: str) -> bool:
+    """Whether every spelling of ``stem`` in ``text`` is in a comment, a name
+    or a test's title, or in a plain string that resolves from ``path`` to a
+    file other than ``declaring``."""
+    root = _parse(text, ts_scope.grammar(path))
+    if root.has_error:
+        return False
+    data = text.encode("utf-8")
+    titles = ts_tests.title_nodes(root, data)
+    pattern = re.compile(rb"(?<![\w$])" + re.escape(stem.encode("utf-8")) + rb"(?![\w$])")
+    for match in pattern.finditer(data):
+        node = root.descendant_for_byte_range(match.start(), match.end())
+        while node is not None and node.type not in ("comment", "string", "template_string") and not node.type.endswith("identifier"):
+            node = node.parent
+        if node is None or node.type == "template_string":
+            return False
+        if node.type == "comment" and is_directive(node.text):
+            return False  # `/// <reference path="./Gate.tsx" />` is read by the compiler
+        if node.type != "string" or node.id in titles:
+            # A comment, a name, or a test's title: none loads a file.
+            continue
+        value = cross_file_ts._string_value(node)
+        target = cross_file_ts.resolve_specifier(path, value, repo_dir, solution=True) if value else None
+        if target is None or _key(target) == declaring:
             return False
     return True
 
@@ -1162,7 +1511,9 @@ def _remove_guard(guard: _Guard, summaries, language, repo_dir, rewrite, engine)
     test = _tested_by(guard.name, guard.path, repo_dir)
     reasons = list(guard.kept)
     if test is not None:
-        reasons.append(f"the test file {test} renders it, and may test the wait itself")
+        rendered = f"the test file {test} renders it, and may test the wait itself"
+        if rendered not in reasons:
+            reasons.append(rendered)
     else:
         driving = _wait_tested(guard, [], repo_dir)
         if driving is not None and driving not in reasons:

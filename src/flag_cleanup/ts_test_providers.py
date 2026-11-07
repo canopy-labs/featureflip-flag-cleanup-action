@@ -47,6 +47,9 @@ UNWRAPPED_PROVIDER = "unwrapped test provider"
 _SDK = ("@featureflip/react", "@featureflip/react/testing")
 _PROVIDER = "TestFeatureflipProvider"
 
+#: How many `export { x } from` barrels a provider's import may pass through.
+_HOPS = 4
+
 #: How many modules one proof may read before it gives up (and keeps the provider).
 _BUDGET = 5000
 
@@ -195,28 +198,77 @@ def _is_provider(specifier: str, name: str, path: str, repo_dir: str) -> bool:
     repository wrapper of it."""
     if specifier in _SDK:
         return name == _PROVIDER and cross_file_ts.names_package(path, specifier, repo_dir)
-    target = _resolve(path, specifier, repo_dir)
-    if target is None or not target.endswith(ts_scope.FAMILY_EXTENSIONS) or target.endswith(".d.ts"):
-        return False
-    try:
-        source = Path(target).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    root = ts_scope.parse(source, target)
-    if root.has_error:
-        return False
-    data = source.encode("utf-8")
-    function = _exported_function(root, name)
-    if function is None:
-        return False
-    sdk = {
-        local
-        for statement in root.named_children
-        if (imported := _named_imports(statement)) is not None and imported[0] in _SDK
-        for imported_name, local in imported[1]
-        if imported_name == _PROVIDER and _bound_once(root, local)
-    }
-    return bool(sdk) and _returns_provider_of_children(function, data, sdk)
+    reader = path
+    for _ in range(_HOPS):
+        target = _resolve(reader, specifier, repo_dir)
+        if target is None or not target.endswith(ts_scope.FAMILY_EXTENSIONS) or target.endswith(".d.ts"):
+            return False
+        try:
+            source = Path(target).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        root = ts_scope.parse(source, target)
+        if root.has_error:
+            return False
+        data = source.encode("utf-8")
+        function = _exported_function(root, name)
+        if function is not None:
+            sdk = {
+                local
+                for statement in root.named_children
+                if (imported := _named_imports(statement)) is not None and imported[0] in _SDK
+                for imported_name, local in imported[1]
+                if imported_name == _PROVIDER and _bound_once(root, local)
+            }
+            return bool(sdk) and _returns_provider_of_children(function, data, sdk)
+        # A barrel: `export { name } from './module'` (or `name as other`).
+        hop = _reexport(root, name)
+        if hop is None:
+            return False
+        reader, (specifier, name) = target, hop
+    return False
+
+
+def _reexport(root: Node, name: str) -> tuple[str, str] | None:
+    """``(specifier, original name)`` when the file exports ``name`` by
+    exactly one ``export { original as name } from 'specifier'``, and does
+    not declare or export it any other way."""
+    found: tuple[str, str] | None = None
+    for statement in root.named_children:
+        if statement.type != "export_statement":
+            continue
+        declaration = statement.child_by_field_name("declaration")
+        if declaration is not None:
+            declared = {
+                ts_scope.text(n)
+                for n in cross_file_keys.walk(declaration)
+                if n.type in ("identifier", "type_identifier")
+                and n.parent is not None
+                and n.parent.type in ("function_declaration", "class_declaration", "variable_declarator")
+                and n.parent.child_by_field_name("name") is not None
+                and n.parent.child_by_field_name("name").start_byte == n.start_byte
+            }
+            if name in declared:
+                return None  # declared here too: two bindings of the name
+            continue
+        clause = next((c for c in statement.named_children if c.type == "export_clause"), None)
+        source = _specifier(statement.child_by_field_name("source"))
+        if clause is None:
+            continue
+        if any(c.type == "type" for c in statement.children):
+            continue
+        for item in clause.named_children:
+            if item.type != "export_specifier" or any(c.type == "type" for c in item.children):
+                continue
+            original = item.child_by_field_name("name")
+            alias = item.child_by_field_name("alias")
+            exported = ts_scope.text(alias or original) if original is not None else None
+            if exported != name:
+                continue
+            if source is None or found is not None or original is None:
+                return None
+            found = (source, ts_scope.text(original))
+    return found
 
 
 def _exported_function(root: Node, name: str) -> Node | None:
@@ -334,14 +386,16 @@ def _emptied(element: Node, data: bytes) -> bool:
 # --- The proof: nothing the file loads reaches a Featureflip module ----------
 
 
-def _prove(root: Node, data: bytes, path: str, repo_dir: str, own: Node | None) -> None:
+def _prove(
+    root: Node, data: bytes, path: str, repo_dir: str, own: Node | None, hit: re.Pattern[str] | None = None
+) -> None:
     """Raise :class:`_Unproven` unless no module the test file loads, other
     than the provider's own import statement ``own``, reaches a Featureflip
     module, followed through every module it loads in turn."""
     text = data.decode("utf-8")
     skip = (own.start_byte, own.end_byte) if own is not None else None
     outside = text if skip is None else text[: _chars(data, skip[0])] + text[_chars(data, skip[1]) :]
-    if "@featureflip/" in outside:
+    if (hit.search(outside) if hit is not None else "@featureflip/" in outside):
         raise _Unproven  # a mock, an `importOriginal`, a second import
     seen: set[str] = set()
     pending = [(path, s) for s in _loads(root, skip)]
@@ -354,12 +408,35 @@ def _prove(root: Node, data: bytes, path: str, repo_dir: str, own: Node | None) 
         if len(seen) > _BUDGET:
             raise _Unproven
         source = Path(target).read_text(encoding="utf-8")
-        if "@featureflip/" in source:
+        if hit.search(source) if hit is not None else "@featureflip/" in source:
             raise _Unproven
         module = ts_scope.parse(source, target)
         if module.has_error:
             raise _Unproven
         pending.extend((target, s) for s in _loads(module, None))
+
+
+#: Every module that is, or wraps, a flag client: the audited Featureflip SDKs
+#: and the clients a project may call through instead.
+FLAG_CLIENTS = re.compile(
+    r"@featureflip/|openfeature|launchdarkly|flagsmith|unleash|growthbook|statsig|optimizely|posthog|split\.?io",
+    re.IGNORECASE,
+)
+
+
+def loads_no_flag_client(path: str, source: str, repo_dir: str) -> bool:
+    """Whether the file ``path`` (as ``source``) provably loads no flag-client
+    module, followed through everything it loads in turn, by the same proof a
+    test provider's unwrapping uses. A module that cannot be resolved, read or
+    parsed, a load not spelled as a string, or a budget overrun is a ``False``."""
+    try:
+        root = ts_scope.parse(source, path)
+        if root.has_error:
+            return False
+        _prove(root, source.encode("utf-8"), path, repo_dir, None, FLAG_CLIENTS)
+    except (_Unproven, OSError, RecursionError, UnicodeDecodeError, ValueError):
+        return False
+    return True
 
 
 def _chars(data: bytes, offset: int) -> int:

@@ -4891,7 +4891,7 @@ def string_mentions(index: Index, path: str, wrapper: wi.Wrapper) -> list[tuple[
     prefix = r"\$?" if wrapper.kind == "property" else ""
     # A lookup ignoring case or by a prefix: any spelling counts, and so
     # does a prefix pattern the name matches, in every string of the file.
-    loose = csharp_family.loose_names(source)
+    loose = csharp_family.loose_names(source, index.repo_dir)
     # An accessor's name (`get_IsX`, `set_IsX`) is the member's too; a
     # backing field's (`<IsX>k__BackingField`) is spelled as a word already.
     word = re.compile(

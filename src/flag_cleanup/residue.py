@@ -44,7 +44,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_ts, mock_stubs, rule_synthesis, syntax, ts_tests, unused
+from flag_cleanup import cross_file_csharp, cross_file_ts, mock_stubs, rule_synthesis, syntax, ts_tests, unused
 
 #: Extension to the grammar this module parses it with. ERB is absent: its
 #: Ruby lives inside a template, and a comment verdict there would need the
@@ -109,6 +109,13 @@ class Residue:
     #: Files every mention of the flag in which outside comments is a segment
     #: of a package, namespace or import path; see :func:`_namespace_only`.
     namespace_only: tuple[str, ...] = ()
+    #: C# files every mention of the flag in which outside comments is a
+    #: plain string argument of a call that is no flag read; see
+    #: :func:`_plain_string_lines`.
+    plain_strings: tuple[str, ...] = ()
+    #: ``(path, line, text)`` for each line of a ``plain_strings`` file that
+    #: names the key, comments included, so the reviewer need not search.
+    plain_string_lines: tuple[tuple[str, int, str], ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
@@ -408,6 +415,373 @@ def _array_value(string: Node) -> bool:
     )
 
 
+#: Words that keep a callee, a constructed type or a receiver from being
+#: "not a flag read": a name holding one may read a flag by key (an SDK call
+#: of any type, ``GetBooleanValueAsync``, a wrapper the run does not know,
+#: ``IsFeatureOn``) or look a value up by it (``GetSection``, ``GetValue``).
+#: Matched case-insensitively anywhere in the name.
+_FLAG_WORDS = re.compile(
+    r"flag|feature|toggle|switch|gate|variation|variant|evaluat|experiment|treatment|rollout"
+    r"|enabled|disabled|active|ison|isoff|value|detail|config|setting|option|section|override",
+    re.IGNORECASE,
+)
+#: Other vendors' reads by key, and lookups by key, matched against the
+#: whole name: Optimizely's ``Decide``, Eppo's ``GetStringAssignment``,
+#: Statsig's ``GetLayer``/``GetExperiment``/``GetConfig``, DevCycle's
+#: ``Variable``/``VariableValue``, Split's ``GetTreatment``, a bare ``Get``.
+_KEYED_READS = re.compile(
+    r"Decide\w*|Get\w*Assignment\w*|GetLayer|GetExperiment|GetConfig|Variable|VariableValue"
+    r"|Evaluate\w*|IsFeatureEnabled|IsEnabled|GetFeatureValue|GetFeature|GetTreatment\w*"
+    r"|(?:Try)?Get(?:Async)?|Lookup|Find|Fetch|Read"
+)
+#: Mocking calls (Moq, NSubstitute, FakeItEasy): a string argument of a call
+#: set up, verified or stubbed through one is a stub of that call, whatever
+#: its name.
+_MOCK_CALLS = frozenset({
+    "Setup", "SetupGet", "SetupSequence", "SetupProperty", "Verify", "VerifyGet",
+    "Returns", "ReturnsAsync", "ReturnsForAnyArgs", "Received", "DidNotReceive",
+    "ReceivedWithAnyArgs", "When", "Do", "CallTo", "Throws", "ThrowsAsync", "Is", "IsAny",
+})
+#: Argument matchers: a call holding one is a mock's.
+_MATCHERS = frozenset({"Arg", "It", "A"})
+#: Where a call's value is not used by any other code: the statement, the
+#: resource a ``using`` disposes, and nothing else (see :func:`_value_discarded`).
+_MEMBER_SCOPES = frozenset({
+    "method_declaration", "local_function_statement", "constructor_declaration",
+    "property_declaration", "field_declaration", "class_declaration", "struct_declaration",
+    "record_declaration", "compilation_unit",
+})
+
+
+@dataclass(frozen=True)
+class _Callee:
+    name: str
+    receiver: Node | None
+    generic: bool
+
+
+def _csharp_callee(call: Node) -> _Callee | None:
+    """The simple name, receiver and genericness of a C# invocation or
+    object creation, or ``None`` when the callee is not a plain name (a
+    delegate called through an expression, an indexer's result)."""
+    if call.type == "object_creation_expression":
+        spelled = call.child_by_field_name("type")
+        if spelled is None:
+            return None
+        text = _node_text(spelled)
+        return _Callee(re.split(r"[.:]", re.sub(r"<.*", "", text, flags=re.DOTALL))[-1].strip(), None, "<" in text)
+    function = call.child_by_field_name("function")
+    receiver = None
+    if function is not None and function.type == "member_access_expression":
+        receiver = function.child_by_field_name("expression")
+        function = function.child_by_field_name("name")
+    elif function is not None and function.type == "conditional_access_expression":
+        receiver = function.child_by_field_name("condition")
+        binding = function.named_children[-1] if function.named_children else None
+        function = binding.child_by_field_name("name") if binding is not None and binding.type == "member_binding_expression" else None
+    generic = function is not None and function.type == "generic_name"
+    if generic:
+        function = next((c for c in function.named_children if c.type == "identifier"), None)
+    if function is None or function.type != "identifier":
+        return None
+    return _Callee(_node_text(function), receiver, generic)
+
+
+def _node_text(node: Node) -> str:
+    return node.text.decode("utf-8", "replace")
+
+
+def _reading_wrappers(root: Node) -> frozenset[str]:
+    """Names of the file's own methods and local functions that hand one of
+    their parameters to a call: a wrapper that may read a flag by the key it
+    is given (``bool On(string k) => _client.BoolVariation(k, …)``)."""
+    found: set[str] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.children)
+        if node.type not in ("method_declaration", "local_function_statement"):
+            continue
+        name = node.child_by_field_name("name")
+        listed = node.child_by_field_name("parameters")
+        if name is None or listed is None:
+            continue
+        parameters = {
+            _node_text(p.child_by_field_name("name"))
+            for p in listed.named_children
+            if p.type == "parameter" and p.child_by_field_name("name") is not None
+        }
+        inner = [node]
+        while inner:
+            current = inner.pop()
+            inner.extend(current.children)
+            if current.type == "argument" and any(
+                n.type == "identifier" and _node_text(n) in parameters for n in _subtree(current)
+            ):
+                found.add(_node_text(name))
+                break
+    return frozenset(found)
+
+
+def _subtree(node: Node):
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(current.children)
+
+
+def _read_like(call: Node, reads: frozenset[str], wrappers: frozenset[str]) -> bool:
+    """Whether ``call`` may read a flag by key, or is a mock's: an unknown
+    callee, a read, an accessor or a same-file wrapper by name, a name with a
+    flag word or a keyed read's name, a generic ``Get…<T>``, or a receiver
+    with a flag word or a mocking call or matcher anywhere in it."""
+    callee = _csharp_callee(call)
+    if callee is None:
+        return True
+    name = callee.name
+    if (
+        name in reads or name in wrappers or name in _MOCK_CALLS
+        or _FLAG_WORDS.search(name) or _KEYED_READS.fullmatch(name)
+        or (callee.generic and name.startswith("Get"))
+    ):
+        return True
+    if callee.receiver is None:
+        return False
+    for node in _subtree(callee.receiver):
+        # Names only: a string in the receiver chain (`t.ForJob("k")`) is data.
+        if node.type == "identifier" and (_node_text(node) in _MATCHERS or _FLAG_WORDS.search(_node_text(node))):
+            return True
+        if node.type == "invocation_expression":
+            inner = _csharp_callee(node)
+            if inner is None or inner.name in _MOCK_CALLS:
+                return True
+    return False
+
+
+def _lambda_parameters(lam: Node) -> set[str]:
+    names: set[str] = set()
+    for child in lam.named_children:
+        if child.type == "implicit_parameter":
+            names.add(_node_text(child))
+        elif child.type == "parameter_list":
+            names |= {
+                _node_text(p.child_by_field_name("name"))
+                for p in child.named_children
+                if p.type == "parameter" and p.child_by_field_name("name") is not None
+            }
+    return names
+
+
+def _chain_root(node: Node) -> Node:
+    """The expression a builder chain (``t.A(…).B(…)``) starts from."""
+    while True:
+        if node.type == "invocation_expression":
+            node = node.child_by_field_name("function") or node
+            if node.type != "member_access_expression":
+                return node
+        if node.type == "member_access_expression":
+            node = node.child_by_field_name("expression") or node
+            continue
+        return node
+
+
+def _value_discarded(call: Node) -> bool:
+    """Whether nothing reads the value of ``call``: the end of the builder
+    chain it starts (``t.ForJob("k").WithIdentity(…)``) is a statement of
+    its own, a resource a ``using`` disposes, a ``using var`` read nowhere
+    else, or the result of a lambda configuring the parameter it is handed
+    (``j => j.WithIdentity("k")``) as an argument of a call whose own value
+    is discarded, the call or the next in its chain being a builder verb
+    (:data:`_BUILDER_VERBS`; ``sp => sp.Resolve("k")`` is a factory). A
+    local, a field, a return, a condition, an argument or a property read of
+    the result (``new Key("k").Value``) uses it."""
+    node = call
+    first = _csharp_callee(call)
+    chain = [first.name] if first is not None else [""]
+    while True:
+        parent = node.parent
+        if parent is None:
+            return False
+        if parent.type == "member_access_expression" and parent.child_by_field_name("expression") == node:
+            outer = parent.parent
+            if outer is not None and outer.type == "invocation_expression" and outer.child_by_field_name("function") == parent:
+                node = outer
+                named = _csharp_callee(outer)
+                chain.append(named.name if named is not None else "")
+                continue
+            return False
+        if parent.type == "await_expression":
+            node = parent
+            continue
+        break
+    parent = node.parent
+    if parent.type == "expression_statement":
+        return True
+    if parent.type == "using_statement" and parent.child_by_field_name("body") != node:
+        return True
+    if parent.type == "variable_declarator":
+        declaration = parent.parent
+        statement = declaration.parent if declaration is not None else None
+        if (
+            statement is None
+            or statement.type != "local_declaration_statement"
+            or not any(not c.is_named and _node_text(c) == "using" for c in statement.children)
+        ):
+            return False
+        name = parent.child_by_field_name("name")
+        scope = statement.parent
+        if name is None or scope is None:
+            return False
+        spelled = _node_text(name)
+        return not any(
+            n.type == "identifier" and _node_text(n) == spelled and n.start_byte != name.start_byte
+            for n in _subtree(scope)
+        )
+    if parent.type == "lambda_expression" and parent.child_by_field_name("body") == node:
+        root = _chain_root(node)
+        if root.type != "identifier" or _node_text(root) not in _lambda_parameters(parent):
+            return False
+        # A configurator (`j => j.WithIdentity("k")`), not a factory whose
+        # result is used (`sp => sp.Resolve("k")`): the call holding the
+        # string, or the next one in its chain, is a builder verb.
+        if not any(_BUILDER_VERBS.match(name) for name in chain[:2]):
+            return False
+        argument = parent.parent
+        arguments = argument.parent if argument is not None and argument.type == "argument" else None
+        outer = arguments.parent if arguments is not None and arguments.type == "argument_list" else None
+        return outer is not None and outer.type == "invocation_expression" and _value_discarded(outer)
+    return False
+
+
+#: Names a configurator's calls start with, in a lambda handed to a builder.
+_BUILDER_VERBS = re.compile(r"(?:With|For|Named|Set|Use|Configure|Add|Map|Has)(?![a-z])")
+#: Receivers that name the type's own members, which a base class may declare.
+_OWN_RECEIVERS = frozenset({"this", "base"})
+
+
+def _own_members(root: Node) -> frozenset[str]:
+    """Names of the methods and local functions the file declares."""
+    return frozenset(
+        _node_text(name)
+        for node in _subtree(root)
+        if node.type in ("method_declaration", "local_function_statement")
+        and (name := node.child_by_field_name("name")) is not None
+    )
+
+
+#: What another argument of the call may be: a name, a member read or a
+#: string. A computed value (``new Flag(true)``, ``1 == 1``, ``$"…"``, a
+#: literal of another type) may be a registry or stub entry for the key.
+_PLAIN_OTHER_ARGUMENTS = frozenset({"identifier", "member_access_expression", "string_literal"})
+
+
+def _plain_argument(
+    leaf: Node, flag_key: str, reads: frozenset[str], wrappers: frozenset[str] = frozenset(), own: frozenset[str] = frozenset()
+) -> bool:
+    """Whether ``leaf`` is the whole content of a plain C# string literal
+    passed to a call the run can see reads no flag with it:
+
+    * the call, and every call around it up to its member, is not
+      :func:`_read_like` (``BoolVariation(Keys.Normalize("k"), …)`` is a read);
+    * its value is used by nothing (:func:`_value_discarded`), so it cannot
+      carry the key on to a read (``var key = Normalize("k")``);
+    * every other argument is a name, a member read or a string, and a named
+      argument's label does not say key or flag;
+    * a call with no receiver, or through ``this``, is to a method ``own``
+      (the file's own) declares; never through ``base``."""
+    string = leaf.parent
+    if (
+        leaf.type != "string_literal_content"
+        or _node_text(leaf) != flag_key
+        or string is None
+        or string.type != "string_literal"
+        or len(string.named_children) != 1
+    ):
+        return False
+    argument = string.parent
+    arguments = argument.parent if argument is not None and argument.type == "argument" else None
+    call = arguments.parent if arguments is not None and arguments.type == "argument_list" else None
+    if call is None or call.type not in ("invocation_expression", "object_creation_expression"):
+        return False
+    if any(not c.is_named and _node_text(c) in ("ref", "out", "in") for c in argument.children):
+        return False
+    if call.type == "invocation_expression":
+        # A bare `Require("k")`, `this.Check("k")` or `base.Require("k")` may be
+        # a guard a base class in another file declares: only a method of
+        # this file, read above as no wrapper, is known.
+        callee = _csharp_callee(call)
+        receiver = _node_text(callee.receiver) if callee is not None and callee.receiver is not None else None
+        if callee is not None and (receiver is None or receiver in _OWN_RECEIVERS):
+            if receiver == "base" or callee.name not in own:
+                return False
+    # A named argument (`key: "k"`) is an identifier and a `:` before the value.
+    label = argument.children[0] if len(argument.children) > 2 and _node_text(argument.children[1]) == ":" else None
+    if label is not None and (_FLAG_WORDS.search(_node_text(label)) or "key" in _node_text(label).lower()):
+        return False
+    for other in arguments.named_children:
+        if other.type != "argument" or other == argument:
+            continue
+        value = other.named_children[-1] if other.named_children else None
+        if value is None or value.type not in _PLAIN_OTHER_ARGUMENTS:
+            return False
+    current: Node | None = call
+    while current is not None and current.type not in _MEMBER_SCOPES:
+        if current.type in ("invocation_expression", "object_creation_expression") and _read_like(current, reads, wrappers):
+            return False
+        current = current.parent
+    return _value_discarded(call)
+
+
+def _plain_string_lines(
+    root: Node, source: str, flag_key: str, language: str, reads: frozenset[str]
+) -> list[tuple[int, str]] | None:
+    """``(line, text)`` of each line naming the key, when every mention of
+    it outside comments is a plain string argument of a call that is no
+    flag read (:func:`_plain_argument`), with one such mention found; else
+    ``None``. C# only.
+
+    Judged with the residual scan's own match (:func:`_scan_mention`), so
+    every hit the scan made is accounted for: a key-const declaration, a
+    dictionary entry, an attribute's argument, an interpolated or verbatim
+    string or anything else keeps the file in the generic caveat, and so
+    does a file that does not parse whole."""
+    if language != "csharp" or root.has_error:
+        return None
+    scan = _scan_mention(flag_key)
+    lines = source.split("\n")
+    found: dict[int, str] = {}
+    strings = judged = 0
+    wrappers = _reading_wrappers(root)
+    own = _own_members(root)
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        text = _node_text(node)
+        if not scan.search(text):
+            continue
+        if "comment" in node.type:
+            for match in scan.finditer(text):
+                judged += 1
+                row = node.start_point[0] + text.count("\n", 0, match.start())
+                found.setdefault(row + 1, lines[row].strip() if row < len(lines) else "")
+            continue
+        if node.child_count:
+            stack.extend(node.children)
+            continue
+        if not _plain_argument(node, flag_key, reads, wrappers, own):
+            return None
+        strings += 1
+        judged += 1
+        row = node.start_point[0]
+        found.setdefault(row + 1, lines[row].strip() if row < len(lines) else "")
+    # A mention no single leaf holds (`my-flag` spelled as `my - flag` in
+    # code) was never judged above.
+    if not strings or judged != len(scan.findall(source)):
+        return None
+    return sorted(found.items())
+
+
 #: The grammar node of one enum member, per language (measured, not guessed).
 #: Python has no enum syntax: an assignment in a class whose bases name an
 #: ``...Enum`` or a Django ``...Choices`` is the member there.
@@ -544,6 +918,8 @@ def classify(
     path_only: list[str] = []
     literal_only: list[str] = []
     namespace_only: list[str] = []
+    plain_strings: list[str] = []
+    plain_string_lines: list[tuple[str, int, str]] = []
     for path in paths:
         language = _grammar_by_extension(path)
         if language is None:
@@ -577,6 +953,14 @@ def classify(
         if _namespace_only(root, source, flag_key, language):
             namespace_only.append(path)
             continue
+        plain = _plain_string_lines(
+            root, source, flag_key, language,
+            frozenset({*cross_file_csharp._READ_CALLEES, *rule_synthesis.accessors_for(language, accessors)}),
+        )
+        if plain is not None:
+            plain_strings.append(path)
+            plain_string_lines.extend((path, line, text) for line, text in plain)
+            continue
         held = _enum_held(root, mention, language)
         if held is not None:
             enum_held.append((path, held))
@@ -589,6 +973,8 @@ def classify(
         tuple(path_only),
         literal_only=tuple(literal_only),
         namespace_only=tuple(namespace_only),
+        plain_strings=tuple(plain_strings),
+        plain_string_lines=tuple(plain_string_lines),
     )
 
 

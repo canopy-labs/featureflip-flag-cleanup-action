@@ -48,36 +48,33 @@ from dataclasses import dataclass, field
 import httpx
 
 from flag_cleanup import http_retry
+from flag_cleanup.branches import (
+    _FULL_SHA_RE,
+    _MAX_BRANCH_SEGMENT,
+    BRANCH_PREFIX,
+    Commit,
+    UnsafeFlagKeyError,
+    flag_key_from_branch,
+    foreign_commits,
+    removal_branch,
+    short_ref,
+)
+from flag_cleanup.forge import (
+    BaseRefError,
+    ForgeApiError,
+    ForgeAuthError,
+    ForgeConfigError,
+    HandledPullRequest,
+    MergedRemoval,
+    OpenPullRequest,
+    PullRequest,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://api.github.com"
 DEFAULT_SERVER_URL = "https://github.com"
 
-#: Frozen by the plan — one PR per flag on ``featureflip/remove-flag/<key>``.
-BRANCH_PREFIX = "featureflip/remove-flag/"
-
-# Characters kept verbatim in a branch name. Deliberately excludes ``.``: with
-# no dot anywhere in the encoded key, git's dot rules (no leading ``.``, no
-# ``..``, no trailing ``.``, no ``.lock`` suffix) are satisfied by construction
-# rather than by a pile of special cases that would each be a chance to be
-# subtly wrong.
-_SAFE_BRANCH_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-)
-_ESCAPE = "="
-
-# Uppercase only: `_encode_char` emits `{byte:02X}`, so accepting lowercase
-# here would decode a branch this tool could not have written.
-_UPPER_HEX = frozenset("0123456789ABCDEF")
-
-# The bound is on the ENCODED segment because that is what becomes a path
-# component: a loose ref is stored at `.git/refs/heads/<...>/<encoded key>`,
-# and git writes `<that>.lock` beside it while updating. Most filesystems cap a
-# component at 255 bytes, so 240 leaves room for the 5-byte suffix. Counting
-# raw characters instead would let a non-ASCII key (6 encoded characters per
-# emoji) sail past the real limit and fail inside git.
-_MAX_BRANCH_SEGMENT = 240
 
 _API_VERSION = "2022-11-28"
 
@@ -90,7 +87,6 @@ _API_VERSION = "2022-11-28"
 # `diverged` both mean the second ref carries commits of its own.
 _SECOND_REF_CONTAINED = frozenset({"identical", "behind"})
 
-_FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 # GitHub's compare endpoint returns at most this many commits in `commits`,
 # with the true count in `total_commits`. See :func:`branch_commits`.
@@ -102,24 +98,15 @@ _MAX_COMPARE_COMMITS = 250
 WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 
 
-class GitHubConfigError(ValueError):
+class GitHubConfigError(ForgeConfigError):
     """A runner-provided GitHub variable is missing or malformed."""
 
 
-class UnsafeFlagKeyError(ValueError):
-    """The flag key cannot be represented as a git branch name.
-
-    Raised rather than guessed at: silently mangling a key risks two flags
-    landing on one branch, and pushing a ref git will not accept fails deep in
-    a subprocess with a far less obvious message.
-    """
-
-
-class GitHubApiError(RuntimeError):
+class GitHubApiError(ForgeApiError):
     """A GitHub API call failed. Never carries the token in its message."""
 
 
-class GitHubAuthError(GitHubApiError):
+class GitHubAuthError(GitHubApiError, ForgeAuthError):
     """A GitHub call was refused with 401/403 — a run-level fact, not a bad flag.
 
     Distinct from its parent so the orchestrator can stop instead of repeating
@@ -128,13 +115,6 @@ class GitHubAuthError(GitHubApiError):
     to create and approve pull requests"* turned off, refuses every flag
     equally; one clear message beats N copies of it, and (combined with the
     orphan-branch cleanup) leaves nothing behind to clean up by hand.
-    """
-
-
-class BaseRefError(RuntimeError):
-    """The checkout cannot safely be the source of a removal branch.
-
-    Raised before any candidate is processed, so nothing has been modified.
     """
 
 
@@ -260,115 +240,6 @@ class GitHubApi:
         return self._client.post(self._graphql_url, json={"query": query, "variables": variables})
 
 
-def removal_branch(key: str) -> str:
-    """Return ``featureflip/remove-flag/<escaped key>``.
-
-    The key is escaped, not sanitized: every character outside
-    ``[A-Za-z0-9_-]`` (including the escape character itself) becomes
-    ``=<UPPERCASE HEX>`` per UTF-8 byte. That is a bijection on the encoded
-    alphabet, so distinct keys always produce distinct branches — a "strip the
-    bad characters" scheme would map ``a/b`` and ``a-b`` (or ``a.b``) onto one
-    branch and let two flags overwrite each other's PR.
-
-    Ordinary kebab/snake-case keys pass through untouched, so the common case
-    stays readable (``old-checkout`` -> ``featureflip/remove-flag/old-checkout``).
-
-    Note that the key is NOT stripped first: ``"a "`` and ``"a"`` are different
-    keys and must not share a branch, so the trailing space is escaped like any
-    other character.
-
-    Raises :class:`UnsafeFlagKeyError` when the key is blank or would produce a
-    ref segment too long to store — skip such a flag loudly rather than guess.
-    The limit is on the ENCODED length (see ``_MAX_BRANCH_SEGMENT``), so the
-    message reports both numbers: a key well under the limit as written can
-    still exceed it once escaped.
-    """
-    if not key.strip():
-        raise UnsafeFlagKeyError(f"flag key {key!r} is blank")
-    encoded = "".join(_encode_char(char) for char in key)
-    if len(encoded) > _MAX_BRANCH_SEGMENT:
-        raise UnsafeFlagKeyError(
-            f"flag key {key!r} is {len(key)} character(s) long but escapes to "
-            f"{len(encoded)} characters for use as a branch name, over the "
-            f"{_MAX_BRANCH_SEGMENT}-character limit. Characters outside "
-            "[A-Za-z0-9_-] cost 3 characters per byte once escaped"
-        )
-    return f"{BRANCH_PREFIX}{encoded}"
-
-
-def _encode_char(char: str) -> str:
-    if char in _SAFE_BRANCH_CHARS:
-        return char
-    return "".join(f"{_ESCAPE}{byte:02X}" for byte in char.encode("utf-8"))
-
-
-def flag_key_from_branch(branch: str) -> str | None:
-    """The flag key ``branch`` encodes, or ``None`` if it is not one of ours.
-
-    The exact inverse of :func:`removal_branch`, which matters more than it
-    looks: that function is a documented BIJECTION on the encoded alphabet, so
-    the branch name a removal pull request already carries IS a lossless,
-    machine-readable record of which flag it removes. Archive-on-merge
-    therefore needs no marker written into the pull-request body at open time,
-    and works on every pull request this Action has ever opened rather than
-    only on ones opened after the feature shipped.
-
-    ``None`` rather than an exception for the overwhelmingly common case: the
-    customer's workflow fires on *every* closed pull request in the repository,
-    and almost none of them are ours. A branch that is not a removal branch is
-    an ordinary no-op, not an error.
-
-    The scan rejects the malformed shapes — lowercase hex, a truncated escape,
-    a character :func:`removal_branch` would have escaped. The re-encode check
-    at the end exists for the one thing the scan cannot see: a **non-canonical**
-    encoding of a perfectly valid key. ``=6F=6C=64`` decodes to ``old`` under
-    any lenient reader, but this Action writes ``old``, so a branch spelled that
-    way was made by something else. Without that check a hand-crafted branch
-    under this prefix could name any flag it liked, and the value flows straight
-    into a call that mutates the customer's flag state. It also catches an
-    over-long segment, which :func:`removal_branch` refuses to write.
-
-    Stated positively: this can only ever return a key that WOULD produce
-    exactly this branch.
-    """
-    if not branch.startswith(BRANCH_PREFIX):
-        return None
-    encoded = branch[len(BRANCH_PREFIX) :]
-    if not encoded:
-        return None
-
-    decoded = bytearray()
-    index = 0
-    while index < len(encoded):
-        char = encoded[index]
-        if char == _ESCAPE:
-            pair = encoded[index + 1 : index + 3]
-            if len(pair) != 2 or any(digit not in _UPPER_HEX for digit in pair):
-                return None
-            decoded.append(int(pair, 16))
-            index += 3
-        elif char in _SAFE_BRANCH_CHARS:
-            decoded.append(ord(char))
-            index += 1
-        else:
-            return None
-
-    try:
-        key = decoded.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-    # The one check that makes this exact. `removal_branch` refuses a blank or
-    # over-long key, and either refusal means the input was never something it
-    # could have produced.
-    try:
-        if removal_branch(key) != branch:
-            return None
-    except UnsafeFlagKeyError:
-        return None
-    return key
-
-
 def already_handled(gh: GitHubApi, repo: str, branch: str) -> bool:
     """Has this flag's removal already been proposed?
 
@@ -386,21 +257,6 @@ def already_handled(gh: GitHubApi, repo: str, branch: str) -> bool:
     return existing_pull_request(gh, repo, branch) is not None
 
 
-@dataclass(frozen=True, slots=True)
-class OpenPullRequest:
-    """An open removal pull request, as much of it as holding it needs.
-
-    ``node_id`` is what GraphQL addresses it by (REST cannot toggle draft), and
-    ``author`` is whose comments are trusted to say whether it is on hold.
-    """
-
-    number: int
-    node_id: str
-    draft: bool
-    author: str
-    html_url: str
-
-
 def _open_pull(pr: dict) -> OpenPullRequest | None:
     try:
         user = pr["user"]
@@ -413,41 +269,6 @@ def _open_pull(pr: dict) -> OpenPullRequest | None:
         )
     except (KeyError, TypeError, ValueError):
         return None
-
-
-@dataclass(frozen=True, slots=True)
-class HandledPullRequest:
-    """The idempotency answer :func:`already_handled_pull_request` gives — with
-    a link, when there is a safe one to give.
-
-    ``open_pr_url`` names a still-OPEN pull request from this branch, so the
-    caller can report it to Featureflip again. It is deliberately empty in the
-    other two ways ``handled`` can be true: a CLOSED pull request (the
-    customer's "no thanks" — reporting it would look like a live PR) and a
-    branch that exists with no pull request ever opened from it (nothing to
-    link). ``handled`` is false only when neither the branch nor any pull
-    request exists.
-
-    ``open_pull`` carries what holding or releasing the pull request needs;
-    ``None`` whenever ``open_pr_url`` is empty, or GitHub's answer lacked one
-    of those fields.
-
-    ``state`` says which of those it was: ``"open"``, ``"merged"``, ``"closed"``
-    (closed without merging), ``"branch"`` (a branch with no pull request), or
-    empty when ``handled`` is false. A merged removal and a declined one are
-    both ``state: closed`` to the REST API and opposite facts to the customer:
-    one is waiting to be archived, the other was turned down.
-
-    ``closed_pr_url`` names a merged or closed pull request, for the run's
-    report only. It is a separate field from ``open_pr_url`` so that nothing
-    that links pull requests in Featureflip can pick it up by mistake.
-    """
-
-    handled: bool
-    open_pr_url: str = ""
-    open_pull: OpenPullRequest | None = None
-    state: str = ""
-    closed_pr_url: str = ""
 
 
 def already_handled_pull_request(gh: GitHubApi, repo: str, branch: str) -> HandledPullRequest:
@@ -612,28 +433,6 @@ def existing_pull_request(gh: GitHubApi, repo: str, branch: str) -> str | None:
     return str(pr.get("html_url") or "")
 
 
-@dataclass(frozen=True, slots=True)
-class MergedRemoval:
-    """The merged pull request a removal branch produced.
-
-    ``number`` is ``None`` when the response did not carry one — the pull
-    request still merged, and that is the fact the caller acts on, so the
-    missing number degrades to an unnamed reference rather than discarding the
-    evidence (same reasoning as ``pr_event.MergedPullRequest``'s ``number=0``).
-
-    ``merge_commit_sha`` degrades to ``""`` for the same reason, and the
-    consequence is stated here because it is not obvious from the field: it is
-    what ``mode: archive-on-deploy`` compares against the deployed commit, so
-    an empty one means that mode cannot establish the removal is live and
-    leaves the flag outstanding. ``archive-on-merge`` and ``archive-sweep``
-    never read it, so they are unaffected.
-    """
-
-    number: int | None
-    html_url: str
-    merge_commit_sha: str = ""
-
-
 def merged_removal(
     gh: GitHubApi, repo: str, branch: str, *, base: str
 ) -> MergedRemoval | None:
@@ -758,13 +557,6 @@ def commit_is_contained(gh: GitHubApi, repo: str, commit: str, *, within: str) -
     return status in _SECOND_REF_CONTAINED
 
 
-def short_ref(ref: str) -> str:
-    """``ref`` as a report line should print it: a full sha abbreviated, a
-    name — ``prod/web``, ``release/2026-10`` — never, since cutting a name
-    short can make it read as a different ref."""
-    return ref[:12] if _FULL_SHA_RE.match(ref) else ref
-
-
 def _describe_ref(ref: str) -> str:
     return f"commit {short_ref(ref)}" if _FULL_SHA_RE.match(ref) else f"ref {ref}"
 
@@ -862,26 +654,6 @@ def open_pr(
             )
 
     return url
-
-
-@dataclass(frozen=True, slots=True)
-class PullRequest:
-    """One pull request, as much of it as this tool acts on.
-
-    Read in a single ``GET``: the head branch names the flag (through the
-    :func:`removal_branch` bijection), ``head_sha`` is the value the
-    force-push leases against, and ``state``/``merged``/``draft`` decide what
-    a re-run may do to it.
-    """
-
-    number: int
-    head_ref: str
-    head_sha: str
-    base_ref: str
-    state: str
-    merged: bool
-    draft: bool
-    html_url: str
 
 
 def pull_request(gh: GitHubApi, repo: str, number: int) -> PullRequest:
@@ -1092,15 +864,6 @@ def ensure_head_on_base(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class Commit:
-    """One commit on a branch, reduced to what the ownership guard reads."""
-
-    sha: str
-    author_email: str
-    committer_email: str
-
-
 def branch_commits(
     gh: GitHubApi, repo: str, base: str, branch: str
 ) -> tuple[Commit, ...]:
@@ -1163,25 +926,6 @@ def branch_commits(
             )
         )
     return tuple(resolved)
-
-
-def foreign_commits(commits: Sequence[Commit], bot_email: str) -> tuple[str, ...]:
-    """SHAs of commits not both authored AND committed by ``bot_email``.
-
-    Both fields, because a rebase or an accepted suggestion preserves the
-    author and replaces the committer — checking only the author would wave
-    through precisely the edit a human is most likely to have made.
-
-    Compared case-insensitively: git preserves the case a commit was made
-    with, and an address that differs only in case is the same mailbox.
-    """
-    expected = bot_email.strip().lower()
-    return tuple(
-        commit.sha
-        for commit in commits
-        if commit.author_email.strip().lower() != expected
-        or commit.committer_email.strip().lower() != expected
-    )
 
 
 def actor_permission(gh: GitHubApi, repo: str, login: str) -> str:

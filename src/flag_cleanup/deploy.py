@@ -84,7 +84,9 @@ from flag_cleanup.backlog import (
 )
 from flag_cleanup.client import FeatureflipClient
 from flag_cleanup.config import Config
-from flag_cleanup.github_ops import GitHubApi, GitHubEnv
+from flag_cleanup.forge import Forge
+from flag_cleanup.github_ops import GitHubApi
+from flag_cleanup.run_context import github_env_from, resolve_forge
 from flag_cleanup.pr_event import DEPLOYMENT_SUCCESS, DeploymentEvent, deployment_event
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,7 @@ def run_archive_on_deploy(
     *,
     client: FeatureflipClient | None = None,
     gh: GitHubApi | None = None,
+    forge: Forge | None = None,
 ) -> list[ArchiveResult]:
     """Archive every outstanding flag whose removal this deployment shipped.
 
@@ -138,22 +141,23 @@ def run_archive_on_deploy(
     # weeks later and in the run that mattered. It reads environment variables
     # and opens no connection, so paying for it on a delivery this mode ignores
     # costs nothing.
-    github = GitHubEnv.from_env(env)
+    github = github_env_from(env)
 
     skipped = _skip_reason(deployment, config.deployment_environment)
     if skipped is not None:
         return [skipped]
 
-    owned_gh = gh is None
+    # A deployment event only exists on GitHub, so this mode's forge is always
+    # GitHub, built from the environment checked above.
+    active_forge, owned_forge = resolve_forge(forge=forge, github=github, gh=gh)
     owned_client = client is None
-    active_gh = gh if gh is not None else GitHubApi(github.token, api_url=github.api_url)
     active = (
         client if client is not None else FeatureflipClient(config.api_url, config.api_token)
     )
     try:
-        candidates = outstanding_archives(config, active_gh, github.repository, client=active)
+        candidates = outstanding_archives(config, active_forge, client=active)
         deployed, pending = partition_by_containment(
-            active_gh, github.repository, candidates, _deployment_gate(deployment.sha)
+            active_forge, candidates, _deployment_gate(deployment.sha)
         )
         return pending + archive_outstanding(
             config,
@@ -162,8 +166,8 @@ def run_archive_on_deploy(
             merged_removals={candidate.key for candidate in candidates},
         )
     finally:
-        if owned_gh:
-            active_gh.close()
+        if owned_forge:
+            active_forge.close()
         if owned_client:
             active.close()
 

@@ -8,6 +8,75 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.8.0
+
+### Added
+
+- Bitbucket Cloud support. On a repository hosted on Bitbucket Cloud, the image runs as a Bitbucket Pipelines step and opens one pull request per stale flag, with the same guarantees as on GitHub: a pull request you declined is never opened again, and `archive-sweep` (with or without `deployed-refs`) archives a flag only once its removal merged into the base branch from the repository itself. A stale flag's removal opens as a draft; where Bitbucket does not hold it as one, the description carries a "Not ready to merge" notice instead. Bitbucket pull requests have no labels, so `pr-labels` is logged and ignored there. An example pipeline ships as `bitbucket/bitbucket-pipelines.yml`, and the run needs a `BITBUCKET_ACCESS_TOKEN` repository access token with the `pullrequest:write` and `repository:write` scopes.
+- A C# `//` or `///` comment that names the removed gate (by its key, or by a type the run deleted) now loses the clause that only the gate made true, instead of being left for you to reword: `, once <gate> is on`, `only once that gate is on`, the purpose clause `so that turning the flag on takes effect without a redeploy, and so <rest>` (leaving `so that <rest>`), `once <gate> is on and the <noun> has run` (leaving `once the <noun> has run`) and `, gated on <gate>, so flipping that flag takes effect without a redeploy`. Only for a flag that served `true`, only these shapes, and only in comment text: XML documentation stays well-formed, the paragraph is filled again no wider than it was, and a comment that names another gate, holds a tool directive or uses another state word is left and listed as before.
+- The CircleCI orb takes a `forge` parameter (`github`, `gitlab` or `bitbucket`), with `forge-token` naming the variable that holds the GitLab or Bitbucket token, and `forge-server-url`/`forge-api-url` for a self-managed GitLab. On GitLab or Bitbucket the repository's path, including a GitLab subgroup, is read from the project's clone URL. Left at `github`, the orb runs exactly as before.
+- Any CI provider can run the image by naming the forge with `FLAG_CLEANUP_FORGE`, `FLAG_CLEANUP_REPOSITORY` and `FLAG_CLEANUP_FORGE_TOKEN`, plus `FLAG_CLEANUP_API_URL` and `FLAG_CLEANUP_SERVER_URL` for GitHub Enterprise Server or a self-managed GitLab. The README's "On any other CI" section has a `docker run` example.
+- GitLab support. On a project hosted on gitlab.com or a self-managed GitLab instance, the image opens one merge request per stale flag, with the same guarantees as on GitHub: a stale flag's removal opens as a draft, a merge request you closed is never opened again, and `archive-sweep` (with or without `deployed-refs`) archives a flag only once its removal merged into the base branch from the project itself. It ships as a CI/CD template, `gitlab/templates/flag-cleanup.yml`, and needs a `GITLAB_TOKEN` project access token with the `api` scope (`read_api` is enough for a pipeline that only runs `archive-sweep`). `archive-on-merge`, `archive-on-deploy` and `pr-command` stay GitHub-only and exit `2` elsewhere with a message saying so.
+- `FLAG_CLEANUP_FORGE_TOKEN`, when set, is the forge token in every mode, in place of `GITHUB_TOKEN` or `GITLAB_TOKEN`.
+
+### Changed
+
+- A comment that joins the removed flag to something else with `+`, `&`, `&&`, `and` or `AND` now loses the flag half when the flag served `true`: `// release flag + Pro plan` becomes `// Pro plan`, and a doc line "the `k` release flag AND a Pro plan." becomes "a Pro plan.". This applies to a comment that names the key, and to the comment at a call of a function the removal took the flag's only read out of. A comment with an `or`, a third part, a negation, a condition or another key is still left and listed.
+- A `key=value` item naming the removed flag in a comma-separated list inside a comment (`FORCE_FLAGS=k=true,a=1`) is removed with one comma, unless that would empty the list.
+- C#: a test whose middle the run cut out, left named for what happened at the removed value (`Job_DoesNothing_UntilTheGateIsOn`), is now folded into its sibling when what is left arranges and acts, token for token, as exactly one other bare `[Fact]` of its class does and both then only assert. Its assertions the sibling does not already make are added at the end of the sibling, and the test is deleted. The pull request lists each fold instead of asking you to rename the test or compare it with the sibling.
+- C#: a file that names the flag's key only as plain string arguments of calls that read no flag (a Quartz job identity, a scope or log name, an `Assert.Contains`) is no longer listed under "still reference this flag". The pull request lists each such line, with its text, in a note of its own.
+- The C# "comments next to changed code describe a flag's state" report no longer fires on ordinary words that a deleted comment happened to contain, or on a bare "the flag" role mention.
+- The report of test titles that still describe the removed branch is stricter. A kept title is listed only when it speaks of a flag's state or readiness ("when the flag is off", "waits for flags to load") and shares a word with a test deleted from the same `describe` group. In a repository about feature flags, titles that merely mention "flags", "toggle" or another flag's name are no longer listed.
+- A kept test whose own body pinned the removed flag to the kept value now has a trailing "even with the gate on" (or "when the flag is on") dropped from its title, and is reported as a renamed test. A test that pinned no flag, or another flag as well, keeps its title.
+
+### Fixed
+
+- A Featureflip test provider that the removal left empty is now unwrapped when the test file imports it through an `export { name } from './module'` barrel, as a repository's `index` file usually exports it.
+- C#: a reflection lookup that loops over a `private` field holding only constant names (`private static readonly string[] Names = ["_a", "_b"]; foreach (var n in Names) type.GetField(n, …)`) no longer makes every string in the repository that spells a removed gate's member count as a possible mention. Such a lookup in a test helper used to leave the whole gate family partial. The same goes for a local `string[]` written as a collection expression.
+- C#: a lookup name looped over an array of another element type (`new Name[] { "A" }`), or through a loop variable of another type (`foreach (Name n in …)`), now counts as computed: a conversion of your own may turn each string into any name.
+- C#: a lookup name looped over a local array whose `Count` is read, or through `var` in a repository that declares a type named `var`, now counts as computed; so does a name written with a Unicode escape or a soft hyphen that decodes to the array's name.
+- C#: a private field's constant names now hold only while no reflection lookup anywhere in the repository, in any project, could reach that field by a computed name, a pattern, an ignore-case match, an alias or an escaped type name.
+- C#: a by-name lookup whose binding flags are held outside the call (a constant of another class, a local) now has the strings of its file matched in any case, as `IgnoreCase` written in the file already did.
+- C#: binding flags count as plain only when they name real members of the framework's enum that no type, alias or extension block of the repository could shadow; a `/*` on a preprocessor line, or a comment that swallows a preprocessor line, now makes its file count as holding a lookup of any name.
+- **TypeScript and JavaScript (JSX):** a gate component that the removal left
+  only waiting for the flags and then rendering its `children` is now deleted
+  in more of the cases where nothing can still reach it. A comment elsewhere
+  that names it no longer keeps it. A comparison opening a sentence
+  (`Like BillingGate, it waits…`) is cut, the next word capitalised
+  (`It waits…`), and listed as edited, when that word is plain lowercase and
+  no same-named component stays in the directory the run sweeps; any other mention is
+  left as written and listed for you to reword. A triple-slash directive
+  (`/// <reference path="…" />`) naming the component or its file still keeps
+  it, since the compiler reads it. A same-named
+  component of another package, with its own users and tests, no longer keeps
+  it either, and nor does a mention in prose or in source of another language
+  (`.md`, `.py`, …). A mention in markup that can load a component (`.mdx`,
+  `.html`) still keeps it.
+- Before deleting such a component's file, every module the file imported,
+  named or bare, must still load wherever the component was used: it is
+  React or React Router, declared in `side-effect-free-modules`, proven to do
+  nothing when it loads, or imported anyway by every file that rendered the
+  component. Otherwise the file stays, and the pull request names the module.
+  This replaces the rule that kept the file only for a bare import.
+- A test file other than the component's own that renders it now keeps the
+  wait, named in the pull request, rather than having its elements unwrapped.
+  The component's own test file is deleted with it only when it tests nothing
+  else: every module it imports is the component, a test library, React or
+  React Router, a Featureflip SDK, or a module declared in
+  `side-effect-free-modules` whose only names it uses are the SDK's
+  `TestFeatureflipProvider` or your wrapper of it, as an element. A test that
+  loads another module some other way (`import()`, `vi.importActual`,
+  `jest.requireActual`, `importOriginal` given a module) keeps the component.
+- **Every language:** the pull request no longer lists what other steps did
+  inside a file it deletes outright (a flag-keyed entry removed, a test
+  deleted or renamed, an argument left out): the note announcing the
+  deletion covers that file. Rows about files that stay are unchanged.
+- A discarded hook call kept because a test mocks the hook, and then deleted
+  because `side-effect-free-calls` names it, is now reported once, as
+  deleted, and its package's import goes with it as when the hook's own audit
+  deletes it. A note that code was kept is dropped when a later step of the
+  same run removed that statement.
+
 ## 2.7.0
 
 ### Added

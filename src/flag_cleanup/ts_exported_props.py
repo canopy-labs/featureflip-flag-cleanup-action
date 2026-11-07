@@ -375,6 +375,8 @@ def _users(
     use=_element_name,
     solution=False,
     exempt=None,
+    commented: list[str] | None = None,
+    homonyms: list[str] | None = None,
 ) -> list[_File] | None:
     """Every file spelling ``component`` (the declaring one first), each
     proven to spell it only as allowed, or None. ``use`` says which other
@@ -382,7 +384,11 @@ def _users(
     default. ``solution`` resolves imports through a solution-style
     ``tsconfig.json`` (see :func:`flag_cleanup.cross_file_ts.resolve_specifier`).
     ``exempt(file)`` names a file whose spellings need no proof because the
-    caller deletes it whole; it is still returned."""
+    caller deletes it whole; it is still returned. With ``commented``, a file
+    other than the declaring one that spells ``component`` only inside
+    comments is no use of it: its path is appended there instead, for the
+    caller to report. With ``homonyms``, likewise a file whose spellings all
+    name a same-named component that is not this one (:func:`homonym`)."""
     word = re.compile(rf"(?<![\w$]){re.escape(component)}(?![\w$])")
     decl_resolved = str(Path(decl.path).resolve())
     users = [decl]
@@ -397,6 +403,20 @@ def _users(
         spelled, original, current = found
         sources.append((spelled, current))
         if not word.search(current) and not word.search(original):
+            continue
+        if (
+            commented is not None
+            and listed.resolved != decl_resolved
+            and only_in_comments(spelled, (original, current), component)
+        ):
+            commented.append(spelled)
+            continue
+        if (
+            homonyms is not None
+            and listed.resolved != decl_resolved
+            and homonym(spelled, (original, current), component, decl_resolved, repo_dir, solution)
+        ):
+            homonyms.append(spelled)
             continue
         if listed.resolved == decl_resolved:
             if listed.ignored:
@@ -434,6 +454,167 @@ def _users(
     if _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution):
         return None
     return users
+
+
+def only_in_comments(path: str, texts, name: str) -> bool:
+    """Whether every spelling of ``name`` (as a word) in each of ``texts``,
+    read as ``path``'s grammar, lies inside a comment, with at least one.
+
+    A comment loads nothing, renders nothing and is read by no test runner,
+    so such a file uses nothing of what it names. A triple-slash directive
+    (``/// <reference path="./Row.tsx" />``) is no such comment: the compiler
+    reads it, so a spelling there is a use. A text that does not parse
+    cleanly is not judged so."""
+    word = re.compile(rb"(?<![\w$])" + re.escape(name.encode("utf-8")) + rb"(?![\w$])")
+    grammar = ts_scope.grammar(path)
+    seen = False
+    for text in texts:
+        data = text.encode("utf-8")
+        matches = [m.span() for m in word.finditer(data)]
+        if not matches:
+            continue
+        root = _parse(text, grammar)
+        if root.has_error:
+            return False
+        comments = [
+            (n.start_byte, n.end_byte) for n in _walk(root) if n.type == "comment" and not is_directive(n.text)
+        ]
+        if not all(any(s <= start and end <= e for s, e in comments) for start, end in matches):
+            return False
+        seen = True
+    return seen
+
+
+_DIRECTIVE = re.compile(rb"\A///\s*<")
+
+
+def is_directive(comment: bytes) -> bool:
+    """Whether a comment's text is a triple-slash directive (``/// <reference
+    …/>``, ``/// <amd-dependency …/>``), which the compiler reads."""
+    return _DIRECTIVE.match(comment) is not None
+
+
+#: Top-level declarations that bind their ``name`` field to a value or type
+#: of the file's own.
+_OWN_DECLARATIONS = frozenset({
+    "function_declaration", "generator_function_declaration", "class_declaration",
+    "abstract_class_declaration", "enum_declaration", "interface_declaration",
+    "type_alias_declaration",
+})
+
+
+def _declares_own(root: Node, name: str) -> bool:
+    """Whether ``root``'s top level declares ``name`` itself (not by an import)."""
+    for statement in root.named_children:
+        node = statement.child_by_field_name("declaration") if statement.type == "export_statement" else statement
+        if node is None:
+            continue
+        declared = node.child_by_field_name("name") if node.type in _OWN_DECLARATIONS else None
+        if declared is not None and declared.text.decode("utf-8", "replace") == name:
+            return True
+        if node.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in node.named_children:
+                target = declarator.child_by_field_name("name") if declarator.type == "variable_declarator" else None
+                if target is not None and target.type == "identifier" and target.text.decode("utf-8", "replace") == name:
+                    return True
+    return False
+
+
+def homonym(path: str, texts, component: str, decl_resolved: str, repo_dir: str, solution: bool = False) -> bool:
+    """Whether ``path`` spells ``component`` only for a same-named component
+    of its own or of another file, never the one ``decl_resolved`` declares.
+
+    In each of ``texts`` the file binds the name exactly once, by a top-level
+    declaration of its own or by an import; every import or re-export of the
+    name reads a file other than the declaring one that declares the name
+    itself (a module cannot also re-export another's under a name it
+    declares); and the name is never a property (``m.Row``), a shorthand or
+    a string (a lookup). Every other way to reach the declaring file's
+    export unspelled is refused for the whole proof by
+    :func:`_reached_unspelled`."""
+    from flag_cleanup import ts_tests
+
+    word = re.compile(rf"(?<![\w$]){re.escape(component)}(?![\w$])")
+    grammar = ts_scope.grammar(path)
+    seen = False
+    for text in texts:
+        if not word.search(text):
+            continue
+        root = _parse(text, grammar)
+        if root.has_error:
+            return False
+        data = text.encode("utf-8")
+        titles = ts_tests.title_nodes(root, data)
+        # The binding scan counts a JSX element's name as a binding of it.
+        binders = [
+            n
+            for n in ts_scope.bindings(root, component)
+            if n.parent is None
+            or n.parent.type not in ("jsx_opening_element", "jsx_closing_element", "jsx_self_closing_element")
+        ]
+        if len(binders) != 1:
+            return False
+        binder = binders[0]
+        if not _in_import_statement(binder):
+            parent = binder.parent
+            own = parent is not None and (
+                (parent.type in _OWN_DECLARATIONS and parent.child_by_field_name("name") == binder)
+                or (parent.type == "variable_declarator" and parent.child_by_field_name("name") == binder)
+            )
+            if not own:
+                return False
+        for node in _walk(root):
+            if node.type == "comment":
+                if is_directive(node.text) and word.search(_text(node, data)):
+                    return False
+                continue
+            if node.type in ("string_fragment", "template_string") and word.search(_text(node, data)):
+                # Only a test's title, which nothing looks up, or a module
+                # path to another file: `'./Row'` of its own import, or
+                # `vi.mock('./Row')` of its own module.
+                if node.type == "string_fragment" and node.parent is not None and node.parent.id in titles:
+                    continue
+                value = cross_file_ts._string_value(node.parent) if node.type == "string_fragment" else None
+                target = (
+                    cross_file_ts.resolve_specifier(path, value, repo_dir, solution=solution) if value else None
+                )
+                if target is None or str(Path(target).resolve()) == decl_resolved:
+                    return False
+                continue
+            if node.type not in _NAMES or _text(node, data) != component:
+                continue
+            if node.type in ("property_identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"):
+                return False
+            parent = node.parent
+            if parent is not None and parent.type in ("import_specifier", "export_specifier"):
+                spec = _source(parent, data)
+                if spec is None:
+                    if parent.type == "import_specifier":
+                        return False
+                    continue  # `export { Row }`: the file's own binding
+                imported = _text(parent.child_by_field_name("name"), data)
+                target = cross_file_ts.resolve_specifier(path, spec, repo_dir, solution=solution)
+                if target is None or str(Path(target).resolve()) == decl_resolved:
+                    return False
+                try:
+                    other = Path(target).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    return False
+                other_root = _parse(other, ts_scope.grammar(target))
+                if other_root.has_error or not _declares_own(other_root, imported):
+                    return False
+            elif parent is not None and parent.type in ("import_clause", "namespace_import", "import_require_clause"):
+                return False
+        seen = True
+    return seen
+
+
+def _in_import_statement(node: Node) -> bool:
+    while node is not None:
+        if node.type == "import_statement":
+            return True
+        node = node.parent
+    return False
 
 
 #: A module specifier as an import or an export spells it, or as the first

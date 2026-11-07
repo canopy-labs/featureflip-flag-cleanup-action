@@ -100,6 +100,7 @@ from __future__ import annotations
 
 import functools
 import re
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1691,6 +1692,8 @@ _ROUTE_IN_ERROR = re.compile(
     r"|TypeDescriptor|PropertyDescriptor|DataBinder|Binding|PropertyOrField)\b|\bExpression\s*\.\s*Property\b"
 )
 _STRING_LITERALS = frozenset({"string_literal", "verbatim_string_literal", "raw_string_literal"})
+#: Every string a reflection name may be written in, an interpolated one included.
+_STRINGS = _STRING_LITERALS | {"interpolated_string_expression"}
 #: repo_dir -> the C# files (resolved) holding a by-name route whose name is
 #: not a string literal, each with the types its every such route is bound
 #: to, or None when one may reach any type; see :func:`computed_name_route`.
@@ -1791,14 +1794,49 @@ _UNNAMED_BINDINGS = frozenset(
 )
 
 
+#: An escape that spells one character: ``\uXXXX`` and ``\UXXXXXXXX`` in an
+#: identifier or a string, ``\x`` with one to four hex digits in a string.
+_ESCAPES = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|x([0-9A-Fa-f]{1,4}))")
+
+
+def _decoded(text: str) -> str:
+    """``text`` with every escape replaced by the character it spells and the
+    formatting characters (Unicode ``Cf``, a soft hyphen) the compiler drops
+    from an identifier taken out. Applied to any text, a string's or a
+    comment's included, it can only add spellings: ``\\\\u0061`` is decoded
+    too, and a string keeps its formatting characters at run time."""
+    if "\\" in text:
+        text = _ESCAPES.sub(
+            lambda m: (lambda v: chr(v) if v <= 0x10FFFF else "")(int(m.group(1) or m.group(2) or m.group(3), 16)),
+            text,
+        )
+    if not text.isascii():
+        text = _format_characters().sub("", text)
+    return text
+
+
+@functools.cache
+def _format_characters() -> re.Pattern[str]:
+    """Every Unicode ``Cf`` character, as one character class."""
+    return re.compile(
+        "[" + "".join(re.escape(chr(c)) for c in range(0x110000) if unicodedata.category(chr(c)) == "Cf") + "]"
+    )
+
+
+def _ident(node: Node) -> str:
+    """The name an identifier node spells to the compiler: escapes decoded,
+    formatting characters and a leading ``@`` dropped."""
+    return _decoded(xcs._text(node)).removeprefix("@")
+
+
 def _only_binding(scope: Node, name: str, site: Node) -> bool:
     """Whether ``site`` is the one place in ``scope`` that binds ``name``:
     any other identifier of the name a binding construct holds directly is
     another binding, which the name might mean instead."""
     for node in cross_file_keys.walk(scope):
-        if node.type == "implicit_parameter" and xcs._text(node).removeprefix("@") == name:
+        if node.type == "implicit_parameter" and _ident(node) == name:
             return False
-        if node.type != "identifier" or node.id == site.id or xcs._text(node).removeprefix("@") != name:
+        if node.type != "identifier" or node.id == site.id or _ident(node) != name:
             continue
         parent = node.parent
         if parent is None or parent.type not in _BINDING_PARENTS:
@@ -1815,7 +1853,7 @@ def _written(scope: Node, name: str) -> bool:
     included), an increment, a ``ref`` alias of it, or passing it by
     ``ref``, ``out`` or ``in``."""
     for node in cross_file_keys.walk(scope):
-        if node.type != "identifier" or xcs._text(node).removeprefix("@") != name:
+        if node.type != "identifier" or _ident(node) != name:
             continue
         parent = node.parent
         if parent is None:
@@ -1856,14 +1894,15 @@ def name_sources(name: Node, nameof: bool = True, repo_dir: str | None = None, d
     that is not checked, which only widens the answer.
 
     So may a ``foreach`` variable over an array of constants, written in
-    place or held by a local nothing writes, passes or returns; and a value
-    passed may itself be any of these."""
+    place, held by a local nothing writes, passes or returns, or held by a
+    private field only its class iterates (with ``repo_dir``, no other file
+    spelling its name); and a value passed may itself be any of these."""
     if name.type != "identifier" or depth > 2:
         return None
-    looped = _looped_constants(name, nameof)
+    looped = _looped_constants(name, nameof, repo_dir)
     if looped is not None:
         return looped
-    parameter = xcs._text(name).removeprefix("@")
+    parameter = _ident(name)
     method = name.parent
     while method is not None and method.type != "method_declaration":
         method = method.parent
@@ -1872,12 +1911,12 @@ def name_sources(name: Node, nameof: bool = True, repo_dir: str | None = None, d
     if listed is None or method_name is None or any(c.type not in ("parameter", "comment") for c in listed.named_children):
         return None
     parameters = [p for p in listed.named_children if p.type == "parameter"]
-    names = [xcs._text(n).removeprefix("@") if (n := p.child_by_field_name("name")) is not None else "" for p in parameters]
+    names = [_ident(n) if (n := p.child_by_field_name("name")) is not None else "" for p in parameters]
     index = next(
         (
             i
             for i, p in enumerate(parameters)
-            if (n := p.child_by_field_name("name")) is not None and xcs._text(n).removeprefix("@") == parameter
+            if (n := p.child_by_field_name("name")) is not None and _ident(n) == parameter
         ),
         None,
     )
@@ -1891,7 +1930,7 @@ def name_sources(name: Node, nameof: bool = True, repo_dir: str | None = None, d
     root = method
     while root.parent is not None:
         root = root.parent
-    called = xcs._text(method_name).removeprefix("@")
+    called = _ident(method_name)
     word = re.compile(rf"(?<![\w@]){re.escape(called)}(?![\w])")
     attributes = _attribute_names(method)
     sources: list[Node] = []
@@ -1908,8 +1947,8 @@ def name_sources(name: Node, nameof: bool = True, repo_dir: str | None = None, d
                 return None
             sources.append(value)
         if repo_dir is not None:
-            mentioning = cross_file_keys.mention_files(repo_dir, [called], exclude=())
-            if len(mentioning) != 1 or len(word.findall(xcs._text(root))) != 1:
+            mentioning = _spelling_files(repo_dir, called)
+            if len(mentioning) != 1 or len(word.findall(_decoded(xcs._text(root)))) != 1:
                 return None
         return sources
     words = xcs._modifiers(method)
@@ -1923,9 +1962,9 @@ def name_sources(name: Node, nameof: bool = True, repo_dir: str | None = None, d
     ):
         return None
     for node in cross_file_keys.walk(root):
-        if node.type in _STRING_LITERALS and word.search(xcs._text(node)):
+        if node.type in _STRINGS and word.search(_decoded(xcs._text(node))):
             return None  # reflection may call it
-        if node.type != "identifier" or node.id == method_name.id or xcs._text(node).removeprefix("@") != called:
+        if node.type != "identifier" or node.id == method_name.id or _ident(node) != called:
             continue
         callee = node.parent if node.parent is not None and node.parent.type == "generic_name" else node
         call = callee.parent
@@ -1953,13 +1992,13 @@ def _binding_loop(name: Node, variables: Callable[[Node], list[Node]]) -> tuple[
     whose BODY holds ``name`` and whose ``variables(left)`` bind its name,
     when nothing inside that loop binds the name again. A use in the loop's
     ``in`` expression is outside the loop's scope."""
-    variable = xcs._text(name).removeprefix("@")
+    variable = _ident(name)
     child, loop = name, name.parent
     while loop is not None:
         if loop.type == "foreach_statement" and xcs._field(loop, child) == "body":
             left = loop.child_by_field_name("left")
             site = next(
-                (n for n in variables(left) if xcs._text(n).removeprefix("@") == variable), None
+                (n for n in variables(left) if _ident(n) == variable), None
             ) if left is not None else None
             if site is not None:
                 return (loop, site) if _only_binding(loop, variable, site) else None
@@ -1967,26 +2006,869 @@ def _binding_loop(name: Node, variables: Callable[[Node], list[Node]]) -> tuple[
     return None
 
 
-def _looped_constants(name: Node, nameof: bool) -> list[Node] | None:
+def _looped_constants(name: Node, nameof: bool, repo_dir: str | None = None) -> list[Node] | None:
     """The elements a ``foreach`` variable ``name`` takes, when it iterates
-    an array (written in place, or a local nothing writes, passes or
-    returns) of constants and nothing else in its method binds the name."""
+    an array of constants (:func:`_constant_elements`) and nothing else in
+    its method binds the name: written in place, held by a local nothing
+    writes, passes or returns, or held by a private field only its class
+    iterates (:func:`_read_only_field`). A file that does not parse whole
+    proves nothing: a formatting character inside a name (a soft hyphen)
+    is an error to the grammar, and the name to the compiler.
+
+    With ``repo_dir``, ``var`` counts only while no file of the checkout may
+    declare a type of that name (:func:`declares_var`)."""
     found = _binding_loop(name, lambda left: [left] if left.type == "identifier" else [])
     method = found[0] if found is not None else None
     while method is not None and method.type not in ("method_declaration", "local_function_statement", "constructor_declaration"):
         method = method.parent
     if found is None or method is None:
         return None
+    root = method
+    while root.parent is not None:
+        root = root.parent
+    if root.has_error:
+        return None
+    # `foreach (Name n in names)` converts each string, by a conversion that
+    # may be the repository's and return any name.
+    looped = found[0].child_by_field_name("type")
+    if looped is None or not (_implicit(looped, repo_dir) or _is_string(looped)):
+        return None
     collection = found[0].child_by_field_name("right")
     if collection is not None and collection.type == "identifier":
-        collection = _read_only_local(collection, method)
-    if collection is None or collection.type not in ("implicit_array_creation_expression", "array_creation_expression"):
+        held = collection
+        collection = _read_only_local(held, method, _ARRAY_READS)
+        if collection is None:
+            collection = _read_only_field(held, repo_dir)
+    return _constant_elements(collection, nameof, repo_dir)
+
+
+def _implicit(node: Node, repo_dir: str | None) -> bool:
+    """Whether a declared type is ``var`` that infers its type: no file of
+    the checkout may declare a type ``var`` (unknown without ``repo_dir``,
+    where an answer only widens a list of names)."""
+    return node.type == "implicit_type" and (repo_dir is None or not declares_var(repo_dir))
+
+
+#: Text that may declare a type ``var``: a type keyword before it, a type
+#: parameter list holding it, or a ``using`` alias. Only a filter: a file
+#: it finds is parsed (:func:`_declares_var_in`).
+_VAR_TYPE = re.compile(
+    r"\b(?:class|struct|interface|enum|record|delegate\b[^;{}()]*?)\s+@?var\b"
+    r"|[<,]\s*(?:(?:in|out)\s+)?@?var\s*[>,]"
+    r"|\busing\s+@?var\s*="
+)
+#: Declarations whose ``name`` field can name a type.
+_VAR_DECLARATIONS = frozenset(
+    {
+        "class_declaration", "struct_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "delegate_declaration", "type_parameter", "using_directive",
+    }
+)
+#: repo_dir -> :func:`declares_var`'s answer.
+_VAR: dict[str, bool] = {}
+
+
+def _declares_var_in(path: str, text: str) -> bool:
+    """Whether one file may declare a type named ``var``. A C# file that
+    parses whole does when a type, a delegate, a type parameter or a
+    ``using`` alias is named ``var`` (escapes decoded, ``@var`` included);
+    any other file whose decoded text :data:`_VAR_TYPE` finds may."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    if _VAR_TYPE.search(_decoded(text)) is None:
+        return False
+    if not path.lower().endswith(".cs"):
+        return True
+    root = wc.parse(text)
+    if root.has_error:
+        return True
+    return any(
+        n.type in _VAR_DECLARATIONS and (name := n.child_by_field_name("name")) is not None and _ident(name) == "var"
+        for n in cross_file_keys.walk(root)
+    )
+
+
+def declares_var(repo_dir: str) -> bool:
+    """Whether a C# or .NET guest file of the checkout, ignored ones
+    included, may declare a type named ``var`` (:func:`_declares_var_in`),
+    a project ``<Using Alias="var">`` item gives one, an item or a file
+    cannot be read, or the index holds such a type. ``var`` then
+    names that type, and a ``foreach (var n in names)`` converts each
+    string by its conversions. Cached per ``repo_dir``."""
+    if repo_dir not in _VAR:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        index = xcs.csharp_index(repo_dir)
+        items, readable = xcs.msbuild_usings(repo_dir)
+        declared = (
+            bool(index.by_last.get("var"))
+            or index.unreadable
+            or not readable
+            or any(i.alias is not None and _decoded(i.alias).removeprefix("@") == "var" for i in items)
+        )
+        if not declared:
+            for f in source_index.files(repo_dir, None, with_ignored=True):
+                if not f.path.name.lower().endswith((".cs", *wc._GUESTS)):
+                    continue
+                text = wc._read(f.resolved)
+                if text is None or _declares_var_in(f.resolved, text):
+                    declared = True
+                    break
+        _VAR[repo_dir] = declared
+    return _VAR[repo_dir]
+
+
+#: The one member of a ``string[]`` that only reads it. ``Count`` is no
+#: member of an array: it binds to an extension of the repository's, which
+#: may write the array.
+_ARRAY_READS = frozenset({"Length"})
+
+
+#: (repo_dir, name) -> :func:`_spelling_files`.
+_SPELLINGS: dict[tuple[str, str], list[str]] = {}
+
+
+def _spelling_files(repo_dir: str, name: str) -> list[str]:
+    """Every file of the checkout, ignored ones included, that may spell
+    ``name`` as a word: as written (:func:`cross_file_keys.mention_files`),
+    or with escapes decoded and formatting characters dropped. Cached per
+    ``(repo_dir, name)``."""
+    if (repo_dir, name) not in _SPELLINGS:
+        _SPELLINGS[(repo_dir, name)] = _scan_spellings(repo_dir, name)
+    return _SPELLINGS[(repo_dir, name)]
+
+
+def _scan_spellings(repo_dir: str, name: str) -> list[str]:
+    found = set(cross_file_keys.mention_files(repo_dir, [name], exclude=(), with_ignored=True))
+    word = re.compile(rf"(?<![\w@]){re.escape(name)}(?![\w])")
+    for path, text in _decoded_files(repo_dir):
+        if path not in found and (text is None or word.search(text)):
+            found.add(path)
+    return sorted(found)
+
+
+#: repo_dir -> :func:`_decoded_files`.
+_DECODED: dict[str, tuple[tuple[str, str | None], ...]] = {}
+
+
+def _decoded_files(repo_dir: str) -> tuple[tuple[str, str | None], ...]:
+    """Every file of the checkout, ignored ones included, whose text an
+    escape or a formatting character changes, with its decoded text
+    (:func:`_decoded`); None for one that cannot be read. Read once per
+    ``repo_dir``: every other file spells a name only as written."""
+    if repo_dir not in _DECODED:
+        from flag_cleanup import source_index
+
+        found: list[tuple[str, str | None]] = []
+        for f in source_index.files(repo_dir, None, with_ignored=True):
+            text = cross_file_keys._searchable_text(f.path, ["a"])
+            if text is None:
+                found.append((f.resolved, None))
+            elif _ESCAPES.search(text) is not None or (not text.isascii() and _format_characters().search(text)):
+                found.append((f.resolved, _decoded(text)))
+        _DECODED[repo_dir] = tuple(found)
+    return _DECODED[repo_dir]
+
+
+def _is_string(node: Node | None) -> bool:
+    return node is not None and node.type == "predefined_type" and xcs._text(node) == "string"
+
+
+def _string_array(node: Node | None) -> bool:
+    """Whether a type node is ``string[]``: one rank, no size, ``string``."""
+    return (
+        node is not None
+        and node.type == "array_type"
+        and _is_string(node.child_by_field_name("type"))
+        and "".join(xcs._text(node.child_by_field_name("rank") or node).split()) == "[]"
+    )
+
+
+def _constant_elements(collection: Node | None, nameof: bool, repo_dir: str | None = None) -> list[Node] | None:
+    """The elements of a ``string[]`` written in place of constants
+    (:func:`_constant`): ``new[] { ... }``, ``new string[] { ... }``, or a
+    collection expression initialising a ``string[]``. When it initialises
+    a local or field, that is declared ``var`` or ``string[]``. Any other
+    type may convert a string by the repository's own conversion, or
+    enumerate anything. A spread refuses."""
+    if collection is None:
         return None
-    initializer = next((c for c in collection.named_children if c.type == "initializer_expression"), None)
-    elements = list(initializer.named_children) if initializer is not None else []
+    declarator = collection.parent
+    declaration = declarator.parent if declarator is not None and declarator.type == "variable_declarator" else None
+    declared = declaration.child_by_field_name("type") if declaration is not None and declaration.type == "variable_declaration" else None
+    if declared is not None and not (_implicit(declared, repo_dir) or _string_array(declared)):
+        return None
+    if collection.type in ("implicit_array_creation_expression", "array_creation_expression"):
+        if collection.type == "array_creation_expression" and not _string_array(collection.child_by_field_name("type")):
+            return None
+        initializer = next((c for c in collection.named_children if c.type == "initializer_expression"), None)
+        elements = list(initializer.named_children) if initializer is not None else []
+    elif collection.type == "collection_expression":
+        if not _string_array(declared):
+            return None
+        elements = []
+        for element in collection.named_children:
+            values = element.named_children if element.type == "collection_element" else []
+            if len(values) != 1 or values[0].type != "expression_element" or len(values[0].named_children) != 1:
+                return None
+            elements.append(values[0].named_children[0])
+    else:
+        return None
     if not elements or not all(_constant(e, nameof) for e in elements):
         return None
     return elements
+
+
+#: The file :func:`_route_files` is judging, which :func:`_read_only_field`
+#: names its field by; None outside that scan.
+_ROUTE_FILE: str | None = None
+#: The file :func:`_field_routes` is reading, while it reads one: then
+#: :func:`_read_only_field` only records the field a route's names come from
+#: in :data:`_FED_BY` and proves nothing.
+_TABLE_FILE: str | None = None
+_FED_BY: list[tuple[str, str, str]] = []
+#: Types whose private fields :func:`_read_only_field` judges.
+_FIELD_OWNERS = frozenset({"class_declaration", "struct_declaration", "record_declaration"})
+_ACCESS_WORDS = frozenset({"public", "internal", "protected"})
+
+
+def _read_only_field(name: Node, repo_dir: str | None) -> Node | None:
+    """The initializer of the field ``name`` (a ``foreach``'s collection)
+    reads, when it is a ``private`` field of the nearest type around it and
+    only that type's own text can reach it, and every mention there only
+    iterates it or reads its ``Length`` (:data:`_ARRAY_READS`).
+
+    Every other spelling of the name in the type refuses, so ``name`` binds
+    the field: nothing there binds the name again (a local, a parameter, a
+    pattern, a primary constructor's parameter). The field is ``private`` (spelled or
+    by default), carries no attribute, and its type is not ``partial``: no
+    other text but reflection can name it. No string of its file spells its
+    name, and with ``repo_dir`` no other file of the checkout does either
+    (:func:`_spelling_files`). Every name is compared as the compiler reads
+    it (:func:`_decoded`: ``N\\u0061mes`` is ``Names``).
+
+    With ``repo_dir`` no route of the checkout that can reach a field may
+    take a loose or computed name unless it is bounded away from the
+    owner's type, nor a constant naming the field (:func:`_field_reachable`);
+    the proof is made only inside :func:`_route_files`, which names the
+    file. Reflection that reaches it by enumerating fields in a loop is the
+    limit :func:`name_sources` accepts for a private method.
+
+    While :func:`_field_routes` reads a route (:data:`_TABLE_FILE`), the
+    field is only recorded as the route's source, after the checks inside
+    the type: what may reach it is judged when it is itself proven."""
+    if _TABLE_FILE is None and repo_dir is not None and _ROUTE_FILE is None:
+        return None
+    field_name = _ident(name)
+    owner = name.parent
+    while owner is not None and owner.type != "declaration_list":
+        owner = owner.parent
+    owner = owner.parent if owner is not None else None
+    if owner is None or owner.type not in _FIELD_OWNERS or "partial" in xcs._modifiers(owner):
+        return None
+    body = owner.child_by_field_name("body") or next((c for c in owner.children if c.type == "declaration_list"), None)
+    declarators = [
+        d
+        for f in (body.named_children if body is not None else [])
+        if f.type == "field_declaration"
+        for v in f.named_children
+        if v.type == "variable_declaration"
+        for d in v.named_children
+        if d.type == "variable_declarator"
+        and (n := d.child_by_field_name("name")) is not None
+        and _ident(n) == field_name
+    ]
+    if len(declarators) != 1:
+        return None
+    declarator = declarators[0]
+    field = declarator.parent.parent
+    if xcs._modifiers(field) & _ACCESS_WORDS or any(c.type == "attribute_list" for c in field.children):
+        return None
+    declared = declarator.child_by_field_name("name")
+    for node in cross_file_keys.walk(owner):
+        if node.type != "identifier" or node.id == declared.id or _ident(node) != field_name:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "foreach_statement" and xcs._field(parent, node) == "right":
+            if any(c.type == "ref" for c in parent.children):
+                return None
+            continue
+        if (
+            parent is not None
+            and parent.type == "member_access_expression"
+            and xcs._field(parent, node) == "expression"
+            and _ident(parent.child_by_field_name("name")) in _ARRAY_READS
+            and not (
+                parent.parent is not None
+                and parent.parent.type in ("invocation_expression", "assignment_expression")
+                and xcs._field(parent.parent, parent) in ("function", "left")
+            )
+        ):
+            continue
+        return None  # written, passed, returned, qualified or used some other way
+    owner_name = owner.child_by_field_name("name")
+    if owner_name is None:
+        return None
+    if _TABLE_FILE is not None:
+        _FED_BY.append((_TABLE_FILE, _ident(owner_name), field_name))
+        values = [c for c in declarator.named_children if c.id != declared.id]
+        return values[0] if len(values) == 1 else None
+    root = owner
+    while root.parent is not None:
+        root = root.parent
+    word = re.compile(rf"(?<![\w@]){re.escape(field_name)}(?![\w])")
+    if any(
+        n.type in _STRINGS and word.search(_decoded(xcs._text(n)))
+        for n in cross_file_keys.walk(root)
+    ):
+        return None  # reflection may reach it
+    if repo_dir is not None:
+        if len(_spelling_files(repo_dir, field_name)) != 1:
+            return None
+        if _field_reachable(repo_dir, (_ROUTE_FILE, _ident(owner_name), field_name)):
+            return None
+    values = [c for c in declarator.named_children if c.id != declared.id]
+    return values[0] if len(values) == 1 else None
+
+
+#: Lookups that take the name of a member that may be a field. A static
+#: ``RuntimeReflectionExtensions.GetRuntimeField(t, n)`` passes the type
+#: first: every argument is judged, so the position does not matter.
+_FIELD_NAMED = frozenset(
+    {
+        "GetField", "GetRuntimeField", "GetDeclaredField", "GetMember", "InvokeMember",
+        # Test and library accessors of private state by name (MSTest's
+        # `PrivateType`, helpers named so).
+        "GetStaticField", "SetStaticField", "GetFieldOrProperty",
+    }
+)
+#: Expression-tree members that take a field's name (on ``Expression``).
+_FIELD_TREES = frozenset({"Field", "PropertyOrField"})
+#: Lookups that list members, a field among them. Looped over whole
+#: (``foreach (var f in t.GetFields())``) they are the documented limit;
+#: indexed, filtered or handed on they may pick any field.
+_FIELD_LISTS = frozenset({"GetFields", "GetRuntimeFields", "DeclaredFields", "GetMembers", "DeclaredMembers", "GetDefaultMembers"})
+#: Lookups by a filter or a pattern: any name.
+_FIELD_FILTERS = frozenset({"FindMembers", "FilterName", "FilterNameIgnoreCase"})
+_FIELD_WORDS = _FIELD_NAMED | _FIELD_TREES | _FIELD_LISTS | _FIELD_FILTERS | {"UnsafeAccessor", "UnsafeAccessorAttribute"}
+_FIELD_ROUTE_TEXT = re.compile(r"\b(?:" + "|".join(sorted(_FIELD_WORDS)) + r")\b")
+#: The members of the framework enums a lookup's selector may name, each
+#: under its namespace. ``IgnoreCase`` is left out: it widens the name.
+_FLAG_MEMBERS: dict[str, tuple[str, frozenset[str]]] = {
+    "BindingFlags": (
+        "System.Reflection",
+        frozenset(
+            {
+                "Default", "DeclaredOnly", "Instance", "Static", "Public", "NonPublic", "FlattenHierarchy",
+                "InvokeMethod", "CreateInstance", "GetField", "SetField", "GetProperty", "SetProperty",
+                "PutDispProperty", "PutRefDispProperty", "ExactBinding", "SuppressChangeType",
+                "OptionalParamBinding", "IgnoreReturn", "DoNotWrapExceptions",
+            }
+        ),
+    ),
+    "MemberTypes": (
+        "System.Reflection",
+        frozenset({"Constructor", "Event", "Field", "Method", "Property", "TypeInfo", "Custom", "NestedType", "All"}),
+    ),
+    "CallingConventions": ("System.Reflection", frozenset({"Standard", "VarArgs", "Any", "HasThis", "ExplicitThis"})),
+    "UnsafeAccessorKind": (
+        "System.Runtime.CompilerServices",
+        frozenset({"Constructor", "Method", "StaticMethod", "Field", "StaticField"}),
+    ),
+}
+#: Every enum of :data:`_FLAG_MEMBERS`: what :func:`_plain_flag` trusts no
+#: name of when it cannot see the checkout.
+_ALL_FLAG_ENUMS = frozenset(_FLAG_MEMBERS)
+
+
+def _plain_flag(text: str, shadowed: frozenset[str]) -> bool:
+    """Whether ``text`` (decoded, spaces dropped) is one real member of a
+    framework enum of :data:`_FLAG_MEMBERS` (``BindingFlags.Public``,
+    ``System.Reflection.BindingFlags.Public``, ``global::…``), the enum not
+    being one the checkout may shadow (:func:`_shadowed_enums`): a type, an
+    alias or an extension block of the repository's could give
+    ``BindingFlags.Hidden`` any value."""
+    parts = text.removeprefix("global::").split(".")
+    if len(parts) < 2:
+        return False
+    enum, member, namespace = parts[-2], parts[-1], ".".join(parts[:-2])
+    known = _FLAG_MEMBERS.get(enum)
+    return (
+        known is not None
+        and enum not in shadowed
+        and member in known[1]
+        and namespace in ("", known[0])
+    )
+
+
+#: repo_dir -> :func:`_shadowed_enums`.
+_SHADOWED: dict[str, frozenset[str]] = {}
+
+
+def _shadowed_enums(repo_dir: str | None) -> frozenset[str]:
+    """The enums of :data:`_FLAG_MEMBERS` whose members a selector may not
+    be read by: all of them without ``repo_dir``, or when the checkout
+    declares an extension block (a static extension member can be named on
+    any type) or its aliases cannot be read; else those a checkout type
+    may be named after (:meth:`may_declare_type`) or an alias names."""
+    if repo_dir is None:
+        return _ALL_FLAG_ENUMS
+    if repo_dir not in _SHADOWED:
+        aliases = _alias_names(repo_dir)
+        if aliases is None or declares_extension_blocks(repo_dir):
+            _SHADOWED[repo_dir] = _ALL_FLAG_ENUMS
+        else:
+            index = xcs.csharp_index(repo_dir)
+            _SHADOWED[repo_dir] = frozenset(
+                e for e in _FLAG_MEMBERS if index.may_declare_type(e) or e in aliases
+            )
+    return _SHADOWED[repo_dir]
+
+
+@dataclass(frozen=True)
+class _FieldRoute:
+    """One use of a lookup that may reach a field (:func:`_field_routes`)."""
+
+    path: str
+    #: The types its receiver can only be (:func:`_receiver_types`), as
+    #: written; None: any type.
+    bounds: frozenset[str] | None
+    #: A name it takes that is not a known constant, any case or a pattern.
+    loose: bool
+    #: The decoded text of every constant it passes.
+    constants: tuple[str, ...]
+    #: The private fields its constants were read from (path, type, field).
+    fed_by: frozenset[tuple[str, str, str]]
+    #: Whether it may return a non-public field (:func:`_public_only`).
+    private: bool = True
+    #: Whether it compares a name ignoring case (an expression tree's).
+    ignore_case: bool = False
+
+
+#: repo_dir -> :func:`_field_routes`.
+_FIELD_ROUTES: dict[str, tuple[_FieldRoute, ...]] = {}
+#: repo_dir -> :func:`_alias_names`.
+_ALIASES: dict[str, frozenset[str] | None] = {}
+_ALIAS = re.compile(r"\busing\s+(?:static\s+)?@?(\w+)\s*=")
+
+
+def _alias_names(repo_dir: str) -> frozenset[str] | None:
+    """Every name a ``using X = …`` (``global`` or not, in any C# or .NET
+    guest file, escapes decoded) or a project ``<Using Alias>`` item gives
+    a type or namespace; None when an item cannot be read."""
+    if repo_dir not in _ALIASES:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        items, readable = xcs.msbuild_usings(repo_dir)
+        names: set[str] | None = {_decoded(i.alias).removeprefix("@") for i in items if i.alias} if readable else None
+        if names is not None:
+            for f in source_index.files(repo_dir, None, with_ignored=True):
+                if not f.path.name.lower().endswith((".cs", *wc._GUESTS)):
+                    continue
+                text = wc._read(f.resolved)
+                if text is None:
+                    names = None
+                    break
+                names.update(_ALIAS.findall(_decoded(text)))
+        _ALIASES[repo_dir] = frozenset(names) if names is not None else None
+    return _ALIASES[repo_dir]
+
+
+def _bounded_from(bound: str, owner: str, repo_dir: str) -> bool:
+    """Whether a lookup on ``typeof(bound)`` cannot see the private fields
+    of a type named ``owner``: ``bound``, escapes decoded, is a plain
+    (qualified) name with no segment an alias may stand for, whose last
+    segment is neither ``owner`` nor a type that may extend it."""
+    text = _decoded(bound).replace(" ", "")
+    text = re.sub(r"<.*>", "", text.removeprefix("global::"))
+    segments = [s.removeprefix("@") for s in re.split(r"::|\.", text)]
+    aliases = _alias_names(repo_dir)
+    if aliases is None or any(not re.fullmatch(r"\w+", s) or s in aliases for s in segments):
+        return False
+    return segments[-1] != owner and not xcs.csharp_index(repo_dir).reaches([segments[-1]], owner)
+
+
+def _selects(value: Node, shadowed: frozenset[str] = _ALL_FLAG_ENUMS) -> bool:
+    """Whether a lookup's argument only selects, and names nothing: ``null``,
+    a number, ``typeof``, a framework flag other than ``IgnoreCase``
+    (:func:`_plain_flag`, against ``shadowed``) or ``|`` of them, an array
+    of ``typeof``s, or ``Type.EmptyTypes``."""
+    kind = value.type
+    if kind in ("null_literal", "integer_literal", "boolean_literal", "typeof_expression", "default_expression"):
+        return True
+    if kind == "parenthesized_expression":
+        return all(_selects(c, shadowed) for c in value.named_children)
+    if kind == "binary_expression":
+        return _operator(value) == "|" and all(_selects(c, shadowed) for c in value.named_children)
+    if kind == "member_access_expression":
+        text = _decoded(xcs._text(value)).replace(" ", "")
+        return _plain_flag(text, shadowed) or text in ("Type.EmptyTypes", "System.Type.EmptyTypes")
+    if kind in ("implicit_array_creation_expression", "array_creation_expression"):
+        initializer = next((c for c in value.named_children if c.type == "initializer_expression"), None)
+        return initializer is not None and all(c.type == "typeof_expression" for c in initializer.named_children)
+    return False
+
+
+def _route_arguments(call: Node | None, repo_dir: str) -> tuple[bool, list[str]] | None:
+    """``(loose, constants)`` for a lookup's arguments: each a constant name
+    (a literal, a ``nameof``, or what :func:`name_sources` proves), or one
+    that only selects (``null``, a number, ``typeof``, a framework flag
+    other than ``IgnoreCase`` or ``|`` of them, an array of ``typeof``s,
+    ``Type.EmptyTypes``). Anything else, a ``ref``/``out`` argument or an
+    ``IgnoreCase`` anywhere in it is loose. None when the call has no
+    argument list."""
+    arguments = call.child_by_field_name("arguments") if call is not None else None
+    if arguments is None:
+        return None
+    if "IgnoreCase" in _decoded(xcs._text(arguments)):
+        return (True, [])
+    constants: list[str] = []
+    loose = False
+    shadowed = _shadowed_enums(repo_dir)
+
+    def selects(value: Node) -> bool:
+        return _selects(value, shadowed)
+
+    for argument in arguments.named_children:
+        if argument.type != "argument":
+            continue
+        if any(c.type in ("ref", "out", "in") for c in argument.children):
+            return (True, [])
+        label = argument.child_by_field_name("name")
+        values = [c for c in argument.named_children if label is None or c.id != label.id]
+        value = values[-1] if values else None
+        if value is None:
+            return (True, [])
+        if value.type in _STRING_LITERALS:
+            constants.append(_decoded(xcs._text(value)))
+        elif (n := nameof_value(value)) is not None:
+            constants.append(_decoded(n))
+        elif selects(value):
+            continue
+        elif value.type == "identifier" and (sources := name_sources(value, True, repo_dir)) is not None:
+            constants.extend(_decoded(nameof_value(s) or xcs._text(s)) for s in sources)
+        else:
+            loose = True
+    return (loose, constants)
+
+
+#: The ``Type`` lookups whose default binding is ``Public``, and which take
+#: at most one ``BindingFlags`` argument.
+_PUBLIC_BY_DEFAULT = frozenset({"GetField", "GetFields", "GetMember", "GetMembers"})
+_FLAGGED = _PUBLIC_BY_DEFAULT | {"FindMembers"}
+
+
+def _public_only(
+    word: str, call: Node | None, declared: frozenset[str], shadowed: frozenset[str] = _ALL_FLAG_ENUMS,
+    repo_dir: str | None = None,
+) -> bool:
+    """Whether a ``Type`` lookup can return public members only: no method
+    of the checkout takes its name, and either its one ``BindingFlags``
+    argument is a plain selector (:func:`_selects`) without ``NonPublic``,
+    or it is ``GetFields()``/``GetMembers()`` with no argument, or
+    ``GetField``/``GetMember`` with one plainly string argument on a
+    receiver that is plainly a ``System.Type`` (:func:`_type_receiver`): a
+    library's by-name accessor of private state (MSTest's
+    ``PrivateObject.GetField(string)``) takes the same shape."""
+    arguments = call.child_by_field_name("arguments") if call is not None else None
+    if word not in _FLAGGED or word in declared or arguments is None:
+        return False
+    text = _decoded(xcs._text(arguments))
+    if "NonPublic" in text:
+        return False
+    values = []
+    for argument in arguments.named_children:
+        if argument.type != "argument":
+            continue
+        label = argument.child_by_field_name("name")
+        kept = [c for c in argument.named_children if label is None or c.id != label.id]
+        if not kept:
+            return False
+        values.append(kept[-1])
+    flags = [v for v in values if "BindingFlags" in _decoded(xcs._text(v))]
+    if flags:
+        return len(flags) == 1 and _selects(flags[0], shadowed)
+    if word not in _PUBLIC_BY_DEFAULT:
+        return False
+    if word in ("GetFields", "GetMembers"):
+        return not values
+    # `GetField(string)` and `GetMember(string)`: one argument that is
+    # plainly a string binds the instance overload before any extension.
+    function = call.child_by_field_name("function")
+    receiver = function.child_by_field_name("expression") if function is not None and function.type == "member_access_expression" else None
+    return len(values) == 1 and _stringly(values[0]) and _type_receiver(receiver, repo_dir)
+
+
+def _type_receiver(receiver: Node | None, repo_dir: str | None) -> bool:
+    """Whether a lookup's receiver is plainly a ``System.Type``: a
+    ``typeof(…)``, ``x.GetType()`` or ``Type.GetType(…)`` (no checkout
+    method named ``GetType``), or a parameter or local of the member
+    around it declared ``System.Type``, or ``Type`` while no checkout type
+    may be named ``Type``, that nothing else in the member binds."""
+    while receiver is not None and (
+        receiver.type == "parenthesized_expression"
+        or (receiver.type == "postfix_unary_expression" and xcs._text(receiver).rstrip().endswith("!"))
+    ):
+        receiver = receiver.named_children[0] if receiver.named_children else None
+    if receiver is None or repo_dir is None:
+        return False
+    if receiver.type == "typeof_expression":
+        return True
+    index = xcs.csharp_index(repo_dir)
+    if receiver.type == "invocation_expression":
+        function = receiver.child_by_field_name("function")
+        name = function.child_by_field_name("name") if function is not None and function.type == "member_access_expression" else None
+        if name is None or _ident(name) != "GetType" or "GetType" in _checkout_method_names(repo_dir):
+            return False
+        spelled = _decoded(xcs._text(function.child_by_field_name("expression"))).replace(" ", "")
+        arguments = receiver.child_by_field_name("arguments")
+        count = len([a for a in arguments.named_children if a.type == "argument"]) if arguments is not None else 0
+        return count == 0 or spelled in ("Type", "System.Type", "global::System.Type")
+    if receiver.type != "identifier":
+        return False
+    variable = _ident(receiver)
+    member = receiver.parent
+    while member is not None and member.type not in (
+        "method_declaration", "local_function_statement", "constructor_declaration", "accessor_declaration",
+        "lambda_expression",
+    ):
+        member = member.parent
+    while member is not None and member.parent is not None and member.parent.type not in ("declaration_list",):
+        member = member.parent
+    if member is None:
+        return False
+    declared = [
+        n
+        for n in cross_file_keys.walk(member)
+        if n.type in ("parameter", "variable_declarator")
+        and (name := n.child_by_field_name("name")) is not None
+        and _ident(name) == variable
+    ]
+    if len(declared) != 1 or not _only_binding(member, variable, declared[0].child_by_field_name("name")):
+        return False
+    holder = declared[0] if declared[0].type == "parameter" else declared[0].parent
+    written = holder.child_by_field_name("type") if holder is not None else None
+    text = _decoded(xcs._text(written)).replace(" ", "") if written is not None else ""
+    return text in ("System.Type", "global::System.Type") or (text == "Type" and not index.may_declare_type("Type"))
+
+
+#: repo_dir -> every method or local function name the checkout's C# declares
+#: among the lookups :func:`_type_receiver` trusts.
+_METHOD_WORDS: dict[str, frozenset[str]] = {}
+
+
+def _checkout_method_names(repo_dir: str) -> frozenset[str]:
+    """Which of ``GetType`` the checkout declares as a method or local
+    function (a file that cannot be read or parsed may)."""
+    if repo_dir not in _METHOD_WORDS:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        found: set[str] = set()
+        for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+            if not f.path.name.endswith(".cs"):
+                continue
+            text = wc._read(f.resolved)
+            if text is None:
+                found.add("GetType")
+                break
+            if "GetType" not in _decoded(text):
+                continue
+            root = wc.parse(text)
+            if root.has_error or any(
+                d.type in ("method_declaration", "local_function_statement")
+                and (n := d.child_by_field_name("name")) is not None
+                and _ident(n) == "GetType"
+                for d in cross_file_keys.walk(root)
+            ):
+                found.add("GetType")
+                break
+        _METHOD_WORDS[repo_dir] = frozenset(found)
+    return _METHOD_WORDS[repo_dir]
+
+
+def _stringly(value: Node) -> bool:
+    """Whether an expression is plainly a ``string``: a literal, an
+    interpolation, a ``nameof``, or ``+`` with a string literal operand."""
+    if value.type in _STRINGS or nameof_value(value) is not None:
+        return True
+    if value.type == "parenthesized_expression":
+        return any(_stringly(c) for c in value.named_children)
+    return value.type == "binary_expression" and _operator(value) == "+" and any(
+        _stringly(c) for c in value.named_children
+    )
+
+
+def _outside_comments(root: Node, text: str) -> str:
+    """``text`` with every comment of ``root`` blanked out."""
+    data = bytearray(text.encode("utf-8"))
+    for node in cross_file_keys.walk(root):
+        if node.type == "comment":
+            data[node.start_byte : node.end_byte] = b" " * (node.end_byte - node.start_byte)
+    return data.decode("utf-8", "replace")
+
+
+def _field_routes(repo_dir: str) -> tuple[_FieldRoute, ...]:
+    """Every use, in a C# or .NET guest file of the checkout (ignored ones
+    and every project included), of a lookup that may reach a field: a
+    lookup by name (:data:`_FIELD_NAMED`, ``Expression.Field`` and
+    ``PropertyOrField``), a member list not looped over whole
+    (:data:`_FIELD_LISTS`), a filter (:data:`_FIELD_FILTERS`) or an
+    ``[UnsafeAccessor]``. A guest file, or a C# file that does not parse,
+    spelling one outside its comments is a route of any name on any type.
+    A bare call to a method the enclosing type declares under such a name
+    is that method. Read once per ``repo_dir``."""
+    if repo_dir not in _FIELD_ROUTES:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        global _TABLE_FILE
+        found: list[_FieldRoute] = []
+        anything = lambda path: _FieldRoute(path, None, True, (), frozenset())  # noqa: E731
+        parsed: list[tuple[str, Node]] = []
+        declared: set[str] = set()
+        for f in source_index.files(repo_dir, None, with_ignored=True):
+            name = f.path.name.lower()
+            if not name.endswith((".cs", *wc._GUESTS)):
+                continue
+            text = wc._read(f.resolved)
+            if text is None:
+                found.append(anything(f.resolved))
+                continue
+            if _FIELD_ROUTE_TEXT.search(_decoded(text)) is None:
+                continue
+            root = wc.parse(text) if name.endswith(".cs") else None
+            if _directive_hides(text, root):
+                found.append(anything(f.resolved))
+                continue
+            if root is not None and root.has_error:
+                if _FIELD_ROUTE_TEXT.search(_decoded(_outside_comments(root, text))) is not None:
+                    found.append(anything(f.resolved))
+                continue
+            if root is None:
+                found.append(anything(f.resolved))
+                continue
+            parsed.append((f.resolved, root))
+            # A method of the checkout named like a lookup: its calls are
+            # not the framework's, whatever they bind.
+            declared.update(
+                _ident(n)
+                for d in cross_file_keys.walk(root)
+                if d.type in ("method_declaration", "local_function_statement")
+                and (n := d.child_by_field_name("name")) is not None
+                and _ident(n) in _FIELD_WORDS
+            )
+        for path, root in parsed:
+            _TABLE_FILE = path
+            f_resolved = path
+            try:
+                for node in cross_file_keys.walk(root):
+                    if node.type != "identifier" or (word := _ident(node)) not in _FIELD_WORDS:
+                        continue
+                    parent = node.parent
+                    if parent is None or (parent.type in _NAMED_DECLARATIONS and xcs._field(parent, node) == "name"):
+                        continue
+                    _FED_BY.clear()
+                    access = parent if parent.type == "member_access_expression" and xcs._field(parent, node) == "name" else None
+                    target = access if access is not None else node
+                    if target.parent is not None and target.parent.type == "generic_name":
+                        target = target.parent
+                    call = target.parent if target.parent is not None and target.parent.type == "invocation_expression" else None
+                    if call is not None and xcs._field(call, target) != "function":
+                        call = None
+                    bounds = _receiver_types(access, repo_dir) if access is not None else None
+                    if access is None and call is not None and _own_method(node, word):
+                        continue  # the enclosing type's own method of the name
+                    if word in ("UnsafeAccessor", "UnsafeAccessorAttribute"):
+                        attribute = parent if parent.type == "attribute" else None
+                        listed = next((c for c in attribute.named_children if c.type == "attribute_argument_list"), None) if attribute else None
+                        constants: list[str] = []
+                        loose = attribute is None
+                        for argument in listed.named_children if listed is not None else []:
+                            values = [c for c in argument.named_children if c.type != "identifier" or c.next_sibling is None or c.next_sibling.type != "="]
+                            value = values[-1] if values else None
+                            if value is not None and value.type in _STRING_LITERALS:
+                                constants.append(_decoded(xcs._text(value)))
+                            elif value is None or not _plain_flag(_decoded(xcs._text(value)).replace(" ", ""), _shadowed_enums(repo_dir)):
+                                loose = True
+                        holder = attribute.parent.parent if attribute is not None and attribute.parent is not None else None
+                        if holder is not None and (method := holder.child_by_field_name("name")) is not None:
+                            constants.append(_ident(method))
+                        found.append(_FieldRoute(f_resolved, None, loose, tuple(constants), frozenset()))
+                        continue
+                    tree = word in _FIELD_TREES
+                    if tree:
+                        receiver = access.child_by_field_name("expression") if access is not None else None
+                        spelled = _decoded(xcs._text(receiver)) if receiver is not None else "Expression"
+                        if spelled != "Expression" and not spelled.endswith(".Expression"):
+                            continue
+                        bounds = None
+                    private = access is None or not _public_only(
+                        word, call, frozenset(declared), _shadowed_enums(repo_dir), repo_dir
+                    )
+                    if word in _FIELD_LISTS:
+                        holder = call if call is not None else target
+                        if holder.parent is not None and holder.parent.type == "foreach_statement" and xcs._field(holder.parent, holder) == "right":
+                            continue  # looped over whole: the documented limit
+                        found.append(_FieldRoute(f_resolved, bounds, True, (), frozenset(), private))
+                        continue
+                    if word in _FIELD_FILTERS:
+                        outer = call if call is not None else target
+                        holder = outer.parent.parent if outer.parent is not None and outer.parent.type == "argument" else None
+                        holder = holder.parent if holder is not None and holder.type == "argument_list" else None
+                        callee = holder.child_by_field_name("function") if holder is not None and holder.type == "invocation_expression" else None
+                        if word != "FindMembers" and callee is not None and _decoded(xcs._last_name(callee) or "") == "FindMembers":
+                            continue  # judged with its FindMembers
+                        found.append(_FieldRoute(f_resolved, bounds if word == "FindMembers" else None, True, (), frozenset(), private))
+                        continue
+                    judged = _route_arguments(call, repo_dir)
+                    loose, constants = judged if judged is not None else (True, [])
+                    loose = loose or any("*" in c for c in constants)
+                    found.append(_FieldRoute(f_resolved, bounds, loose, tuple(constants), frozenset(_FED_BY), private, tree))
+            finally:
+                _TABLE_FILE = None
+                _FED_BY.clear()
+        _FIELD_ROUTES[repo_dir] = tuple(found)
+    return _FIELD_ROUTES[repo_dir]
+
+
+def _field_reachable(repo_dir: str, field: tuple[str | None, str, str]) -> bool:
+    """Whether some route of the checkout (:func:`_field_routes`) may reach
+    the private field ``(path, type, name)``: one not bounded away from the
+    type (:func:`_bounded_from`) that takes a loose name, a name read from
+    another field, or a constant spelling the field's name."""
+    path, owner, name = field
+    word = re.compile(rf"(?<![\w@]){re.escape(name)}(?![\w])")
+    folded = re.compile(word.pattern, re.IGNORECASE)
+    for route in _field_routes(repo_dir):
+        if not route.private:
+            continue
+        if route.bounds is not None and all(_bounded_from(b, owner, repo_dir) for b in route.bounds):
+            continue
+        if route.loose or route.fed_by - {(path, owner, name)}:
+            return True
+        if any((folded if route.ignore_case else word).search(c) for c in route.constants):
+            return True
+    return False
+
+
+def _own_method(node: Node, word: str) -> bool:
+    """Whether a bare call's callee ``node`` names a method or local
+    function an enclosing type or member declares: member lookup finds it
+    before any ``using static`` import, and the file's own helper is no
+    framework lookup."""
+    scope = node.parent
+    while scope is not None:
+        if scope.type in ("declaration_list", "block"):
+            for child in scope.named_children:
+                if child.type in ("local_function_statement", "method_declaration"):
+                    name = child.child_by_field_name("name")
+                    if name is not None and _ident(name) == word:
+                        return True
+        scope = scope.parent
+    return False
 
 
 def _argument_for(call: Node, parameter: str, index: int, names: list[str]) -> Node | None | bool:
@@ -2006,7 +2888,7 @@ def _argument_for(call: Node, parameter: str, index: int, names: list[str]) -> N
         values = [c for c in argument.named_children if label is None or c.id != label.id]
         value = values[-1] if values else None
         if label is not None:
-            spelled = xcs._text(label).removeprefix("@")
+            spelled = _ident(label)
             if spelled == parameter:
                 return value
             reordered |= place >= len(names) or names[place] != spelled
@@ -2040,9 +2922,51 @@ _UNNAMED_ROUTE = re.compile(
 _LOOSE_NAME = re.compile(r"IgnoreCase\b|\"\w*\*\"")
 
 
-def loose_names(source: str) -> bool:
-    """Whether a file may look a member up ignoring case or by a prefix."""
-    return _LOOSE_NAME.search(source) is not None
+def loose_names(source: str, repo_dir: str | None = None) -> bool:
+    """:func:`_loose_names` against the enums ``repo_dir`` may shadow
+    (:func:`_shadowed_enums`; every one of them without it)."""
+    return _loose_names(source, _shadowed_enums(repo_dir))
+
+
+@functools.lru_cache(maxsize=512)
+def _loose_names(source: str, shadowed: frozenset[str]) -> bool:
+    """Whether a file may look a member up ignoring case or by a prefix:
+    it spells ``IgnoreCase`` or a ``"…*"`` pattern (escapes decoded), or a
+    by-name lookup taking binding flags (:data:`_NAME_TAKING`) passes an
+    argument besides its NAME that is not a plain selector
+    (:func:`_selects`): flags held elsewhere (``Flags.Loose``, a local, a
+    ``using static``) may include ``IgnoreCase``. A file that does not parse
+    and spells a lookup may too."""
+    decoded = _decoded(source)
+    if _LOOSE_NAME.search(decoded) is not None:
+        return True
+    if _ROUTE_TEXT.search(decoded) is None:
+        return False
+    from flag_cleanup import wrapper_csharp as wc
+
+    root = wc.parse(source)
+    if root.has_error:
+        return True
+    for node in cross_file_keys.walk(root):
+        if node.type != "invocation_expression":
+            continue
+        function = node.child_by_field_name("function")
+        callee = _decoded(xcs._last_name(function) or "") if function is not None else ""
+        if callee not in _NAME_TAKING:
+            continue
+        named = _name_value(node, callee)
+        arguments = node.child_by_field_name("arguments")
+        for argument in arguments.named_children if arguments is not None else []:
+            if argument.type != "argument":
+                continue
+            label = argument.child_by_field_name("name")
+            values = [c for c in argument.named_children if label is None or c.id != label.id]
+            value = values[-1] if values else None
+            if value is None or (named is not None and value.id == named.id):
+                continue
+            if not _selects(value, shadowed):
+                return True
+    return False
 
 
 #: repo_dir -> the C# files (resolved) that may look a member up ignoring
@@ -2060,7 +2984,7 @@ def loose_files(repo_dir: str) -> tuple[str, ...]:
 
         found: list[str] = []
         for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
-            if f.path.name.endswith(".cs") and (text := wc._read(f.resolved)) is not None and loose_names(text):
+            if f.path.name.endswith(".cs") and (text := wc._read(f.resolved)) is not None and loose_names(text, repo_dir):
                 found.append(f.resolved)
         _LOOSE[repo_dir] = tuple(found)
     return _LOOSE[repo_dir]
@@ -2201,15 +3125,17 @@ def _receiver_types(access: Node | None, repo_dir: str | None) -> frozenset[str]
     return _typeof_elements(collection, len(names), names.index(site), repo_dir)
 
 
-def _read_only_local(name: Node, method: Node) -> Node | None:
+def _read_only_local(name: Node, method: Node, members: frozenset[str] = _READ_ONLY_MEMBERS) -> Node | None:
     """The initializer of the local ``name`` reads, when it is a local of
     ``method`` that nothing else binds, and every other mention of it only
-    reads a :data:`_READ_ONLY_MEMBERS` member or is iterated by a
-    ``foreach``."""
-    local = xcs._text(name).removeprefix("@")
+    reads one of ``members`` (:data:`_READ_ONLY_MEMBERS`, the ``Count`` of a
+    framework collection included; an array's caller passes
+    :data:`_ARRAY_READS`) or is iterated by a ``foreach``. Names are
+    compared as the compiler reads them (:func:`_ident`)."""
+    local = _ident(name)
     declarator = None
     for node in cross_file_keys.walk(method):
-        if node.type != "identifier" or xcs._text(node).removeprefix("@") != local or node.id == name.id:
+        if node.type != "identifier" or _ident(node) != local or node.id == name.id:
             continue
         parent = node.parent
         if parent is not None and parent.type == "variable_declarator" and xcs._field(parent, node) == "name":
@@ -2223,7 +3149,7 @@ def _read_only_local(name: Node, method: Node) -> Node | None:
             parent is not None
             and parent.type == "member_access_expression"
             and xcs._field(parent, node) == "expression"
-            and xcs._text(parent.child_by_field_name("name")) in _READ_ONLY_MEMBERS
+            and _ident(parent.child_by_field_name("name")) in members
             and not (
                 parent.parent is not None
                 and parent.parent.type in ("invocation_expression", "assignment_expression")
@@ -2499,6 +3425,37 @@ _NAMED_DECLARATIONS = frozenset(
 )
 
 
+#: What ends a line to the C# compiler, and the whitespace it allows before a
+#: directive's ``#`` (Unicode ``Zs``, tab, vertical tab, form feed).
+_CS_LINE_BREAK = re.compile("\r\n|[\r\n\x85  ]")
+_CS_SPACE = "\t\x0b\x0c \xa0  -   　"
+#: A directive the grammar took into a comment: a line break inside the
+#: comment, then whitespace, then ``#``.
+_SWALLOWED = re.compile("[\r\n\x85  ][" + _CS_SPACE + "]*#")
+_DIRECTIVE_LINE = re.compile("[" + _CS_SPACE + "]*#")
+
+
+def _directive_hides(text: str, root: Node | None) -> bool:
+    """Whether the grammar and the compiler may disagree about which text
+    is code, so code may hide from every tree walk: a comment of ``root``
+    holds a line that starts, after whitespace, with ``#`` (the grammar
+    swallowed a directive, whatever its condition: ``#if NEVER /* …``,
+    ``#else`` of ``#if true``), or a directive (a ``preproc`` node, or a
+    line of ``text`` split at C#'s line breaks only that starts, after its
+    whitespace, with ``#``) holds ``/*``, which the compiler reads as the
+    directive's own text (``#region /*``). A file it finds is judged as
+    spelling anything."""
+    if root is not None and any(
+        (n.type == "comment" and _SWALLOWED.search(xcs._text(n)))
+        or (n.type.startswith("preproc") and "/*" in xcs._text(n))
+        for n in cross_file_keys.walk(root)
+    ):
+        return True
+    return any(
+        _DIRECTIVE_LINE.match(line) is not None and "/*" in line for line in _CS_LINE_BREAK.split(text)
+    )
+
+
 def _route_files(repo_dir: str) -> dict[str, frozenset[str] | None]:
     """Every C# file of the checkout, ignored ones included, holding a
     computed-name route, with the types its routes are bound to (None: any
@@ -2513,6 +3470,7 @@ def _route_files(repo_dir: str) -> dict[str, frozenset[str] | None]:
         #: What each file's routes are when ``nameof`` is not the operator,
         #: where that differs.
         by_nameof: dict[str, frozenset[str] | None] = {}
+        global _ROUTE_FILE
         for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
             if not f.path.name.endswith(".cs"):
                 continue
@@ -2521,20 +3479,27 @@ def _route_files(repo_dir: str) -> dict[str, frozenset[str] | None]:
                 found[f.resolved] = None
             elif _ROUTE_TEXT.search(text):
                 root = wc.parse(text)
-                bounds: set[str] = set()
-                tested: list[Node] = []
-                if _computed_route(root, repo_dir=repo_dir, bounds=bounds, attribute_only=tested):
+                if _directive_hides(text, root):
                     found[f.resolved] = None
                     continue
-                if bounds:
-                    found[f.resolved] = frozenset(bounds)
-                loose: set[str] = set()
-                if _computed_route(root, nameof=False, repo_dir=repo_dir, bounds=loose, attribute_only=tested):
-                    by_nameof[f.resolved] = None
-                elif loose != bounds:
-                    by_nameof[f.resolved] = frozenset(loose)
-                if tested:
-                    attributed.append(f.resolved)
+                bounds: set[str] = set()
+                tested: list[Node] = []
+                _ROUTE_FILE = f.resolved
+                try:
+                    if _computed_route(root, repo_dir=repo_dir, bounds=bounds, attribute_only=tested):
+                        found[f.resolved] = None
+                        continue
+                    if bounds:
+                        found[f.resolved] = frozenset(bounds)
+                    loose: set[str] = set()
+                    if _computed_route(root, nameof=False, repo_dir=repo_dir, bounds=loose, attribute_only=tested):
+                        by_nameof[f.resolved] = None
+                    elif loose != bounds:
+                        by_nameof[f.resolved] = frozenset(loose)
+                    if tested:
+                        attributed.append(f.resolved)
+                finally:
+                    _ROUTE_FILE = None
         if by_nameof and declares_nameof(repo_dir):
             found.update(by_nameof)
         _ATTRIBUTE_ROUTES[repo_dir] = tuple(p for p in attributed if p not in found)
@@ -2643,6 +3608,13 @@ def reset_cache() -> None:
     _ATTRIBUTE_ROUTES.clear()
     _ROUTED.clear()
     _NAMEOF.clear()
+    _VAR.clear()
+    _FIELD_ROUTES.clear()
+    _SPELLINGS.clear()
+    _SHADOWED.clear()
+    _METHOD_WORDS.clear()
+    _DECODED.clear()
+    _ALIASES.clear()
     _LOOSE.clear()
     _PATTERNS.clear()
 

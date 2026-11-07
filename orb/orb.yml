@@ -1,13 +1,13 @@
 version: 2.1
 
 description: >-
-  Remove dead and stale feature flags from a GitHub-hosted repository with
-  Featureflip. Each run reads removal candidates from your Featureflip
-  project, rewrites the code that reads each flag with AST-level transforms,
-  and opens one pull request per flag. No LLM is involved. It runs the same
-  image as the Featureflip Flag Cleanup GitHub Action, so the supported
-  languages, safety checks and pull requests are identical. The repository
-  must be hosted on GitHub, because the pull requests are opened there.
+  Remove dead and stale feature flags from a repository hosted on GitHub,
+  GitLab or Bitbucket with Featureflip. Each run reads removal candidates
+  from your Featureflip project, rewrites the code that reads each flag with
+  AST-level transforms, and opens one pull request (or GitLab merge request)
+  per flag. No LLM is involved. It runs the same image as the Featureflip
+  Flag Cleanup GitHub Action, so the supported languages, safety checks and
+  pull requests are identical.
 
 display:
   home_url: https://featureflip.io/docs/integrations/flag-cleanup-action/
@@ -145,9 +145,9 @@ commands:
         type: string
         default: ""
         description: >-
-          The GitHub repository as `owner/name`. Empty derives it from the
-          CircleCI project, which works for projects that follow a GitHub
-          repository.
+          The repository's path: `owner/name` on GitHub, `workspace/name` on
+          Bitbucket, `group/sub/project` on GitLab. Empty derives it from the
+          CircleCI project.
       github-server-url:
         type: string
         default: https://github.com
@@ -156,6 +156,35 @@ commands:
         type: string
         default: https://api.github.com
         description: GitHub API origin. Change it only for GitHub Enterprise Server.
+      forge:
+        type: enum
+        enum: ["github", "gitlab", "bitbucket"]
+        default: github
+        description: >-
+          Where the repository is hosted. On gitlab or bitbucket the change
+          requests open there, with `forge-token`.
+      forge-token:
+        type: env_var_name
+        default: FLAG_CLEANUP_FORGE_TOKEN
+        description: >-
+          Name of the environment variable holding a GitLab project access
+          token (`api` scope) or a Bitbucket repository access token
+          (`pullrequest:write`, `repository:write`). Ignored on github, which
+          uses `github-token`.
+      forge-api-url:
+        type: string
+        default: ""
+        description: >-
+          Self-managed GitLab only: the API origin, for example
+          `https://gitlab.example.com/api/v4`. Set it with `forge-server-url`
+          or not at all.
+      forge-server-url:
+        type: string
+        default: ""
+        description: >-
+          Self-managed GitLab only: the web origin, for example
+          `https://gitlab.example.com`. Set it with `forge-api-url` or not at
+          all.
       image:
         type: string
         default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
@@ -166,25 +195,67 @@ commands:
           command: |
             set -euo pipefail
 
+            forge="<< parameters.forge >>"
             repository="<< parameters.repository >>"
-            if [ -z "$repository" ]; then
-              if [ -z "${CIRCLE_PROJECT_USERNAME:-}" ] || [ -z "${CIRCLE_PROJECT_REPONAME:-}" ]; then
-                echo "Could not work out the GitHub repository from this pipeline. Set the orb's repository parameter to owner/name." >&2
+            if [ "$forge" = github ]; then
+              if [ -z "$repository" ]; then
+                if [ -z "${CIRCLE_PROJECT_USERNAME:-}" ] || [ -z "${CIRCLE_PROJECT_REPONAME:-}" ]; then
+                  echo "Could not work out the GitHub repository from this pipeline. Set the orb's repository parameter to owner/name." >&2
+                  exit 2
+                fi
+                repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
+              fi
+
+              server_host="<< parameters.github-server-url >>"
+              server_host="${server_host#*://}"
+              server_host="${server_host%%/*}"
+              case "${CIRCLE_REPOSITORY_URL:-}" in
+                "" | *"@${server_host}:"* | *"://${server_host}/"*) ;;
+                *)
+                  echo "This project is hosted at ${CIRCLE_REPOSITORY_URL}, not on ${server_host}. Flag cleanup opens GitHub pull requests, so it needs a GitHub-hosted repository." >&2
+                  exit 2
+                  ;;
+              esac
+            else
+              server_host="<< parameters.forge-server-url >>"
+              if [ -z "$server_host" ]; then
+                case "$forge" in
+                  gitlab) server_host=gitlab.com ;;
+                  bitbucket) server_host=bitbucket.org ;;
+                esac
+              fi
+              server_host="${server_host#*://}"
+              server_host="${server_host%%/*}"
+              # An ssh clone URL names the host without the web port.
+              ssh_host="${server_host%%:*}"
+              url="${CIRCLE_REPOSITORY_URL:-}"
+              case "$url" in
+                "" | *"@${ssh_host}:"* | *"://${server_host}/"*) ;;
+                *)
+                  echo "This project is hosted at ${url}, not on ${server_host}. Set forge to where the repository is hosted." >&2
+                  exit 2
+                  ;;
+              esac
+              # The path comes from the clone URL, because a GitLab project in
+              # a subgroup (group/sub/project) has no CircleCI owner/name form.
+              if [ -z "$repository" ]; then
+                case "$url" in
+                  # ssh://user@host:port/path: the port is not part of the path.
+                  *"://"*"@${ssh_host}:"*)
+                    repository="${url#*"@${ssh_host}:"}"
+                    repository="${repository#*/}"
+                    ;;
+                  *"@${ssh_host}:"*) repository="${url#*"@${ssh_host}:"}" ;;
+                  *"://${server_host}/"*) repository="${url#*"://${server_host}/"}" ;;
+                esac
+                repository="${repository%/}"
+                repository="${repository%.git}"
+              fi
+              if [ -z "$repository" ]; then
+                echo "Could not work out the repository from this pipeline. Set the orb's repository parameter to the project's path." >&2
                 exit 2
               fi
-              repository="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"
             fi
-
-            server_host="<< parameters.github-server-url >>"
-            server_host="${server_host#*://}"
-            server_host="${server_host%%/*}"
-            case "${CIRCLE_REPOSITORY_URL:-}" in
-              "" | *"@${server_host}:"* | *"://${server_host}/"*) ;;
-              *)
-                echo "This project is hosted at ${CIRCLE_REPOSITORY_URL}, not on ${server_host}. Flag cleanup opens GitHub pull requests, so it needs a GitHub-hosted repository." >&2
-                exit 2
-                ;;
-            esac
 
             # Secrets are exported and passed to docker by NAME, so their
             # values never appear in a process's argument list.
@@ -193,6 +264,20 @@ commands:
             export GITHUB_REPOSITORY="$repository"
             export GITHUB_SERVER_URL="<< parameters.github-server-url >>"
             export GITHUB_API_URL="<< parameters.github-api-url >>"
+            export FLAG_CLEANUP_FORGE="$forge"
+            export FLAG_CLEANUP_REPOSITORY="$repository"
+            export FLAG_CLEANUP_FORGE_TOKEN="${<< parameters.forge-token >>:-}"
+            export FLAG_CLEANUP_API_URL="<< parameters.forge-api-url >>"
+            export FLAG_CLEANUP_SERVER_URL="<< parameters.forge-server-url >>"
+            # Only the named forge's variables reach the container: `-e NAME`
+            # passes nothing for an unset NAME.
+            if [ "$forge" = github ]; then
+              unset FLAG_CLEANUP_FORGE FLAG_CLEANUP_REPOSITORY FLAG_CLEANUP_FORGE_TOKEN FLAG_CLEANUP_API_URL FLAG_CLEANUP_SERVER_URL
+            else
+              unset GITHUB_TOKEN GITHUB_REPOSITORY GITHUB_SERVER_URL GITHUB_API_URL
+              [ -n "$FLAG_CLEANUP_API_URL" ] || unset FLAG_CLEANUP_API_URL
+              [ -n "$FLAG_CLEANUP_SERVER_URL" ] || unset FLAG_CLEANUP_SERVER_URL
+            fi
             export FEATUREFLIP_ORG="<< parameters.org >>"
             export FEATUREFLIP_PROJECT="<< parameters.project >>"
             export FEATUREFLIP_API_URL="<< parameters.api-url >>"
@@ -220,6 +305,11 @@ commands:
               -e GITHUB_REPOSITORY \
               -e GITHUB_SERVER_URL \
               -e GITHUB_API_URL \
+              -e FLAG_CLEANUP_FORGE \
+              -e FLAG_CLEANUP_REPOSITORY \
+              -e FLAG_CLEANUP_FORGE_TOKEN \
+              -e FLAG_CLEANUP_API_URL \
+              -e FLAG_CLEANUP_SERVER_URL \
               -e FEATUREFLIP_ORG \
               -e FEATUREFLIP_PROJECT \
               -e FEATUREFLIP_API_URL \
@@ -278,6 +368,23 @@ jobs:
         type: string
         default: ghcr.io/canopy-labs/featureflip-flag-cleanup-action:v2
         description: The cleanup image.
+      forge:
+        type: enum
+        enum: ["github", "gitlab", "bitbucket"]
+        default: github
+        description: Where the repository is hosted.
+      forge-token:
+        type: env_var_name
+        default: FLAG_CLEANUP_FORGE_TOKEN
+        description: Name of the environment variable holding the GitLab or Bitbucket token. Ignored on github.
+      forge-api-url:
+        type: string
+        default: ""
+        description: Self-managed GitLab only, with `forge-server-url`.
+      forge-server-url:
+        type: string
+        default: ""
+        description: Self-managed GitLab only, with `forge-api-url`.
     steps:
       - checkout
       - cleanup:
@@ -289,6 +396,10 @@ jobs:
           staleness: << parameters.staleness >>
           dry-run: << parameters.dry-run >>
           image: << parameters.image >>
+          forge: << parameters.forge >>
+          forge-token: << parameters.forge-token >>
+          forge-api-url: << parameters.forge-api-url >>
+          forge-server-url: << parameters.forge-server-url >>
 
 examples:
   weekly_cleanup:
