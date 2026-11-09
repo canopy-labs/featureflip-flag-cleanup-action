@@ -60,8 +60,12 @@ No other binding of the name may exist anywhere in either file, a nested
   component: ``cloneElement``, ``Children``, ``x.props`` (not ``this.props``,
   and not a holder the same file assigns ``.props`` to, which a frozen
   element cannot be), ``.prop(…)``, or a shallow renderer;
-* a test mocks a module on the import chain (``vi.mock``/``jest.mock``) or
-  spies on the callee by name, since it may assert on the argument;
+* a test spies on the callee by name, or mocks a module on the import chain
+  (``vi.mock``/``jest.mock``) where a stand-in could see the argument or a
+  test could read the calls it recorded: a mocked function is followed only
+  when it is imported straight from its declaring module and
+  :mod:`flag_cleanup.ts_mock_callee` proves no stand-in reads that far into
+  its arguments, and a mocked component never is;
 * the element spreads attributes, names the prop twice, or the prop is
   ``key`` or ``ref``, which React keeps out of the props;
 * a comment sits beside the attribute or in the bytes the edit takes.
@@ -180,6 +184,7 @@ def drop_default_arguments(
     path: str | None = None,
     repo_dir: str | None = None,
     width: int | None = None,
+    mocks: dict | None = None,
 ) -> Dropped:
     """``after`` without each literal this removal left equal to the
     callee's default; see the module docstring for the proof.
@@ -188,6 +193,8 @@ def drop_default_arguments(
     another; without them only a callee declared in this file is followed.
     An argument list the drop leaves with one element is put back on one
     line when it fits ``width``; see :mod:`flag_cleanup.ts_list_join`.
+    ``mocks`` keeps what the checkout's mocks allow, per callee, across the
+    calls of one run; see :func:`flag_cleanup.ts_mock_callee.reach`.
     """
     unchanged = Dropped(after, (), ())
     if before == after:
@@ -200,7 +207,7 @@ def drop_default_arguments(
     produced = emptied | folded
     if not produced:
         return unchanged
-    resolver = _Resolver(root, data, path, repo_dir, language)
+    resolver = _Resolver(root, data, path, repo_dir, language, mocks)
     # Each edit's bytes, the site to report it under (one per call or element
     # it shortens, so a second span of the same object has none), the
     # emptied-override lines it accounts for, and the options a folded value
@@ -514,6 +521,8 @@ def _call_parameter(literal: Node, resolver: _Resolver) -> tuple[Node, _Callee, 
     pattern = parameter.child_by_field_name("pattern")
     if parameter.type not in _PARAMETERS or pattern is None or pattern.type == "rest_pattern":
         return None
+    if not resolver.unmocked(callee, position):
+        return None
     return parameter, callee, position == len(passed) - 1
 
 
@@ -681,9 +690,19 @@ def _number(text: str) -> float | None:
 class _Resolver:
     """Finds the function a name in the caller's file calls, once per name."""
 
-    def __init__(self, root: Node, data: bytes, path: str | None, repo_dir: str | None, language: str):
+    def __init__(
+        self,
+        root: Node,
+        data: bytes,
+        path: str | None,
+        repo_dir: str | None,
+        language: str,
+        mocks: dict | None = None,
+    ):
         self.root, self.data, self.path, self.repo_dir = root, data, path, repo_dir
         self.language = language
+        #: What the checkout's mocks allow, per callee; shared across a run.
+        self.mocks = {} if mocks is None else mocks
         self._functions: dict[tuple[str, bool], _Callee | None] = {}
         self._undefined: bool | None = None
         self._scanned: list[tuple[str, str, str]] | None = None
@@ -695,12 +714,38 @@ class _Resolver:
         return self._undefined
 
     def function(self, name: Node) -> _Callee | None:
-        """The function a call to ``name`` runs, when it is a plain function
-        nothing in the checkout mocks."""
-        callee = self._lookup(name, component=False)
-        if callee is None or self._mocked(callee):
-            return None
-        return callee
+        """The function a call to ``name`` runs, when it is a plain function;
+        whether a mock can tell is :meth:`unmocked`'s to say."""
+        return self._lookup(name, component=False)
+
+    def unmocked(self, callee: _Callee, position: int) -> bool:
+        """Whether no test can tell a call to ``callee`` that leaves out the
+        argument at ``position`` from one that passes it: nothing spies on
+        it by name, and either nothing mocks its import chain or
+        :func:`~flag_cleanup.ts_mock_callee.reach` proves no stand-in reads
+        that far."""
+        key = ("chain", callee.modules, callee.names)
+        if key not in self.mocks:
+            self.mocks[key] = self._mock_hits(callee)
+        mocked, spied = self.mocks[key]
+        if spied:
+            return False
+        if not mocked:
+            return True
+        name = _declared_name(callee.function, callee.data)
+        if (
+            self.repo_dir is None
+            or len(callee.modules) != 1
+            or callee.path not in callee.modules
+            or callee.names != {name}
+        ):
+            # Only a callee imported straight from its declaring module, under
+            # its own name, is followed into a mock.
+            return False
+        from flag_cleanup import ts_mock_callee
+
+        seen = ts_mock_callee.reach(callee.path, name, self.repo_dir, self.mocks)
+        return seen is not None and position >= seen
 
     def component(self, tag: Node) -> _Callee | None:
         """The function component JSX ``tag`` renders, unwrapped from React's
@@ -710,7 +755,7 @@ class _Resolver:
         if (
             callee is None
             or self._default_props_near(callee, _text(tag, self.data))
-            or self._mocked(callee)
+            or any(self._mock_hits(callee))
             or self._element_props_readable()
         ):
             return None
@@ -853,32 +898,63 @@ class _Resolver:
             )
         return self._props_readable
 
-    def _mocked(self, callee: _Callee) -> bool:
+    def _mock_hits(self, callee: _Callee) -> tuple[bool, bool]:
         """Whether a file in the checkout mocks a module on the callee's
-        import chain, or spies on it by one of its names: a test that then
-        asserts on the call or the props would see the argument go."""
+        import chain, and whether one spies on it by one of its names: a test
+        that then asserts on the call or the props could see the argument go."""
+        from flag_cleanup import ts_mock_config as config
+
+        if self.repo_dir is not None and config.everything_mocked(self.repo_dir):
+            # Automock, or a mapper to a mock: every module is a recording stand-in.
+            return True, True
+        mocked = False
         for path, text, grammar in self._scan():
             if "mock" not in text.lower() and "spyOn" not in text:
                 continue
-            for call in _walk(_parse(text, grammar)):
+            root = _parse(text, grammar)
+            for call in _walk(root):
                 if call.type != "call_expression":
                     continue
-                verb = _called_name(call.child_by_field_name("function"))
+                function = call.child_by_field_name("function")
+                verb = _called_name(function)
                 arguments = call.child_by_field_name("arguments")
                 passed = [c for c in arguments.named_children if c.type != "comment"] if arguments else []
+                if config.automock_call(function):
+                    return True, True
+                node_verb = config.node_mocker(function)
+                if node_verb == "module" and passed:
+                    # node:test and bun:test: not a call the stand-in proof follows,
+                    # so a module it can name, or any module when it is computed.
+                    computed, target = self._resolve_mocked(path, passed[0])
+                    if computed or target in callee.modules:
+                        return mocked, True
+                elif node_verb is not None and len(passed) > 1:
+                    # A name that is not a literal could be any member.
+                    named = config.plain_string(passed[1])
+                    if named is None or named in callee.names:
+                        return mocked, True
                 if verb in _MOCKERS and passed and callee.modules:
-                    specifier = _module_specifier(passed[0])
-                    target = (
-                        cross_file_ts.resolve_specifier(path, specifier, self.repo_dir, solution=True)
-                        if specifier is not None
-                        else None
-                    )
-                    if target is not None and str(Path(target).resolve()) in callee.modules:
-                        return True
+                    computed, target = self._resolve_mocked(path, passed[0])
+                    if computed:
+                        # A computed specifier could name any module.
+                        if _runner_mocker(function, root):
+                            mocked = True
+                    elif target in callee.modules:
+                        mocked = True
                 if verb == "spyOn" and len(passed) > 1:
-                    if cross_file_ts._string_value(passed[1]) in callee.names:
-                        return True
-        return False
+                    named = config.plain_string(passed[1])
+                    if named is None or named in callee.names:
+                        return mocked, True
+        return mocked, False
+
+    def _resolve_mocked(self, path: str, argument: Node) -> tuple[bool, str | None]:
+        """Whether a mock's specifier is computed, and the file it names (None
+        when it names nothing in the checkout)."""
+        specifier = _module_specifier(argument)
+        if specifier is None:
+            return True, None
+        target = cross_file_ts.resolve_specifier(path, specifier, self.repo_dir, solution=True)
+        return False, (str(Path(target).resolve()) if target is not None else None)
 
     def _scan(self) -> list[tuple[str, str, str]]:
         """The path, text and grammar of every TS/JS file in the checkout
@@ -939,7 +1015,15 @@ def _module_specifier(argument: Node) -> str | None:
         if callee is None or callee.type != "import" or arguments is None or not arguments.named_children:
             return None
         argument = arguments.named_children[0]
-    return cross_file_ts._string_value(argument)
+    from flag_cleanup import ts_mock_config
+
+    return ts_mock_config.plain_string(argument)
+
+
+def _runner_mocker(function: Node | None, root: Node) -> bool:
+    from flag_cleanup.ts_constant_params import _is_module_mocker
+
+    return _is_module_mocker(function, root)
 
 
 def _reads_element_props(text: str, grammar: str) -> bool:

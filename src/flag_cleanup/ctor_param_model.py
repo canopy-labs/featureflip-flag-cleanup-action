@@ -54,6 +54,8 @@ FORMS = {
     "parameter": "{}",
     "initializer": "{} = 0",
     "import": "import 'dart:core' as {};",
+    # A JSX element's tag names, to be replaced by a fragment around its children.
+    "fragment": "{}_frag",
 }
 
 #: The same for C#, plus a whole type declaration and a ``using`` directive.

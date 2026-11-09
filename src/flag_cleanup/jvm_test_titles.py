@@ -70,7 +70,13 @@ def rename_kept_titles(
     edits: list[tuple[int, int, bytes]] = []
     renamed: list[tuple[str, str]] = []
     produced: set[str] = set()
-    for start, end in _titles(syntax._parse(source, language), data, language):
+    spans = _titles(syntax._parse(source, language), data, language)
+    # Kotest registers a second test of one name in a container as a duplicate
+    # and fails the spec, so a title another test already carries is not a
+    # name to rename into. Anywhere in the file: a sibling is the case that
+    # matters, and telling containers apart is not worth a wrong rename.
+    taken = {data[a:b].decode("utf-8", "replace") for a, b in spans} if language == "kt" else set()
+    for start, end in spans:
         title = data[start:end].decode("utf-8", "replace")
         new = ts_tests.reworded_title(title, flag_key, kept)
         # A function's name must stay its own, and a title with `$` is a template.
@@ -79,6 +85,7 @@ def rename_kept_titles(
             or "$" in title
             or f"`{new}`" in source
             or new in produced
+            or new in taken
             or re.search(rf"\bfun\s+{re.escape(new)}\s*\(", source)
         ):
             continue

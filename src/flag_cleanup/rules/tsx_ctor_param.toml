@@ -21,3 +21,30 @@ query = """(
 replace_node = "element"
 replace = "@child"
 is_seed_rule = true
+
+# ctor: argument
+# An element whose tag names carry the fragment mark, replaced by a fragment
+# around everything it held: several children, text, or an `{expression}`. The
+# opening tag (with every attribute) becomes `<>` and the closing tag `</>`, so
+# the children stay exactly where they were. Two rules because the two tags are
+# two nodes; each is marked only with its partner.
+[[rules]]
+name = "unwrap_ctor_marked_fragment_open"
+query = """(
+  (jsx_opening_element name: (identifier) @name) @tag
+  (#eq? @name "__CTOR_SENTINEL___frag")
+)"""
+replace_node = "tag"
+replace = "<>"
+is_seed_rule = true
+
+# ctor: argument
+[[rules]]
+name = "unwrap_ctor_marked_fragment_close"
+query = """(
+  (jsx_closing_element name: (identifier) @name) @tag
+  (#eq? @name "__CTOR_SENTINEL___frag")
+)"""
+replace_node = "tag"
+replace = "</>"
+is_seed_rule = true

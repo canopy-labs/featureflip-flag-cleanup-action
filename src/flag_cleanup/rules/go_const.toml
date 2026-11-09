@@ -386,3 +386,92 @@ not_contains = [
   (#eq? @second_arg "@variable_name")
 )""",
 ]
+
+# --- a typed flag HANDLE: `var NAME = Ctor("flag-key", ...)` -----------------
+#
+# The key held in a package-level `var` built by a constructor that takes it,
+# read in other files as `ff.BoolFlag(ctx, pkg.NAME)`. The readers are
+# `go_xconst.toml`'s, cloned per proven read; these two rules only delete the
+# declaration once they have folded. They are package-level only (`source_file`
+# is the declaration's parent), and the PROOF that the name is a handle and
+# nothing else is the gate's, not the query's: `key_const._go_var_holders` and
+# `_go_withholds` keep the file when the name is mentioned in it anywhere but
+# here, and `cross_file_go.references` refuses every mention elsewhere that is
+# not a read it folds (an assignment, `&NAME`, `NAME.f`). The not_contains
+# guard is the sequencing one the const rules carry: while a call in this file
+# still takes the name as its first or second argument, the declaration stays.
+
+[[rules]]
+name = "delete_flag_key_var_handle_declaration"
+query = """(
+  (source_file
+    (var_declaration
+      [(var_spec
+         name: (identifier) @variable_name
+         value: (expression_list . (call_expression
+           arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))) .))
+       (var_spec_list . (var_spec
+         name: (identifier) @variable_name
+         value: (expression_list . (call_expression
+           arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))) .)) .)]) @declaration)
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+delete_whole_lines = true
+
+[[rules.filters]]
+enclosing_node = """([(source_file) (function_declaration) (block)] @container)"""
+not_contains = [
+  """(
+  (call_expression
+    arguments: (argument_list . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)""",
+  """(
+  (call_expression
+    arguments: (argument_list . (_) . (identifier) @second_arg)) @surviving_read
+  (#eq? @second_arg "@variable_name")
+)""",
+]
+
+[[rules]]
+name = "delete_flag_key_var_handle_spec_in_group"
+query = """(
+  (source_file
+    [(var_declaration
+       (var_spec_list
+         (var_spec)
+         (var_spec
+           name: (identifier) @variable_name
+           value: (expression_list . (call_expression
+             arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))) .)) @spec))
+     (var_declaration
+       (var_spec_list
+         (var_spec
+           name: (identifier) @variable_name
+           value: (expression_list . (call_expression
+             arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))) .)) @spec
+         (var_spec)))])
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "spec"
+replace = ""
+holes = ["stale_flag_name"]
+delete_whole_lines = true
+
+[[rules.filters]]
+enclosing_node = """([(source_file) (function_declaration) (block)] @container)"""
+not_contains = [
+  """(
+  (call_expression
+    arguments: (argument_list . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)""",
+  """(
+  (call_expression
+    arguments: (argument_list . (_) . (identifier) @second_arg)) @surviving_read
+  (#eq? @second_arg "@variable_name")
+)""",
+]

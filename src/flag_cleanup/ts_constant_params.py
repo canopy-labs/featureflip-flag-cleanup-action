@@ -748,9 +748,17 @@ def _mocks_package(resolver, package: str) -> bool:
     if package in cached:
         return cached[package]
 
+    from flag_cleanup import ts_mock_config as config
+
     def names(root: Node) -> bool:
         for call in _walk(root):
-            if call.type != "call_expression" or _called_name(call.child_by_field_name("function")) not in _MOCKERS:
+            if call.type != "call_expression":
+                continue
+            function = call.child_by_field_name("function")
+            if config.automock_call(function):
+                return True
+            node_mock = config.node_mocker(function) == "module"
+            if not node_mock and _called_name(function) not in _MOCKERS:
                 continue
             arguments = call.child_by_field_name("arguments")
             passed = [c for c in arguments.named_children if c.type != "comment"] if arguments else []
@@ -761,11 +769,13 @@ def _mocks_package(resolver, package: str) -> bool:
                 return True
             # An unreadable name counts only for the test runners' own mockers:
             # `fetchMock.mock(url, 200)` is something else.
-            if specifier is None and _is_module_mocker(call.child_by_field_name("function"), root):
+            if specifier is None and (node_mock or _is_module_mocker(function, root)):
                 return True
         return False
 
-    mocked = names(resolver.root)
+    mocked = names(resolver.root) or (
+        resolver.repo_dir is not None and config.everything_mocked(resolver.repo_dir, automock_only=True)
+    )
     if not mocked and resolver.repo_dir is not None:
         for _path, text, grammar in resolver._scan():
             if "mock" in text.lower() and not is_test_file(text, grammar) and names(_parse(text, grammar)):

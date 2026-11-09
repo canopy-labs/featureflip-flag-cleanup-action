@@ -1553,17 +1553,21 @@ def review_names(
             logger.info("references to renamed tests in %s not judged: %s: %s", relative, type(exc).__name__, exc)
             continue
         go: list[tuple[int, int, str, str]] = []
+        written: dict[tuple[str, str], list[str]] = {}
         #: The method's own references (``nameof``, ``cref``) that move with it.
         along: list[tuple[int, int, str, str]] = []
         for start, end, old, new in edits:
             owner, owner_start, owner_end = owners.get((resolved, start), ("", -1, -1))
             blockers: list[str] = []
+            prose: list[str] = []
             moving: list[tuple[int, int, str, str]] = []
             for where, line, spelled_path, at, to in spelled.get(old, []):
                 if spelled_path == resolved and at == start + bom:
                     continue  # the declaration being renamed
                 if spelled_path == resolved and owner and _own_reference(tree, at - bom, to - bom, owner, owner_start + bom <= at < owner_end + bom):
                     moving.append((at - bom, to - bom, old, new))
+                elif _inert_prose(where, spelled_path, line):
+                    prose.append(f"{where}:{line}")
                 else:
                     blockers.append(f"{where}:{line}")
             taken = _declared_in_hierarchy(resolved, start, new, repo_dir)
@@ -1579,6 +1583,8 @@ def review_names(
             else:
                 go.append((start, end, old, new))
                 along += moving
+                if prose:
+                    written[(resolved, old)] = sorted(prose)
         if not go:
             continue
         git_ops.before_writing([resolved])
@@ -1590,7 +1596,10 @@ def review_names(
             data = data[: start + offset] + new.encode() + data[end + offset :]
         Path(resolved).write_bytes(data)
         summaries[index] = rewrite(summary.path, summary.original_content, data.decode("utf-8"))
-        rows += [(relative, RENAMED_METHOD, f"{old}\n{new}") for _, _, old, new in sorted(go)]
+        rows += [
+            (relative, RENAMED_METHOD, "\n".join([old, new, *([", ".join(written[(resolved, old)])] if (resolved, old) in written else [])]))
+            for _, _, old, new in sorted(go)
+        ]
     return summaries, rows
 
 
@@ -1684,6 +1693,34 @@ def _members(declaration: Node) -> list[tuple[str, int]]:
                 if n is not None:
                     found.append((_text(n), n.start_point[0] + 1))
     return found
+
+
+#: Files that only describe: nothing runs or parses a test's name from them, so
+#: a spelling there never blocks a rename. Anything else might (a test list, a
+#: ``--filter`` in a workflow, a runsettings file) and does.
+_PROSE_SUFFIXES = (".md", ".mdx", ".markdown", ".rst", ".adoc")
+#: A prose file a test or a build can still read by name: a snapshot, a file
+#: under a test path, or a line that pulls text in from elsewhere.
+_SNAPSHOT_PATH = re.compile(r"\.(?:verified|approved|received)\.|(?:^|/)__snapshots__/", re.IGNORECASE)
+_TESTISH_SEGMENT = re.compile(r"(?:^|[-_.])(?:tests?|specs?)(?:[-_.]|$)", re.IGNORECASE)
+_PULLS_TEXT_IN = re.compile(r"literalinclude|include::|xref:|:start-after:|:end-before:|<xref|(?-i:(?<![\w.])@[A-Z]\w*\.)", re.IGNORECASE)
+
+
+def _inert_prose(where: str, resolved: str, line: int) -> bool:
+    """Whether the spelling at ``where``:``line`` is in a document nothing
+    runs or parses by name. A prose document still blocks when it is a
+    snapshot, sits under a test-like path, or the line includes text from
+    another file (``literalinclude``, ``xref:``, …): a test or a doc build
+    reads those."""
+    if not where.lower().endswith(_PROSE_SUFFIXES) or _SNAPSHOT_PATH.search(where):
+        return False
+    if any(_TESTISH_SEGMENT.search(part) for part in Path(where).parts):
+        return False
+    try:
+        text = Path(resolved).read_text(encoding="utf-8", errors="replace").split("\n")[line - 1]
+    except (OSError, IndexError):
+        return False
+    return _PULLS_TEXT_IN.search(text) is None
 
 
 def _spellings(names: set[str], repo_dir: str) -> dict[str, list[tuple[str, int, str, int, int]]]:

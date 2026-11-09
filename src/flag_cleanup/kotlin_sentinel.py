@@ -677,7 +677,7 @@ class SentinelPrePass:
                     extra_spans=self.extra_spans.get(path, ()),
                     marks_reads=self.marks_reads,
                 )
-            except SentinelCollisionError:
+            except (SentinelCollisionError, ValueError):
                 self.failed_path = path
                 raise
             if rewritten is None:

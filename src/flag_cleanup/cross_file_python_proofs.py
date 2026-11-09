@@ -119,8 +119,12 @@ def _bindings(root: Node, path: str, repo_dir: str, decl: xk.KeyDeclaration) -> 
     return found
 
 
-def _is_read_at(node: Node, accessors: frozenset[str]) -> bool:
-    """Whether ``node`` (the key expression) is the first argument of a removable read."""
+def _is_read_at(node: Node, accessors: frozenset[str], *, positioned: bool = True) -> bool:
+    """Whether ``node`` (the key expression) is the key of a removable read: the
+    first argument, or the declared slot of a positioned accessor (``get[1]``).
+    ``positioned=False`` for a key with no positioned reader rule (an enum's)."""
+    if positioned and key_const.python_positioned_read(node, accessors):
+        return True
     arguments = node.parent
     if arguments is None or arguments.type != "argument_list":
         return False

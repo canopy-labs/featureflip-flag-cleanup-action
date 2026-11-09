@@ -606,6 +606,24 @@ holes = ["marker"]
 # `<Banner />` in `{!hideBanner && <Banner />}`, for both treatments, in a file
 # holding no sentinel at all. The engine cause was not found, so the order must
 # not be changed.
+# A read of an accessor that returns a Promise, marked by `ts_async_reads` as
+# `<sentinel>(FF_CLEANUP_PROMISE_READ)`: it keeps its type, so it becomes
+# `Promise.resolve(<literal>)`. No group: nothing downstream folds it. It must
+# precede the literal rule below, which matches any call of the sentinel.
+[[rules]]
+name = "replace_promise_sentinel_read_with_resolved_promise"
+query = """(
+  (call_expression
+    function: (identifier) @marked_callee
+    arguments: (arguments . (identifier) @promise_tag .)
+  ) @call
+  (#eq? @marked_callee "@sentinel")
+  (#eq? @promise_tag "FF_CLEANUP_PROMISE_READ")
+)"""
+replace_node = "call"
+replace = "Promise.resolve(@treated)"
+holes = ["treated", "sentinel"]
+
 [[rules]]
 name = "delete_discarded_sentinel_statement"
 query = """(

@@ -44,6 +44,10 @@ NAME_NOT_UNIQUE = "name-not-unique"
 IMPORT_UNRESOLVED = "import-unresolved"
 NOT_A_READ = "not-a-read"
 REBOUND = "rebound"
+#: An import of the key constant through a re-export whose target file is
+#: gitignored and absent from the checkout: a generated barrel that has not been
+#: generated. Nothing can be proven through it until it exists.
+GENERATED_BARREL = "generated-barrel"
 OTHER_LANGUAGE = "other-language"
 UNSUPPORTED_FORM = "unsupported-form"
 #: A proven reader left unfolded because a declaration it reads is kept by
@@ -339,6 +343,10 @@ class Profile:
     #: which judges one file at a time, this walks the checkout itself, so it
     #: can follow a module through others that re-export it (a TS barrel).
     module_escapes: Callable[[str, str], list[Refusal]] | None = None
+    #: ``(sources by path, names)``: the other names a re-export hands those
+    #: names on under (TypeScript's ``export { X as Y } from``), so a file that
+    #: spells only ``Y`` is scanned too. None for a language with no rename.
+    reexport_aliases: Callable[[dict[str, str], set[str]], set[str]] | None = None
 
 
 class DeclarationsUnreadable(Exception):
@@ -635,6 +643,30 @@ def key_token(flag_key: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![\w.-]){re.escape(flag_key)}(?![\w.-])")
 
 
+def with_aliases(repo_dir: str, language: str, names: set[str]) -> set[str]:
+    """``names`` and every name a re-export hands them on under (see
+    :attr:`Profile.reexport_aliases`), so a file that spells only the new name
+    is scanned too. ``names`` itself for a language with no rename."""
+    _load_profiles()
+    profile = _PROFILES.get(language)
+    if profile is None or profile.reexport_aliases is None or not names:
+        return names
+    known = set(names)
+    texts: dict[str, str] = {}
+    while True:
+        for path in mention_files(repo_dir, known, exclude=()):
+            if path in texts:
+                continue
+            try:
+                texts[path] = Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+        fresh = profile.reexport_aliases(texts, known) - known
+        if not fresh:
+            return known
+        known |= fresh
+
+
 def mention_files(
     repo_dir: str,
     names: Iterable[str],
@@ -808,6 +840,8 @@ def resolve(
 
     declaring = {decl.path for decl in unique if decl.kind in REMOVABLE}
 
+    alias_of: dict[str, set[str]] = {}
+
     def spelled_in(source: str, path: str) -> set[str]:
         """The declaring files whose constant ``source`` spells by name.
 
@@ -817,12 +851,16 @@ def resolve(
         case.
         """
         flags = re.IGNORECASE if _case_insensitive(path) else 0
-        return {
+        found = {
             d.path
             for d in unique
             if d.kind in REMOVABLE
             and re.compile(mention_pattern([d.name]).pattern, flags).search(source)
         }
+        for alias, held in alias_of.items():
+            if mention_pattern([alias]).search(source):
+                found |= held
+        return found
 
     family_extensions = tuple(
         ext for lang in profile.language_family for ext in _extensions(lang)
@@ -862,6 +900,44 @@ def resolve(
             sources[path] = Path(path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             sources[path] = None
+    if profile.reexport_aliases is not None:
+        # A constant re-exported under another name is imported by that name,
+        # which a scan for the constant's own never finds. The aliases come
+        # from the files that spell the constant; the files spelling an alias
+        # are scanned next, and any of those may rename it again.
+        known = set(names)
+        while True:
+            texts = {p: t for p, t in sources.items() if t is not None}
+            fresh = profile.reexport_aliases(texts, known) - known
+            if not fresh:
+                break
+            known |= fresh
+            for path in mention_files(
+                repo_dir, fresh, exclude=(), with_ignored=True, also=also, extra_suffixes=unparsed
+            ):
+                if path in sources:
+                    continue
+                try:
+                    sources[path] = Path(path).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    sources[path] = None
+        aliases = known - names
+        # Which declaring files each alias leads back to: a refusal in a file
+        # that spells only the alias keeps these.
+        texts = {p: t for p, t in sources.items() if t is not None}
+        for decl in unique:
+            if decl.kind not in REMOVABLE:
+                continue
+            reached = {decl.name}
+            while True:
+                fresh = profile.reexport_aliases(texts, reached) - reached
+                if not fresh:
+                    break
+                reached |= fresh
+            for alias in reached - {decl.name}:
+                alias_of.setdefault(alias, set()).add(decl.path)
+    else:
+        aliases = set()
     ignored = _ignored(repo_dir, unparsed)
 
     voided = _competing(unique, sources, refusals)
@@ -881,10 +957,10 @@ def resolve(
         if profile.enum_escapes is not None
         else set()
     )
-    spells_a_name = mention_pattern(names | judged_owners)
+    spells_a_name = mention_pattern(names | judged_owners | aliases)
     spells_a_name_folded = re.compile(spells_a_name.pattern, re.IGNORECASE)
     live_constants = [d for d in live if d.kind in REMOVABLE]
-    spells_a_constant = mention_pattern({d.name for d in live_constants})
+    spells_a_constant = mention_pattern({d.name for d in live_constants} | aliases)
     for path, source in sources.items():
         if unparsed and Path(path).suffix in unparsed:
             # Never rewritten, and never read by `references`: a constant it

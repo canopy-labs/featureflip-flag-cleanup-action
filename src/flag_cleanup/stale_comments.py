@@ -326,7 +326,7 @@ def _blank(line: bytes) -> bool:
     return not line.strip()
 
 
-def _tidy(data: bytes, removals: list[Removal]) -> list[tuple[int, int]]:
+def _tidy(data: bytes, removals: list[Removal], grammar: str = "") -> list[tuple[int, int]]:
     """The byte spans to cut: each removal, with the blank line it would
     leave doubled (or stranded under an opening brace or above a closing one)."""
     starts = _line_starts(data)
@@ -348,7 +348,12 @@ def _tidy(data: bytes, removals: list[Removal]) -> list[tuple[int, int]]:
         has_below = below < len(lines) and lines[below] != b""
         cut_start, cut_end = starts[top], ends[row - 1]
         if has_below and _blank(lines[below]):
-            opens = not has_above or _blank(lines[above]) or lines[above].rstrip().endswith((b"{", b"(", b"["))
+            opens = (
+                not has_above
+                or _blank(lines[above])
+                or lines[above].rstrip().endswith((b"{", b"(", b"["))
+                or _opens_block(lines[above], grammar)
+            )
             if opens:
                 cut_end = ends[below]
                 row += 1
@@ -358,6 +363,22 @@ def _tidy(data: bytes, removals: list[Removal]) -> list[tuple[int, int]]:
             cut_start = starts[above]
         spans.append((cut_start, cut_end))
     return sorted(spans)
+
+
+#: A line that opens an indentation or keyword block, where a blank first
+#: line would be stranded once the statements under it go.
+_BLOCK_OPENERS = {
+    "python": re.compile(rb":\s*(?:#.*)?$"),
+    "ruby": re.compile(
+        rb"^\s*(?:def|class|module|begin|if|unless|while|until|case|else|elsif|ensure|rescue|when)\b[^\n]*$"
+        rb"|\bdo(?:\s*\|[^|\n]*\|)?\s*$"
+    ),
+}
+
+
+def _opens_block(line: bytes, grammar: str) -> bool:
+    pattern = _BLOCK_OPENERS.get(grammar)
+    return pattern is not None and pattern.search(line.rstrip(b"\r\n")) is not None
 
 
 def _code_tokens(root: Node) -> list[tuple[str, bytes]]:
@@ -407,7 +428,7 @@ def _cut(data: bytes, root: Node, removals: list[Removal], grammar: str) -> byte
     or ``None`` when the result would change a code token."""
     out = bytearray()
     at = 0
-    for start, end in _tidy(data, removals):
+    for start, end in _tidy(data, removals, grammar):
         if start < at:
             start = at
         out += data[at:start]
@@ -893,6 +914,43 @@ def is_directive_line(raw: bytes, content: str) -> bool:
     return bool(_DIRECTIVE.match(content) or _SHAPED_DIRECTIVE.match(content) or _BARE_DIRECTIVE.match(raw))
 
 
+#: A line that continues the construct above it instead of starting a new one.
+_CONTINUES = re.compile(r"(?:else|elif|except|finally|case|when|rescue|ensure|elsif)\b")
+
+
+def _dedents(following: str, deleted: str) -> bool:
+    """Whether the line after a deletion ends the block the deleted statement
+    sat in, as Python's indentation does: code indented less than the
+    statement, and not a comment (which may be anywhere) or a clause that
+    continues the block above (``else``, ``except``, …)."""
+    code = following.lstrip()
+    if not code or code.startswith("#") or _CONTINUES.match(code):
+        return False
+    return len(following) - len(code) < len(deleted) - len(deleted.lstrip())
+
+
+#: A comment line that is not plain prose, whatever tool reads it: a shebang,
+#: an encoding or Ruby magic comment, or any ``tool:`` prefix.
+_NOT_PROSE = re.compile(
+    r"(?:coding[:=]|encoding\b|(?:frozen_string_literal|warn_indent|shareable_constant_value)\b"
+    r"|[A-Za-z_@][\w.@-]*:\s*\S)",
+    re.IGNORECASE,
+)
+
+
+def _plain_prose(texts: list[str]) -> bool:
+    """Whether EVERY line of a comment group is plain prose. Sound by
+    construction: one line that might instruct a tool keeps the whole group."""
+    for text in texts:
+        raw = text.encode("utf-8")
+        content = _content(raw).decode("utf-8", "replace")
+        if raw.startswith(b"#!") or is_directive_line(raw, content):
+            return False
+        if re.search(r"coding[:=]|-\*-", content, re.IGNORECASE) or _NOT_PROSE.match(content):
+            return False
+    return True
+
+
 def _closes(line: bytes) -> bool:
     """Whether ``line`` (stripped of its indent) closes the block it sits in:
     a bracket, or ``end`` as a whole word, not ``endpoint``."""
@@ -1002,7 +1060,7 @@ def leading_comments(
         if i2 == i1:
             continue
         following = old_lines[i2].lstrip().encode("utf-8") if i2 < len(old_lines) else b""
-        closed = not following or _closes(following)
+        closed = not following or _closes(following) or (grammar == "python" and _dedents(old_lines[i2], old_lines[i1]))
         entry = _normalised("\n".join(old_lines[i1:i2])) in own_entries
         if entry:
             shared = not closed and i2 not in comment_rows
@@ -1029,6 +1087,8 @@ def leading_comments(
             any(t.encode("utf-8").startswith(_DOC_MARKERS) for t in texts)
             or names.search(raw)
             or _DIRECTIVE.match(joined)
+            or first <= (1 if grammar in ("python", "ruby") else 0)
+            or (grammar in ("python", "ruby") and not _plain_prose(texts))
         ):
             continue
         found.append(
@@ -1105,6 +1165,10 @@ def _whole_statements(root: Node, data: bytes, starts: list[int], first: int, en
         finish -= 1
     node = root
     while True:
+        # Python wraps a bare call or assignment in an ``expression_statement``
+        # of the same span: that is the statement, not the node inside it.
+        if node.type == "expression_statement" and node.start_byte == begin and node.end_byte == finish:
+            break
         inner = next(
             (c for c in node.children if c.start_byte <= begin and c.end_byte >= finish),
             None,
@@ -1121,8 +1185,16 @@ def _whole_statements(root: Node, data: bytes, starts: list[int], first: int, en
     return covered if all(_is_statement(c) for c in covered) else None
 
 
+#: Ruby has no statement node: a statement is whatever sits directly in one
+#: of these, an assignment or a call among them.
+_RUBY_BODIES = frozenset({"program", "body_statement", "block_body", "then", "else", "do", "begin", "ensure"})
+_RUBY_STATEMENTS = frozenset({"assignment", "call", "method_call"})
+
+
 def _is_statement(node: Node) -> bool:
-    return any(word in node.type for word in ("statement", "declaration", "definition"))
+    if any(word in node.type for word in ("statement", "declaration", "definition")):
+        return True
+    return node.type in _RUBY_STATEMENTS and node.parent is not None and node.parent.type in _RUBY_BODIES
 
 
 def remove_leading(after: str, grammar: str, comments: list[LeadingComment]) -> str | None:

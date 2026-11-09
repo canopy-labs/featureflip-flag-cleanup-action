@@ -127,6 +127,19 @@ replace = "@treated"
 groups = ["replace_expression_with_boolean_literal"]
 holes = ["treated", "stale_flag_name"]
 
+# A `*args`, a `**kwargs` or a comment among the arguments decline the call:
+# the wildcard count that pins the slot cannot see how many arguments a splat
+# supplies. The same three filters as the key-constant forms
+# (`key_const.PYTHON_CONST_RULE_FILTERS`); a test compares them.
+[[rules.filters]]
+not_contains = ["""((list_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((dictionary_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
 # The same two decorator-gate filters as the template above, for the same
 # reason: an indexed accessor used as a decorator must never become `@True`.
 [[rules.filters]]

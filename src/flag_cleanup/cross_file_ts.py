@@ -91,7 +91,7 @@ from pathlib import Path
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import key_const, key_const_visibility, source_index, ts_syntax
+from flag_cleanup import key_const, key_const_visibility, rule_synthesis, source_index, ts_barrels, ts_syntax
 
 #: Callees whose FIRST argument the reader rules rewrite. `getBooleanValue`
 #: only when awaited: the bare call is a `Promise<boolean>`, exactly as in
@@ -770,7 +770,8 @@ def _resolve(
 
 
 def _stop_for(repo_dir: str) -> Path:
-    from flag_cleanup.piranha_runner import checkout_root
+    # Asked of git once per run (:func:`flag_cleanup.source_index.run_scope`).
+    from flag_cleanup.source_index import checkout_root
 
     return Path(checkout_root(repo_dir)).resolve()
 
@@ -1179,6 +1180,7 @@ def _import_bindings(
     declared: dict[tuple[str, str], xk.KeyDeclaration],
     modules: frozenset[str],
     enums: dict[tuple[str, str], dict[str, xk.KeyDeclaration]],
+    through=None,
 ) -> list[_Binding]:
     top = statement.parent is not None and statement.parent.type == "program"
     type_only = any(c.type == "type" for c in statement.children)
@@ -1219,6 +1221,8 @@ def _import_bindings(
                         if module is not None and imported.type == "identifier"
                         else None
                     )
+                    if decl is None and through is not None and imported.type == "identifier":
+                        decl = through(module, _text(imported))
                     enum_of = (
                         (module, _text(imported))
                         if decl is None and module is not None and (module, _text(imported)) in enums
@@ -1335,22 +1339,25 @@ def _within(node: Node, kinds: tuple[str, ...]) -> Node | None:
     return None
 
 
-def _is_read(argument: Node, accessors: frozenset[str]) -> bool:
-    """First argument of a call the reader rules rewrite.
+def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = True) -> bool:
+    """The key of a call the reader rules rewrite.
 
     Mirrors `key_const._ts_is_removable_read` and the seeds in `ts.toml`: no
     optional call, no optional member callee, and `getBooleanValue` only under
-    an `await`.
+    an `await`. The key is the first argument, or the argument at the index a
+    positioned accessor (``get[1]``) names; ``positioned=False`` for a key that
+    has no positioned reader rule (an enum entry's).
     """
     args = argument.parent
     if args is None or args.type != "arguments" or not args.named_children:
         return False
-    if args.named_children[0].id != argument.id:
+    index = next((i for i, c in enumerate(args.named_children) if c.id == argument.id), None)
+    if index is None or (index and not positioned):
         return False
     call = args.parent
     if call is None or call.type != "call_expression":
         return False
-    if any(c.type == "?." for c in call.children):
+    if ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
         return False
     function = call.child_by_field_name("function")
     if function is None:
@@ -1364,6 +1371,8 @@ def _is_read(argument: Node, accessors: frozenset[str]) -> bool:
     if function is None or function.type not in ("identifier", "property_identifier"):
         return False
     callee = _text(function)
+    if index:
+        return rule_synthesis.positions_of(accessors).get(callee) == index
     if callee not in _READ_CALLEES and callee not in accessors:
         return False
     if callee in _AWAITED_ONLY_CALLEES and callee not in accessors:
@@ -1530,6 +1539,194 @@ def _is_plain_member(node: Node) -> bool:
     )
 
 
+def package_outside(reader_path: str, specifier: str, repo_dir: str) -> bool:
+    """Whether bare ``specifier``, which resolves to no file, names a package
+    that cannot be a file of the checkout, so an ``export *`` from it supplies
+    none of this run's constants.
+
+    All of these must hold, and any doubt is a no:
+
+    * no ``tsconfig``/``jsconfig`` ``paths`` pattern or ``baseUrl`` can read it
+      as a file (:func:`names_package`);
+    * no ``package.json`` of the checkout (outside ``node_modules``) is named
+      for it: a workspace package IS in the checkout;
+    * no config of a bundler or test runner aliases it
+      (``ts_constant_params._aliased_package``);
+    * it is a Node built-in, or declared in a ``package.json`` above the reader
+      by a version (not ``file:``/``link:``/``portal:``/``workspace:``) or
+      installed in a ``node_modules`` above it as a real directory (a symlink
+      into the checkout is a workspace link).
+    """
+    import json
+
+    from flag_cleanup import ts_constant_params
+
+    if specifier.startswith("node:"):
+        return True
+    if not specifier or specifier.startswith((".", "/", "#")):
+        return False
+    if not names_package(reader_path, specifier, repo_dir):
+        return False
+    parts = specifier.split("/")
+    package = "/".join(parts[:2]) if specifier.startswith("@") else parts[0]
+    root = Path(source_index.checkout_root(repo_dir)).resolve()
+    try:
+        babel, manifests = _manifests(root)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    if babel:
+        return False  # a Babel module resolver can map any package anywhere
+    for data in manifests:
+        if not isinstance(data, dict) or data.get("name") == package:
+            return False
+        jest = data.get("jest")
+        if (isinstance(jest, dict) and "moduleNameMapper" in jest) or "babel" in data or _linked_override(data, package):
+            return False
+
+    class _Stub:
+        pass
+
+    stub = _Stub()
+    stub.repo_dir = repo_dir
+    if ts_constant_params._aliased_package(stub, specifier):
+        return False
+    directory = Path(reader_path).resolve().parent
+    installed = False
+    while True:
+        linked = directory / "node_modules" / package
+        if linked.exists():
+            resolved = linked.resolve()
+            if resolved.is_relative_to(root) and "node_modules" not in resolved.relative_to(root).parts:
+                return False  # a workspace link into the checkout
+            installed = True
+        manifest = directory / "package.json"
+        if manifest.is_file():
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                return False
+            if isinstance(data, dict):
+                for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                    wanted = data.get(field)
+                    if isinstance(wanted, dict) and package in wanted:
+                        if not isinstance(wanted[package], str) or wanted[package].startswith(
+                            ("file:", "link:", "portal:", "workspace:", ".", "/", "~/")
+                        ):
+                            return False
+                        installed = True
+        if directory == root or directory.parent == directory or not directory.is_relative_to(root):
+            return installed
+        directory = directory.parent
+
+
+_MANIFESTS: dict[Path, tuple[bool, list]] = {}
+
+
+def _manifests(root: Path) -> tuple[bool, list]:
+    """Whether a Babel config exists, and every ``package.json`` of the
+    checkout parsed. Every directory is walked but ``node_modules`` (and git's
+    own): ignored, generated and vendored ones included, since a manifest there
+    is still in the checkout. Cached per root for the run in progress
+    (:func:`flag_cleanup.source_index.run_scope`), or for the process when there
+    is none."""
+    import json
+
+    memo = source_index.run_memo("ts_manifests")
+    cache = memo if memo is not None else _MANIFESTS
+    if root in cache:
+        return cache[root]
+    babel = False
+    found: list = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in ("node_modules", ".git"))
+        for name in sorted(filenames):
+            if name.startswith((".babelrc", "babel.config")):
+                babel = True
+            elif name == "package.json":
+                found.append(json.loads((Path(directory) / name).read_text(encoding="utf-8")))
+    cache[root] = (babel, found)
+    return cache[root]
+
+
+def _linked_override(manifest: dict, package: str) -> bool:
+    """Whether ``overrides``, ``resolutions`` or ``pnpm.overrides`` point
+    ``package`` at a path or workspace (``link:``, ``file:``, ``portal:``,
+    ``workspace:``), anywhere in their (possibly nested) entries."""
+
+    def mentions(node, inside: bool) -> bool:
+        if isinstance(node, dict):
+            return any(
+                mentions(value, inside or key == package or key.startswith(f"{package}@") or key.endswith(f"/{package}"))
+                for key, value in node.items()
+            )
+        if isinstance(node, str):
+            return inside and node.startswith(("link:", "file:", "portal:", "workspace:", ".", "/"))
+        return False
+
+    pnpm = manifest.get("pnpm")
+    return any(
+        mentions(node, False)
+        for node in (
+            manifest.get("overrides"),
+            manifest.get("resolutions"),
+            pnpm.get("overrides") if isinstance(pnpm, dict) else None,
+        )
+    )
+
+
+def generated_target(from_file: str, specifier: str, repo_dir: str) -> bool:
+    """Whether the relative ``specifier`` names a file that is absent from the
+    checkout and gitignored as a TypeScript module: a generated file that has
+    not been generated.
+
+    Labelled so only when the ignored candidate is the ``.ts``/``.tsx`` file or
+    the ``index.ts``/``index.tsx`` of a directory of that name, or a directory
+    rule covers the directory the target would sit in. An ignore of ``*.js``
+    says nothing about a target that does not exist for another reason (a typo).
+    """
+    import subprocess
+
+    if not specifier.startswith((".", "..")):
+        return False
+    base = os.path.normpath(Path(from_file).parent / specifier)
+    try:
+        if _candidates(base):
+            return False
+    except _Unknown:
+        return False  # several files could answer it: not an absent one
+    stem = re.sub(r"\.(?:js|jsx|mjs|cjs)$", "", base)
+    variants = [
+        stem + ext for ext in (".ts", ".tsx")
+    ] + [f"{stem}/index{ext}" for ext in (".ts", ".tsx")]
+    if any(Path(v).exists() for v in [base, *variants]):
+        return False
+    root = Path(source_index.checkout_root(repo_dir)).resolve()
+    directory = os.path.dirname(base)
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--", *variants, directory],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return False
+    return done.returncode == 0 and bool(done.stdout.strip())
+
+
+def _aliases_of(repo_dir: str, names: frozenset[str]) -> set[str]:
+    """The other names ``names`` are re-exported under (see
+    :func:`flag_cleanup.cross_file_keys.with_aliases`), once per run."""
+    memo = source_index.run_memo("ts_aliases")
+    key = (repo_dir, names)
+    if memo is not None and key in memo:
+        return memo[key]
+    found = xk.with_aliases(repo_dir, "ts", set(names)) - names
+    if memo is not None:
+        memo[key] = found
+    return found
+
+
 def references(
     path: str,
     source: str,
@@ -1557,6 +1754,8 @@ def references(
     entry_members = {d.name for d in entries}
 
     names = {d.name for d in declarations}
+    # The names a barrel hands them on under are spelled, and judged, like theirs.
+    names |= _aliases_of(repo_dir, frozenset(names))
     if root.has_error:
         # A mention may sit in the part the parser could not read. Each
         # refusal is labelled by what it may be a mention of: the constants
@@ -1587,6 +1786,61 @@ def references(
         if specifier not in resolved:
             resolved[specifier] = _resolve(path, specifier, stop)
         return resolved[specifier]
+
+    def outside(from_file: str, specifier: str) -> bool:
+        return package_outside(from_file, specifier, repo_dir)
+
+    followed: dict[tuple[str, str], xk.KeyDeclaration | None] = {}
+
+    def through(module: str | None, name: str) -> xk.KeyDeclaration | None:
+        """The declaration ``name`` is when ``module`` is a barrel re-exporting it
+        (under the same name or a renamed one)."""
+        if module is None or module in modules:
+            return None
+        if (module, name) not in followed:
+            end = ts_barrels.provider_of(module, name, lambda f, s: _resolve(f, s, stop), outside)
+            followed[(module, name)] = declared.get(end) if isinstance(end, tuple) else None
+        return followed[(module, name)]
+
+    def generated(module: str | None, name: str) -> tuple[str, str] | None:
+        """The ``(barrel, specifier)`` of a generated, absent hop on the way to ``name``."""
+        if module is None or module in modules:
+            return None
+        return ts_barrels.generated_hop(
+            module, name, lambda f, s: _resolve(f, s, stop), lambda f, s: generated_target(f, s, repo_dir)
+        )
+
+    def generated_barrel(binding: _Binding, imported_name: str) -> bool:
+        """Whether the import of ``imported_name`` goes through a barrel whose
+        file, or a file it re-exports from, is gitignored and absent."""
+        if binding.module is not None:
+            return generated(binding.module, imported_name) is not None
+        statement = _within(binding.node, ("import_statement",))
+        spec = _string_value(statement.child_by_field_name("source")) if statement is not None else None
+        return spec is not None and generated_target(path, spec, repo_dir)
+
+    inside_repo = xk.within(Path(path).resolve(), Path(repo_dir).resolve())
+
+    def removable_reexport(node: Node, export: Node) -> bool:
+        """Whether ``node`` is the name of a plain ``export { NAME } from`` that
+        the run removes with the constant it re-exports (see
+        :mod:`flag_cleanup.ts_barrels`, which finds it again to remove it)."""
+        allowed = ts_barrels.editable.get()
+        if not inside_repo or node.parent is None or allowed is None:
+            return False
+        if str(Path(path).resolve()) not in allowed:
+            return False
+        specifier = node.parent
+        if node not in (specifier.child_by_field_name("name"), specifier.child_by_field_name("alias")):
+            return False
+        resolver = lambda f, s: _resolve(f, s, stop)  # noqa: E731
+        hop = ts_barrels.removable(specifier, path, resolver, set(declared), outside)
+        if hop is None:
+            return False
+        recorded = ts_barrels.judged.get()
+        if recorded is not None:
+            recorded.add((str(Path(path).resolve()), hop.name, hop.source, hop.module))
+        return True
 
     # Every binding OCCURRENCE in the file, by node. `binding_nodes` reads the
     # grammar's binding fields; an import names its locals without one, and an
@@ -1640,7 +1894,7 @@ def references(
     bindings: list[_Binding] = []
     for node in _walk(root):
         if node.type == "import_statement":
-            bindings.extend(_import_bindings(node, resolve, declared, modules, enums))
+            bindings.extend(_import_bindings(node, resolve, declared, modules, enums, through))
         elif node.type == "import_alias":
             name = next((c for c in node.named_children if c.type == "identifier"), None)
             if name is not None:
@@ -1671,13 +1925,24 @@ def references(
             return candidates[0]
         return None
 
+    generated_locals = {
+        b.local
+        for b in bindings
+        if b.declaration is None
+        and b.namespace_of is None
+        and b.enum_of is None
+        and _imported_name(b.node) in names
+        and _within(b.node, ("import_statement",)) is not None
+        and generated_barrel(b, _imported_name(b.node))
+    }
+
     def unproven_reason(local: str) -> str:
         candidates = ours.get(local, [])
         if candidates and (count.get(local, 0) > 1 or any(c.require_rebound for c in candidates)):
             return xk.REBOUND
         if candidates and all(c.type_only for c in candidates):
             return xk.NOT_A_READ
-        return xk.IMPORT_UNRESOLVED
+        return xk.GENERATED_BARREL if local in generated_locals else xk.IMPORT_UNRESOLVED
 
     by_binding_node = {b.node.id: b for b in bindings}
     own_exports: dict[tuple[str, str], bool] = {}
@@ -1781,7 +2046,7 @@ def references(
                 elif (
                     _is_plain_member(node.parent)
                     and _is_plain_member(qualifier)
-                    and _is_read(node.parent, accessors)
+                    and _is_read(node.parent, accessors, positioned=False)
                 ):
                     owner = f"{_text(inner)}.{_text(owner_prop)}"
                     reads.append(xk.KeyReference(path, owner, member, "", decl))
@@ -1814,7 +2079,7 @@ def references(
                 refuse(node, xk.UNSUPPORTED_FORM, decl.entry)
             elif not plain:
                 refuse(node, xk.UNSUPPORTED_FORM, decl.entry)
-            elif foldable and _is_read(node.parent, accessors):
+            elif foldable and _is_read(node.parent, accessors, positioned=False):
                 reads.append(xk.KeyReference(path, local, member, "", decl))
             else:
                 refuse(node, xk.NOT_A_READ, decl.entry)
@@ -2208,6 +2473,8 @@ def references(
             continue
         export = _within(node, ("export_statement",))
         if export is not None and export.child_by_field_name("source") is not None:
+            if removable_reexport(node, export):
+                continue  # a barrel's line for the constant: removed with it
             refuse(node, xk.IMPORT_UNRESOLVED)  # a re-export through a barrel
             continue
         bound = proof(text)
@@ -2243,7 +2510,7 @@ def references(
                 and _within(binding.node, ("import_statement",))
                 and not foreign_own(binding)
             ):
-                refuse(binding.node, xk.IMPORT_UNRESOLVED)
+                refuse(binding.node, xk.GENERATED_BARREL if binding.local in generated_locals else xk.IMPORT_UNRESOLVED)
             continue
         if binding.unsupported:
             refuse(binding.node, xk.UNSUPPORTED_FORM)
@@ -3540,7 +3807,7 @@ def constant_module_escapes(path: str, repo_dir: str) -> list[xk.Refusal]:
 
     return [
         xk.Refusal(where, line, xk.UNSUPPORTED_FORM, text)
-        for where, line, text in wrapper_ts.handed_on(repo_dir, path)
+        for where, line, text in wrapper_ts.handed_on(repo_dir, path, named=True)
     ]
 
 
@@ -3562,6 +3829,7 @@ _PROFILE = xk.Profile(
     enum_unparsed_match=component_match,
     enum_unparsed_escapes=component_escapes,
     module_escapes=constant_module_escapes,
+    reexport_aliases=ts_barrels.alias_names,
 )
 for _language_name in ("ts", "tsx", "js"):
     xk.register(_language_name, _PROFILE)

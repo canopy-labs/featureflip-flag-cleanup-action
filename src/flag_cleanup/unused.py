@@ -428,6 +428,12 @@ class Candidate:
     #: (:func:`flag_cleanup.inert_load.declared`), so the pull request can say
     #: the deletion rests on their word. ``None`` otherwise.
     declared: str | None = None
+    #: The other names of the destructuring pattern a name candidate sits in,
+    #: when its value is not a ``require``: the name may only go once every
+    #: one of these is unread too, so the pattern is emptied down to the
+    #: one-name declaration the pass discards whole (see
+    #: ``_require_pattern_candidates``). Empty for every other candidate.
+    siblings: tuple[str, ...] = ()
 
 
 def _candidate(
@@ -2124,7 +2130,7 @@ def _variable_candidates_of(source: str, language: str) -> tuple[Candidate, ...]
             pair = _ruby_declared_name_and_value(node)
         else:
             if language in _TS_MODULE_LANGUAGES:
-                candidates += _require_pattern_candidates(node, source_bytes)
+                candidates += _require_pattern_candidates(node, source_bytes, source, language)
             pair = _declared_name_and_value(node, name_field, value_field)
             if pair is not None:
                 name_node, value_node = pair
@@ -2950,23 +2956,36 @@ def _is_require(node: Node | None) -> bool:
     )
 
 
-def _require_pattern_candidates(node: Node, source_bytes: bytes) -> list[Candidate]:
-    """One candidate per name of ``const { a, b } = require("./m")``.
+def _require_pattern_candidates(
+    node: Node, source_bytes: bytes, source: str, language: str
+) -> list[Candidate]:
+    """One candidate per name of ``const { a, b } = value``.
 
-    That declaration is an import in all but spelling, so it loses one name
-    the way ``import { a, b }`` does: the shorthand name alone, with its comma
-    (``_sits_in_comma_separated_list``), and the declaration stays for the
-    others. The candidate's span is the name, its initializer ``None``, so
-    ``_apply`` can only delete it and the ``require`` still runs. Once one
-    name is left the pattern binds one name, and the whole-declaration
-    candidate takes over (``require("./m");``).
+    For ``require("./m")`` that declaration is an import in all but spelling,
+    so it loses one name the way ``import { a, b }`` does: the shorthand name
+    alone, with its comma (``_sits_in_comma_separated_list``), and the
+    declaration stays for the others. The candidate's span is the name, its
+    initializer ``None``, so ``_apply`` can only delete it and the ``require``
+    still runs. Once one name is left the pattern binds one name, and the
+    whole-declaration candidate takes over (``require("./m");``).
+
+    For any other value the names are offered ALL OR NOTHING, and only when
+    the whole declaration will then go: each name is tied to its siblings
+    (``Candidate.siblings``) and goes only once every one of them is unread,
+    and the names are offered at all only when the one-name declaration they
+    leave is one the pass removes (an inert value) or discards to a bare
+    statement (``_is_statement_expression``). A value that is neither
+    (``load() as any``, ``x!``, ``x ?? {}``, ``load() satisfies T``, ``x?.y``,
+    a ternary, an object literal) would leave the pattern half-emptied, so no
+    name is offered; neither is a pattern with a comment inside it, which is
+    not the one-name declaration the later rounds look for.
 
     Declined unless the pattern holds nothing but shorthand names. A rest
     element would receive the dropped property, a default (``{ a = f() }``)
-    is code, and a renamed ``{ a: b }`` is not one token. And only for
-    ``require``: dropping a name from any other object skips a property read,
-    which a getter can make do work. A module's exports are read the same way
-    an import binding is.
+    is code, and a renamed ``{ a: b }`` is not one token. Dropping a name from
+    a non-``require`` object skips a property read, which a getter can make do
+    work; that is the trade the one-name pattern already makes when the call
+    stays. A module's exports are read the same way an import binding is.
     """
     declarators = [c for c in node.named_children if c.type == "variable_declarator"]
     if len(declarators) != 1:
@@ -2974,14 +2993,23 @@ def _require_pattern_candidates(node: Node, source_bytes: bytes) -> list[Candida
     pattern = declarators[0].child_by_field_name("name")
     if pattern is None or pattern.type != "object_pattern":
         return []
-    if not _is_require(declarators[0].child_by_field_name("value")):
+    value = declarators[0].child_by_field_name("value")
+    if value is None:
+        return []
+    if any(c.type == "comment" for c in pattern.named_children) and not _is_require(value):
         return []
     names = [c for c in pattern.named_children if c.type != "comment"]
     if len(names) < 2 or any(c.type != _PATTERN_NAME for c in names):
         return []
+    texts = [
+        source_bytes[name.start_byte:name.end_byte].decode("utf-8", "replace")
+        for name in names
+    ]
+    siblings = not _is_require(value)
+    if siblings and not _one_name_form_goes(node, value, names[0], source_bytes, source, language):
+        return []
     found = []
-    for name in names:
-        text = source_bytes[name.start_byte:name.end_byte].decode("utf-8", "replace")
+    for name, text in zip(names, texts):
         if not text.isidentifier():
             continue
         found.append(
@@ -2992,9 +3020,30 @@ def _require_pattern_candidates(node: Node, source_bytes: bytes) -> list[Candida
                 kind="variable",
                 text=text,
                 binder=(name.start_byte, name.end_byte),
+                siblings=tuple(t for t in texts if t != text) if siblings else (),
             )
         )
     return found
+
+
+def _one_name_form_goes(
+    declaration: Node, value: Node, name: Node, source_bytes: bytes, source: str, language: str
+) -> bool:
+    """Whether ``declaration`` with its pattern cut to one name would be
+    removed whole or discarded to a bare statement: the candidate the one-name
+    pattern becomes, asked the two questions ``_apply`` asks of it."""
+    stand_in = Candidate(
+        name=source_bytes[name.start_byte:name.end_byte].decode("utf-8", "replace"),
+        start=declaration.start_byte,
+        end=declaration.end_byte,
+        kind="variable",
+        text="",
+        initializer=(value.start_byte, value.end_byte),
+        binder=(name.start_byte, name.end_byte),
+    )
+    return is_inert(stand_in, source, language) or _is_statement_expression(
+        source, stand_in, language
+    )
 
 
 #: How each language spells "evaluate this and throw the value away".
@@ -5041,6 +5090,33 @@ def _php_member_spellings(source: str, name: str) -> int:
     return total
 
 
+def unread_locals(before: str, after: str, language: str) -> list[Candidate]:
+    """The locals the fold left declared and never read, which the pass kept.
+
+    A local qualifies on the same evidence as :func:`remove_stranded_bindings`
+    (read in ``before``, nowhere in ``after``, scope matched unambiguously)
+    and is run AFTER it, so what is returned is what it declined: a local whose
+    initializer may do work (``val ctx = a?.let { Ctx.builder().build() } ?: …``).
+    Nothing is written. Kotlin only: its compiler no longer warns, so the
+    local would otherwise go unmentioned.
+    """
+    if language != "kt":
+        return []
+    found: list[Candidate] = []
+    for candidate in _variable_candidates(after, language):
+        if not _bound_name_occurs_once_in_own_span(candidate, after, language):
+            continue
+        scopes = _matching_scope(before, after, candidate, language)
+        if scopes is None:
+            continue
+        before_span, current_span = scopes
+        if _references_in_scope(before, candidate.name, language, *before_span) and not _references_in_scope(
+            after, candidate.name, language, *current_span
+        ):
+            found.append(candidate)
+    return sorted(found, key=lambda c: c.start)
+
+
 def remove_stranded_bindings(
     before: str,
     after: str,
@@ -5200,6 +5276,11 @@ def remove_stranded_bindings(
             if before_count == 0:
                 continue
             if current_count != 0:
+                continue
+            if candidate.siblings and any(
+                _references_in_scope(current, sibling, language, *current_span)
+                for sibling in candidate.siblings
+            ):
                 continue
             if candidate.loads is not None and inert is not None:
                 if inert(candidate.loads) or covered(

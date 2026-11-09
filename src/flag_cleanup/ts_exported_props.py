@@ -377,6 +377,9 @@ def _users(
     exempt=None,
     commented: list[str] | None = None,
     homonyms: list[str] | None = None,
+    use_in: Callable[[_File, Node], bool] | None = None,
+    factories: bool = False,
+    loadable: Callable[[str, str], bool] | None = None,
 ) -> list[_File] | None:
     """Every file spelling ``component`` (the declaring one first), each
     proven to spell it only as allowed, or None. ``use`` says which other
@@ -388,7 +391,16 @@ def _users(
     other than the declaring one that spells ``component`` only inside
     comments is no use of it: its path is appended there instead, for the
     caller to report. With ``homonyms``, likewise a file whose spellings all
-    name a same-named component that is not this one (:func:`homonym`)."""
+    name a same-named component that is not this one (:func:`homonym`).
+    ``use_in(file, node)`` is a second ``use`` that also sees the file; a
+    file whose only spellings it accepts are property keys needs no import
+    of the name. ``factories`` lets a module's own original be spread into a
+    test runner's mock factory, and a type query name it
+    (:func:`_classify`). ``loadable(reader, specifier)``, with
+    ``factories``, says whether a specifier resolving to no file names
+    something its reader can load; a plausible one that is not may name the
+    declaring file to whatever runs the test (a root-relative path, a bundler
+    alias), so a file importing through it refuses."""
     word = re.compile(rf"(?<![\w$]){re.escape(component)}(?![\w$])")
     decl_resolved = str(Path(decl.path).resolve())
     users = [decl]
@@ -434,7 +446,7 @@ def _users(
             users.append(file)
             continue
         if not _accounted(
-            component, file, file is decl, allowed, decl_resolved, repo_dir, use, solution
+            component, file, file is decl, allowed, decl_resolved, repo_dir, use, solution, use_in
         ):
             return None
         if file is not decl:
@@ -451,7 +463,7 @@ def _users(
         if word.search(text):
             return None
         markup.append((str(listed.path), text))
-    if _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution):
+    if _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution, factories, loadable):
         return None
     return users
 
@@ -634,7 +646,9 @@ _GLOB = re.compile(r"\bimport\.meta\.glob(?:Eager)?\b|\brequire\.context\b")
 _MOCKS = frozenset({"mock", "doMock", "unmock", "doUnmock"})
 
 
-def _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution) -> bool:
+def _reached_unspelled(
+    decl_resolved, sources, markup, repo_dir, solution, factories=False, loadable=None
+) -> bool:
     """Whether a module can reach the declaring file's exports without
     spelling the name the caller proof follows.
 
@@ -672,6 +686,10 @@ def _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution) -> bo
         if _LOAD.search(text) and _computed_load(path, text) and packages.may_load(path, decl_resolved):
             return True
         specifiers = [m.group(2) for m in _SPECIFIER.finditer(text)]
+        if loadable is not None and _unproven(
+            path, text, [m.group(2) for m in _ARGUMENT.finditer(text)], loadable, repo_dir, solution, cache
+        ):
+            return True
         if specifiers:
             found.append((str(Path(path).resolve()), path, text, specifiers))
     while True:
@@ -680,7 +698,7 @@ def _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution) -> bo
             hits = sum(1 for spec in specifiers if reaches(path, spec))
             if not hits:
                 continue
-            verdict = _classify(path, text, lambda spec, p=path: reaches(p, spec))
+            verdict = _classify(path, text, lambda spec, p=path: reaches(p, spec), factories)
             if verdict is None or verdict[0] != hits:
                 # A reaching specifier the parse did not account for.
                 return True
@@ -693,6 +711,227 @@ def _reached_unspelled(decl_resolved, sources, markup, repo_dir, solution) -> bo
         if any(reaches(path, m.group(2)) for m in _SPECIFIER.finditer(text)):
             return True
     return False
+
+
+#: A string that follows ``(`` or ``,`` (an argument of any call, in any
+#: position) or ``from``/``import``: every place a specifier can be written,
+#: whatever the call or statement. A superset, narrowed by :func:`_loads`.
+_ARGUMENT = re.compile(r"""(?:[(,]|\bfrom|\bimport)\s*(['"`])([@#~/\w.][\w@#~/.:+-]*)\1""")
+
+
+def _unproven(path, text, specifiers, loadable, repo_dir, solution, cache) -> bool:
+    """With ``factories``: whether ``path`` loads a module through a specifier
+    that is not relative, names nothing ``loadable`` accepts (a package, a Node
+    built-in) and resolves to no file. Whatever resolves it (a bundler alias, a
+    ``package.json`` ``imports`` entry, a ``moduleNameMapper`` key) is a tool
+    this proof cannot read, so it cannot show the specifier is not the
+    declaring file. Decided without the name filter of :func:`_plausible`:
+    only a specifier that is a real load (``import``, ``export … from``,
+    ``import()``, ``require()``, a runner's ``mock``) counts."""
+    for specifier in dict.fromkeys(specifiers):
+        if specifier.startswith("."):
+            continue
+        key = ("unproven", os.path.dirname(path), specifier)
+        if key not in cache:
+            # Once per directory and specifier, whatever the file.
+            if loadable(path, specifier):
+                cache[key] = "loadable"
+            else:
+                target = cross_file_ts.resolve_specifier(path, specifier, repo_dir, solution=solution)
+                cache[key] = str(Path(target).resolve()) if target is not None else None
+        if cache[key] is None and _may_load(text, specifier) and _loads(path, text, specifier):
+            return True
+    return False
+
+
+#: Calls whose string arguments are titles, not specifiers.
+_TITLE_CALLS = frozenset({"it", "test", "describe", "bench", "suite"})
+
+#: Nodes that only a type can sit in: a load there is erased.
+_TYPE_ONLY = frozenset(
+    {
+        "type_annotation",
+        "type_alias_declaration",
+        "type_query",
+        "type_arguments",
+        "interface_declaration",
+        "extends_type_clause",
+        "type_parameters",
+        "ambient_declaration",
+    }
+)
+
+
+def _may_load(text: str, specifier: str) -> bool:
+    """Whether ``text`` could load ``specifier``: it is spelled as a string, and
+    not only as the title of a test (``it('works', …)``). A cheap test so a
+    plain title is never parsed for."""
+    quoted = r"""['"`]""" + re.escape(specifier) + r"""['"`]"""
+    titles = r"""\b(?:it|test|describe|bench|suite)(?:\.\w+)*\s*\(\s*"""
+    spelled = len(re.findall(quoted, text))
+    return spelled > len(re.findall(titles + quoted, text))
+
+
+def _loads(path: str, text: str, specifier: str) -> bool:
+    """Whether ``text`` spells ``specifier`` where something may load it.
+
+    Every string or template string that sits in an ``import_statement``,
+    ``export_statement`` or ``import_require_clause`` (before any other
+    statement or declaration), or is an argument of any call, is a candidate, so no load form has to be listed. An argument of a call counts when the call is named for
+    loading or mocking a module (:func:`_loader_call`) or the string reads as a
+    path or an aliased name (:func:`_path_shaped`): a bare word handed to an
+    ordinary call (``toBe('admin')``) is data. Exempt: a type-only
+    statement (``import type``, ``export type``, an import whose every
+    specifier is ``type``), a load inside a type position or ``typeof``, and
+    the title of an ``it``/``test``/``describe``/``bench``/``suite`` call."""
+    root = _parse(text, ts_scope.grammar(path))
+    for node in _walk(root):
+        if node.type not in ("string", "template_string") or _specifier(node) != specifier:
+            continue
+        if _candidate(node):
+            return True
+    return False
+
+
+def _candidate(node: Node) -> bool:
+    """Whether the string ``node`` may be a specifier, per :func:`_loads`."""
+    parent = node.parent
+    call = parent.parent if parent is not None and parent.type == "arguments" else None
+    ancestor = node.parent
+    statement = None
+    while ancestor is not None:
+        if ancestor.type in _TYPE_ONLY:
+            return False
+        if statement is None and ancestor.type in ("import_statement", "export_statement", "import_require_clause"):
+            statement = ancestor
+        elif statement is None and (
+            ancestor.type.endswith(("_statement", "_declaration")) or ancestor.type == "program"
+        ):
+            statement = False
+        ancestor = ancestor.parent
+    if call is not None and call.type == "call_expression":
+        # Before the statement: `export default { alias: f('x') }` is a call's argument.
+        specifier = _specifier(node) or ""
+        return (
+            not _title_call(call)
+            and not _path_arithmetic(call)
+            and (_loader_call(call) or _path_shaped(specifier))
+        )
+    if statement and node.parent is not None and node.parent.type in (
+        "import_statement",
+        "export_statement",
+        "import_require_clause",
+    ):
+        holder = statement.parent if statement.type == "import_require_clause" else statement
+        return not _type_only_statement(holder)
+    return False
+
+
+#: The modules whose functions build paths, not load modules.
+_PATH_MODULES = frozenset({"path", "node:path", "path/posix", "node:path/posix"})
+
+
+def _path_arithmetic(call: Node) -> bool:
+    """Whether ``call`` builds a file path: a call anchored on ``__dirname``,
+    ``__filename``, ``process.cwd()`` or ``import.meta`` (``resolve(__dirname,
+    'src')``), or a call through the ``path`` module (``path.resolve(root,
+    'src')``), however it is imported. A bundler config's ``alias`` is the
+    usual place; its strings are directories, not specifiers."""
+    arguments = call.child_by_field_name("arguments")
+    for node in _walk(arguments) if arguments is not None else ():
+        if node.type == "identifier" and node.text in (b"__dirname", b"__filename"):
+            return True
+        if node.type == "meta_property" or (node.type == "member_expression" and node.text == b"process.cwd"):
+            return True
+    callee = call.child_by_field_name("function")
+    if callee is None:
+        return False
+    name = callee.child_by_field_name("object") if callee.type == "member_expression" else callee
+    if name is None or name.type != "identifier":
+        return False
+    root = call
+    while root.parent is not None:
+        root = root.parent
+    return name.text.decode("utf-8") in _path_bindings(root)
+
+
+def _path_bindings(root: Node) -> set[str]:
+    """The local names bound to the ``path`` module or to one of its functions."""
+    names: set[str] = set()
+    for node in _walk(root):
+        if node.type == "import_statement":
+            if _specifier(node.child_by_field_name("source")) in _PATH_MODULES:
+                for leaf in _walk(node):
+                    if leaf.type == "import_specifier":
+                        local = leaf.child_by_field_name("alias") or leaf.child_by_field_name("name")
+                        if local is not None:
+                            names.add(local.text.decode("utf-8"))
+                    elif leaf.type == "identifier" and leaf.parent is not None and leaf.parent.type in (
+                        "import_clause",
+                        "namespace_import",
+                    ):
+                        names.add(leaf.text.decode("utf-8"))
+        elif node.type == "variable_declarator":
+            value = node.child_by_field_name("value")
+            target = node.child_by_field_name("name")
+            if value is not None and value.type == "call_expression" and target is not None:
+                callee = value.child_by_field_name("function")
+                arguments = value.child_by_field_name("arguments")
+                passed = [c for c in arguments.named_children if c.type != "comment"] if arguments is not None else []
+                if (
+                    callee is not None
+                    and callee.text == b"require"
+                    and len(passed) == 1
+                    and _specifier(passed[0]) in _PATH_MODULES
+                ):
+                    names.update(leaf.text.decode("utf-8") for leaf in _walk(target) if leaf.type in ("identifier", "shorthand_property_identifier_pattern"))
+    return names
+
+
+#: A callee named for loading or mocking a module.
+_LOADER_NAME = re.compile(r"(?i)mock|require|import|resolve|load|actual")
+
+
+def _loader_call(call: Node) -> bool:
+    """Whether ``call`` is ``require(…)``, ``import(…)``, or a call named for
+    loading, resolving or mocking a module (``vi.mock``, ``jest.requireActual``,
+    ``loadModule``)."""
+    callee = call.child_by_field_name("function")
+    if callee is None:
+        return False
+    if callee.type == "import":
+        return True
+    name = callee.child_by_field_name("property") if callee.type == "member_expression" else callee
+    return name is not None and _LOADER_NAME.search(name.text.decode("utf-8")) is not None
+
+
+def _path_shaped(specifier: str) -> bool:
+    """A string that reads as a path or a scoped or aliased name (``a/b``,
+    ``@x``, ``#x``, ``~x``), which a call may well load."""
+    return "/" in specifier or specifier.startswith(("@", "#", "~", "."))
+
+
+def _type_only_statement(statement: Node) -> bool:
+    """``import type …``, ``export type …``, or an import whose every
+    specifier is ``type``."""
+    if any(c.type == "type" for c in statement.children):
+        return True
+    if statement.type != "import_statement":
+        return False
+    clause = next((c for c in statement.named_children if c.type == "import_clause"), None)
+    if clause is None or any(c.type != "named_imports" for c in clause.named_children):
+        return False
+    specifiers = [c for c in clause.named_children[0].named_children if c.type == "import_specifier"]
+    return bool(specifiers) and all(any(c.type == "type" for c in sp.children) for sp in specifiers)
+
+
+def _title_call(call: Node) -> bool:
+    """Whether ``call`` is ``it(…)``, ``test.only(…)``, ``describe.each(…)(…)``
+    and the like."""
+    callee = call.child_by_field_name("function")
+    while callee is not None and callee.type in ("call_expression", "member_expression"):
+        callee = callee.child_by_field_name("function" if callee.type == "call_expression" else "object")
+    return callee is not None and callee.type == "identifier" and callee.text.decode("utf-8") in _TITLE_CALLS
 
 
 #: What a specifier may end in beyond the module's own name.
@@ -753,10 +992,18 @@ def _exact_aliases(repo_dir: str) -> frozenset[str] | None:
 _SKIPPED_DIRECTORIES = frozenset({"node_modules", ".git", "dist", "build", "coverage", ".next"})
 
 
-def _classify(path: str, text: str, reaches) -> tuple[int, bool] | None:
+def _classify(path: str, text: str, reaches, factories: bool = False) -> tuple[int, bool] | None:
     """For the statements and calls of ``path`` whose specifier ``reaches``:
     how many there are and whether one is a plain ``export *`` (the file is
-    a barrel), or None when one can reach an export unspelled."""
+    a barrel), or None when one can reach an export unspelled.
+
+    With ``factories``, three more shapes are accounted for: ``typeof
+    import(…)`` in a type, which loads nothing; the module's own original
+    spread into the object a mock factory of the same module returns
+    (:func:`spread_original`), which hands out only the real exports, under
+    their own names, to whoever imports them by name; ``import * as m``
+    read only by name (:func:`_named_members_only`); and ``const { a } =
+    await import(…)`` (:func:`_destructured_load`)."""
     root = _parse(text, ts_scope.grammar(path))
     count, barrel = 0, False
     for node in _walk(root):
@@ -770,6 +1017,8 @@ def _classify(path: str, text: str, reaches) -> tuple[int, bool] | None:
             if any(c.type == "import_require_clause" for c in node.named_children):
                 return None
             if clause is not None and any(c.type != "named_imports" for c in clause.named_children):
+                if factories and _named_members_only(clause, root):
+                    continue
                 # A default import or `* as m`.
                 return None
         elif node.type == "export_statement" and node.child_by_field_name("source") is not None:
@@ -791,11 +1040,246 @@ def _classify(path: str, text: str, reaches) -> tuple[int, bool] | None:
             if spec is None or not reaches(spec):
                 continue
             count += 1
+            if factories and (_in_type_query(node) or spread_original(node) or _destructured_load(node)):
+                continue
             if not (callee.type == "member_expression" and _member_name(callee) in _MOCKS):
                 # `import()`, `require()`, `requireActual()`, `importActual()`
                 # or anything else handed the module: it can index it.
                 return None
     return count, barrel
+
+
+#: The calls a mock factory loads a module's own original through.
+_ORIGINALS = frozenset({"importActual", "requireActual"})
+
+#: The calls that install a factory for a module.
+_FACTORY_MOCKS = frozenset({"mock", "doMock"})
+
+_FACTORY_FUNCTIONS = frozenset({"arrow_function", "function_expression", "function"})
+
+
+def _in_type_query(node: Node) -> bool:
+    """Whether ``node`` sits in a ``typeof …`` type, which loads nothing."""
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "type_query":
+            return True
+        if parent.type in ("statement_block", "program"):
+            return False
+        parent = parent.parent
+    return False
+
+
+def _outward(node: Node) -> Node:
+    """``node`` with the parentheses around it."""
+    while node.parent is not None and node.parent.type == "parenthesized_expression":
+        node = node.parent
+    return node
+
+
+def factory_of(obj: Node) -> tuple[Node, Node] | None:
+    """``(factory, mock call)`` when ``obj`` is the object literal a test
+    runner's mock factory returns: an inline function handed to
+    ``….mock(spec, …)`` or ``….doMock(spec, …)`` as its second argument,
+    returning ``obj`` as its expression body or as its last statement."""
+    node = _outward(obj)
+    holder = node.parent
+    if holder is None:
+        return None
+    if holder.type == "return_statement":
+        block = holder.parent
+        if block is None or block.type != "statement_block":
+            return None
+        statements = [c for c in block.named_children if c.type != "comment"]
+        if not statements or statements[-1] != holder:
+            return None
+        function = block.parent
+        if function is None or function.child_by_field_name("body") != block:
+            return None
+    elif holder.type in _FACTORY_FUNCTIONS and holder.child_by_field_name("body") == node:
+        function = holder
+    else:
+        return None
+    if function.type not in _FACTORY_FUNCTIONS:
+        return None
+    arguments = function.parent
+    call = arguments.parent if arguments is not None and arguments.type == "arguments" else None
+    if call is None or call.type != "call_expression":
+        return None
+    callee = call.child_by_field_name("function")
+    passed = [c for c in arguments.named_children if c.type != "comment"]
+    if (
+        callee is None
+        or callee.type != "member_expression"
+        or _member_name(callee) not in _FACTORY_MOCKS
+        or len(passed) != 2
+        or passed[1] != function
+    ):
+        return None
+    return function, call
+
+
+def original_call(call: Node) -> str | None:
+    """The specifier of ``vi.importActual(spec)`` or ``jest.requireActual(spec)``."""
+    callee = call.child_by_field_name("function")
+    arguments = call.child_by_field_name("arguments")
+    if callee is None or callee.type != "member_expression" or arguments is None:
+        return None
+    target = callee.child_by_field_name("object")
+    if target is None or target.type != "identifier" or target.text not in (b"vi", b"jest"):
+        return None
+    if _member_name(callee) not in _ORIGINALS:
+        return None
+    passed = [c for c in arguments.named_children if c.type != "comment"]
+    return _specifier(passed[0]) if len(passed) == 1 else None
+
+
+def spread_original(call: Node) -> bool:
+    """Whether ``call`` loads a module's own original only to spread it into
+    the object its mock factory returns: ``...(await vi.importActual(spec))``
+    or ``...jest.requireActual(spec)``, or a ``const`` the factory binds to
+    one and reads only in that spread, where the mock names the same
+    ``spec``. The spread hands each real export out under its own name."""
+    spec = original_call(call)
+    if spec is None:
+        return False
+    node = _outward(call)
+    if node.parent is not None and node.parent.type == "await_expression":
+        node = _outward(node.parent)
+    holder = node.parent
+    if holder is None:
+        return False
+    if holder.type == "spread_element":
+        spread = holder
+    elif holder.type == "variable_declarator" and holder.child_by_field_name("value") == node:
+        spread = _sole_spread(holder)
+        if spread is None:
+            return False
+    else:
+        return False
+    obj = spread.parent
+    found = factory_of(obj) if obj is not None and obj.type == "object" else None
+    if found is None:
+        return False
+    if holder.type == "variable_declarator" and not _declared_in(holder, found[0]):
+        return False
+    arguments = found[1].child_by_field_name("arguments")
+    first = [c for c in arguments.named_children if c.type != "comment"][0]
+    return _specifier(first) == spec
+
+
+def _declared_in(declarator: Node, function: Node) -> bool:
+    """Whether ``declarator`` is a ``const`` statement of ``function``'s body."""
+    statement = declarator.parent
+    return (
+        statement is not None
+        and statement.type == "lexical_declaration"
+        and statement.text.startswith(b"const")
+        and statement.parent is not None
+        and statement.parent == function.child_by_field_name("body")
+    )
+
+
+def _sole_spread(declarator: Node) -> Node | None:
+    """The one spread reading the name ``declarator`` binds, when nothing
+    else in the enclosing function names it."""
+    name = declarator.child_by_field_name("name")
+    if name is None or name.type != "identifier":
+        return None
+    function = declarator.parent
+    while function is not None and function.type not in _FACTORY_FUNCTIONS:
+        function = function.parent
+    if function is None:
+        return None
+    reads = [
+        n
+        for n in _walk(function)
+        if n.type in ("identifier", "shorthand_property_identifier") and n.text == name.text and n != name
+    ]
+    if len(reads) != 1 or reads[0].type != "identifier":
+        return None
+    spread = _outward(reads[0]).parent
+    return spread if spread is not None and spread.type == "spread_element" else None
+
+
+def _named_members_only(clause: Node, root: Node) -> bool:
+    """Whether the import ``clause`` is ``* as m`` alone and the file reads
+    ``m`` only as ``m.name``, as ``spyOn(m, 'name')``, or in a type: each
+    names the export it reads, which the name scan then sees."""
+    children = [c for c in clause.named_children if c.type != "comment"]
+    if len(children) != 1 or children[0].type != "namespace_import":
+        return False
+    names = [c for c in children[0].named_children if c.type == "identifier"]
+    if len(names) != 1:
+        return False
+    local = names[0]
+    for node in _walk(root):
+        if node == local or node.text != local.text:
+            continue
+        if node.type in ("shorthand_property_identifier", "shorthand_property_identifier_pattern"):
+            return False
+        if node.type != "identifier":
+            continue
+        if _in_type_query(node):
+            continue
+        holder = node.parent
+        if (
+            holder is not None
+            and holder.type == "member_expression"
+            and holder.child_by_field_name("object") == node
+            and (member := holder.child_by_field_name("property")) is not None
+            and member.type == "property_identifier"
+        ):
+            continue
+        if holder is not None and holder.type == "arguments" and _spied_by_name(holder, node):
+            continue
+        return False
+    return True
+
+
+def _destructured_load(call: Node) -> bool:
+    """Whether ``call`` is ``import(spec)`` awaited straight into a ``const``
+    or ``let`` that destructures plain names, each of which the name scan
+    sees: ``const { a, b: c } = await import('./m')``."""
+    callee = call.child_by_field_name("function")
+    if callee is None or callee.type != "import":
+        return False
+    node = _outward(call)
+    if node.parent is None or node.parent.type != "await_expression":
+        return False
+    node = _outward(node.parent)
+    declarator = node.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("value") != node:
+        return False
+    pattern = declarator.child_by_field_name("name")
+    if pattern is None or pattern.type != "object_pattern":
+        return False
+    for member in pattern.named_children:
+        if member.type == "comment" or member.type == "shorthand_property_identifier_pattern":
+            continue
+        if member.type == "pair_pattern":
+            key = member.child_by_field_name("key")
+            if key is not None and key.type == "property_identifier":
+                continue
+        return False
+    return True
+
+
+def _spied_by_name(arguments: Node, target: Node) -> bool:
+    """Whether ``arguments`` are ``spyOn(target, '<name>')``'s."""
+    call = arguments.parent
+    callee = call.child_by_field_name("function") if call is not None else None
+    if callee is None:
+        return False
+    name = callee if callee.type == "identifier" else callee.child_by_field_name("property")
+    passed = [c for c in arguments.named_children if c.type != "comment"]
+    return (
+        name is not None
+        and name.text == b"spyOn"
+        and len(passed) >= 2
+        and passed[0] == target
+        and passed[1].type == "string"
+    )
 
 
 def _member_name(callee: Node) -> str | None:
@@ -906,9 +1390,11 @@ def _computed_load(path: str, text: str) -> bool:
 
 
 def _accounted(
-    component, file, declaring, allowed, decl_resolved, repo_dir, use=_element_name, solution=False
+    component, file, declaring, allowed, decl_resolved, repo_dir, use=_element_name, solution=False, use_in=None
 ) -> bool:
     imported = 0
+    # Spellings only ``use_in`` accepted: property keys, and the rest.
+    keys = others = 0
     for node in _walk(file.root):
         if node.type in ("string_fragment", "template_string") and _text(node, file.data) == component:
             # `components["Row"]`: a lookup by name.
@@ -916,6 +1402,13 @@ def _accounted(
         if node.type not in _NAMES or _text(node, file.data) != component:
             continue
         if use(node):
+            others += 1
+            continue
+        if use_in is not None and use_in(file, node):
+            if node.type == "property_identifier":
+                keys += 1
+            else:
+                others += 1
             continue
         if declaring:
             if node.id not in allowed:
@@ -937,5 +1430,6 @@ def _accounted(
             imported += 1
             continue
         return False
-    return declaring or imported == 1
+    # A mock factory's key names the module's export, not a binding here.
+    return declaring or imported == 1 or imported == 0 and others == 0 and keys > 0
 

@@ -75,6 +75,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
+from flag_cleanup import jsx_unwrap
 from flag_cleanup.ts_syntax import _parse, _walk
 
 _NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -140,6 +141,8 @@ class _Found:
     gate: Gate
     #: Why this gate cannot be unwrapped on ``true``, or ``None`` if it can.
     problem: str | None
+    #: The gate's own ``key={…}`` attribute, which the replacement must carry.
+    key: Node | None = None
 
 
 def find_gates(
@@ -154,8 +157,9 @@ def find_gates(
     if not gates or not covers(language):
         return []
     data = source.encode("utf-8")
+    root = _parse(source, language)
     found: list[_Found] = []
-    for node in _walk(_parse(source, language)):
+    for node in _walk(root):
         if node.type not in _ELEMENTS:
             continue
         tag = node.child_by_field_name("open_tag") if node.type == "jsx_element" else node
@@ -170,9 +174,14 @@ def find_gates(
             problem = _key_problem(tag, data, gate.prop, flag_key)
             if problem is _NOT_THIS_FLAG:
                 continue
+            key = _key_attribute(tag, data)
             if problem is None and node.type == "jsx_self_closing_element":
                 problem = "it has no children to keep"
-            found.append(_Found(node, gate, problem))
+            if problem is None and gate.prop == "key":
+                problem = "its flag prop is `key`, which React reads as the list key"
+            elif problem is None and key is not None:
+                problem = _keyed_problem(node, key, data, root)
+            found.append(_Found(node, gate, problem, key))
             break
     outermost = [
         f
@@ -210,35 +219,127 @@ def refusal_reason(
 
 
 def unwrap_gates(
-    source: str, language: str, flag_key: str, gates: tuple[Gate, ...]
+    source: str,
+    language: str,
+    flag_key: str,
+    gates: tuple[Gate, ...],
+    path: str,
+    engine: jsx_unwrap.Engine,
 ) -> tuple[str, int]:
     """``source`` with every gate on ``flag_key`` replaced by its children.
 
     For the ``true`` treatment only, and only after :func:`refusal_reason` has
     passed the file. A gate that is nonetheless not unwrappable is left
-    standing rather than guessed at. Returns the number unwrapped.
+    standing rather than guessed at. Returns the number unwrapped. The edit is
+    the engine's (:mod:`flag_cleanup.jsx_unwrap`); ``path`` holds ``source``
+    and ``engine`` runs the marked-element rules over it.
     """
     count = 0
-    # One gate per parse: replacing it moves every byte after it, and a gate
-    # nested in its children is only outermost once it is gone.
+    # The outermost gates per round: a gate nested in another's children is
+    # only outermost once that one is gone.
     for _ in range(1000):
         found = [f for f in find_gates(source, language, flag_key, gates) if f.problem is None]
         if not found:
             break
-        data = source.encode("utf-8")
-        node = found[0].node
-        replacement = _children_text(node, data)
-        data = data[: node.start_byte] + replacement + data[node.end_byte :]
-        source = data.decode("utf-8")
-        count += 1
+        keyed = [f for f in found if f.key is not None]
+        if keyed:
+            # A gate with a `key` is spliced here, not by the engine: its key
+            # has to land on what replaces it.
+            edited = _unwrap_keyed(source, language, keyed)
+            if edited is None:
+                break
+            source = edited
+            count += len(keyed)
+            continue
+        after = jsx_unwrap.unwrap(
+            path, source, [(f.node.start_byte, f.node.end_byte) for f in found], language, engine
+        )
+        done = len(found)
+        if after is None:
+            # One gate the engine cannot unwrap must not hold back the rest:
+            # try them one at a time, last first so the earlier spans stay valid.
+            after, done = source, 0
+            for f in reversed(found):
+                one = jsx_unwrap.unwrap(
+                    path, after, [(f.node.start_byte, f.node.end_byte)], language, engine
+                )
+                if one is not None:
+                    after, done = one, done + 1
+            if not done:
+                break
+        source = after
+        count += done
     return source, count
 
 
-def unwrap_boolean_gates(before: str, after: str, language: str, gates: tuple[Gate, ...]) -> str:
+def _unwrap_keyed(source: str, language: str, keyed: list[_Found]) -> str | None:
+    """``source`` with each keyed gate replaced, its key carried over.
+
+    The lone child element takes the key as an attribute; anything else is
+    wrapped in ``<Fragment key=…>``. ``None`` if no edit could be made.
+    """
+    data = source.encode("utf-8")
+    root = _parse(source, language)
+    edits: list[tuple[int, int, bytes]] = []
+    need_fragment = False
+    ref = _fragment_ref(root, data)
+    for f in keyed:
+        assert f.key is not None
+        key_text = data[f.key.start_byte : f.key.end_byte]
+        node = f.node
+        children = _children(node, data)
+        replacement: bytes | None = None
+        if len(children) == 1 and children[0].type in _ELEMENTS:
+            child = children[0]
+            child_tag = child.child_by_field_name("open_tag") if child.type == "jsx_element" else child
+            child_name = child_tag.child_by_field_name("name") if child_tag is not None else None
+            text = _dedented(child, node, data)
+            slot = _key_slot(child, child_tag, data) if child_tag is not None else None
+            if child_name is not None and text is not None and slot is not None:
+                replacement = text[:slot] + b" " + key_text + text[slot:]
+        if replacement is None:
+            if isinstance(ref, _NoFragment):
+                return None
+            need_fragment = True
+            open_tag = node.child_by_field_name("open_tag")
+            close_tag = node.child_by_field_name("close_tag")
+            assert open_tag is not None and close_tag is not None
+            name = ref.name.encode()
+            edits.append((close_tag.start_byte, close_tag.end_byte, b"</" + name + b">"))
+            edits.append(
+                (open_tag.start_byte, open_tag.end_byte, b"<" + name + b" " + key_text + b">")
+            )
+            continue
+        edits.append((node.start_byte, node.end_byte, replacement))
+    if need_fragment and not isinstance(ref, _NoFragment) and ref.import_edit is not None:
+        offset, text = ref.import_edit
+        edits.append((offset, offset, text))
+    for start, end, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        data = data[:start] + text + data[end:]
+    try:
+        result = data.decode("utf-8")
+    except UnicodeDecodeError:  # pragma: no cover - the splices are on node boundaries
+        return None
+    # As `jsx_unwrap.unwrap` does for the engine's output: a parse error means no edit.
+    if _parse(result, language).has_error:
+        return None
+    return result
+
+
+def unwrap_boolean_gates(
+    before: str,
+    after: str,
+    language: str,
+    gates: tuple[Gate, ...],
+    path: str,
+    engine: jsx_unwrap.Engine,
+) -> str:
     """``after`` with each boolean gate the transform settled replaced by its branch.
 
     ``before`` is the file as the customer wrote it. See the module docstring
-    for which elements qualify; the rest are left as they are.
+    for which elements qualify; the rest are left as they are. A gate that
+    renders its children is unwrapped by the engine, as in
+    :func:`unwrap_gates` (``path`` holds ``after``).
     """
     gates = tuple(
         gate
@@ -256,7 +357,13 @@ def unwrap_boolean_gates(before: str, after: str, language: str, gates: tuple[Ga
             edit = _branch_edit(node, gate, literal, data)
             if edit is not None:
                 start, end, replacement = edit
-                after = (data[:start] + replacement + data[end:]).decode("utf-8")
+                if replacement is None:
+                    unwrapped = jsx_unwrap.unwrap(path, after, [(start, end)], language, engine)
+                    if unwrapped is None:
+                        return after
+                    after = unwrapped
+                else:
+                    after = (data[:start] + replacement + data[end:]).decode("utf-8")
                 break
         else:
             return after
@@ -312,8 +419,11 @@ def _condition(tag: Node, prop: str, data: bytes) -> str | None:
 
 def _branch_edit(
     node: Node, gate: Gate, literal: str, data: bytes
-) -> tuple[int, int, bytes] | None:
-    """The ``(start, end, replacement)`` that settles ``node``, ``None`` to leave it."""
+) -> tuple[int, int, bytes | None] | None:
+    """The ``(start, end, replacement)`` that settles ``node``, ``None`` to leave it.
+
+    A ``None`` replacement means "its children": the caller has the engine
+    unwrap the element."""
     tag = _open_tag(node)
     assert tag is not None
     props = {}
@@ -328,7 +438,8 @@ def _branch_edit(
     chosen = gate.show if literal == "true" else gate.otherwise
     in_jsx = node.parent is not None and node.parent.type == "jsx_element"
     if chosen == _CHILDREN and children:
-        return node.start_byte, node.end_byte, _children_text(node, data)
+        # Replaced by its children: the engine's edit (see `unwrap_boolean_gates`).
+        return node.start_byte, node.end_byte, None
     attribute = props.get(chosen) if chosen != _CHILDREN else None
     if attribute is None:
         return _nothing_rendered(node, in_jsx, data)
@@ -413,6 +524,183 @@ def _key_problem(tag: Node, data: bytes, prop: str, flag_key: str) -> str | None
     return None
 
 
+def _key_attribute(tag: Node, data: bytes) -> Node | None:
+    """The opening tag's ``key`` attribute, ``None`` if it has none."""
+    keys = [
+        a
+        for a in tag.children_by_field_name("attribute")
+        if a.type == "jsx_attribute"
+        and a.named_children
+        and _text(a.named_children[0], data) == "key"
+    ]
+    return keys[-1] if keys else None
+
+
+def _keyed_problem(element: Node, key: Node, data: bytes, root: Node) -> str | None:
+    """Why a gate carrying ``key`` cannot hand it to what replaces it, or ``None``.
+
+    The replacement is a ``<Fragment key=…>`` for several children, or the lone
+    child element with the key added to it. Anything else would lose the key,
+    which tells React which list item this is.
+    """
+    tag = element.child_by_field_name("open_tag")
+    assert tag is not None
+    attributes = tag.children_by_field_name("attribute")
+    if sum(1 for a in attributes if _is_key(a, data)) > 1:
+        return "it carries more than one `key` prop"
+    after_key = [a for a in attributes if a.start_byte > key.start_byte]
+    if any(_is_spread(a) for a in after_key):
+        return "a spread attribute after its `key` prop may override it"
+    if len(key.named_children) < 2:
+        return "its `key` prop has no value"
+    children = _children(element, data)
+    if len(children) == 1 and children[0].type in _ELEMENTS:
+        child = children[0]
+        child_tag = child.child_by_field_name("open_tag") if child.type == "jsx_element" else child
+        child_name = child_tag.child_by_field_name("name") if child_tag is not None else None
+        if (
+            child_tag is not None
+            and child_name is not None
+            and _key_slot(child, child_tag, data) is not None
+            and _dedented(child, element, data) is not None
+        ):
+            child_attributes = child_tag.children_by_field_name("attribute")
+            if _key_attribute(child_tag, data) is not None:
+                return "it carries a `key` prop and so does its only child"
+            if any(_is_spread(a) for a in child_attributes):
+                return "its only child spreads props, which may set a `key`"
+            return None
+        if child_name is None:
+            return "its only child is a fragment, which cannot take the `key`"
+    ref = _fragment_ref(root, data)
+    return ref.problem if isinstance(ref, _NoFragment) else None
+
+
+def _key_slot(child: Node, child_tag: Node, data: bytes) -> int | None:
+    """Where in ``child``'s text a ``key`` attribute goes: after its tag name and
+    any type arguments. ``None`` when that is not on the first line (the text
+    moves out by lines, so the offset would no longer hold) or the child has a
+    bare carriage return, which the dedent does not handle."""
+    name = child_tag.child_by_field_name("name")
+    if name is None:
+        return None
+    end = name.end_byte
+    type_arguments = child_tag.child_by_field_name("type_arguments")
+    if type_arguments is None:
+        type_arguments = next((c for c in child_tag.children if c.type == "type_arguments"), None)
+    if type_arguments is not None:
+        end = max(end, type_arguments.end_byte)
+    if b"\n" in data[child.start_byte : end] or b"\r" in data[child.start_byte : end]:
+        return None
+    if re.search(rb"\r(?!\n)", data[child.start_byte : child.end_byte]):
+        return None
+    return end - child.start_byte
+
+
+def _is_key(attribute: Node, data: bytes) -> bool:
+    return (
+        attribute.type == "jsx_attribute"
+        and bool(attribute.named_children)
+        and _text(attribute.named_children[0], data) == "key"
+    )
+
+
+@dataclass(frozen=True)
+class _NoFragment:
+    problem: str
+
+
+@dataclass(frozen=True)
+class _FragmentRef:
+    #: How the elements spell it: ``Fragment``, or ``React.Fragment``.
+    name: str
+    #: ``(offset, text)`` that makes ``name`` resolve, ``None`` if it already does.
+    import_edit: tuple[int, bytes] | None
+
+
+#: Declarations an identifier can be the name of, as opposed to a use.
+_BINDING_PARENTS = frozenset(
+    {
+        "variable_declarator", "required_parameter", "optional_parameter", "function_declaration",
+        "function_expression", "generator_function_declaration", "class_declaration", "class",
+        "catch_clause", "array_pattern", "object_pattern", "pair_pattern", "rest_pattern",
+        "assignment_pattern", "arrow_function", "for_in_statement", "enum_declaration",
+        "type_alias_declaration", "interface_declaration", "shorthand_property_identifier_pattern",
+        "formal_parameters", "function_signature", "internal_module", "import_require_clause",
+    }
+)
+
+_PRAGMA = re.compile(rb"@jsx\w*")
+
+
+def _rebinds(root: Node, data: bytes, name: str, imports: list[Node]) -> bool:
+    """Whether anything but an import binds ``name`` in this file."""
+    for node in _walk(root):
+        if node.type not in ("identifier", "shorthand_property_identifier_pattern", "type_identifier"):
+            continue
+        if _text(node, data) != name:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type in _BINDING_PARENTS and not any(
+            _contains(i, node) for i in imports
+        ):
+            return True
+    return False
+
+
+def _fragment_ref(root: Node, data: bytes) -> _FragmentRef | _NoFragment:
+    """How to write ``Fragment`` in this file, or why it cannot be written.
+
+    Only through a value import of ``react`` the file already has: a file on
+    another JSX runtime (a pragma, or an import of ``preact``) is refused, since
+    a ``react`` import there would be a second runtime.
+    """
+    if _PRAGMA.search(data):
+        return _NoFragment("the file sets a JSX pragma, so `Fragment` may not be React's")
+    imports = [n for n in root.children if n.type == "import_statement"]
+    react_named: Node | None = None
+    head: str | None = None
+    ref: _FragmentRef | None = None
+    for statement in imports:
+        source = statement.child_by_field_name("source")
+        if source is None or _text(source, data)[1:-1] != "react":
+            continue
+        clause = next((c for c in statement.children if c.type == "import_clause"), None)
+        if clause is None or any(c.type == "type" for c in statement.children):
+            continue
+        for part in clause.children:
+            if part.type == "identifier":
+                head = _text(part, data)
+                ref = ref or _FragmentRef(f"{head}.Fragment", None)
+            elif part.type == "namespace_import":
+                ident = next(c for c in part.children if c.type == "identifier")
+                head = _text(ident, data)
+                ref = ref or _FragmentRef(f"{head}.Fragment", None)
+            elif part.type == "named_imports":
+                react_named = part
+                for spec in part.named_children:
+                    if spec.type != "import_specifier" or _text(spec, data).startswith("type "):
+                        continue
+                    name = spec.child_by_field_name("name")
+                    alias = spec.child_by_field_name("alias")
+                    if name is not None and _text(name, data) == "Fragment":
+                        local = _text(alias if alias is not None else name, data)
+                        ref = ref or _FragmentRef(local, None)
+    if ref is None:
+        if react_named is None:
+            return _NoFragment("the file has no value import of `react` to take `Fragment` from")
+        for node in _walk(root):
+            if node.type in ("identifier", "type_identifier", "property_identifier", "shorthand_property_identifier") and _text(node, data) == "Fragment":
+                return _NoFragment("`Fragment` already names something else in this file")
+        specs = [c for c in react_named.named_children if c.type == "import_specifier"]
+        if not specs:
+            return _NoFragment("the file's `react` import has nothing to add `Fragment` to")
+        ref = _FragmentRef("Fragment", (specs[-1].end_byte, b", Fragment"))
+    if _rebinds(root, data, ref.name.split(".")[0], imports):
+        return _NoFragment(f"`{ref.name.split('.')[0]}` is rebound in this file")
+    return ref
+
+
 def _literal(value: Node, data: bytes) -> str | None:
     """The text of ``"k"``, ``{'k'}`` or ``{`k`}``; ``None`` for anything else."""
     if value.type == "jsx_expression":
@@ -436,20 +724,6 @@ def _is_spread(attribute: Node) -> bool:
     )
 
 
-def _children_text(element: Node, data: bytes) -> bytes:
-    """What the gate rendered: its sole child element, or its children in a fragment."""
-    open_tag = element.child_by_field_name("open_tag")
-    close_tag = element.child_by_field_name("close_tag")
-    assert open_tag is not None and close_tag is not None
-    children = _children(element, data)
-    if len(children) == 1 and children[0].type in _ELEMENTS:
-        moved = _dedented(children[0], element, data)
-        if moved is not None:
-            return moved
-    inner = data[open_tag.end_byte : close_tag.start_byte]
-    return b"<>" + inner + b"</>"
-
-
 def _children(element: Node, data: bytes) -> list[Node]:
     """``element``'s children, without the whitespace around them."""
     open_tag = element.child_by_field_name("open_tag")
@@ -459,7 +733,7 @@ def _children(element: Node, data: bytes) -> list[Node]:
         c
         for c in element.named_children
         if c.id not in (open_tag.id, close_tag.id)
-        and not (c.type == "jsx_text" and not _text(c, data).strip())
+        and not (c.type == "jsx_text" and not data[c.start_byte : c.end_byte].strip())
     ]
 
 

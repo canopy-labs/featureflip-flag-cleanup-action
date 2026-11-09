@@ -47,7 +47,7 @@ from pathlib import Path
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import go_module, go_scope, key_const, source_index, syntax
+from flag_cleanup import go_module, go_scope, go_setters, key_const, source_index, syntax
 from flag_cleanup.unused import go_import_name
 
 #: The SDK reads ``go_const.toml`` folds; the run's accessors are added per call.
@@ -85,7 +85,9 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
     module = _module_id(Path(path).parent, clause)
     data = source.encode("utf-8")
     consts = key_const._go_key_consts(root, data, flag_key)
-    if key_const._go_withholds(root, data, consts):
+    with key_const.go_file(path):
+        withheld = key_const._go_withholds(root, data, consts)
+    if withheld:
         # The file's own gate keeps every declaration of the key in it.
         return []
     return [
@@ -252,6 +254,31 @@ def _named_example(reader: _Reader) -> bool:
     return False
 
 
+def _setter_pin(path: str, source: str, root: Node, node: Node, spelling: str, repo_dir: str) -> bool:
+    """Whether ``node`` is the key of a test setter (:mod:`flag_cleanup.go_setters`)
+    the test-double pass will delete under EITHER treatment, so that the
+    declaration may go with it. Asked of the pass itself, on the text as
+    written: every setter of the spelling in the file has to clear, since a
+    test it cannot decide keeps its setter and the file would not build
+    without the constant. The runner re-checks the rewritten file with the
+    setters suspended, which refuses the flag if one survived."""
+    names = go_setters.declared()
+    if not names or not path.endswith("_test.go"):
+        return False
+    spellings = frozenset({"".join(spelling.split())})
+    if not any(site.key.id == node.id for site in go_setters.sites(path, root, spellings, repo_dir, names)):
+        return False
+    from flag_cleanup import mock_stubs
+
+    for treatment in (True, False):
+        resolved, _ = mock_stubs.resolve(
+            source, "go", "\x00no-such-key", treatment, key_texts=frozenset(spellings), checkout=(repo_dir, path)
+        )
+        if go_setters.remaining(_parse(resolved), names, spellings):
+            return False
+    return True
+
+
 def references(path, source, declarations, accessors, repo_dir):
     """The proven reads of ``declarations`` in ``path``, and its refusals.
 
@@ -304,6 +331,10 @@ def references(path, source, declarations, accessors, repo_dir):
                         break
                     call = _read_call(node, accessor_set)
                     if call is None:
+                        if _setter_pin(path, source, root, node, name, repo_dir):
+                            reads.append(xk.KeyReference(path, None, name))
+                            bare_proven = True
+                            break
                         refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
                         break
                     reason = _position_reason(call)
@@ -360,6 +391,10 @@ def references(path, source, declarations, accessors, repo_dir):
                 break
             call = _read_call(node, accessor_set)
             if call is None:
+                if _setter_pin(path, source, root, node, f"{qualifier}.{name}", repo_dir):
+                    reads.append(xk.KeyReference(path, qualifier, name))
+                    owners.add(qualifier)
+                    break
                 refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
                 break
             reason = _position_reason(call)

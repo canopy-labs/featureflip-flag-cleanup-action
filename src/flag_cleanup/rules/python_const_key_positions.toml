@@ -1,0 +1,66 @@
+# Templates for an accessor whose key is not its first argument AND is held in
+# a module constant of the same file: `get[1]` in the `accessors` input is
+# `flag_is_active(request, OLD_CHECKOUT)`. See `python_accessors.toml`, whose
+# literal block this is the constant form of, and `python_const_accessors.toml`,
+# whose first-argument rule it mirrors.
+#
+# Never run as written, never staged: `rule_synthesis.with_accessor_const_rules`
+# clones it once per such accessor. `key_const._python_is_removable_read` is the
+# other half: it counts a reference in exactly this slot as a read these rules
+# remove, and nothing else, so the declaration goes only when every reference is
+# one. A `*args`, a `**kwargs` or a comment anywhere in the call is declined
+# (`key_const.PYTHON_CONST_RULE_FILTERS` names the three, and a test compares).
+
+[[rules]]
+name = "accessor_const_template__key_at_position"
+# accessor-template: key-position
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list . __KEY_POSITION__(identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_contains = ["""((list_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((dictionary_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules.filters]]
+enclosing_node = """(
+  (module
+    (expression_statement
+      (assignment
+        left: (identifier) @decl_name
+        right: (string (string_start) . (string_content) @flag_name . (string_end))))) @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""
+
+# A decorator gate on the constant is left for `python_gates`, for the reason
+# `python_accessors.toml` gives at its filters.
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @gate_fn)
+                     (identifier) @gate_fn])) @gate
+  (#eq? @gate_fn "@sdk_fn")
+)"""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @adapter_fn)
+                     (identifier) @adapter_fn])) @adapted
+  (#eq? @adapter_fn "method_decorator")
+)"""

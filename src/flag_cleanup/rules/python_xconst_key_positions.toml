@@ -1,0 +1,96 @@
+# Reader templates for an accessor whose key is not its first argument and is a
+# module constant declared in ANOTHER file: `get[1]` is
+# `flag_is_active(request, keys.OLD_CHECKOUT)` or, after `from keys import OLD`,
+# `flag_is_active(request, OLD)`. See `python_xconst.toml` for the placeholders
+# and `python_const_key_positions.toml` for the marker.
+# `rule_synthesis.cross_file_key_rules` clones each block once per proven
+# reference and per positioned accessor; `cross_file_python_proofs._is_read_at`
+# is the proof, and accepts exactly this slot. Never run as written.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_key_at_position"
+# accessor-template: key-position
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . __KEY_POSITION__(attribute) @key_ref)
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @key_ref "__XCONST_OWNER__.__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((list_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((dictionary_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @gate_fn)
+                     (identifier) @gate_fn])) @gate
+  (#eq? @gate_fn "@sdk_fn")
+)"""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @adapter_fn)
+                     (identifier) @adapter_fn])) @adapted
+  (#eq? @adapter_fn "method_decorator")
+)"""
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_key_at_position"
+# accessor-template: key-position
+query = """(
+  (call
+    function: [(attribute attribute: (identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (argument_list
+      . __KEY_POSITION__(identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((list_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((dictionary_splat) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @gate_fn)
+                     (identifier) @gate_fn])) @gate
+  (#eq? @gate_fn "@sdk_fn")
+)"""
+
+[[rules.filters]]
+not_enclosing_node = """(
+  (decorator
+    (call function: [(attribute attribute: (identifier) @adapter_fn)
+                     (identifier) @adapter_fn])) @adapted
+  (#eq? @adapter_fn "method_decorator")
+)"""

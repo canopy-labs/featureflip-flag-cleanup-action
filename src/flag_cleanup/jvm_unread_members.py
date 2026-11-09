@@ -123,10 +123,13 @@ def kotlin_annotations(modifiers: Node | None) -> list[str]:
     for child in modifiers.named_children:
         if child.type != "annotation":
             continue
-        for part in walk(child):
-            if part.type == "user_type":
+        # ``@A``, ``@A(x)`` and the grouped ``@[A B(x)]`` all hold their names as a direct
+        # ``user_type`` child or one under a ``constructor_invocation`` child; arguments are skipped.
+        for part in child.named_children:
+            if part.type == "constructor_invocation":
+                part = child_of_type(part, "user_type")
+            if part is not None and part.type == "user_type":
                 names.append(_last_segment(part))
-                break
     return names
 
 
@@ -550,10 +553,14 @@ def classes(root: Node, grammar: str) -> list[Node]:
     ]
 
 
-def members(source: str, grammar: str) -> dict[tuple[str, str], int] | None:
+def members(source: str, grammar: str, eligibility: object = None) -> dict[tuple[str, str], int] | None:
     """``(class, member) -> reads`` for each private member of a named class in
     ``source`` that the module docstring does not skip. ``None`` when the file
-    does not parse."""
+    does not parse. A class is considered only when it is eligible
+    (:mod:`flag_cleanup.jvm_class_eligibility`)."""
+    from flag_cleanup import jvm_class_eligibility
+
+    eligible = eligibility if eligibility is not None else jvm_class_eligibility.Eligibility(None)
     root = _parse(source, grammar)
     if root.has_error:
         return None
@@ -574,7 +581,7 @@ def members(source: str, grammar: str) -> dict[tuple[str, str], int] | None:
             _java_class_reads_every_field(declaration)
             if grammar == "java"
             else _kotlin_class_reads_every_field(declaration)
-        )
+        ) or not eligible.class_ok(declaration, grammar, source)
         listed = java_fields(declaration) if grammar == "java" else kotlin_properties(declaration)
         for member, name_node in listed:
             member_name = text(name_node)
@@ -595,14 +602,14 @@ def members(source: str, grammar: str) -> dict[tuple[str, str], int] | None:
     return {(cls, member): counts[member] for cls, member in candidates if (cls, member) in wanted}
 
 
-def unread_members(before: str, after: str, grammar: str) -> list[str]:
+def unread_members(before: str, after: str, grammar: str, eligibility: object = None) -> list[str]:
     """Each private member read in ``before`` and not in ``after``.
 
     Returned as ``Class.member`` (``Svc.flags``) in the order they appear in
     ``after``. ``grammar`` is ``"java"`` or ``"kt"``.
     """
-    old = members(before, grammar)
-    new = members(after, grammar)
+    old = members(before, grammar, eligibility)
+    new = members(after, grammar, eligibility)
     if old is None or new is None:
         return []
     return [

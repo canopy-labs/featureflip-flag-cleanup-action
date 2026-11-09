@@ -44,7 +44,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_csharp, cross_file_ts, mock_stubs, rule_synthesis, syntax, ts_tests, unused
+from flag_cleanup import cross_file_csharp, cross_file_ts, generated_files, mock_stubs, rule_synthesis, syntax, ts_tests, unused
 
 #: Extension to the grammar this module parses it with. ERB is absent: its
 #: Ruby lives inside a template, and a comment verdict there would need the
@@ -116,6 +116,22 @@ class Residue:
     #: ``(path, line, text)`` for each line of a ``plain_strings`` file that
     #: names the key, comments included, so the reviewer need not search.
     plain_string_lines: tuple[tuple[str, int, str], ...] = ()
+    #: ``(path, statement)`` for every test line that stubs or verifies a read
+    #: callee this run removed a call of with a WILDCARD key (``any()``,
+    #: ``It.IsAny<string>()``): it may stub the removed flag, and no key says
+    #: so. See :mod:`flag_cleanup.wildcard_stubs`.
+    wildcard_stubbed: tuple[tuple[str, str], ...] = ()
+    #: Generated files every mention of the flag in which sits inside a
+    #: comment. Their comments are not in ``comment_only`` or
+    #: ``comment_lines``: rewording a generated file by hand is wrong, so the
+    #: pull request names each as generated instead. See
+    #: :mod:`flag_cleanup.generated_files`.
+    generated_comment_only: tuple[str, ...] = ()
+    #: ``(path, line, text)`` for each line of the checkout, relative to its
+    #: root, that spells a refusal message the run deleted: code that still
+    #: handles a response the removal means the server can no longer send.
+    #: See :mod:`flag_cleanup.removed_refusals`.
+    refusals: tuple[tuple[str, int, str], ...] = ()
 
 
 def _mention(flag_key: str) -> re.Pattern[str]:
@@ -920,6 +936,7 @@ def classify(
     namespace_only: list[str] = []
     plain_strings: list[str] = []
     plain_string_lines: list[tuple[str, int, str]] = []
+    generated_comment_only: list[str] = []
     for path in paths:
         language = _grammar_by_extension(path)
         if language is None:
@@ -938,6 +955,9 @@ def classify(
                 continue
         root = _parse(source, language)
         if _comment_only(root, mention):
+            if generated_files.is_generated(path, source):
+                generated_comment_only.append(path)
+                continue
             comment_only.append(path)
             comment_lines.extend((path, line, text) for line, text in _comment_lines(root, source, mention))
             continue
@@ -975,6 +995,7 @@ def classify(
         namespace_only=tuple(namespace_only),
         plain_strings=tuple(plain_strings),
         plain_string_lines=tuple(plain_string_lines),
+        generated_comment_only=tuple(generated_comment_only),
     )
 
 

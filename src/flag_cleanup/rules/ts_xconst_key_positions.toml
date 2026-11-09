@@ -1,0 +1,63 @@
+# Reader templates for an accessor whose key is not its first argument and is a
+# constant declared in ANOTHER file: `get[1]` is `get(state, OLD_CHECKOUT)`.
+# See `ts_xconst.toml` for the placeholders and `ts_key_positions.toml` for the
+# marker. `rule_synthesis.cross_file_key_rules` clones each block once per
+# proven reference and per positioned accessor; `cross_file_ts._is_read` is the
+# proof, and accepts exactly this slot. Never run as written.
+
+[[rules]]
+# xconst: qualified
+name = "xconst_qualified_key_at_position"
+# accessor-template: key-position
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . __KEY_POSITION__(member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+not_contains = ["""((spread_element) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules]]
+# xconst: bare
+name = "xconst_bare_key_at_position"
+# accessor-template: key-position
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments
+      . __KEY_POSITION__(identifier) @key_member)
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+not_contains = ["""((spread_element) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]

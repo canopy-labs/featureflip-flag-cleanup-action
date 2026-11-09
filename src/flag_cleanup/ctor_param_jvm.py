@@ -180,11 +180,159 @@ def _class_annotations(declaration: Node, grammar: str) -> list[str]:
     return jvm.kotlin_annotations(jvm.child_of_type(declaration, "modifiers"))
 
 
+#: Lombok annotations that only add a logger or a try/finally wrapper, with the
+#: package that defines each. None of them reads a field or builds a
+#: constructor, so a file that uses only these is as safe to edit as one that
+#: uses no Lombok at all. Inert only when the name resolves to THIS package.
+_LOMBOK_INERT = {
+    "Slf4j": "lombok.extern.slf4j",
+    "XSlf4j": "lombok.extern.slf4j",
+    "Log4j": "lombok.extern.log4j",
+    "Log4j2": "lombok.extern.log4j",
+    "Log": "lombok.extern.java",
+    "CommonsLog": "lombok.extern.apachecommons",
+    "Flogger": "lombok.extern.flogger",
+    "JBossLog": "lombok.extern.jbosslog",
+    "CustomLog": "lombok",
+    "SneakyThrows": "lombok",
+    "Synchronized": "lombok",
+    "Cleanup": "lombok",
+}
+#: Annotations of ``java.lang``, which a star import never shadows.
+_JAVA_LANG_ANNOTATIONS = frozenset({"Override", "Deprecated", "SuppressWarnings", "SafeVarargs", "FunctionalInterface"})
+
+
+def _dotted(node: Node) -> str | None:
+    """The dotted name a Java ``scoped_identifier`` or a Kotlin
+    ``qualified_identifier`` spells, built from its identifier nodes so a
+    comment or line break inside it cannot change the answer; ``None`` when it
+    holds anything else."""
+    if node.type == "identifier":
+        return _text(node)
+    if node.type not in ("scoped_identifier", "qualified_identifier", "user_type"):
+        return None
+    parts: list[str] = []
+    for child in node.named_children:
+        if "comment" in child.type:
+            continue
+        part = _dotted(child)
+        if part is None:
+            return None
+        parts.append(part)
+    return ".".join(parts) if parts else None
+
+
+def _is_kotlin(root: Node) -> bool:
+    return root.type == "source_file"
+
+
+def _imports(root: Node) -> tuple[dict[str, str], list[str], bool]:
+    """``(single, stars, unreadable)``: each name a non-static import binds
+    (an alias, in Kotlin, binds the alias) with its dotted path; the packages
+    star-imported; and whether an import naming ``lombok`` could not be read
+    from its nodes. A static import binds a member, never an annotation type,
+    so it is in none of them."""
+    single: dict[str, str] = {}
+    stars: list[str] = []
+    unreadable = False
+    for n in root.named_children:
+        if n.type not in ("import_declaration", "import"):
+            continue
+        if any(c.type == "static" for c in n.children):
+            continue
+        target = next(
+            (c for c in n.named_children if c.type in ("scoped_identifier", "qualified_identifier")), None
+        ) or next((c for c in n.named_children if c.type == "identifier"), None)
+        path = _dotted(target) if target is not None else None
+        if path is None:
+            unreadable = unreadable or "lombok" in _text(n)
+            continue
+        star = any(c.type in ("asterisk", "*") for c in n.children)
+        if star:
+            stars.append(path)
+            continue
+        alias = next(
+            (c for c in n.named_children if c.type == "identifier" and target is not None and c.id != target.id),
+            None,
+        )
+        single[_text(alias) if alias is not None else path.rsplit(".", 1)[-1]] = path
+    return single, stars, unreadable
+
+
+def _annotation_names(root: Node) -> set[str | None]:
+    """Every annotation in the file, as written (``Data``, ``lombok.Data``)."""
+    names: set[str | None] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in ("marker_annotation", "annotation"):
+            names.add(_written(node))
+        stack.extend(node.named_children)
+    return names
+
+
+def _written(annotation: Node) -> str | None:
+    """The name an annotation usage spells, built from its name node so a
+    comment or line break inside it cannot change the answer; ``None`` when
+    it cannot be read."""
+    for child in annotation.named_children:
+        if child.type == "constructor_invocation":
+            child = next((c for c in child.named_children if c.type == "user_type"), child)
+        if child.type in ("identifier", "scoped_identifier", "user_type"):
+            return _dotted(child)
+    return None
+
+
+def _lombok_status(root: Node, written: str | None) -> str:
+    """``"no"``, ``"inert"`` or ``"yes"``: whether the annotation ``written``
+    may be Lombok's, and if so whether it is one that generates nothing.
+
+    Sound by construction: an annotation is Lombok's unless it is shown not
+    to be, and it is inert only when it is shown to be one of the logger
+    annotations. Shown not to be Lombok's:
+
+    * its first segment is bound by a single-type import (or a Kotlin alias)
+      from outside Lombok, or it is written fully qualified outside
+      ``lombok.``;
+    * a ``java.lang`` annotation;
+    * no import of Lombok could bring the name in.
+
+    Inert only through a single-type import from the package that defines it,
+    or written fully qualified. A bare name under a star import is never
+    inert (a type of the file or its package could shadow it), and is Lombok's
+    whenever the star package could define it. Kotlin is never inert: Lombok
+    does not process it, so "inert" there could only skip a refusal.
+    """
+    single, stars, unreadable = _imports(root)
+    if written is None:
+        # A usage whose name cannot be read: Lombok's if the file names Lombok at all.
+        return "yes" if b"lombok" in root.text else "no"
+    first, _, rest = written.partition(".")
+    bound = single.get(first)
+    if bound is not None:
+        fqn = f"{bound}.{rest}" if rest else bound
+    elif rest:
+        fqn = written  # fully qualified, or a type of this package or a star import
+    else:
+        fqn = None
+    lombok_stars = [p for p in stars if p == "lombok" or p.startswith("lombok.")]
+    if fqn is not None and (bound is not None or written.startswith("lombok.")):
+        if not (fqn == "lombok" or fqn.startswith("lombok.")):
+            return "no"
+        inert = _LOMBOK_INERT.get(fqn.rsplit(".", 1)[-1]) == fqn.rsplit(".", 1)[0]
+        return "inert" if inert and not _is_kotlin(root) else "yes"
+    if first in _JAVA_LANG_ANNOTATIONS and not rest:
+        return "no"
+    if unreadable or lombok_stars:
+        return "yes"
+    return "no"
+
+
 def _imports_lombok(root: Node) -> bool:
-    return any(
-        n.type in ("import_declaration", "import") and _text(n).replace(" ", "").startswith(("importlombok", "importstaticlombok"))
-        for n in root.named_children
-    )
+    """Whether the file uses an annotation that may be Lombok's and may
+    generate code reading a field or constructing the class. Logger
+    annotations (``@Slf4j``) do not."""
+    return any(_lombok_status(root, written) == "yes" for written in _annotation_names(root))
 
 
 def _string_spells(repo_dir: str, name: str) -> str | None:
@@ -775,7 +923,16 @@ def _exported_kotlin(declaration: Node) -> bool:
 
 def _class_refusal(root: Node, declaration: Node, grammar: str) -> str | None:
     """Why the class's constructor cannot change, its callers aside."""
-    if set(_class_annotations(declaration, grammar)) - _HARMLESS_ANNOTATIONS:
+    modifiers = jvm.java_modifiers(declaration) if grammar == "java" else jvm.child_of_type(declaration, "modifiers")
+    written = [
+        _written(c)
+        for c in (modifiers.named_children if modifiers is not None else ())
+        if c.type in ("marker_annotation", "annotation")
+    ]
+    if any(
+        w is None or (w.rsplit(".", 1)[-1] not in _HARMLESS_ANNOTATIONS and _lombok_status(root, w) != "inert")
+        for w in written
+    ):
         return "an annotated class (a framework may construct it)"
     if _imports_lombok(root):
         return "its file uses Lombok"
@@ -855,6 +1012,8 @@ def _plan_java_field(path: str, root: Node, data: bytes, label: str, repo_dir: s
     if len(declarations) != 1:
         return Refusal(label, "the class is declared more than once in its file")
     declaration = declarations[0]
+    if jvm._java_class_reads_every_field(declaration):
+        return Refusal(label, "an annotated class or a Serializable one, a persistence or serialization class (generated code reads every field)")
     found = [(m, n) for m, n in jvm.java_fields(declaration) if _text(n) == field]
     if len(found) != 1:
         return Refusal(label, "declared more than once")
@@ -1007,6 +1166,8 @@ def _plan_kotlin_member(path: str, root: Node, data: bytes, label: str, repo_dir
     if len(declarations) != 1:
         return Refusal(label, "the class is declared more than once in its file")
     declaration = declarations[0]
+    if jvm._kotlin_class_reads_every_field(declaration):
+        return Refusal(label, "an annotated class or a Serializable one, a persistence or serialization class (generated code reads every field)")
     found = [(m, n) for m, n in jvm.kotlin_properties(declaration) if _text(n) == member_name]
     if len(found) != 1:
         return Refusal(label, "declared more than once")
@@ -1084,6 +1245,38 @@ def plan(path: str, source: str, kind: str, label: str, repo_dir: str) -> Remova
     if kind == "unread constructor parameter":
         return _plan_kotlin_plain(path, root, label, repo_dir)
     return _plan_kotlin_member(path, root, data, label, repo_dir)
+
+
+def drop_empty_primary_constructor(data: bytes, class_name: str) -> bytes:
+    """``data`` with the ``()`` of ``class_name``'s primary constructor removed
+    when no parameter, annotation or modifier is left in it: ``class Svc() {``
+    becomes ``class Svc {``. Anything else in the constructor (``private
+    constructor()``, ``@Inject constructor()``) keeps it, as does a class
+    declared twice or a file that does not parse."""
+    source = data.decode("utf-8")
+    root = _parse(source, "kt")
+    if root.has_error:
+        return data
+    declarations = _find_class(root, "kt", class_name)
+    if len(declarations) != 1:
+        return data
+    declaration = declarations[0]
+    # Without a primary constructor Kotlin generates a no-arg one only when
+    # the class declares no secondary constructor, and never for these kinds.
+    body = jvm.child_of_type(declaration, "class_body")
+    if body is not None and any(m.type == "secondary_constructor" for m in body.named_children):
+        return data
+    if jvm.kotlin_modifier_words(declaration) & {"expect", "actual", "external", "annotation", "enum", "value", "inline"}:
+        return data
+    if any(c.type == "enum_class_body" for c in declaration.named_children) or jvm.is_kotlin_interface(declaration):
+        return data
+    constructor = jvm.child_of_type(declaration, "primary_constructor")
+    if constructor is None or not re.fullmatch(rb"\(\s*\)", data[constructor.start_byte : constructor.end_byte]):
+        return data
+    start = constructor.start_byte
+    while start > 0 and data[start - 1 : start] in (b" ", b"\t"):
+        start -= 1
+    return data[:start] + data[constructor.end_byte :]
 
 
 def has_member(source: str, path: str, class_name: str, name: str) -> bool:

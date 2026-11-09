@@ -149,6 +149,30 @@ def _parser(language: str) -> Parser:
     return Parser(Language(grammar()))
 
 
+#: The `not_contains` filters the key-constant rule templates carry, by the
+#: name of what they decline. The Gate 2 predicates (`key_const._ts_is_removable_read`,
+#: `cross_file_ts._is_read`) must decline exactly these, so a reference counts
+#: as a removable read only when a rule will fold it; a test parses the TOML and
+#: compares it with this table.
+CONST_RULE_FILTERS = {
+    "optional_call": '((call_expression "?." arguments: (arguments)) @optional_call)',
+    "spread": "((spread_element) @spread)",
+    "comment": "((comment) @comment)",
+}
+
+
+def declined_by_const_rules(call: Node, *, positioned: bool) -> bool:
+    """Whether the key-constant rules decline ``call``: an optional call
+    anywhere within it, and for a positioned accessor a spread or a comment too."""
+    wanted = {"call_expression"} | ({"spread_element", "comment"} if positioned else set())
+    for node in _walk(call):
+        if node.type not in wanted:
+            continue
+        if node.type != "call_expression" or any(c.type == "?." for c in node.children):
+            return True
+    return False
+
+
 def _walk(node: Node):
     """Yield every node in the tree, depth first."""
     stack = [node]

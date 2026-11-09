@@ -35,6 +35,7 @@ from flag_cleanup.cross_file_keys import (
     LEFT_COMPETING,
     NAME_NOT_UNIQUE,
 )
+from flag_cleanup import go_emptied
 from flag_cleanup.mock_stubs import (
     DUPLICATE_TEST,
     FALSE_TITLE,
@@ -43,6 +44,7 @@ from flag_cleanup.mock_stubs import (
     PINNED_PARAMETER,
     REBUILT,
     RENAMED_METHOD,
+    SETTER_TEST,
     SIBLING_TEST,
     TEST,
     TEST_PHASE,
@@ -51,6 +53,7 @@ from flag_cleanup.mock_stubs import (
 )
 from flag_cleanup.residue import Residue
 from flag_cleanup.inert_load import DECLARED_LOAD
+from flag_cleanup.python_constant_function import COLLAPSED_FUNCTION
 from flag_cleanup.cross_file_php_features import REMOVED_FEATURE_CLASS
 from flag_cleanup.ts_readiness_gates import EDITED_COMMENT, KEPT_GUARD, NAMED_IN_COMMENT, REMOVED_GATE, REMOVED_GUARD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
@@ -193,12 +196,14 @@ REPORTED_BINDING_KINDS = frozenset(
         "unread parameter",
         "unread member",
         "unread constructor parameter",
+        "unread local",
         "removed parameter",
         "removed member",
         "changed constructor",
         "kept argument local",
         "failing assertion",
         "constant guard",
+        COLLAPSED_FUNCTION,
         "unread binding",
         "emptied override",
         "dropped default argument",
@@ -770,6 +775,26 @@ def _constant_guard_lines(guards: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _collapsed_function_lines(rows: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Python function the fold left returning one value
+    on every path, now reduced to that return, or nothing. The statements it
+    lost were checked to do nothing else, but they were the customer's."""
+    if not rows:
+        return []
+    count = len(rows)
+    noun = "function was" if count == 1 else "functions were"
+    return [
+        f"> **{count} {noun} reduced to a constant.** Folding the flag out left every "
+        "`return` of each one the same literal. The statements before them only fed "
+        "that result (assignments, environment reads, string tests and comparisons), "
+        "and none of them could do anything else, so they were removed:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def _kept_argument_local_lines(kept: list[tuple[str, str]]) -> list[str]:
     """The callout naming each local whose only reader was an argument this
     pull request removed with a constructor parameter, or nothing.
@@ -789,6 +814,29 @@ def _kept_argument_local_lines(kept: list[tuple[str, str]]) -> list[str]:
         f"{'it' if count == 1 else 'each'} if that work is not needed:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in kept[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_local_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each local the fold left declared and never read, or nothing.
+
+    The local stays because its initializer may do work (a call, a builder
+    chain), so deleting it is the reviewer's call.
+    """
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "local is" if count == 1 else "locals are"
+    return [
+        f"> **⚠️ {count} {noun} no longer read.** {'It was' if count == 1 else 'Each was'} "
+        "read only by code this pull request removed. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        f"the value {'it is' if count == 1 else 'they are'} set to may do work. Remove "
+        f"{'it' if count == 1 else 'each'} if that work is not needed:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -1232,6 +1280,7 @@ def _shown_residue(residue: Residue, show) -> Residue:
         residue,
         stubbed=_shown_rows(residue.stubbed, show),
         comment_only=tuple(show(path) for path in residue.comment_only),
+        generated_comment_only=tuple(show(path) for path in residue.generated_comment_only),
         enum_held=_shown_rows(residue.enum_held, show),
         title_only=tuple(show(path) for path in residue.title_only),
         comment_lines=_shown_rows(residue.comment_lines, show),
@@ -1240,6 +1289,7 @@ def _shown_residue(residue: Residue, show) -> Residue:
         namespace_only=tuple(show(path) for path in residue.namespace_only),
         plain_strings=tuple(show(path) for path in residue.plain_strings),
         plain_string_lines=_shown_rows(residue.plain_string_lines, show),
+        wildcard_stubbed=_shown_rows(residue.wildcard_stubbed, show),
     )
 
 
@@ -1450,6 +1500,7 @@ def pr_body(
     sorted_out = (
         set(stubbed_paths)
         | set(residue.comment_only)
+        | set(residue.generated_comment_only)
         | set(residue.title_only)
         | set(residue.path_only)
         | set(residue.literal_only)
@@ -1474,6 +1525,43 @@ def pr_body(
             *(
                 [f"> - ...and {len(residue.stubbed) - 20} more"]
                 if len(residue.stubbed) > 20
+                else []
+            ),
+            "",
+        ]
+    if residue.refusals:
+        files = list(dict.fromkeys(path for path, _, _ in residue.refusals))
+        lines += [
+            f"> **ℹ️ {len(files)} file(s) still handle a refusal this pull request "
+            "removed.** The run deleted code that refused with a message, so the "
+            "server may no longer send it, but these lines still spell it: a mapping "
+            "from the response, a test that feeds it in, a description or comment "
+            "that promises it. Nothing here names the flag, so no scan above could "
+            "find them, and nothing was changed; check whether each may now be dead:",
+            ">",
+            *[f"> - {_md_code(f'{path}:{line}')} — {_md_code(text)}" for path, line, text in residue.refusals[:20]],
+            *(
+                [f"> - ...and {len(residue.refusals) - 20}{'+' if len(residue.refusals) >= 500 else ''} more line(s)"]
+                if len(residue.refusals) > 20
+                else []
+            ),
+            "",
+        ]
+    if residue.wildcard_stubbed:
+        lines += [
+            f"> **⚠️ {len(residue.wildcard_stubbed)} test line(s) stub a read this "
+            "pull request removed with a wildcard key**, so no key says which flag "
+            "each one is for. A wildcard stub answers for every flag read through "
+            "that call, the removed one among them, and a test that relied on it "
+            "to reach the deleted branch may now fail. Check them by hand:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in residue.wildcard_stubbed[:20]
+            ],
+            *(
+                [f"> - ...and {len(residue.wildcard_stubbed) - 20} more"]
+                if len(residue.wildcard_stubbed) > 20
                 else []
             ),
             "",
@@ -1563,6 +1651,25 @@ def pr_body(
             *(
                 [f"> - ...and {len(comment_only) - len(shown)} more"]
                 if len(comment_only) > len(shown)
+                else []
+            ),
+            "",
+        ]
+    if residue.generated_comment_only:
+        shown = residue.generated_comment_only[:20]
+        lines += [
+            f"> **ℹ️ {len(residue.generated_comment_only)} "
+            "generated file(s) mention this flag only in comments.** Their text was not "
+            "listed above for rewording: a hand edit is overwritten by the next "
+            "regeneration, and a repository's drift check fails on one. The text comes "
+            "from the source the file is generated from: reword the matching text "
+            "there (among the comments listed above, if that source is in this "
+            "repository), then regenerate:",
+            ">",
+            *[f"> - {_md_code(path)}" for path in shown],
+            *(
+                [f"> - ...and {len(residue.generated_comment_only) - len(shown)} more"]
+                if len(residue.generated_comment_only) > len(shown)
                 else []
             ),
             "",
@@ -1770,6 +1877,7 @@ def pr_body(
     changed_constructors = [
         (path, text) for path, kind, text in bindings if kind == "changed constructor"
     ]
+    unread_locals = [(path, text) for path, kind, text in bindings if kind == "unread local"]
     kept_argument_locals = [
         (path, text) for path, kind, text in bindings if kind == "kept argument local"
     ]
@@ -1845,7 +1953,11 @@ def pr_body(
     lines += _failing_assertion_lines(failing_assertions)
     lines += _test_scaffolding_lines(vacuous_assertions, stale_titles)
     lines += _constant_guard_lines(constant_guards)
+    lines += _collapsed_function_lines(
+        [(path, text) for path, kind, text in bindings if kind == COLLAPSED_FUNCTION]
+    )
     lines += _kept_argument_local_lines(kept_argument_locals)
+    lines += _unread_local_lines(unread_locals)
     lines += _declared_call_lines(declared_calls)
     lines += _readiness_lines(readiness)
     lines += _hook_call_lines(hook_calls)
@@ -1853,6 +1965,22 @@ def pr_body(
     lines += _unwrapped_provider_lines(unwrapped_providers)
     lines += _discarded_call_lines(discarded_calls)
     lines += _unread_binding_lines(unread_bindings)
+    emptied_rows = [b for b in bindings if b[1] in (go_emptied.FUNCTION, go_emptied.CALL)]
+    if emptied_rows:
+        bindings = tuple(b for b in bindings if b not in emptied_rows)
+        functions = [b for b in emptied_rows if b[1] == go_emptied.FUNCTION]
+        noun = "function was" if len(functions) == 1 else "functions were"
+        lines += [
+            f"> **{len(functions)} emptied {noun} deleted, with {len(emptied_rows) - len(functions)} "
+            "call(s).** Folding the flag out left each with an empty body, so every call did "
+            "nothing. A function is deleted only when it is unexported, has no result, and every "
+            "use of its name in its package is a plain call statement whose arguments are names, "
+            "member reads or literals:",
+            ">",
+            *[f"> - {_md_code(path)} — {kind}: {_md_code(text)}" for path, kind, text in emptied_rows[:20]],
+            *([f"> - ...and {len(emptied_rows) - 20} more"] if len(emptied_rows) > 20 else []),
+            "",
+        ]
     lines += _dropped_argument_lines(dropped_arguments)
     lines += _emptied_override_lines(emptied)
     lines += _removed_comment_lines(removed_comments)
@@ -1964,6 +2092,7 @@ def pr_body(
             "",
         ]
     mocked_tests = [(path, text) for path, kind, text in test_doubles if kind == "test"]
+    setter_tests = [(path, text) for path, kind, text in test_doubles if kind == SETTER_TEST]
     sibling_tests = [(path, text) for path, kind, text in test_doubles if kind == SIBLING_TEST]
     pinned = [(path, text) for path, kind, text in test_doubles if kind == PINNED_PARAMETER]
     phases = [(path, text) for path, kind, text in test_doubles if kind == TEST_PHASE]
@@ -1971,7 +2100,9 @@ def pr_body(
     rebuilt = [(path, text) for path, kind, text in test_doubles if kind == REBUILT]
     false_titles = [(path, text) for path, kind, text in test_doubles if kind == FALSE_TITLE]
     facts = [(path, text) for path, kind, text in test_doubles if kind == THEORY_FACT]
-    renamed_methods = [(path, *text.split("\n", 1)) for path, kind, text in test_doubles if kind == RENAMED_METHOD and "\n" in text]
+    renamed_methods = [
+        (path, *[*text.split("\n", 2), ""][:3]) for path, kind, text in test_doubles if kind == RENAMED_METHOD and "\n" in text
+    ]
     gate_named = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == GATE_NAMED and ": " in text]
     duplicates = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == DUPLICATE_TEST and ": " in text]
     folded = [(path, *text.split("\n")) for path, kind, text in test_doubles if kind == FOLDED_TEST and text.count("\n") == 4]
@@ -1994,6 +2125,22 @@ def pr_body(
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in mocked_tests[:20]
             ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if setter_tests:
+        count = len(setter_tests)
+        noun = "test was" if count == 1 else "tests were"
+        lines += [
+            f"> **⚠️ {count} {noun} deleted.** Each pinned the flag with a test "
+            f"setter to `{'false' if candidate.treatment else 'true'}` — the "
+            f"**{deleted}** branch, which this pull request deletes — so its "
+            "assertions describe behaviour the code can no longer produce. The "
+            "choice was made from the setter's own literal, not the test's "
+            "name; a test whose setter pinned the kept value stayed, without "
+            "the setter:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in setter_tests[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -2101,10 +2248,15 @@ def pr_body(
         lines += [
             f"> **{count} {noun} renamed.** {'Its' if count == 1 else 'Each'} name said the gate "
             f"this pull request removes was **{kept}**, the branch it keeps, in a part of the name "
-            "of its own. Once the gate is gone that says nothing, so the part was dropped. Nothing "
-            "else in the repository spells the old name:",
+            "of its own. Once the gate is gone that says nothing, so the part was dropped. No code or "
+            "configuration spells the old name; where a document still does, it is listed under the "
+            "rename, for you to update:",
             ">",
-            *[f"> - {_md_code(path)}: {_md_code(old)} → {_md_code(new)}" for path, old, new in renamed_methods[:20]],
+            *[
+                f"> - {_md_code(path)}: {_md_code(old)} → {_md_code(new)}"
+                + (f" (the old name is still written in {written})" if written else "")
+                for path, old, new, written in renamed_methods[:20]
+            ],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -2241,6 +2393,14 @@ def pr_body(
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
+        if any(reason == "generated-barrel" for _p, _l, reason, _t in unproven):
+            lines += [
+                "> The `generated-barrel` rows import the constant through a file "
+                "that is generated and gitignored, so it is not in this checkout. "
+                "Generate it before running, so the run can follow the re-export "
+                "to the constant.",
+                "",
+            ]
     if competing:
         count = len(competing)
         noun = "declaration" if count == 1 else "declarations"
@@ -2320,7 +2480,7 @@ _WRAPPER_STATUSES = ("complete", "partial")
 _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-prose")
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
-    TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
+    TEST, SETTER_TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
     FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST, FOLDED_TEST,
 )
 

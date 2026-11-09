@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.8.1"
+version = "2.9.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -570,7 +570,18 @@ dependencies = [
     # a `#region` pair in a dead tail are declined (the Action refuses them),
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
-    "polyglot-piranha==0.48.0",
+    #
+    # 0.49.0. C#: the grammar moves to canopy-labs/tree-sitter-c-sharp
+    # 87435a0, and the C# wheel below with it to `+canopy.3`. A verbatim `""`
+    # straight after a hole is an escaped quote, so `$@"a ""{t}"""` no longer
+    # makes the rest of the file an ERROR (the file was refused, and with a
+    # read in it the whole flag). Directive text runs to the line break, `/*`
+    # included and no `\` continuation, so the code under `#region /*` is in
+    # the tree. Inside an `#if` block, a comment or string that can span lines
+    # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
+    # branch the compiler skips, that line ends the branch. Outside every
+    # `#if` block nothing is skipped and nothing is refused.
+    "polyglot-piranha==0.49.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -679,8 +690,9 @@ dependencies = [
     # C#. NOT a PyPI release, and pinned EXACTLY for the same reason as
     # tree-sitter-typescript above: Gate 1 must see the SAME node shapes the
     # engine rewrites against, or its checks silently stop matching.
-    # Since `+canopy.2` polyglot-piranha bundles canopy-labs/tree-sitter-c-sharp
-    # f7e8943: upstream's C# 14 grammar (past the 0.23.5 release, which is now
+    # Since `+canopy.3` polyglot-piranha bundles canopy-labs/tree-sitter-c-sharp
+    # 87435a0 (`+canopy.2` was f7e8943, without the two scanner fixes noted at
+    # 0.49.0 above): upstream's C# 14 grammar (past the 0.23.5 release, which is now
     # only a name) plus our patches, and this wheel is cut from that same
     # commit. The patches: `partial`, `async` and `required` parse as
     # identifiers at the start of a statement, several real-world shapes
@@ -699,7 +711,7 @@ dependencies = [
     # whenever the engine's pinned commit does. The test
     # `test_the_csharp_grammar_matches_the_engines_view_of_escaped_braces`
     # fails if the stock grammar is ever installed instead.
-    "tree-sitter-c-sharp==0.23.5+canopy.2",
+    "tree-sitter-c-sharp==0.23.5+canopy.3",
     # Dart. The ONE grammar here that is NOT the version the engine bundles,
     # and the gap is a whole restructuring rather than a skew: the engine pins
     # `tree-sitter-dart 0.3.0` (0.2.0 until engine 0.38.0: a conventional

@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import key_const, key_const_visibility, syntax
+from flag_cleanup import jvm_matchers, key_const, key_const_visibility, syntax
 
 _READ_CALLEES = frozenset({"boolVariation"})
 _TYPE_DECLS = (
@@ -1046,7 +1046,48 @@ def constant_module_pattern(constants: tuple[xk.KeyDeclaration, ...], repo_dir: 
     return xk.mention_pattern(owner_reach(constants, repo_dir).names())
 
 
+#: Mockito's equality matcher, which a stub wraps around the key: ``eq(KEY)``.
+_EQUALITY_MATCHERS = frozenset({"eq"})
+
+
+def _equality_matcher(arg: Node) -> Node | None:
+    """The ``eq(...)`` call whose only argument is ``arg``, or ``None``.
+
+    The matcher is recognised by its name, and only when it provably is the
+    library's (``ArgumentMatchers.eq``, a static import of it): a test's own
+    ``eq`` is not. It is only ever treated as the key's carrier when it is itself the key argument of a
+    read call, which is where a stub puts it.
+    """
+    args = arg.parent
+    if args is None or args.type != "argument_list" or len(args.named_children) != 1:
+        return None
+    call = args.parent
+    if call is None or call.type != "method_invocation":
+        return None
+    name = call.child_by_field_name("name")
+    if name is None or _text(name) not in _EQUALITY_MATCHERS:
+        return None
+    return call if _is_library_matcher(call) else None
+
+
+def _is_library_matcher(call: Node) -> bool:
+    """Whether the ``eq`` call is Mockito's: a fully qualified or imported
+    library qualifier, or a bare ``eq`` the file imports by name (see
+    :mod:`jvm_matchers`)."""
+    receiver = call.child_by_field_name("object")
+    root = call
+    while root.parent is not None:
+        root = root.parent
+    source = root.text.decode("utf-8", "replace")
+    if receiver is not None:
+        return jvm_matchers.qualifier_is_library(_text(receiver), source)
+    return jvm_matchers.bare_eq_is_library(source, "java")
+
+
 def _read_call(arg: Node, accessors: frozenset[str]) -> bool:
+    matcher = _equality_matcher(arg)
+    if matcher is not None:
+        arg = matcher
     args = arg.parent
     if args is None or args.type != "argument_list" or not args.named_children:
         return False
@@ -1114,6 +1155,7 @@ def references(
     accessors: frozenset[str],
     repo_dir: str,
 ) -> tuple[list[xk.KeyReference], list[xk.Refusal]]:
+    jvm_matchers.use_repo(repo_dir)
     root = syntax._parse(source, "java")
     package = _package(root)
     plain, static = _imports(root)

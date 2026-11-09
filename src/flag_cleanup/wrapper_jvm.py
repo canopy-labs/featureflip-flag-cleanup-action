@@ -58,6 +58,7 @@ def type_resolves(
     imports: Imports,
     target_package: str,
     target_name: str,
+    rivals: frozenset[str] = frozenset(),
 ) -> bool:
     """Whether a declared type, as a file spells it, can only mean the target.
 
@@ -66,6 +67,11 @@ def type_resolves(
     is declared once in the repository (:func:`qualify`), so a type from the
     file's own package can only be it, and two star imports both providing the
     name do not compile.
+
+    ``rivals`` are the packages of other top-level types of the same simple
+    name (:meth:`Index.rival_packages`). A file in one of them means its own
+    type, which beats a star import of the target's package; a star import of
+    a rival's package beside the target's is ambiguous, so it proves nothing.
     """
     fqn = f"{target_package}.{target_name}" if target_package else target_name
     if "." in type_text:
@@ -75,7 +81,51 @@ def type_resolves(
         return bound == fqn
     if type_text != target_name:
         return False
-    return file_package == target_package or target_package in imports.wildcards
+    if file_package == target_package:
+        return True
+    if file_package in rivals or imports.wildcards & rivals:
+        return False
+    return target_package in imports.wildcards
+
+
+_TYPE_NAME_NODES = frozenset({"identifier", "type_identifier", "simple_identifier"})
+_NESTED_TYPES = frozenset(
+    {
+        "class_declaration", "interface_declaration", "enum_declaration", "record_declaration",
+        "annotation_type_declaration", "object_declaration", "type_alias",
+    }
+)
+
+
+def _declared_name(node: Node) -> str | None:
+    named = node.child_by_field_name("name")
+    if named is None:
+        named = next((c for c in node.named_children if c.type in _TYPE_NAME_NODES), None)
+    return named.text.decode("utf-8", "replace") if named is not None else None
+
+
+def type_rebound(anchor: Node, type_text: str) -> bool:
+    """Whether something in scope at ``anchor`` could make the simple type name
+    ``type_text`` mean another type than an import or the package would.
+
+    An enclosing type parameter (``class U<Cfg : Base>``, ``<T> void m(T t)``)
+    and a nested class, object or typealias of an enclosing class both beat
+    every import. A qualified or generic text is not a simple name and is
+    left to :func:`type_resolves`. Nothing else in Kotlin or Java can shadow a
+    type name within a file, so the walk is complete for the scopes it climbs."""
+    if not type_text or not re.fullmatch(r"[A-Za-z_$][\w$]*", type_text):
+        return False
+    scope: Node | None = anchor
+    while scope is not None:
+        for child in scope.named_children:
+            if child.type == "type_parameters":
+                if any(_declared_name(p) == type_text for p in child.named_children if p.type == "type_parameter"):
+                    return True
+            elif scope.type in ("class_body", "enum_class_body", "interface_body", "enum_body"):
+                if child.type in _NESTED_TYPES and _declared_name(child) == type_text:
+                    return True
+        scope = scope.parent
+    return False
 
 
 @dataclass
@@ -107,9 +157,24 @@ class Index:
     #: property name -> ``(path, start byte)`` of every class-body, top-level
     #: and ``val``/``var`` constructor-parameter declaration of it.
     properties: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    #: The Kotlin properties among :attr:`properties` that ``recv.name()`` may
+    #: call: a function-typed one, or any whose type is not a plain scalar.
+    callable_properties: dict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    #: The Kotlin properties spelled with a scalar type name: (name, declaration).
+    #: Callable after all if that name is rebound (see :meth:`_settle`).
+    scalar_properties: dict[str, list[tuple[str, tuple[str, int]]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    #: Names a Kotlin ``import x as Name`` binds.
+    import_aliases: set[str] = field(default_factory=set)
     types: dict[str, list[TypeDecl]] = field(default_factory=lambda: defaultdict(list))
     #: Simple names something in the repository extends or implements.
     subclassed: set[str] = field(default_factory=set)
+    #: Simple name -> the declarations naming it as a supertype.
+    extenders: dict[str, list[TypeDecl]] = field(default_factory=lambda: defaultdict(list))
+    #: Simple names extended by an anonymous object or a Groovy/Scala class:
+    #: there is no declaration to tell apart from a same-named type.
+    loose_subclassed: set[str] = field(default_factory=set)
     #: interface simple name -> how many classes, objects and anonymous
     #: classes implement it.
     implementations: dict[str, int] = field(default_factory=lambda: defaultdict(int))
@@ -155,6 +220,10 @@ class Index:
         index.wrapper_words = _member_words(wrapper, source)
         if wrapper.kind == "property":
             words |= set(getter_names(wrapper.name))
+        elif wrapper.language == "java":
+            # A Kotlin `val x` is `getX()` to Java, and a file declaring it
+            # never spells the getter's name.
+            words |= set(property_spellings(wrapper.name))
         types = words - {wrapper.name}
         for path in cross_file_keys.mention_files(repo_dir, words, exclude=()):
             if path.endswith(FOREIGN_EXTENSIONS):
@@ -174,6 +243,7 @@ class Index:
                 continue
             index.parsed.append(path)
             index._add(path, text, words)
+        index._settle()
         if wrapper.language == "java":
             index.synthetic = _kotlin_property_reads(repo_dir, wrapper.name)
         prop = bean_property(wrapper, source)
@@ -182,6 +252,29 @@ class Index:
         if wrapper.language == "kt" and wrapper.kind == "property":
             index.synthetic = jvm_getter_calls(repo_dir, wrapper.name)
         return index
+
+    def _settle(self) -> None:
+        """A property spelled with a scalar name is still callable when that
+        name is a typealias, an import alias or a type of the repository:
+        ``typealias Boolean = () -> kotlin.Boolean``. The alias's file need
+        not mention the wrapper, so the repository is searched for it."""
+        names = {name for entries in self.scalar_properties.values() for name, _ in entries}
+        rebound = {n for n in names if n in self.type_aliases or n in self.import_aliases or self.types.get(n)}
+        todo = names - rebound
+        if todo and self.repo_dir:
+            forms = {n: re.compile(rf"\b(?:typealias|class|interface|object)\s+{re.escape(n)}\b") for n in todo}
+            for path in cross_file_keys.mention_files(self.repo_dir, sorted(todo), exclude=()):
+                if not path.endswith((".kt", ".kts")):
+                    continue
+                text = _read_text(path)
+                if text is None:
+                    self.unreadable = True
+                    continue
+                rebound |= {n for n, form in forms.items() if form.search(text)}
+        for prop, entries in self.scalar_properties.items():
+            for name, decl in entries:
+                if name in rebound:
+                    self.callable_properties[prop].append(decl)
 
     def _add_foreign(self, path: str, types: set[str]) -> None:
         """Count a Groovy or Scala class, closure coercion or anonymous class
@@ -201,6 +294,7 @@ class Index:
             count = sum(len(re.findall(form, text)) for form in forms)
             if count:
                 self.subclassed.add(name)
+                self.loose_subclassed.add(name)
                 self.implementations[name] += count
 
     def _add(self, path: str, text: str, words: set[str]) -> None:
@@ -213,6 +307,7 @@ class Index:
             self.types[decl.name].append(decl)
             for supertype in decl.supertypes:
                 self.subclassed.add(supertype)
+                self.extenders[supertype].append(decl)
                 self.implementations[supertype] += 1
         for node in cross_file_keys.walk(root):
             if node.type in ("function_declaration", "method_declaration"):
@@ -227,9 +322,27 @@ class Index:
                 prop_name = _property_name(node)
                 if prop_name is not None:
                     self.properties[prop_name].append((path, node.start_byte))
+                    scalar = _scalar_spelling(node)
+                    if scalar is None:
+                        self.callable_properties[prop_name].append((path, node.start_byte))
+                    elif not scalar.startswith("kotlin."):
+                        self.scalar_properties[prop_name].append((scalar, (path, node.start_byte)))
+            if kotlin and node.type == "import":
+                alias = _import_alias(node)
+                if alias is not None:
+                    self.import_aliases.add(alias)
             for supertype in _anonymous_supertypes(node, kotlin):
                 self.subclassed.add(supertype)
+                self.loose_subclassed.add(supertype)
                 self.implementations[supertype] += 1
+
+
+def _rival_packages(self: Index, package: str, name: str) -> frozenset[str]:
+    """The packages, other than ``package``, of the repository's types named ``name``."""
+    return frozenset(d.package for d in self.types.get(name, ()) if d.package != package)
+
+
+Index.rival_packages = _rival_packages  # type: ignore[attr-defined]
 
 
 def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str | None]:
@@ -244,13 +357,25 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
         if index.types.get(wrapper.name) or wrapper.name in index.type_aliases:
             return None, wi.NAME_NOT_UNIQUE  # `f()` would construct it or call its `invoke`
         return (wrapper, None) if len(declared) == 1 else (None, wi.NAME_NOT_UNIQUE)
+    if wrapper.owner in index.type_aliases:
+        # A typealias of the owner's simple name beats an import in its own
+        # package, and it is not a declaration the index counts.
+        return None, wi.NAME_NOT_UNIQUE
     owners = index.types.get(wrapper.owner, [])
     if len(owners) != 1:
-        return None, wi.NAME_NOT_UNIQUE
+        # Another top-level type of the same simple name in another package
+        # (an Android app's subclass of its `common` module's base class) is
+        # told apart by package: callers are resolved by `type_resolves`.
+        mine = [o for o in owners if o.path == wrapper.path and o.top_level]
+        others = [o for o in owners if o not in mine]
+        if len(mine) != 1 or not all(o.top_level and o.package != mine[0].package for o in others):
+            return None, wi.NAME_NOT_UNIQUE
+        owners = mine
     owner = owners[0]
     member = wrapper
     for supertype in owner.supertypes:
-        candidates = index.types.get(supertype, [])
+        # A type is never its own supertype: the name is another type's.
+        candidates = [c for c in index.types.get(supertype, []) if c is not owner]
         declared_in = (lambda c: c.properties) if wrapper.kind == "property" else (lambda c: c.members)
         if not any(wrapper.name in declared_in(c) for c in candidates):
             continue
@@ -290,14 +415,25 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
             + [d for n in getter_names(wrapper.name) for d in index.methods.get(n, [])]
         )
     else:
-        pool = index.methods.get(wrapper.name, [])
+        # A Kotlin property of the name (`val enableX: () -> Boolean`, or an
+        # `isX` property Java reads as `isX()`) is callable the same way.
+        # Java sees every Kotlin property as a getter; Kotlin calls only one
+        # whose type may be a function (see :meth:`Index._settle`).
+        source = index.properties if wrapper.language == "java" else index.callable_properties
+        pool = index.methods.get(wrapper.name, []) + [
+            d
+            for prop, decls in source.items()
+            if prop == wrapper.name or (wrapper.language == "java" and wrapper.name in getter_names(prop))
+            for d in decls
+        ]
     declared = [d for d in pool if d != interface_at]
     if len(declared) != 1:
         return None, wi.NAME_NOT_UNIQUE
     if (
         owner.open
         or index.wrapper_words & {"open", "abstract"}
-        or wrapper.owner in index.subclassed
+        or wrapper.owner in index.loose_subclassed
+        or any(d is not owner for d in index.extenders.get(wrapper.owner, ()))
     ):
         return None, wi.OVERRIDABLE
     return member, None
@@ -313,6 +449,17 @@ def getter_names(prop: str) -> tuple[str, ...]:
     if re.fullmatch(r"is[A-Z]\w*", prop):
         return (prop, f"get{cap}")
     return (f"get{cap}",)
+
+
+def property_spellings(method: str) -> tuple[str, ...]:
+    """The Kotlin property names Java reads as the getter ``method``:
+    ``getEnabled()`` is ``enabled``, ``getURL()`` is ``URL`` or ``uRL``, and
+    ``getIsEnabled()`` is ``isEnabled``."""
+    match = re.fullmatch(r"get([A-Z][\w$]*)", method)
+    if match is None:
+        return ()
+    rest = match.group(1)
+    return (rest, rest[0].lower() + rest[1:])
 
 
 def bean_property(wrapper: wi.Wrapper, source: str) -> str | None:
@@ -363,6 +510,47 @@ def _bean_reads(repo_dir: str, prop: str) -> list[tuple[str, int, str]]:
             if word.search(line)
         ]
     return found
+
+
+_SCALAR_TYPES = frozenset({"Boolean", "String", "Int", "Long", "Double", "Float", "Short", "Byte", "Char", "Unit"})
+
+
+def _declared_type(node: Node) -> str | None:
+    """The type a Kotlin property or constructor parameter is declared with,
+    or None when it is inferred. An extension property's receiver is a direct
+    child of the declaration and is not its type: the type is read from the
+    ``variable_declaration`` (a constructor parameter has no receiver, and
+    holds its type directly)."""
+    holder = node
+    if node.type == "property_declaration":
+        holder = next((c for c in node.named_children if c.type == "variable_declaration"), None)
+        if holder is None:
+            return None
+    for child in holder.named_children:
+        if child.type in ("user_type", "nullable_type", "function_type"):
+            return child.text.decode("utf-8", "replace").rstrip("?").strip()
+    return None
+
+
+def _scalar_spelling(node: Node) -> str | None:
+    """The plain scalar type name ``node`` is spelled with, or None when it
+    is inferred, function-typed or any other type. Whether that name really
+    is the scalar depends on the whole index (see :meth:`Index._settle`)."""
+    text = _declared_type(node)
+    if text is None:
+        return None
+    if text.startswith("kotlin.") and text[len("kotlin.") :] in _SCALAR_TYPES:
+        return text  # fully qualified: no typealias or import alias can rebind it
+    return text if text in _SCALAR_TYPES else None
+
+
+def _import_alias(node: Node) -> str | None:
+    """``Name`` for ``import a.b as Name``, else None."""
+    children = node.children
+    for i, child in enumerate(children):
+        if child.type == "as" and i + 1 < len(children):
+            return _text(children[i + 1])
+    return None
 
 
 def _property_name(node: Node) -> str | None:

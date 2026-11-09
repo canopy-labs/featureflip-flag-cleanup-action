@@ -122,9 +122,11 @@ def remove_unused_options(
     rewritten: dict[str, tuple[str, str]] = {}
     labels: list[tuple[str, str]] = []
     done: list[DroppedOption] = []
+    #: The mocks' half of the proof, once per callee: it reads the whole checkout.
+    proofs: dict[tuple[str, str], object] = {}
     for option in dict.fromkeys(options):
         by_resolved = {str(Path(p).resolve()): p for p in state}
-        planned = _plan(option, state, by_resolved, files, taken, repo_dir)
+        planned = _plan(option, state, by_resolved, files, taken, repo_dir, proofs)
         if planned is None:
             continue
         edits, declaring, label = planned
@@ -139,7 +141,7 @@ def remove_unused_options(
     return Removed(rewritten, tuple(labels), tuple(done))
 
 
-def _plan(option, state, by_resolved, run_files, taken, repo_dir):
+def _plan(option, state, by_resolved, run_files, taken, repo_dir, proofs):
     """``({file: (deletions, replacements)}, declaring path, label)``, or None."""
     found = _read(option.path, state, by_resolved)
     if found is None:
@@ -180,6 +182,8 @@ def _plan(option, state, by_resolved, run_files, taken, repo_dir):
         solution=True,
     )
     if users is None:
+        users = _mocked_users(option, decl, allowed, state, by_resolved, repo_dir, proofs)
+    if users is None:
         return None
     deletions: dict[_File, list[tuple[int, int]]] = {}
     for file in users:
@@ -210,6 +214,38 @@ def _plan(option, state, by_resolved, run_files, taken, repo_dir):
         return None
     node = found_option.parameter if found_option.sole else found_option.member
     return edits, spelled, _one_line(node.text.decode("utf-8"))
+
+
+def _mocked_users(option, decl, allowed, state, by_resolved, repo_dir, proofs):
+    """The users :func:`_plan` proves, when a test mocks the function's
+    module: a stand-in receives the calls' arguments, so only one that cannot
+    see as far as the option's parameter is followed; see
+    :mod:`flag_cleanup.ts_mock_callee`."""
+    from flag_cleanup import ts_mock_callee
+
+    key = (str(Path(option.path).resolve()), option.function)
+    if key not in proofs:
+        proofs[key] = ts_mock_callee.prepare(option.path, option.function, repo_dir)
+    proof = proofs[key]
+    if proof is None:
+        return None
+    users = _users(
+        option.function,
+        decl,
+        allowed,
+        state,
+        by_resolved,
+        repo_dir,
+        in_run=lambda _path: True,
+        use=_callee,
+        solution=True,
+        use_in=proof.use_in,
+        factories=True,
+        loadable=proof.loadable(repo_dir),
+    )
+    if users is None or proof.reach > option.position:
+        return None
+    return users
 
 
 def _plain(function: Node) -> bool:

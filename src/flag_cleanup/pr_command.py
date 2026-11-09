@@ -47,6 +47,7 @@ from flag_cleanup import (
     forwarder_csharp,
     git_ops,
     github_ops,
+    go_setters,
     inert_calls,
     inert_load,
     orchestrate,
@@ -608,7 +609,7 @@ def _regenerate(
             config.side_effect_free_modules
         ), inert_calls.declaring(
             config.side_effect_free_calls
-        ), orchestrate.piranha_transform(
+        ), go_setters.declaring(config.test_setters), orchestrate.piranha_transform(
             candidate, config, ledger, known_flag_keys
         ) as (
             diff,
@@ -636,7 +637,7 @@ def _regenerate(
                 # complete.
                 raise transform_error
             unprocessed = orchestrate.all_unprocessed(config, key, unprocessable)
-            residue = orchestrate.sort_residue(config, unprocessed, key)
+            residue = orchestrate.sort_residue(config, unprocessed, key, diff)
             wrappers = pr_content.without_inlined(
                 constant_wrappers.find_constant_wrappers(diff, config.directories),
                 wrapper_findings,
@@ -881,7 +882,7 @@ def _dry_run_caveats(
     # A file naming the flag only in kept comments is counted as what it is.
     # So is one naming its key only as plain strings in no flag read.
     unprocessed = tuple(
-        path for path in unprocessed if path not in {*residue.comment_only, *residue.plain_strings}
+        path for path in unprocessed if path not in {*residue.comment_only, *residue.generated_comment_only, *residue.plain_strings}
     )
     if unprocessed:
         notes.append(f"{len(unprocessed)} file(s) would still reference this flag")
@@ -912,6 +913,7 @@ def _dry_run_caveats(
     scaffolding = sum(1 for _, kind, _ in bindings if kind in (VACUOUS_ASSERTION, STALE_TITLE))
     removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
+    unread_locals = sum(1 for _, kind, _ in bindings if kind == "unread local")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
     failing = sum(1 for _, kind, _ in bindings if kind == "failing assertion")
     declared_loads = sum(1 for _, kind, _ in bindings if kind == DECLARED_LOAD)
@@ -935,7 +937,7 @@ def _dry_run_caveats(
     cleaned = (
         len(bindings) - unread - unread_members - unread_ctor - unread_bindings - emptied - dropped
         - left_out
-        - removed_ctor - removed_members - changed_ctor - kept_locals - removed_comments - reworded_comments
+        - removed_ctor - removed_members - changed_ctor - kept_locals - unread_locals - removed_comments - reworded_comments
         - failing
         - state_comments
         - call_site
@@ -1011,6 +1013,8 @@ def _dry_run_caveats(
         notes.append(
             f"{renamed_tests} test title(s) naming this flag's kept branch would be rewritten"
         )
+    if unread_locals:
+        notes.append(f"{unread_locals} local(s) would be left unread after the flag read was removed")
     if kept_locals:
         notes.append(
             f"{kept_locals} local(s) would be left unread after their argument was removed"
@@ -1068,7 +1072,7 @@ def _dry_run_caveats(
             f"{len(declined)} flag-keyed {noun} would be LEFT IN PLACE, pinning "
             "the flag to the branch being removed"
         )
-    removed_tests = sum(1 for _, kind, _ in test_doubles if kind == "test")
+    removed_tests = sum(1 for _, kind, _ in test_doubles if kind in ("test", "setter test"))
     sibling_tests = sum(1 for _, kind, _ in test_doubles if kind == "sibling test")
     pinned = sum(1 for _, kind, _ in test_doubles if kind == "pinned parameter")
     phases = sum(1 for _, kind, _ in test_doubles if kind == "test phase")
@@ -1123,6 +1127,21 @@ def _dry_run_caveats(
         files = len({path for path, _ in residue.stubbed})
         notes.append(
             f"{files} test file(s) would still stub the removed read"
+        )
+    if residue.wildcard_stubbed:
+        notes.append(
+            f"{len(residue.wildcard_stubbed)} test line(s) would still stub the "
+            "removed read with a wildcard key"
+        )
+    if residue.generated_comment_only:
+        notes.append(
+            f"{len(residue.generated_comment_only)} generated file(s) would still name this flag in "
+            "comments, to be fixed in their source and regenerated"
+        )
+    if residue.refusals:
+        notes.append(
+            f"{len({path for path, _, _ in residue.refusals})} file(s) would still handle a "
+            "refusal the removal deleted"
         )
     if deleted_tests:
         notes.append(

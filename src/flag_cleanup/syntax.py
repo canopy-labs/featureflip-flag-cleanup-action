@@ -2616,6 +2616,89 @@ def _mock_stubbed_literals(source: str, language: str) -> int:
     return len(pattern.findall(source))
 
 
+#: Annotations that make a Java method run around the tests rather than as one.
+_JAVA_SETUP_ANNOTATIONS = frozenset(
+    {"BeforeEach", "BeforeAll", "Before", "BeforeClass", "BeforeMethod", "BeforeTest", "BeforeSuite"}
+)
+_STUB_VALUE = re.compile(r"\s*\.\s*(?:thenReturn|willReturn)\(\s*(true|false)?\s*([^)]*)")
+
+#: Why a folded stub could not be decided, in the order they are reported.
+_STUB_SHAPE_REASONS = (
+    (
+        "setup",
+        "a setup method stubs the value the flag no longer has, so there is no one test to delete",
+    ),
+    (
+        "both",
+        "one test stubs both values of the flag, so the stub of the removed value cannot be told "
+        "from the one that stays",
+    ),
+    (
+        "nonliteral",
+        "a stub answers with something other than a plain true or false literal, so "
+        "which branch it pins is not known",
+    ),
+)
+
+
+def _java_stub_shapes(source: str) -> dict[str, int]:
+    """How many folded Java stubs (``when(true)``) are of each undecidable shape.
+
+    ``setup``: in a method that runs around the tests (``@BeforeEach``…), or
+    outside any method. ``both``: a method holding stubs that answer ``true``
+    and ``false``. ``nonliteral``: a stub whose answer is not a literal. The
+    shapes are exclusive, in that order.
+    """
+    root = _parse(source, "java")
+    data = source.encode("utf-8")
+    found: list[tuple[Node | None, str | None]] = []
+    for match in _MOCK_STUBBED_LITERAL.finditer(source):
+        start = len(source[: match.start()].encode("utf-8"))
+        node = root.descendant_for_byte_range(start, start)
+        while node is not None and node.type not in ("method_declaration", "constructor_declaration"):
+            node = node.parent
+        answer = _STUB_VALUE.match(source, match.end())
+        if answer is None:
+            value = None
+        elif answer.group(1) and not answer.group(2).strip():
+            value = answer.group(1)
+        else:
+            value = "?"
+        found.append((node, value))
+    answers: dict[int, set[str | None]] = {}
+    for node, value in found:
+        if node is not None:
+            answers.setdefault(node.id, set()).add(value)
+    shapes = {"setup": 0, "both": 0, "nonliteral": 0}
+    for node, value in found:
+        if node is None:
+            shapes["setup"] += 1
+            continue
+        modifiers = next((c for c in node.children if c.type == "modifiers"), None)
+        names = set()
+        for annotation in modifiers.named_children if modifiers is not None else ():
+            name = annotation.child_by_field_name("name")
+            if annotation.type in ("annotation", "marker_annotation") and name is not None:
+                names.add(data[name.start_byte : name.end_byte].decode("utf-8").rsplit(".", 1)[-1])
+        if names & _JAVA_SETUP_ANNOTATIONS:
+            shapes["setup"] += 1
+        elif {"true", "false"} <= answers[node.id]:
+            shapes["both"] += 1
+        elif value in (None, "?"):
+            shapes["nonliteral"] += 1
+    return shapes
+
+
+def _stub_refusal(before: str, after: str, language: str) -> str:
+    """The reason a folded stub is refused, naming its shape where it is known."""
+    generic = "a test double now stubs a literal where the flag read was"
+    if language != "java":
+        return generic
+    now, was = _java_stub_shapes(after), _java_stub_shapes(before)
+    named = [text for shape, text in _STUB_SHAPE_REASONS if now[shape] > was[shape]]
+    return f"{generic}: " + "; ".join(named) if named else generic
+
+
 #: What follows a value to read a member of it. PHP's `.` joins strings, and
 #: its members are `->`.
 _MEMBER_ACCESS = re.compile(rb"\s*(?:\?\.|&\.|\.(?![.\d])|\[)")
@@ -2648,6 +2731,66 @@ def _literal_members(source: str, language: str) -> int:
         and data[max(0, node.start_byte - 1) : node.start_byte] != b"."
         and pattern.match(data, node.end_byte) is not None
     )
+
+
+#: Wrappers that change a value's type, not its identity: ``(read() as T)``,
+#: ``read()!``, ``read() satisfies T``, ``(read())``.
+_VALUE_TRANSPARENT = frozenset(
+    {"parenthesized_expression", "as_expression", "non_null_expression", "satisfies_expression", "type_assertion"}
+)
+_DESTRUCTURING_PATTERNS = frozenset({"object_pattern", "array_pattern"})
+
+
+def _structural_literal_uses(source: str, language: str) -> int:
+    """TS/JS boolean literals consumed STRUCTURALLY rather than as a boolean.
+
+    A read whose result is an object folds to a literal wherever it stands, and
+    only a few positions accept a boolean there. Counted: the initializer or
+    default of an object/array destructuring (``const {value} = true``,
+    ``[a] = true``, ``({a} = true) =>``), the object of a member, subscript or
+    optional access, the callee of a call or tagged template, the target of
+    ``new``, a spread, the iterable of ``for..of``/``for..in`` and the right of
+    ``in``. Each parses; each fails ``tsc`` or yields ``undefined`` at run time.
+    The member forms with a leading ``.``/``?.``/``[`` are also in
+    :func:`_literal_members`; this is the closed list of tree positions.
+    """
+    if language not in _TS_LANGUAGES:
+        return 0
+    root = ts_syntax._parse(source, language)
+    count = 0
+    for node in _walk(root):
+        if node.type not in ("true", "false"):
+            continue
+        child, parent = node, node.parent
+        while parent is not None and parent.type in _VALUE_TRANSPARENT:
+            child, parent = parent, parent.parent
+        if parent is None:
+            continue
+        kind = parent.type
+
+        def is_field(name: str) -> bool:
+            held = parent.child_by_field_name(name)
+            return held is not None and held.id == child.id
+
+        if kind in ("variable_declarator", "assignment_expression", "assignment_pattern", "required_parameter", "optional_parameter"):
+            pattern = parent.child_by_field_name("left" if kind in ("assignment_expression", "assignment_pattern") else "name" if kind == "variable_declarator" else "pattern")
+            value_field = "right" if kind in ("assignment_expression", "assignment_pattern") else "value"
+            if is_field(value_field) and pattern is not None and pattern.type in _DESTRUCTURING_PATTERNS:
+                count += 1
+        elif kind in ("member_expression", "subscript_expression"):
+            count += is_field("object")
+        elif kind == "call_expression":
+            count += is_field("function")
+        elif kind == "new_expression":
+            count += is_field("constructor")
+        elif kind == "spread_element":
+            count += 1
+        elif kind == "for_in_statement":
+            count += is_field("right")
+        elif kind == "binary_expression":
+            operator = parent.child_by_field_name("operator")
+            count += is_field("right") and operator is not None and operator.type == "in"
+    return count
 
 
 def _called_literals(source: str, language: str) -> int:
@@ -2755,9 +2898,16 @@ def refusal_reason(
         if blade_code.balance(after, names) != 0:
             return "the rewrite left a Blade block without its opener or its closer"
     if _mock_stubbed_literals(after, language) > _mock_stubbed_literals(before, language):
-        return "a test double now stubs a literal where the flag read was"
+        return _stub_refusal(before, after, language)
     if _literal_members(after, language) > _literal_members(before, language):
         return "the flag read's result is used as an object, so it is not a boolean read"
+    if _structural_literal_uses(after, language) > _structural_literal_uses(before, language):
+        # Destructured, called, spread, constructed or iterated: the same
+        # "result is an object" verdict as the member form, by tree position.
+        return (
+            "the flag read's result is used as an object (destructured, called, "
+            "spread, constructed, iterated or read for a member), so it is not a boolean read"
+        )
     # Same placement argument: the multi-way guard residue is keyed for the TS
     # family as well as for Kotlin, so it must run ahead of the delegation.
     if _multiway_literal_arms(after, language) > _multiway_literal_arms(before, language):

@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, ruby_owner_reach, source_index
+from flag_cleanup import git_ops, github_ops, go_setters, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, removed_refusals, ruby_owner_reach, source_index, wildcard_stubs
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -470,7 +470,7 @@ def run(
         # The declared side-effect-free modules hold for the same span.
         with source_index.run_scope(), inert_load.declaring(
             config.side_effect_free_modules
-        ), inert_calls.declaring(config.side_effect_free_calls):
+        ), inert_calls.declaring(config.side_effect_free_calls), go_setters.declaring(config.test_setters):
             proposed = 0
             for candidate in resolved_client.removal_candidates(
                 config.org, config.project, config.staleness
@@ -756,7 +756,7 @@ def _process_candidate(
         # preview a real run would have contradicted the real run's own body.
         if transform_error is None:
             unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-            sorted_residue = sort_residue(config, unprocessed, candidate.key)
+            sorted_residue = sort_residue(config, unprocessed, candidate.key, diff)
             enum_held = sorted_residue.enum_held
             wrappers = without_inlined(
                 find_constant_wrappers(diff, config.directories), wrapper_findings
@@ -932,7 +932,7 @@ def _process_candidate_for_pr(
                 unprocessed = all_unprocessed(config, candidate.key, unprocessable)
                 # Sorted while the rewrite is still on disk, for the same
                 # reason `unprocessed` is computed here.
-                residue = sort_residue(config, unprocessed, candidate.key)
+                residue = sort_residue(config, unprocessed, candidate.key, diff)
                 sorted_residue = residue
                 enum_held = residue.enum_held
                 # Same window, same reason: the members it reads are only
@@ -2092,9 +2092,16 @@ _TEMPLATE_SUFFIXES = frozenset({".twig", ".latte", ".tpl", ".volt", ".j2", ".jin
 #: only when the key sits inside a ``{% … %}`` or ``{{ … }}`` tag.
 _PAGE_TEMPLATE_SUFFIXES = frozenset({".html", ".htm"})
 _TEMPLATE_TAG = re.compile(r"\{%.*?%\}|\{\{.*?\}\}", re.DOTALL)
+#: .NET views: Razor (``.cshtml``, ``.razor``, VB's ``.vbhtml``) and Web Forms
+#: (``.aspx``, ``.ascx``, ``.master``). Their code is C# or VB inside markup,
+#: which no language here parses, so a read there
+#: (``@if (await FeatureManager.IsEnabledAsync("key"))``, the
+#: ``<feature name="key">`` tag helper) is never rewritten. Any mention counts,
+#: as in a HAML view: the suffix says the file is a template.
+_DOTNET_VIEW_SUFFIXES = frozenset({".cshtml", ".razor", ".vbhtml", ".aspx", ".ascx", ".master"})
 
 #: What :func:`_unprocessed_references` reads: every suffix the tool knows, the
-#: server templates above, and the Ruby no language rewrites. That is views
+#: server templates and .NET views above, and the Ruby no language rewrites. That is views
 #: (``.haml``, ``.slim``, ``.jbuilder``), project files (``config.ru``, a ``.gemspec``) and, among
 #: files with no suffix, a ``Rakefile``, a ``Gemfile`` or a script with a Ruby
 #: shebang. A read in one of them survives every removal, so this caveat is the
@@ -2106,6 +2113,7 @@ _RESIDUE_SUFFIXES = (
     | source_index.NO_SUFFIX
     | _TEMPLATE_SUFFIXES
     | _PAGE_TEMPLATE_SUFFIXES
+    | _DOTNET_VIEW_SUFFIXES
 )
 
 
@@ -2139,7 +2147,7 @@ def all_unprocessed(
 
 def _not_comment_only(unprocessed: tuple[str, ...], sorted_out: Residue) -> tuple[str, ...]:
     """``unprocessed`` without the files whose every mention is a kept comment."""
-    prose = set(sorted_out.comment_only)
+    prose = {*sorted_out.comment_only, *sorted_out.generated_comment_only}
     return tuple(path for path in unprocessed if path not in prose)
 
 
@@ -2165,6 +2173,30 @@ def _warn_on_unprocessed_references(
                 f"{show(path)}:{line}: {text}" for path, line, text in sorted_out.comment_lines
             ),
         )
+    if sorted_out.generated_comment_only:
+        logger.info(
+            "%d generated file(s) name flag %r only in comments; reword the text in their source "
+            "and regenerate them: %s",
+            len(sorted_out.generated_comment_only),
+            flag_key,
+            ", ".join(map(show, sorted_out.generated_comment_only)),
+        )
+    if sorted_out.refusals:
+        logger.info(
+            "%d line(s) still spell a refusal message the removal of flag %r deleted; "
+            "check whether they are dead: %s",
+            len(sorted_out.refusals),
+            flag_key,
+            "; ".join(f"{path}:{line}: {text}" for path, line, text in sorted_out.refusals),
+        )
+    if sorted_out.wildcard_stubbed:
+        logger.warning(
+            "%d test line(s) stub a read the removal of flag %r deleted with a "
+            "wildcard key, so they may stub this flag; check them by hand: %s",
+            len(sorted_out.wildcard_stubbed),
+            flag_key,
+            "; ".join(f"{show(path)}: {text}" for path, text in sorted_out.wildcard_stubbed),
+        )
     unprocessed = _not_comment_only(unprocessed, sorted_out)
     if unprocessed:
         # Deliberately does NOT name a single cause. The list has three sources
@@ -2186,15 +2218,43 @@ def _warn_on_unprocessed_references(
         )
 
 
-def sort_residue(config: Config, unprocessed: tuple[str, ...], flag_key: str) -> Residue:
+def sort_residue(
+    config: Config, unprocessed: tuple[str, ...], flag_key: str, diff: str = ""
+) -> Residue:
     """``unprocessed`` sorted by :func:`~flag_cleanup.residue.classify`, with
-    the files outside the swept directories that name the flag beside it.
+    the files outside the swept directories that name the flag beside it,
+    and the test lines stubbing a read ``diff`` removed with a wildcard key.
 
     Public: ``pr_command`` regenerates the body through the same path."""
     return replace(
         classify_residue(unprocessed, flag_key, config.accessors),
         outside=outside_mentions(config, flag_key),
+        wildcard_stubbed=wildcard_stub_lines(config, diff),
+        refusals=refusal_lines(config, diff),
     )
+
+
+def refusal_lines(config: Config, diff: str) -> tuple[tuple[str, int, str], ...]:
+    """:func:`flag_cleanup.removed_refusals.find` over the whole checkout, for
+    the refusal messages ``diff`` deleted."""
+    messages = removed_refusals.removed_messages(diff) if diff else ()
+    if not messages or not config.directories:
+        return ()
+    return removed_refusals.find(Path(checkout_root(config.directories[0])).resolve(), messages, _SKIP_DIRS | _GENERATED_DIRS)
+
+
+def wildcard_stub_lines(config: Config, diff: str) -> tuple[tuple[str, str], ...]:
+    """:func:`flag_cleanup.wildcard_stubs.find` over the swept directories,
+    for the read callees ``diff`` removed a call of. Deduplicated by resolved
+    path, like the residual scan, for overlapping directories."""
+    names = wildcard_stubs.removed_reads(diff, config.accessors) if diff else frozenset()
+    if not names:
+        return ()
+    seen: dict[str, Path] = {}
+    for directory in config.directories:
+        for path in source_files(Path(directory), wildcard_stubs.SUFFIXES, _SKIP_DIRS | _GENERATED_DIRS):
+            seen.setdefault(str(path.resolve()), path)
+    return wildcard_stubs.find(seen.values(), names)
 
 
 def outside_mentions(config: Config, flag_key: str) -> tuple[str, ...]:

@@ -292,6 +292,11 @@ def remove(
             ):
                 # A deleted first import leaves the blank line after it.
                 tidied = tidy_lines(marked[key], tidied)
+            if language == "kt":
+                # The only constructor parameter went: no `class Svc() {`.
+                for _, removal in removals:
+                    if removal.param_name is not None and _key(removal.declaring_path) == key:
+                        tidied = ctor_param_jvm.drop_empty_primary_constructor(tidied, removal.class_name)
             if b"\r" in tidied:
                 tidied = syntax.collapse_introduced_carriage_returns(
                     _decode(marked[key]), _decode(tidied), _grammar(key, language)

@@ -94,7 +94,7 @@ from dataclasses import dataclass, field
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import key_const, key_const_visibility, kotlin_sentinel
+from flag_cleanup import jvm_matchers, key_const, key_const_visibility, kotlin_sentinel
 
 #: The callees the pre-pass marks, the same object. OpenFeature's
 #: `getBooleanValue` is a read here in EVERY file, on purpose: its per-file
@@ -548,8 +548,44 @@ def _in_type_body(node: Node) -> bool:
     return False
 
 
+def _equality_matcher(value: Node) -> Node | None:
+    """The ``eq(value)`` call whose only argument is ``value``, or ``None``.
+
+    Recognised by name, and only when it provably is the library's (imported
+    from it, or written qualified by it; a file's own ``eq`` is not): it carries the
+    key only when it is itself the key argument of a read, which is where a
+    stub puts it, and the test-double pass resolves that stub before the
+    engine runs. One it does not resolve is left naming the constant, and the
+    run's close-out check refuses it rather than deleting the declaration."""
+    argument = value.parent
+    if argument is None or argument.type != "value_argument" or len(argument.named_children) != 1:
+        return None
+    arguments = argument.parent
+    if arguments is None or arguments.type != "value_arguments" or len(arguments.named_children) != 1:
+        return None
+    call = arguments.parent
+    if call is None or call.type != "call_expression" or not call.named_children:
+        return None
+    callee = call.named_children[0]
+    if kotlin_sentinel._method_name(callee) != "eq":
+        return None
+    root = call
+    while root.parent is not None:
+        root = root.parent
+    source = root.text.decode("utf-8", "replace")
+    if callee.type == "navigation_expression":
+        qualifier = callee.text.decode("utf-8", "replace").rsplit(".", 1)[0]
+        return call if jvm_matchers.qualifier_is_library(qualifier, source) else None
+    if jvm_matchers.bare_eq_is_library(source, "kt"):
+        return call
+    if jvm_matchers.inside_mockk_scope(call) and jvm_matchers.mockk_scope_eq_is_library(source):
+        return call
+    return None
+
+
 def _is_read(value: Node, accessors: frozenset[str]) -> bool:
     """``value`` is the whole first argument of a call the pre-pass marks."""
+    value = _equality_matcher(value) or value
     argument = value.parent
     if argument is None or argument.type != "value_argument":
         return False
@@ -1056,6 +1092,7 @@ def references(
     accessors: frozenset[str],
     repo_dir: str,
 ) -> tuple[list[xk.KeyReference], list[xk.Refusal]]:
+    jvm_matchers.use_repo(repo_dir)
     root = _parse(source)
     if root.has_error:
         lines = source.splitlines()

@@ -1,0 +1,55 @@
+# Templates for an accessor whose key is not its first argument AND is held in
+# a constant of the same file: `get[1]` in the `accessors` input is
+# `get(state, OLD_CHECKOUT)`. See `ts_key_positions.toml`, whose literal block
+# this is the constant form of, and `ts_const.toml`, whose first-argument
+# rules it mirrors.
+#
+# Never run as written, never staged: `rule_synthesis.with_accessors` clones it
+# once per such accessor. `key_const._ts_is_removable_read` is the other half:
+# it counts a reference in exactly this slot as a read these rules remove, and
+# nothing else, so the declaration goes only when every reference is one.
+
+[[rules]]
+name = "accessor_template__const_key_at_position"
+# accessor-template: key-position
+query = """(
+  (call_expression
+    function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+               (identifier) @sdk_fn]
+    arguments: (arguments . __KEY_POSITION__(identifier) @key_const)
+  ) @call
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+)"""
+replace_node = "call"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated", "stale_flag_name"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+not_contains = ["""((spread_element) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules.filters]]
+enclosing_node = """(
+  [(program
+     [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string . (string_fragment) @flag_name .)) .)
+      (export_statement declaration: (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: (string . (string_fragment) @flag_name .)) .))])
+   (statement_block
+     (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: (string . (string_fragment) @flag_name .)) .))] @scope
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @decl_name "@key_const")
+)"""

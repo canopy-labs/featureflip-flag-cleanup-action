@@ -881,17 +881,29 @@ def runner_config_doubles(repo_dir: str, wrapper: wi.Wrapper, configs: list[Path
 # --- The wrapper's module handed on ------------------------------------------------
 
 
-def _barrels(path: str, text: str, modules: set[str], repo_dir: str) -> list[tuple[int, int]]:
+def _barrels(
+    path: str, text: str, modules: set[str], repo_dir: str, named: bool = False
+) -> list[tuple[int, int]]:
     """The byte span of each ``export * from`` one of ``modules`` in a file:
     a barrel, which re-exports the wrapper but never hands on a module object
     itself. ``export * as ns``, ``export type *`` and a file that does not
-    parse are left to the escape scan."""
+    parse are left to the escape scan.
+
+    With ``named``, a plain ``export { a, b as c } from`` is one too: it hands
+    on those exports and never the module. A key constant's scan asks for it,
+    since the barrel's own line for a constant is judged where it is
+    (:func:`flag_cleanup.cross_file_ts.references`); a function wrapper's does
+    not, as its re-export has always been refused."""
     root = ts_scope.parse(text, path)
     if root.has_error:
         return []
     found = []
     for node in root.named_children:
-        if node.type != "export_statement" or not any(c.type == "*" for c in node.children):
+        if node.type != "export_statement":
+            continue
+        starred = any(c.type == "*" for c in node.children)
+        clause = any(c.type == "export_clause" for c in node.named_children)
+        if not (starred or (named and clause)):
             continue
         if any(c.type in ("namespace_export", "type") for c in node.children):
             continue
@@ -917,7 +929,7 @@ def module_escapes(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, s
     return handed_on(repo_dir, wrapper.path)
 
 
-def handed_on(repo_dir: str, module_path: str) -> list[tuple[str, int, str]]:
+def handed_on(repo_dir: str, module_path: str, named: bool = False) -> list[tuple[str, int, str]]:
     """``(path, line, text)`` of each use that hands the module at
     ``module_path`` on as an object (:func:`cross_file_ts.module_escapes`),
     which can then reach any of its exports by a name computed at run time.
@@ -950,7 +962,7 @@ def handed_on(repo_dir: str, module_path: str) -> list[tuple[str, int, str]]:
             text = texts[path]
             if text is None or not path.endswith(ts_scope.FAMILY_EXTENSIONS):
                 continue
-            spans = _barrels(path, text, frontier, repo_dir)
+            spans = _barrels(path, text, frontier, repo_dir, named)
             if spans:
                 followed.setdefault(path, []).extend(spans)
                 found.add(str(Path(path).resolve()))

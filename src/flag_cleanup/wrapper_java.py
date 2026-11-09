@@ -476,9 +476,15 @@ def occurrences(
     if wrapper.interface is not None and path == wrapper.interface.path:
         skip.add(wrapper.interface.start)
 
+    at: list[Node | None] = [None]
+
     def resolves(type_text: str) -> str | None:
+        if at[0] is not None and wrapper_jvm.type_rebound(at[0], type_text):
+            return wi.RECEIVER_UNPROVEN
         if any(
-            wrapper_jvm.type_resolves(type_text, package, imports, pkg, name)
+            wrapper_jvm.type_resolves(
+                type_text, package, imports, pkg, name, index.rival_packages(pkg, name)
+            )
             for pkg, name in targets
         ):
             return None
@@ -491,6 +497,7 @@ def occurrences(
     for node in cross_file_keys.walk(root):
         if node.type != "identifier" or _text(node) != wrapper.name:
             continue
+        at[0] = node
         parent = node.parent
         if parent is None or parent.type in ("import_declaration", "scoped_identifier"):
             continue

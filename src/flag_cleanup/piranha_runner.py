@@ -83,6 +83,7 @@ else:  # pragma: no cover - project requires >=3.11
 from polyglot_piranha import PiranhaArguments, execute_piranha
 
 from flag_cleanup import (
+    py_key_survivors,
     contradicting,
     cs_kept_tests,
     cs_orphan_usings,
@@ -97,18 +98,23 @@ from flag_cleanup import (
     cross_file_python,
     discarded_calls,
     failing_assertions,
+    go_emptied,
+    go_setters,
     inert_calls,
+    jvm_matchers,
     inert_load,
     file_deletion,
     git_ops,
     go_dead_code,
     go_initializers,
     go_arity,
+    go_two_value,
     go_inline,
     go_stranded,
     jvm_constant_fields,
     jvm_emptied_tests,
     jvm_test_titles,
+    jvm_class_eligibility,
     jvm_unread_members,
     key_const,
     line_width,
@@ -128,6 +134,7 @@ from flag_cleanup import (
     comment_conjuncts,
     comment_sentences,
     stale_comments,
+    ts_barrels,
     ts_bound_overrides,
     ts_constant_params,
     ts_constant_props,
@@ -138,6 +145,8 @@ from flag_cleanup import (
     ts_unread_props,
     ts_fold,
     ts_gates,
+    ts_object_reads,
+    ts_key_survivors,
     ts_param_pins,
     ts_readiness_gates,
     ts_unused_options,
@@ -147,6 +156,7 @@ from flag_cleanup import (
 )
 from flag_cleanup.kotlin_sentinel import Rewrite
 from flag_cleanup.php_fold import fold_literal_conditions as fold_php_literal_conditions
+from flag_cleanup import python_constant_function
 from flag_cleanup.python_fold import inline_literal_bindings, marker_for
 from flag_cleanup.key_const_visibility import VisibleKeyConst
 from flag_cleanup.syntax import (
@@ -165,11 +175,12 @@ from flag_cleanup.primary_constructor import unread_parameters
 from flag_cleanup.ts_unread_members import unread_constructor_parameters, unread_members
 from flag_cleanup.ts_syntax import count_syntax_errors, strip_dangling_type_separators
 from flag_cleanup.inert_load import DECLARED_LOAD
-from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_bindings
+from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_bindings, unread_locals
 
 logger = logging.getLogger(__name__)
 
 from flag_cleanup import rule_synthesis
+from flag_cleanup import ts_async_reads
 
 RULES_DIR = Path(__file__).parent / "rules"
 
@@ -662,6 +673,10 @@ KNOWN_EXTENSIONS = frozenset(
 _SKIP_DIRS = frozenset({".git", "node_modules"})
 
 
+#: The languages whose rules can read a key that is not the first argument.
+KEY_POSITION_LANGUAGES = frozenset({"python", "ts", "tsx", "js"})
+
+
 def supported_languages() -> tuple[str, ...]:
     """Return the language tokens ``run_piranha`` accepts."""
     return tuple(_LANGUAGES)
@@ -781,7 +796,7 @@ def candidate_files(
                 text = Path(mention).read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue  # never admitted; the wrapper pass reports it
-            if flag_key in text:
+            if _names_key(text, flag_key, mention):
                 continue  # its own run rewrites it
             if _claimed(claims, root, siblings, flag_key, accessors, True).search(text):
                 continue  # a candidate of another run of the family as well
@@ -828,7 +843,9 @@ def _own_candidates(root: Path, language: str, flag_key: str) -> list[str]:
     holders = _candidate_files(root, spec.extensions, flag_key, spec.excludes)
     if not cross_file_keys.supported(language):
         return holders
-    names = _key_const_names(holders, language, flag_key)
+    names = cross_file_keys.with_aliases(
+        str(root), language, _key_const_names(holders, language, flag_key)
+    )
     resolved_root = root.resolve()
     readers = [
         mention
@@ -882,7 +899,9 @@ def _candidate_files_without_wrappers(
     found = _candidate_files(root, spec.extensions, flag_key, spec.excludes)
     if not cross_file_keys.supported(language):
         return found
-    names = _key_const_names(found, language, flag_key)
+    names = cross_file_keys.with_aliases(
+        repo_dir, language, _key_const_names(found, language, flag_key)
+    )
     siblings = [
         sibling
         for sibling in sorted(cross_file_keys.family(language) & set(languages))
@@ -904,7 +923,7 @@ def _candidate_files_without_wrappers(
         except (OSError, UnicodeDecodeError):
             continue  # never a reader; the resolution refuses it on its own
         if sibling:
-            if flag_key in text:
+            if _names_key(text, flag_key, mention):
                 continue  # its own run rewrites it
             if _claimed(claims, root, siblings, flag_key, accessors, wrappers).search(text):
                 continue  # a reader in another run of the family as well
@@ -1048,9 +1067,28 @@ def _candidate_files(
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if flag_key in text:
+        if _names_key(text, flag_key, str(path)):
             candidates.append(str(path))
     return candidates
+
+
+_TS_FAMILY_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _names_key(text: str, flag_key: str, path: str) -> bool:
+    """Whether ``text`` of ``path`` spells ``flag_key`` anywhere a run would
+    treat as a mention of it.
+
+    In the TypeScript family a key inside a module specifier is a path, not a
+    mention: counting it made a ``.tsx`` file importing ``./old-checkout`` a
+    holder of the key for the ``tsx`` run (which has no declaration for it) and
+    kept the ``ts`` run from admitting it as a sibling reader.
+    """
+    if flag_key not in text:
+        return False
+    if not path.endswith(_TS_FAMILY_SUFFIXES):
+        return True
+    return flag_key in ts_barrels.without_specifiers(text, path)
 
 
 def _load_argument_flags(base: str) -> dict[str, object]:
@@ -1775,9 +1813,9 @@ def transform_flag(
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
     ``key_positions`` names the accessors whose key is not their first
-    argument, with its index (``("flag_is_active", 1)``). Python reads them;
-    every other language's run drops those accessors, since its rules could
-    only match them with the key first.
+    argument, with its index (``("flag_is_active", 1)``). Python and the
+    TypeScript family read them; every other language's run drops those
+    accessors, since its rules could only match them with the key first.
 
     ``read_elsewhere`` says another language's pass over this directory has a
     read of the flag to fold, so this pass's stubs of it are dead too.
@@ -1814,7 +1852,7 @@ def transform_flag(
     # below, rules and passes alike, sees only names its language can spell.
     accessors = rule_synthesis.accessors_for(language, accessors)
     positions = dict(key_positions)
-    if language != "python":
+    if language not in KEY_POSITION_LANGUAGES:
         accessors = tuple(name for name in accessors if name not in positions)
         positions = {}
     doubles: list[mock_stubs.Prepass] = []
@@ -1937,7 +1975,16 @@ def _transform_flag(
     ValueError
         ``language`` is not one of :func:`supported_languages`.
     """
+    jvm_matchers.forget()
+    jvm_matchers.use_repo(repo_dir)
     ensure_supported_key(flag_key)
+    # An accessor with its key in another slot travels as `name[index]` through
+    # every pass but the generated rules and the attribute gates (which get the
+    # plain names). A pass that takes the key to be the FIRST argument (wrappers,
+    # test doubles) then cannot match it: `get(KEY, state)` is not a read of KEY.
+    # The key-constant passes read the index back (`rule_synthesis.positions_of`).
+    all_accessors = accessors
+    accessors = rule_synthesis.encode_positions(accessors, key_positions)
     spec = _language_spec(language)
     piranha_language, base = spec.piranha_id, spec.rule_base
 
@@ -1968,6 +2015,19 @@ def _transform_flag(
     # afterwards would be reading a file the engine had already corrupted.
     paths, skipped = _partition_by_readability(paths, language)
 
+    # An accessor with an un-awaited read that must not become a bare literal
+    # (it returns a Promise, or could) is "managed": its un-awaited reads are
+    # decided and marked one by one below, and it leaves `accessors`, which is
+    # what every sync-read pass (wrappers, doubles, const guards, cross-file
+    # readers) is told. See :mod:`flag_cleanup.ts_async_reads`.
+    planned_accessors = accessors
+    first_sites = ts_async_reads.plan(repo_dir, paths + sibling_readers, flag_key, accessors, language)
+    # A read that cannot be folded safely cannot stay while the others go: the
+    # flag is refused, before anything is written.
+    refused_reads = ts_async_reads.refusal(first_sites)
+    async_names = ts_async_reads.managed_accessors(first_sites)
+    accessors = tuple(a for a in accessors if a not in async_names)
+
     # Resolve the test doubles that stub or verify this read, on the customer's
     # bytes and BEFORE everything below reads them: Mockito, MockK, Dart
     # mockito, ts-mockito and gomock take a real call, which the engine would
@@ -1976,9 +2036,19 @@ def _transform_flag(
     # :mod:`flag_cleanup.mock_stubs`. Before the entry and pinned-test reads
     # below, so neither describes a test this has already deleted.
     if doubles is not None and mock_stubs.covers(language):
-        stub_pass = mock_stubs.Prepass(language, flag_key, treatment, accessors)
+        stub_pass = mock_stubs.Prepass(
+            language, flag_key, treatment, accessors, repo_dir=repo_dir if language == "go" else None
+        )
         doubles.append(stub_pass)
         stub_pass.apply(paths)
+
+    # A `(bool, error)` read and its `if err != nil` check, rewritten to the
+    # single-valued read the engine folds (see :mod:`flag_cleanup.go_two_value`).
+    # Joins `doubles` before it writes, so a raise anywhere undoes it.
+    if doubles is not None and language == "go":
+        two_value = go_two_value.Prepass(language, flag_key, treatment, accessors, repo_dir=repo_dir)
+        doubles.append(two_value)
+        two_value.apply(paths)
 
     # Computed here, off the CUSTOMER's bytes, before anything rewrites them.
     # It is the only reading of the tree that has to happen first: every prong
@@ -2008,6 +2078,15 @@ def _transform_flag(
     # cannot be unwrapped, and there is nothing to roll back yet. The test-
     # double pass above is undone by `transform_flag`, which catches this.
     gate_paths = _check_gates(paths, language, flag_key, gates, treatment)
+    _check_object_reads(paths, language, flag_key, all_accessors, repo_dir)
+    # After the object-read check, whose reason is more precise when both apply.
+    if refused_reads is not None:
+        reason, culprits = refused_reads
+        raise UnsafeRewriteError(
+            f"the {spec.display_name} transform refused flag {flag_key!r}: {reason}",
+            refused=culprits,
+            discarded=[],
+        )
 
     if not paths:
         # Every candidate was unreadable, so there is nothing to transform —
@@ -2035,11 +2114,12 @@ def _transform_flag(
     # its rules match a sentinel, not a name, so its accessor support is in the
     # pre-pass below, which is the only part of this that can read a key.
     generated_rules: tempfile.TemporaryDirectory | None = None
-    if accessors and language != "kt":
+    if all_accessors and language != "kt":
         generated_rules = tempfile.TemporaryDirectory(prefix="flag-cleanup-rules-")
         rules_file, const_rules_file = _write_generated_rules(
-            Path(generated_rules.name), rules_file, const_rules_file, accessors,
-            key_positions=key_positions,
+            Path(generated_rules.name), rules_file, const_rules_file,
+            tuple(a for a in all_accessors if a not in async_names),
+            key_positions=key_positions, async_accessors=async_names,
         )
 
     # `untreated` is `treated`'s complement — the literal spelling of the branch
@@ -2109,13 +2189,35 @@ def _transform_flag(
         treatment=treatment,
     )
 
+    # The lines of a barrel that re-export a key constant by name
+    # (`export { X } from "./x"`), which `cross_file_ts` lets the run remove
+    # with the constant. Planned on the customer's bytes, removed after the
+    # engine has deleted (or kept) the declaration.
+    barrel_hops: list[ts_barrels.Hop] = []
+    barrel_declared: set[tuple[str, str]] = set()
+    if language in ("ts", "tsx", "js"):
+        from flag_cleanup import cross_file_ts
+
+        barrel_declared = {
+            (d.module, d.name)
+            for d in resolution.declarations
+            if d.kind == cross_file_keys.CONSTANT
+        }
+        if barrel_declared:
+            barrel_hops = ts_barrels.plan(
+                paths + sibling_readers,
+                barrel_declared,
+                _barrel_resolver(repo_dir),
+                lambda f, spec: cross_file_ts.package_outside(f, spec, repo_dir),
+            )
+
     # A declaration a mention elsewhere keeps says nothing about the reads
     # beside it, which are reads of the flag like any other, unless the
     # constant may hold something else by then.
     kept_declarations = [
         p for p in without_const
         if language in _FOLDS_KEPT_CONSTANTS
-        and const_path_is_safe(Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
+        and _const_safe_at(p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
     ]
     if kept_declarations and language == "python":
         # Only a declaration the resolution kept for mentions that spell its
@@ -2131,7 +2233,7 @@ def _transform_flag(
     # constant may name its key. Its refusal comes before the engine writes
     # anything, as a gate component's does.
     attribute_gates = _check_attribute_gates(
-        sorted({*paths, *reader_paths}), language, flag_key, accessors, resolution, treatment,
+        sorted({*paths, *reader_paths}), language, flag_key, all_accessors, resolution, treatment,
         key_positions=key_positions,
     )
 
@@ -2139,9 +2241,17 @@ def _transform_flag(
     # the resolution can say that one does. Without this the fold reaches it.
     key_texts = _reader_key_texts(resolution, paths)
     if doubles is not None and key_texts and mock_stubs.covers(language):
-        stub_pass = mock_stubs.Prepass(language, flag_key, treatment, accessors, key_texts=key_texts)
+        stub_pass = mock_stubs.Prepass(
+            language, flag_key, treatment, accessors, key_texts=key_texts,
+            repo_dir=repo_dir if language == "go" else None,
+        )
         doubles.append(stub_pass)
         stub_pass.apply(sorted(key_texts))
+
+    if doubles is not None and key_texts and language == "go":
+        two_value = go_two_value.Prepass(language, flag_key, treatment, accessors, key_texts=key_texts, repo_dir=repo_dir)
+        doubles.append(two_value)
+        two_value.apply(sorted(key_texts))
 
     # Each TypeScript-family file's line width, for the engine's joins (see
     # :func:`_print_width_facts`), off the customer's bytes: nothing below has
@@ -2185,6 +2295,40 @@ def _transform_flag(
         grouped = set(with_const) | set(without_const) | set(kept_declarations) | set(reader_paths)
         without_const = without_const + [p for p in wrappers.spans if p not in grouped]
 
+    # The managed accessors' un-awaited reads, judged on the bytes the engine
+    # will get (the double pass above may have edited them). A read decided to
+    # stay is not marked, so no rule reaches it.
+    # Kept apart from `wrappers.spans`, which feeds the wrapper counts and
+    # reports: these marks are not wrappers, and exist only to be consumed.
+    read_marks: dict[str, list] = {}
+    if language in ("ts", "tsx", "js") and (async_names or reader_paths):
+        read_sites = ts_async_reads.plan(
+            repo_dir, [*paths, *sibling_readers, *reader_paths], flag_key, planned_accessors, language
+        )
+        # A reader file the cross-file path rewrites was not known when the
+        # managed set was fixed. A read there that must not fold, of an
+        # accessor not already managed, would be folded with no decision made.
+        # A reader file was not known when the managed set was fixed.
+        later = ts_async_reads.refusal(read_sites)
+        late = ts_async_reads.managed_accessors(read_sites) - async_names
+        if later is not None or late:
+            reason, culprits = later or (
+                f"an un-awaited read of {', '.join(sorted(late))} whose result may be a Promise, "
+                "in a file that reads the key through a constant declared elsewhere",
+                sorted({site.path for site in read_sites if site.accessor in late}),
+            )
+            raise UnsafeRewriteError(
+                f"the {spec.display_name} transform refused flag {flag_key!r}: {reason}",
+                refused=culprits,
+                discarded=[],
+            )
+        for site_path in dict.fromkeys(site.path for site in read_sites):
+            found = ts_async_reads.marks(read_sites, async_names, site_path)
+            if found:
+                read_marks[site_path] = found
+        grouped = set(with_const) | set(without_const) | set(kept_declarations) | set(reader_paths)
+        without_const = without_const + [p for p in read_marks if p not in grouped and p not in wrappers.spans]
+
     # A COMPOSER DEPENDENCY (a `vendor/` beside a `composer.json`) is never
     # rewritten: `composer install` puts it back, and a team that commits
     # `vendor/` would get a dependency edited in its pull request. It stays a
@@ -2201,7 +2345,10 @@ def _transform_flag(
         accessors,
         const_key_paths=frozenset(with_const),
         external_keys=_external_keys(language, resolution, proven),
-        wrapper_spans={p: tuple(spans) for p, spans in wrappers.spans.items()},
+        wrapper_spans={
+            p: (*wrappers.spans.get(p, ()), *read_marks.get(p, ()))
+            for p in dict.fromkeys([*wrappers.spans, *read_marks])
+        },
     )
     if prepass is not None:
         substitutions["sentinel"] = prepass.sentinel
@@ -2209,7 +2356,18 @@ def _transform_flag(
             # A sibling caller of a keyless wrapper (a `.tsx` caller of a `.ts`
             # wrapper; see `candidate_files`) is marked like any other. Every
             # other pre-engine pass still skips it: it holds no key.
-            prepass.apply(paths + [p for p in sibling_readers if p in wrappers.spans])
+            prepass.apply(paths + [p for p in sibling_readers if p in wrappers.spans or p in read_marks])
+        except ValueError as exc:
+            # Two marks cover the same bytes: a read's whole call holds a call
+            # the wrapper pass also marked. Nothing can be folded safely there.
+            prepass.restore_all()
+            raise UnsafeRewriteError(
+                f"a flag read and a keyless-wrapper call overlap in "
+                f"{prepass.failed_path or 'a file'}, so the {spec.display_name} "
+                f"pre-pass refused flag {flag_key!r}: {exc}",
+                refused=[prepass.failed_path] if prepass.failed_path else [],
+                discarded=sorted(set(prepass.originals) - {prepass.failed_path}),
+            ) from exc
         except kotlin_sentinel.SentinelCollisionError as exc:
             # "This file must not be transformed", and it can fire after earlier
             # files were already marked — so the undo runs before the refusal
@@ -2456,12 +2614,12 @@ def _transform_flag(
     # Replace each configured gate on this flag with the children it rendered.
     # Before the whitespace tidy and the stranded-binding pass: the gate's own
     # import is stranded by this edit, and that pass is what removes it.
-    summaries = _unwrap_gates(summaries, gate_paths, language, flag_key, gates)
+    summaries = _unwrap_gates(summaries, gate_paths, language, flag_key, gates, repo_dir)
     summaries = _delete_attribute_gates(
-        summaries, attribute_gates, flag_key, accessors, language, key_positions=key_positions
+        summaries, attribute_gates, flag_key, all_accessors, language, key_positions=key_positions
     )
     # The gates that take a boolean, which only the fold above can settle.
-    summaries = _unwrap_boolean_gates(summaries, language, gates)
+    summaries = _unwrap_boolean_gates(summaries, language, gates, repo_dir)
 
     # Tidy whitespace this transform stranded mid-line, BEFORE Gate 1 judges the
     # result and before the diff is built — the customer must be shown, and the
@@ -2556,6 +2714,14 @@ def _transform_flag(
     # Before Gate 1 specifically — in Java these statements are the difference
     # between a branch that compiles and one that does not, which is what this
     # used to refuse over.
+    # Python only, before the stranded passes so the imports and constants the
+    # collapsed statements read are offered to them: a function the fold left
+    # returning one literal on every path is reduced to that return, when every
+    # statement it drops is provably inert.
+    collapsed_functions: tuple[tuple[str, str, str], ...] = ()
+    if language == "python":
+        summaries, collapsed_functions = _collapse_python_constant_functions(summaries, repo_dir)
+
     summaries, stranded = _remove_stranded_statements(summaries, language, repo_dir)
     stranded = tuple(engine_stranded) + stranded
 
@@ -2564,7 +2730,7 @@ def _transform_flag(
     # bytes that stay on disk. In Go both shapes are compile errors, so this is
     # the difference between a branch that builds and one that does not.
     summaries, bindings = _remove_stranded_bindings(summaries, language, repo_dir)
-    bindings = engine_bindings + bindings
+    bindings = engine_bindings + bindings + collapsed_functions
 
     # A discarded call the customer declared side-effect free is deleted,
     # and what it alone read is offered to the stranded-binding pass again.
@@ -2701,6 +2867,17 @@ def _transform_flag(
     )
     bindings = bindings + method_bindings
 
+    # A Go function the fold emptied goes with its calls, when every one of
+    # them is proven (:mod:`flag_cleanup.go_emptied`). What the calls alone
+    # read is stranded in turn, so the binding pass runs once more.
+    if language == "go":
+        summaries, emptied = go_emptied.remove(summaries, repo_dir, Rewrite)
+        if emptied:
+            summaries, more_bindings = _remove_stranded_bindings(
+                summaries, language, repo_dir, include_methods=True
+            )
+            bindings = bindings + emptied + more_bindings
+
     # The labels the fold and the passes above left with nothing to jump to
     # them, which the customer's lint rejects (and Go's compiler).
     if language in _TS_GRAMMARS or language == "go":
@@ -2759,8 +2936,10 @@ def _transform_flag(
     # the fold wrote (`{ enabled: true }`). One the callee's declaration proves
     # a no-op is left out; an emptied one that stays is reported. Last, so
     # they read the bytes that stay on disk.
+    # What the checkout's mocks allow, per callee, for both passes below.
+    mocks: dict = {}
     summaries, emptied_rows, dropped_options = _drop_default_arguments(
-        summaries, language, flag_key, repo_dir
+        summaries, language, flag_key, repo_dir, mocks
     )
     bindings = bindings + emptied_rows
     # An option a value the fold wrote was just left out of, when no call
@@ -2773,6 +2952,7 @@ def _transform_flag(
         dropped_options,
         taken=_taken_by_family(language, flag_key, repo_dir, accessors, inline_wrappers),
         language=language,
+        mocks=mocks,
     )
     bindings = bindings + option_rows
 
@@ -2926,8 +3106,24 @@ def _transform_flag(
     # `mock_stubs.resolve`), and the differential checks below would read a
     # deleted test as a fold that lost something.
     summaries = summaries + deleted_files
+    barrel_reasons: dict[str, str] = {}
+    if barrel_declared:
+        resolver = _barrel_resolver(repo_dir)
+        summaries, barrel_reasons = ts_barrels.apply(
+            summaries,
+            barrel_hops,
+            barrel_declared,
+            resolver,
+            Rewrite,
+            MODULE_MARKER,
+            ts_barrels.star_reach(repo_dir, resolver),
+            ts_barrels.judged.get(),
+        )
     changed = [s for s in summaries if s.original_content != s.content]
-    reasons: dict[str, str] = {}
+    # Last of all, off the bytes that stay on disk: every pass above has run, so a
+    # local one of them removed is not named.
+    bindings = bindings + _unread_locals(summaries, language, repo_dir)
+    reasons: dict[str, str] = dict(barrel_reasons)
     for s in changed:
         # A deleted file has no text left to judge: the pass that deleted it
         # proved every use of what it held was removed with it, and its own
@@ -2961,6 +3157,10 @@ def _transform_flag(
         # one literal: it parses, and Go rejects the count.
         if reason is None and _grammar_of(s.path, language) == "go":
             reason = go_arity.refusal_reason(s.original_content, s.content)
+        if reason is None and _grammar_of(s.path, language) == "go":
+            reason = go_two_value.survivors(
+                [p for p in doubles or () if isinstance(p, go_two_value.Prepass)], s.path, s.content
+            )
         # Gate 2 let a reference in a block the fold deletes go with the
         # block, which only predicted the fold. If the declaration went and
         # such a name is still referenced, the build fails on it.
@@ -2998,12 +3198,27 @@ def _transform_flag(
             text = Path(path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             text = ""
-        if cross_file_keys.still_mentions(
-            path, text, language, resolution, accessors, repo_dir
-        ):
+        with go_setters.suspended():
+            survived = cross_file_keys.still_mentions(
+                path, text, language, resolution, accessors, repo_dir
+            )
+        if survived:
             reasons[path] = (
                 "a read of a key constant declared in another file was not rewritten"
             )
+    # The belt to the predicates' braces, for a key constant whose declaration
+    # this run deleted: any identifier still naming it (in its own file, or
+    # through an import) means the fold and the Gate 2 proof disagreed.
+    if language in ("ts", "tsx", "js") and changed:
+        for path, reason in ts_key_survivors.refusals(
+            changed, repo_dir, flag_key, lambda p: _grammar_of(p, language), file_deletion.deleted
+        ).items():
+            reasons.setdefault(path, reason)
+    if language == "python" and changed:
+        for path, reason in py_key_survivors.refusals(
+            changed, repo_dir, flag_key, file_deletion.deleted
+        ).items():
+            reasons.setdefault(path, reason)
     # A django-waffle pin the test-double pass could not settle keeps a test
     # on the branch this removal deletes: on a class, in a fixture, or with a
     # value it cannot read. Asked only of a run that folded a read, as the
@@ -3397,6 +3612,34 @@ def _resolve_wrapper_doubles(
     return qualified, refusals
 
 
+def _check_object_reads(
+    paths: list[str],
+    language: str,
+    flag_key: str,
+    accessors: tuple[str, ...],
+    repo_dir: str,
+) -> None:
+    """Refuse a TS/JS read of an accessor that returns an object.
+
+    See :mod:`flag_cleanup.ts_object_reads`. Raised before the engine writes
+    anything, so there is nothing to roll back.
+    """
+    if language not in ("ts", "tsx", "js") or not accessors:
+        return
+    reasons = ts_object_reads.refusals(paths, flag_key, accessors, repo_dir)
+    if not reasons:
+        return
+    refused = sorted(reasons)
+    named = "; ".join(f"{path} ({reasons[path]})" for path in refused)
+    logger.warning("refusing to transform for flag %r: %s", flag_key, named)
+    raise UnsafeRewriteError(
+        f"a read of flag {flag_key!r} returns an object, not a boolean: {named}",
+        refused=refused,
+        discarded=[],
+        reasons=reasons,
+    )
+
+
 def _check_gates(
     paths: list[str],
     language: str,
@@ -3531,6 +3774,7 @@ def _unwrap_gates(
     language: str,
     flag_key: str,
     gates: tuple[ts_gates.Gate, ...],
+    repo_dir: str,
 ) -> list:
     """Unwrap the gates in ``gate_paths``, adding a summary for any file the
     engine did not touch — a file whose only mention of the flag is a gate."""
@@ -3543,12 +3787,14 @@ def _unwrap_gates(
         before = (
             summary.content
             if summary is not None
-            else Path(path).read_text(encoding="utf-8")
+            else Path(path).read_bytes().decode("utf-8")
         )
-        after, count = ts_gates.unwrap_gates(before, language, flag_key, gates)
+        after, count = ts_gates.unwrap_gates(
+            before, language, flag_key, gates, path, _marked_element_engine(language, repo_dir)
+        )
         if not count:
             continue
-        Path(path).write_text(after, encoding="utf-8")
+        Path(path).write_bytes(after.encode("utf-8"))
         rewrite = Rewrite(path, summary.original_content if summary else before, after)
         if summary is None:
             result.append(rewrite)
@@ -3557,12 +3803,25 @@ def _unwrap_gates(
     return result
 
 
-def _unwrap_boolean_gates(summaries, language: str, gates: tuple[ts_gates.Gate, ...]) -> list:
+def _marked_element_engine(language: str, repo_dir: str):
+    """The engine call :mod:`flag_cleanup.jsx_unwrap` makes its edits with:
+    the rendered marked-span rules over the given paths, nothing beside them."""
+    return lambda paths, rules: _execute_ctor_param_rules(paths, language, rules, repo_dir)
+
+
+def _unwrap_boolean_gates(
+    summaries, language: str, gates: tuple[ts_gates.Gate, ...], repo_dir: str
+) -> list:
     """Replace each boolean gate the fold settled with the branch it renders."""
     result = []
     for summary in summaries:
         after = ts_gates.unwrap_boolean_gates(
-            summary.original_content, summary.content, language, gates
+            summary.original_content,
+            summary.content,
+            language,
+            gates,
+            summary.path,
+            _marked_element_engine(language, repo_dir),
         )
         if after == summary.content:
             result.append(summary)
@@ -4088,7 +4347,7 @@ def _flag_state_comments(
 
 
 def _drop_default_arguments(
-    summaries, language: str, flag_key: str, repo_dir: str
+    summaries, language: str, flag_key: str, repo_dir: str, mocks: dict | None = None
 ) -> tuple[list, tuple[tuple[str, str, str], ...], tuple[ts_default_arguments.DroppedOption, ...]]:
     """Leave out each literal this run left equal to the callee's default,
     and report each emptied override that stays; TypeScript family only. See
@@ -4127,6 +4386,7 @@ def _drop_default_arguments(
             summary.path,
             repo_dir,
             width=ts_list_join.line_limit(summary.path, summary.original_content, repo_dir),
+            mocks=mocks,
         )
         for line in dropped.lines:
             emptied.remove(line)
@@ -4178,6 +4438,7 @@ def _remove_unused_options(
     options: tuple[ts_default_arguments.DroppedOption, ...],
     taken=None,
     language: str = "",
+    mocks: dict | None = None,
 ) -> tuple[list, tuple[tuple[str, str, str], ...]]:
     """Remove each of ``options`` no call sets any more from its declaration;
     see :mod:`flag_cleanup.ts_unused_options`. A declaring or calling file the
@@ -4249,6 +4510,7 @@ def _remove_unused_options(
                 repo_dir,
                 # As the main pass: the width the customer's own file asks for.
                 width=ts_list_join.line_limit(path, result[n].original_content, repo_dir),
+                mocks=mocks,
             )
             if not dropped.sites:
                 continue
@@ -4514,7 +4776,12 @@ def _unwrap_test_providers(
             result.append(summary)
             continue
         after, lines = ts_test_providers.unwrap(
-            summary.original_content, summary.content, summary.path, repo_dir, flag_key
+            summary.original_content,
+            summary.content,
+            summary.path,
+            repo_dir,
+            flag_key,
+            _marked_element_engine(language, repo_dir),
         )
         if not lines or count_syntax_errors(after, grammar) > count_syntax_errors(
             summary.content, grammar
@@ -4729,6 +4996,16 @@ def _rewrite_dart_key_imports(
     return result
 
 
+def _barrel_resolver(repo_dir: str):
+    """``(from_file, specifier) -> file`` as the TypeScript profile resolves it."""
+    from flag_cleanup import cross_file_ts
+
+    stop = cross_file_ts._stop_for(repo_dir)
+    return lambda from_file, specifier: cross_file_ts._resolve(
+        str(Path(from_file).resolve()), specifier, stop
+    )
+
+
 def _proven_readers(
     resolution: cross_file_keys.Resolution, paths: list[str]
 ) -> list[str]:
@@ -4786,9 +5063,16 @@ def _resolve_cross_file(
     groups: it is in ``paths`` for the undo snapshot alone.
     """
     key_paths = _key_paths(paths, flag_key)
-    resolution = cross_file_keys.resolve(
-        repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
-    )
+    # The files this run can write, which is where a barrel's line for a
+    # constant can be removed (see :mod:`flag_cleanup.ts_barrels`).
+    editable = ts_barrels.editable.set(frozenset(str(Path(p).resolve()) for p in paths))
+    ts_barrels.judged.set(set())  # read back by `ts_barrels.apply`
+    try:
+        resolution = cross_file_keys.resolve(
+            repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
+        )
+    finally:
+        ts_barrels.editable.reset(editable)
     proven = _proven_readers(resolution, paths)
     template = RULES_DIR / f"{_language_spec(language).rule_base}_xconst.toml"
     reader_paths = proven if template.exists() else []
@@ -4818,7 +5102,7 @@ def _resolve_cross_file(
             if str(Path(path).resolve()) not in deletable or path in proven_set:
                 continue
             source = Path(path).read_text(encoding="utf-8")
-            if const_path_is_safe(source, language, flag_key, accessors, treatment):
+            if _const_safe_at(path, source, language, flag_key, accessors, treatment):
                 regained.append(path)
     elif resolution.readers:
         logger.info(
@@ -4950,7 +5234,7 @@ def _key_paths(paths: list[str], flag_key: str) -> list[str]:
     return [
         p
         for p in paths
-        if flag_key in Path(p).read_text(encoding="utf-8", errors="replace")
+        if _names_key(Path(p).read_text(encoding="utf-8", errors="replace"), flag_key, p)
     ]
 
 
@@ -4999,6 +5283,7 @@ def _reader_rules(
     if not reader_paths:
         return None
     template = (RULES_DIR / f"{spec.rule_base}_xconst.toml").read_text(encoding="utf-8")
+    positional = _key_position_templates_for(RULES_DIR / f"{spec.rule_base}_xconst.toml")
     base = rules_file.read_text(encoding="utf-8")
     keyed = frozenset(_key_paths(reader_paths, flag_key))
     # The wrapper pass's sentinel, when a reader also calls a keyless wrapper
@@ -5025,11 +5310,12 @@ def _reader_rules(
             _ReaderGroup(
                 paths=frozenset(paths),
                 keyless=rule_synthesis.cross_file_key_rules(
-                    base, template, refs, accessors=accessors, marked=marked
+                    base, template, refs, accessors=accessors, marked=marked,
+                    positional_text=positional,
                 ),
                 keyed=rule_synthesis.cross_file_key_rules(
                     base, template, refs, accessors=accessors, strip_key_hole=False,
-                    marked=marked,
+                    marked=marked, positional_text=positional,
                 ),
             )
         )
@@ -5372,6 +5658,7 @@ def _write_generated_rules(
     accessors: tuple[str, ...],
     *,
     key_positions: dict[str, int] | None = None,
+    async_accessors: frozenset[str] = frozenset(),
 ) -> tuple[Path, Path]:
     """Write accessor-extended copies of the rule files and return their paths.
 
@@ -5405,9 +5692,11 @@ def _write_generated_rules(
     generated.write_text(
         rule_synthesis.with_accessors(
             rules_file.read_text(encoding="utf-8"),
-            accessors,
+            (*accessors, *sorted(async_accessors)),
             templates_text=_accessor_templates_for(rules_file),
             key_positions=key_positions,
+            positional_text=_key_position_templates_for(rules_file),
+            async_accessors=async_accessors,
         ),
         encoding="utf-8",
     )
@@ -5422,6 +5711,7 @@ def _write_generated_rules(
             accessors,
             templates_text=_accessor_templates_for(const_rules_file),
             key_positions=key_positions,
+            positional_text=_key_position_templates_for(const_rules_file),
         ),
         encoding="utf-8",
     )
@@ -5431,6 +5721,12 @@ def _write_generated_rules(
 def _accessor_templates_for(rules_file: Path) -> str | None:
     """The ``<stem>_accessors.toml`` beside ``rules_file``, or ``None``."""
     templates = rules_file.with_name(f"{rules_file.stem}_accessors.toml")
+    return templates.read_text(encoding="utf-8") if templates.exists() else None
+
+
+def _key_position_templates_for(rules_file: Path) -> str | None:
+    """The ``<stem>_key_positions.toml`` beside ``rules_file``, or ``None``."""
+    templates = rules_file.with_name(f"{rules_file.stem}_key_positions.toml")
     return templates.read_text(encoding="utf-8") if templates.exists() else None
 
 
@@ -6086,6 +6382,39 @@ def _inline_constant_members(
     return list(current.values())
 
 
+def _collapse_python_constant_functions(summaries, repo_dir: str) -> tuple[list, tuple]:
+    """Reduce each function the fold made constant to its ``return``, and write it back.
+
+    Returns the summaries and a ``bindings`` row per function, for the pull
+    request body.
+    """
+    collapsed = []
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content:
+            collapsed.append(summary)
+            continue
+        result, report = python_constant_function.collapse_reporting(
+            summary.original_content, summary.content
+        )
+        if result == summary.content:
+            collapsed.append(summary)
+            continue
+        Path(summary.path).write_text(result, encoding="utf-8", newline="")
+        collapsed.append(Rewrite(summary.path, summary.original_content, result))
+        relative = os.path.relpath(summary.path, repo_dir)
+        for name, removed, literal in report:
+            noun = "statement" if removed == 1 else "statements"
+            rows.append(
+                (
+                    relative,
+                    python_constant_function.COLLAPSED_FUNCTION,
+                    f"{name}() now always returns {literal}; {removed} {noun} removed",
+                )
+            )
+    return collapsed, tuple(rows)
+
+
 def _inline_python_literals(summaries) -> list:
     """Inline, with the bare literal, a read still bound to a name, and write it back."""
     folded = []
@@ -6313,6 +6642,30 @@ def _remove_stranded_bindings(
     return cleaned_summaries, tuple(bindings)
 
 
+def _clip(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _unread_locals(
+    summaries, language: str, repo_dir: str
+) -> tuple[tuple[str, str, str], ...]:
+    """``(path, "unread local", declaration)`` for each Kotlin local the fold
+    left unread and the stranded-binding pass kept, because its initializer
+    may do work. Nothing is written."""
+    found: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content or file_deletion.deleted(summary):
+            continue
+        relative = os.path.relpath(summary.path, repo_dir)
+        found.extend(
+            (relative, "unread local", _clip(" ".join(c.text.split())))
+            for c in unread_locals(
+                summary.original_content, summary.content, _grammar_of(summary.path, language)
+            )
+        )
+    return tuple(found)
+
+
 def _unread_primary_parameters(
     summaries, language: str, repo_dir: str
 ) -> tuple[tuple[str, str, str], ...]:
@@ -6340,6 +6693,7 @@ def _unread_private_members(
     unread.
     Nothing is written."""
     found: list[tuple[str, str, str]] = []
+    eligibility = jvm_class_eligibility.Eligibility(repo_dir)
     for summary in summaries:
         if summary.original_content == summary.content:
             continue
@@ -6350,7 +6704,7 @@ def _unread_private_members(
             labels = unread_members(summary.original_content, summary.content, grammar)
         elif grammar in ("java", "kt"):
             labels = jvm_unread_members.unread_members(
-                summary.original_content, summary.content, grammar
+                summary.original_content, summary.content, grammar, eligibility
             )
         else:
             continue
@@ -6721,6 +7075,13 @@ def _referenced_elsewhere(
     return hits
 
 
+def _const_safe_at(path: str, *args) -> bool:
+    """:func:`const_path_is_safe` for the file at ``path``: a Go handle's
+    constructor is proven from the repository around it."""
+    with key_const.go_file(path):
+        return const_path_is_safe(*args)
+
+
 def _partition_by_const_safety(
     paths: list[str],
     language: str,
@@ -6758,7 +7119,7 @@ def _partition_by_const_safety(
         except (OSError, UnicodeDecodeError):  # pragma: no cover - filtered earlier
             withheld.append(path)
             continue
-        allowed_here = const_path_is_safe(source, language, flag_key, accessors, treatment)
+        allowed_here = _const_safe_at(path, source, language, flag_key, accessors, treatment)
         if not allowed_here and language == "go":
             grouped = key_const.go_positional_key_consts(source, flag_key)
             if grouped:

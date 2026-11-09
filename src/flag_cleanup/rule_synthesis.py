@@ -58,6 +58,32 @@ PENNANT_ACTIVE = "active"
 BLADE_FEATURE = "__blade_feature"
 
 
+_POSITIONED = re.compile(r"\A(?P<name>[A-Za-z_][A-Za-z0-9_]*)\[(?P<index>[1-9])\]\Z")
+
+
+def encode_positions(accessors, positions: Mapping[str, int] | None) -> tuple[str, ...]:
+    """``accessors`` with each one that has a key position spelled ``name[index]``.
+
+    The passes that take a key to be the FIRST argument compare a callee's name
+    with the accessor set, so ``get[1]`` never matches ``get(KEY, …)`` there,
+    and the passes that know about positions read the index back with
+    :func:`positions_of`. One tuple carries both, so a pass that is not told
+    about positions cannot treat a positioned accessor as a first-argument one.
+    """
+    positions = positions or {}
+    return tuple(f"{name}[{positions[name]}]" if name in positions else name for name in accessors)
+
+
+def positions_of(accessors) -> dict[str, int]:
+    """The ``{name: index}`` of the entries :func:`encode_positions` spelled."""
+    found = {}
+    for accessor in accessors:
+        match = _POSITIONED.match(accessor)
+        if match is not None:
+            found[match["name"]] = int(match["index"])
+    return found
+
+
 def accessors_for(language: str, accessors: tuple[str, ...]) -> tuple[str, ...]:
     """``accessors`` as one ``language``'s run takes them.
 
@@ -231,6 +257,9 @@ _KEY_POSITION_TEMPLATE_MARKER = re.compile(
 _KEY_POSITION = "__KEY_POSITION__"
 
 
+#: A seed whose query matches the ``await`` expression rather than the call.
+_AWAITED_QUERY = re.compile(r"^\s*\(await_expression\b", re.MULTILINE)
+
 def _seed_blocks(blocks: list[str], *, key_position: bool = False) -> list[_Block]:
     seeds = []
     for block in blocks[1:]:
@@ -273,8 +302,19 @@ def with_accessors(
     templates_text: str | None = None,
     before_trailing_rules: bool = False,
     key_positions: Mapping[str, int] | None = None,
+    positional_text: str | None = None,
+    async_accessors: frozenset[str] = frozenset(),
 ) -> str:
     """Return ``rules_text`` plus one cloned rule per accessor per shape.
+
+    ``positional_text`` names a different source for the ``key-position``
+    blocks alone, for a language whose plain templates are its own seed rules
+    (TypeScript: `rules/ts_key_positions.toml`).
+
+    ``async_accessors`` (TypeScript family only) names accessors whose un-awaited
+    reads are decided per site and marked (see :mod:`flag_cleanup.ts_async_reads`).
+    They get only the AWAITED clone: the bare-call clone would fold every
+    un-awaited read, including the ones that must be left or kept as a Promise.
 
     ``key_positions`` maps an accessor to the index of its key argument when
     that is not 0 (``flag_is_active[1]`` in the input). Such an accessor is
@@ -329,10 +369,21 @@ def with_accessors(
             seen_shapes.add(seed.shape)
             templates.append(seed)
     positions = dict(key_positions or {})
-    positional = _seed_blocks(blocks, key_position=True) if positions else []
+    positional = (
+        _seed_blocks(blocks if positional_text is None else _split_blocks(positional_text), key_position=True)
+        if positions
+        else []
+    )
+    awaited_templates = [t for t in templates if _AWAITED_QUERY.search(t.text)]
+    if async_accessors and not awaited_templates:
+        raise SynthesisError("an async accessor needs an awaited seed rule to clone")
 
     generated = []
     for accessor in accessors:
+        if accessor in async_accessors:
+            templates_for = awaited_templates
+        else:
+            templates_for = templates
         index = positions.get(accessor, 0)
         chosen = [
             _Block(
@@ -341,7 +392,7 @@ def with_accessors(
                 callee=template.callee,
             )
             for template in positional
-        ] if index else templates
+        ] if index else templates_for
         names = generated_rule_names(accessor, len(chosen))
         for new_name, template in zip(names, chosen, strict=True):
             clone = re.sub(
@@ -438,6 +489,7 @@ def with_accessor_const_rules(
     *,
     templates_text: str | None = None,
     key_positions: Mapping[str, int] | None = None,
+    positional_text: str | None = None,
 ) -> str:
     """Return ``const_rules_text`` plus one cloned rule per accessor per shape.
 
@@ -475,6 +527,7 @@ def with_accessor_const_rules(
         templates_text=templates_text,
         before_trailing_rules=True,
         key_positions=key_positions,
+        positional_text=positional_text,
     )
 
 
@@ -583,6 +636,7 @@ def cross_file_key_rules(
     accessors: tuple[str, ...] = (),
     strip_key_hole: bool = True,
     marked: bool = False,
+    positional_text: str | None = None,
 ) -> str:
     """Rules for the reader invocation: one clone per proven reference.
 
@@ -636,6 +690,14 @@ def cross_file_key_rules(
         if marker is not None:
             enum_blocks.setdefault(marker.group(1), []).append(block)
 
+    positioned = positions_of(accessors)
+    positional = {
+        kind: [b for b in _split_blocks(_strip_comments_keep_markers(positional_text))[1:] if f"# xconst: {kind}" in b]
+        for kind in ("qualified", "bare")
+    } if positional_text is not None and positioned else {}
+    # A positioned accessor is not a first-argument one: the loops below see plain names only.
+    accessors = tuple(a for a in accessors if a not in {f"{n}[{i}]" for n, i in positioned.items()})
+
     clones: list[str] = []
     for index, (owner, member, accessor) in enumerate(distinct):
         # `ns.Flags.X`: an entry read through a namespace of its file.
@@ -659,6 +721,20 @@ def cross_file_key_rules(
             chosen = nested
         else:
             chosen = qualified if owner is not None else bare
+        if not accessor and not nested:
+            for name, at in positioned.items():
+                for template in positional.get("qualified" if owner is not None else "bare", []):
+                    block = template.replace("__XCONST_OWNER__", _query_text(owner_text))
+                    block = block.replace("__XCONST_MEMBER__", _query_text(member))
+                    block = block.replace(_KEY_POSITION, "(_) . " * at)
+                    clone = re.sub(
+                        r'^name = "(.*)"$',
+                        lambda m: f'name = "{m.group(1)}__{index}__accessor_{name}"',
+                        _for_accessor(block, name),
+                        count=1,
+                        flags=re.MULTILINE,
+                    )
+                    clones.append(_RULE_HEADER + "\n" + clone.removeprefix(_RULE_HEADER).strip() + "\n")
         for block in chosen:
             block = block.replace("__XCONST_NAMESPACE__", _query_text(namespace))
             block = block.replace("__XCONST_OWNER__", _query_text(owner_text))

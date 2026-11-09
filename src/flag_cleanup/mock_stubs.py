@@ -82,7 +82,7 @@ from typing import Callable, Iterable, Mapping
 
 from tree_sitter import Node
 
-from flag_cleanup import cs_param_pins, key_const, kotlin_sentinel, syntax, ts_syntax, unused
+from flag_cleanup import cs_param_pins, go_setters, jvm_matchers, key_const, kotlin_sentinel, syntax, ts_syntax, unused
 from flag_cleanup.key_const import (
     _CSHARP_FLAG_READ_CALLEES,
     _DART_FLAG_READ_CALLEES,
@@ -100,6 +100,9 @@ STUB, VERIFICATION, TEST = "stub", "verification", "test"
 #: A C# test that read a keyless wrapper's member through a receiver typed as
 #: a sibling implementation; carries the test's name.
 SIBLING_TEST = "sibling test"
+#: A Go test deleted because it pinned the removed value with a test setter
+#: (:mod:`flag_cleanup.go_setters`); carries the test's name.
+SETTER_TEST = "setter test"
 #: A C# test helper's parameter removed by a pin (:mod:`flag_cleanup.cs_param_pins`),
 #: one per helper; carries its signature and how many calls lost the argument.
 PINNED_PARAMETER = "pinned parameter"
@@ -151,6 +154,19 @@ _KOTLIN_WHEN = r"(?:whenever|`when`)"
 #: A C# wrapper stub's value: a literal, or a name a helper's parameter may
 #: hold (:mod:`flag_cleanup.cs_param_pins`).
 _VALUE = r"(?:(?P<value>true|false)|(?P<param>[A-Za-z_]\w*))"
+
+
+def _cs_returns(methods: str, value: str) -> str:
+    """A C# stub's ``.Returns(<value>)``, where a Task-returning read is
+    usually given its value wrapped: ``Task.FromResult(true)``,
+    ``Task.FromResult<bool>(true)``, ``new ValueTask<bool>(true)`` or
+    ``ValueTask.FromResult(true)``. The wrapper is matched whole, so a
+    wrapped call or a chained ``.ContinueWith`` decides nothing."""
+    generic = r"(?:\s*<\s*bool\s*>)?"
+    wrapper = (
+        rf"(?:(?:Value)?Task\s*\.\s*FromResult{generic}|new\s+ValueTask\s*<\s*bool\s*>)\s*\(\s*"
+    )
+    return rf"(?:{methods})\(\s*(?P<wrapped>{wrapper})?{value}\s*(?(wrapped)\)\s*)\)"
 
 #: The words a statement must hold to be a test-double line at all. A read
 #: with none of them is a real read, and the engine folds it.
@@ -251,12 +267,64 @@ def _java_test(node: Node, data: bytes) -> str | None:
 #: minutest, Spek and Kotest: a single test, or a group whose `before {}` a
 #: stub of the removed value sends with every test under it.
 _KOTLIN_TEST_CALLEES = frozenset({"test", "it", "should", "context", "describe"})
+#: Kotest styles whose tests are a string invoked with a lambda, ``"title" { … }``.
+#: Anywhere else that call is whatever ``String.invoke`` the file brings in.
+_KOTEST_STRING_SPECS = frozenset({"StringSpec", "WordSpec", "FreeSpec"})
+
+
+def _plain_title(title: Node, data: bytes) -> str | None:
+    """A string literal's text, when it has no interpolation."""
+    parts = [c for c in title.named_children if "comment" not in c.type]
+    return _text(parts[0], data) if len(parts) == 1 and parts[0].type == "string_content" else None
+
+
+def _in_kotest_string_spec(node: Node, data: bytes) -> bool:
+    """``node`` sits in a class or object extending a style of
+    :data:`_KOTEST_STRING_SPECS`, by its lambda or its ``init``."""
+    ancestor = node.parent
+    while ancestor is not None and ancestor.type not in ("class_declaration", "object_declaration", "object_literal"):
+        ancestor = ancestor.parent
+    if ancestor is None:
+        return False
+    specifiers = next((c for c in ancestor.children if c.type == "delegation_specifiers"), None)
+    if specifiers is None:
+        return False
+    return any(
+        c.type == "user_type" and _text(c, data).rsplit(".", 1)[-1] in _KOTEST_STRING_SPECS
+        for specifier in specifiers.named_children
+        for invocation in specifier.named_children
+        if invocation.type == "constructor_invocation"
+        for c in invocation.named_children
+    )
+
+
+def _kotest_test_position(node: Node, data: bytes) -> bool:
+    """``node`` is a statement of a Kotest string spec's own lambda, its
+    ``init``, or a container's body. Anywhere deeper, as in a test's body,
+    ``"x" { … }`` is the file's own ``String.invoke`` DSL, not a test."""
+    body = node.parent
+    holder = body.parent if body is not None else None
+    if holder is None or not _in_kotest_string_spec(node, data):
+        return False
+    if body.type == "block":
+        return holder.type == "anonymous_initializer"
+    if body.type != "lambda_literal":
+        return False
+    if holder.type == "value_argument":
+        invocation = holder.parent.parent if holder.parent is not None else None
+        return invocation is not None and invocation.type == "constructor_invocation"
+    return holder.type in ("infix_expression", "binary_expression") and _kotlin_container_body(holder, data) == body
 
 
 def _kotlin_call_test(node: Node, data: bytes) -> str | None:
-    """``test("title") { … }``, and the title with no interpolation."""
+    """``test("title") { … }``, or Kotest's ``"title" { … }``, and the title
+    with no interpolation."""
     call = node.named_children[0] if node.named_children else None
-    if call is None or call.type != "call_expression" or not any(c.type == "annotated_lambda" for c in node.children):
+    if call is None or not any(c.type == "annotated_lambda" for c in node.children):
+        return None
+    if call.type == "string_literal":
+        return _plain_title(call, data) if _kotest_test_position(node, data) else None
+    if call.type != "call_expression":
         return None
     callee = call.named_children[0]
     arguments = next((c for c in call.children if c.type == "value_arguments"), None)
@@ -266,8 +334,60 @@ def _kotlin_call_test(node: Node, data: bytes) -> str | None:
     title = values[0].named_children[0] if len(values) == 1 and values[0].named_children else None
     if title is None or title.type != "string_literal":
         return None
-    parts = [c for c in title.named_children if "comment" not in c.type]
-    return _text(parts[0], data) if len(parts) == 1 and parts[0].type == "string_content" else None
+    return _plain_title(title, data)
+
+
+#: WordSpec's ``"x" should { … }`` and ``"x" When { … }`` containers.
+_KOTEST_INFIX_CONTAINERS = frozenset({"should", "When", "`when`"})
+
+
+def _kotlin_container_body(node: Node, data: bytes) -> Node | None:
+    """The lambda holding a container's tests: a call-shaped test's
+    (``context("x") { … }``), or a Kotest string spec's ``"x" should { … }``
+    or FreeSpec ``"x" - { … }``."""
+    if node.type == "call_expression" and _kotlin_call_test(node, data) is not None:
+        annotated = next((c for c in node.children if c.type == "annotated_lambda"), None)
+        return next((c for c in annotated.named_children if c.type == "lambda_literal"), None) if annotated else None
+    children = node.named_children
+    if (
+        node.type not in ("infix_expression", "binary_expression")
+        or len(children) not in (2, 3)
+        or children[0].type != "string_literal"
+        or children[-1].type != "lambda_literal"
+        or not _in_kotest_string_spec(node, data)
+    ):
+        return None
+    if node.type == "infix_expression":
+        infix = children[1] if len(children) == 3 else None
+        return children[-1] if infix is not None and _text(infix, data) in _KOTEST_INFIX_CONTAINERS else None
+    operator = node.child_by_field_name("operator")
+    return children[-1] if len(children) == 2 and operator is not None and _text(operator, data) == "-" else None
+
+
+def _kotlin_emptied_containers(tests: list[tuple[Node, str, str]], data: bytes) -> list[tuple[Node, str, str]]:
+    """``tests``, with a container whose every statement is a deleted test
+    deleted in their place, outward until a container keeps a line."""
+    while True:
+        by_parent: dict[int, list[tuple[Node, str, str]]] = {}
+        for entry in tests:
+            if entry[0].parent is not None:
+                by_parent.setdefault(entry[0].parent.id, []).append(entry)
+        for gone in by_parent.values():
+            body = gone[0][0].parent
+            statements = [c for c in body.named_children if "comment" not in c.type]
+            container = body.parent.parent if body.parent is not None and body.parent.type == "annotated_lambda" else body.parent
+            ids = {test.id for test, _, _ in gone}
+            if (
+                container is None
+                or _kotlin_container_body(container, data) != body
+                or {s.id for s in statements} != ids
+            ):
+                continue
+            tests = [entry for entry in tests if entry[0].id not in ids]
+            tests.append((container, ", ".join(name for _, name, _ in gone), gone[0][2]))
+            break
+        else:
+            return tests
 
 
 def _kotlin_test(node: Node, data: bytes) -> str | None:
@@ -442,16 +562,16 @@ def _php_test(node: Node, data: bytes) -> str | None:
 
 def _mockito_patterns(read_call: str, read: str, key: str) -> list[tuple[str, str]]:
     """Mockito and BDDMockito, and the Kotlin and Dart ports of them."""
-    when = r"(?:(?:Mockito|BDDMockito)\.)?(?:when|`when`|whenever|given)"
-    times = rf"(?:\s*,\s*(?:Mockito\.)?\w+\({_BALANCED}\))?"
+    when = r"(?:(?:Mockito|BDDMockito)\s*\.\s*)?(?:when|`when`|whenever|given)"
+    times = rf"(?:\s*,\s*(?:Mockito\s*\.\s*)?\w+\s*\({_BALANCED}\))?"
     return [
-        (STUB, rf"{when}\(\s*{read_call}\s*\)\s*\.\s*(?:thenReturn|willReturn)\(\s*{_BOOL}\s*\)"),
+        (STUB, rf"(?<![\w$.]){when}\s*\(\s*{read_call}\s*\)\s*\.\s*(?:thenReturn|willReturn)\(\s*{_BOOL}\s*\)"),
         (
             STUB,
-            rf"(?:Mockito\.)?doReturn\(\s*{_BOOL}\s*\)\s*\.\s*when\(\s*{_MOCK}\s*\)"
+            rf"(?<![\w$.])(?:Mockito\s*\.\s*)?doReturn\s*\(\s*{_BOOL}\s*\)\s*\.\s*when\s*\(\s*{_MOCK}\s*\)"
             rf"\s*\.\s*(?:{read})\(\s*{key}{_TAIL}",
         ),
-        (VERIFICATION, rf"(?:Mockito\.)?verify\(\s*{_MOCK}{times}\s*\)\s*\.\s*(?:{read})\(\s*{key}{_TAIL}"),
+        (VERIFICATION, rf"(?<![\w$.])(?:Mockito\s*\.\s*)?verify\s*\(\s*{_MOCK}{times}\s*\)\s*\.\s*(?:{read})\(\s*{key}{_TAIL}"),
     ]
 
 
@@ -644,18 +764,18 @@ def _wrapper_patterns(language: str, names: str, receivers: str) -> list[tuple[s
         return _csharp_wrapper_patterns(names, receivers)
     receiver = rf"(?:this\s*\.\s*)?(?:{receivers})"
     read_call = rf"{receiver}\s*\.\s*(?:{names})\(\s*{_BALANCED}\)"
-    when = r"(?:(?:Mockito|BDDMockito)\.)?(?:when|`when`|whenever|given)"
-    times = rf"(?:\s*,\s*(?:Mockito\.)?\w+\({_BALANCED}\))?"
+    when = r"(?:(?:Mockito|BDDMockito)\s*\.\s*)?(?:when|`when`|whenever|given)"
+    times = rf"(?:\s*,\s*(?:Mockito\s*\.\s*)?\w+\s*\({_BALANCED}\))?"
     patterns = [
-        (STUB, rf"{when}\(\s*{read_call}\s*\)\s*\.\s*(?:thenReturn|willReturn)\(\s*{_BOOL}\s*\)"),
+        (STUB, rf"(?<![\w$.]){when}\s*\(\s*{read_call}\s*\)\s*\.\s*(?:thenReturn|willReturn)\(\s*{_BOOL}\s*\)"),
         (
             STUB,
-            rf"(?:Mockito\.)?doReturn\(\s*{_BOOL}\s*\)\s*\.\s*when\(\s*{receiver}\s*\)"
+            rf"(?<![\w$.])(?:Mockito\s*\.\s*)?doReturn\s*\(\s*{_BOOL}\s*\)\s*\.\s*when\s*\(\s*{receiver}\s*\)"
             rf"\s*\.\s*(?:{names})\(\s*{_BALANCED}\)",
         ),
         (
             VERIFICATION,
-            rf"(?:Mockito\.)?verify\(\s*{receiver}{times}\s*\)\s*\.\s*(?:{names})\(\s*{_BALANCED}\)",
+            rf"(?<![\w$.])(?:Mockito\s*\.\s*)?verify\s*\(\s*{receiver}{times}\s*\)\s*\.\s*(?:{names})\(\s*{_BALANCED}\)",
         ),
     ]
     if language == "kt":
@@ -679,9 +799,9 @@ def _csharp_wrapper_patterns(names: str, receivers: str) -> list[tuple[str, str]
     )
     mock = rf"(?:this\s*\.\s*)?(?:{receivers})"
     return [
-        (STUB, rf"{mock}\s*\.\s*Setup(?:Get)?\(\s*{lam}\s*\)\s*\.\s*Returns(?:Async)?\(\s*{_VALUE}\s*\)"),
+        (STUB, rf"{mock}\s*\.\s*Setup(?:Get)?\(\s*{lam}\s*\)\s*\.\s*" + _cs_returns("Returns(?:Async)?", _VALUE)),
         (VERIFICATION, rf"{mock}\s*\.\s*Verify(?:Get)?\(\s*{lam}\s*(?:,{_BALANCED})?\)"),
-        (STUB, rf"{mock}\s*\.\s*{member}\s*\.\s*Returns(?:ForAnyArgs)?\(\s*{_VALUE}\s*\)"),
+        (STUB, rf"{mock}\s*\.\s*{member}\s*\.\s*" + _cs_returns("Returns(?:ForAnyArgs)?", _VALUE)),
         (
             VERIFICATION,
             rf"(?:_\s*=\s*)?{mock}\s*\.\s*(?:Received\(\s*\d*\s*\)|DidNotReceive\(\s*\))\s*\.\s*{member}",
@@ -755,13 +875,16 @@ def _java_patterns(read: str, key: str) -> list[tuple[str, str]]:
     return _mockito_patterns(rf"{_CHAIN}(?:{read})\(\s*{key}{_TAIL}", read, key)
 
 
-def _kotlin_patterns(read: str, key: str) -> list[tuple[str, str]]:
+def _kotlin_patterns(read: str, key: str, scope_key: str | None = None) -> list[tuple[str, str]]:
+    """``scope_key`` is the key as spelled inside MockK's ``every { }`` /
+    ``verify { }``, where a bare ``eq`` is the scope's member."""
     read_call = rf"{_CHAIN}(?:{read})\(\s*{key}{_TAIL}"
+    scoped = rf"{_CHAIN}(?:{read})\(\s*{scope_key or key}{_TAIL}"
     return [
         *_mockito_patterns(read_call, read, key),
-        (STUB, rf"(?:co)?every\s*\{{\s*{read_call}\s*\}}\s*returns\s+{_BOOL}"),
+        (STUB, rf"(?:co)?every\s*\{{\s*{scoped}\s*\}}\s*returns\s+{_BOOL}"),
         (STUB, rf"{_KOTLIN_WHEN}\(\s*{read_call}\s*\)\s+doReturn\s+{_BOOL}"),
-        (VERIFICATION, rf"(?:co)?verify\s*(?:\({_BALANCED}\))?\s*\{{\s*{read_call}\s*\}}"),
+        (VERIFICATION, rf"(?:co)?verify\s*(?:\({_BALANCED}\))?\s*\{{\s*{scoped}\s*\}}"),
     ]
 
 
@@ -1290,7 +1413,7 @@ def _go_patterns(read: str, key: str) -> list[tuple[str, str]]:
     return [
         (
             STUB,
-            rf"{_MOCK}\.EXPECT\(\s*\)\s*\.\s*(?:{read})\(\s*{key}{_TAIL}"
+            rf"{_MOCK}\s*\.\s*EXPECT\(\s*\)\s*\.\s*(?:{read})\(\s*{key}{_TAIL}"
             rf"{calls}\s*\.\s*Return\(\s*{_BOOL}\s*\){calls}",
         ),
     ]
@@ -1309,12 +1432,12 @@ def _csharp_patterns(read: str, key: str) -> list[tuple[str, str]]:
         rf"(?P<receiver>\w+)\s*\.\s*(?:{read})\(\s*{key}{_TAIL}"
     )
     return [
-        (STUB, rf"{_MOCK}\.Setup\(\s*{lam}\s*\)\s*\.\s*Returns(?:Async)?\(\s*{_BOOL}\s*\)"),
-        (VERIFICATION, rf"{_MOCK}\.Verify\(\s*{lam}\s*(?:,{_BALANCED})?\)"),
+        (STUB, rf"{_MOCK}\s*\.\s*Setup\(\s*{lam}\s*\)\s*\.\s*" + _cs_returns("Returns(?:Async)?", _BOOL)),
+        (VERIFICATION, rf"{_MOCK}\s*\.\s*Verify\(\s*{lam}\s*(?:,{_BALANCED})?\)"),
         # NSubstitute, which takes the real call.
         (
             STUB,
-            rf"{_CSHARP_CHAIN}(?:{read})\(\s*{key}{_TAIL}\s*\.\s*Returns(?:ForAnyArgs)?\(\s*{_BOOL}\s*\)",
+            rf"{_CSHARP_CHAIN}(?:{read})\(\s*{key}{_TAIL}\s*\.\s*" + _cs_returns("Returns(?:ForAnyArgs)?", _BOOL),
         ),
         (
             VERIFICATION,
@@ -1432,13 +1555,22 @@ def _reads(language: str, accessors: tuple[str, ...], source: str) -> str:
     return "|".join(re.escape(name) for name in ordered)
 
 
-def _key(flag_key: str, consts: Iterable[str]) -> str:
+def _key(
+    flag_key: str, consts: Iterable[str], jvm_source: tuple[str, str] | None = None, mockk_scope: bool = False
+) -> str:
     """The key as a stub can spell it: quoted, a hoisted constant, or inside an
-    equality matcher (``eq("k")``, ``gomock.Eq("k")``)."""
+    equality matcher (``eq("k")``, ``gomock.Eq("k")``).
+
+    ``jvm_source`` is ``(source, language)`` for Java and Kotlin, where ``eq``
+    is a matcher only when it provably is the library's (:mod:`jvm_matchers`):
+    a file's own ``eq`` is not the key's carrier."""
     spellings = [re.escape(f'"{flag_key}"'), re.escape(f"'{flag_key}'"), re.escape(f"`{flag_key}`")]
     # `(?!\w)`, not `\b`: `nameof(Flags.X)` ends in a bracket.
     spellings += [rf"\b{re.escape(name)}(?!\w)" for name in consts]
     literal = "|".join(spellings)
+    if jvm_source is not None:
+        matcher = jvm_matchers.eq_alternation(*jvm_source, mockk_scope=mockk_scope)
+        return rf"(?:{matcher}\(\s*(?:{literal})\s*\)|(?:{literal}))"
     return rf"(?:(?:[\w$]+\.)*(?:eq|Eq)\(\s*(?:{literal})\s*\)|(?:{literal}))"
 
 
@@ -1843,6 +1975,8 @@ def resolve(
     knob_holders = (knob_receivers or frozenset()) if knob_names else frozenset()
     owners = {o: (k, p) for o, k, p in wrapper.sibling_owners} if fakes else {}
     defaults = dict(wrapper.owner_defaults) if fakes else {}
+    decided: dict[tuple[int, int], bool] = {}
+    setter_mention: re.Pattern[str] | None = None
     if wrapper is not None:
         if (
             language not in ("java", "kt", "csharp")
@@ -1871,14 +2005,35 @@ def resolve(
         # `(?!\w)`, not `\b`: a Ruby accessor ends in `?`, after which `\b`
         # needs a word character and so never matches the call. A Sinon stub
         # names the read in a string, which the same search finds.
-        if not re.search(rf"\b(?:{reads})(?!\w)", source) and "withArgs" not in source:
+        setter_names = go_setters.declared() if language == "go" else frozenset()
+        if (
+            not re.search(rf"\b(?:{reads})(?!\w)", source)
+            and "withArgs" not in source
+            and not (setter_names and go_setters.call_pattern(setter_names).search(source))
+        ):
             return source, []
         data = source.encode("utf-8")
         root = profile.parse(source, language)
         consts = [k.name for k in key_const.key_consts(root, data, language, flag_key)]
-        key = _key(flag_key, [*consts, *key_texts])
-        mention = re.compile(rf"\b(?:{reads})\s*\(\s*{key}")
-        patterns = [(kind, re.compile(p)) for kind, p in profile.patterns(reads, key)]
+        jvm = (source, language) if language in ("java", "kt") else None
+        all_consts = [*consts, *key_texts]
+        key = _key(flag_key, all_consts, jvm)
+        scope_key = _key(flag_key, all_consts, jvm, mockk_scope=True) if language == "kt" else key
+        mention = re.compile(rf"\b(?:{reads})\s*\(\s*{scope_key}")
+        if setter_names:
+            names = "|".join(re.escape(n) for n in sorted(setter_names, key=len, reverse=True))
+            setter_mention = re.compile(f"(?<![\\w$])(?:{names})\\s*\\((?:[^()]|\\([^()]*\\))*?{key}")
+            spellings = frozenset(
+                {*(f'"{flag_key}"', f"`{flag_key}`"), *("".join(c.split()) for c in consts), *("".join(t.split()) for t in key_texts)}
+            )
+            decided = {
+                (site.statement.start_byte, site.statement.end_byte): site.value
+                for site in go_setters.sites(
+                    checkout[1] if checkout else "", root, spellings, checkout[0] if checkout else "", setter_names
+                )
+            } if checkout else {}
+        built = _kotlin_patterns(reads, key, scope_key) if language == "kt" else profile.patterns(reads, key)
+        patterns = [(kind, re.compile(p)) for kind, p in built]
         if language in _TS_LANGUAGES:
             sinon = _sinon_patterns(reads, key, _sinon_names(source, reads))
             patterns += [(kind, re.compile(p)) for kind, p in sinon]
@@ -1896,6 +2051,8 @@ def resolve(
         patterns.append((STUB, re.compile(rf"{holder}\s*\.\s*(?:{knobs})\s*=\s*{_VALUE}")))
 
     def describes(text: str) -> bool:
+        if setter_mention is not None and setter_mention.search(text):
+            return True
         return _describes_read(text, mention) or (knob_mention is not None and bool(knob_mention.search(text)))
 
     statements = _statements(root, data, profile, describes)
@@ -1905,6 +2062,7 @@ def resolve(
         source, language, profile, root, data, statements, patterns, treatment,
         wrapper=wrapper, siblings=siblings, fakes=bool(fakes), owners=owners,
         knob_writes=patterns[-1][1] if knob_holders else None, defaults=defaults, checkout=checkout,
+        decided=decided,
     )
 
 
@@ -1955,6 +2113,7 @@ def _apply(
     knob_writes: re.Pattern[str] | None = None,
     defaults: dict[str, bool] | None = None,
     checkout: tuple[str, str] | None = None,
+    decided: Mapping[tuple[int, int], bool] | None = None,
 ) -> tuple[str, list[Removal]]:
     """Decide each test or statement from its stubs and delete what goes, with
     the ``extra`` spans another recogniser already decided. ``siblings``,
@@ -2022,6 +2181,9 @@ def _apply(
         if kept_word is not None and kept_word.search(_text(statement, data)):
             unit.kept = True
         kind, value, groups = _recognise(_text(statement, data), patterns)
+        if decided and (statement.start_byte, statement.end_byte) in decided:
+            # A Go test setter proven by :mod:`flag_cleanup.go_setters`.
+            kind, value, groups = STUB, "true" if decided[(statement.start_byte, statement.end_byte)] else "false", {}
         if kind == STUB and language == "ruby" and _in_ruby_after_hook(statement, data):
             # It runs once the test is over, so it says nothing of the branch
             # the test ran, and goes whatever that was.
@@ -2180,7 +2342,10 @@ def _apply(
                 # The removed value may not be the one the test runs with.
                 unit.unprovable = True
             if unit.test is not None and not unit.unprovable and values == {not treatment}:
-                tests.append((unit.test, unit.name or "", TEST))
+                by_setter = bool(decided) and any(
+                    (s.start_byte, s.end_byte) in decided for s, _ in unit.stubs
+                )
+                tests.append((unit.test, unit.name or "", SETTER_TEST if by_setter else TEST))
                 continue
             if (
                 unit.test is not None
@@ -2260,6 +2425,8 @@ def _apply(
     ]
     if language == "ruby":
         lines = _ruby_emptied_hooks(lines, data)
+    if language == "kt":
+        tests = _kotlin_emptied_containers(tests, data)
     extra = list(extra)
     # A pin whose every call keeps its test still edits: the parameter, the
     # arguments and a construction's literal.

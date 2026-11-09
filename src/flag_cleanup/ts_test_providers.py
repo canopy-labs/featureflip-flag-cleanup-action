@@ -39,7 +39,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, cross_file_ts, ts_gates, ts_scope
+from flag_cleanup import cross_file_keys, cross_file_ts, jsx_unwrap, ts_gates, ts_scope
 
 #: The ``bindings`` kind of a provider this run unwrapped. Text: its line.
 UNWRAPPED_PROVIDER = "unwrapped test provider"
@@ -79,11 +79,14 @@ def covers(grammar: str) -> bool:
     return grammar in ("tsx", "js")
 
 
-def unwrap(before: str, after: str, path: str, repo_dir: str, flag_key: str) -> tuple[str, list[str]]:
+def unwrap(
+    before: str, after: str, path: str, repo_dir: str, flag_key: str, engine: jsx_unwrap.Engine
+) -> tuple[str, list[str]]:
     """``after`` with each Featureflip test provider this run emptied replaced
     by its children, when nothing the file loads reaches a Featureflip
     module; and the line of each element unwrapped. ``after`` unchanged
-    otherwise."""
+    otherwise. The edit is the engine's (:mod:`flag_cleanup.jsx_unwrap`):
+    ``path`` holds ``after`` and ``engine`` runs the marked-element rules."""
     grammar = ts_scope.grammar(path)
     if not covers(grammar) or before == after:
         return after, []
@@ -107,22 +110,14 @@ def unwrap(before: str, after: str, path: str, repo_dir: str, flag_key: str) -> 
             _prove(root, data, path, repo_dir, statement if solo else None)
         except (_Unproven, OSError, RecursionError, UnicodeDecodeError):
             continue
-        return _unwrapped(after, path, local)
+        unwrapped = jsx_unwrap.unwrap(
+            path, after, [(e.start_byte, e.end_byte) for e in elements], grammar, engine
+        )
+        if unwrapped is None:
+            continue
+        lines = [data[e.start_byte :].split(b"\n", 1)[0].decode("utf-8").strip() for e in elements]
+        return unwrapped, lines
     return after, []
-
-
-def _unwrapped(source: str, path: str, local: str) -> tuple[str, list[str]]:
-    lines: list[str] = []
-    for _ in range(1000):
-        data = source.encode("utf-8")
-        elements = _elements(ts_scope.parse(source, path), data, local) or []
-        if not elements:
-            break
-        element = elements[0]
-        lines.append(data[element.start_byte :].split(b"\n", 1)[0].decode("utf-8").strip())
-        data = data[: element.start_byte] + ts_gates._children_text(element, data) + data[element.end_byte :]
-        source = data.decode("utf-8")
-    return source, lines
 
 
 def _providers(root: Node, data: bytes, path: str, repo_dir: str) -> list[tuple[str, Node, bool]]:

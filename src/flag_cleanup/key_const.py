@@ -48,13 +48,16 @@ the flag as still referenced, forever.
 
 from __future__ import annotations
 
+import contextlib
 import re
+from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Callable
 
 from tree_sitter import Node
 
-from flag_cleanup import dead_branches, kotlin_sentinel, ts_syntax
+from flag_cleanup import dead_branches, kotlin_sentinel, rule_synthesis, ts_syntax
 from flag_cleanup.tree_walk import preorder
 
 __all__ = ["KeyConst", "path_is_safe", "supported_languages", "key_consts"]
@@ -830,7 +833,218 @@ def _go_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyCo
                     name_nodes=(names[0],),
                 )
             )
+    found.extend(_go_var_holders(root, source_bytes, flag_key))
     return found
+
+
+def _go_constructor_call(value: Node, source_bytes: bytes) -> Node | None:
+    """The ``Ctor("key", ...)`` call a package-level ``var``'s only value is,
+    or ``None``: a plain function name or ``pkg.Name``, no type arguments,
+    the key an interpreted string literal in the FIRST argument."""
+    if value.type != "expression_list" or len(value.named_children) != 1:
+        return None
+    call = value.named_children[0]
+    if call.type != "call_expression" or call.child_by_field_name("type_arguments") is not None:
+        return None
+    function = call.child_by_field_name("function")
+    if function is None:
+        return None
+    if function.type == "selector_expression":
+        operand = function.child_by_field_name("operand")
+        field = function.child_by_field_name("field")
+        if operand is None or operand.type != "identifier" or field is None:
+            return None
+    elif function.type != "identifier":
+        return None
+    arguments = call.child_by_field_name("arguments")
+    if arguments is None or not arguments.named_children:
+        return None
+    first = arguments.named_children[0]
+    if first.type != "interpreted_string_literal":
+        return None
+    return first
+
+
+def _go_var_holders(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
+    """Every package-level ``var NAME = Ctor("flag-key", ...)``: a typed flag
+    HANDLE that other files pass to a configured accessor
+    (``ff.BoolFlag(ctx, pkg.NAME)``).
+
+    A ``var`` can be reassigned and has an address, which a ``const`` does not,
+    so what proves it a holder is that NOTHING else mentions it: in this file
+    :func:`_go_withholds` keeps the file when its name occurs anywhere but the
+    declaration, and in every other file the cross-file reader refuses any
+    mention that is not a read it folds (an assignment, ``&NAME``, ``NAME.f``,
+    a call that is not a configured accessor's). Whether the constructor really
+    returns a value naming the key is the one thing no syntax proves; it is the
+    customer's naming of the constructor by passing the key as its first
+    argument."""
+    found: list[KeyConst] = []
+    for declaration in root.named_children:
+        if declaration.type != "var_declaration":
+            continue
+        specs = [
+            spec
+            for child in declaration.named_children
+            for spec in (child.named_children if child.type == "var_spec_list" else [child])
+            if spec.type == "var_spec"
+        ]
+        for spec in specs:
+            names = [c for c in spec.children_by_field_name("name") if c.type == "identifier"]
+            value = spec.child_by_field_name("value")
+            if len(names) != 1 or value is None:
+                continue
+            literal = _go_constructor_call(value, source_bytes)
+            if literal is None:
+                continue
+            content = next((c for c in literal.named_children if "content" in c.type), None)
+            text = _text(content, source_bytes) if content is not None else _text(literal, source_bytes)[1:-1]
+            if text == flag_key and _text(names[0], source_bytes) != "_":
+                found.append(
+                    KeyConst(
+                        name=_text(names[0], source_bytes),
+                        declaration=declaration,
+                        name_nodes=(names[0],),
+                    )
+                )
+    return found
+
+
+def go_is_var_holder(const: KeyConst) -> bool:
+    return const.declaration.type == "var_declaration"
+
+
+_GO_FILE: ContextVar[str | None] = ContextVar("go_key_const_file", default=None)
+
+
+@contextlib.contextmanager
+def go_file(path: str | None) -> Iterator[None]:
+    """The Go file the next gate question is about. A handle's constructor is
+    proven from the repository around the file, so a question asked without
+    one cannot prove it and withholds the file (see :func:`_go_withholds`)."""
+    token = _GO_FILE.set(None if path is None else str(path))
+    try:
+        yield
+    finally:
+        _GO_FILE.reset(token)
+
+
+def _go_holder_call(const: KeyConst) -> Node | None:
+    for spec in _walk(const.declaration):
+        if spec.type != "var_spec":
+            continue
+        names = spec.children_by_field_name("name")
+        if any(n.id == const.name_nodes[0].id for n in names):
+            value = spec.child_by_field_name("value")
+            return value.named_children[0] if value is not None and value.named_children else None
+    return None
+
+
+def _go_param_carried(constructor: Node) -> bool:
+    """Whether a constructor's body is one ``return T{…}`` or ``return &T{…}``
+    holding its first parameter, a ``string``, unmodified as a field value."""
+    if constructor.child_by_field_name("type_parameters") is not None:
+        return False
+    parameters = constructor.child_by_field_name("parameters")
+    body = constructor.child_by_field_name("body")
+    if parameters is None or body is None:
+        return False
+    first = next(iter(parameters.named_children), None)
+    if first is None or first.type != "parameter_declaration":
+        return False
+    names = first.children_by_field_name("name")
+    kind = first.child_by_field_name("type")
+    if not names or kind is None or kind.text != b"string":
+        return False
+    parameter = names[0].text
+    listed = next((c for c in body.named_children if c.type == "statement_list"), None)
+    statements = [c for c in (listed.named_children if listed is not None else []) if c.type != "comment"]
+    if len(statements) != 1 or statements[0].type != "return_statement":
+        return False
+    results = statements[0].named_children
+    if len(results) != 1:
+        return False
+    expression = results[0]
+    if expression.type == "expression_list":
+        if len(expression.named_children) != 1:
+            return False
+        expression = expression.named_children[0]
+    if expression.type == "unary_expression":
+        if not expression.children or expression.children[0].type != "&":
+            return False
+        expression = expression.child_by_field_name("operand")
+    if expression is None or expression.type != "composite_literal":
+        return False
+    if expression.child_by_field_name("type").type not in ("type_identifier", "qualified_type"):
+        return False
+    literal = expression.child_by_field_name("body")
+    if literal is None:
+        return False
+    carried = False
+    for element in literal.named_children:
+        value = element
+        if element.type == "keyed_element":
+            value = element.child_by_field_name("value") or element
+        elif element.type == "literal_element":
+            value = element
+        # `literal_element` wraps the value in some grammar versions.
+        while value.type in ("literal_element", "literal_value") and len(value.named_children) == 1:
+            value = value.named_children[0]
+        if value.type == "identifier" and value.text == parameter:
+            carried = True
+        elif any(n.type == "identifier" and n.text == parameter for n in _walk(value)):
+            # Another field holds something derived from it.
+            return False
+    return carried
+
+
+def go_constructor_proven(call: Node, path: str | None) -> bool:
+    """Whether the ``Ctor`` of a handle's ``Ctor("key", …)`` is declared in the
+    repository as a function that stores its first argument unmodified in what
+    it returns (:func:`_go_param_carried`). ``Ctor`` is ``name`` of the file's
+    own package or ``pkg.Name`` through an import of the same module; any other
+    callee (the standard library, a dependency) is not proven."""
+    if path is None:
+        return False
+    from pathlib import Path
+
+    from flag_cleanup import go_scope
+
+    function = call.child_by_field_name("function")
+    if function is None:
+        return False
+    from flag_cleanup import source_index
+
+    packages = go_scope.Packages(Path(source_index.checkout_root(str(Path(path).resolve().parent))))
+    here = Path(path).resolve()
+    file = packages.file(here)
+    if file is None or file.clause is None:
+        return False
+    if function.type == "identifier":
+        name = function.text
+        directory, clause = here.parent, file.clause
+    elif function.type == "selector_expression":
+        operand = function.child_by_field_name("operand")
+        field = function.child_by_field_name("field")
+        if operand is None or field is None or operand.type != "identifier":
+            return False
+        if go_scope.local_binders(function, operand.text.decode()):
+            return False
+        imported = packages.imported(file, operand.text.decode())
+        if imported is None:
+            return False
+        name, directory, clause = field.text, imported.directory, imported.clause
+    else:
+        return False
+    found = [
+        declaration
+        for member in packages.package(directory, clause)
+        for declaration in member.root.named_children
+        if declaration.type == "function_declaration"
+        and declaration.child_by_field_name("name") is not None
+        and declaration.child_by_field_name("name").text == name
+    ]
+    return len(found) == 1 and _go_param_carried(found[0])
 
 
 def go_group_is_positional(declaration: Node, source_bytes: bytes) -> bool:
@@ -868,9 +1082,27 @@ def _go_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bo
     the delete rule for a group entry needs another entry beside it, so the
     second would be left as the group's last."""
     groups = [const.declaration.id for const in consts]
-    return len(groups) != len(set(groups)) or any(
+    if len(groups) != len(set(groups)) or any(
         go_group_is_positional(const.declaration, source_bytes) for const in consts
-    )
+    ):
+        return True
+    # A `var` handle is folded only where another file reads it, and the
+    # reader rules know no in-file read of one: any other mention here (a
+    # registry listing it, a read, an assignment, `&NAME`) keeps the file.
+    for const in consts:
+        if not go_is_var_holder(const):
+            continue
+        call = _go_holder_call(const)
+        if call is None or not go_constructor_proven(call, _GO_FILE.get()):
+            # Not proven to carry the key: no holder, the file is kept.
+            return True
+        declared = {n.id for n in const.name_nodes}
+        if any(
+            n.type == "identifier" and n.id not in declared and _text(n, source_bytes) == const.name
+            for n in _walk(root)
+        ):
+            return True
+    return False
 
 
 def _go_is_binding(node: Node) -> bool:
@@ -1117,7 +1349,9 @@ def _ts_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyCo
 
 
 def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
-    """First argument of a flag read ``ts_const.toml`` removes.
+    """A flag read ``ts_const.toml`` removes: the key is the first argument of
+    a read callee, or the argument at the index a positioned accessor
+    (``get[1]``) names.
 
     An OPTIONAL call is excluded for the reason ``ts.toml`` excludes it from
     the literal rules: `client.boolVariation?.(K, ...)` is `undefined` when the
@@ -1126,10 +1360,16 @@ def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     so counting such a read as removable here would let the delete rule strand
     a reference the engine deliberately left standing.
     """
-    call = _first_argument_of(identifier, "identifier", "arguments")
+    arguments = identifier.parent
+    if arguments is None or arguments.type != "arguments" or not arguments.named_children:
+        return False
+    index = next((i for i, c in enumerate(arguments.named_children) if c.id == identifier.id), None)
+    if index is None:
+        return False
+    call = arguments.parent
     if call is None or call.type != "call_expression":
         return False
-    if any(c.type == "?." for c in call.children):
+    if ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
         return False
     function = call.child_by_field_name("function")
     if function is None:
@@ -1143,6 +1383,8 @@ def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     if function is None or function.type not in ("identifier", "property_identifier"):
         return False
     callee = function.text.decode("utf-8")
+    if index:
+        return rule_synthesis.positions_of(accessors).get(callee) == index
     if callee not in _TS_FLAG_READ_CALLEES and callee not in accessors:
         return False
     if callee in _TS_AWAITED_ONLY_CALLEES:
@@ -1710,14 +1952,93 @@ def _contains(ancestor: Node, node: Node) -> bool:
     return any(child.id == node.id for child in _walk(ancestor))
 
 
+#: The `not_contains` filters the positioned Python key-constant rule templates
+#: (`python_const_key_positions.toml`, `python_xconst_key_positions.toml`) carry,
+#: by the name of what they decline. :func:`python_declined_by_const_rules` must
+#: decline exactly these; a test parses the TOML and compares.
+PYTHON_CONST_RULE_FILTERS = {
+    "list_splat": "((list_splat) @spread)",
+    "dictionary_splat": "((dictionary_splat) @spread)",
+    "comment": "((comment) @comment)",
+}
+
+
+#: The `not_enclosing_node` filters the same templates carry (whitespace is not
+#: significant; the test normalises it): a call inside a decorator whose own call
+#: is the accessor (``@flag_is_active(request, OLD)``, left for `python_gates`),
+#: or is ``method_decorator``. :func:`python_declined_by_const_rules` mirrors both.
+PYTHON_CONST_NOT_ENCLOSING = {
+    "gate": (
+        "((decorator (call function: [(attribute attribute: (identifier) @gate_fn) "
+        "(identifier) @gate_fn])) @gate (#eq? @gate_fn \"@sdk_fn\"))"
+    ),
+    "adapter": (
+        "((decorator (call function: [(attribute attribute: (identifier) @adapter_fn) "
+        "(identifier) @adapter_fn])) @adapted (#eq? @adapter_fn \"method_decorator\"))"
+    ),
+}
+
+
+def _python_callee_name(call: Node) -> str:
+    function = call.child_by_field_name("function")
+    if function is not None and function.type == "attribute":
+        function = function.child_by_field_name("attribute")
+    return function.text.decode("utf-8") if function is not None and function.type == "identifier" else ""
+
+
+def python_declined_by_const_rules(call: Node) -> bool:
+    """Whether the positioned key-constant rules decline ``call``: a ``*args``,
+    a ``**kwargs`` or a comment anywhere within it, or a call inside a decorator
+    gate on the same accessor or on ``method_decorator``."""
+    wanted = {"list_splat", "dictionary_splat", "comment"}
+    if any(n.type in wanted for n in _walk(call)):
+        return True
+    callee = _python_callee_name(call)
+    ancestor = call.parent
+    while ancestor is not None:
+        if ancestor.type == "decorator":
+            gate = next((c for c in ancestor.named_children if c.type == "call"), None)
+            if gate is not None and _python_callee_name(gate) in (callee, "method_decorator"):
+                return True
+        ancestor = ancestor.parent
+    return False
+
+
+def python_positioned_read(argument: Node, accessors: frozenset[str]) -> bool:
+    """Whether ``argument`` is the key of a positioned accessor's read the rules remove.
+
+    ``argument`` is the argument NODE (an identifier, or an attribute for a key
+    of another module). It counts only in the slot the accessor was declared
+    with (``get[1]``), and only when the rules would not decline the call."""
+    arguments = argument.parent
+    if arguments is None or arguments.type != "argument_list":
+        return False
+    index = next((i for i, c in enumerate(arguments.named_children) if c.id == argument.id), None)
+    if not index:
+        return False
+    call = arguments.parent
+    if call is None or call.type != "call" or python_declined_by_const_rules(call):
+        return False
+    function = call.child_by_field_name("function")
+    if function is not None and function.type == "attribute":
+        function = function.child_by_field_name("attribute")
+    if function is None or function.type != "identifier":
+        return False
+    return rule_synthesis.positions_of(accessors).get(function.text.decode("utf-8")) == index
+
+
 def _python_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
-    """First argument of a read ``python_const.toml`` removes.
+    """A read ``python_const.toml`` removes: the key is the first argument of a
+    read callee, or the argument at the index a positioned accessor
+    (``get[1]``) names.
 
     Mirrors those rules exactly, INCLUDING the boolean-literal requirement on
     `variation`: that SDK read is generic over the flag's type, so the literal
     default is the only evidence the flag is a boolean at all. `get_boolean_value`
     is boolean by name and needs none.
     """
+    if python_positioned_read(identifier, accessors):
+        return True
     call = _first_argument_of(identifier, "identifier", "argument_list")
     if call is None or call.type != "call":
         return False

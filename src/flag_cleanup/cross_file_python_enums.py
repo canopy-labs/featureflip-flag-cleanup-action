@@ -540,7 +540,7 @@ def _member_read(attribute: Node, owner: str, decl: xk.KeyDeclaration, accessors
         return xk.NOT_A_READ  # the member itself, handed on
     if _text(outer.child_by_field_name("attribute")) != "value" or _raw(outer) != f"{owner}.{decl.name}.value":
         return xk.UNSUPPORTED_FORM  # `.name`, `.label`, a method
-    return None if _is_read_at(outer, accessors) else xk.NOT_A_READ
+    return None if _is_read_at(outer, accessors, positioned=False) else xk.NOT_A_READ
 
 
 def _owner_use(node: Node, binding: _Binding) -> str | None:

@@ -270,6 +270,21 @@ inputs:
       default) changes nothing.
     required: false
     default: ''
+  test-setters:
+    description: >-
+      Go only. Comma-separated names of the functions your tests set a flag
+      with, such as `Set` for `featureflag.Set(orgID, Flag, true)`. A test
+      that pins the flag being removed to the value that stays loses that
+      line, and a test that pins it to the value that goes is deleted, as
+      for a mocked read. A call is touched only when this tool can prove it:
+      the callee must be a package-level function of your repository
+      (`pkg.Set(...)` or `Set(...)`, never a method) taking the flag's key
+      constant and a boolean literal, and every other argument a name, a
+      member read or a literal. A call it cannot prove is left in place and
+      keeps the key constant. Names are plain function names, held to the same
+      rules as `accessors`. Empty (the default) changes nothing.
+    required: false
+    default: ''
   languages:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
@@ -409,6 +424,7 @@ runs:
     FEATUREFLIP_INLINE_WRAPPERS: ${{ inputs.inline-wrappers }}
     FEATUREFLIP_SIDE_EFFECT_FREE_MODULES: ${{ inputs.side-effect-free-modules }}
     FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: ${{ inputs.side-effect-free-calls }}
+    FEATUREFLIP_TEST_SETTERS: ${{ inputs.test-setters }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
     FEATUREFLIP_FLAGS: ${{ inputs.flags }}

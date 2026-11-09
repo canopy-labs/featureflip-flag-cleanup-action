@@ -818,6 +818,7 @@ entries dropped.
 | `inline-wrappers` | `FEATUREFLIP_INLINE_WRAPPERS` | `true` | Kotlin, Java, C#, Go, TypeScript, JavaScript, Python, Dart, PHP, Ruby and Swift: inline a method, Kotlin property getter, Kotlin top-level function, C# get-only `bool` property, Go function, TypeScript or JavaScript function or class method, Python function, method or `@property`, Dart function, method or getter, PHP function or class method, Ruby method, or Swift function, method or computed property whose whole body is one read of the flag at every call its file proves is bound to it, and delete it once nothing calls it. `false` folds the read inside the method and stops there. See [Wrapping the SDK](#wrapping-the-sdk). |
 | `side-effect-free-modules` | `FEATUREFLIP_SIDE_EFFECT_FREE_MODULES` | *(none)* | TypeScript and JavaScript: comma-separated module specifiers whose load does nothing, spelled exactly as your imports spell them (`@/lib/featureflip, ./keys`). An import the removal left with nothing to import is deleted instead of being kept bare for its load, and the pull request names each one deleted this way. See [Supported JS/TS flag-read shapes](#supported-jsts-flag-read-shapes). |
 | `side-effect-free-calls` | `FEATUREFLIP_SIDE_EFFECT_FREE_CALLS` | *(none)* | Every language: comma-separated function or method names whose call does nothing you need, such as a getter that only returns your flag client (`GetClient, getClient`). When a removal leaves a call running only as a discard (`_ = getClient(p)` in Go, a bare `getClient(p);` elsewhere), a call to a listed name is deleted instead of kept, when every argument is a name, a literal or a member read. Plain names only, as for `accessors`, matched by the name the call ends in. The pull request names each call deleted this way. See [Discarded calls](#discarded-calls). |
+| `test-setters` | `FEATUREFLIP_TEST_SETTERS` | *(none)* | Go only: comma-separated names of the functions your tests set a flag with, such as `Set` for `featureflag.Set(orgID, Flag, true)`. A test that pins the flag being removed to the value that stays loses that line, and a test that pins it to the value that goes is deleted, the same way a mocked read is resolved. A call is touched only when it is proven: the callee is a package-level function of your repository (`Set(...)` in its own package or `pkg.Set(...)` through an import of the same module, never a method) declared with a `bool` parameter, the call is a statement of its own with exactly one argument spelling the flag's key and one `true` or `false` literal, and every other argument is a name, a member read or a literal. A test that sets the flag both ways, a setter in a `defer`, a method call and any call that is not proven are left in place, and the constant they name stays. Plain names only, as for `accessors`. |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
 | `base-branch` | `FEATUREFLIP_BASE_BRANCH` | the repository's default branch | Base branch each removal PR targets. Unset means "look it up" — see below. In the archive modes, the only branch a removal's merge counts on: give them the same value as the cleanup workflow. |
@@ -1203,6 +1204,55 @@ predicate or bang method — anything else fails the run immediately, before
 anything is modified, because these names are substituted into the rewrite
 rules.
 
+**A TypeScript or JavaScript accessor that may return a Promise keeps its type.**
+An awaited read (`await client.isEnabled('old-checkout')`) folds to the
+literal as usual. An un-awaited read is decided on its own, and the outcome for
+the flag is only ever a full fold or a refusal: if any read cannot be folded
+safely, the whole flag is refused (the run reports `unsafe-rewrite`, names the
+file and the reason, and changes nothing), never half removed. Two rules hold
+throughout: `Promise.resolve(true)` is written only on local evidence (the
+enclosing function's explicit `Promise<…>`/`PromiseLike<…>` return type, or a
+receiver whose declared type gives the accessor an explicit Promise return
+type), and a bare literal is never written when there is any Promise evidence.
+Parentheses, `!`, `as` and `satisfies` around the read are looked through, then,
+first match wins. A read that is only tested (an `if`, `while`, `do` or `for` condition, a ternary condition, an operand of `!`, or of `&&`/`||`/`??` whose result is itself tested) always folds to the literal, because a Promise there would already be truthy; test doubles (`sinon.stub`, `jest.fn`, `vi.fn`, `spyOn`) and declarations in test files do not count as declarations of the accessor:
+
+1. The result is used as a Promise (`.then`/`.catch`/`.finally` or any member
+   access on it, any `as`, `satisfies` or `<T>` cast to a type other than `boolean`, an
+   argument of `Promise.all` and the like, `expect(…).resolves`, or a variable
+   bound to the read and later used that way): the flag is refused.
+2. It is what an `async` function returns: the literal.
+3. It is what a function with an explicit return type returns:
+   `Promise<…>` gives `Promise.resolve(true)`, exactly `boolean` gives the
+   literal, anything else (a union, an alias, `MaybePromise`) refuses the flag. A read
+   that is only an arm of a ternary or an operand of `&&`, `||` or `??` is
+   folded only inside an `async` function or one annotated `boolean`.
+4. Its receiver is a plain identifier that is a typed parameter of an
+   enclosing function and is bound nowhere else inside that function (no
+   variable, loop, `catch`, nested parameter, destructuring or assignment of the
+   same name). Its annotation must be a plain reference to an interface or
+   object type alias, in the same file or imported by name, unrenamed, from a
+   relative file that declares it, and not a type parameter. If every member of
+   that name has an explicit return type and they agree, `Promise<…>` gives
+   `Promise.resolve(true)` when the read is returned (and refuses the flag elsewhere),
+   and `boolean` gives the literal. Anything else, including `this.field`, a
+   class, a package type or a re-export, does not resolve.
+5. Otherwise by name: if no declaration of the name in your repository is
+   `async`, Promise-typed, documented `@returns {Promise<…>}`, or could be, it
+   folds to the literal. If any is, the flag is refused. A declaration could be
+   async unless it has the return type `boolean` or is a function whose every
+   returned expression is a boolean literal, a comparison, a `!` test or a
+   `typeof`/`in`/`instanceof` test; a value that is a reference, a call, an
+   alias, a destructured binding, a returned local or a ternary all count.
+
+A refusal names the file and the reason ("an un-awaited read whose result may
+be a Promise: …"), including for a read through a key constant, so a key
+constant is never deleted while a read of it stays. A name declared only in a
+package you depend on is read as synchronous, so an async accessor from a
+package folds to the literal unless the read is returned from an `async` or
+annotated function. An awaited read through a key constant is not folded for an
+accessor that has any un-awaited read decided this way.
+
 **Ruby predicate methods are named with their `?`.** Ruby flag libraries and
 wrappers read through predicates, so name them as Ruby spells them:
 
@@ -1250,10 +1300,11 @@ being removed. A `useFlag` in
 someone else's library, or a `trackEvent('old-checkout')` alongside it, is
 untouched.
 
-**In Python, an accessor can say where its key is.** django-waffle reads a
-flag as `flag_is_active(request, "old-checkout")`, with the request first.
-Write the accessor with the index of its key argument, counting from 0 as
-Python does:
+**In Python, TypeScript and JavaScript, an accessor can say where its key is.**
+django-waffle reads a flag as `flag_is_active(request, "old-checkout")`, with
+the request first; lodash's `get(toggles, "old-checkout", false)` has the
+object first. Write the accessor with the index of its key argument, counting
+from 0:
 
 ```yaml
 with:
@@ -1261,13 +1312,35 @@ with:
 ```
 
 `flag_is_active[1]` then matches only a call whose argument at index 1 is the
-exact key, as a string literal. A call with the key in another slot,
+exact key, as a string literal (a constant holding the key counts as well, see
+below). A call with the key in another slot,
 `flag_is_active("old-checkout", request)` included, is untouched, so the
 blast radius stays one slot wide. The index is a single digit, an accessor has
-one of them, and `[0]` is the same as the plain name. A key held in a constant
-is not resolved in that slot, so the constant stays and is listed. Other
-languages ignore such an accessor, and a run whose `languages` leaves out
-Python fails at start-up rather than ignore it.
+one of them, and `[0]` is the same as the plain name. Other languages ignore such an accessor, and a run whose `languages` leaves out
+Python, TypeScript and JavaScript fails at start-up rather than ignore it.
+In TypeScript and JavaScript the call is matched by its callee name and the
+slot alone (a string literal or a constant, no optional call, no spread or
+comment among the arguments), so name only an accessor whose key slot no other
+call shares: `get[1]` folds `get(toggles, "old-checkout", false)` and also any
+other `get(x, "old-checkout")` in the repository. A constant, in the same file or
+imported from another, is folded in that slot as well (`get(state, OLD)`, or
+redux-saga's `yield call(checkForFeatureFlag, OLD)` with `call[1]`, which
+becomes `yield true`), and its declaration goes only when every reference to it
+is such a read: a use in another slot, or any other use, keeps the declaration
+and every read of it, and the run lists them.
+
+Python resolves a constant in that slot the same way. A module constant read as
+`flag_is_active(request, OLD)`, through `from consts import OLD` or as
+`consts.OLD`, is folded, and its declaration goes only when every reference to
+it is such a read. A `*args`, a `**kwargs` or a comment anywhere in the call
+leaves the call, and so the constant, alone. A run also refuses the flag when a
+key constant it deleted is still named afterwards, in its own file or in a file
+importing it.
+
+**A subscript read is not supported.** `state.featureToggles[OLD]` or
+`toggles["old-checkout"]` is not a call, so no accessor name reaches it, and any
+object can be subscripted. The constant stays, the subscript is listed as a
+reference that still names the flag, and the rest of the run is unaffected.
 
 **A wrapper that takes the key indirectly cannot be reached this way.** If your
 wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
@@ -3189,6 +3262,18 @@ more than one. The gate's import goes too once nothing else in the file uses
 it. The key must be a string literal (`flag="old-checkout"` or
 `flag={'old-checkout'}`), as for a function.
 
+A gate in a list that carries a React `key` (`<FlagGate key={id} flag="…">`)
+hands it on. A single child element gets the `key` as a prop of its own, and
+several children are wrapped in `<Fragment key={id}>` (or `<React.Fragment>`
+when the file imports React as a default or namespace, with `Fragment` added to
+the file's `react` import otherwise). The gate is refused instead when the key
+cannot be handed on: the only child already has a `key`, spreads props, or is a
+`<>` fragment; a spread comes after the gate's `key`; the gate's own flag prop
+is named `key`; or, for several children, the file has no value import of
+`react` to take `Fragment` from, sets a JSX pragma (`@jsx`, `@jsxImportSource`,
+`@jsxFrag`), uses the name `Fragment` for something else, or rebinds `React`
+(or the name you imported it as). A new `react` import is never added.
+
 Served `false`, the flag is **refused**, with the file and line named. What a
 gate renders when its flag is off is up to the component (a redirect, a
 fallback, nothing at all), and the call site doesn't say which, so the run
@@ -3412,13 +3497,94 @@ parameters, a JavaScript function with JSDoc types, a `...rest` in the
 destructuring, a member typed as required, a component wrapped in anything
 but React's `memo` or `forwardRef` (and `memo` handed a fresh `{}` or `[]`),
 a `defaultProps` anywhere that names the component, an element that spreads
-attributes, a test that mocks the callee's module or spies on it, and any
-JSX prop at all where code in the repository reads an element's props from
-outside the component (`cloneElement`, `Children`, `element.props`, a shallow
-renderer). A literal you wrote yourself is never touched, even when it equals
-the default. The pull request lists each call and element it shortened, and
-each emptied override it kept (`<Provider flags={{}}>`), since the prop or
-argument carrying it may now be pointless.
+attributes, a test that spies on the callee, a test that mocks a component's
+module, and any JSX prop at all where code in the repository reads an
+element's props from outside the component (`cloneElement`, `Children`,
+`element.props`, a shallow renderer). A literal you wrote yourself is never
+touched, even when it equals the default. The pull request lists each call
+and element it shortened, and each emptied override it kept
+(`<Provider flags={{}}>`), since the prop or argument carrying it may now be
+pointless.
+
+Some mocks leave nothing to follow, and then every argument is kept: a call
+to `jest.enableAutomock()`; `mock.module(…)` or `mock.method(…)` from
+`node:test` or `bun:test` naming the function's module or name; a computed
+module path given to `vi.mock`, `jest.mock` or `jest.doMock`; a `spyOn` or
+`mock.method` whose member name is not a string literal; and
+``vi.spyOn(m, `name`)`` with a template literal. Test-runner configuration
+is read the same way, and fails closed, on purpose: a JavaScript or TypeScript
+test configuration that may remap modules switches this cleanup off for the
+whole repository. That is any file named `jest*`, `vitest*`, `vitest.workspace.*`
+or like a jest preset (and a `vite.config.*` when the repository uses vitest,
+meaning `vitest` is in a `package.json`'s dependencies or scripts, or a vitest
+config exists) that spells `namemapper`, `alias`, `automock`, `projects`,
+`setupfiles`, `preset`, `resolver`, `moduledirectories` or `modulepaths` in any
+case, or that cannot be read. Such a file is never parsed to clear it. JSON
+configuration (a `jest*.json` file, the `jest` key of a `package.json`, and every
+`projects` entry) is parsed and is clean unless `automock` is anything but false,
+or `preset`, `setupFiles`, `setupFilesAfterEnv`, `resolver`, `moduleDirectories`
+or `modulePaths` appears, or a `moduleNameMapper` entry is neither
+`identity-obj-proxy` nor a pattern matching only style or asset extensions. A
+`package.json` script running jest or vitest with `--config`, `--automock` or
+`-c` also keeps the argument. A vite app that does not use vitest keeps the cleanup.
+
+A function whose module a test mocks (`vi.mock`, `jest.mock`) is followed
+only when no test can tell the two calls apart: the stand-in that runs
+instead must not be able to read the argument, and nothing may read the
+calls it recorded. So the function must be imported straight from the file
+that declares it, under its own name, and every mention of its name in the
+repository must be a call, that import, or one of these, in a test file:
+
+- the key in a mock factory, `vi.mock('./api', () => ({ useMembers: … }))`,
+  whose value is `vi.fn()`, `jest.fn()`, either one given an inline
+  implementation, or an inline function, that declares no more parameters
+  than the position of the argument being left out (`() => ({ data })`
+  cannot see an options argument; `(id, options) => …` can). A rest
+  parameter, `arguments` or `eval` sees them all, and so does any `function`
+  (as opposed to an arrow) in a file that runs in sloppy mode, with no
+  `import`, `export` or `"use strict"`, which can read its arguments through
+  `.arguments` or a caller's `.caller.arguments`;
+- `vi.mocked(useMembers)`, `useMembers`, or `useMembers as Mock` followed by
+  `mockReturnValue`, `mockResolvedValue`, `mockRejectedValue` (or their
+  `Once` forms), `mockReturnThis`, `mockClear`, `mockReset`, `mockRestore`,
+  `mockName`, or `mockImplementation` with an inline function, as a statement
+  of its own, as the body of an arrow handed to `beforeEach` (or another test
+  hook), or as the body of an arrow `const` helper only ever called as a
+  statement;
+- one `const` alias of such a receiver (`const mocked = vi.mocked(useMembers)`),
+  used only as one.
+
+Each mock of the function's module must be in a test file, not a setup file
+or shared helper. A factory must be an inline function returning an object
+literal, which may spread the module's own original once
+(`...(await importOriginal())`, `...jest.requireActual('./api')`, or a
+`const` bound to one); a computed key, any other spread, a getter or method
+named for the function, and `this` refuse. A mock without a factory refuses
+when a `__mocks__` file exists anywhere. Every other file may reach the
+module only by named imports, side-effect imports, named re-exports,
+`import * as m` read as `m.name` or `spyOn(m, 'name')`, `typeof import(…)`,
+and `const { name } = await import(…)`. Every `vi.mock` or `jest.mock` in
+the repository must name its module plainly: a computed path, or one that
+resolves to no file and is not a Node built-in or a package declared or
+installed above the test, refuses, and so does importing the repository's
+own package by name. So does a file importing the module through a path that
+resolves to no file, is not relative and names no installed package (a
+root-relative `/src/api`, an alias only your bundler knows, a Jest
+`moduleNameMapper` key), since the tool that runs the test may resolve it to
+the function's module. `vi` and `jest` count under whatever name they are
+imported from `vitest` or `@jest/globals` as, and `mock(…)` or `doMock(…)` on
+any other object that is handed a function is read as a test runner's.
+The proof looks for these loads by where a string sits (an import or export
+statement, or an argument of a call named for loading or mocking a module, or
+written as a path or an alias such as `lib/api`, `@api`, `#api`, `~api`), not
+from a list of forms. It does not see a module alias that is a bare word
+(`api`, no `/`, `@`, `#` or `~`) loaded through a helper function whose name
+does not look like a loader (`fetchMod('api')`), and a function that builds a
+path (`path.resolve(__dirname, 'src')`, or anything handed `__dirname`,
+`process.cwd()` or `import.meta`) is not read as a load. In a repository that
+resolves such a bare alias to the function's file, name the module in a mock
+or keep the alias out of the tests. When a mocked function loses an option this way, the
+same proof applies to removing that option.
 
 When the value the fold wrote was the last thing setting an option, the
 option goes from the function too. `useRole(id, { enabled: true })` becoming
@@ -3850,7 +4016,7 @@ What counts as a resolvable constant, per language:
 | --- | --- |
 | JavaScript / TypeScript / JSX / TSX | `const K = 'key'`, including `export const`. A `let` or `var` is **not** — it may be reassigned |
 | Java | `static final String K = "key"`, a `final` local, or an interface field (implicitly `final`). A non-`final` field is **not** |
-| Go | `const k = "key"`, alone or as one entry of a `const ( … )` block, where that entry's line is removed and the others stay. A `var` is **not**, and a block that uses `iota` or has an entry with no value (which repeats the one above it) is left alone, since removing one entry could change the others |
+| Go | `const k = "key"`, alone or as one entry of a `const ( … )` block, where that entry's line is removed and the others stay. A `var` is **not**, except a typed flag handle (see below), and a block that uses `iota` or has an entry with no value (which repeats the one above it) is left alone, since removing one entry could change the others |
 | C# | `const string K = "key"`. `static readonly` is **not** a compile-time constant — it may be assigned in a static constructor |
 | Kotlin | `const val K = "key"`. A plain `val` or `var` is **not** |
 | Dart | `const` or `final`. A `var` or a bare-typed declaration is **not** |
@@ -3921,7 +4087,7 @@ behaviour above: the declaration is left in place and nothing is deleted.
 | --- | --- |
 | C# | A `const string` in a class, struct, record or interface, including one nested in another type (`FeatureFlags.Checkout.NAME`, spelled from the outermost type). `Owner.NAME`, with `Owner`'s namespace enclosing the reader or imported by a `using` in the file, in the enclosing namespace block, as a `global using`, or as a `<Using>` item in a project file; `Alias.NAME` under `using Alias = Ns.Owner;` at file level (or `global using`, or a project `<Using Alias="...">`); bare `NAME` under `using static Ns.Owner;` at file level. The read is the first argument of a `BoolVariation(...)` call, of an awaited `GetBooleanValueAsync(...)`, or of an accessor you named. A read spelled with its namespace (`Ns.Owner.NAME`, `global::Ns.Owner.NAME`), a `partial` owner, and a constant declared `static readonly` are left alone, and the declaration is kept. A type taken whole keeps every key constant it owns, since reflection reaches a constant without spelling it: `typeof(Owner)` (but not as a logging category, `GetLogger(typeof(Owner))`, `ForContext(typeof(Owner))`, `CreateLogger(typeof(Owner))`), `nameof(Owner)`, `Owner` as a type argument (`All<Owner>()`, but not a logger's or an equality contract's: `ILogger<Owner>`, `Logger<Owner>`, `CreateLogger<Owner>()`, `ForContext<Owner>()`, `IEquatable<Owner>`, `IComparable<Owner>`), or a string holding its qualified name (`Type.GetType("Ns.Owner")`, `"Ns.Owner, Assembly"`, `"Ns.Outer+Owner"`) or exactly its simple name (`t.Name == "Owner"`), in any file, the owner's own included, each refused as `unsupported-form`. The same holds for an outer type of a nested owner, a repository type deriving from the owner, and, except in a string, an alias of either. Types are matched by name, so a same-named type in another namespace keeps the declaration too. In a Razor view, XAML, VB, F# or other .NET file the Action does not parse, any spelling of one of those types not followed by a member access (`typeof(Owner)`, `GetType(Owner)`, `typeof<Owner>`, `{x:Type local:Owner}`, `"Ns.Owner"`) keeps it the same way; `Owner.OTHER` there reads only `OTHER`. Not seen: a name assembled from parts (`"Ns." + name`), escapes in the string, `GetType()` on an instance, a scan of every type (`assembly.GetTypes()`), and a derived type outside the checkout |
 | Dart | A top-level `const` or `final`, or a `static const`/`static final` member of a class, mixin or extension type. Bare `NAME` through an `import` of the declaring file (a relative URI or `package:` of the reader's own package), `show` and `hide` honoured; `p.NAME` through `import '...' as p`; `Owner.NAME` and `p.Owner.NAME` for a member. The read is the first argument of a non-null-aware `boolVariation(...)` call or of an accessor you named. A read through a re-exporting library, a conditional or deferred import, another package of the repository, a typedef, or from a `part` file is left alone, and the declaration is kept. A file that imports or exports `dart:mirrors`, the declaring file included, keeps every key constant of the run, refused as `unsupported-form`: `reflectClass(Owner).declarations`, a library's top-level constants through any class of it, and `currentMirrorSystem().libraries` all reach a constant without spelling it. An import the fold leaves unused is removed, and a `show` naming the deleted constant is trimmed |
-| Go | A package-level `const` declaring one name with a plain double-quoted string, typed (`const NewCheckout Key = "..."`) or not, alone or as one entry of a `const ( ... )` block. Bare `NAME` in any other file of the same package (the same directory and the same `package` clause, test files of that clause included); `pkg.NAME` for an exported constant from another package of the same module, where `pkg` is the import's alias or, for an unaliased import, the package clause, which must then match the import path's last segment (a `/vN` segment or `.vN` suffix dropped) so the import can be removed once its last use folds. An external test package (`package flags_test`) is another package and reads it the same way. The read is the first argument of a `BoolVariation(...)` call, the second of an OpenFeature `Boolean(ctx, ...)` call, or the first or second of an accessor you named. Left alone, and the declaration kept: a constant in a `const ( ... )` block that uses `iota` or has an entry with no value (removing one entry could change the others, since `iota` counts entries and an entry with no value repeats the one above), a `var`, a raw string, a read from a file of another module (one with its own `go.mod`, even through a `replace` directive or a workspace), a read through a dot import, a qualifier or bare name a local variable, parameter or constant shadows (any spelling of it in the file), a file that also declares a local or parameter named like the import's qualifier anywhere, any other use of the name (a log line, a map entry, a typed key's method), a read under `go` or `defer`, a discarded read whose arguments call something or receive from a channel, one in parentheses, or one in an `if`, `switch` or `for` header, and any read in an external test package that declares a named `Example` function. An example function named after the constant (`ExampleNewCheckout`, `ExampleNewCheckout_suffix`) in a test file of its package keeps the declaration, since `go vet` resolves that name. A second package-level declaration of the name in the same package, such as one per build constraint (`keys_linux.go` beside `keys_darwin.go`), keeps both (`name-not-unique`). Strings, comments and other file types are not mentions: Go cannot reach a constant by name at run time. An exported constant is deleted once every read in the repository has folded, as it is when it is read only in its own file, so if your module is a library other modules import, read the deletion in the diff before merging. A declaration kept by another file's mention (a test seeding a store with it, say) keeps only itself: Go cannot assign a constant, so the reads of it in its own file still fold, and the pull request lists the mention that kept it |
+| Go | A package-level `const` declaring one name with a plain double-quoted string, typed (`const NewCheckout Key = "..."`) or not, alone or as one entry of a `const ( ... )` block. Bare `NAME` in any other file of the same package (the same directory and the same `package` clause, test files of that clause included); `pkg.NAME` for an exported constant from another package of the same module, where `pkg` is the import's alias or, for an unaliased import, the package clause, which must then match the import path's last segment (a `/vN` segment or `.vN` suffix dropped) so the import can be removed once its last use folds. An external test package (`package flags_test`) is another package and reads it the same way. The read is the first argument of a `BoolVariation(...)` call, the second of an OpenFeature `Boolean(ctx, ...)` call, or the first or second of an accessor you named. A package-level `var NAME = NewBoolFlag("key", fallback)` (a call to a plain function name or `pkg.Name` whose first argument is the key as a double-quoted string, alone or one entry of a `var ( ... )` block) is a flag handle only when the constructor is declared in your repository, takes the key as its first `string` parameter and its whole body is one `return T{…}` or `return &T{…}` storing that parameter unmodified (a constructor from a dependency or the standard library, one that formats or transforms its argument, or one that reassigns it is not a handle) and is resolved the same way, read as `ff.BoolFlag(ctx, pkg.NAME)` through an accessor you named; the handle must not be mentioned anywhere else in its file, and any assignment, address-of, method call or other use of it elsewhere keeps it. Left alone, and the declaration kept: a constant in a `const ( ... )` block that uses `iota` or has an entry with no value (removing one entry could change the others, since `iota` counts entries and an entry with no value repeats the one above), a `var`, a raw string, a read from a file of another module (one with its own `go.mod`, even through a `replace` directive or a workspace), a read through a dot import, a qualifier or bare name a local variable, parameter or constant shadows (any spelling of it in the file), a file that also declares a local or parameter named like the import's qualifier anywhere, any other use of the name (a log line, a map entry, a typed key's method), a read under `go` or `defer`, a discarded read whose arguments call something or receive from a channel, one in parentheses, or one in an `if`, `switch` or `for` header, and any read in an external test package that declares a named `Example` function. An example function named after the constant (`ExampleNewCheckout`, `ExampleNewCheckout_suffix`) in a test file of its package keeps the declaration, since `go vet` resolves that name. A second package-level declaration of the name in the same package, such as one per build constraint (`keys_linux.go` beside `keys_darwin.go`), keeps both (`name-not-unique`). Strings, comments and other file types are not mentions: Go cannot reach a constant by name at run time. An exported constant is deleted once every read in the repository has folded, as it is when it is read only in its own file, so if your module is a library other modules import, read the deletion in the diff before merging. A declaration kept by another file's mention (a test seeding a store with it, say) keeps only itself: Go cannot assign a constant, so the reads of it in its own file still fold, and the pull request lists the mention that kept it |
 | Java | `Owner.NAME`, with `Owner` in the same package or imported (`import pkg.Owner;`, `import pkg.*;`); bare `NAME` under `import static pkg.Owner.NAME;` or `import static pkg.Owner.*;`. The read is the first argument of a `boolVariation(...)` call or of an accessor you named |
 | Kotlin | `Owner.NAME` for a `const val` in a top-level `object`, or in the `companion object` of a top-level class (`Owner` is the class; `Owner.Companion.NAME`, or `Owner.Keys.NAME` for a companion named `Keys`, works too), with `Owner` imported or in the same package; bare `NAME` (or its `as` alias) under `import pkg.Owner.NAME`, `import pkg.Owner.Companion.NAME` or `import pkg.NAME`, or in the same package for a top-level `const val`. The read is the first argument of a `boolVariation(...)` call, of an OpenFeature `getBooleanValue(...)` call in a file that imports something from `dev.openfeature` (in any other file, a same-key `getBooleanValue` refuses the flag), or of an accessor you named. A subclass of the class can read a companion's constant without naming it, so a constant read that way is kept |
 | TypeScript / TSX / JavaScript | an `export const` read through `import { NAME }` (or `as`), `import * as ns` (`ns.NAME`), `const ns = require(...)`, or `const { NAME } = require(...)`. Relative specifiers, and `paths` (against its `baseUrl`) from the nearest `tsconfig.json` or `jsconfig.json`, written there or inherited through `extends`, are followed; a bare specifier that only `baseUrl` would resolve is not. The read is the first argument of a non-optional `boolVariation(...)` or `useFeatureFlag(...)`, an awaited `getBooleanValue(...)`, or an accessor you named |
@@ -3958,6 +4124,54 @@ of it included, keeps the declaration the same way. The constant's proven
 reads are still folded; only the declaration stays. An `export * from` the
 module (a barrel) is followed rather than refused, so a namespace of the
 barrel handed on keeps the declaration too.
+
+A TypeScript or JavaScript key constant imported through a barrel is folded
+like one imported from its own file. The chain is followed through
+`export { NAME } from "./m"` and `export * from "./m"`, any number of hops and
+through `paths` aliases, to the module that declares the constant. When
+the constant goes, the barrel's `export { NAME } from` line goes with it, or just that
+specifier if the statement lists others, and a file left with no import or
+export gets `export {};` so it stays a module (a declaring file that an
+`export *` still reaches too). A chain is followed only when
+it can be read to the end: every `export *` target of a barrel must resolve to a
+file in the checkout, and exactly one of them may supply the name. The one
+exception is a package that cannot be a file of the checkout: an
+`export * from "some-package"` is skipped as supplying none of your constants
+only when the package is declared by a version (not `file:`, `link:`,
+`portal:` or `workspace:`) in a `package.json` above the barrel, or installed
+there as a real directory, is not the name of any `package.json` in the
+checkout (build directories and ignored ones included, `node_modules` not),
+is not pointed at a path or workspace by `overrides`, `resolutions` or
+`pnpm.overrides` (`link:`, `file:`, `portal:`, `workspace:`), and no `tsconfig`
+`paths`, `baseUrl`, bundler or test-runner alias can reach it. A Babel config
+(`.babelrc*`, `babel.config.*`, a `babel` key) or a `jest.moduleNameMapper` in a
+`package.json` anywhere switches the skip off. Any doubt keeps the chain
+`import-unresolved`; a workspace package is not followed. A renamed re-export (`export { OLD as NEW } from`) is followed under
+its new name: the importers of `NEW` are found and folded, and when the
+constant goes only the `OLD as NEW` specifier is removed (the statement, if it
+was the only one). A barrel line that hands the constant on under a name that
+is then used for anything but a flag read keeps the constant and its line. A
+re-export of a name the chain renames again is followed the same way, but a
+rename of a local (`export { local as NAME }`) is not. A name the barrel also declares
+itself, a type-only re-export, a barrel in CommonJS or that does not parse, and
+a barrel in a file the run does not rewrite, a barrel with a `@ts-expect-error`,
+`@ts-ignore` or `eslint-disable-next-line` comment anywhere in the run of
+comments above the line, and any barrel under a `package.json` that is not
+`private` and declares `main`, `module`, `types`, `typings`, `exports`,
+`browser` or `bin` (a published package: the nearest manifest decides, and no
+file name is matched) stay `import-unresolved`, with the reads and the declaration kept. A
+comment after the removed line goes with it, and a CRLF file stays CRLF.
+
+An import that goes through a file which is gitignored and absent from the
+checkout (a generated barrel such as `index.generated.ts`, or a barrel
+re-exporting from one) cannot be followed. It is listed with the reason
+`generated-barrel` rather than `import-unresolved`, and the pull request says the
+barrel is generated and gitignored: generate it before running, and the run can
+follow it. A missing file that is not gitignored stays `import-unresolved`, and so does
+one whose ignore rule could not be what makes it absent: it counts as generated
+only when the `.ts`/`.tsx` file (or a directory's `index.ts`/`index.tsx`) is
+ignored, or a directory rule covers the directory the file would sit in. A
+destructured `require` or a default import through a barrel is still not followed.
 
 A Ruby key constant read from another file is resolved in the shapes the
 table above lists. Every other way another file in the checkout holding Ruby
@@ -4475,7 +4689,8 @@ reason:
 | Reason | What triggers it |
 | --- | --- |
 | `name-not-unique` | the same qualified constant is declared more than once, or another file declares a competing one: the same name or owner in another source set, build variant or module, or in the other JVM language (a Java `Owner` beside a Kotlin `Owner`). A Kotlin top-level property named like the owner (`val Owner = ...`) or a `@file:JvmName("Owner")` facade counts too. Which declaration a reader gets is then decided by the build, so none is touched. The pull request lists these apart from the other reasons, since a build variant is usually deliberate |
-| `import-unresolved` | nothing in the reading file ties the name to the declaring file: no import or same-package route, an import that resolves to another file or to none, a TypeScript default import, a re-export through a barrel (`export ... from`), a TypeScript import alias of the constant off a name that is not a namespace import of its file (`import K = m.NAME` under `import m = require(...)`), or a TypeScript enum taken off a name that is not a namespace import of its file (`use(m.Flags)`, `const F = m.Flags`, `import F = m.Flags`) or used as a value through an import that does not resolve (`use(Flags)`), or, in a file that names that enum, a computed lookup (`m[k]`) off a namespace or default import of a script that does not resolve, such as a package (`Icons[name]`; a `.css` or `.json` import is not a script); a Python star import beside the name, an absolute import that two files in the checkout could mean, or a `from pkg import keys` or `import pkg.keys` through a package `__init__.py` that is not plain or with a compiled module beside the declaring one, or a PHP read whose `use` is written after it, a class the checkout does not declare (such as a `class_alias`), or a global constant read from inside a namespace, or a Dart import that re-exports the declaring library, is conditional or deferred, names another package of the repository, or does not resolve, or a Swift read from another module with no plain `import` of the declaring one, an access level the import does not allow, or a second imported module that declares the name, or a Swift `Module.Flags.X.rawValue` whose module name a declaration of that name in the reading module, or in a module it imports, could stand for, or a Swift `Flags` or `Module.Flags` a typealias in the repository could stand for, or a Go read from a file of another module, through a dot import, of an unexported constant from another package, or through an unaliased import whose package clause is not the import path's last segment |
+| `import-unresolved` | nothing in the reading file ties the name to the declaring file: no import or same-package route, an import that resolves to another file or to none, a TypeScript default import, a re-export under another name (`export { NAME as OTHER } from`), a barrel the run cannot follow to one declaration (an `export *` target outside the checkout or that does not resolve, two `export *` that both supply the name, a CommonJS or unparseable barrel), a TypeScript import alias of the constant off a name that is not a namespace import of its file (`import K = m.NAME` under `import m = require(...)`), or a TypeScript enum taken off a name that is not a namespace import of its file (`use(m.Flags)`, `const F = m.Flags`, `import F = m.Flags`) or used as a value through an import that does not resolve (`use(Flags)`), or, in a file that names that enum, a computed lookup (`m[k]`) off a namespace or default import of a script that does not resolve, such as a package (`Icons[name]`; a `.css` or `.json` import is not a script); a Python star import beside the name, an absolute import that two files in the checkout could mean, or a `from pkg import keys` or `import pkg.keys` through a package `__init__.py` that is not plain or with a compiled module beside the declaring one, or a PHP read whose `use` is written after it, a class the checkout does not declare (such as a `class_alias`), or a global constant read from inside a namespace, or a Dart import that re-exports the declaring library, is conditional or deferred, names another package of the repository, or does not resolve, or a Swift read from another module with no plain `import` of the declaring one, an access level the import does not allow, or a second imported module that declares the name, or a Swift `Module.Flags.X.rawValue` whose module name a declaration of that name in the reading module, or in a module it imports, could stand for, or a Swift `Flags` or `Module.Flags` a typealias in the repository could stand for, or a Go read from a file of another module, through a dot import, of an unexported constant from another package, or through an unaliased import whose package clause is not the import path's last segment |
+| `generated-barrel` | a TypeScript or JavaScript import of the constant goes through a file that is gitignored and not in the checkout (a generated barrel), so the chain cannot be followed; generate it before running |
 | `not-a-read` | the name is used for something other than a flag read: a log line, a map entry, a callable reference (`Owner::NAME`), a TypeScript type-only import, an import left with no read to remove, or a TypeScript enum taken as a value off a namespace import of its file (`use(ns.Flags)`) |
 | `rebound` | the reading file binds the same name itself, or an in-repository supertype supplies a member of that name (in Swift, also an enclosing type, an extension of it, or an extension of a protocol it conforms to, declaring a member or generic parameter of the read's first name); or a Python declaring file binds its constant a second time |
 | `other-language` | the constant is mentioned, in a way that can reach it, from a file in another JVM language (Java reading a Kotlin constant, Kotlin reading a Java one, or a Groovy or Scala file reading either), from a Razor, XAML, VB or F# file reading a C# constant, from a Twig, Latte or Smarty template or Symfony YAML or XML configuration reading a PHP constant or enum case, or a read of it that would be resolved sits in another file type of the family than the declaration (a `.tsx` or `.js` file reading a `.ts` constant) and is not rewritten with it: its language is not configured, or another run rewrites the file |
@@ -4529,7 +4744,12 @@ request lists every line and every test it deleted:
 
 Recognised spellings, each with the key as a literal, a constant declared in the
 same file, or inside an equality matcher (`eq("KEY")`, `gomock.Eq("KEY")`), and
-with any name in `accessors` counting as a read:
+with any name in `accessors` counting as a read (in Java and Kotlin `eq` is the
+matcher only when it is provably the library's: imported by name from Mockito or
+MockK, or written qualified as in `ArgumentMatchers.eq("KEY")`, and declared
+nowhere in the repository's Java and Kotlin files; the library's star import
+counts only when no other star import could bring in an `eq` of its own, and a
+stub beside any other `eq` is kept):
 
 * **Java** — Mockito `when(…).thenReturn(…)`, `doReturn(…).when(mock).<read>(…)`
   and `verify(mock[, times(n)]).<read>(…)`; BDDMockito `given(…).willReturn(…)`.
@@ -4538,9 +4758,15 @@ with any name in `accessors` counting as a read:
 * **Kotlin** — MockK `every { … } returns …` / `coEvery`, `verify { … }` /
   `coVerify`; mockito-kotlin `whenever(…).thenReturn(…)` and
   `whenever(…) doReturn …`. A test is a function annotated the same way, or a
-  `test("…") { }`, `it("…") { }` or `should("…") { }` call with a plain title. A
+  `test("…") { }`, `it("…") { }` or `should("…") { }` call with a plain title,
+  or, in a Kotest `StringSpec`, `WordSpec` or `FreeSpec`, a plain title invoked
+  with a block, `"…" { }`. A
   `context` or `describe` holding a stub of the removed value in its `before`
-  goes whole, since every test under it runs that value.
+  goes whole, since every test under it runs that value. A container left
+  with no line but the deleted tests goes with them: a `context("…") { }`, or a
+  Kotest `"…" should { }`, `"…" When { }` or `"…" - { }`. A Kotest test with a
+  `.config(…)` is not recognised, so a stub of the removed value in it still
+  refuses the flag.
 * **Dart** — `package:mockito` `when(…).thenReturn(…)`, `verify(…)` and
   `verifyNever(…)`, and the same three in `package:mocktail`'s lambda form,
   `when(() => …)`. Either library's stub may answer with
@@ -4557,7 +4783,10 @@ with any name in `accessors` counting as a read:
   subtest.
 * **C#** — Moq `Setup(c => c.<read>(…)).Returns(…)` / `ReturnsAsync(…)` and
   `Verify(c => c.<read>(…), …)`; NSubstitute `sub.<read>(…).Returns(…)`,
-  `Received()` and `DidNotReceive()`. A test is a method carrying `[Fact]`,
+  `Received()` and `DidNotReceive()`. For a read that returns a task, a
+  `Returns(Task.FromResult(true))`, `Task.FromResult<bool>(…)`,
+  `ValueTask.FromResult(…)` or `new ValueTask<bool>(…)` counts like
+  `ReturnsAsync(true)`. A test is a method carrying `[Fact]`,
   `[Test]` or `[TestMethod]`.
 * **PHP** — Laravel Pennant's `Feature::activate('k');` and
   `Feature::deactivate('k');`, with `activate('k', true)` and the `ForEveryone`
@@ -4595,6 +4824,34 @@ exactly as they are:
   the kept value there is still deleted);
 * every line of a test that also holds a mock of the read in a spelling not
   listed above.
+* a stub or verification whose key is a wildcard matcher (`any()`,
+  `anyString()`, `any<String>()`, `It.IsAny<string>()`, `Arg.Any<string>()`,
+  `gomock.Any()`, `anything()`) instead of the key. It answers for every flag
+  read through that call, so nothing in the line says which flag it was
+  written for. When the pull request removed a call of that read, it lists
+  each such line under a warning, since a test that relied on it to reach the
+  deleted branch may now fail.
+
+When the first, third or fourth of these stops a flag in a Java test and the
+stub's key is a string literal, the refusal says which: a setup method stubbing
+the removed value, one test stubbing both values, or a stub answering with
+something other than a plain `true` or `false` literal. A stub keyed by a
+constant, or by `eq(CONSTANT)`, gets the general refusal.
+
+When the run deletes a statement that throws or returns a message (`throw
+Failure("FEATURE_NOT_ENABLED: dates are not enabled.")`, `raise Forbidden("…")`,
+`return res.status(403).json({ error: "…" })`), code elsewhere may still
+handle that refusal, and it names no flag key. The pull request searches the
+whole checkout, in every language and swept or not, for the message's exact
+text, and lists each file and line that still spells it under a note, such as
+a client that maps the response or a test that feeds it in. Only the sentence
+is searched: the code before the colon (`FEATURE_NOT_ENABLED`) is shared by
+every gate, so on its own it never matches. A message of fewer than three
+words, or one the pull request writes again, is not searched, nor is a
+string in a logging call or one piece of a longer concatenation. A line that
+is itself a `throw`, `raise` or `return` of the message in a file that is not a
+test is left out, since it is code that still sends it; a test that mocks the
+message is listed. Nothing is edited.
 
 A Java or Kotlin test class that loses its last test this way goes too, with
 its file when nothing else is declared there, and so does an emptied `@Nested`
@@ -4609,7 +4866,15 @@ loses that part (`EnsureCanSet_Passes`), together with the `nameof(…)` and
 name, no snapshot file is named for it and the type has no member with the new
 name. A name in a string, a comment that is not a `cref`, or another file keeps
 the test as it was, and the pull request lists the test with every spelling that
-stopped the rename. A name that speaks of several gates (`EitherGateOff_…`)
+stopped the rename. A spelling in a Markdown or reStructuredText document
+(`.md`, `.mdx`, `.markdown`, `.rst`, `.adoc`) does not stop it, since nothing
+runs a test by a name written there: the test is renamed, and the pull request
+lists those documents under the rename so the prose can be updated. A
+document still stops it when a test or a build can read it: a snapshot
+(`.verified.`, `.approved.`, `.received.`, `__snapshots__`), a file under a
+path with a `test`, `tests` or `spec` part, or a line that pulls text in from
+another file (`literalinclude`, `include::`, `xref:`, `:start-after:`,
+`:end-before:`). A name that speaks of several gates (`EitherGateOff_…`)
 once one of them is gone is listed, never renamed. A test the run cut down to
 statements that begin exactly as a sibling in its class does, up to the first
 assertions, is listed as one that may now duplicate it, and nothing is deleted.
@@ -4809,6 +5074,11 @@ the declaration becomes the call alone, `useParams();`. A destructured name left
 unused leaves its pattern when the pattern keeps another name
 (`const { orgId, tab } = useParams()` becomes `const { tab } = useParams()`),
 and a pattern it was the only name of is treated like the plain local above.
+When every name of a pattern of plain names is left unused, the declaration
+becomes the call alone too (`const { orgId, projectId } = useParams()` becomes
+`useParams();`). A pattern whose value cannot become a statement on its own
+(`load() as any`, `x ?? {}`, a conditional) or that has a comment inside it is
+left exactly as it was, never half-emptied.
 
 A binding at the **top level of a module** is cleaned too — the usual
 `const client = OpenFeature.getClient();` above the functions that read the
@@ -5078,6 +5348,26 @@ A branch of any size is folded, re-indented to the `if`'s own column — as in
 every other language here, though in Python it is the difference between a file
 that runs and one that does not. The indentation of a multi-line string is
 never changed — those lines are data.
+
+A function the fold left returning the same `True` or `False` on every path is
+reduced to that one `return`, when every statement it drops is provably inert.
+That is a short list: assignments of a plain name from a literal, a parameter or
+local, a module-level literal constant, `os.getenv(...)` or `os.environ.get(...)`
+with a literal key, or a `str` method such as `.strip()` or `.lower()` on a value
+known to be a `str`; tests built from `not`, `and`, `or`, `is`, `is not`, `==`,
+`!=`, `in` and `|` between such values; and an `if` whose branches only return.
+A call to anything else, a subscript (`os.environ["X"]` can raise), an attribute
+read, a loop, a `with`, a comprehension or an f-string keeps the function as the
+fold left it, as does a function that already returned one literal before the
+run. A parameter is only ever compared with `is` or `is not`, since any other
+operator would run its own code. A module-level constant is trusted only if it is
+a literal that cannot change (a string, number, tuple or `frozenset({...})`), or
+a private set, list or dict (`_NAME`) that the module only ever tests with `in`
+or combines with `|`. A function with a comment of yours inside the dropped
+lines is kept, and so is a name defined twice in the file (a property's getter
+and setter, for one). The pull request lists each function reduced this way, with
+how many statements went. The file's `import os` stays: an import the removal
+strands is marked, not cut.
 
 A local or an import that only the removed branch used is cleaned up too.
 Ruff's default rules include F401 (unused import) and F841 (unused local
@@ -6049,6 +6339,17 @@ persistence or serialization annotation (`@Entity`, `@Serializable`, ...), or
 is `Serializable`, and one with an annotation of its own other than an
 injection or nullability one.
 
+A Kotlin local read only by code the run removed (`val context = …` passed as the
+read's context argument, or used only in the deleted branch) is deleted when its initializer is a literal or a bare
+call, and otherwise left in place and listed under "no longer read", since an
+initializer such as a `?.let { … } ?: …` builder chain may do work.
+
+Two JVM classes of one simple name in different packages (an app module's
+subclass of a `common` module's base class) are told apart by package: a
+wrapper in one is inlined when callers resolve to it by their own package or
+imports, nothing extends either class, and the other class does not declare
+the method. Otherwise it stays `name-not-unique` or `overridable`.
+
 Such a member is **removed** when nothing its deletion skips can do work and
 nothing outside the code can still use it, and **named in the pull request
 body** otherwise:
@@ -6060,7 +6361,21 @@ body** otherwise:
   Kotlin `lateinit`, delegated (`by`) and accessor properties stay. A member
   whose name the repository's Java or Kotlin spells as a string
   (`ReflectionTestUtils.setField(svc, "flags", …)`) stays, and so does any
-  member in a file that uses Lombok.
+  member in a file that uses a Lombok annotation other than a logger or
+  another annotation that adds no accessors or constructors (`@Slf4j`,
+  `@Log4j2`, `@Log`, ...). Such an annotation is recognised only when it is
+  imported by its own name from the Lombok package that defines it, or written
+  fully qualified. Any other annotation not shown to be foreign (a bare name
+  under a Lombok star import, or one whose import cannot be read) counts as
+  Lombok's, and no annotation is treated as harmless in a Kotlin file. Any
+  field of a class that is not proven free of reflective readers stays too:
+  every class annotation must be a Spring bean stereotype (`@Service`,
+  `@Component`, ...), a marker such as `@Deprecated`, or a Lombok logger or
+  constructor annotation; no field may carry another annotation than an
+  injection or nullability one; and every supertype must be a plain JDK
+  interface or a class of the repository that meets the same conditions (a
+  base class from a library, or from another file that implements
+  `Serializable`, does not). A Kotlin `data` or `value` class is never reported.
 * When that statement was its parameter's last read, or the member is a
   Kotlin constructor parameter, the parameter goes too, with the argument
   every caller passes for it (a Kotlin named argument by its name; a call
@@ -6189,10 +6504,27 @@ returning `(bool, error)`, and an accessor you name may too:
 on, err := client.BoolVariation("old-checkout", ctx, false)
 ```
 
-One literal cannot stand in for that call. `on, err := true`, and `return true`
-from a function returning `(bool, error)`, do not compile, so a run that would
-write either is refused, and the output names the file and the functions
-holding such a read. This applies wherever the read gives values to several
+One literal cannot stand in for that call, but the common shape is folded whole:
+a `:=` declaration of the value and the error, followed at once by `if err != nil { … }`
+(no initializer, no `else`), becomes the single-valued read. The check is deleted
+whole because, with the flag fixed, the read can no longer fail, so the error
+branch is dead.
+
+```go
+on, err := client.IsFlagEnabled(ctx, "old-checkout", org)
+if err != nil {
+	return "", fmt.Errorf("check flag: %w", err)
+}
+```
+
+The read must be a bool reader (`BoolVariation` or an accessor you name) that the
+checkout declares as returning `(bool, error)` or does not declare at all; its
+arguments must be names, selectors or literals; no comment may sit in the pair; and `err` must appear
+nowhere else in the function: not earlier, not later, not as a parameter or named
+result, and `on` must be new. Beside a blank error (`on, _ := …`) the read is
+folded with nothing to remove. Any other shape is not touched, and a run that
+would write `on, err := true`, or `return true` from a function returning
+`(bool, error)`, is refused, with the file and the functions named. This applies wherever the read gives values to several
 names (`:=`, `=`, `var`, an `if` header, beside a blank `_`) or is returned
 from a function with several results, whether the key is a literal or a
 constant. Remove those reads by hand, or read the flag through a call that
@@ -6301,6 +6633,27 @@ re-padded as `gofmt` pads them, so `gofmt -l` stays clean. A block that was not
 
 Files under a `go mod vendor` tree are skipped, detected by the
 `vendor/modules.txt` manifest rather than by directory name.
+
+
+### Go test setters and emptied functions
+
+Name the function your tests set a flag with in `test-setters` (`Set` for
+`featureflag.Set(orgID, Flag, true)`). When the flag's key constant is the
+argument and the other argument is a `true` or `false` literal, the call is a
+setter if `Set` is a package-level function of your repository with a `bool`
+parameter there. A setter that pins the value that stays is deleted. A test
+whose setters pin the value that goes is deleted, and a test that pins both
+values is left whole with its setters. A method call (`store.Set(...)`), a
+setter in a `defer` or a function literal's cleanup, a value held in a
+variable and an argument that calls something are not proven, so they stay and
+keep the constant, which the pull request lists as still referenced.
+
+A function the removal leaves with an empty body is deleted together with its
+calls when it is unexported, has no result and no type parameters, has at least one call, and every
+mention of its name in its package is a call of its own whose arguments are
+names, member reads or literals. Anything else (a use as a value, `go`,
+`defer`, an argument that calls, an exported name) leaves it as the removal
+wrote it. The pull request lists the function and each call deleted.
 
 ## Supported PHP flag-read shapes
 
@@ -6749,9 +7102,12 @@ means no PR.
      hand. The same goes for a server-side template: a Twig, Latte, Smarty,
      Volt or Jinja file (`.twig`, `.latte`, `.tpl`, `.volt`, `.j2`, `.jinja`,
      `.jinja2`) naming the key, and an `.html` or `.htm` file naming it inside
-     a `{% %}` or `{{ }}` tag, as Django's `{% flag "key" %}` does. Templates
-     are never rewritten, and a flag-keyed entry stays while one still reads
-     the key;
+     a `{% %}` or `{{ }}` tag, as Django's `{% flag "key" %}` does. And a .NET
+     view: a Razor view (`.cshtml`, `.razor`, `.vbhtml`) or a Web Forms page,
+     control or master page (`.aspx`, `.ascx`, `.master`) naming the key, such
+     as `@if (await FeatureManager.IsEnabledAsync("key"))` or a
+     `<feature name="key">` tag helper. Templates and views are never
+     rewritten, and a flag-keyed entry stays while one still reads the key;
   2. the engine could not parse the file, so it was quarantined (see the
      grammar gap further down);
   3. **the mention is not a flag read and not a flag-keyed entry.** The rules
@@ -6779,6 +7135,15 @@ means no PR.
   anything this cannot decide stays in the generic list. Such a file is not
   counted as still referencing the flag in the run's log either: it is
   printed as a note, line by line.
+
+  A **generated file** that names the flag only in comments is not listed
+  for rewording: a hand edit is overwritten by the next regeneration, and a
+  repository's drift check fails on one. A file counts as generated when a
+  marker in its first lines says so (`this file is generated`, `this file was
+  auto-generated`, `@generated`, `Code generated … DO NOT EDIT`,
+  `<auto-generated`) or `.gitattributes` marks it
+  `linguist-generated`. The pull request names each such file once, and says
+  to reword the text in its source and regenerate it.
 
   A file that names the key **only as a URL path segment** in a string is
   listed in a paragraph of its own too, since an endpoint is often named
@@ -6930,9 +7295,14 @@ means no PR.
   object) is "any other statement". Doc comments, tool directives
   (`eslint-disable`, `noqa`, `NOSONAR`, …) and comments naming the flag are
   never removed this way, and nothing is removed while the flag is still read
-  in that language and directory. In Python and Ruby only the registry-entry
-  half applies so far: a comment above a deleted read or variable there is
-  left in place.
+  in that language and directory. In Python and Ruby, a comment above the read
+  goes too. A block ends in Python when the next line is code indented less
+  than the deleted statement (not a comment, and not `else`, `elif`, `except`,
+  `finally` or `case`), and in Ruby at `end`. A comment group is taken only
+  when every line is plain prose: a shebang, an encoding or magic comment
+  (`frozen_string_literal`), or any line starting `tool:` (`pylint:`,
+  `rubocop:`, `type:`, `isort:`, …) keeps the whole group, as does a group on
+  the first two lines of a Python or Ruby file.
 
   **A comment beside the change that describes a flag's state is reported
   even when it does not name the flag.** A comment on a line the run changed,
@@ -7037,6 +7407,21 @@ means no PR.
   `undefined`, which silently takes the branch the flag turned off. So a member
   read off a literal the fold wrote refuses the flag (`unsafe-rewrite`), in every
   language. Declare a read that returns a boolean instead.
+
+  In TypeScript and JavaScript the same refusal covers every other position that
+  needs an object, not only a member: a destructuring
+  (`const { value, isReady } = useFlag('k')`, `const [on] = …`, a destructured
+  parameter default), a call of the result, `new`, a spread, a `for…of`/`for…in`
+  over it, and `'x' in result`. The run names the reason.
+
+  A read can also be refused before anything is folded, because of the accessor
+  rather than the expression: when the accessor's declaration in the repository
+  provably returns an object or array (an explicit object, array or tuple return
+  type, or a body that returns only such literals or a call of another such
+  hook), every read of it is refused, and so is a read returned from a
+  `renderHook(() => …)` callback in a test that reads a member of `.current`.
+  An accessor with no declaration in the repository (one from a package) is
+  still taken to return a boolean.
 
   This is also how a C# NSubstitute stub that "Tests that mock the flag read"
   cannot resolve ends: `sub.BoolVariation("KEY", ctx, false).Returns(value)` is a
@@ -7272,7 +7657,12 @@ means no PR.
   (`final enabled =\n    multiMediaEnabled ?? true;` becomes
   `final enabled = multiMediaEnabled ?? true;`), under the `formatter:
   page_width` of the nearest `analysis_options.yaml` (following a relative
-  `include:`), or 80.
+  `include:`), or 80. In TypeScript and JavaScript, under the width above, a
+  value Prettier moved to the line after its `=` or `:` goes back beside it,
+  and an `if`, `while` or `do … while` condition broken inside its
+  parentheses (`if (\n  enabled &&\n  ready\n) {`) goes back on the
+  statement's line (`if (ready) {`). A `return (…)` keeps its parentheses
+  and its layout, since Prettier would drop the parentheses instead.
 * **A comparison against a non-literal is propagated but not folded.**
   `if (on === true)` reduces fully, because both sides end up literal. But
   `if (on === other)` becomes `if (true === other)` and stops — correct, and

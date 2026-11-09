@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from flag_cleanup.client import token_is_sendable
-from flag_cleanup.piranha_runner import supported_languages
+from flag_cleanup.piranha_runner import KEY_POSITION_LANGUAGES, supported_languages
 from flag_cleanup.rule_synthesis import SUFFIXED_ACCESSOR_LANGUAGES
 from flag_cleanup.ts_gates import Gate, parse_gate
 from flag_cleanup.urls import redact_userinfo
@@ -151,7 +151,7 @@ class Config:
     gates: tuple[Gate, ...] = ()
     #: Accessors whose key is not their first argument, with its index:
     #: ``flag_is_active[1]`` in the input is ``("flag_is_active", 1)`` here, and
-    #: its bare name is in ``accessors``. Python only; see
+    #: its bare name is in ``accessors``. Python, TypeScript and JavaScript; see
     #: :func:`flag_cleanup.rule_synthesis.with_accessors`.
     key_positions: tuple[tuple[str, int], ...] = ()
     ignore: frozenset[str] = frozenset()
@@ -188,6 +188,12 @@ class Config:
     #: Their word, not a proof, so every such deletion is named in the pull
     #: request.
     side_effect_free_calls: tuple[str, ...] = ()
+    #: Go only: function names the customer's tests set a flag with
+    #: (``featureflag.Set(org, Flag, true)``), held to the ``accessors``
+    #: shape. A call that this tool proves is such a setter for the flag being
+    #: removed is resolved like a test double's stub; see
+    #: :mod:`flag_cleanup.go_setters`.
+    test_setters: tuple[str, ...] = ()
     #: Most pull requests one run may propose; ``0`` means no limit. A bound on
     #: blast radius rather than on correctness — see :data:`DEFAULT_MAX_PRS`.
     max_prs: int = DEFAULT_MAX_PRS
@@ -244,14 +250,14 @@ class Config:
             )
 
         accessors, gates, key_positions = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
-        if key_positions and "python" not in languages:
+        if key_positions and not KEY_POSITION_LANGUAGES & set(languages):
             # Every other language's run drops them, so the input would be
             # read and then silently match nothing.
             raise ConfigError(
                 f"FEATUREFLIP_ACCESSORS value(s) "
                 f"{', '.join(repr(f'{name}[{index}]') for name, index in key_positions)} "
-                "name the position of the key, which only a Python run reads, but "
-                "FEATUREFLIP_LANGUAGES does not include python"
+                "name the position of the key, which only a Python, TypeScript or "
+                "JavaScript run reads, but FEATUREFLIP_LANGUAGES includes none of them"
             )
         suffixed = [name for name in accessors if name.endswith(("?", "!"))]
         if suffixed and not SUFFIXED_ACCESSOR_LANGUAGES & set(languages):
@@ -315,7 +321,10 @@ class Config:
                 _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_MODULES", ""), default=()
             ),
             side_effect_free_calls=_parse_call_names(
-                _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_CALLS", "")
+                _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_CALLS", ""), "FEATUREFLIP_SIDE_EFFECT_FREE_CALLS"
+            ),
+            test_setters=_parse_call_names(
+                _get(env, "FEATUREFLIP_TEST_SETTERS", ""), "FEATUREFLIP_TEST_SETTERS"
             ),
             gates=gates,
             ignore=frozenset(_split_csv(_get(env, "FEATUREFLIP_IGNORE", ""), default=())),
@@ -425,8 +434,9 @@ def _parse_accessors(
     return tuple(seen), tuple(gates), tuple(positions.items())
 
 
-def _parse_call_names(value: str) -> tuple[str, ...]:
-    """Split, validate and de-duplicate ``FEATUREFLIP_SIDE_EFFECT_FREE_CALLS``.
+def _parse_call_names(value: str, variable: str = "FEATUREFLIP_SIDE_EFFECT_FREE_CALLS") -> tuple[str, ...]:
+    """Split, validate and de-duplicate ``FEATUREFLIP_SIDE_EFFECT_FREE_CALLS``
+    (or another list of plain function names, named by ``variable``).
 
     Held to the ``accessors`` shape (:data:`_ACCESSOR_RE`) for the same
     reason: a name is compared with a callee's name, and anything that is not
@@ -437,7 +447,7 @@ def _parse_call_names(value: str) -> tuple[str, ...]:
     invalid = [name for name in names if not _ACCESSOR_RE.match(name)]
     if invalid:
         raise ConfigError(
-            f"unsupported FEATUREFLIP_SIDE_EFFECT_FREE_CALLS value(s): "
+            f"unsupported {variable} value(s): "
             f"{', '.join(repr(name) for name in invalid)}; each must be a function "
             "or method name in your source, matching [A-Za-z_][A-Za-z0-9_]* with at "
             "most one trailing ? or ! (Ruby only). A call is matched by the name it "
