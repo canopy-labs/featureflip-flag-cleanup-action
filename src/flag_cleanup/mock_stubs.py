@@ -665,6 +665,10 @@ class StubTargets:
     receivers: frozenset[str] = frozenset()
     modules: frozenset[str] = frozenset()
     instances: frozenset[str] = frozenset()
+    #: TypeScript and JavaScript: the wrapper returns a Promise, so a spy
+    #: answering ``mockResolvedValue(<bool>)`` decides the test as
+    #: ``mockReturnValue(<bool>)`` does for a synchronous one.
+    resolved: bool = False
 
 
 #: The calls that replace a whole module, with a factory or without one.
@@ -955,13 +959,17 @@ def _spelled(receiver: str) -> str:
     return r"\s*".join(re.escape(token) for token in re.findall(r"[\w$]+|\S", receiver))
 
 
-def _ts_wrapper_patterns(name: str, receivers: str) -> list[tuple[str, str]]:
+def _ts_wrapper_patterns(name: str, receivers: str, resolved: bool = False) -> list[tuple[str, str]]:
     """Jest and Vitest spies, Sinon stubs, a mock's member (jest-mock-extended,
     ``vi.mocked``), and ts-mockito, each on a receiver the wrapper pass
-    proved. ``name`` is already escaped."""
+    proved. ``name`` is already escaped. ``resolved``: the wrapper returns a
+    Promise, and a stub may answer with ``mockResolvedValue`` too."""
     target = rf"(?:{receivers})"
     member = rf"(?P<quote>['\"`]){name}(?P=quote)"
-    returns = rf"\s*\.\s*mockReturnValue(?:Once)?\(\s*{_BOOL}\s*\)"
+    # Awaiting a stub's plain boolean gives the boolean, so a Promise wrapper's
+    # caller is decided by either answer; a synchronous one's by the plain one.
+    answer = "(?:mockResolvedValue|mockReturnValue)" if resolved else "mockReturnValue"
+    returns = rf"\s*\.\s*{answer}(?:Once)?\(\s*{_BOOL}\s*\)"
     spy = rf"(?:jest|vi)\s*\.\s*spyOn\(\s*{target}\s*,\s*{member}\s*\)"
     return [
         (STUB, spy + returns),
@@ -1387,7 +1395,9 @@ def _resolve_ts_wrappers(
         for name in names
         if targets[name].receivers
         for kind, pattern in _ts_wrapper_patterns(
-            re.escape(name), "|".join(_spelled(r) for r in sorted(targets[name].receivers, key=len, reverse=True))
+            re.escape(name),
+            "|".join(_spelled(r) for r in sorted(targets[name].receivers, key=len, reverse=True)),
+            targets[name].resolved,
         )
     ]
     modules = {name: targets[name].modules for name in names if targets[name].modules}

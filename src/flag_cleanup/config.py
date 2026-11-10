@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from flag_cleanup.client import token_is_sendable
-from flag_cleanup.piranha_runner import KEY_POSITION_LANGUAGES, supported_languages
+from flag_cleanup.piranha_runner import CODE_KEY_RE, KEY_POSITION_LANGUAGES, supported_languages
 from flag_cleanup.rule_synthesis import SUFFIXED_ACCESSOR_LANGUAGES
 from flag_cleanup.ts_gates import Gate, parse_gate
 from flag_cleanup.urls import redact_userinfo
@@ -197,6 +197,23 @@ class Config:
     #: Most pull requests one run may propose; ``0`` means no limit. A bound on
     #: blast radius rather than on correctness — see :data:`DEFAULT_MAX_PRS`.
     max_prs: int = DEFAULT_MAX_PRS
+    #: ``(featureflip_key, code_key)`` pairs from ``key-aliases``: the code
+    #: spells the flag ``code_key``, so every search of the code uses that
+    #: spelling, while everything about the flag ITSELF (its branch, the
+    #: already-handled lookup, the API calls, ``flags``/``ignore``, the
+    #: archive modes) keeps the Featureflip key. See :meth:`code_key`.
+    key_aliases: tuple[tuple[str, str], ...] = ()
+
+    def code_key(self, flag_key: str) -> str:
+        """``flag_key`` as the code spells it: its alias, or itself."""
+        for featureflip_key, code_key in self.key_aliases:
+            if featureflip_key == flag_key:
+                return code_key
+        return flag_key
+
+    def code_keys(self) -> frozenset[str]:
+        """Every spelling an alias maps a flag to."""
+        return frozenset(code_key for _, code_key in self.key_aliases)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
@@ -342,6 +359,7 @@ class Config:
                 "FEATUREFLIP_MAX_PRS",
                 _get(env, "FEATUREFLIP_MAX_PRS", str(DEFAULT_MAX_PRS)),
             ),
+            key_aliases=_parse_key_aliases(_get(env, "FEATUREFLIP_KEY_ALIASES", "")),
         )
 
 
@@ -487,6 +505,75 @@ def _parse_deployed_refs(value: str) -> tuple[str, ...]:
             "so anything else would compare against a ref you did not name"
         )
     return tuple(dict.fromkeys(refs))
+
+
+#: The key grammar Featureflip itself enforces: lowercase alphanumeric
+#: segments joined by single ``-`` or ``_``. The left side of an alias names a
+#: flag in Featureflip, so it can be nothing else.
+PLATFORM_KEY_RE = re.compile(r"\A[a-z0-9]+(?:[_-][a-z0-9]+)*\Z")
+
+
+def _parse_key_aliases(value: str) -> tuple[tuple[str, str], ...]:
+    """Split and validate ``FEATUREFLIP_KEY_ALIASES``.
+
+    Entries are ``featureflip-key=code-key``, separated by commas or newlines
+    (a YAML block scalar is the natural way to list many). Strict, and every
+    ambiguity refuses the run rather than picking a winner: an alias decides
+    which code a removal deletes, so a typo here must never become a removal
+    of the wrong reads.
+
+    * The left side must be a key Featureflip can hold
+      (:data:`PLATFORM_KEY_RE`); the right side a spelling the rewrite can
+      search for (:data:`~flag_cleanup.piranha_runner.CODE_KEY_RE`).
+    * A Featureflip key listed twice is refused, even with the same spelling.
+    * Two Featureflip keys mapped to one spelling are refused: removing one
+      would delete the other's reads.
+    * A spelling that is also another entry's Featureflip key is refused, for
+      the same reason: the code's reads of it would belong to two flags.
+    """
+    entries = [item.strip() for item in re.split(r"[,\n]", value) if item.strip()]
+    aliases: dict[str, str] = {}
+    owners: dict[str, str] = {}
+    for entry in entries:
+        featureflip_key, sep, code_key = entry.partition("=")
+        featureflip_key, code_key = featureflip_key.strip(), code_key.strip()
+        if not sep or not featureflip_key or not code_key:
+            raise ConfigError(
+                f"FEATUREFLIP_KEY_ALIASES entry {entry!r} is not featureflip-key=code-key"
+            )
+        if not PLATFORM_KEY_RE.match(featureflip_key):
+            raise ConfigError(
+                f"FEATUREFLIP_KEY_ALIASES entry {entry!r}: {featureflip_key!r} is not a "
+                "Featureflip flag key (lowercase letters and digits, in segments joined "
+                "by single '-' or '_')"
+            )
+        if not CODE_KEY_RE.match(code_key):
+            raise ConfigError(
+                f"FEATUREFLIP_KEY_ALIASES entry {entry!r}: {code_key!r} cannot be searched "
+                "for safely. A code key is letters, digits, '_', '-', '.' and ':', and "
+                "starts and ends with a letter, digit or '_'"
+            )
+        if featureflip_key in aliases:
+            raise ConfigError(
+                f"FEATUREFLIP_KEY_ALIASES names {featureflip_key!r} more than once; "
+                "give each flag one code key"
+            )
+        if code_key in owners:
+            raise ConfigError(
+                f"FEATUREFLIP_KEY_ALIASES maps both {owners[code_key]!r} and "
+                f"{featureflip_key!r} to {code_key!r}; the code's reads of it can "
+                "belong to only one flag"
+            )
+        aliases[featureflip_key] = code_key
+        owners[code_key] = featureflip_key
+    for code_key, featureflip_key in owners.items():
+        if code_key in aliases and code_key != featureflip_key:
+            raise ConfigError(
+                f"FEATUREFLIP_KEY_ALIASES maps {featureflip_key!r} to {code_key!r}, which "
+                "is also a flag the input aliases; the code's reads of it can belong "
+                "to only one flag"
+            )
+    return tuple(aliases.items())
 
 
 def _is_plain_ref(ref: str) -> bool:

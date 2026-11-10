@@ -636,8 +636,8 @@ def _regenerate(
                 # red, which is the module's contract for everything it cannot
                 # complete.
                 raise transform_error
-            unprocessed = orchestrate.all_unprocessed(config, key, unprocessable)
-            residue = orchestrate.sort_residue(config, unprocessed, key, diff)
+            unprocessed = orchestrate.all_unprocessed(config, config.code_key(key), unprocessable)
+            residue = orchestrate.sort_residue(config, unprocessed, config.code_key(key), diff)
             wrappers = pr_content.without_inlined(
                 constant_wrappers.find_constant_wrappers(diff, config.directories),
                 wrapper_findings,

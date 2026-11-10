@@ -53,6 +53,10 @@ from flag_cleanup.unused import _parse
 
 _CLASSES = frozenset({"class_declaration", "abstract_class_declaration", "class"})
 
+#: The ``bindings`` kind naming a factory function's parameter the run left
+#: unread (:func:`unread_factory_parameters`).
+UNREAD_FACTORY_PARAMETER = "unread factory parameter"
+
 #: Nodes whose text, when it spells a member's name, is counted as a read.
 _NAMES = frozenset(
     {
@@ -265,4 +269,58 @@ def unread_constructor_parameters(before: str, after: str, grammar: str) -> list
         f"{class_name}({name})"
         for (class_name, name), reads in new.items()
         if reads == 0 and old.get((class_name, name), 0) > 0
+    ]
+
+
+def _factory_parameters(source: str, grammar: str) -> dict[tuple[str, str], int] | None:
+    """``(factory, parameter) -> reads`` for each plain parameter of each
+    top-level factory function (:func:`ts_scope.factory_object`): one whose
+    whole body returns an object literal. ``None`` when the file does not parse."""
+    root = _parse(source, grammar)
+    if root.has_error:
+        return None
+    found: dict[tuple[str, str], int] = {}
+    names: list[str] = []
+    for statement in root.named_children:
+        function = statement.child_by_field_name("declaration") if statement.type == "export_statement" else statement
+        if function is None or function.type != "function_declaration" or ts_scope.factory_object(function) is None:
+            continue
+        name_node = function.child_by_field_name("name")
+        if name_node is None:
+            continue
+        factory = name_node.text.decode("utf-8", "replace")
+        names.append(factory)
+        parameters = function.child_by_field_name("parameters")
+        for parameter in parameters.named_children if parameters else ():
+            pattern = parameter.child_by_field_name("pattern")
+            if parameter.type not in _PARAMETERS or pattern is None or pattern.type != "identifier":
+                continue
+            if any(b != pattern for b in ts_scope.bindings(function, pattern.text.decode("utf-8", "replace"))):
+                continue  # bound again inside: which reads are whose is not asked
+            found[(factory, pattern.text.decode("utf-8", "replace"))] = sum(
+                1
+                for node in _walk(function)
+                if node.type in ("identifier", "shorthand_property_identifier")
+                and (node.text == pattern.text or node.text == b"eval")
+                and node != pattern
+            )
+    return {key: value for key, value in found.items() if names.count(key[0]) == 1}
+
+
+def unread_factory_parameters(before: str, after: str, grammar: str) -> list[str]:
+    """Each parameter of a factory function (``function buildFlags(client) {
+    return { ... }; }``) read in ``before`` and not in ``after``, as
+    ``buildFlags(client)``. The usual cause: the members that read it were
+    the flag's, and the run folded or deleted them. ``noUnusedParameters`` and
+    typescript-eslint's ``no-unused-vars`` (the last parameter) then reject
+    it; removing it changes every call of the factory, so it is named in the
+    pull request instead."""
+    old = _factory_parameters(before, grammar)
+    new = _factory_parameters(after, grammar)
+    if old is None or new is None:
+        return []
+    return [
+        f"{factory}({name})"
+        for (factory, name), reads in new.items()
+        if reads == 0 and old.get((factory, name), 0) > 0
     ]

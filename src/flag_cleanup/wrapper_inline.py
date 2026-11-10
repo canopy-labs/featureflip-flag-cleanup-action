@@ -300,6 +300,9 @@ class Wrapper:
     #: flag's key, not a spelling of the wrapper's name.
     flag_key: str = ""
     accessors: tuple[str, ...] = ()
+    #: TypeScript and JavaScript: its body returns the read's Promise, so a
+    #: call is folded where it is awaited and kept a Promise where it is not.
+    promise: bool = False
 
     @property
     def label(self) -> str:
@@ -540,6 +543,7 @@ def discover_all(
     flag_key: str,
     accessors: tuple[str, ...],
     folded_files: dict[str, tuple[bool, frozenset[str]]],
+    promise_reads: frozenset[tuple[str, int, int]] = frozenset(),
 ) -> list[Wrapper]:
     """Every wrapper declared in a file whose reads this run folds.
 
@@ -548,6 +552,10 @@ def discover_all(
     cross-file resolution proved name the key there. A read the run does not
     fold never makes a wrapper, so a caller is never folded while its wrapper
     keeps reading the flag.
+
+    ``promise_reads`` holds ``(resolved path, start, end)`` of each read
+    decided to keep its Promise (``Promise.resolve(<literal>)``), which a
+    profile that takes them may count as a wrapper's body too.
     """
     found: list[Wrapper] = []
     lang = profile(language)
@@ -557,7 +565,10 @@ def discover_all(
         source = _read(path)
         if source is None:
             continue
-        is_read = lang.read_test(path, source, flag_key, accessors, const_ok, external)
+        if promise_reads:
+            is_read = lang.read_test(path, source, flag_key, accessors, const_ok, external, promise_reads=promise_reads)
+        else:
+            is_read = lang.read_test(path, source, flag_key, accessors, const_ok, external)
         found.extend(
             dataclasses.replace(w, flag_key=flag_key, accessors=tuple(accessors))
             for w in lang.discover(str(Path(path).resolve()), source, is_read)

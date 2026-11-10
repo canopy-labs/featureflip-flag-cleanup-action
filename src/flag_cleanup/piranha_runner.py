@@ -99,6 +99,7 @@ from flag_cleanup import (
     discarded_calls,
     failing_assertions,
     go_emptied,
+    go_handles,
     go_setters,
     inert_calls,
     jvm_matchers,
@@ -172,7 +173,12 @@ from flag_cleanup.syntax import (
     refusal_reason,
 )
 from flag_cleanup.primary_constructor import unread_parameters
-from flag_cleanup.ts_unread_members import unread_constructor_parameters, unread_members
+from flag_cleanup.ts_unread_members import (
+    UNREAD_FACTORY_PARAMETER,
+    unread_constructor_parameters,
+    unread_factory_parameters,
+    unread_members,
+)
 from flag_cleanup.ts_syntax import count_syntax_errors, strip_dangling_type_separators
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_bindings, unread_locals
@@ -300,6 +306,42 @@ def ensure_supported_key(flag_key: str) -> None:
             "regular expression rather than as text. Rename the flag, or add the "
             "key to the `ignore` input to stop reporting it"
         )
+
+
+#: A key's spelling in the CODE, mapped from a Featureflip key by the
+#: `key-aliases` input: the safe alphabet above plus `.` and `:`, which other
+#: vendors' keys use (`experimental.agents`, `following_v2:enable`), starting
+#: and ending in a letter, digit or `_`. Only these two are added, and only for
+#: an aliased key, because only these two were measured safe at every layer
+#: the key reaches (see :func:`rule_operand`): neither is special in a query
+#: string, `#eq?`/`#not-eq?`/`#any-of?` compare text, and every Python pattern
+#: built from a key escapes it.
+CODE_KEY_RE = re.compile(r"\A[A-Za-z0-9_](?:[A-Za-z0-9_.:-]*[A-Za-z0-9_])?\Z")
+
+
+def ensure_supported_code_key(code_key: str) -> None:
+    """Raise :class:`UnsupportedFlagKeyError` unless ``code_key`` is a spelling
+    an alias may map a flag to (:data:`CODE_KEY_RE`)."""
+    if not CODE_KEY_RE.match(code_key):
+        raise UnsupportedFlagKeyError(
+            f"code key {code_key!r} is not a spelling this tool can search for "
+            "safely: it must be letters, digits, '_', '-', '.' and ':', starting "
+            "and ending with a letter, digit or '_'"
+        )
+
+
+def rule_operand(key: str) -> str:
+    """``key`` as the value of a hole the rules compare it through.
+
+    The value reaches two layers. In the query it sits inside a predicate
+    string, where tree-sitter drops a backslash before any character but
+    ``n``/``r``/``t``/``0``, so ``\\.`` compares as ``.``. The engine also joins
+    every hole value into a REGEX that picks which files to parse at all, and
+    there an unescaped ``.`` matches any character: harmless (more files are
+    parsed, none matches a rule they do not hold), but escaping it makes the
+    pre-filter exact too. A key without a ``.`` is returned unchanged.
+    """
+    return key.replace(".", "\\.")
 
 
 # Maps the tool's language token -> (Piranha language id, rule-file basename,
@@ -1106,7 +1148,9 @@ def _load_argument_flags(base: str) -> dict[str, object]:
     return dict(data.get("piranha_arguments", {}))
 
 
-def render_known_flag_keys(keys: Iterable[str], target: str, language: str) -> str:
+def render_known_flag_keys(
+    keys: Iterable[str], target: str, language: str, *, code_keys: frozenset[str] = frozenset()
+) -> str:
     """Render the project's OTHER flag keys for the ``@known_flag_keys`` hole.
 
     The value is spliced textually into a tree-sitter query as the argument
@@ -1134,7 +1178,9 @@ def render_known_flag_keys(keys: Iterable[str], target: str, language: str) -> s
     rendered: list[str] = []
     for key in sorted(set(keys) - {target}):
         try:
-            ensure_supported_key(key)
+            # An aliased sibling is spelled as its code spells it, and held to
+            # that alphabet, as the target is (see `transform_flag`).
+            (ensure_supported_code_key if key in code_keys else ensure_supported_key)(key)
         except UnsupportedFlagKeyError:
             logger.warning(
                 "dropping flag key %r from the sibling list: it cannot be "
@@ -1143,6 +1189,7 @@ def render_known_flag_keys(keys: Iterable[str], target: str, language: str) -> s
                 key,
             )
             continue
+        key = rule_operand(key)
         if language == "dart":
             rendered.append(f"\"'{key}'\"")
             rendered.append(f'"\\"{key}\\""')
@@ -1768,6 +1815,7 @@ def run_piranha(
     inline_wrappers: bool = True,
     flag_default: ts_tests.FlagDefault | None = None,
     key_positions: tuple[tuple[str, int], ...] = (),
+    code_keys: frozenset[str] = frozenset(),
 ) -> str:
     """:func:`transform_flag`, keeping only the diff.
 
@@ -1790,7 +1838,7 @@ def run_piranha(
     return transform_flag(
         repo_dir, language, flag_key, treatment, paths, accessors,
         known_flag_keys=known_flag_keys, gates=gates, inline_wrappers=inline_wrappers,
-        flag_default=flag_default, key_positions=key_positions,
+        flag_default=flag_default, key_positions=key_positions, code_keys=code_keys,
     ).diff
 
 
@@ -1809,8 +1857,14 @@ def transform_flag(
     *,
     entries: bool = True,
     key_positions: tuple[tuple[str, int], ...] = (),
+    code_keys: frozenset[str] = frozenset(),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
+
+    ``flag_key`` is the key as the CODE spells it. ``code_keys`` holds every
+    spelling the ``key-aliases`` input maps a flag to; one of them, as
+    ``flag_key`` or among ``known_flag_keys``, is checked against
+    :data:`CODE_KEY_RE` rather than the strict alphabet.
 
     ``key_positions`` names the accessors whose key is not their first
     argument, with its index (``("flag_is_active", 1)``). Python and the
@@ -1864,13 +1918,13 @@ def transform_flag(
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
                 known_flag_keys, doubles, gates, inline_wrappers, flag_default, read_elsewhere,
-                entries=entries, key_positions=positions,
+                entries=entries, key_positions=positions, code_keys=code_keys,
             )
         except _NoReadFolded:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
                 known_flag_keys, None, gates, inline_wrappers, flag_default,
-                entries=entries, key_positions=positions,
+                entries=entries, key_positions=positions, code_keys=code_keys,
             )
         except BaseException:
             # Newest first: a later pass's "original" is an earlier pass's
@@ -1900,6 +1954,7 @@ def _transform_flag(
     *,
     entries: bool = True,
     key_positions: dict[str, int] | None = None,
+    code_keys: frozenset[str] = frozenset(),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -1977,7 +2032,9 @@ def _transform_flag(
     """
     jvm_matchers.forget()
     jvm_matchers.use_repo(repo_dir)
-    ensure_supported_key(flag_key)
+    # A spelling the `key-aliases` input mapped a flag to is held to the code-key
+    # alphabet, every other key to the strict one.
+    (ensure_supported_code_key if flag_key in code_keys else ensure_supported_key)(flag_key)
     # An accessor with its key in another slot travels as `name[index]` through
     # every pass but the generated rules and the attribute gates (which get the
     # plain names). A pass that takes the key to be the FIRST argument (wrappers,
@@ -2131,13 +2188,16 @@ def _transform_flag(
     # `contradicting.find_contradicting_entries` reports it. See #3050 and the
     # header of any `rules/*_entries.toml`.
     substitutions = {
-        "stale_flag_name": flag_key,
+        # Through `rule_operand`, which leaves a key without a `.` unchanged.
+        "stale_flag_name": rule_operand(flag_key),
         "treated": spec.true_literal if treatment else spec.false_literal,
         # `recv&.read` in a condition folds by treatment: see `ruby_accessors.toml`.
-        "safe_nav_false_flag_name": "" if treatment else flag_key,
-        "safe_nav_true_flag_name": flag_key if treatment else "",
+        "safe_nav_false_flag_name": "" if treatment else rule_operand(flag_key),
+        "safe_nav_true_flag_name": rule_operand(flag_key) if treatment else "",
         "untreated": spec.false_literal if treatment else spec.true_literal,
-        "known_flag_keys": render_known_flag_keys(known_flag_keys, flag_key, language),
+        "known_flag_keys": render_known_flag_keys(
+            known_flag_keys, flag_key, language, code_keys=code_keys
+        ),
         # The marker rules of Python, the TS family, Java, Kotlin and Go; supplied
         # unconditionally, because a substitution no rule names costs nothing
         # and a rule whose hole is absent aborts the engine. See
@@ -2289,6 +2349,9 @@ def _transform_flag(
         wrappers = _plan_wrappers(
             repo_dir, language, flag_key, treatment, accessors, paths + sibling_readers, resolution,
             [*with_const, *kept_declarations], without_const, reader_paths, reader_const, doubles,
+            promise_reads=_promise_reads(
+                repo_dir, paths, flag_key, planned_accessors, language, async_names, first_sites, doubles
+            ),
         )
         # A call-site file that neither holds the key nor reads its constant
         # is in no engine group yet; the marks are its only reads.
@@ -2573,8 +2636,11 @@ def _transform_flag(
     # give the summaries the customer's bytes as their "before". Asked BEFORE
     # that rebase: the engine's own "before" already holds the edits, so a
     # deleted stub is not mistaken for a fold.
+    # Every accessor the run folds counts, a managed one's too: its reads
+    # become ``Promise.resolve(<literal>)``, which is a fold as much as a
+    # literal is.
     summaries, test_doubles = _settle_test_doubles(
-        summaries, doubles, language, accessors, repo_dir, unprocessable, read_elsewhere
+        summaries, doubles, language, planned_accessors, repo_dir, unprocessable, read_elsewhere
     )
     # Listed with the mock lines: each checked a flag read this removal folded.
     engine_guards = tuple(row for row in engine_assertions if row[1] == CONSTANT_GUARD)
@@ -2871,6 +2937,9 @@ def _transform_flag(
     # them is proven (:mod:`flag_cleanup.go_emptied`). What the calls alone
     # read is stranded in turn, so the binding pass runs once more.
     if language == "go":
+        # A handle deleted although its constructor does more than build it
+        # is named (:mod:`flag_cleanup.go_handles`).
+        bindings = bindings + tuple(go_handles.deleted_with_effects(summaries, flag_key, repo_dir))
         summaries, emptied = go_emptied.remove(summaries, repo_dir, Rewrite)
         if emptied:
             summaries, more_bindings = _remove_stranded_bindings(
@@ -3206,6 +3275,13 @@ def _transform_flag(
             reasons[path] = (
                 "a read of a key constant declared in another file was not rewritten"
             )
+    # A Go handle deleted although its constructor does more than build it:
+    # anything still spelling the key may read what the constructor did for it.
+    if language == "go":
+        for path, reason in go_handles.residue_refusals(
+            [b for b in bindings if b[1] == go_handles.SIDE_EFFECTS], flag_key, repo_dir
+        ).items():
+            reasons.setdefault(path, reason)
     # The belt to the predicates' braces, for a key constant whose declaration
     # this run deleted: any identifier still naming it (in its own file, or
     # through an import) means the fold and the Gate 2 proof disagreed.
@@ -3359,6 +3435,40 @@ def _refuse_wrappers_kept_at_close_out(
 _STUBS_GATED_PER_WRAPPER = frozenset({"csharp", "java", "kt", "python", "ruby"})
 
 
+def _promise_reads(
+    repo_dir: str,
+    paths: list[str],
+    flag_key: str,
+    accessors: tuple[str, ...],
+    language: str,
+    managed: frozenset[str],
+    planned: list[ts_async_reads.Site],
+    doubles: list[mock_stubs.Prepass] | None,
+) -> frozenset[tuple[str, int, int]]:
+    """``(resolved path, start, end)`` of each keyed read of a managed accessor
+    that the run folds to ``Promise.resolve(<literal>)``, on the bytes the
+    wrapper pass reads. ``planned`` is the plan made on the customer's bytes;
+    only a file a double pass has edited since is planned again, since its
+    offsets may have moved."""
+    if not managed or language not in ("ts", "tsx", "js"):
+        return frozenset()
+
+    def resolved(path: str) -> str:
+        return str(Path(path).resolve())
+
+    edited = {resolved(p) for d in doubles or () for p in d.originals}
+    wanted = {resolved(p) for p in paths}
+    again = [p for p in paths if resolved(p) in edited]
+    sites = [s for s in planned if resolved(s.path) in wanted and resolved(s.path) not in edited]
+    if again:
+        sites += ts_async_reads.plan(repo_dir, again, flag_key, accessors, language)
+    return frozenset(
+        (resolved(site.path), *site.call)
+        for site in sites
+        if site.decision == ts_async_reads.PROMISE and site.keyed and site.accessor in managed
+    )
+
+
 def _plan_wrappers(
     repo_dir: str,
     language: str,
@@ -3372,6 +3482,7 @@ def _plan_wrappers(
     reader_paths: list[str],
     reader_const: frozenset[str],
     doubles: list[mock_stubs.Prepass] | None,
+    promise_reads: frozenset[tuple[str, int, int]] = frozenset(),
 ) -> wrapper_inline.WrapperPlan:
     """Discover, qualify and prove this flag's keyless wrappers.
 
@@ -3395,7 +3506,7 @@ def _plan_wrappers(
         p: (p in const_ok, external(p))
         for p in [*with_const, *without_const, *reader_paths]
     }
-    found = wrapper_inline.discover_all(language, flag_key, accessors, folded)
+    found = wrapper_inline.discover_all(language, flag_key, accessors, folded, promise_reads)
     qualified, refusals = wrapper_inline.qualify_all(repo_dir, found, treatment)
     by_resolved = {str(Path(p).resolve()): p for p in paths}
     stub_pass: mock_stubs.Prepass | None = None
@@ -6735,6 +6846,11 @@ def _unread_plain_constructor_parameters(
             continue
         relative = os.path.relpath(summary.path, repo_dir)
         found.extend((relative, "unread constructor parameter", label) for label in labels)
+        if grammar in ("ts", "tsx", "js"):
+            found.extend(
+                (relative, UNREAD_FACTORY_PARAMETER, label)
+                for label in unread_factory_parameters(summary.original_content, summary.content, grammar)
+            )
     return tuple(found)
 
 

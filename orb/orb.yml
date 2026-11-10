@@ -115,6 +115,14 @@ commands:
           flag with (`Set` for `featureflag.Set(org, Flag, true)`). A call
           this tool can prove sets the flag being removed is resolved like a
           mocked read; one it cannot is left in place.
+      key-aliases:
+        type: string
+        default: ""
+        description: >-
+          Comma-separated `featureflip-key=code-key` entries for code that
+          spells a flag's key differently from Featureflip
+          (`experimental-agents=experimental.agents`). The removal searches the
+          code for the right-hand spelling.
       languages:
         type: string
         default: ""
@@ -298,6 +306,7 @@ commands:
             export FEATUREFLIP_SIDE_EFFECT_FREE_MODULES="<< parameters.side-effect-free-modules >>"
             export FEATUREFLIP_SIDE_EFFECT_FREE_CALLS="<< parameters.side-effect-free-calls >>"
             export FEATUREFLIP_TEST_SETTERS="<< parameters.test-setters >>"
+            export FEATUREFLIP_KEY_ALIASES="<< parameters.key-aliases >>"
             export FEATUREFLIP_DIRECTORIES="<< parameters.directories >>"
             export FEATUREFLIP_IGNORE="<< parameters.ignore >>"
             export FEATUREFLIP_FLAGS="<< parameters.flags >>"
@@ -331,6 +340,7 @@ commands:
               -e FEATUREFLIP_SIDE_EFFECT_FREE_MODULES \
               -e FEATUREFLIP_SIDE_EFFECT_FREE_CALLS \
               -e FEATUREFLIP_TEST_SETTERS \
+              -e FEATUREFLIP_KEY_ALIASES \
               -e FEATUREFLIP_DIRECTORIES \
               -e FEATUREFLIP_IGNORE \
               -e FEATUREFLIP_FLAGS \

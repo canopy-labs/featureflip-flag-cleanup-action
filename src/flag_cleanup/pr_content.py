@@ -26,6 +26,7 @@ from flag_cleanup.config import Config
 from flag_cleanup.discarded_calls import DISCARDED_CALL
 from flag_cleanup.failing_assertions import FLAG_VALUE_ASSERTION
 from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
+from flag_cleanup.ts_unread_members import UNREAD_FACTORY_PARAMETER
 from flag_cleanup.forwarder_csharp import INLINED as INLINED_FORWARDER, KEPT as KEPT_FORWARDER
 from flag_cleanup.cross_file_keys import (
     ENUM_DYNAMIC,
@@ -35,7 +36,7 @@ from flag_cleanup.cross_file_keys import (
     LEFT_COMPETING,
     NAME_NOT_UNIQUE,
 )
-from flag_cleanup import go_emptied
+from flag_cleanup import go_emptied, go_handles
 from flag_cleanup.mock_stubs import (
     DUPLICATE_TEST,
     FALSE_TITLE,
@@ -196,6 +197,7 @@ REPORTED_BINDING_KINDS = frozenset(
         "unread parameter",
         "unread member",
         "unread constructor parameter",
+        UNREAD_FACTORY_PARAMETER,
         "unread local",
         "removed parameter",
         "removed member",
@@ -222,6 +224,7 @@ REPORTED_BINDING_KINDS = frozenset(
         REMOVED_FEATURE_CLASS,
         DISCARDED_CALL,
         DECLARED_CALL,
+        go_handles.SIDE_EFFECTS,
         INLINED_FORWARDER,
         KEPT_FORWARDER,
         REMOVED_GATE,
@@ -557,6 +560,27 @@ def _declared_call_lines(declared: list[tuple[str, str]]) -> list[str]:
         "does do work, restore it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in declared[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _handle_constructor_lines(deleted: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Go flag handle deleted although its
+    constructor does more than build it, or nothing."""
+    if not deleted:
+        return []
+    count = len(deleted)
+    return [
+        f"> **{'A flag handle was' if count == 1 else f'{count} flag handles were'} "
+        "deleted whose constructor does more than build it.** The constructor "
+        "still runs for every other flag, but nothing it did for this one happens "
+        "any more: registering it in a store or a fallback map, counting it, logging "
+        "it, or anything else in its body. Code that lists, counts or orders every "
+        "registered flag, such as a test asserting the set, now sees one fewer. "
+        "Nothing left in the repository names the key:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in deleted[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -908,6 +932,30 @@ def _unread_jvm_lines(unread: list[tuple[str, str]], parameters: list[tuple[str,
         "it:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _unread_factory_parameter_lines(unread: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each TypeScript or JavaScript factory function's
+    parameter this pull request left unread, or nothing: the members that
+    read it were this flag's, and they were folded or deleted."""
+    if not unread:
+        return []
+    count = len(unread)
+    noun = "parameter is" if count == 1 else "parameters are"
+    return [
+        f"> **⚠️ {count} factory {noun} no longer read.** The members that "
+        "read it returned this flag, and this pull request folded or deleted "
+        "them. With `noUnusedParameters` on, `tsc` now reports it (TS6133), and "
+        "ESLint's `no-unused-vars` does when it is the last parameter. "
+        f"{'It was' if count == 1 else 'They were'} left in place because "
+        "removing a parameter changes every call of the function. Remove "
+        f"{'it' if count == 1 else 'each'}, with the argument callers pass for "
+        "it:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unread[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -1463,6 +1511,7 @@ def pr_body(
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
     renamed_tests = _renamed_tests(bindings)
     removed_defaults = _removed_defaults(bindings)
+    code_key = config.code_key(candidate.key)
     flag_url = (
         f"{_without_userinfo(config.api_url)}/api/v1/orgs/{quote(config.org, safe='')}"
         f"/projects/{quote(config.project, safe='')}"
@@ -1474,6 +1523,15 @@ def pr_body(
         "| | |",
         "| --- | --- |",
         f"| **Flag** | {_md_cell(_md_code(candidate.key))} |",
+        *(
+            # Only for a key `key-aliases` maps to another spelling: the one
+            # this run searched the code for, so a reviewer can match the diff
+            # to the flag.
+            [f"| **Code key** | {_md_cell(_md_code(code_key))} — the flag's spelling in this "
+             "repository, set by `key-aliases` |"]
+            if code_key != candidate.key
+            else []
+        ),
         f"| **Status** | {_md_cell(_md_code(candidate.status))} |",
         # Code-spanned like every other server-supplied value: `reason` is API
         # text, and left bare it renders as live markdown in the customer's PR.
@@ -1601,14 +1659,14 @@ def pr_body(
         row
         for row in residue.comment_lines
         if not still_read
-        and stale_comments.describes_removed(row[2], candidate.key, candidate.treatment)
+        and stale_comments.describes_removed(row[2], code_key, candidate.treatment)
     ]
     kept_branch = [
         row
         for row in residue.comment_lines
         if not still_read
         and row not in removed_branch
-        and stale_comments.describes_kept(row[2], candidate.key, candidate.treatment)
+        and stale_comments.describes_kept(row[2], code_key, candidate.treatment)
     ]
     lines += _flag_state_comment_lines(
         removed_branch + _state_rows(bindings, stale_comments.REMOVED_BRANCH_KIND),
@@ -1868,6 +1926,9 @@ def pr_body(
     unread_constructor_parameters = [
         (path, text) for path, kind, text in bindings if kind == "unread constructor parameter"
     ]
+    unread_factory_parameters = [
+        (path, text) for path, kind, text in bindings if kind == UNREAD_FACTORY_PARAMETER
+    ]
     removed_parameters = [
         (path, text) for path, kind, text in bindings if kind == "removed parameter"
     ]
@@ -1909,6 +1970,9 @@ def pr_body(
     declared_calls = [
         (path, text) for path, kind, text in bindings if kind == DECLARED_CALL
     ]
+    handle_constructors = [
+        (path, text) for path, kind, text in bindings if kind == go_handles.SIDE_EFFECTS
+    ]
     inlined_forwarders = [
         (path, text) for path, kind, text in bindings if kind == INLINED_FORWARDER
     ]
@@ -1946,6 +2010,7 @@ def pr_body(
     lines += _unread_constructor_parameter_lines(
         [p for p in unread_constructor_parameters if not p[0].endswith(_JVM_SUFFIXES)]
     )
+    lines += _unread_factory_parameter_lines(unread_factory_parameters)
     lines += _removed_member_lines([m for m in removed_members if not m[0].endswith(".dart")])
     lines += _removed_dart_field_lines([m for m in removed_members if m[0].endswith(".dart")])
     lines += _removed_constructor_lines(removed_parameters, changed_constructors)
@@ -1959,6 +2024,7 @@ def pr_body(
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_local_lines(unread_locals)
     lines += _declared_call_lines(declared_calls)
+    lines += _handle_constructor_lines(handle_constructors)
     lines += _readiness_lines(readiness)
     lines += _hook_call_lines(hook_calls)
     lines += _kept_hook_call_lines(kept_hook_calls)

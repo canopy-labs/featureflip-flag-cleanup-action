@@ -92,7 +92,7 @@ from flag_cleanup.client import (
     OrganizationReadOnlyError,
     RemovalPrPermissionError,
 )
-from flag_cleanup.config import Config
+from flag_cleanup.config import PLATFORM_KEY_RE, Config
 from flag_cleanup.forge import (
     Forge,
     ForgeApiError,
@@ -115,6 +115,7 @@ from flag_cleanup.piranha_runner import (
     UnsupportedFlagKeyError,
     candidate_files,
     checkout_root,
+    ensure_supported_code_key,
     ensure_supported_key,
     plan_reads,
     plan_registry_default,
@@ -709,7 +710,7 @@ def _process_candidate(
     if unsafe_key is not None:
         return unsafe_key
 
-    unsupported = _unsupported_key_result(candidate)
+    unsupported = _unsupported_key_result(candidate, config, known_flag_keys)
     if unsupported is not None:
         return unsupported
 
@@ -755,8 +756,8 @@ def _process_candidate(
         # this run had just cleaned — a dry run whose whole promise is to
         # preview a real run would have contradicted the real run's own body.
         if transform_error is None:
-            unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-            sorted_residue = sort_residue(config, unprocessed, candidate.key, diff)
+            unprocessed = all_unprocessed(config, config.code_key(candidate.key), unprocessable)
+            sorted_residue = sort_residue(config, unprocessed, config.code_key(candidate.key), diff)
             enum_held = sorted_residue.enum_held
             wrappers = without_inlined(
                 find_constant_wrappers(diff, config.directories), wrapper_findings
@@ -765,7 +766,9 @@ def _process_candidate(
     if transform_error is not None:
         return _refusal_result(candidate, transform_error)
 
-    _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
+    _warn_on_unprocessed_references(
+        config, config.code_key(candidate.key), unprocessed, sorted_residue
+    )
     note_removed_comments(_bindings)
     note_reworded_comments(_bindings)
     note_call_site_comments(_bindings)
@@ -841,7 +844,7 @@ def _process_candidate_for_pr(
     if unsafe_key is not None:
         return unsafe_key
 
-    unsupported = _unsupported_key_result(candidate)
+    unsupported = _unsupported_key_result(candidate, config, known_flag_keys)
     if unsupported is not None:
         return unsupported
 
@@ -922,17 +925,17 @@ def _process_candidate_for_pr(
             elif not diff:
                 logger.info("no changes for %s: opening no PR", candidate.key)
                 action = "no-changes"
-                unprocessed = all_unprocessed(config, candidate.key, unprocessable)
-                sorted_residue = sort_residue(config, unprocessed, candidate.key)
+                unprocessed = all_unprocessed(config, config.code_key(candidate.key), unprocessable)
+                sorted_residue = sort_residue(config, unprocessed, config.code_key(candidate.key))
                 enum_held = sorted_residue.enum_held
             else:
                 # Computed BEFORE the PR is opened so the body can carry the
                 # caveat. A PR titled "remove flag X" whose repo still reads X
                 # from a .js file must say so where the reviewer will see it.
-                unprocessed = all_unprocessed(config, candidate.key, unprocessable)
+                unprocessed = all_unprocessed(config, config.code_key(candidate.key), unprocessable)
                 # Sorted while the rewrite is still on disk, for the same
                 # reason `unprocessed` is computed here.
-                residue = sort_residue(config, unprocessed, candidate.key, diff)
+                residue = sort_residue(config, unprocessed, config.code_key(candidate.key), diff)
                 sorted_residue = residue
                 enum_held = residue.enum_held
                 # Same window, same reason: the members it reads are only
@@ -1132,7 +1135,9 @@ def _process_candidate_for_pr(
                     raise
 
     if action in {"pr-opened", "no-changes"}:
-        _warn_on_unprocessed_references(config, candidate.key, unprocessed, sorted_residue)
+        _warn_on_unprocessed_references(
+            config, config.code_key(candidate.key), unprocessed, sorted_residue
+        )
         note_removed_comments(bindings)
         note_reworded_comments(bindings)
         note_call_site_comments(bindings)
@@ -1201,20 +1206,77 @@ def _branch_or_refusal(candidate: Candidate) -> tuple[str, FlagResult | None]:
         )
 
 
-def _unsupported_key_result(candidate: Candidate) -> FlagResult | None:
+def _unsupported_key_result(
+    candidate: Candidate, config: Config, known_flag_keys: frozenset[str] = frozenset()
+) -> FlagResult | None:
     """Refuse, loudly, a key that cannot be substituted into the rules.
 
     Asked in BOTH modes and before the transform, so a dry run reports exactly
     what a real run would refuse. Reported as ``unsafe-key`` — the same outcome
     as a key that cannot be a branch name, because it is the same fact from the
     customer's side: this flag can never be proposed until it is renamed.
+
+    A key the ``key-aliases`` input maps is searched for by its code spelling,
+    so that is what is checked, against the code-key alphabet. Then, aliased or
+    not, the spelling must belong to this flag alone: another flag of the
+    project spelled the same way in the code (one aliased onto this flag's key,
+    or this flag aliased onto another's) would have its reads removed too.
     """
+    code_key = config.code_key(candidate.key)
     try:
-        ensure_supported_key(candidate.key)
+        if code_key in config.code_keys():
+            ensure_supported_code_key(code_key)
+        else:
+            ensure_supported_key(candidate.key)
     except UnsupportedFlagKeyError as exc:
         logger.error("skipping %s", exc)
         return FlagResult(
             candidate.key, candidate.treatment, candidate.status, "", "unsafe-key"
+        )
+    conflict = _code_key_conflict(candidate, config, known_flag_keys)
+    if conflict is not None:
+        logger.error("skipping %s: %s", candidate.key, conflict)
+        return FlagResult(
+            candidate.key, candidate.treatment, candidate.status, "", "unsafe-key"
+        )
+    return None
+
+
+def _code_key_conflict(
+    candidate: Candidate, config: Config, known_flag_keys: frozenset[str]
+) -> str | None:
+    """Why ``candidate``'s spelling in the code may also be another flag's, or
+    ``None`` when it is this flag's alone.
+
+    Asked from what the configuration says first, so a project flag list that
+    could not be read never turns the answer into "no": every key
+    ``key-aliases`` names is checked, whatever the list holds, which catches
+    an unaliased flag that some alias maps another flag onto. Then the list.
+    A list that does not hold the candidate itself is not the project's flag
+    list (it could not be fetched, or ``pr-command`` did not fetch it), so an
+    alias whose spelling is a key Featureflip could hold (``new-ui``) is
+    refused: nothing can rule out a flag of that name whose reads it is.
+    """
+    code_key = config.code_key(candidate.key)
+    named = set(known_flag_keys) | {key for key, _ in config.key_aliases}
+    sharing = sorted(
+        key for key in named if key != candidate.key and config.code_key(key) == code_key
+    )
+    if sharing:
+        return (
+            f"the code spells it {code_key!r}, and so it spells "
+            f"{', '.join(repr(key) for key in sharing)}, so a removal cannot tell their "
+            "reads apart. Change `key-aliases` so each flag has a spelling of its own"
+        )
+    if (
+        code_key != candidate.key
+        and PLATFORM_KEY_RE.match(code_key)
+        and candidate.key not in known_flag_keys
+    ):
+        return (
+            f"`key-aliases` spells it {code_key!r}, which could be another flag's own "
+            "key, and the project's flag list could not be read to rule that out, so "
+            "a removal could delete that flag's reads. It is retried on the next run"
         )
     return None
 
@@ -1417,7 +1479,7 @@ def _too_deep_result(candidate: Candidate, config: Config) -> FlagResult:
     ``unsafe-rewrite`` and not ``no-changes``: nothing was decided about this
     flag, and the build goes red until a person looks.
     """
-    found = nesting.deep_files(config.directories, config.languages, candidate.key)
+    found = nesting.deep_files(config.directories, config.languages, config.code_key(candidate.key))
     reasons = tuple(
         (
             path,
@@ -1597,6 +1659,12 @@ def piranha_transform(
     re-assert it after the branch cleanup, which is the last thing to touch
     the tree.
     """
+    if config.code_key(candidate.key) in config.code_keys():
+        logger.info(
+            "searching the code for flag %s as %r, its spelling in `key-aliases`",
+            candidate.key,
+            config.code_key(candidate.key),
+        )
     plan = _transform_plan(candidate, config)
     snapshot = git_ops.WorktreeSnapshot.take(_transform_targets(plan))
     # Registered here, BEFORE the engine runs and regardless of how this
@@ -1620,6 +1688,7 @@ def piranha_transform(
     transform_error: TransformRefusal | None = None
     try:
         try:
+            _refuse_ambiguous_code_key(candidate, config, known_flag_keys)
             with git_ops.guarding_writes(snapshot, ledger):
                 outcomes = _run_plan(plan, candidate, config, known_flag_keys)
             kept_entries: list[tuple[str, str]] = []
@@ -1639,7 +1708,7 @@ def piranha_transform(
             if any(o.entries for o in outcomes):
                 live = _live_references(
                     config,
-                    candidate.key,
+                    config.code_key(candidate.key),
                     [path for o in outcomes for path in o.unprocessable],
                 )
                 if live:
@@ -1780,6 +1849,99 @@ def piranha_transform(
         _undo_transform(config, snapshot, pending=None)
 
 
+def _refuse_ambiguous_code_key(
+    candidate: Candidate, config: Config, known_flag_keys: frozenset[str]
+) -> None:
+    """Refuse a key whose code spelling is another flag's too, or is EXTENDED
+    by another token.
+
+    The first is :func:`_unsupported_key_result`'s check, which the remove
+    modes have already made; asked again here because ``pr-command``
+    regenerates through this transform and not through that function.
+
+    Every search of the code holds the key to a boundary: a neighbouring
+    letter, digit, ``_`` or ``-`` means a longer key, so ``new-ui`` never
+    matches ``new-ui-shell``. That set was written for Featureflip's own keys,
+    which hold no ``.`` or ``:``. A code key that does (``experimental.agents``)
+    has a longer sibling those boundaries cannot see:
+    ``experimental.agents.beta`` or ``beta.experimental.agents``. The rules
+    compare whole literals and cannot confuse them, but a scan that reads
+    text (a comment naming the flag, a test title, the residue) would take
+    the longer one for this flag. Rather than teach every such scan the
+    wider boundary, a flag whose spelling is extended anywhere a run reads
+    is refused, naming each line, and nothing is written.
+
+    Asked of the files the residue scan reads, generated directories
+    included, since the transform reads those too. It is asked only where an
+    alias says a longer key is there: of a dotted spelling ``key-aliases``
+    gave this flag, and of a flag (``exp``) whose spelling another alias
+    extends (``exp.agents``), whose scans would count every mention of the
+    longer flag as one of this one.
+    """
+    code_key = config.code_key(candidate.key)
+    conflict = _code_key_conflict(candidate, config, known_flag_keys)
+    if conflict is not None:
+        raise UnsafeRewriteError(
+            f"flag {candidate.key!r}: {conflict}", refused=(), discarded=()
+        )
+    key = re.escape(code_key)
+    token = r"[A-Za-z0-9_.:-]*"
+    # The key after `x.` or `x:`, or followed by `.x` or `:x`, as a whole
+    # token otherwise. The surrounding token is matched only to be named.
+    extended = re.compile(
+        rf"{token}[A-Za-z0-9_][.:]{key}(?![A-Za-z0-9_-]){token}"
+        rf"|(?<![A-Za-z0-9_-]){key}[.:][A-Za-z0-9_]{token}"
+    )
+    # Asked of a dotted spelling `key-aliases` gave this flag, and of any
+    # flag, aliased or not, whose spelling another alias EXTENDS (`exp` beside
+    # `exp-agents=exp.agents`): either way a longer key is known to be there.
+    # Without an alias neither is asked, so nothing changes for a run that
+    # sets none.
+    own = code_key in config.code_keys() and any(c in code_key for c in ".:")
+    longer = any(
+        extended.search(other) for other in config.code_keys() if other != code_key
+    )
+    if not (own or longer):
+        return
+    reasons: dict[str, str] = {}
+    seen: set[str] = set()
+    for directory in config.directories:
+        for path in source_files(Path(directory), _RESIDUE_SUFFIXES, _SKIP_DIRS):
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if code_key not in text:
+                continue
+            for number, line in enumerate(text.splitlines(), start=1):
+                found = extended.search(line)
+                if found is None:
+                    continue
+                reasons[str(path)] = (
+                    f"line {number} spells {found.group(0)!r}, which extends the code key "
+                    f"{code_key!r} with a '.' or ':', so a scan of the text could not tell "
+                    "the two apart. Change `key-aliases` so neither spelling extends the "
+                    "other, or add this flag to `ignore`"
+                )
+                break
+    if reasons:
+        raise UnsafeRewriteError(
+            f"the code key {code_key!r} of flag {candidate.key!r} is extended by another "
+            f"token in {len(reasons)} file(s)",
+            refused=sorted(reasons),
+            discarded=[],
+            reasons=reasons,
+        )
+
+
+#: A code spelling that is also a name in every supported language.
+_IDENTIFIER = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
 #: The :class:`~flag_cleanup.piranha_runner.TransformOutcome` fields whose
 #: rows start with a path relative to the directory their pass swept.
 _DIRECTORY_RELATIVE_FIELDS = (
@@ -1825,8 +1987,21 @@ def _run_plan(
 
     # Read before the first pass writes: a `.ts` registry's pass deletes the
     # entry a later `.tsx` pass's tests rely on. See `plan_registry_default`.
-    flag_default = plan_registry_default(plan, candidate.key)
-    reads = plan_reads(plan, candidate.key, config.accessors)
+    # Everything below searches the code, so it is handed the key as the code
+    # spells it, and the project's other keys the same way.
+    code_key = config.code_key(candidate.key)
+    known_flag_keys = frozenset(config.code_key(key) for key in known_flag_keys)
+    if code_key != candidate.key and _IDENTIFIER.match(code_key):
+        # An alias spelled as a name (`workspacesEnabled`, `DARK_MODE`) is an
+        # unquoted object key or a type member too, and as one it is far more
+        # often an ordinary property than a flag-keyed entry. The entry rules
+        # would delete `{ darkMode: false }` from any object a candidate file
+        # holds, guarded only by the name being spelled nowhere else. So no
+        # entry is removed for such a flag: each stays, listed with the
+        # files that still name it.
+        entries = False
+    flag_default = plan_registry_default(plan, code_key)
+    reads = plan_reads(plan, code_key, config.accessors)
     outcomes: list[TransformOutcome] = []
     for directory, language, files in plan:
         if not files:
@@ -1834,7 +2009,7 @@ def _run_plan(
         outcome = transform_flag(
             directory,
             language,
-            candidate.key,
+            code_key,
             candidate.treatment,
             paths=files,
             accessors=config.accessors,
@@ -1845,6 +2020,7 @@ def _run_plan(
             read_elsewhere=any(d == directory and lang != language for d, lang in reads),
             entries=entries,
             key_positions=config.key_positions,
+            code_keys=config.code_keys(),
         )
         outcomes.append(
             replace(
@@ -1898,7 +2074,7 @@ def _transform_plan(
                 candidate_files(
                     directory,
                     language,
-                    candidate.key,
+                    config.code_key(candidate.key),
                     languages=config.languages,
                     accessors=config.accessors,
                     inline_wrappers=config.inline_wrappers,

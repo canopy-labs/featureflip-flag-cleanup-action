@@ -320,6 +320,74 @@ def holds_object_literal(declarator: Node | None) -> bool:
     )
 
 
+def factory_owner(name: str) -> str:
+    """The owner of the members of the object a factory function returns:
+    ``buildFlags()`` for ``function buildFlags(...) { return { ... }; }``.
+    No class can be named so, so it never meets a class's ``TypeRef``."""
+    return f"{name}()"
+
+
+def factory_name(owner: str) -> str | None:
+    """The factory function an owner names, or ``None`` for any other owner."""
+    return owner[:-2] if owner.endswith("()") else None
+
+
+def _only_statement(body: Node | None) -> Node | None:
+    """The one statement of a block, comments aside."""
+    if body is None or body.type != "statement_block":
+        return None
+    statements = [c for c in body.named_children if c.type != "comment"]
+    return statements[0] if len(statements) == 1 else None
+
+
+def _returned(function: Node) -> Node | None:
+    """What a plain function returns when its whole body is ``return <expr>;``,
+    parentheses taken off: no ``async``, no ``*``, no type parameters."""
+    if function.type != "function_declaration" or any(c.type in ("async", "*") for c in function.children):
+        return None
+    if function.child_by_field_name("type_parameters") is not None:
+        return None
+    statement = _only_statement(function.child_by_field_name("body"))
+    if statement is None or statement.type != "return_statement":
+        return None
+    returned = [c for c in statement.named_children if c.type != "comment"]
+    if len(returned) != 1:
+        return None
+    value = returned[0]
+    while value.type == "parenthesized_expression":
+        inner = [c for c in value.named_children if c.type != "comment"]
+        if len(inner) != 1:
+            return None
+        value = inner[0]
+    return value
+
+
+def factory_object(function: Node | None) -> Node | None:
+    """The object literal a top-level factory function returns, fresh on every
+    call: ``function buildFlags(client) { return { m() { ... } }; }``.
+
+    A spread or a computed key in the literal may put any value under a
+    member's name, so such a literal is no factory's."""
+    if function is None or function.type != "function_declaration" or not top_level(function):
+        return None
+    value = _returned(function)
+    if value is None or value.type != "object":
+        return None
+    for member in value.named_children:
+        if member.type == "spread_element":
+            return None
+        key = member.child_by_field_name("key" if member.type == "pair" else "name")
+        if key is not None and key.type == "computed_property_name":
+            return None
+    return value
+
+
+def _top_function(root: Node, name: str) -> Node | None:
+    """The one top-level function declaration of ``name``."""
+    found = top_declarations(root, ("function_declaration",), name)
+    return found[0] if len(found) == 1 else None
+
+
 def top_value(root: Node, name: str) -> Node | None:
     """The one module-level ``const`` declarator of ``name``."""
     hits = []
@@ -601,6 +669,88 @@ class Files:
             return None if name is None else self._class_in(module, text(name))
         return None
 
+    def _function_named(self, name: str, file: File) -> tuple[File, Node] | None:
+        """The top-level function declaration ``name`` means in ``file``: one
+        of its own, or a named import of one that its module declares at the
+        top and exports directly."""
+        bound = file.binding(name)
+        if bound is None:
+            return None
+        parent = bound.parent
+        if parent is not None and parent.type == "function_declaration" and parent.child_by_field_name("name") == bound:
+            return (file, parent) if top_level(parent) else None
+        imported = file.import_of(name)
+        if (
+            imported is None
+            or imported.module is None
+            or imported.type_only
+            or not imported.top
+            or imported.imported in (None, "default", "=")
+            or _via_require(bound)
+        ):
+            return None
+        module = self.file(imported.module)
+        if module is None or module.binding(imported.imported) is None or not _exports_directly(module.root, imported.imported):
+            return None
+        function = _top_function(module.root, imported.imported)
+        if function is None or module.binding(imported.imported) != function.child_by_field_name("name"):
+            return None
+        return module, function
+
+    def made(self, value: Node | None, file: File) -> TypeRef | None:
+        """The objects ``F(...)`` makes, when ``F`` is a factory function
+        (:func:`factory_object`): each call returns a fresh object literal,
+        whose members are the factory's."""
+        if value is None or value.type != "call_expression":
+            return None
+        if value.child_by_field_name("type_arguments") is not None or any(c.type == "?." for c in value.children):
+            return None
+        function = value.child_by_field_name("function")
+        if function is None or function.type != "identifier":
+            return None
+        found = self._function_named(text(function), file)
+        if found is None or factory_object(found[1]) is None:
+            return None
+        module, declaration = found
+        name = declaration.child_by_field_name("name")
+        return None if name is None else TypeRef(module.path, factory_owner(text(name)))
+
+    def _held(self, module: File, name: str) -> TypeRef | None:
+        """What a top-level ``const name = F(...)`` of ``module`` holds, the
+        file's one binding of the name."""
+        declarator = top_value(module.root, name)
+        if declarator is None or module.binding(name) != declarator.child_by_field_name("name"):
+            return None
+        return self.made(declarator.child_by_field_name("value"), module)
+
+    def getter_call(self, call: Node, file: File) -> TypeRef | None:
+        """What ``g()`` returns when ``g`` is a top-level function of no
+        parameters whose whole body is ``return x;``, ``x`` being a top-level
+        ``const`` of ``g``'s own module that a factory call initialises.
+        Every call then returns that one object, and evaluating it does
+        nothing else."""
+        if call.type != "call_expression" or call.child_by_field_name("type_arguments") is not None:
+            return None
+        if any(c.type == "?." for c in call.children):
+            return None
+        arguments = call.child_by_field_name("arguments")
+        if arguments is None or arguments.type != "arguments" or any(c.type != "comment" for c in arguments.named_children):
+            return None
+        function = call.child_by_field_name("function")
+        if function is None or function.type != "identifier":
+            return None
+        found = self._function_named(text(function), file)
+        if found is None:
+            return None
+        module, getter = found
+        parameters = getter.child_by_field_name("parameters")
+        if parameters is None or any(c.type != "comment" for c in parameters.named_children):
+            return None
+        returned = _returned(getter)
+        if returned is None or returned.type != "identifier":
+            return None
+        return self._held(module, text(returned))
+
     def _exported(self, module: File, name: str) -> TypeRef | None:
         """``name`` at the top of ``module``: the class itself, the object a
         ``const name = { ... }`` holds, or the instance a ``const name = new
@@ -614,6 +764,9 @@ class Files:
             return None
         if holds_object_literal(declarator):
             return TypeRef(module.path, name, static=True)
+        held = self._held(module, name)
+        if held is not None:
+            return held
         made = self.constructed(declarator.child_by_field_name("value"), module)
         written = declarator.child_by_field_name("type")
         if written is not None and self.annotated(written, module) != made:
@@ -633,6 +786,13 @@ class Files:
         if parent.type == "variable_declarator" and parent.child_by_field_name("name") == bound:
             if holds_object_literal(parent):
                 return TypeRef(file.path, name, static=True)
+            declaration = parent.parent
+            if declaration is not None and declaration.type == "lexical_declaration" and any(
+                c.type == "const" for c in declaration.children
+            ):
+                held = self.made(parent.child_by_field_name("value"), file)
+                if held is not None:
+                    return held
             made = self.constructed(parent.child_by_field_name("value"), file)
             written = parent.child_by_field_name("type")
             if written is None:
@@ -679,6 +839,8 @@ class Files:
             return self._this_class(node, file)
         if node.type == "identifier":
             return self._identifier_type(node, file)
+        if node.type == "call_expression":
+            return self.getter_call(node, file)
         if node.type != "member_expression" or node.child_by_field_name("optional_chain") is not None:
             return None
         obj = node.child_by_field_name("object")

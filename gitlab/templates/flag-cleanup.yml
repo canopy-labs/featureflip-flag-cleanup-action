@@ -51,6 +51,9 @@ spec:
     test-setters:
       default: ''
       description: The Action's `test-setters` input; see README.md.
+    key-aliases:
+      default: ''
+      description: The Action's `key-aliases` input; see README.md.
     directories:
       default: '.'
       description: Directories to scan (comma-separated), relative to the checkout.
@@ -93,6 +96,7 @@ featureflip-flag-cleanup:
     FEATUREFLIP_SIDE_EFFECT_FREE_MODULES: $[[ inputs.side-effect-free-modules ]]
     FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: $[[ inputs.side-effect-free-calls ]]
     FEATUREFLIP_TEST_SETTERS: $[[ inputs.test-setters ]]
+    FEATUREFLIP_KEY_ALIASES: $[[ inputs.key-aliases ]]
     FEATUREFLIP_DIRECTORIES: $[[ inputs.directories ]]
     FEATUREFLIP_IGNORE: $[[ inputs.ignore ]]
     FEATUREFLIP_FLAGS: $[[ inputs.flags ]]

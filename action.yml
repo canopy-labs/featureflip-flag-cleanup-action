@@ -137,8 +137,8 @@ inputs:
       below except `api-url` is ignored. `pr-command` reads a NARROWER set of
       `remove`'s inputs — the complete list is in the README's "Re-run a
       removal from a comment" section, and the short version is: `api-token`,
-      `org`, `project`, `api-url`, `directories`, `languages`, `accessors` and
-      `ignore` all apply and must match the workflow that opened the pull
+      `org`, `project`, `api-url`, `directories`, `languages`, `accessors`,
+      `key-aliases` and `ignore` all apply and must match the workflow that opened the pull
       request, or a re-run regenerates a different diff than the one already
       proposed. `staleness` is NOT on that list: this command looks the flag
       up by the key its branch already encodes and checks both tiers
@@ -285,6 +285,25 @@ inputs:
       rules as `accessors`. Empty (the default) changes nothing.
     required: false
     default: ''
+  key-aliases:
+    description: >-
+      For code whose flag keys are spelled differently from the keys in
+      Featureflip, typically after moving from another vendor or an in-house
+      system: `featureflip-key=code-key` entries, one per line or
+      comma-separated, such as `experimental-agents=experimental.agents`. The
+      removal of `experimental-agents` then searches your code for
+      `experimental.agents`. The left side must be a Featureflip key; the right
+      side may hold letters (either case), digits, `_`, `-`, `.` and `:`, and
+      must start and end with a letter, digit or `_`. A malformed entry, a key
+      listed twice, two keys given one spelling, or a spelling that is another
+      listed key fails the run immediately (exit 2). Everything about the flag
+      itself keeps the Featureflip key: the branch name, the check for an
+      existing pull request, `flags` and `ignore`, and the archive modes. A
+      flag whose spelling another token in your code extends
+      (`experimental.agents.beta` beside `experimental.agents`) is refused
+      rather than guessed at. Empty (the default) changes nothing.
+    required: false
+    default: ''
   languages:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
@@ -425,6 +444,7 @@ runs:
     FEATUREFLIP_SIDE_EFFECT_FREE_MODULES: ${{ inputs.side-effect-free-modules }}
     FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: ${{ inputs.side-effect-free-calls }}
     FEATUREFLIP_TEST_SETTERS: ${{ inputs.test-setters }}
+    FEATUREFLIP_KEY_ALIASES: ${{ inputs.key-aliases }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
     FEATUREFLIP_FLAGS: ${{ inputs.flags }}

@@ -521,3 +521,40 @@ not_contains = ["""(
   (call_expression arguments: (arguments . (identifier) @first_arg)) @surviving_read
   (#eq? @first_arg "@variable_name")
 )"""]
+
+# --- delete a now-unread key HOLDER: `const NAME = new C("key", …)` ---------
+# The key held in a constructed object that other files hand to a configured
+# accessor (`useFeature(featureX)`). Those readers are `ts_xconst.toml`'s,
+# cloned per proven read; this rule only deletes the declaration once they
+# have folded. Top-level only, exactly the shape `key_const._ts_holders`
+# recognises, so it never meets a holder the gate did not judge: the gate
+# proves the class keeps the key unmodified and that nothing in this file but
+# the declaration names it (`key_const._ts_withholds`), and the cross-file
+# pass that every mention elsewhere is a read it folds. The guard is the
+# sequencing one the key-const delete above carries.
+[[rules]]
+name = "delete_flag_key_holder_declaration"
+query = """(
+  (program
+    [(lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @variable_name
+           value: (new_expression
+             arguments: (arguments . (string . (string_fragment) @flag_name .)))) .) @declaration
+     (export_statement declaration: (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @variable_name
+           value: (new_expression
+             arguments: (arguments . (string . (string_fragment) @flag_name .)))) .)) @declaration])
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "declaration"
+replace = ""
+holes = ["stale_flag_name"]
+
+[[rules.filters]]
+enclosing_node = """([(program)] @container)"""
+not_contains = ["""(
+  (call_expression arguments: (arguments . (identifier) @first_arg)) @surviving_read
+  (#eq? @first_arg "@variable_name")
+)"""]

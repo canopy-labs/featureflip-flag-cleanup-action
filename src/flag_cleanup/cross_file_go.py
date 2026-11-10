@@ -99,6 +99,21 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
     ]
 
 
+def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
+    """Why a typed flag handle declared here is kept: its constructor is not
+    proven to carry the key (:mod:`flag_cleanup.go_handles`), or its own file
+    mentions it. The in-file gate withholds such a file without a word, so
+    this is what names the reason, at the declaration or the mention."""
+    root = _parse(source)
+    if root.has_error:
+        return []
+    data = source.encode("utf-8")
+    consts = key_const._go_key_consts(root, data, flag_key)
+    with key_const.go_file(path):
+        found = key_const.go_handle_findings(root, data, consts)
+    return [xk.refusal(path, node, reason, source) for node, reason in found]
+
+
 def declared_names(path: str, source: str) -> set[xk.QualifiedName]:
     """Every package-level name the file declares, whatever it holds: a
     ``const``, ``var``, type or function. A second declaration of the key's
@@ -480,6 +495,7 @@ xk.register(
         language_family=frozenset({"go"}),
         declarations=declarations,
         references=references,
+        entry_findings=entry_findings,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
         # `go vet` resolves an example's name to a package-level name.

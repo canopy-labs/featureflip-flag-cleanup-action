@@ -919,9 +919,11 @@ _GO_FILE: ContextVar[str | None] = ContextVar("go_key_const_file", default=None)
 
 @contextlib.contextmanager
 def go_file(path: str | None) -> Iterator[None]:
-    """The Go file the next gate question is about. A handle's constructor is
-    proven from the repository around the file, so a question asked without
-    one cannot prove it and withholds the file (see :func:`_go_withholds`)."""
+    """The file the next gate question is about. A Go handle's constructor,
+    and a TypeScript or JavaScript holder's class, is proven from the
+    repository around the file, so a question asked without one cannot prove
+    it and withholds the file (see :func:`_go_withholds`,
+    :func:`_ts_withholds`)."""
     token = _GO_FILE.set(None if path is None else str(path))
     try:
         yield
@@ -938,113 +940,6 @@ def _go_holder_call(const: KeyConst) -> Node | None:
             value = spec.child_by_field_name("value")
             return value.named_children[0] if value is not None and value.named_children else None
     return None
-
-
-def _go_param_carried(constructor: Node) -> bool:
-    """Whether a constructor's body is one ``return T{…}`` or ``return &T{…}``
-    holding its first parameter, a ``string``, unmodified as a field value."""
-    if constructor.child_by_field_name("type_parameters") is not None:
-        return False
-    parameters = constructor.child_by_field_name("parameters")
-    body = constructor.child_by_field_name("body")
-    if parameters is None or body is None:
-        return False
-    first = next(iter(parameters.named_children), None)
-    if first is None or first.type != "parameter_declaration":
-        return False
-    names = first.children_by_field_name("name")
-    kind = first.child_by_field_name("type")
-    if not names or kind is None or kind.text != b"string":
-        return False
-    parameter = names[0].text
-    listed = next((c for c in body.named_children if c.type == "statement_list"), None)
-    statements = [c for c in (listed.named_children if listed is not None else []) if c.type != "comment"]
-    if len(statements) != 1 or statements[0].type != "return_statement":
-        return False
-    results = statements[0].named_children
-    if len(results) != 1:
-        return False
-    expression = results[0]
-    if expression.type == "expression_list":
-        if len(expression.named_children) != 1:
-            return False
-        expression = expression.named_children[0]
-    if expression.type == "unary_expression":
-        if not expression.children or expression.children[0].type != "&":
-            return False
-        expression = expression.child_by_field_name("operand")
-    if expression is None or expression.type != "composite_literal":
-        return False
-    if expression.child_by_field_name("type").type not in ("type_identifier", "qualified_type"):
-        return False
-    literal = expression.child_by_field_name("body")
-    if literal is None:
-        return False
-    carried = False
-    for element in literal.named_children:
-        value = element
-        if element.type == "keyed_element":
-            value = element.child_by_field_name("value") or element
-        elif element.type == "literal_element":
-            value = element
-        # `literal_element` wraps the value in some grammar versions.
-        while value.type in ("literal_element", "literal_value") and len(value.named_children) == 1:
-            value = value.named_children[0]
-        if value.type == "identifier" and value.text == parameter:
-            carried = True
-        elif any(n.type == "identifier" and n.text == parameter for n in _walk(value)):
-            # Another field holds something derived from it.
-            return False
-    return carried
-
-
-def go_constructor_proven(call: Node, path: str | None) -> bool:
-    """Whether the ``Ctor`` of a handle's ``Ctor("key", …)`` is declared in the
-    repository as a function that stores its first argument unmodified in what
-    it returns (:func:`_go_param_carried`). ``Ctor`` is ``name`` of the file's
-    own package or ``pkg.Name`` through an import of the same module; any other
-    callee (the standard library, a dependency) is not proven."""
-    if path is None:
-        return False
-    from pathlib import Path
-
-    from flag_cleanup import go_scope
-
-    function = call.child_by_field_name("function")
-    if function is None:
-        return False
-    from flag_cleanup import source_index
-
-    packages = go_scope.Packages(Path(source_index.checkout_root(str(Path(path).resolve().parent))))
-    here = Path(path).resolve()
-    file = packages.file(here)
-    if file is None or file.clause is None:
-        return False
-    if function.type == "identifier":
-        name = function.text
-        directory, clause = here.parent, file.clause
-    elif function.type == "selector_expression":
-        operand = function.child_by_field_name("operand")
-        field = function.child_by_field_name("field")
-        if operand is None or field is None or operand.type != "identifier":
-            return False
-        if go_scope.local_binders(function, operand.text.decode()):
-            return False
-        imported = packages.imported(file, operand.text.decode())
-        if imported is None:
-            return False
-        name, directory, clause = field.text, imported.directory, imported.clause
-    else:
-        return False
-    found = [
-        declaration
-        for member in packages.package(directory, clause)
-        for declaration in member.root.named_children
-        if declaration.type == "function_declaration"
-        and declaration.child_by_field_name("name") is not None
-        and declaration.child_by_field_name("name").text == name
-    ]
-    return len(found) == 1 and _go_param_carried(found[0])
 
 
 def go_group_is_positional(declaration: Node, source_bytes: bytes) -> bool:
@@ -1086,23 +981,46 @@ def _go_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bo
         go_group_is_positional(const.declaration, source_bytes) for const in consts
     ):
         return True
-    # A `var` handle is folded only where another file reads it, and the
-    # reader rules know no in-file read of one: any other mention here (a
-    # registry listing it, a read, an assignment, `&NAME`) keeps the file.
+    return bool(go_handle_findings(root, source_bytes, consts))
+
+
+def go_handle_findings(
+    root: Node, source_bytes: bytes, consts: list[KeyConst]
+) -> list[tuple[Node, str]]:
+    """Why each ``var`` handle among ``consts`` keeps its file:
+    ``(node, reason)`` at the handle's name when its constructor is not proven
+    (a :mod:`flag_cleanup.go_handles` reason), or at a mention of it in its own
+    file (``not-a-read``). A handle is folded only where another file reads
+    it, and the reader rules know no in-file read of one: any other mention
+    here (a registry listing it, a read, an assignment, ``&NAME``) keeps the
+    file. The file asked about is :func:`go_file`'s."""
+    from flag_cleanup import cross_file_keys, go_handles
+
+    found: list[tuple[Node, str]] = []
     for const in consts:
         if not go_is_var_holder(const):
             continue
         call = _go_holder_call(const)
-        if call is None or not go_constructor_proven(call, _GO_FILE.get()):
+        if call is None:
+            found.append((const.name_nodes[0], go_handles.UNRESOLVED))
+            continue
+        refusal = go_handles.verdict(call, _GO_FILE.get()).refusal
+        if refusal is not None:
             # Not proven to carry the key: no holder, the file is kept.
-            return True
+            found.append((const.name_nodes[0], refusal))
+            continue
         declared = {n.id for n in const.name_nodes}
-        if any(
-            n.type == "identifier" and n.id not in declared and _text(n, source_bytes) == const.name
-            for n in _walk(root)
-        ):
-            return True
-    return False
+        mention = next(
+            (
+                n
+                for n in _walk(root)
+                if n.type == "identifier" and n.id not in declared and _text(n, source_bytes) == const.name
+            ),
+            None,
+        )
+        if mention is not None:
+            found.append((mention, cross_file_keys.NOT_A_READ))
+    return found
 
 
 def _go_is_binding(node: Node) -> bool:
@@ -1345,7 +1263,523 @@ def _ts_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyCo
                 name_nodes=(name,),
             )
         )
+    found.extend(_ts_holders(root, source_bytes, flag_key))
     return found
+
+
+def _ts_holder_value(declaration: Node) -> Node | None:
+    """The ``new C("key", …)`` a top-level single-declarator ``const``
+    (exported or not) is initialised with, or ``None``."""
+    declarators = [c for c in declaration.named_children if c.type == "variable_declarator"]
+    if len(declarators) != 1:
+        return None
+    value = declarators[0].child_by_field_name("value")
+    return value if value is not None and value.type == "new_expression" else None
+
+
+def _ts_holders(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
+    """Every top-level ``const NAME = new C("flag-key", …)``, exported or not:
+    the key held in a constructed object that other files hand to a
+    configured accessor (``useFeature(featureX)``).
+
+    Recognised by syntax alone, exactly the shape the holder delete rule in
+    ``ts_const.toml`` matches (the key the first argument, a plain string with
+    nothing but its text), so that rule never meets a holder this gate did
+    not judge. Whether it IS a holder -- the class proven to keep the key
+    unmodified, nothing else mentioning it here -- is :func:`_ts_withholds`'.
+    """
+    found: list[KeyConst] = []
+    for statement in root.named_children:
+        declaration = statement
+        if statement.type == "export_statement":
+            declaration = statement.child_by_field_name("declaration")
+        if declaration is None or declaration.type != "lexical_declaration":
+            continue
+        if not any(c.type == "const" for c in declaration.children):
+            continue
+        value = _ts_holder_value(declaration)
+        if value is None:
+            continue
+        arguments = value.child_by_field_name("arguments")
+        listed = arguments.named_children if arguments is not None else []
+        first = listed[0] if listed else None
+        if first is None or first.type != "string" or len(first.named_children) != 1:
+            continue
+        fragment = first.named_children[0]
+        if fragment.type != "string_fragment" or _text(fragment, source_bytes) != flag_key:
+            continue
+        name = declaration.named_children[0].child_by_field_name("name")
+        if name is None or name.type != "identifier":
+            continue
+        found.append(KeyConst(name=_text(name, source_bytes), declaration=declaration, name_nodes=(name,)))
+    return found
+
+
+def ts_is_holder(const: KeyConst) -> bool:
+    """Whether ``const`` is a constructed holder rather than a string constant."""
+    return _ts_holder_value(const.declaration) is not None
+
+
+#: Values whose evaluation does nothing: deleting a holder deletes them.
+_TS_INERT_LEAVES = frozenset(
+    {"string", "number", "true", "false", "null", "undefined", "identifier", "this", "regex"}
+)
+_TS_INERT_WRAPPERS = frozenset(
+    {"as_expression", "satisfies_expression", "non_null_expression", "parenthesized_expression"}
+)
+
+
+def _ts_inert(node: Node) -> bool:
+    """A literal, a name, a member read, or an object, array or ``as`` of them."""
+    kind = node.type
+    if kind == "comment" or kind in _TS_INERT_LEAVES:
+        return True
+    if kind == "template_string":
+        return not any(c.type == "template_substitution" for c in node.named_children)
+    if kind == "member_expression":
+        obj = node.child_by_field_name("object")
+        return obj is not None and _ts_inert(obj)
+    if kind == "unary_expression":
+        operator = node.child_by_field_name("operator")
+        argument = node.child_by_field_name("argument")
+        return (
+            operator is not None
+            and operator.type in ("!", "-", "+")
+            and argument is not None
+            and _ts_inert(argument)
+        )
+    if kind in _TS_INERT_WRAPPERS:
+        values = [c for c in node.named_children if c.type != "comment"]
+        return bool(values) and _ts_inert(values[0])
+    if kind == "array":
+        return all(_ts_inert(c) for c in node.named_children)
+    if kind == "object":
+        for prop in node.named_children:
+            if prop.type == "comment":
+                continue
+            if prop.type != "pair":
+                return False
+            key = prop.child_by_field_name("key")
+            value = prop.child_by_field_name("value")
+            if key is None or key.type not in ("property_identifier", "string", "number"):
+                return False
+            if value is None or not _ts_inert(value):
+                return False
+        return True
+    return False
+
+
+def _ts_class_name_binders(root: Node, name: str) -> list[Node]:
+    """Every binding of ``name`` in the file; a re-export names, never binds."""
+    return [
+        n
+        for n in ts_syntax.binding_nodes(root)
+        if n.text.decode("utf-8") == name and (n.parent is None or n.parent.type != "export_specifier")
+    ]
+
+
+def _ts_top_level_class(binder: Node) -> Node | None:
+    """The top-level class ``binder`` names (``class C``, ``export class C``)."""
+    node = binder.parent
+    if node is None or node.type != "class_declaration" or binder.type != "type_identifier":
+        return None
+    parent = node.parent
+    if parent is not None and parent.type == "export_statement":
+        parent = parent.parent
+    return node if parent is not None and parent.type == "program" else None
+
+
+def _ts_imported_class(binder: Node, path: str) -> Node | None:
+    """The exported top-level class an ``import { C } from "./m"`` of a file in
+    the repository binds, or ``None``: an alias, a type-only or default
+    import, a package and anything the compiler could read differently
+    (:func:`flag_cleanup.cross_file_ts.resolve_specifier`) is not followed."""
+    imported = _ts_imported(binder, path)
+    if imported is None:
+        return None
+    other, _target = imported
+    name = binder.text.decode("utf-8")
+    binders = _ts_class_name_binders(other, name)
+    if len(binders) != 1:
+        return None
+    found = _ts_top_level_class(binders[0])
+    if found is None or found.parent is None or found.parent.type != "export_statement":
+        return None
+    return found
+
+
+def _ts_imported(binder: Node, path: str) -> tuple[Node, str] | None:
+    """The parsed file, and its path, an unaliased value ``import { N }`` of
+    a file in the repository reads ``N`` from; ``None`` otherwise."""
+    from pathlib import Path
+
+    from flag_cleanup import cross_file_ts
+
+    specifier = binder.parent
+    if specifier is None or specifier.type != "import_specifier" or specifier.child_by_field_name("alias"):
+        return None
+    if any(c.type in ("type", "typeof") for c in specifier.children):
+        return None
+    statement = specifier
+    while statement is not None and statement.type != "import_statement":
+        statement = statement.parent
+    if statement is None or statement.parent is None or statement.parent.type != "program":
+        return None
+    if any(c.type in ("type", "typeof") for c in statement.children):
+        return None
+    source = statement.child_by_field_name("source")
+    fragment = source.named_children[0] if source is not None and len(source.named_children) == 1 else None
+    if fragment is None or fragment.type != "string_fragment":
+        return None
+    target = cross_file_ts.resolve_specifier(path, fragment.text.decode("utf-8"), str(Path(path).parent))
+    if target is None:
+        return None
+    try:
+        text = Path(target).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    other = ts_syntax._parse(text, cross_file_ts._language(target))
+    if other.has_error:
+        return None
+    return other, target
+
+
+def _ts_this_field(target: Node | None) -> str | None:
+    """``F`` of ``this.F``, or ``None``."""
+    if target is None or target.type != "member_expression":
+        return None
+    obj = target.child_by_field_name("object")
+    prop = target.child_by_field_name("property")
+    if obj is None or obj.type != "this" or prop is None or prop.type != "property_identifier":
+        return None
+    return prop.text.decode("utf-8")
+
+
+def _ts_parameter_property(param: Node) -> bool:
+    """``public id: string`` / ``readonly id``: a parameter that is a field."""
+    return any(c.type in ("accessibility_modifier", "readonly", "override_modifier") for c in param.children)
+
+
+def _ts_class_keeps_first_argument(cls: Node) -> bool:
+    """Whether constructing ``cls`` does nothing but store its arguments, the
+    first one unmodified in a field nothing else in the class writes.
+
+    No superclass and no decorator (either can replace the constructor); one
+    ``constructor``, whose parameters are plain names with literal defaults at
+    most, the first one required and, if typed, a ``string``; a body of
+    ``this.F = <parameter>;`` statements only; instance fields initialised
+    with literals at most; the first parameter stored either as a parameter
+    property (``public readonly id: string``) or by ``this.F = id``, and the
+    field it lands in written nowhere else and not shadowed by an accessor or
+    method of its name. Construction is then side-effect free, so deleting a
+    holder deletes nothing but the value, and the value names the key. Every
+    ``this`` in the class is the object of a plain ``this.F``, and the key's
+    field is written only by the constructor's own assignment."""
+    if any(c.type == "decorator" for c in cls.children):
+        return False
+    heritage = next((c for c in cls.named_children if c.type == "class_heritage"), None)
+    if heritage is not None and any(c.type != "implements_clause" for c in heritage.named_children):
+        return False
+    body = cls.child_by_field_name("body")
+    if body is None:
+        return False
+    constructors: list[Node] = []
+    members: list[Node] = []
+    for member in body.named_children:
+        if member.type == "comment" or member.type == "method_signature":
+            continue
+        if any(c.type == "decorator" for c in member.children):
+            return False
+        name = member.child_by_field_name("name")
+        if member.type == "method_definition" and name is not None and name.text == b"constructor":
+            constructors.append(member)
+            continue
+        if member.type == "class_static_block":
+            return False
+        if member.type == "public_field_definition":
+            static = any(c.type == "static" for c in member.children)
+            value = member.child_by_field_name("value")
+            if not static and value is not None and not _ts_inert(value):
+                return False
+        members.append(member)
+    if len(constructors) != 1:
+        return False
+    constructor = constructors[0]
+    stored: set[int] = set()
+    parameters = constructor.child_by_field_name("parameters")
+    block = constructor.child_by_field_name("body")
+    if parameters is None or block is None:
+        return False
+    params = [p for p in parameters.named_children if p.type != "comment"]
+    names: list[str] = []
+    for index, param in enumerate(params):
+        if param.type not in ("required_parameter", "optional_parameter"):
+            return False
+        if any(c.type == "decorator" for c in param.children):
+            return False
+        pattern = param.child_by_field_name("pattern")
+        if pattern is None or pattern.type != "identifier":
+            return False
+        default = param.child_by_field_name("value")
+        if default is not None and not _ts_inert(default):
+            return False
+        if index == 0:
+            if param.type != "required_parameter" or default is not None:
+                return False
+            annotation = param.child_by_field_name("type")
+            if annotation is not None and annotation.text.decode("utf-8").lstrip(":").strip() != "string":
+                return False
+        names.append(pattern.text.decode("utf-8"))
+    if not names:
+        return False
+    fields: set[str] = {names[0]} if _ts_parameter_property(params[0]) else set()
+    assigned: list[str] = []
+    others: set[str] = {n for p, n in zip(params[1:], names[1:]) if _ts_parameter_property(p)}
+    for statement in block.named_children:
+        if statement.type == "comment":
+            continue
+        expression = statement.named_children[0] if statement.type == "expression_statement" else None
+        if expression is None or expression.type != "assignment_expression":
+            return False
+        left = expression.child_by_field_name("left")
+        field = _ts_this_field(left)
+        right = expression.child_by_field_name("right")
+        if field is None or right is None or right.type != "identifier":
+            return False
+        stored.add(left.id)
+        if right.text.decode("utf-8") not in names:
+            return False
+        assigned.append(field)
+        (fields if right.text.decode("utf-8") == names[0] else others).add(field)
+    # Each field written once, and the key's never from another parameter.
+    if not fields or len(assigned) != len(set(assigned)) or fields & others:
+        return False
+    # No accessor or method of the key field's name stands in for it.
+    for member in members:
+        name = member.child_by_field_name("name")
+        if member.type != "public_field_definition" and name is not None and name.text.decode("utf-8") in fields:
+            return False
+    # Every `this` in the class is the object of a plain `this.F`, and the
+    # key's field is written by the constructor's own assignment alone:
+    # `this["id"]`, `(this as any).id`, `const self = this`,
+    # `Object.assign(this, …)` and `delete this.id` can each change it unseen.
+    for node in _walk(body):
+        if node.type != "this":
+            continue
+        member = node.parent
+        obj = member.child_by_field_name("object") if member is not None else None
+        if member is None or member.type != "member_expression" or obj is None or obj.id != node.id:
+            return False
+        prop = member.child_by_field_name("property")
+        if prop is None or prop.type != "property_identifier":
+            return False
+        if member.id not in stored and _ts_written(member) and prop.text.decode("utf-8") in fields:
+            return False
+    return True
+
+
+#: Where a member expression is assigned to as part of a pattern.
+_TS_PATTERNS = frozenset({"array_pattern", "object_pattern", "pair_pattern", "assignment_pattern", "rest_pattern"})
+
+
+def _ts_written(member: Node) -> bool:
+    """Whether ``member`` is assigned, updated, deleted or destructured into."""
+    parent = member.parent
+    if parent is None:
+        return False
+    if parent.type in ("assignment_expression", "augmented_assignment_expression", "for_in_statement"):
+        left = parent.child_by_field_name("left")
+        return left is not None and left.id == member.id
+    if parent.type == "update_expression":
+        return True
+    if parent.type == "unary_expression" and parent.children and parent.children[0].type == "delete":
+        return True
+    return parent.type in _TS_PATTERNS
+
+
+def _ts_holder_proven(root: Node, value: Node, path: str | None) -> bool:
+    """Whether ``value``, a holder's ``new C("key", …)``, names the key.
+
+    ``C`` is a plain name bound exactly once in the file, by a top-level class
+    or by a named import of one exported from a file of the repository, and
+    that class keeps its first argument (:func:`_ts_class_keeps_first_argument`).
+    Every other argument is inert, since deleting the holder deletes their
+    evaluation. The holder is typed boolean: its type argument, if any, is
+    exactly ``<boolean>``, and otherwise its second argument is proven a
+    boolean (:func:`_ts_boolean`). No file of the checkout may reach the
+    class's prototype (:func:`_ts_prototype_reached`).
+    """
+    if path is None:
+        return False
+    constructor = value.child_by_field_name("constructor")
+    arguments = value.child_by_field_name("arguments")
+    if constructor is None or constructor.type != "identifier" or arguments is None:
+        return False
+    rest = [c for c in arguments.named_children if c.type != "comment"][1:]
+    if not all(_ts_inert(a) for a in rest):
+        return False
+    type_arguments = value.child_by_field_name("type_arguments")
+    if type_arguments is not None:
+        listed = [c for c in type_arguments.named_children if c.type != "comment"]
+        if len(listed) != 1 or listed[0].text != b"boolean":
+            return False
+    elif not rest or not _ts_boolean(rest[0], root, path, 0):
+        # No default and no type argument says nothing about the value's type.
+        return False
+    binders = _ts_class_name_binders(root, constructor.text.decode("utf-8"))
+    if len(binders) != 1:
+        return False
+    cls = _ts_top_level_class(binders[0]) or _ts_imported_class(binders[0], path)
+    if cls is None or not _ts_class_keeps_first_argument(cls):
+        return False
+    name = cls.child_by_field_name("name")
+    return name is not None and not _ts_prototype_reached(name.text.decode("utf-8"), path)
+
+
+#: Operators whose result is a boolean whatever their operands are.
+_TS_BOOLEAN_OPERATORS = frozenset({"===", "!==", "==", "!=", "<", ">", "<=", ">=", "instanceof", "in"})
+
+
+def _ts_boolean(node: Node, root: Node, path: str, depth: int) -> bool:
+    """Whether ``node`` is a boolean: ``true``/``false``, ``!x``, a
+    comparison, or a name bound once, by a top-level ``const`` of the file or
+    an unaliased named import of one from a file of the repository, to one of
+    those (``isDevelopment``)."""
+    while node.type in ("parenthesized_expression", "non_null_expression", "satisfies_expression"):
+        inner = [c for c in node.named_children if c.type != "comment"]
+        if not inner:
+            return False
+        node = inner[0]
+    if node.type in ("true", "false"):
+        return True
+    if node.type == "as_expression":
+        listed = [c for c in node.named_children if c.type != "comment"]
+        return len(listed) == 2 and listed[1].text == b"boolean" and _ts_boolean(listed[0], root, path, depth)
+    if node.type == "unary_expression":
+        operator = node.child_by_field_name("operator")
+        return operator is not None and operator.type == "!"
+    if node.type == "binary_expression":
+        operator = node.child_by_field_name("operator")
+        return operator is not None and operator.type in _TS_BOOLEAN_OPERATORS
+    if node.type != "identifier" or depth > 3:
+        return False
+    name = node.text.decode("utf-8")
+    binders = _ts_class_name_binders(root, name)
+    if len(binders) != 1:
+        return False
+    binder = binders[0]
+    declarator = binder.parent
+    if declarator is not None and declarator.type == "variable_declarator":
+        declaration = declarator.parent
+        top = declaration.parent if declaration is not None else None
+        if top is not None and top.type == "export_statement":
+            top = top.parent
+        value = declarator.child_by_field_name("value")
+        if (
+            top is None
+            or top.type != "program"
+            or declaration.type != "lexical_declaration"
+            or not any(c.type == "const" for c in declaration.children)
+            or value is None
+        ):
+            return False
+        return _ts_boolean(value, root, path, depth + 1)
+    imported = _ts_imported(binder, path)
+    if imported is None:
+        return False
+    other, other_path = imported
+    found = _ts_class_name_binders(other, name)
+    if len(found) != 1 or found[0].parent is None or found[0].parent.type != "variable_declarator":
+        return False
+    declaration = found[0].parent.parent
+    value = found[0].parent.child_by_field_name("value")
+    if (
+        declaration is None
+        or declaration.parent is None
+        or declaration.parent.type != "export_statement"
+        or not any(c.type == "const" for c in declaration.children)
+        or value is None
+    ):
+        return False
+    return _ts_boolean(value, other, other_path, depth + 1)
+
+
+#: Whatever reaches a class's prototype: a patch there changes every holder.
+_TS_PROTOTYPE = re.compile(r"\bprototype\b|\b(?:defineProperty|defineProperties|setPrototypeOf)\b")
+
+
+def _ts_prototype_reached(name: str, path: str) -> bool:
+    """Whether any TypeScript or JavaScript file of the checkout spells both
+    the class's name and its prototype (``Feature.prototype``,
+    ``Object.defineProperty(Feature…)``, ``setPrototypeOf``): such a file can
+    change what every instance reads. Text, not syntax, on purpose: an alias
+    (``import { Feature as F }``) still spells the name in its import."""
+    from pathlib import Path
+
+    from flag_cleanup import source_index
+
+    try:
+        root = source_index.checkout_root(str(Path(path).parent))
+    except Exception:  # noqa: BLE001 - outside a checkout nothing is proven
+        return True
+    memo = source_index.run_memo("ts_prototype_reached")
+    if memo is not None and (root, name) in memo:
+        return memo[(root, name)]
+    spelled = re.compile(rf"(?<![\w$]){re.escape(name)}(?![\w$])")
+    found = False
+    for listed in source_index.files(root, (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")):
+        try:
+            text = Path(listed.resolved).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _TS_PROTOTYPE.search(text) and spelled.search(text):
+            found = True
+            break
+    if memo is not None:
+        # The run only removes code, so a patch never appears mid-run.
+        memo[(root, name)] = found
+    return found
+
+
+#: The directive that is an error of its own once nothing below it fails.
+#: Others (`@ts-ignore`, `eslint-disable-next-line`) are left above whatever
+#: follows, as they are for a string constant.
+_TS_DIRECTIVE = re.compile(rb"^(//|/\*+)\s*@ts-expect-error\b")
+
+
+def _ts_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bool:
+    """A holder is folded only where another file reads it, and only once its
+    class is proven (:func:`_ts_holder_proven`): any mention of it in its own
+    file but the declaration -- a read, a registry, ``export { NAME }``,
+    ``typeof NAME`` -- or a class that cannot be proven keeps the file."""
+    holders = [c for c in consts if ts_is_holder(c)]
+    if not holders:
+        return False
+    path = _GO_FILE.get()
+    for const in holders:
+        if not _ts_holder_proven(root, _ts_holder_value(const.declaration), path):
+            return True
+        statement = const.declaration
+        if statement.parent is not None and statement.parent.type == "export_statement":
+            statement = statement.parent
+        # TypeScript applies a directive to the next line of code, past blank
+        # lines and other comments: deleting the holder would hand one above
+        # it to the next statement, and an unused `@ts-expect-error` is an
+        # error of its own.
+        above = statement.prev_sibling
+        while above is not None and above.type == "comment":
+            if _TS_DIRECTIVE.match(above.text):
+                return True
+            above = above.prev_sibling
+        declared = {n.id for n in const.name_nodes}
+        for node in _walk(root):
+            if (
+                node.type in ("identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern")
+                and node.id not in declared
+                and _text(node, source_bytes) == const.name
+            ):
+                return True
+    return False
 
 
 def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
@@ -2585,6 +3019,7 @@ _PROFILES.update(
                 # second copy of its field rules — see `binding_nodes` there.
                 binding_ids=lambda root: {n.id for n in ts_syntax.binding_nodes(root)},
                 is_removable_read=_ts_is_removable_read,
+                withholds=_ts_withholds,
             )
             for language in ("ts", "tsx", "js")
         },

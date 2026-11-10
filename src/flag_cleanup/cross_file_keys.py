@@ -108,6 +108,10 @@ class KeyDeclaration:
     #: ``vendor/``). Its reads still fold, but the pull request never lists it
     #: as safe to delete: it is not the reviewer's code.
     third_party: bool = False
+    #: A constant holding the key in a constructed object rather than as its
+    #: value (TypeScript's ``new Feature("key", false)``): only a configured
+    #: accessor reads it, never an SDK call, which takes the key itself.
+    holder: bool = False
 
     @property
     def entry(self) -> str:
@@ -1139,6 +1143,16 @@ def resolve(
         blocked |= voided_by
     else:
         kept_reads_fold = frozenset()
+    holders = [d for d in unique if d.holder and d.kind == CONSTANT and d.path in (blocked | duplicated)]
+    if holders:
+        # A holder is an object, which any file naming it may change
+        # (`Object.assign(featureX, …)`), so whatever keeps one -- a mention
+        # that is not a read, the module handed on whole -- keeps every read
+        # of it too, as a declaration does under `readers_need_deletable`.
+        readers, refusals, voided_by = _void_readers_of_kept(
+            readers, refusals, {d.path for d in holders}, holders, lambda path: sources.get(path)
+        )
+        blocked |= voided_by
     return Resolution(
         readers,
         tuple(refusals),

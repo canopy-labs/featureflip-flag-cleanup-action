@@ -207,10 +207,18 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
     if root.has_error:
         return []  # an export hidden in the broken part could rename it
     found: list[xk.KeyDeclaration] = []
-    for const in key_const.key_consts(root, source.encode("utf-8"), language, flag_key):
+    data = source.encode("utf-8")
+    consts = key_const.key_consts(root, data, language, flag_key)
+    with key_const.go_file(path):
+        withheld = key_const._ts_withholds(root, data, consts)
+    if withheld:
+        # A holder of the key this file cannot prove, or mentions: the file's
+        # own gate keeps every declaration of the key in it.
+        return []
+    for const in consts:
         if not key_const_visibility.visible_key_consts([const], language):
             continue  # not exported: no other file can name it
-        found.append(xk.KeyDeclaration(path, const.name, None, path))
+        found.append(xk.KeyDeclaration(path, const.name, None, path, holder=key_const.ts_is_holder(const)))
     entries, _refused = _enum_entries(path, root, source, flag_key)
     return found + entries
 
@@ -1339,14 +1347,16 @@ def _within(node: Node, kinds: tuple[str, ...]) -> Node | None:
     return None
 
 
-def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = True) -> bool:
+def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = True, holder: bool = False) -> bool:
     """The key of a call the reader rules rewrite.
 
     Mirrors `key_const._ts_is_removable_read` and the seeds in `ts.toml`: no
     optional call, no optional member callee, and `getBooleanValue` only under
     an `await`. The key is the first argument, or the argument at the index a
     positioned accessor (``get[1]``) names; ``positioned=False`` for a key that
-    has no positioned reader rule (an enum entry's).
+    has no positioned reader rule (an enum entry's). A ``holder`` (a
+    constructed object holding the key) is read by a configured accessor
+    only: an SDK call takes the key itself.
     """
     args = argument.parent
     if args is None or args.type != "arguments" or not args.named_children:
@@ -1373,7 +1383,7 @@ def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = Tr
     callee = _text(function)
     if index:
         return rule_synthesis.positions_of(accessors).get(callee) == index
-    if callee not in _READ_CALLEES and callee not in accessors:
+    if callee not in accessors and (holder or callee not in _READ_CALLEES):
         return False
     if callee in _AWAITED_ONLY_CALLEES and callee not in accessors:
         parent = call.parent
@@ -2438,7 +2448,9 @@ def references(
                     refuse(node, xk.IMPORT_UNRESOLVED)
             elif (bound.namespace_of, _text(node)) not in declared:
                 refuse(node, xk.IMPORT_UNRESOLVED)  # another module's member
-            elif _is_plain_member(parent) and _is_read(parent, accessors):
+            elif _is_plain_member(parent) and _is_read(
+                parent, accessors, holder=declared[(bound.namespace_of, _text(node))].holder
+            ):
                 reads.append(xk.KeyReference(path, owner, _text(node)))
             else:
                 refuse(node, xk.NOT_A_READ)
@@ -2482,7 +2494,7 @@ def references(
             continue  # this file's own constant of the same name
         if bound is None or bound.declaration is None:
             refuse(node, unproven_reason(text))
-        elif kind == "identifier" and _is_read(node, accessors):
+        elif kind == "identifier" and _is_read(node, accessors, holder=bound.declaration.holder):
             reads.append(xk.KeyReference(path, None, text))
             read_locals.add(text)
         else:

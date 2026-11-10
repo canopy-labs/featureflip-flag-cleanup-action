@@ -42,10 +42,12 @@ Order, first match wins, after parentheses, ``!`` (non-null), ``as`` and
    Anything unresolvable (a package type, a destructured binding, a deeper
    ``this`` chain) falls through.
 4. By name: any declaration in the repository that is async, Promise-typed,
-   documented as returning a Promise, or could be (an explicit return type other
-   than ``boolean``, no return type on a signature, a body that returns a call,
-   a const initialised from a call, a ``.then`` chain) leaves the read; none
-   folds it. A name declared nowhere folds, as it always did.
+   documented as returning a Promise, or could be (an explicit return type that
+   is not a primitive or a union of primitives, no return type on a signature,
+   a body that returns a call, a const initialised from a call, a ``.then``
+   chain) leaves the read; none folds it. Test files are not read, and in test
+   support directories (``tests/``, ``__mocks__/``, ...) a fake whose returns
+   call nothing does not count. A name declared nowhere folds, as it always did.
 
 An accessor with at least one read that does not fold to the literal is
 "managed": its un-awaited reads are marked per site (see ``piranha_runner``)
@@ -181,34 +183,69 @@ def _member_kind(node: Node) -> str | None:
     return None
 
 
-_COMPARISONS = frozenset({"==", "===", "!=", "!==", "<", ">", "<=", ">=", "instanceof", "in"})
+_LOGICAL = frozenset({"&&", "||", "??"})
+#: Expressions whose value is always a primitive, never an object, so never a Promise.
+#: Not ``undefined``: it is a name, and a parameter can shadow it.
+_PRIMITIVE_NODES = frozenset({"true", "false", "number", "string", "template_string", "null"})
 
 
 def _certainly_boolean(expr: Node | None) -> bool:
-    """A returned expression that cannot be a Promise: a boolean literal, a
-    comparison or type test, or a negation."""
+    """A returned expression that cannot be a Promise: a literal (boolean,
+    number, string, template, ``null``), any unary or binary
+    operation except the logical ones (comparisons, type tests, ``!``,
+    ``typeof``, arithmetic all yield primitives), or a ternary or
+    ``&&``/``||``/``??`` whose every possible result is one of those."""
     while expr is not None and expr.type == "parenthesized_expression" and expr.named_children:
         expr = expr.named_children[0]
     if expr is None:
         return False
-    if expr.type in {"true", "false"}:
+    if expr.type in _PRIMITIVE_NODES:
         return True
     if expr.type == "binary_expression":
         operator = expr.child_by_field_name("operator")
-        return operator is not None and _text(operator) in _COMPARISONS
+        if operator is None:
+            return False
+        if _text(operator) in _LOGICAL:
+            return _certainly_boolean(expr.child_by_field_name("left")) and _certainly_boolean(
+                expr.child_by_field_name("right")
+            )
+        return True
+    if expr.type == "ternary_expression":
+        return _certainly_boolean(expr.child_by_field_name("consequence")) and _certainly_boolean(
+            expr.child_by_field_name("alternative")
+        )
     if expr.type == "unary_expression":
         operator = expr.child_by_field_name("operator")
-        return operator is not None and _text(operator) == "!"
+        return operator is not None and _text(operator) != "delete"
     return False
 
 
-def _returns_only_booleans(subject: Node) -> bool:
+#: Types a Promise can never be assigned to. Not ``void``: a function typed
+#: ``() => void`` may be an async function.
+_PRIMITIVE_TYPES = re.compile(
+    r"""\A(?:boolean|true|false|undefined|null|string|number|bigint|-?\d[\w.]*|'[^'|]*'|"[^"|]*")\Z"""
+)
+
+
+def _primitive_return(type_node: Node | None) -> bool:
+    """An explicit return type that is a primitive keyword or literal type, or a
+    union of them (``boolean | undefined``)."""
+    if type_node is None:
+        return False
+    text = _text(type_node).strip().lstrip(":").strip().lstrip("|").strip()
+    parts = [part.strip() for part in text.split("|")]
+    return bool(text) and all(_PRIMITIVE_TYPES.match(part) for part in parts)
+
+
+def _returned_expressions(subject: Node) -> list[Node | None]:
+    """What a function returns: its expression body, or each ``return``'s
+    expression (None for a bare ``return``), nested functions excluded."""
     body = subject.child_by_field_name("body")
     if body is None:
-        return False
+        return []
     if body.type != "statement_block":
-        return _certainly_boolean(body)
-    returns = []
+        return [body]
+    returns: list[Node | None] = []
     stack = list(body.children)
     while stack:
         node = stack.pop()
@@ -217,11 +254,49 @@ def _returns_only_booleans(subject: Node) -> bool:
         if node.type == "return_statement":
             returns.append(node.named_children[0] if node.named_children else None)
         stack.extend(node.children)
+    return returns
+
+
+def _returns_only_booleans(subject: Node) -> bool:
+    returns = _returned_expressions(subject)
     return bool(returns) and all(_certainly_boolean(r) for r in returns)
+
+
+def _only_reads(expr: Node | None) -> bool:
+    """A returned expression that calls and constructs nothing: a primitive, a
+    name, a property or index read, or a ternary or ``&&``/``||``/``??`` whose
+    every possible result is one of those."""
+    while expr is not None and expr.type == "parenthesized_expression" and expr.named_children:
+        expr = expr.named_children[0]
+    if expr is None:
+        return False
+    if _certainly_boolean(expr):
+        return True
+    if expr.type in {"identifier", "member_expression", "subscript_expression"}:
+        return not any(
+            n.type in {"call_expression", "new_expression", "await_expression"} or n.type in _FUNCTION_NODES
+            for n in ts_syntax._walk(expr)
+        )
+    if expr.type == "binary_expression":
+        operator = expr.child_by_field_name("operator")
+        return (
+            operator is not None
+            and _text(operator) in _LOGICAL
+            and _only_reads(expr.child_by_field_name("left"))
+            and _only_reads(expr.child_by_field_name("right"))
+        )
+    if expr.type == "ternary_expression":
+        return _only_reads(expr.child_by_field_name("consequence")) and _only_reads(
+            expr.child_by_field_name("alternative")
+        )
+    return False
 
 
 _TEST_DOUBLE_METHODS = frozenset({"stub", "fn", "spyOn", "createStubInstance"})
 _TEST_FILE = re.compile(r"(\.(test|spec)\.[cm]?[jt]sx?$)|(/__tests__/)")
+#: A directory of test support code, matched on the path from the repository
+#: root. A declaration there that only reads is a fake (see ``_a_fake``).
+_TEST_DIRECTORY = re.compile(r"(?:\A|/)(?:tests?|__mocks__|fixtures|__fixtures__)/")
 
 
 def _is_test_double(value: Node | None) -> bool:
@@ -240,22 +315,26 @@ def _is_test_double(value: Node | None) -> bool:
 def _possibly_async(node: Node) -> bool | None:
     """Whether a declaration of the name is, or could be, async. None: says nothing.
 
-    Possibly async UNLESS it has an explicit return annotation of exactly
-    ``boolean``, or is a function whose every returned expression is certainly
-    a boolean. A value that is a reference, a call, an alias, a ternary or a
-    returned local all count as possibly async.
+    Possibly async UNLESS it has an explicit return type that is ``boolean`` or
+    another primitive (or a union of them), or is a non-``async`` function
+    whose every returned expression is certainly a primitive. A value that is a
+    reference, a call, an alias or a returned local, or a ternary or ``&&``
+    with such an arm, all count as possibly async.
     """
     if node.type in _VALUE_KINDS:
         value = node.child_by_field_name("value")
         annotation = node.child_by_field_name("type")
         if _is_test_double(value):
             return None
+        ftype = _function_type(annotation)
         if value is not None and value.type in _FUNCTION_VALUES:
             subject = value
+            if ftype is not None and not (_has_async_token(value) or _jsdoc_promise(node)):
+                # `const isEnabled: (k: string) => R = (k) => …`: the declared type decides.
+                return not _primitive_return(ftype.child_by_field_name("return_type"))
         else:
-            ftype = _function_type(annotation)
             if ftype is not None:
-                return _jsdoc_promise(node) or return_kind(ftype.child_by_field_name("return_type")) != "sync"
+                return _jsdoc_promise(node) or not _primitive_return(ftype.child_by_field_name("return_type"))
             if annotation is None and value is None:
                 return None
             return True
@@ -265,10 +344,296 @@ def _possibly_async(node: Node) -> bool | None:
         return True
     rtype = subject.child_by_field_name("return_type")
     if rtype is not None:
-        return return_kind(rtype) != "sync"
+        return not _primitive_return(rtype)
     if node.type in _SIGNATURE_KINDS:
         return True
     return not _returns_only_booleans(subject)
+
+
+#: Text that can make or name a Promise, a thenable or a getter (whose read runs code).
+_PROMISE_TOKENS = re.compile(_PROMISEISH.pattern + r"|\bawait\b|\bthen\b|(?i:thenable)|\bget\s+[\w$'\"\[]")
+_RUNS_CODE = frozenset(
+    {"call_expression", "new_expression", "await_expression", "yield_expression", "method_definition", "class",
+     "spread_element", "tagged_template_expression"}
+) | _FUNCTION_NODES
+_WRITES = frozenset({"assignment_expression", "augmented_assignment_expression"})
+
+
+def _a_fake(node: Node, tree: Node) -> bool:
+    """A declaration in test support code that reads like a fake and provably
+    returns no Promise of its own making.
+
+    It is a function that is not ``async`` and carries no return type, declared
+    type or ``@returns``; its text holds no Promise-ish token; every returned
+    expression only reads (``(key) => key === flag && enabled``,
+    ``(key) => flags[key] ?? false``); and every name those returns read
+    resolves (``_resolved``) to a parameter or to a binding of this file that
+    itself only reads. What a PARAMETER carries is whatever a caller passes,
+    and is not decided here."""
+    subject = node
+    if node.type in _VALUE_KINDS:
+        if node.child_by_field_name("type") is not None:
+            return False
+        subject = node.child_by_field_name("value")
+        if subject is None or subject.type not in _FUNCTION_VALUES:
+            return False
+    elif node.type in _SIGNATURE_KINDS:
+        return False
+    if _has_async_token(subject) or _jsdoc_promise(node) or subject.child_by_field_name("return_type") is not None:
+        return False
+    if _PROMISE_TOKENS.search(_text(subject)):
+        return False
+    returns = _returned_expressions(subject)
+    if not returns or not all(_only_reads(r) for r in returns):
+        return False
+    return all(r is not None and _resolved(r, tree, set(), subject) for r in returns)
+
+
+def _resolved(expr: Node, tree: Node, seen: set[int], fake: Node) -> bool:
+    """Every name ``expr`` reads is a parameter of an enclosing function, or a
+    ``const``/``let`` of this file bound once, whose initializer is a primitive
+    or an object/array literal that runs no code and whose names resolve too,
+    and which nothing in the file writes to (``x = ``, ``x.a = ``, ``x[k]++``,
+    ``delete x.a``) or hands on (``_escapes``). ``this`` never resolves."""
+    for node in [expr, *ts_syntax._walk(expr)]:
+        if node.type in {"this", "super"}:
+            return False
+        if node.type in _RUNS_CODE:
+            return False
+        if node.type in {"identifier", "shorthand_property_identifier", "undefined"}:
+            if not _name_resolves(node, _text(node), tree, seen, fake):
+                return False
+    return True
+
+
+def _params(function: Node) -> list[Node]:
+    params = function.child_by_field_name("parameters")
+    nodes = list(params.named_children) if params is not None else []
+    single = function.child_by_field_name("parameter")
+    if single is not None:
+        nodes.append(single)
+    return nodes
+
+
+def _param_names(function: Node) -> set[str]:
+    names: set[str] = set()
+    for param in _params(function):
+        names |= _names_bound_by(param)
+    return names
+
+
+def _names_bound_by(param: Node) -> set[str]:
+    """The names one parameter binds; its default values bind nothing."""
+    names: set[str] = set()
+    stack = [param]
+    while stack:
+        current = stack.pop()
+        if current.type in {"identifier", "shorthand_property_identifier_pattern"}:
+            names.add(_text(current))
+            continue
+        if current.type in {"assignment_pattern", "object_assignment_pattern"}:
+            left = current.child_by_field_name("left")
+            if left is not None:
+                stack.append(left)
+            continue  # a default value binds nothing
+        if current.type in {"required_parameter", "optional_parameter"}:
+            pattern = current.child_by_field_name("pattern")
+            if pattern is not None:
+                stack.append(pattern)
+            continue
+        if current.type == "pair_pattern":
+            value = current.child_by_field_name("value")
+            if value is not None:
+                stack.append(value)
+            continue
+        stack.extend(current.named_children)
+    return names
+
+
+def _bindings_of(tree: Node, name: str) -> list[Node]:
+    """Every node of the file that binds ``name``."""
+    found = []
+    for node in ts_syntax._walk(tree):
+        kind = node.type
+        if kind == "variable_declarator" and _binds(node.child_by_field_name("name"), name):
+            found.append(node)
+        elif kind in _FUNCTION_NODES and name in _param_names(node):
+            found.append(node)
+        elif kind in {"function_declaration", "generator_function_declaration", "class_declaration", "class", "function_expression"}:
+            own = node.child_by_field_name("name")
+            if own is not None and _text(own) == name:
+                found.append(node)
+        elif kind == "import_statement" and _binds(node, name):
+            found.append(node)
+        elif kind == "catch_clause" and _binds(node.child_by_field_name("parameter"), name):
+            found.append(node)
+        elif kind == "for_in_statement" and _binds(node.child_by_field_name("left"), name):
+            found.append(node)
+    return found
+
+
+def _defaults_read_only(function: Node, name: str, tree: Node, seen: set[int], fake: Node) -> bool:
+    """Every default value in the parameter that binds ``name`` runs no code, and
+    is a primitive or resolves (``(key, v = load(key)) => v`` is a call's
+    result, not a parameter's; ``enabled = def.mode === 'on'`` is a boolean)."""
+    for param in _params(function):
+        if name not in _names_bound_by(param):
+            continue
+        if -1 - param.start_byte in seen:
+            continue  # a default naming its own parameter list is checked once
+        seen.add(-1 - param.start_byte)
+        for node in [param, *ts_syntax._walk(param)]:
+            if node.type in {"assignment_pattern", "object_assignment_pattern"}:
+                default = node.child_by_field_name("right")
+            elif node.type in {"required_parameter", "optional_parameter"}:
+                default = node.child_by_field_name("value")  # `(key, v = load(key))`
+            else:
+                continue
+            if default is None:
+                continue
+            if any(n.type in _RUNS_CODE for n in [default, *ts_syntax._walk(default)]):
+                return False
+            # A comparison or other operator yields a primitive whatever it reads.
+            if not _certainly_boolean(default) and not _resolved(default, tree, seen, fake):
+                return False
+    return True
+
+
+def _name_resolves(use: Node, name: str, tree: Node, seen: set[int], fake: Node) -> bool:
+    current = use.parent
+    while current is not None:
+        if current.type in _FUNCTION_NODES and name in _param_names(current):
+            body = current.child_by_field_name("body")
+            if body is not None and (_written(body, name) or _bindings_of(body, name)):
+                return False  # written, or shadowed by a binding inside (`let`, `catch`, `for … of`)
+            return _defaults_read_only(current, name, tree, seen, fake)
+        current = current.parent
+    bindings = _bindings_of(tree, name)
+    if not bindings:
+        return name == "undefined"
+    if len(bindings) != 1 or bindings[0].type != "variable_declarator":
+        return False
+    declarator = bindings[0]
+    if declarator.start_byte in seen:
+        return True  # a cycle adds nothing a first visit does not check
+    seen.add(declarator.start_byte)
+    holder = declarator.parent
+    if holder is None or holder.type != "lexical_declaration":
+        return False  # `var` hoists; only `const`/`let`
+    if declarator.child_by_field_name("name").type != "identifier":
+        return False
+    scope = holder.parent
+    if scope is None or not _is_ancestor(scope, use):
+        return False
+    value = declarator.child_by_field_name("value")
+    if value is None or _PROMISE_TOKENS.search(_text(value)):
+        return False
+    if not _resolved(value, tree, seen, fake):
+        return False
+    if _certainly_boolean(value):
+        return not _written(tree, name, declarator)  # a primitive cannot be changed through an alias
+    return not _escapes(tree, name, declarator, fake)
+
+
+def _is_parameter(use: Node, name: str) -> bool:
+    current = use.parent
+    while current is not None:
+        if current.type in _FUNCTION_NODES and name in _param_names(current):
+            return True
+        current = current.parent
+    return False
+
+
+def _escapes(tree: Node, name: str, declarator: Node, fake: Node) -> bool:
+    """Whether any use of an object-valued binding could change what it holds.
+
+    Every use must only read it: through property or index reads into an
+    operator that consumes the value, a condition, or the fake's own return.
+    Anything else (a write, a method call on it, an alias, an argument) may
+    replace a property with a Promise. The one exception is an argument, bare
+    or inside an object or array literal, of a call to a PARAMETER: that
+    callback is the caller's, the same as what a parameter carries."""
+    own = declarator.child_by_field_name("name")
+    for node in ts_syntax._walk(tree):
+        if node.type not in {"identifier", "shorthand_property_identifier"} or _text(node) != name or node == own:
+            continue
+        if not _read_use(node, fake):
+            return True
+    return False
+
+
+def _read_use(node: Node, fake: Node) -> bool:
+    top = node
+    while True:
+        parent = top.parent
+        if parent is None:
+            return False
+        kind = parent.type
+        if kind in {"member_expression", "subscript_expression"} and parent.child_by_field_name("object") == top:
+            top = parent
+        elif kind in {"parenthesized_expression", "non_null_expression"}:
+            top = parent
+        elif kind == "binary_expression":
+            if _text(parent.child_by_field_name("operator")) not in _LOGICAL:
+                return True  # a comparison or arithmetic consumes the value
+            top = parent
+        elif kind == "ternary_expression":
+            if parent.child_by_field_name("condition") == top:
+                return True
+            top = parent
+        elif kind == "unary_expression":
+            return _text(parent.child_by_field_name("operator")) != "delete"
+        elif kind == "subscript_expression":
+            return True  # used as an index
+        elif kind in {"template_substitution", "if_statement", "while_statement", "do_statement", "expression_statement"}:
+            return True
+        elif kind == "return_statement" or (kind == "arrow_function" and parent.child_by_field_name("body") == top):
+            return _is_ancestor(fake, top) or top.parent == fake
+        elif kind in {"pair", "object", "array", "arguments"} or top.type == "shorthand_property_identifier":
+            container = top
+            while container.parent is not None and container.parent.type in {"pair", "object", "array"}:
+                if container.parent.type == "pair" and container.parent.child_by_field_name("value") != container:
+                    return False
+                container = container.parent
+            if container.parent is None or container.parent.type != "arguments" and container.type != "arguments":
+                return False
+            arguments = container if container.type == "arguments" else container.parent
+            call = arguments.parent
+            callee = call.child_by_field_name("function") if call is not None and call.type == "call_expression" else None
+            return callee is not None and callee.type == "identifier" and _is_parameter(callee, _text(callee))
+        else:
+            return False
+
+
+def _is_ancestor(scope: Node, node: Node) -> bool:
+    current = node.parent
+    while current is not None:
+        if current == scope:
+            return True
+        current = current.parent
+    return False
+
+
+def _written(scope: Node, name: str, declarator: Node | None = None) -> bool:
+    """Whether anything in ``scope`` writes ``name`` or through it."""
+    for node in ts_syntax._walk(scope):
+        if node.type != "identifier" or _text(node) != name:
+            continue
+        if declarator is not None and node == declarator.child_by_field_name("name"):
+            continue
+        top = node
+        while top.parent is not None and top.parent.type in {"member_expression", "subscript_expression", "parenthesized_expression", "non_null_expression"} and top.parent.child_by_field_name("index") != top:
+            top = top.parent
+        parent = top.parent
+        if parent is None:
+            continue
+        if parent.type in _WRITES and parent.child_by_field_name("left") == top:
+            return True
+        if parent.type == "update_expression":
+            return True
+        if parent.type == "unary_expression" and _text(parent.child_by_field_name("operator")) == "delete":
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -304,11 +669,14 @@ class _Repo:
                 continue
             if _TEST_FILE.search(str(path).replace("\\", "/")):
                 continue  # a test file's fakes say nothing about the production accessor
+            support = root.is_dir() and _TEST_DIRECTORY.search(path.relative_to(root).as_posix()) is not None
             for node in ts_syntax._walk(tree):
                 if node.type in _CALLABLE_KINDS or node.type in _VALUE_KINDS:
                     name = _name_of(node)
                     if name in accessors:
                         verdict = _possibly_async(node)
+                        if verdict and support and _a_fake(node, tree):
+                            verdict = None  # a fake in test support code that only reads
                         if verdict is not None:
                             self.possibly_async[name] = self.possibly_async[name] or verdict
                 elif node.type == "shorthand_property_identifier_pattern" and _text(node) in accessors:
