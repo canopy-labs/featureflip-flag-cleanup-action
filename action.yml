@@ -304,6 +304,20 @@ inputs:
       rather than guessed at. Empty (the default) changes nothing.
     required: false
     default: ''
+  workspace-packages:
+    description: >-
+      TypeScript and JavaScript monorepos: `follow` lets an import of another
+      package of your repository by name (`import { FLAG } from
+      "@acme/flags"`) be followed to that package's source, so its key
+      constants, enum entries, holders and wrappers are removed like local
+      ones. Set it only if no bundler, test runner, Babel plugin or loader in
+      your build maps a workspace package to a different implementation than
+      its source; the Action checks the common places and refuses where it
+      sees one, but it cannot see every build (see README, "Workspace
+      packages"). `off` (the default) leaves every such import
+      `import-unresolved`. Any other value fails the run immediately (exit 2).
+    required: false
+    default: 'off'
   languages:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
@@ -445,6 +459,7 @@ runs:
     FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: ${{ inputs.side-effect-free-calls }}
     FEATUREFLIP_TEST_SETTERS: ${{ inputs.test-setters }}
     FEATUREFLIP_KEY_ALIASES: ${{ inputs.key-aliases }}
+    FEATUREFLIP_WORKSPACE_PACKAGES: ${{ inputs.workspace-packages }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}
     FEATUREFLIP_FLAGS: ${{ inputs.flags }}

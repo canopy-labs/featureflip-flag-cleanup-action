@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-from flag_cleanup import cross_file_ts, key_const, source_index, ts_barrels
+from flag_cleanup import cross_file_ts, key_const, source_index, ts_barrels, ts_workspace
 from flag_cleanup.ts_syntax import _parse, _walk, binding_nodes
 
 _SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
@@ -54,15 +56,190 @@ def refusals(changed, repo_dir: str, flag_key: str, grammar_of, deleted) -> dict
     ``changed`` are the run's summaries (``path``, ``original_content``,
     ``content``); ``grammar_of(path)`` is the file's grammar; ``deleted(s)``
     says a summary's file was deleted whole."""
-    gone: list[tuple[str, str]] = []
-    summaries = {str(Path(s.path).resolve()): s for s in changed}
-    for resolved, s in summaries.items():
-        grammar = grammar_of(s.path)
-        before = _constants(s.original_content, grammar, flag_key)
-        after = set() if deleted(s) else _constants(s.content, grammar, flag_key)
-        gone.extend((resolved, name) for name in sorted(before - after))
-    if not gone:
+    reach = _reach(changed, repo_dir, flag_key, grammar_of, deleted)
+    if reach is None:
         return {}
+    files, exposed, resolve, parse, grammar_for = (
+        reach.files, reach.exposed, reach.resolve, reach.parse, reach.grammar_for
+    )
+    every = set().union(*exposed.values())
+
+    found: dict[str, str] = {}
+    for path, resolved, text in files:
+        if not text or not any(name in text for name in every):
+            continue  # cheap: a file spelling none of the names cannot be a survivor
+        hit = _survivor(path, resolved, text, grammar_for(path), exposed, resolve, parse)
+        if hit is not None:
+            found[path] = _reason(hit)
+    return found
+
+
+def deleted_names(changed, repo_dir: str, flag_key: str, grammar_of, deleted) -> dict[str, frozenset[str]]:
+    """Per resolved path, the names of the key constants the run deleted that
+    a comment there can mean.
+
+    Same arguments as :func:`refusals`. A key constant's name is not unique
+    (every module may have its own ``FLAG_KEY``), so a name is scoped to a
+    file only on proof that the name there IS the deleted constant: the
+    declaring file itself, and a file whose ORIGINAL text takes the name from
+    a module exposing it (see :func:`_taken_names`) and binds it no other way.
+    Anything else, a component file or a file that does not parse included,
+    is not scoped, and its comments are kept."""
+    reach = _reach(changed, repo_dir, flag_key, grammar_of, deleted)
+    if reach is None:
+        return {}
+    scoped: dict[str, set[str]] = {}
+    for declaring, name in reach.gone:
+        scoped.setdefault(declaring, set()).add(name)
+    every = set().union(*reach.exposed.values())
+    for path, resolved, _text in reach.files:
+        original = reach.originals.get(resolved, "")
+        if not original or not any(name in original for name in every):
+            continue
+        if Path(path).suffix in source_index.COMPONENT_SUFFIXES or not _is_code(path):
+            continue
+        root = reach.parse(original, reach.grammar_for(path))
+        if root.has_error:
+            continue
+        names = _taken_names(root, path, reach.exposed, reach.resolve)
+        if names:
+            scoped.setdefault(resolved, set()).update(names)
+    return {path: frozenset(names) for path, names in scoped.items()}
+
+
+def _taken_names(root, path: str, exposed, resolve) -> set[str]:
+    """The local names under which this parsed file takes a deleted constant
+    from a module exposing it, and binds no other way.
+
+    WHITELIST. The forms are: a named import (its local name, so the alias
+    when there is one) or ``export { N } from`` (``N``); a member read
+    ``ns.N`` off a namespace import, ``import ns = require``, or a
+    ``const ns = require(...)``/``await import(...)`` whose name is bound
+    nowhere else in the file; and a destructured ``require``/``import()``
+    (``{ N }``, or the local of ``{ N: local }``). A name is then dropped if
+    anything else in the file binds it too (a declaration, a parameter, an
+    import from another module): the comment may mean that one."""
+
+    def names_of(spec: str | None) -> set[str]:
+        module = resolve(path, spec) if spec is not None else None
+        return exposed.get(module, set()) if module is not None else set()
+
+    def text_of(node) -> str:
+        return node.text.decode("utf-8").strip("'\"")
+
+    takes: list[tuple[str, int | None]] = []  # (local name, its binding node)
+    namespaces: dict[str, tuple[int, set[str]]] = {}
+    for node in _walk(root):
+        if node.type in ("import_statement", "export_statement"):
+            clause = next((c for c in node.named_children if c.type == "import_require_clause"), None)
+            if clause is not None:
+                have = names_of(cross_file_ts._string_value(next((c for c in clause.named_children if c.type == "string"), None)))
+                local = next((c for c in clause.named_children if c.type == "identifier"), None)
+                if have and local is not None:
+                    namespaces[text_of(local)] = (local.id, have)
+                continue
+            have = names_of(cross_file_ts._string_value(node.child_by_field_name("source")))
+            if not have:
+                continue
+            for sub in _walk(node):
+                if sub.type == "import_specifier" and node.type == "import_statement":
+                    name, alias = sub.child_by_field_name("name"), sub.child_by_field_name("alias")
+                    if name is not None and text_of(name) in have:
+                        local = alias if alias is not None else name
+                        takes.append((text_of(local), local.id))
+                elif sub.type == "export_specifier" and node.type == "export_statement":
+                    name = sub.child_by_field_name("name")
+                    if name is not None and text_of(name) in have:
+                        takes.append((text_of(name), name.id))
+                elif sub.type == "namespace_import":
+                    local = next((c for c in sub.named_children if c.type == "identifier"), None)
+                    if local is not None:
+                        namespaces[text_of(local)] = (local.id, have)
+        elif node.type == "call_expression":
+            have = names_of(_load_spec(node))
+            if not have:
+                continue
+            top = node
+            while top.parent is not None and top.parent.type in ("await_expression", "parenthesized_expression"):
+                top = top.parent
+            consumer = top.parent
+            if consumer is None or consumer.type != "variable_declarator" or consumer.child_by_field_name("value") != top:
+                continue
+            target = consumer.child_by_field_name("name")
+            if target is not None and target.type == "identifier":
+                namespaces[text_of(target)] = (target.id, have)
+            elif target is not None and target.type == "object_pattern":
+                for prop in target.named_children:
+                    if prop.type == "shorthand_property_identifier_pattern" and text_of(prop) in have:
+                        takes.append((text_of(prop), prop.id))
+                    elif prop.type == "pair_pattern":
+                        key, value = prop.child_by_field_name("key"), prop.child_by_field_name("value")
+                        if key is not None and value is not None and value.type == "identifier" and text_of(key) in have:
+                            takes.append((text_of(value), value.id))
+
+    bindings = _all_bindings(root)
+    if namespaces:
+        for node in _walk(root):
+            if node.type != "member_expression":
+                continue
+            obj, prop = node.child_by_field_name("object"), node.child_by_field_name("property")
+            if obj is None or prop is None or obj.type != "identifier":
+                continue
+            bound = namespaces.get(text_of(obj))
+            if bound is None or text_of(prop) not in bound[1]:
+                continue
+            # The namespace must be bound once, by its load: a shadowing
+            # binding could make this `ns` some other object.
+            if [b for b in bindings if text_of(b) == text_of(obj) and b.id != bound[0]]:
+                continue
+            takes.append((text_of(prop), None))
+
+    found: set[str] = set()
+    for local, own in takes:
+        if not any(text_of(b) == local and b.id != own for b in bindings):
+            found.add(local)
+    return found
+
+
+def _all_bindings(root) -> list:
+    """Every node binding a name in this file: :func:`binding_nodes` plus the
+    names an import introduces (an alias, a default, a namespace,
+    ``import x = require``), which carry no binding field. Over-collecting
+    only keeps a comment."""
+    found = {n.id: n for n in binding_nodes(root)}
+    for node in _walk(root):
+        if node.type == "import_specifier":
+            local = node.child_by_field_name("alias") or node.child_by_field_name("name")
+            if local is not None:
+                found[local.id] = local
+        elif node.type in ("import_clause", "namespace_import", "import_require_clause"):
+            for child in node.named_children:
+                if child.type == "identifier":
+                    found[child.id] = child
+    return list(found.values())
+
+
+@dataclass(frozen=True)
+class _Reach:
+    """What :func:`refusals` and :func:`deleted_names` share: the deleted
+    constants, every module's text, and which modules expose each name."""
+
+    gone: list[tuple[str, str]]
+    files: list[tuple[str, str, str]]  # (path, resolved, current text)
+    originals: dict[str, str]
+    exposed: dict[str, set[str]]
+    resolve: Callable[[str, str], str | None]
+    parse: Callable
+    grammar_for: Callable[[str], str]
+
+
+def _reach(changed, repo_dir: str, flag_key: str, grammar_of, deleted) -> _Reach | None:
+    """The run's deleted key constants and the modules exposing them; None
+    when the run deleted none."""
+    summaries = {str(Path(s.path).resolve()): s for s in changed}
+    gone = _gone(summaries, flag_key, grammar_of, deleted)
+    if not gone:
+        return None
 
     suffixes = _SUFFIXES + tuple(sorted(source_index.COMPONENT_SUFFIXES))
     files: list[tuple[str, str, str]] = []  # (path, resolved, current text)
@@ -124,27 +301,40 @@ def refusals(changed, repo_dir: str, flag_key: str, grammar_of, deleted) -> dict
     def resolve(path: str, specifier: str) -> str | None:
         key = (str(Path(path).parent), specifier)
         if key not in resolved_cache:
+            package = None
             try:
-                found = cross_file_ts.resolve_specifier(path, specifier, repo_dir, solution=True)
+                found = cross_file_ts.resolve_specifier(path, specifier, repo_dir, solution=True, workspace=True)
+                if found is None:
+                    # A package of the checkout, whoever imports it: its proven
+                    # entry, or else every module under it (this check may only
+                    # over-attribute).
+                    package = ts_workspace.reach(specifier, repo_dir)
+                    if package is not None and package.entry is not None:
+                        found, package = package.entry, None
             except (OSError, ValueError):
                 found = None
-            resolved_cache[key] = str(Path(found).resolve()) if found is not None else virtual(path, specifier)
+            if package is not None:
+                resolved_cache[key] = _Exposed.under(package.directories)
+            else:
+                resolved_cache[key] = str(Path(found).resolve()) if found is not None else virtual(path, specifier)
         return resolved_cache[key]
 
-    exposed: dict[str, set[str]] = {}
+    exposed: dict[str, set[str]] = _Exposed()
     for declaring, name in gone:
         exposed.setdefault(declaring, set()).add(name)
     _expose(files, originals, grammar_of, resolve, exposed, parse)
-    every = set().union(*exposed.values())
+    return _Reach(gone, files, originals, exposed, resolve, parse, grammar_for)
 
-    found: dict[str, str] = {}
-    for path, resolved, text in files:
-        if not text or not any(name in text for name in every):
-            continue  # cheap: a file spelling none of the names cannot be a survivor
-        hit = _survivor(path, resolved, text, grammar_for(path), exposed, resolve, parse)
-        if hit is not None:
-            found[path] = _reason(hit)
-    return found
+
+def _gone(summaries, flag_key: str, grammar_of, deleted) -> list[tuple[str, str]]:
+    """``(resolved path, name)`` of each key constant a declaring file lost."""
+    gone: list[tuple[str, str]] = []
+    for resolved, s in summaries.items():
+        grammar = grammar_of(s.path)
+        before = _constants(s.original_content, grammar, flag_key)
+        after = set() if deleted(s) else _constants(s.content, grammar, flag_key)
+        gone.extend((resolved, name) for name in sorted(before - after))
+    return gone
 
 
 def _reason(name: str) -> str:
@@ -192,6 +382,36 @@ def _stems(module: str) -> set[str]:
     path = Path(module)
     stem = re.sub(r"\.(?:d\.)?[cm]?[jt]sx?$", "", path.name)
     return {stem, path.parent.name} if stem == "index" else {stem}
+
+
+class _Exposed(dict):
+    """``{module: names it exposes}``, also answering for a key made by
+    :meth:`under`: every module under some directories, which a specifier
+    into a package whose entry is not proven may load."""
+
+    _PREFIX = "\0under:"
+
+    @classmethod
+    def under(cls, directories) -> str:
+        return cls._PREFIX + "\0".join(str(Path(d).resolve()) for d in directories)
+
+    def _union(self, key: str) -> set[str]:
+        roots = [Path(d) for d in key[len(self._PREFIX) :].split("\0")]
+        found: set[str] = set()
+        for module, names in dict.items(self):
+            if any(Path(module).is_relative_to(r) for r in roots):
+                found |= names
+        return found
+
+    def get(self, key, default=None):
+        if isinstance(key, str) and key.startswith(self._PREFIX):
+            return self._union(key) or default
+        return dict.get(self, key, default)
+
+    def __contains__(self, key) -> bool:
+        if isinstance(key, str) and key.startswith(self._PREFIX):
+            return bool(self._union(key))
+        return dict.__contains__(self, key)
 
 
 def _expose(files, originals, grammar_of, resolve, exposed: dict[str, set[str]], parse) -> None:

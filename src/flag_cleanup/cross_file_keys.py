@@ -31,7 +31,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
 
@@ -112,6 +112,11 @@ class KeyDeclaration:
     #: value (TypeScript's ``new Feature("key", false)``): only a configured
     #: accessor reads it, never an SDK call, which takes the key itself.
     holder: bool = False
+    #: The key the declaration holds, as the code spells it (TypeScript only):
+    #: a reader spelling it as a property (``flags.IS_X``) or a destructured
+    #: name may read the key off a flag map, which no rule rewrites. Not part
+    #: of a declaration's identity: every declaration of a run holds one key.
+    key: str = field(default="", compare=False)
 
     @property
     def entry(self) -> str:

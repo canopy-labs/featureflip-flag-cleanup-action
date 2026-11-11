@@ -13,8 +13,10 @@ is never enough. A call is recognised only when
 * it is a statement of its own (not ``go``, ``defer``, a value or an argument);
 * the callee is ``Name(...)`` or ``pkg.Name(...)`` where ``Name`` is a
   package-level FUNCTION of this repository: the same package for the bare
-  form, a package of the same module that ``pkg`` is bound to by an import for
-  the qualified one, with exactly one such declaration. A method call
+  form, for the qualified one a package that ``pkg`` is bound to by an import
+  :func:`flag_cleanup.go_module.resolve` proves (the same module, or another
+  module of the checkout every build reads from here), with exactly one such
+  declaration. A method call
   (``store.Set(...)``) cannot be resolved without types and is not one;
 * it has exactly as many arguments as the function has parameters (no
   variadic), exactly one of them spells the flag's key, and exactly one is the

@@ -12,7 +12,7 @@ local while it does, or logs. The proof is a WHITELIST of how the key may
 travel to the returned value, so a shape nobody listed refuses:
 
 * the constructor is one function declared in the repository (the file's own
-  package, or ``pkg.Name`` through an import of the same module), with no type
+  package, or ``pkg.Name`` through an import of a package of the checkout), with no type
   parameters, an unnamed result, and a first parameter of type ``string``,
   which is only ever read (never assigned, rebound or addressed);
 * if it has other parameters, one of them is a ``bool``: a constructor whose
@@ -477,7 +477,7 @@ def _another_call(packages, here: Path, call: Node, target: tuple[Path, str, byt
 def _struct_fields(packages, file, written: Node) -> tuple[bytes, ...] | None:
     """The field names, in order, of the struct type ``written`` names in
     ``file``: ``T`` declared once in ``file``'s package, or ``pkg.T`` through
-    an import of the same module. Anything else (a named slice or map, an
+    an import :meth:`go_scope.Packages.imported` resolves. Anything else (a named slice or map, an
     alias, a generic type, a type from a dependency, a struct with an
     embedded field) is ``None``."""
     if written.type == "type_identifier":
@@ -526,7 +526,7 @@ def _constructor(call: Node, path: str | None):
     """``(packages, here, declaration, (directory, clause, name), fields)`` for the
     ``Ctor`` of a handle's ``Ctor("key", …)`` at ``path``, or ``None`` when it
     is not exactly one function declared in the repository: ``Name`` of the
-    file's own package or ``pkg.Name`` through an import of the same module.
+    file's own package or ``pkg.Name`` through an import of a package of the checkout.
     Any other callee (the standard library, a dependency) is not resolved,
     and nor is one asked about without the file's path. ``fields`` resolves
     a type written in the constructor's file (:func:`_struct_fields`)."""

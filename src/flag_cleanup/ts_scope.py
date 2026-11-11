@@ -136,7 +136,8 @@ def resolve(reader_path: str, specifier: str, repo_dir: str) -> str | None:
     :func:`cross_file_ts.resolve_specifier` reads it, and also through a
     JavaScript file's own declaration file (``flags.js`` beside
     ``flags.d.ts``) and an explicit ``baseUrl``, unless the specifier may
-    name a package a runtime reads first. Every specifier the proof or the
+    name a package a runtime reads first, and to a workspace package's source
+    (:func:`flag_cleanup.ts_workspace.resolve`). Every specifier the proof or the
     test-double checks follow is read this way, so they agree."""
     from flag_cleanup import wrapper_ts  # it imports this module
 
@@ -146,6 +147,7 @@ def resolve(reader_path: str, specifier: str, repo_dir: str) -> str | None:
         repo_dir,
         beside_declarations=True,
         base_url=lambda reader, spec: not wrapper_ts.may_be_package(reader, spec, repo_dir),
+        workspace=True,
     )
 
 

@@ -53,6 +53,8 @@ from flag_cleanup import (
     orchestrate,
     pr_content,
     source_index,
+    ts_key_names,
+    ts_workspace,
     call_site_comments,
     comment_sentences,
     stale_comments,
@@ -609,7 +611,11 @@ def _regenerate(
             config.side_effect_free_modules
         ), inert_calls.declaring(
             config.side_effect_free_calls
-        ), go_setters.declaring(config.test_setters), orchestrate.piranha_transform(
+        ), go_setters.declaring(config.test_setters), ts_key_names.declaring(
+            config.code_keys()
+        ), ts_workspace.following(
+            config.workspace_packages == "follow"
+        ), orchestrate.piranha_transform(
             candidate, config, ledger, known_flag_keys
         ) as (
             diff,

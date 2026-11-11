@@ -203,6 +203,11 @@ class Config:
     #: already-handled lookup, the API calls, ``flags``/``ignore``, the
     #: archive modes) keeps the Featureflip key. See :meth:`code_key`.
     key_aliases: tuple[tuple[str, str], ...] = ()
+    #: ``workspace-packages``: whether a TS/JS import of a workspace package
+    #: by name is followed to its source (``follow``) or left
+    #: ``import-unresolved`` (``off``, the default); see
+    #: :func:`flag_cleanup.ts_workspace.following`.
+    workspace_packages: str = "off"
 
     def code_key(self, flag_key: str) -> str:
         """``flag_key`` as the code spells it: its alias, or itself."""
@@ -360,6 +365,7 @@ class Config:
                 _get(env, "FEATUREFLIP_MAX_PRS", str(DEFAULT_MAX_PRS)),
             ),
             key_aliases=_parse_key_aliases(_get(env, "FEATUREFLIP_KEY_ALIASES", "")),
+            workspace_packages=_parse_workspace_packages(_get(env, "FEATUREFLIP_WORKSPACE_PACKAGES", "off")),
         )
 
 
@@ -511,6 +517,22 @@ def _parse_deployed_refs(value: str) -> tuple[str, ...]:
 #: segments joined by single ``-`` or ``_``. The left side of an alias names a
 #: flag in Featureflip, so it can be nothing else.
 PLATFORM_KEY_RE = re.compile(r"\A[a-z0-9]+(?:[_-][a-z0-9]+)*\Z")
+
+
+#: The values of ``workspace-packages``.
+WORKSPACE_PACKAGES_VALUES = ("off", "follow")
+
+
+def _parse_workspace_packages(value: str) -> str:
+    """``FEATUREFLIP_WORKSPACE_PACKAGES``, lower-cased; refused when it is not
+    one of :data:`WORKSPACE_PACKAGES_VALUES`."""
+    mode = value.strip().lower()
+    if mode not in WORKSPACE_PACKAGES_VALUES:
+        raise ConfigError(
+            f"unsupported FEATUREFLIP_WORKSPACE_PACKAGES value: {value!r}; "
+            f"expected one of {', '.join(WORKSPACE_PACKAGES_VALUES)}"
+        )
+    return mode
 
 
 def _parse_key_aliases(value: str) -> tuple[tuple[str, str], ...]:

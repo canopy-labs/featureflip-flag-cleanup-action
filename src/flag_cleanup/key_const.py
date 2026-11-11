@@ -57,7 +57,7 @@ from typing import Callable
 
 from tree_sitter import Node
 
-from flag_cleanup import dead_branches, kotlin_sentinel, rule_synthesis, ts_syntax
+from flag_cleanup import dead_branches, kotlin_sentinel, rule_synthesis, ts_prototype, ts_syntax
 from flag_cleanup.tree_walk import preorder
 
 __all__ = ["KeyConst", "path_is_safe", "supported_languages", "key_consts"]
@@ -1598,7 +1598,16 @@ def _ts_written(member: Node) -> bool:
 
 
 def _ts_holder_proven(root: Node, value: Node, path: str | None) -> bool:
-    """Whether ``value``, a holder's ``new C("key", …)``, names the key.
+    """Whether ``value``, a holder's ``new C("key", …)``, names the key:
+    its class is proven (:func:`_ts_holder_class`) and no file of the checkout
+    may reach the class's prototype (:func:`_ts_prototype_site`)."""
+    name = _ts_holder_class(root, value, path)
+    return name is not None and path is not None and _ts_prototype_site(name, path) is None
+
+
+def _ts_holder_class(root: Node, value: Node, path: str | None) -> str | None:
+    """The name of the class of ``value``, a holder's ``new C("key", …)``,
+    when everything but its prototype proves the holder names the key.
 
     ``C`` is a plain name bound exactly once in the file, by a top-level class
     or by a named import of one exported from a file of the repository, and
@@ -1606,34 +1615,33 @@ def _ts_holder_proven(root: Node, value: Node, path: str | None) -> bool:
     Every other argument is inert, since deleting the holder deletes their
     evaluation. The holder is typed boolean: its type argument, if any, is
     exactly ``<boolean>``, and otherwise its second argument is proven a
-    boolean (:func:`_ts_boolean`). No file of the checkout may reach the
-    class's prototype (:func:`_ts_prototype_reached`).
+    boolean (:func:`_ts_boolean`).
     """
     if path is None:
-        return False
+        return None
     constructor = value.child_by_field_name("constructor")
     arguments = value.child_by_field_name("arguments")
     if constructor is None or constructor.type != "identifier" or arguments is None:
-        return False
+        return None
     rest = [c for c in arguments.named_children if c.type != "comment"][1:]
     if not all(_ts_inert(a) for a in rest):
-        return False
+        return None
     type_arguments = value.child_by_field_name("type_arguments")
     if type_arguments is not None:
         listed = [c for c in type_arguments.named_children if c.type != "comment"]
         if len(listed) != 1 or listed[0].text != b"boolean":
-            return False
+            return None
     elif not rest or not _ts_boolean(rest[0], root, path, 0):
         # No default and no type argument says nothing about the value's type.
-        return False
+        return None
     binders = _ts_class_name_binders(root, constructor.text.decode("utf-8"))
     if len(binders) != 1:
-        return False
+        return None
     cls = _ts_top_level_class(binders[0]) or _ts_imported_class(binders[0], path)
     if cls is None or not _ts_class_keeps_first_argument(cls):
-        return False
+        return None
     name = cls.child_by_field_name("name")
-    return name is not None and not _ts_prototype_reached(name.text.decode("utf-8"), path)
+    return name.text.decode("utf-8") if name is not None else None
 
 
 #: Operators whose result is a boolean whatever their operands are.
@@ -1704,16 +1712,11 @@ def _ts_boolean(node: Node, root: Node, path: str, depth: int) -> bool:
     return _ts_boolean(value, other, other_path, depth + 1)
 
 
-#: Whatever reaches a class's prototype: a patch there changes every holder.
-_TS_PROTOTYPE = re.compile(r"\bprototype\b|\b(?:defineProperty|defineProperties|setPrototypeOf)\b")
-
-
-def _ts_prototype_reached(name: str, path: str) -> bool:
-    """Whether any TypeScript or JavaScript file of the checkout spells both
-    the class's name and its prototype (``Feature.prototype``,
-    ``Object.defineProperty(Feature…)``, ``setPrototypeOf``): such a file can
-    change what every instance reads. Text, not syntax, on purpose: an alias
-    (``import { Feature as F }``) still spells the name in its import."""
+def _ts_prototype_site(name: str, path: str) -> ts_prototype.Site | None:
+    """The first place in the checkout holding ``path`` that can change what
+    an instance of the class ``name`` reads (:func:`ts_prototype.reached`),
+    or None. Such a place keeps every holder of the class, and is reported
+    (:func:`ts_prototype_refusals`)."""
     from pathlib import Path
 
     from flag_cleanup import source_index
@@ -1721,23 +1724,33 @@ def _ts_prototype_reached(name: str, path: str) -> bool:
     try:
         root = source_index.checkout_root(str(Path(path).parent))
     except Exception:  # noqa: BLE001 - outside a checkout nothing is proven
-        return True
-    memo = source_index.run_memo("ts_prototype_reached")
+        return ts_prototype.Site(path, 1, "")
+    memo = source_index.run_memo("ts_prototype_site")
     if memo is not None and (root, name) in memo:
         return memo[(root, name)]
-    spelled = re.compile(rf"(?<![\w$]){re.escape(name)}(?![\w$])")
-    found = False
-    for listed in source_index.files(root, (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")):
-        try:
-            text = Path(listed.resolved).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if _TS_PROTOTYPE.search(text) and spelled.search(text):
-            found = True
-            break
+    found = ts_prototype.reached(name, root)
     if memo is not None:
         # The run only removes code, so a patch never appears mid-run.
         memo[(root, name)] = found
+    return found
+
+
+def ts_prototype_refusals(
+    path: str, root: Node, source_bytes: bytes, flag_key: str
+) -> list[ts_prototype.Site]:
+    """For each of the file's holders of ``flag_key`` whose class is proven
+    but whose prototype some file reaches, that place: the reason the holder
+    and every read of it are kept, which the run reports."""
+    if root.has_error:
+        return []
+    found: list[ts_prototype.Site] = []
+    for const in _ts_key_consts(root, source_bytes, flag_key):
+        if not ts_is_holder(const):
+            continue
+        name = _ts_holder_class(root, _ts_holder_value(const.declaration), path)
+        site = _ts_prototype_site(name, path) if name is not None else None
+        if site is not None and site not in found:
+            found.append(site)
     return found
 
 

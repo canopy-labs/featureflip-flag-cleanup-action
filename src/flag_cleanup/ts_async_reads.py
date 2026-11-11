@@ -44,7 +44,8 @@ Order, first match wins, after parentheses, ``!`` (non-null), ``as`` and
 4. By name: any declaration in the repository that is async, Promise-typed,
    documented as returning a Promise, or could be (an explicit return type that
    is not a primitive or a union of primitives, no return type on a signature,
-   a body that returns a call, a const initialised from a call, a ``.then``
+   a body that returns a call other than one of an audited package export
+   (``SYNC_PACKAGE_EXPORTS``), a const initialised from a call, a ``.then``
    chain) leaves the read; none folds it. Test files are not read, and in test
    support directories (``tests/``, ``__mocks__/``, ...) a fake whose returns
    call nothing does not count. A name declared nowhere folds, as it always did.
@@ -59,6 +60,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,6 +88,10 @@ _FUNCTION_NODES = frozenset(
 _SIGNATURE_KINDS = frozenset({"method_signature", "function_signature", "abstract_method_signature"})
 _CALLABLE_KINDS = _SIGNATURE_KINDS | {"method_definition", "function_declaration"}
 _VALUE_KINDS = frozenset({"property_signature", "public_field_definition", "variable_declarator", "pair"})
+#: The declarations that bind a name a bare ``name(...)`` call can reach. A
+#: member (a property, field, method or signature) is reached only through
+#: its object.
+_BINDING_KINDS = frozenset({"variable_declarator", "function_declaration", "function_signature"})
 _FUNCTION_VALUES = frozenset({"arrow_function", "function_expression", "function"})
 _TYPE_DECLARATIONS = frozenset(
     {"interface_declaration", "class_declaration", "abstract_class_declaration", "class", "type_alias_declaration"}
@@ -257,9 +263,72 @@ def _returned_expressions(subject: Node) -> list[Node | None]:
     return returns
 
 
-def _returns_only_booleans(subject: Node) -> bool:
+def _returns_only_booleans(subject: Node, sync_call: Callable[[Node], bool] | None = None) -> bool:
+    """Every returned expression is certainly a primitive, or, given
+    ``sync_call``, a call it proves returns no Promise."""
     returns = _returned_expressions(subject)
-    return bool(returns) and all(_certainly_boolean(r) for r in returns)
+    return bool(returns) and all(
+        _certainly_boolean(r) or (sync_call is not None and r is not None and sync_call(r)) for r in returns
+    )
+
+
+#: Exports of published packages whose result IS the flag's value, never a
+#: Promise, keyed by package, each with the index of the argument the export
+#: may hand back (None: it hands back none of them). Read off the type
+#: declarations of every release of the package published up to the audit
+#: (2026-11), and the runtime source of the latest: GrowthBook's React SDK
+#: declares ``useFeatureIsOn(...): boolean`` and ``useFeatureValue<T extends
+#: JSONValue>(id, fallback: T): WidenPrimitives<T>``, which is the flag's JSON
+#: value or ``fallback``. TypeScript can only infer a JSON type for that
+#: ``fallback``, so the argument matters only in JavaScript, where nothing
+#: checks it (:func:`_audited_sync_call`).
+#:
+#: Named one by one, never matched by a ``use`` prefix: a hook is a plain
+#: function and may return anything. Not a Promise is not enough: GrowthBook's
+#: ``useFeature`` returns a result object, always truthy, so a wrapper of it
+#: does not return the flag's value and is left out, as are the package's
+#: other exports (``useGrowthBook``, ``useGrowthBookSSR``, ...) and SDKs whose
+#: value hook returns its default unchecked in TypeScript too
+#: (``useFeatureFlag<T>(key, defaultValue: T): T``).
+SYNC_PACKAGE_EXPORTS: dict[str, dict[str, int | None]] = {
+    "@growthbook/growthbook-react": {"useFeatureIsOn": None, "useFeatureValue": 1},
+}
+
+
+def _audited_sync_call(expr: Node, tree: Node, path: str, repo_dir: str) -> bool:
+    """Whether ``expr`` is a call of an export of :data:`SYNC_PACKAGE_EXPORTS`.
+
+    The callee is a plain name bound once in the file, by a value import of
+    that export from its package (aliased or not), and no compiler config can
+    read the package's name as a file of the checkout
+    (:func:`cross_file_ts.names_package`). In a JavaScript file an argument
+    the export may hand back must be a primitive literal."""
+    from flag_cleanup import cross_file_ts, inert_calls, ts_scope
+
+    while expr.type == "parenthesized_expression" and expr.named_children:
+        expr = expr.named_children[0]
+    if expr.type != "call_expression" or any(c.type == "?." for c in expr.children):
+        return False
+    callee = expr.child_by_field_name("function")
+    if callee is None or callee.type != "identifier":
+        return False
+    binders = ts_scope.bindings(tree, _text(callee))
+    if len(binders) != 1:
+        return False
+    imported = inert_calls._imported(binders[0])
+    if imported is None:
+        return False
+    specifier, name = imported
+    exports = SYNC_PACKAGE_EXPORTS.get(specifier)
+    if exports is None or name not in exports:
+        return False
+    handed_back = exports[name]
+    if handed_back is not None and _EXTENSIONS.get(Path(path).suffix) == "js":
+        args = expr.child_by_field_name("arguments")
+        items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+        if len(items) <= handed_back or items[handed_back].type not in _PRIMITIVE_NODES - {"template_string"}:
+            return False
+    return cross_file_ts.names_package(path, specifier, repo_dir)
 
 
 def _only_reads(expr: Node | None) -> bool:
@@ -299,10 +368,20 @@ _TEST_FILE = re.compile(r"(\.(test|spec)\.[cm]?[jt]sx?$)|(/__tests__/)")
 _TEST_DIRECTORY = re.compile(r"(?:\A|/)(?:tests?|__mocks__|fixtures|__fixtures__)/")
 
 
-def _is_test_double(value: Node | None) -> bool:
-    """``sinon.stub(..)``, ``jest.fn()``, ``vi.fn().mockResolvedValue(..)``, ``x.spyOn(..)``."""
+#: Packages whose ``fn``/``spyOn``, imported by name, make the same spy as
+#: ``vi.fn``/``jest.fn``: Storybook re-exports Vitest's.
+_TEST_DOUBLE_PACKAGES = frozenset({"storybook/test", "@storybook/test", "@vitest/spy", "jest-mock"})
+
+
+def _is_test_double(value: Node | None, imported_double: Callable[[Node], bool] | None = None) -> bool:
+    """``sinon.stub(..)``, ``jest.fn()``, ``vi.fn().mockResolvedValue(..)``,
+    ``x.spyOn(..)``, and, given ``imported_double``, a call of a name it
+    proves is a test library's (``fn(..).mockName(..)``, see
+    :func:`_imported_test_double`)."""
     while value is not None and value.type == "call_expression":
         callee = value.child_by_field_name("function")
+        if callee is not None and callee.type == "identifier" and imported_double is not None:
+            return imported_double(callee)
         if callee is None or callee.type != "member_expression":
             return False
         prop = callee.child_by_field_name("property")
@@ -312,19 +391,238 @@ def _is_test_double(value: Node | None) -> bool:
     return False
 
 
-def _possibly_async(node: Node) -> bool | None:
+def _imported_test_double(callee: Node, tree: Node, path: str, repo_dir: str) -> bool:
+    """Whether ``callee`` names ``fn`` or ``spyOn`` of :data:`_TEST_DOUBLE_PACKAGES`,
+    bound once in the file by a value import of it from the package."""
+    from flag_cleanup import cross_file_ts, inert_calls, ts_scope
+
+    binders = ts_scope.bindings(tree, _text(callee))
+    imported = inert_calls._imported(binders[0]) if len(binders) == 1 else None
+    return (
+        imported is not None
+        and imported[0] in _TEST_DOUBLE_PACKAGES
+        and imported[1] in ("fn", "spyOn")
+        and cross_file_ts.names_package(path, imported[0], repo_dir)
+    )
+
+
+#: Calls of a global that always return a primitive, when the file binds
+#: no other value to the name.
+_PRIMITIVE_GLOBALS = frozenset({"Boolean", "String", "Number"})
+
+
+def _not_callable(expr: Node | None, tree: Node, depth: int = 0) -> bool:
+    """Whether ``expr`` can never evaluate to a function.
+
+    A primitive (:func:`_certainly_boolean`), an object or array literal,
+    ``Boolean(x)``/``String(x)``/``Number(x)`` when the file binds none of
+    those names, ``a && b`` when ``b`` cannot (a function is truthy, so
+    ``a`` is the result only when it is not one), ``a || b``, ``a ?? b`` or
+    a ternary when no operand that can be the result can, and a name bound
+    once in the file by a ``const`` whose value cannot, or whose declared type
+    is a primitive. Nothing else: a ``let``, a parameter or a property can be
+    given a function later."""
+    while expr is not None and expr.type in ("parenthesized_expression", "non_null_expression") and expr.named_children:
+        expr = expr.named_children[0]
+    if expr is None or depth > 8:
+        return False
+    if _certainly_boolean(expr) or expr.type in ("object", "array"):
+        return True
+    if expr.type == "binary_expression":
+        operator = _text(expr.child_by_field_name("operator"))
+        right = _not_callable(expr.child_by_field_name("right"), tree, depth + 1)
+        if operator == "&&":
+            return right
+        return operator in ("||", "??") and right and _not_callable(expr.child_by_field_name("left"), tree, depth + 1)
+    if expr.type == "ternary_expression":
+        return _not_callable(expr.child_by_field_name("consequence"), tree, depth + 1) and _not_callable(
+            expr.child_by_field_name("alternative"), tree, depth + 1
+        )
+    if expr.type == "call_expression":
+        callee = expr.child_by_field_name("function")
+        return (
+            callee is not None
+            and callee.type == "identifier"
+            and _text(callee) in _PRIMITIVE_GLOBALS
+            and not _bound_anywhere(tree, _text(callee))
+        )
+    if expr.type == "identifier":
+        from flag_cleanup import ts_scope
+
+        binders = ts_scope.bindings(tree, _text(expr))
+        if len(binders) != 1:
+            return False
+        holder = binders[0].parent
+        if holder is None:
+            return False
+        annotation = holder.child_by_field_name("type")
+        if holder.type != "variable_declarator" or holder.child_by_field_name("name") != binders[0]:
+            return False
+        if not _const_declarator(holder):
+            return False
+        if annotation is not None:
+            return _primitive_return(annotation)
+        return _not_callable(holder.child_by_field_name("value"), tree, depth + 1)
+    return False
+
+
+def _const_declarator(node: Node) -> bool:
+    """Whether ``node`` is a declarator of a ``const``: the one declaration
+    whose value nothing can replace. A ``let``, a parameter, a property, a
+    field (``readonly`` or not) and an interface member can all be given a
+    function by a write this scan may not see."""
+    lexical = node.parent if node.type == "variable_declarator" else None
+    return lexical is not None and lexical.type == "lexical_declaration" and any(
+        c.type == "const" for c in lexical.children
+    )
+
+
+#: Calls that define a property from a descriptor: ``(target, key, desc)``.
+_DEFINE_PROPERTY = frozenset({"Object.defineProperty", "Reflect.defineProperty"})
+_ASSIGNMENTS = frozenset({"assignment_expression", "augmented_assignment_expression"})
+
+
+def _callee_text(call: Node) -> str:
+    callee = call.child_by_field_name("function")
+    return _text(callee).replace(" ", "") if callee is not None else ""
+
+
+def _descriptor_possibly_async(descriptor: Node | None, not_callable: Callable[[Node], bool] | None) -> bool | None:
+    """A property descriptor may define a function unless it is an object
+    literal of plain ``value``/``writable``/``enumerable``/``configurable``
+    keys whose ``value``, if any, cannot be a function. A getter can return
+    anything."""
+    if descriptor is None or descriptor.type != "object":
+        return True
+    for prop in descriptor.named_children:
+        if prop.type == "comment":
+            continue
+        key = prop.child_by_field_name("key") if prop.type == "pair" else None
+        if key is None or _text(key).strip("'\"") not in ("value", "writable", "enumerable", "configurable"):
+            return True
+        if _text(key).strip("'\"") == "value" and not (not_callable is not None and not_callable(prop.child_by_field_name("value"))):
+            return True
+    return None
+
+
+def _written_value_possibly_async(
+    value: Node | None,
+    sync_call: Callable[[Node], bool] | None,
+    imported_double: Callable[[Node], bool] | None,
+    not_callable: Callable[[Node], bool] | None,
+) -> bool | None:
+    """What a write gives the name (``o.enabled = <value>``), judged as a
+    declarator's value is: a function by its ``async`` token, return type or
+    returns, a test double or a value that cannot be a function by nothing,
+    anything else as possibly async."""
+    if value is None:
+        return True
+    if value.type in _FUNCTION_VALUES:
+        if _has_async_token(value):
+            return True
+        rtype = value.child_by_field_name("return_type")
+        if rtype is not None:
+            return not _primitive_return(rtype)
+        return not _returns_only_booleans(value, sync_call)
+    if _is_test_double(value, imported_double):
+        return None
+    if not_callable is not None and not_callable(value):
+        return None
+    return True
+
+
+def _write_of(node: Node, name: str) -> tuple[str, Node | None] | None:
+    """How ``node`` writes ``name``, when it does: ``("binding", value)`` for
+    ``name = value`` (``||=`` and friends too), ``("member", value)`` for
+    ``x.name = value``, ``x["name"] = value``,
+    ``Object.defineProperty(x, "name", desc)`` (the value is then the
+    descriptor). A write whose key cannot be read (``x[k] = v``) adds no
+    declaration, and no declaration it could replace is exempt
+    (:func:`_const_declarator`)."""
+    if node.type in _ASSIGNMENTS:
+        left = node.child_by_field_name("left")
+        while left is not None and left.type in ("parenthesized_expression", "non_null_expression") and left.named_children:
+            left = left.named_children[0]
+        value = node.child_by_field_name("right")
+        if left is None:
+            return None
+        if left.type == "identifier":
+            return ("binding", value) if _text(left) == name else None
+        if left.type == "member_expression":
+            prop = left.child_by_field_name("property")
+            return ("member", value) if prop is not None and _text(prop) == name else None
+        if left.type == "subscript_expression":
+            index = left.child_by_field_name("index")
+            literal = index is not None and index.type == "string"
+            if not literal:
+                return None
+            return ("member", value) if _text(index)[1:-1] == name else None
+        return None
+    if node.type == "call_expression" and _callee_text(node) in _DEFINE_PROPERTY:
+        args = node.child_by_field_name("arguments")
+        items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+        if len(items) < 2 or items[1].type != "string":
+            return None
+        if _text(items[1])[1:-1] != name:
+            return None
+        return ("member", items[2] if len(items) > 2 else None)
+    return None
+
+
+def _declared_scope(declaration: Node) -> Node | None:
+    """The node a declaration's name is certainly visible throughout: a
+    ``let``/``const``'s enclosing block or statement, a ``var``'s enclosing
+    function (or the file), a ``function`` declaration's enclosing block.
+    An ``export`` around one is looked through."""
+    if declaration.type == "variable_declarator":
+        holder = declaration.parent
+        if holder is None:
+            return None
+        if holder.type == "variable_declaration":  # `var`
+            current = holder.parent
+            while current is not None and current.type not in _FUNCTION_NODES and current.type != "program":
+                current = current.parent
+            return current
+        scope = holder.parent
+    else:
+        scope = declaration.parent
+    if scope is not None and scope.type == "export_statement":
+        scope = scope.parent
+    return scope
+
+
+def _bound_anywhere(tree: Node, name: str) -> bool:
+    from flag_cleanup import ts_scope
+
+    return bool(ts_scope.bindings(tree, name))
+
+
+def _possibly_async(
+    node: Node,
+    sync_call: Callable[[Node], bool] | None = None,
+    imported_double: Callable[[Node], bool] | None = None,
+    not_callable: Callable[[Node], bool] | None = None,
+) -> bool | None:
     """Whether a declaration of the name is, or could be, async. None: says nothing.
 
     Possibly async UNLESS it has an explicit return type that is ``boolean`` or
     another primitive (or a union of them), or is a non-``async`` function
-    whose every returned expression is certainly a primitive. A value that is a
-    reference, a call, an alias or a returned local, or a ternary or ``&&``
-    with such an arm, all count as possibly async.
+    whose every returned expression is certainly a primitive or, given
+    ``sync_call``, a call it proves returns no Promise
+    (:func:`_audited_sync_call`). A value that is a reference, any other call,
+    an alias or a returned local, or a ternary or ``&&`` with such an arm, all
+    count as possibly async.
+
+    A ``const`` whose value cannot be a function says nothing, since no read
+    calls it and nothing can replace it: one ``not_callable`` proves
+    (:func:`_not_callable`), or one whose declared type is a primitive
+    (``const enabled: boolean = …``). Every other declaration of the name
+    counts: a property, field or interface member whatever its value.
     """
     if node.type in _VALUE_KINDS:
         value = node.child_by_field_name("value")
         annotation = node.child_by_field_name("type")
-        if _is_test_double(value):
+        if _is_test_double(value, imported_double):
             return None
         ftype = _function_type(annotation)
         if value is not None and value.type in _FUNCTION_VALUES:
@@ -337,6 +635,11 @@ def _possibly_async(node: Node) -> bool | None:
                 return _jsdoc_promise(node) or not _primitive_return(ftype.child_by_field_name("return_type"))
             if annotation is None and value is None:
                 return None
+            if _const_declarator(node):
+                if annotation is not None and _primitive_return(annotation):
+                    return None  # `const enabled: boolean = …`: never called
+                if annotation is None and not_callable is not None and not_callable(value):
+                    return None  # `const enabled = opts.enabled !== false`: never called
             return True
     else:
         subject = node
@@ -347,7 +650,7 @@ def _possibly_async(node: Node) -> bool | None:
         return not _primitive_return(rtype)
     if node.type in _SIGNATURE_KINDS:
         return True
-    return not _returns_only_booleans(subject)
+    return not _returns_only_booleans(subject, sync_call)
 
 
 #: Text that can make or name a Promise, a thenable or a getter (whose read runs code).
@@ -659,32 +962,105 @@ class _Repo:
         from flag_cleanup.piranha_runner import _SKIP_DIRS, source_files
 
         self.accessors = accessors
+        #: Every declaration of the name that may be async, whatever it is,
+        #: and where the first one is: what a member read may call.
         self.possibly_async: dict[str, bool] = defaultdict(bool)
+        self.async_at: dict[str, tuple[str, int]] = {}
+        #: The same, of bindings only: all a bare ``name(...)`` read can call.
+        self.binding_async: dict[str, tuple[str, int]] = {}
         self.trees: dict[str, Node] = {}
         root = Path(repo_dir)
         files = [root] if root.is_file() else source_files(root, _EXTENSIONS, _SKIP_DIRS)
+        sources = []
         for path in files:
             tree = self.tree(str(path))
             if tree is None:
                 continue
             if _TEST_FILE.search(str(path).replace("\\", "/")):
                 continue  # a test file's fakes say nothing about the production accessor
+            sources.append((path, tree))
+        for path, tree in sources:
             support = root.is_dir() and _TEST_DIRECTORY.search(path.relative_to(root).as_posix()) is not None
+            shown = str(path.relative_to(root)) if root.is_dir() else path.name
+
+            def note(name: str, node: Node, binding: bool) -> None:
+                at = (shown, node.start_point[0] + 1)
+                self.possibly_async[name] = True
+                self.async_at[name] = min(self.async_at.get(name, at), at)
+                if binding:
+                    self.binding_async[name] = min(self.binding_async.get(name, at), at)
+
             for node in ts_syntax._walk(tree):
                 if node.type in _CALLABLE_KINDS or node.type in _VALUE_KINDS:
                     name = _name_of(node)
                     if name in accessors:
-                        verdict = _possibly_async(node)
+                        verdict = _possibly_async(
+                            node,
+                            lambda call, tree=tree, path=path: _audited_sync_call(call, tree, str(path), repo_dir),
+                            lambda callee, tree=tree, path=path: _imported_test_double(callee, tree, str(path), repo_dir),
+                            lambda value, tree=tree: _not_callable(value, tree),
+                        )
                         if verdict and support and _a_fake(node, tree):
                             verdict = None  # a fake in test support code that only reads
-                        if verdict is not None:
-                            self.possibly_async[name] = self.possibly_async[name] or verdict
+                        if verdict:
+                            note(name, node, node.type in _BINDING_KINDS)
+                if node.type in _ASSIGNMENTS or node.type == "call_expression":
+                    # A write is a declaration too (`o.enabled = async …`,
+                    # `exports.enabled = …`, `enabled = asyncFn`), judged on
+                    # what it writes.
+                    for name in accessors:
+                        write = _write_of(node, name)
+                        if write is None:
+                            continue
+                        kind, value = write
+                        if node.type == "call_expression":
+                            verdict = _descriptor_possibly_async(value, lambda v, tree=tree: _not_callable(v, tree))
+                        else:
+                            verdict = _written_value_possibly_async(
+                                value,
+                                lambda call, tree=tree, path=path: _audited_sync_call(call, tree, str(path), repo_dir),
+                                lambda callee, tree=tree, path=path: _imported_test_double(callee, tree, str(path), repo_dir),
+                                lambda v, tree=tree: _not_callable(v, tree),
+                            )
+                        if verdict:
+                            note(name, node, kind == "binding")
                 elif node.type == "shorthand_property_identifier_pattern" and _text(node) in accessors:
-                    self.possibly_async[_text(node)] = True  # `const { isEnabled } = api`
+                    note(_text(node), node, True)  # `const { isEnabled } = api`
                 elif node.type == "export_specifier":
                     alias = node.child_by_field_name("alias")
                     if alias is not None and _text(alias) in accessors:
-                        self.possibly_async[_text(alias)] = True
+                        note(_text(alias), node, True)
+
+    def locally_declared(self, path: str, use: Node) -> bool:
+        """Whether ``use``, a bare name, means a ``const``, ``let``, ``var``
+        or ``function`` declaration of its own file: every binding of the
+        name there is one (no import, parameter or assignment, which can
+        hand it anything), and ``use`` sits inside the scope of one of them
+        (:func:`_declared_scope`). Otherwise it may mean a global, which
+        any module can set."""
+        from flag_cleanup import ts_scope
+
+        tree = self.tree(path)
+        if tree is None:
+            return False
+        binders = ts_scope.bindings(tree, _text(use))
+        if not binders or not all(
+            b.parent is not None
+            and b.parent.type in ("variable_declarator", "function_declaration")
+            and b.parent.child_by_field_name("name") == b
+            for b in binders
+        ):
+            return False
+        return any(
+            (scope := _declared_scope(b.parent)) is not None
+            and scope.start_byte <= use.start_byte
+            and use.end_byte <= scope.end_byte
+            for b in binders
+        )
+
+    def has_with(self, path: str) -> bool:
+        tree = self.tree(path)
+        return tree is None or any(n.type == "with_statement" for n in ts_syntax._walk(tree))
 
     def tree(self, path: str) -> Node | None:
         key = str(Path(path).resolve())
@@ -1096,8 +1472,14 @@ def decide(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> t
         return LITERAL, ""
     if kind == "other":
         return LEAVE, "the receiver's declared type gives it no explicit boolean or Promise return type"
-    if repo.possibly_async.get(accessor):
-        return LEAVE, f"a declaration of {accessor} in the repository is, or could be, async"
+    # A bare call of a name the file itself declares reaches only a binding
+    # of the name, unless a `with` makes any object's member one. An
+    # imported name is whatever the module exports, members of an exported
+    # object (`module.exports = { enabled }`) included.
+    bare = callee.type == "identifier" and not repo.has_with(path) and repo.locally_declared(path, callee)
+    at = repo.binding_async.get(accessor) if bare else repo.async_at.get(accessor)
+    if at is not None:
+        return LEAVE, f"a declaration of {accessor} in the repository is, or could be, async ({at[0]}:{at[1]})"
     return LITERAL, ""
 
 

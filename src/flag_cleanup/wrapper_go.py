@@ -19,7 +19,8 @@ a call reaches, and nothing can override it. What Go has instead:
   never deleted (:func:`keep`).
 * **Packages, not classes.** A function is called bare in its own package
   (same directory, same ``package`` clause) or through an import of the
-  package's path, which the nearest ``go.mod`` decides
+  package's path, which the nearest ``go.mod`` decides, and from another
+  module only when every build of it reads this checkout's copy
   (:mod:`flag_cleanup.go_module`). Scopes and receiver types are in
   :mod:`flag_cleanup.go_scope`.
 

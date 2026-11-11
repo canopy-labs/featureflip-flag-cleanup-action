@@ -92,6 +92,7 @@ from flag_cleanup import (
     dart_field_removal,
     cross_file_dart,
     cross_file_keys,
+    unused,
     csharp_gates,
     cross_file_kotlin,
     cross_file_php,
@@ -136,6 +137,7 @@ from flag_cleanup import (
     comment_sentences,
     stale_comments,
     ts_barrels,
+    ts_key_names,
     ts_bound_overrides,
     ts_constant_params,
     ts_constant_props,
@@ -1124,13 +1126,21 @@ def _names_key(text: str, flag_key: str, path: str) -> bool:
     In the TypeScript family a key inside a module specifier is a path, not a
     mention: counting it made a ``.tsx`` file importing ``./old-checkout`` a
     holder of the key for the ``tsx`` run (which has no declaration for it) and
-    kept the ``ts`` run from admitting it as a sibling reader.
+    kept the ``ts`` run from admitting it as a sibling reader. A
+    ``key-aliases`` spelling found only as a NAME (``Keys.IS_X`` off an
+    imported ``Keys``, where the code key is ``IS_X``, held as
+    ``IS_X = 'IS_X'``) is not a mention either, for the same reason: such a
+    file reads the key through the declaration (see
+    :mod:`flag_cleanup.ts_key_names`).
     """
     if flag_key not in text:
         return False
     if not path.endswith(_TS_FAMILY_SUFFIXES):
         return True
-    return flag_key in ts_barrels.without_specifiers(text, path)
+    text = ts_barrels.without_specifiers(text, path)
+    if flag_key not in text:
+        return False
+    return not ts_key_names.aliased(flag_key) or flag_key in ts_key_names.without_names(text, path)
 
 
 def _load_argument_flags(base: str) -> dict[str, object]:
@@ -1913,7 +1923,9 @@ def transform_flag(
     # One listing of the checkout for every scan this transform makes, and for
     # the retry: nothing here adds or removes a file. Inside a run's scope,
     # the run's listing.
-    with source_index.run_scope(), source_index.forgetting():
+    with source_index.run_scope(), source_index.forgetting(), unused.prose_blind_scope(), ts_key_names.declaring(
+        code_keys
+    ):
         try:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
@@ -2338,6 +2350,10 @@ def _transform_flag(
     # pre-pass like any other read: it marks each call whose first argument is
     # one of the texts the resolution proved names this flag's key there.
     proven = _proven_readers(resolution, paths + sibling_readers)
+    # The stranded-binding pass counts a comment as a use of an import. For a
+    # key constant these readers import, that would keep an import naming a
+    # declaration the run may delete, and refuse the flag over prose.
+    unused.blind_prose(_key_constant_locals(resolution, language))
 
     # KEYLESS WRAPPERS -- a member whose whole body is a read this run folds,
     # inlined at every call site the file itself proves is bound to it. On
@@ -3058,6 +3074,21 @@ def _transform_flag(
     # flag, or a C# family type it deleted. Last of the edits, so it judges
     # the bytes that stay on disk; before Gate 1, which judges its output too.
     cut_rows: dict[str, set[str]] = {}
+    # A TypeScript key constant the run deleted is a removed name too: a
+    # comment that says nothing but it described a declaration that is gone.
+    # Only in the files that could reach that declaration: the name is not
+    # unique, and another module's `FLAG_KEY` is still there.
+    deleted_constants = (
+        ts_key_survivors.deleted_names(
+            [s for s in summaries if s.original_content != s.content],
+            repo_dir,
+            flag_key,
+            lambda p: _grammar_of(p, language),
+            file_deletion.deleted,
+        )
+        if language in ("ts", "tsx", "js")
+        else {}
+    )
     summaries, comment_rows, wrapper_rows = _remove_stale_comments(
         summaries,
         paths,
@@ -3070,6 +3101,7 @@ def _transform_flag(
         repo_dir,
         treatment=treatment,
         cut_rows=cut_rows,
+        constant_names=deleted_constants,
     )
     bindings = bindings + comment_rows
 
@@ -4149,9 +4181,12 @@ def _remove_stale_comments(
     *,
     treatment: bool = True,
     cut_rows: dict[str, set[str]] | None = None,
+    constant_names: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[list, tuple[tuple[str, str, str], ...], list]:
-    """Delete each comment that only described the flag or a deleted family
-    type, with a ``(path, "removed comment", text)`` row for each. See
+    """Delete each comment that only described the flag, a deleted family
+    type or a deleted key constant, with a ``(path, "removed comment", text)``
+    row for each. ``constant_names`` maps a resolved path to the deleted
+    constants a comment THERE can name (the name is not unique). See
     :mod:`flag_cleanup.stale_comments`.
 
     Only once nothing in this pass still reads the flag: while a file names
@@ -4191,7 +4226,14 @@ def _remove_stale_comments(
                 text = text_of(row.path)
                 if text is not None and not residue.live_mention(row.path, text, flag_key):
                     files.append(row.path)
-    names = stale_comments.names_pattern(flag_key, family_names)
+    patterns: dict[frozenset[str], re.Pattern[bytes]] = {}
+
+    def names_for(path: str) -> re.Pattern[bytes]:
+        constants = (constant_names or {}).get(str(Path(path).resolve()), frozenset())
+        if constants not in patterns:
+            patterns[constants] = stale_comments.names_pattern(flag_key, family_names, constants)
+        return patterns[constants]
+
     result = list(summaries)
     rows: list[tuple[str, str, str]] = []
     shifts: dict[str, object] = {}
@@ -4202,6 +4244,7 @@ def _remove_stale_comments(
         before = text_of(path)
         if before is None:
             continue
+        names = names_for(path)
         after, removals = stale_comments.rewrite(before, grammar, names)
         # What is left of a comment that says more than the removed name:
         # its other sentences, once the ones naming it are cut.
@@ -5113,8 +5156,22 @@ def _barrel_resolver(repo_dir: str):
 
     stop = cross_file_ts._stop_for(repo_dir)
     return lambda from_file, specifier: cross_file_ts._resolve(
-        str(Path(from_file).resolve()), specifier, stop
+        str(Path(from_file).resolve()), specifier, stop, workspace=True
     )
+
+
+def _key_constant_locals(
+    resolution: cross_file_keys.Resolution, language: str
+) -> dict[str, frozenset[str]]:
+    """Per proven TypeScript-family reader (resolved), the local names its
+    plain reads of a key constant from another file are spelled with."""
+    if not cross_file_keys.family(language) & {"ts", "tsx", "js"}:
+        return {}
+    return {
+        path: names
+        for path, refs in resolution.readers.items()
+        if (names := frozenset(r.member for r in refs if r.owner is None and r.declaration is None))
+    }
 
 
 def _proven_readers(

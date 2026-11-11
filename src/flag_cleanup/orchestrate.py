@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, go_setters, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, removed_refusals, ruby_owner_reach, source_index, wildcard_stubs
+from flag_cleanup import git_ops, github_ops, go_setters, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, removed_refusals, ruby_owner_reach, source_index, ts_key_names, ts_workspace, wildcard_stubs
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -471,7 +471,9 @@ def run(
         # The declared side-effect-free modules hold for the same span.
         with source_index.run_scope(), inert_load.declaring(
             config.side_effect_free_modules
-        ), inert_calls.declaring(config.side_effect_free_calls), go_setters.declaring(config.test_setters):
+        ), inert_calls.declaring(config.side_effect_free_calls), go_setters.declaring(
+            config.test_setters
+        ), ts_key_names.declaring(config.code_keys()), ts_workspace.following(config.workspace_packages == "follow"):
             proposed = 0
             for candidate in resolved_client.removal_candidates(
                 config.org, config.project, config.staleness

@@ -96,9 +96,12 @@ from __future__ import annotations
 import codecs
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Iterator
 
 import tree_sitter_c_sharp
@@ -3979,15 +3982,21 @@ def _references_excluding_own_declaration(source: str, name: str, language: str)
     ``_own_binder_spans`` gives: a nested re-bind's initializer is a real
     read of the binding it shadows, and hiding it deletes live code.
     """
+    return references(_without_own_declaration(source, name, language), name, language)
+
+
+def _without_own_declaration(source: str, name: str, language: str) -> str:
+    """``source`` with the bound TOKEN of every declaration of ``name``
+    blanked (see :func:`_references_excluding_own_declaration`)."""
     spans = _own_binder_spans(source, name, language)
     if not spans:
         # Nothing to blank, and the text is the one already indexed: an
         # import is asked this once per name its library declares.
-        return references(source, name, language)
+        return source
     data = source.encode("utf-8")
     for start, end in spans:
         data = data[:start] + b" " * (end - start) + data[end:]
-    return references(data.decode("utf-8", "replace"), name, language)
+    return data.decode("utf-8", "replace")
 
 
 #: The node types, per language, whose subtree bounds ONE local-variable
@@ -5045,13 +5054,118 @@ def _delete_method(source: str, candidate: Candidate) -> str:
     return (data[:start] + data[end:]).decode("utf-8")
 
 
-def _import_references(source: str, candidate: Candidate, language: str) -> int:
-    """How often ``source`` spells any binding of the import ``candidate``."""
-    return sum(
-        _references_excluding_own_declaration(source, name, language)
-        - (_php_member_spellings(source, name) if language == "php" else 0)
-        for name in (candidate.names or (candidate.name,))
-    )
+#: Per resolved file path, the local names that bind a key constant declared
+#: in another file and proven read there (see :func:`blind_prose`). A comment
+#: spelling one of them does not keep its import. None outside a
+#: :func:`prose_blind_scope`.
+_PROSE_BLIND: ContextVar[dict[str, frozenset[str]] | None] = ContextVar(
+    "prose_blind_imports", default=None
+)
+
+#: The languages :func:`blind_prose` applies to.
+_PROSE_BLIND_LANGUAGES = frozenset({"ts", "tsx", "js"})
+
+_BRACED = re.compile(r"\{[^{}]*\}")
+
+#: A comment whose body opens like this is code to some checker: a Flow
+#: annotation (``/*: T */``), Flow code (``/*:: ... */``,
+#: ``/*flow-include ... */``).
+_CODE_COMMENT = re.compile(r"(?://+|/\*+)\s*(?::|flow-include\b)")
+
+#: Any JSDoc-style tag. Only the ones in :data:`_PROSE_TAGS` are prose.
+_COMMENT_TAG = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
+
+#: The tags whose text is prose to every checker: whatever follows them is
+#: never resolved as a type. Any other tag (``@type``, ``@this``, ``@enum``,
+#: ``@param``, ``@extends``, ``@typedef``, ``@link`` ...) may be one.
+_PROSE_TAGS = frozenset(
+    {"see", "deprecated", "todo", "example", "description", "remarks", "since", "author"}
+)
+
+
+@contextmanager
+def prose_blind_scope() -> Iterator[None]:
+    """One transform's scope for :func:`blind_prose`: nothing set inside it
+    outlives it, so one flag's names never reach the next flag's run."""
+    token = _PROSE_BLIND.set({})
+    try:
+        yield
+    finally:
+        _PROSE_BLIND.reset(token)
+
+
+def blind_prose(names: Mapping[str, frozenset[str]]) -> None:
+    """Make prose blind for these imports, for the rest of the enclosing
+    :func:`prose_blind_scope` (replacing what an earlier call set in it).
+
+    ``names`` maps a resolved path to the local names of the key constants
+    that file was proven to read from another file. Counting a comment as a
+    use costs a missed tidy everywhere else; for these imports it costs the
+    flag: the fold removes every read, the run may delete the declaration,
+    and the reader left importing it is refused whole. The comment itself is
+    the stale-comment passes' business.
+
+    A mention that may be a type still counts (see :func:`_prose_only`). In
+    a checked JavaScript file a JSDoc type is a real reference to the import,
+    and keeping that import refuses the flag, which is what happened before.
+    """
+    current = _PROSE_BLIND.get()
+    if current is None:
+        raise RuntimeError("blind_prose outside a prose_blind_scope")
+    current.clear()
+    current.update(names)
+
+
+def _unbraced(text: str) -> str:
+    """``text`` without anything inside braces, nested ones included. An
+    unmatched ``{`` hides the rest of the text: a JSDoc type wrapped across
+    lines of another comment is still a type."""
+    while True:
+        stripped = _BRACED.sub(" ", text)
+        if stripped == text:
+            break
+        text = stripped
+    return text.split("{", 1)[0]
+
+
+def _prose_only(comment: str) -> str:
+    """The part of ``comment`` whose mentions are only prose; empty unless
+    the comment is plainly prose.
+
+    WHITELIST. A comment counts as prose only if its body does not open as
+    a comment type (:data:`_CODE_COMMENT`) and every tag in it is one of
+    :data:`_PROSE_TAGS`. Any other comment is left to count in full as a use
+    of the name, as it did before. Inside a prose comment, a span in braces
+    (``{typeof K}``, ``{@link K}``) still counts too (:func:`_unbraced`)."""
+    if _CODE_COMMENT.match(comment):
+        return ""
+    if any(tag not in _PROSE_TAGS for tag in _COMMENT_TAG.findall(comment)):
+        return ""
+    return _unbraced(comment)
+
+
+def _prose_mentions(source: str, name: str, language: str) -> int:
+    """How often the comments of ``source`` spell ``name`` as prose only."""
+    _, prose = _reference_index(source, language)
+    word = re.compile(rf"\b{re.escape(name)}\b")
+    return sum(len(word.findall(_prose_only(text))) for text in prose)
+
+
+def _import_references(
+    source: str, candidate: Candidate, language: str, blind: frozenset[str] = frozenset()
+) -> int:
+    """How often ``source`` spells any binding of the import ``candidate``,
+    not counting prose that spells a name in ``blind``. Both counts read the
+    same text, the one with the name's own declarations blanked."""
+    total = 0
+    for name in candidate.names or (candidate.name,):
+        text = _without_own_declaration(source, name, language)
+        total += references(text, name, language)
+        if language == "php":
+            total -= _php_member_spellings(source, name)
+        if name in blind:
+            total -= _prose_mentions(text, name, language)
+    return total
 
 
 #: PHP nodes whose ``name`` field is a member of an object or class.
@@ -5225,6 +5339,11 @@ def remove_stranded_bindings(
         if language in {"ts", "tsx", "js"} and path is not None and root is not None
         else None
     )
+    blind = (
+        (_PROSE_BLIND.get() or {}).get(str(Path(path).resolve()), frozenset())
+        if language in _PROSE_BLIND_LANGUAGES and path is not None
+        else frozenset()
+    )
     removed: list[Candidate] = []
     current = after
     original = _parse(before, language)
@@ -5256,8 +5375,8 @@ def remove_stranded_bindings(
                 acted = True
                 break
             if candidate.kind == "import":
-                before_count = _import_references(before, candidate, language)
-                current_count = _import_references(current, candidate, language)
+                before_count = _import_references(before, candidate, language, blind)
+                current_count = _import_references(current, candidate, language, blind)
             else:
                 if not _bound_name_occurs_once_in_own_span(
                     candidate, current, language

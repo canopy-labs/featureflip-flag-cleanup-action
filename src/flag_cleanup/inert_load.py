@@ -55,7 +55,7 @@ from pathlib import Path
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import cross_file_ts
+from flag_cleanup import cross_file_ts, ts_workspace
 
 _DECLARATION_FILES = (".d.ts", ".d.mts", ".d.cts")
 #: The left side of a CommonJS export.
@@ -266,9 +266,13 @@ def _check_load(
         return
     if specifier in packages and cross_file_ts.names_package(reader, specifier, repo_dir):
         return
-    target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir, solution=True)
+    # A workspace package's source is the module its build loads, so it is
+    # read like a local one (`ts_workspace.resolve`).
+    target = cross_file_ts.resolve_specifier(reader, specifier, repo_dir, solution=True, workspace=True)
     if target is None or target.endswith(_DECLARATION_FILES):
         raise _NotInert
+    if not specifier.startswith((".", "/")) and ts_workspace.bundled(specifier, repo_dir):
+        raise _NotInert  # a bundle may load more than the source shows
     resolved = Path(target).resolve()
     if not resolved.is_relative_to(stop):
         raise _NotInert

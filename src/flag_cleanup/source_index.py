@@ -74,6 +74,9 @@ _links: dict[str, tuple[Path, ...]] | None = None
 #: Named per-run memos another module keeps (:func:`run_memo`), or ``None``
 #: outside :func:`run_scope`.
 _memos: dict[str, dict] | None = None
+#: Named memos that last as long as the innermost :func:`forgetting` scope
+#: and are dropped whenever it forgets a file (:func:`transform_memo`).
+_transform_memos: dict[str, dict] | None = None
 
 #: Single-file components: Vue, Svelte and Astro files, and MDX documents,
 #: script inside markup that no profile parses. Listed, but only for a caller
@@ -135,13 +138,25 @@ def forgetting() -> Iterator[None]:
     """Scope :func:`forget` to one transform: when it ends the files are
     back on disk (the transform's undo, or the commit's branch switch), so
     every listing holds them again."""
-    global _forgotten
-    saved = _forgotten
+    global _forgotten, _transform_memos
+    saved, saved_memos = _forgotten, _transform_memos
     _forgotten = set(saved or ())
+    _transform_memos = {}
     try:
         yield
     finally:
-        _forgotten = saved
+        _forgotten, _transform_memos = saved, saved_memos
+
+
+def transform_memo(name: str) -> dict | None:
+    """A dictionary for what depends on which files EXIST: it lasts as long as
+    the innermost :func:`forgetting` scope (one transform), is emptied when
+    that scope forgets a file, and outside one is :func:`run_memo`'s. The run
+    removes files only through :func:`forget` and adds none, so an answer
+    kept here is the one the files on disk would give."""
+    if _transform_memos is None:
+        return run_memo(name)
+    return _transform_memos.setdefault(name, {})
 
 
 def forget(paths: Iterable[str]) -> None:
@@ -153,6 +168,8 @@ def forget(paths: Iterable[str]) -> None:
     fresh, and git does not list a file that is gone from disk."""
     if _forgotten is not None:
         _forgotten.update(str(Path(p).resolve()) for p in paths)
+    if _transform_memos is not None:
+        _transform_memos.clear()
 
 
 #: ``(listing, forgotten, filtered)`` for each listing :func:`_present` has

@@ -44,7 +44,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_scope, ts_tests
+from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_scope, ts_tests, ts_workspace
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.ts_scope import text as _text
 
@@ -968,8 +968,14 @@ def _barrels(
         if any(c.type in ("namespace_export", "type") for c in node.children):
             continue
         spec = cross_file_ts._string_value(node.child_by_field_name("source"))
-        target = None if spec is None else cross_file_ts.resolve_specifier(path, spec, repo_dir)
-        if target is not None and str(Path(target).resolve()) in modules:
+        target = None if spec is None else cross_file_ts.resolve_specifier(path, spec, repo_dir, workspace=True)
+        package = ts_workspace.reach(spec, repo_dir) if target is None and spec is not None else None
+        if package is not None:
+            # Whoever imports it: its proven entry, or else any file of the
+            # package, which is followed like a barrel of each.
+            if any(package.reaches(m) for m in modules):
+                found.append((node.start_byte, node.end_byte))
+        elif target is not None and str(Path(target).resolve()) in modules:
             found.append((node.start_byte, node.end_byte))
     return found
 
@@ -2376,7 +2382,11 @@ def _accounted(use: Node, file: ts_scope.File, repo_dir: str) -> bool:
         )
     constructor = call.child_by_field_name("constructor") if call.type == "new_expression" else None
     imported = None if constructor is None or constructor.type != "identifier" else file.import_of(_text(constructor))
-    target = None if imported is None else cross_file_ts.resolve_specifier(file.path, imported.specifier, repo_dir)
+    target = (
+        None
+        if imported is None
+        else cross_file_ts.resolve_specifier(file.path, imported.specifier, repo_dir, workspace=True)
+    )
     text = None if target is None else _read(target)
     return text is not None and not _stubs(target, text)
 

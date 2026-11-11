@@ -310,11 +310,12 @@ class Packages:
 
     def imported(self, file: File, name: str) -> Import | None:
         """The import that binds ``name`` in ``file``, when it is a package of
-        ``file``'s own module.
+        this checkout: of ``file``'s own module, or of another module that
+        :func:`go_module.resolve` proves every build reads from here.
 
         An unaliased import binds its package clause. A compiling file has one
-        import per bound name, so a match here is the only one. An import of
-        another module never matches, even when it binds ``name``.
+        import per bound name, so a match here is the only one. An import that
+        does not resolve never matches, even when it binds ``name``.
         """
         if file.module is None:
             return None
@@ -327,15 +328,12 @@ class Packages:
             if alias in (".", "_"):
                 continue
             path = _text(path_node).strip('"`')
-            directory = file.module.directory(path)
-            if directory is None or not directory.is_dir():
+            directory = go_module.resolve(path, file.module, self.stop)
+            if directory is None:
                 continue
-            owner = go_module.module_of(directory, self.stop)
-            if owner is None or owner.go_mod != file.module.go_mod:
-                continue
-            clause = self._clause_of(directory.resolve())
+            clause = self._clause_of(directory)
             if clause is not None and (alias or clause) == name:
-                return Import(path, alias, directory.resolve(), clause)
+                return Import(path, alias, directory, clause)
         return None
 
     def resolve_type(self, node: Node, file: File) -> TypeRef | None:

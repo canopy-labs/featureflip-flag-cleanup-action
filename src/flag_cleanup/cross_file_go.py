@@ -23,9 +23,10 @@ group whose entries depend on their position, since a spec with no value
 repeats the expression above it and ``iota`` counts specs, or a group holding
 the key twice. A ``var`` is not a constant and is never offered.
 
-Refused, and the declaration kept: a read in a file of another module (a
-``replace`` directive or a workspace can make that import mean this directory
-or a published version), a read through a dot import, an import whose binding
+Refused, and the declaration kept: a read in a file of another module
+unless :func:`flag_cleanup.go_module.resolve` proves every build of it reads
+this directory (a ``replace`` directive, a workspace or a published version can
+each decide what the import means), a read through a dot import, an import whose binding
 the stranded-import cleanup cannot see (an unaliased path whose last segment,
 version suffix dropped, is not the package clause), a qualifier or a bare name
 a local declaration shadows, any mention other than the first argument of a
@@ -178,19 +179,35 @@ class _Target:
         self.import_path = None if self.module is None else self.module.import_path(self.directory)
 
     def named_by(self, imported: str, reader: _Reader) -> bool:
-        """Whether an import of ``imported`` in ``reader`` may be this
+        """Whether an import of ``imported`` in ``reader`` MAY be this
         package. The path is compared as written AND resolved from the
-        reader's module, since a symlinked directory gives a package a
-        second import path. Without a module it may be any import."""
+        reader's module, since a symlinked directory or a ``replace`` gives a
+        package a second import path. Without a module it may be any import.
+
+        This must over-approximate: a read it misses is neither proven nor
+        refused, and the declaration it still needs is deleted. So it is
+        ``False`` only when every build is proven to read another directory,
+        or none could read this one."""
         if self.import_path is None or imported == self.import_path:
             return True
         if reader.module is None:
             return False
-        directory = reader.module.directory(imported)
         try:
-            return directory is not None and directory.resolve() == self.directory
-        except OSError:
+            proven = go_module.resolve(imported, reader.module, reader.stop)
+            if proven is not None:
+                return proven == self.directory
+            possible = go_module.may_read(imported, reader.module, reader.stop)
+        except (OSError, RuntimeError):
             return True
+        return possible is None or self.directory in possible
+
+    def built_from(self, imported: str, reader: _Reader) -> bool:
+        """Whether every build of ``reader`` reads this package's directory
+        for ``imported``: its own module's, or another module's that the
+        ``go.mod`` and every workspace resolve to this checkout alike."""
+        if self.import_path is None or reader.module is None:
+            return False
+        return go_module.resolve(imported, reader.module, reader.stop) == self.directory
 
 
 def _read_call(node: Node, accessors: frozenset[str]) -> Node | None:
@@ -392,12 +409,12 @@ def references(path, source, declarations, accessors, repo_dir):
             ]
             if not binds:
                 continue
-            if spot.import_path is None or reader.module is None or reader.module.go_mod != spot.module.go_mod:
+            imported, alias = binds[0]
+            if not spot.built_from(imported, reader):
                 # A file of another module (or a package outside any) may
                 # import a published version of the path instead.
                 refused.append(xk.refusal(path, node, xk.IMPORT_UNRESOLVED, source))
                 break
-            imported, alias = binds[0]
             if not name[:1].isupper() or (alias is None and go_import_name(imported) != spot.clause):
                 # Unexported names do not cross packages; an import whose
                 # name the stranded-import cleanup would guess wrong is left

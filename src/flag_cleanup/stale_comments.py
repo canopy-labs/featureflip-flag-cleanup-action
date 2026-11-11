@@ -113,15 +113,21 @@ class Removal:
     text: str
 
 
-def names_pattern(flag_key: str, type_names: Iterable[str] = ()) -> re.Pattern[bytes]:
-    """Every spelling of a removed name: the key as a whole token, and each
-    deleted type, qualified or not, with any member read off it."""
+def names_pattern(
+    flag_key: str, type_names: Iterable[str] = (), constant_names: Iterable[str] = ()
+) -> re.Pattern[bytes]:
+    """Every spelling of a removed name: the key as a whole token, each
+    deleted type, qualified or not, with any member read off it, and each
+    deleted constant as a bare word only. A constant's name is not unique
+    (``FLAG_KEY`` in every module), so ``other.FLAG_KEY`` is someone else's."""
     key = re.escape(flag_key.encode())
     alternatives = [rb"(?<![\w.-])" + key + rb"(?![\w-])(?!\.\w)"]
     for name in sorted(type_names):
         alternatives.append(
             rb"(?<![\w.])(?:[A-Za-z_]\w*\.)*" + re.escape(name.encode()) + rb"(?!\w)(?:\.\w+)*"
         )
+    for name in sorted(set(constant_names) - set(type_names)):
+        alternatives.append(rb"(?<![\w.$])" + re.escape(name.encode()) + rb"(?![\w$])(?!\.\w)")
     return re.compile(b"|".join(alternatives))
 
 

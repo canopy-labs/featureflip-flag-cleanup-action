@@ -91,7 +91,7 @@ from pathlib import Path
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import key_const, key_const_visibility, rule_synthesis, source_index, ts_barrels, ts_syntax
+from flag_cleanup import key_const, key_const_visibility, rule_synthesis, source_index, ts_barrels, ts_enum_spread, ts_key_names, ts_syntax
 
 #: Callees whose FIRST argument the reader rules rewrite. `getBooleanValue`
 #: only when awaited: the bare call is a `Promise<boolean>`, exactly as in
@@ -218,7 +218,11 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
     for const in consts:
         if not key_const_visibility.visible_key_consts([const], language):
             continue  # not exported: no other file can name it
-        found.append(xk.KeyDeclaration(path, const.name, None, path, holder=key_const.ts_is_holder(const)))
+        found.append(
+            xk.KeyDeclaration(
+                path, const.name, None, path, holder=key_const.ts_is_holder(const), key=flag_key
+            )
+        )
     entries, _refused = _enum_entries(path, root, source, flag_key)
     return found + entries
 
@@ -295,7 +299,8 @@ def _enum_entries(
                 continue
             found.append(
                 xk.KeyDeclaration(
-                    path, _text(name), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""})
+                    path, _text(name), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""}),
+                    key=flag_key,
                 )
             )
     for statement in root.named_children:
@@ -359,7 +364,8 @@ def _enum_entries(
                     continue
                 found.append(
                     xk.KeyDeclaration(
-                        path, _text(key), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""})
+                        path, _text(key), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""}),
+                        key=flag_key,
                     )
                 )
     return found, refused
@@ -419,9 +425,15 @@ def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
     so one there is reported, never folded. Inside an enum body a member is
     also named bare: ``Legacy = EnableX`` gives ``Flags.Legacy`` the key, and
     no read of ``Flags.Legacy`` is ever judged against the entry.
+
+    And the place keeping each of its key holders whose class's prototype
+    some file reaches (:func:`key_const.ts_prototype_refusals`): the holder
+    is never declared, so nothing else would say why its reads stay.
     """
     root = ts_syntax._parse(source, _language(path))
     found, refused = _enum_entries(path, root, source, flag_key)
+    for site in key_const.ts_prototype_refusals(path, root, source.encode("utf-8"), flag_key):
+        refused.append(xk.Refusal(site.path, site.line, xk.UNSUPPORTED_FORM, site.text))
     for decl in found:
         spellings = _member_spellings(root, decl.name) + [
             node
@@ -748,7 +760,15 @@ def _resolve(
     base_url: Callable[[str, str], bool] | None = None,
     strict: bool = True,
     solution: bool = False,
+    workspace: bool = False,
 ) -> str | None:
+    if workspace and not specifier.startswith((".", "/")):
+        found = _resolve(reader_path, specifier, stop, beside_declarations, base_url, strict, solution)
+        if found is not None:
+            return found
+        from flag_cleanup import ts_workspace
+
+        return ts_workspace.resolve(reader_path, specifier, stop)
     reader_dir = Path(reader_path).parent
     try:
         if specifier in (".", "..") or specifier.startswith(("./", "../")):
@@ -792,6 +812,7 @@ def resolve_specifier(
     beside_declarations: bool = False,
     base_url: Callable[[str, str], bool] | None = None,
     solution: bool = False,
+    workspace: bool = False,
 ) -> str | None:
     """The absolute path of the file ``specifier`` imports from ``reader_path``.
 
@@ -814,9 +835,14 @@ def resolve_specifier(
     package, which only the caller can rule out. ``solution`` reads a nearest
     config that delegates through ``references`` by the configs it names
     (:func:`_solution_options`); otherwise such a config answers nothing.
+    ``workspace`` lets a bare specifier nothing above resolves reach the
+    source of a workspace package of the checkout
+    (:func:`flag_cleanup.ts_workspace.resolve`); :func:`enum_module_pattern`
+    accounts for it.
     """
     return _resolve(
-        reader_path, specifier, _stop_for(repo_dir), beside_declarations, base_url, solution=solution
+        reader_path, specifier, _stop_for(repo_dir), beside_declarations, base_url, solution=solution,
+        workspace=workspace,
     )
 
 
@@ -1189,6 +1215,7 @@ def _import_bindings(
     modules: frozenset[str],
     enums: dict[tuple[str, str], dict[str, xk.KeyDeclaration]],
     through=None,
+    through_enum=None,
 ) -> list[_Binding]:
     top = statement.parent is not None and statement.parent.type == "program"
     type_only = any(c.type == "type" for c in statement.children)
@@ -1236,6 +1263,8 @@ def _import_bindings(
                         if decl is None and module is not None and (module, _text(imported)) in enums
                         else None
                     )
+                    if enum_of is None and decl is None and through_enum is not None and imported.type == "identifier":
+                        enum_of = through_enum(module, _text(imported))
                     found.append(
                         _Binding(
                             local,
@@ -1737,6 +1766,48 @@ def _aliases_of(repo_dir: str, names: frozenset[str]) -> set[str]:
     return found
 
 
+def _stamp(path: str) -> bytes | None:
+    """A digest of ``path``'s bytes; None when it cannot be read."""
+    import hashlib
+
+    try:
+        return hashlib.sha1(Path(path).read_bytes()).digest()
+    except OSError:
+        return None
+
+
+def _barrel_provider(module: str, name: str, stop: Path, outside) -> tuple[str, str] | None:
+    """:func:`flag_cleanup.ts_barrels.provider_of` through the resolver
+    :func:`references` uses, kept while no file it read changed: a package's
+    barrel is asked once per importer otherwise, and walking every
+    ``export *`` of a large one is the cost of the whole resolution.
+
+    The answer also depends on which files EXIST (a specifier's candidates),
+    so it is kept in a :func:`flag_cleanup.source_index.transform_memo`,
+    dropped whenever the transform deletes a file; the run creates none.
+    The contents of every module the walk read are checked by digest."""
+    memo = source_index.transform_memo("ts_barrel_providers")
+    key = (module, name, stop)
+    if memo is not None and key in memo:
+        end, stamps = memo[key]
+        if all(_stamp(p) == stamp for p, stamp in stamps):
+            return end
+    seen = {module}
+
+    def resolver(from_file: str, specifier: str) -> str | None:
+        seen.add(from_file)
+        target = _resolve(from_file, specifier, stop, workspace=True)
+        if target is not None:
+            seen.add(target)
+        return target
+
+    found = ts_barrels.provider_of(module, name, resolver, outside)
+    end = found if isinstance(found, tuple) else None
+    if memo is not None:
+        memo[key] = (end, [(p, _stamp(p)) for p in sorted(seen)])
+    return end
+
+
 def references(
     path: str,
     source: str,
@@ -1749,7 +1820,11 @@ def references(
     reads: list[xk.KeyReference] = []
     refused: list[xk.Refusal] = []
 
+    #: The nodes a read was proven or a refusal given at.
+    judged: set[int] = set()
+
     def refuse(node: Node, reason: str, entry: str = "") -> None:
+        judged.add(node.id)
         line = node.start_point[0]
         text = lines[line].strip() if line < len(lines) else ""
         refused.append(xk.Refusal(path, line + 1, reason, text, entry))
@@ -1794,30 +1869,42 @@ def references(
 
     def resolve(specifier: str) -> str | None:
         if specifier not in resolved:
-            resolved[specifier] = _resolve(path, specifier, stop)
+            resolved[specifier] = _resolve(path, specifier, stop, workspace=True)
         return resolved[specifier]
 
     def outside(from_file: str, specifier: str) -> bool:
         return package_outside(from_file, specifier, repo_dir)
 
-    followed: dict[tuple[str, str], xk.KeyDeclaration | None] = {}
+    # A barrel can hand on only one of these names: ours, an enum's, or one a
+    # barrel renames them to. Any other import is never followed.
+    owners = frozenset(owner for _module, owner in enums)
+    wanted = names | owners | _aliases_of(repo_dir, owners)
+
+    def provider(module: str | None, name: str) -> tuple[str, str] | None:
+        """``(module, name)`` of the declaration ``module`` re-exports as ``name``."""
+        if module is None or module in modules or name not in wanted:
+            return None
+        return _barrel_provider(module, name, stop, outside)
 
     def through(module: str | None, name: str) -> xk.KeyDeclaration | None:
         """The declaration ``name`` is when ``module`` is a barrel re-exporting it
         (under the same name or a renamed one)."""
-        if module is None or module in modules:
-            return None
-        if (module, name) not in followed:
-            end = ts_barrels.provider_of(module, name, lambda f, s: _resolve(f, s, stop), outside)
-            followed[(module, name)] = declared.get(end) if isinstance(end, tuple) else None
-        return followed[(module, name)]
+        end = provider(module, name)
+        return declared.get(end) if end is not None else None
+
+    def through_enum(module: str | None, name: str) -> tuple[str, str] | None:
+        """The enum ``name`` is when ``module`` is a barrel re-exporting it. Its
+        entries stay: the barrel's own re-export is an escape
+        (:func:`enum_escapes`), so only the reads through it fold."""
+        end = provider(module, name)
+        return end if end is not None and end in enums else None
 
     def generated(module: str | None, name: str) -> tuple[str, str] | None:
         """The ``(barrel, specifier)`` of a generated, absent hop on the way to ``name``."""
         if module is None or module in modules:
             return None
         return ts_barrels.generated_hop(
-            module, name, lambda f, s: _resolve(f, s, stop), lambda f, s: generated_target(f, s, repo_dir)
+            module, name, lambda f, s: _resolve(f, s, stop, workspace=True), lambda f, s: generated_target(f, s, repo_dir)
         )
 
     def generated_barrel(binding: _Binding, imported_name: str) -> bool:
@@ -1843,7 +1930,7 @@ def references(
         specifier = node.parent
         if node not in (specifier.child_by_field_name("name"), specifier.child_by_field_name("alias")):
             return False
-        resolver = lambda f, s: _resolve(f, s, stop)  # noqa: E731
+        resolver = lambda f, s: _resolve(f, s, stop, workspace=True)  # noqa: E731
         hop = ts_barrels.removable(specifier, path, resolver, set(declared), outside)
         if hop is None:
             return False
@@ -1904,7 +1991,7 @@ def references(
     bindings: list[_Binding] = []
     for node in _walk(root):
         if node.type == "import_statement":
-            bindings.extend(_import_bindings(node, resolve, declared, modules, enums, through))
+            bindings.extend(_import_bindings(node, resolve, declared, modules, enums, through, through_enum))
         elif node.type == "import_alias":
             name = next((c for c in node.named_children if c.type == "identifier"), None)
             if name is not None:
@@ -2017,10 +2104,28 @@ def references(
         target = _unwrap(obj)
         plain = obj is not None and target is not None and target.id == obj.id
         if target is not None and target.type == "member_expression":
-            return judge_qualified(node, _text(node), target, plain)
-        if target is None or target.type != "identifier":
+            if judge_qualified(node, _text(node), target, plain):
+                return True
+        elif target is None or target.type != "identifier":
             return False
-        return judge_owned(node, _text(node), target, plain, plain and _is_plain_member(parent))
+        elif judge_owned(node, _text(node), target, plain, plain and _is_plain_member(parent)):
+            return True
+        if spread_roots().reaches(obj):
+            # Read off an object that may spread the enum (`ax.features.X`,
+            # `useAnalytics().features.X`): no fold follows it, so it is named
+            # rather than skipped. The rest of the walk still judges it as a
+            # constant's mention.
+            for decl in sorted((m[_text(node)] for m in enums.values() if _text(node) in m), key=lambda d: d.entry):
+                refuse(node, xk.IMPORT_UNRESOLVED, decl.entry)
+        return False
+
+    roots_cache: list[ts_enum_spread.SpreadRoots] = []
+
+    def spread_roots() -> ts_enum_spread.SpreadRoots:
+        if not roots_cache:
+            owners = frozenset(owner for _module, owner in enums)
+            roots_cache.append(ts_enum_spread.SpreadRoots(root, path, owners, repo_dir))
+        return roots_cache[0]
 
     def judge_qualified(node: Node, member: str, qualifier: Node, plain: bool = False) -> bool:
         """Judge ``member`` of ``ns.Flags`` (``qualifier``); True when it was about an entry.
@@ -2060,6 +2165,7 @@ def references(
                 ):
                     owner = f"{_text(inner)}.{_text(owner_prop)}"
                     reads.append(xk.KeyReference(path, owner, member, "", decl))
+                    judged.add(node.id)
                 else:
                     refuse(node, xk.NOT_A_READ, decl.entry)
         elif inner is not None and inner.type == "identifier" and _text(inner) in namespace_locals:
@@ -2091,6 +2197,7 @@ def references(
                 refuse(node, xk.UNSUPPORTED_FORM, decl.entry)
             elif foldable and _is_read(node.parent, accessors, positioned=False):
                 reads.append(xk.KeyReference(path, local, member, "", decl))
+                judged.add(node.id)
             else:
                 refuse(node, xk.NOT_A_READ, decl.entry)
             return True
@@ -2452,6 +2559,7 @@ def references(
                 parent, accessors, holder=declared[(bound.namespace_of, _text(node))].holder
             ):
                 reads.append(xk.KeyReference(path, owner, _text(node)))
+                judged.add(node.id)
             else:
                 refuse(node, xk.NOT_A_READ)
             continue
@@ -2539,7 +2647,77 @@ def references(
 
     if refused:
         return [], refused
+    if _refuse_spelled_key(root, declarations + entries, judged, refuse, namespace_locals, unproven_reason):
+        # The file may still read the key off a flag map: folding its proven
+        # reads would leave that one live in a file that looks rewritten.
+        return [], refused
     return reads, refused
+
+
+def _key_spellings(root: Node, keys: frozenset[str]):
+    """Every property, destructured key or shorthand pattern spelling one of
+    ``keys``, with the node it is taken off (``None`` when unknown)."""
+    for node in _walk(root):
+        if node.type not in ("property_identifier", "shorthand_property_identifier_pattern"):
+            continue
+        if _text(node) not in keys:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if node.type == "shorthand_property_identifier_pattern":
+            yield node, _pattern_source(parent)
+        elif parent.type == "member_expression" and parent.child_by_field_name("property") == node:
+            yield node, parent.child_by_field_name("object")
+        elif parent.type == "pair_pattern" and parent.child_by_field_name("key") == node:
+            yield node, _pattern_source(parent.parent)
+
+
+def _pattern_source(pattern: Node | None) -> Node | None:
+    """The value an object pattern destructures, when it is a declarator's."""
+    if pattern is None or pattern.type != "object_pattern":
+        return None
+    holder = pattern.parent
+    if holder is not None and holder.type == "variable_declarator" and holder.child_by_field_name("name") == pattern:
+        return holder.child_by_field_name("value")
+    return None
+
+
+def _refuse_spelled_key(root, declarations, judged, refuse, namespace_locals, unproven_reason) -> bool:
+    """Refuse every spelling of the key itself as a property, a destructured
+    key or a shorthand pattern that was not proven to be a read of a
+    declaration (``Keys.IS_X``, ``ns.IS_X``) nor refused already.
+
+    ``flags.IS_X`` with ``IS_X`` the key: whatever the declarations are
+    called, that may read the key off a flag map (an imported JSON file, a
+    hook's result), which no rule rewrites. Labelled for the constants and
+    for every entry, so each declaration of the key stays. True when it
+    refused one.
+    """
+    # A `key-aliases` spelling only, like the holder test in
+    # `piranha_runner._names_key`: for any other key a property of that name
+    # (`cart.checkout()`, `props.search`) stays what it always was, residue.
+    keys = frozenset(d.key for d in declarations if d.key and ts_key_names.aliased(d.key))
+    if not keys:
+        return False
+    refused = False
+    labels = sorted({d.entry for d in declarations if d.kind == xk.ENUM_ENTRY})
+    if any(d.kind != xk.ENUM_ENTRY for d in declarations):
+        labels.insert(0, "")
+    for node, source in _key_spellings(root, keys):
+        if node.id in judged:
+            continue
+        taken = _unwrap(source)
+        if taken is None or taken.type != "identifier":
+            reason = xk.UNSUPPORTED_FORM
+        elif _text(taken) in namespace_locals:
+            reason = unproven_reason(_text(taken))
+        else:
+            reason = xk.IMPORT_UNRESOLVED
+        for label in labels:
+            refuse(node, reason, label)
+        refused = True
+    return refused
 
 
 def _imported_name(local: Node) -> str | None:
@@ -2653,8 +2831,10 @@ _MARKUP_LOADER = re.compile(_GLOB_LOADERS)
 #: A static specifier in a component's markup: ``from "./flags"`` or
 #: ``import "./flags"``, past any spaces and comments. Markup holds one when
 #: its code was cut short, as an Astro frontmatter is by a ``---`` line
-#: inside a template literal.
-_MARKUP_SPECIFIER = re.compile(r"""\b(?:from|import)(?:\s|/\*[\s\S]*?\*/|//[^\n]*)*(["'`])[^"'`\n]*\1""")
+#: inside a template literal. Quoted with ``'`` or ``"`` only: a static
+#: specifier is never a template literal, and prose quoting code after the
+#: word ("from `bg-{color}-600`", in an ``.mdx`` document) is not one.
+_MARKUP_SPECIFIER = re.compile(r"""\b(?:from|import)(?:\s|/\*[\s\S]*?\*/|//[^\n]*)*(["'])[^"'`\n]*\1""")
 _SCRIPT_OPEN = re.compile(r"<script\b", re.IGNORECASE)
 #: A whole ``<script ...>`` opening tag, past quoted attribute values.
 _SCRIPT_TAG = re.compile(r"""<script\b(?:[^>"']|"[^"]*"|'[^']*')*>""", re.IGNORECASE)
@@ -3048,8 +3228,11 @@ def enum_module_pattern(entries: tuple[xk.KeyDeclaration, ...], repo_dir: str) -
     configs above it. Through a ``paths`` alias
     it starts with the alias's text before its ``*``; an alias of nothing
     but ``*`` can name any file, and makes every file a candidate. A symlink
-    to the file is spelled by its own name. Over-matching only parses a file
-    that names none of them.
+    to the file is spelled by its own name. A workspace package's name
+    reaches its entry (:func:`flag_cleanup.ts_workspace.resolve`), so the
+    name of every package whose directory holds the file is a candidate too
+    (:func:`flag_cleanup.ts_workspace.holding`): a deep import reaches any of
+    its files. Over-matching only parses a file that names none of them.
     """
     modules = {d.module for d in entries}
     tokens = {_stem(m) for m in modules}
@@ -3068,7 +3251,13 @@ def enum_module_pattern(entries: tuple[xk.KeyDeclaration, ...], repo_dir: str) -
             if parent == stop or parent.parent == parent:
                 break
             parent = parent.parent
+    from flag_cleanup import ts_workspace
+
     for module in modules:
+        # A bare specifier naming a package that holds the module starts with
+        # the package's name (`import ... from "@acme/flags"`, or a deep
+        # `"@acme/flags/src/keys"`).
+        literals |= ts_workspace.holding(module, repo_dir)
         if _stem(module) == "index":
             indexes = True
             tokens.add(Path(module).parent.name)
@@ -3093,6 +3282,18 @@ def enum_module_pattern(entries: tuple[xk.KeyDeclaration, ...], repo_dir: str) -
     if indexes:
         parts.append(_DOTS)
     return re.compile("|".join(parts))
+
+
+def _leading_text(node: Node) -> str:
+    """A string's text, or a template's up to its first substitution, as
+    written (escapes kept: the result is only matched against package names)."""
+    parts = []
+    for child in node.named_children:
+        if child.type in ("string_fragment", "escape_sequence"):
+            parts.append(_text(child))
+        elif child.type == "template_substitution":
+            break
+    return "".join(parts)
 
 
 def enum_escapes(
@@ -3194,8 +3395,34 @@ def _enum_escapes(
                         aliases.append(None)
                 fits = aliases[0] is not None and aliases[0].targets(spec) is not None
                 resolved[spec] = _resolve(path, spec, stop, strict=False) if fits else None
+                if resolved[spec] is None and not fits:
+                    # A workspace package's proven entry, whoever imports it.
+                    # One whose entry is not proven is swept below
+                    # (`workspace_reached`): it may load any of its files.
+                    package = workspace.get(spec) if spec in workspace else _workspace_reach(spec)
+                    workspace[spec] = package
+                    resolved[spec] = package.entry if package is not None else None
         module = resolved[spec]
         return module if module in by_module else None
+
+    workspace: dict[str, object] = {}
+
+    def _workspace_reach(text: str):
+        from flag_cleanup import ts_workspace
+
+        return ts_workspace.reach(text, repo_dir)
+
+    def workspace_reached(text: str | None) -> list[str]:
+        """The modules a string naming a package of the checkout may load when
+        its entry is not proven: every one under the package's directory."""
+        if not text:
+            return []
+        if text not in workspace:
+            workspace[text] = _workspace_reach(text)
+        package = workspace[text]
+        if package is None or package.entry is not None:
+            return []
+        return [m for m in sorted(by_module) if package.reaches(m)]
 
     def glob_named(spec: str | None) -> bool:
         """Whether ``spec`` is a glob rather than a path to a file."""
@@ -3238,6 +3465,7 @@ def _enum_escapes(
             module = module_named(match.group(2))
             if module is not None:
                 unread(match.start(), [module])
+            unread(match.start(), workspace_reached(match.group(2)))
         load = re.search("|".join((_GLOB_LOADERS, _GLOB_STRINGS, _COMPUTED_LOADS)), source)
         if load is not None:
             unread(load.start(), sorted(by_module))
@@ -3594,6 +3822,108 @@ def _enum_escapes(
                 return  # judged as a glob loader
         reached(node, [(None, True)])
 
+    def judge_create_require(node: Node) -> None:
+        """``createRequire`` spelled anywhere: bound under its own name (an
+        unaliased import or destructuring, whose uses are each judged here
+        too), or called, taken off a module (``m.createRequire(...)``) or
+        not, to make a loader (:func:`judge_made_loader`) from this file
+        (:func:`based_here`). Anything else
+        (renamed, aliased, handed on, re-exported) makes a loader under a
+        name this scan does not follow, which can load any file."""
+        if _in_type(node):
+            return
+        parent = node.parent
+        if parent is None:
+            return
+        if (
+            parent.type == "import_specifier"
+            and parent.child_by_field_name("name") == node
+            and (parent.child_by_field_name("alias") is None or _type_only(parent))
+        ):
+            return
+        if node.type == "shorthand_property_identifier_pattern":
+            return  # `const { createRequire } = require("module")`
+        reference = node
+        if node.type == "property_identifier" and parent.type == "member_expression":
+            reference = parent  # `require("module").createRequire`
+        elif node.type != "identifier":
+            reached(node, [(None, True)])
+            return
+        call = reference.parent
+        if call is not None and call.type == "call_expression" and call.child_by_field_name("function") == reference:
+            if based_here(call):
+                judge_made_loader(call, set())
+            else:
+                reached(call, [(None, True)])  # resolves from a base this scan does not read
+            return
+        reached(node, [(None, True)])
+
+    def based_here(call: Node) -> bool:
+        """Whether ``createRequire(base)`` resolves from this file: ``base`` is
+        exactly ``import.meta.url``, or ``__filename`` where the file binds no
+        such name. A specifier is judged from this file, so any other base
+        (``path.join(process.cwd(), "package.json")``) leaves it unread."""
+        args = call.child_by_field_name("arguments")
+        items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+        if len(items) != 1:
+            return False
+        base = items[0]
+        if base.type == "identifier":
+            return _text(base) == "__filename" and not any(
+                _text(n) == "__filename" for n in ts_syntax.binding_nodes(root)
+            )
+        if base.type != "member_expression":
+            return False
+        obj = base.child_by_field_name("object")
+        prop = base.child_by_field_name("property")
+        return obj is not None and obj.type == "meta_property" and _text(obj).replace(" ", "") == "import.meta" and (
+            prop is not None and _text(prop) == "url"
+        )
+
+    def judge_made_loader(made: Node, followed: set[str]) -> None:
+        """``made`` evaluates to a loader ``createRequire`` made. Called with
+        one plain string, it is ``require`` of that string, whose specifier
+        :func:`judge_specifier` and a glob's judge already see; asked to
+        ``resolve`` one, it loads nothing. Bound by a declaration to a plain
+        name, each use of that name is judged the same way, except
+        ``require``, which is judged wherever it is spelled. Anything else
+        (a computed or second argument, ``.cache``, handed on, exported,
+        written over, destructured) can load any file."""
+        parent = made.parent
+        if parent is not None and parent.type == "call_expression" and parent.child_by_field_name("function") == made:
+            args = parent.child_by_field_name("arguments")
+            items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+            spec = _literal(items[0]) if len(items) == 1 else None
+            if spec is None:
+                reached(parent, [(None, True)])
+            elif glob_named(spec):
+                judge_glob_specifier(parent, spec)
+            return
+        if parent is not None and parent.type == "member_expression" and parent.child_by_field_name("object") == made:
+            prop = parent.child_by_field_name("property")
+            if prop is not None and _text(prop) == "resolve":
+                return  # `.resolve(...)`, `.resolve.paths(...)`
+        exported = parent is not None and parent.parent is not None and parent.parent.parent is not None and (
+            parent.parent.parent.type == "export_statement"
+        )
+        if (
+            parent is not None
+            and parent.type == "variable_declarator"
+            and parent.child_by_field_name("value") == made
+            and not exported  # `export const load = createRequire(...)`: handed to every importer
+        ):
+            target = parent.child_by_field_name("name")
+            if target is not None and target.type == "identifier":
+                local = _text(target)
+                if local == "require" or local in followed:
+                    return  # `require` is judged wherever it is spelled
+                followed.add(local)
+                for use in uses(local, target):
+                    if not _in_type(use):
+                        judge_made_loader(use, followed)
+                return
+        reached(made, [(None, True)])
+
     # Direct `eval` reads the bindings around it, and `with` makes any name
     # an object's member: either can reach the enum, or a name bound to it,
     # without a use this scan sees. Judged once every module the file names
@@ -3631,8 +3961,7 @@ def _enum_escapes(
         elif node.type in ("identifier", "shorthand_property_identifier") and _text(node) == "require":
             judge_require_name(node)
         elif node.type in _CREATE_REQUIRE_LEAVES and _text(node) == "createRequire":
-            if not _in_type(node):
-                reached(node, [(None, True)])  # makes a loader, under any name
+            judge_create_require(node)
         elif node.type == "member_expression" and _member_loader(node):
             parent = node.parent
             called = parent is not None and parent.type == "call_expression" and parent.child_by_field_name("function") == node
@@ -3640,6 +3969,11 @@ def _enum_escapes(
                 reached(node, [(None, True)])  # `const r = module.require`
         elif node.type in ("string", "template_string"):
             judge_specifier(node)
+            # A string naming a package of the checkout whose entry is not
+            # proven (a deep import, a pattern export) may load any of its
+            # files, wherever it stands.
+            for module in workspace_reached(_leading_text(node)):
+                escape(node, every(module))
         elif node.type == "call_expression":
             function = node.child_by_field_name("function")
             if function is not None and function.type == "identifier" and _text(function) == "eval":

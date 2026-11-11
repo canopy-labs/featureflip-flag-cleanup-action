@@ -3140,6 +3140,26 @@ def _with_leading_comments(node: Node, data: bytes) -> int:
     return start
 
 
+def _code_text(node: Node, data: bytes) -> str:
+    """``node``'s text with every comment inside it cut out."""
+    comments: list[tuple[int, int]] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if "comment" in current.type:
+            comments.append((current.start_byte, current.end_byte))
+            continue
+        stack.extend(current.children)
+    if not comments:
+        return _text(node, data)
+    pieces, at = [], node.start_byte
+    for start, end in sorted(comments):
+        pieces.append(data[at:start])
+        at = max(at, end)
+    pieces.append(data[at : node.end_byte])
+    return b" ".join(pieces).decode("utf-8", "replace")
+
+
 def _read_count(source: str, language: str, accessors: tuple[str, ...]) -> int:
     """Reads ``source`` PERFORMS: every call of a read, less those inside a
     statement of a mocking DSL, which describe a read rather than make one."""
@@ -3159,7 +3179,10 @@ def _read_count(source: str, language: str, accessors: tuple[str, ...]) -> int:
         if node.is_named
         and node.parent is not None
         and _holds_statements(node.parent, profile, data)
-        and _DSL.search(_text(node, data))
+        # Code only: a comment saying "when" or "every" describes no mock, and
+        # Go's `statement_list` spans a whole body, so one in a comment hid
+        # every read of the function.
+        and _DSL.search(_code_text(node, data))
         and call.search(_text(node, data))
     ]
     ids = {node.id for node in described}
