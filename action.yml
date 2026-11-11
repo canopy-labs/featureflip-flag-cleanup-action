@@ -214,7 +214,9 @@ inputs:
       whose flag key is not a literal at the call site still cannot be matched.
       A Python accessor whose key is not its first argument is named with the
       key's index, counting from 0: `flag_is_active[1]` matches
-      `flag_is_active(request, "my-flag")` and no other slot.
+      `flag_is_active(request, "my-flag")` and no other slot. In TypeScript and
+      JavaScript, a key that is a property of an object argument is named with
+      the property: `getFlag{key}` matches `await getFlag({ key: "my-flag", … })`.
       A JSX gate component is named with its key prop, `FlagGate[flag]`: on a
       `true` removal `<FlagGate flag="my-flag">…</FlagGate>` is replaced by its
       children, and a `false` removal of a flag it gates is refused. One that

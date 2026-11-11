@@ -1228,15 +1228,30 @@ def _unwrap(call: Node) -> tuple[Node, bool]:
     return node, cast
 
 
-def _use_site_promise(top: Node) -> bool:
-    """The result is used as a Promise: a member access on it, a ``Promise.all`` argument, ``expect(..).resolves``."""
+#: Members a Promise has. A property read off the result that is none of these is
+#: not Promise evidence, it is an OBJECT use: a hook returning `{ status }`.
+_PROMISE_MEMBERS = frozenset({"then", "catch", "finally"})
+
+PROMISE_USE = "promise"
+OBJECT_USE = "object"
+
+#: A refusal reason that starts with this is about an object-shaped result, not a
+#: Promise; :func:`refusal` words its headline from that.
+OBJECT_RESULT = "its result is used as an object"
+
+
+def _use_site_kind(top: Node) -> str | None:
+    """How the result is used when that rules a boolean fold out: ``"promise"`` (a
+    Promise member, a ``Promise.all`` argument, ``expect(..).resolves``), ``"object"``
+    (any other property or index read off it), else ``None``."""
     parent = top.parent
     if parent is None:
-        return False
+        return None
     if parent.type == "member_expression" and parent.child_by_field_name("object") == top:
-        return True
+        prop = parent.child_by_field_name("property")
+        return PROMISE_USE if prop is not None and _text(prop) in _PROMISE_MEMBERS else OBJECT_USE
     if parent.type == "subscript_expression" and parent.child_by_field_name("object") == top:
-        return True
+        return OBJECT_USE
     holder = parent.parent if parent.type == "array" else parent
     if holder is not None and holder.type == "arguments" and holder.parent is not None:
         call = holder.parent
@@ -1244,13 +1259,18 @@ def _use_site_promise(top: Node) -> bool:
         if fn is not None:
             text = _text(fn)
             if re.fullmatch(r"Promise\s*\.\s*(all|allSettled|race|any)", text):
-                return True
+                return PROMISE_USE
             outer = call.parent
             if text == "expect" and outer is not None and outer.type == "member_expression":
                 prop = outer.child_by_field_name("property")
                 if prop is not None and _text(prop) in {"resolves", "rejects"}:
-                    return True
-    return False
+                    return PROMISE_USE
+    return None
+
+
+def _use_site_promise(top: Node) -> bool:
+    """The result is used as a Promise or as an object (see :func:`_use_site_kind`)."""
+    return _use_site_kind(top) is not None
 
 
 def _boolean_consumed(node: Node) -> bool:
@@ -1277,31 +1297,38 @@ def _boolean_consumed(node: Node) -> bool:
             return False
 
 
-def _bound_read_promise(top: Node) -> bool:
-    """The read is bound (``const p = <read>``) and ``p`` is later used as a Promise
-    in the same scope: member access, ``await``, a ``Promise.*`` argument, or
-    returned from a function annotated Promise."""
+def _bound_read_kind(top: Node) -> str | None:
+    """The read is bound (``const p = <read>``) and ``p`` is later used in the same
+    scope in a way no boolean survives: ``"promise"`` for ``await``, a Promise member,
+    a ``Promise.*`` argument or a return from a function annotated Promise,
+    ``"object"`` for a property read, a destructuring, or an index. A Promise use
+    wins when both occur."""
     parent = top.parent
     if parent is None or parent.type != "variable_declarator" or parent.child_by_field_name("value") != top:
-        return False
+        return None
     target = parent.child_by_field_name("name")
     if target is None or target.type != "identifier":
-        return True  # a destructured binding of the result: not understood
+        return OBJECT_USE  # a destructured binding of the result
     name = _text(target)
     scope = parent.parent.parent if parent.parent is not None else None
     if scope is None:
-        return False
+        return None
+    found = None
     for node in ts_syntax._walk(scope):
         if node.type != "identifier" or _text(node) != name or node == target:
             continue
-        if _use_site_promise(node) or (node.parent is not None and node.parent.type == "await_expression"):
-            return True
+        kind = _use_site_kind(node)
+        if node.parent is not None and node.parent.type == "await_expression":
+            kind = PROMISE_USE
         holder = node.parent
         if holder is not None and holder.type == "return_statement":
             function = _enclosing_function(holder)
             if function is not None and return_kind(function.child_by_field_name("return_type")) == "promise":
-                return True
-    return False
+                kind = PROMISE_USE
+        if kind == PROMISE_USE:
+            return PROMISE_USE
+        found = found or kind
+    return found
 
 
 def _returned(top: Node) -> tuple[Node | None, bool]:
@@ -1437,6 +1464,12 @@ def _is_optional(call: Node, callee: Node) -> bool:
     return any(c.type == "?." for c in call.children)
 
 
+_OBJECT_ADVICE = (
+    ": an accessor or hook that returns an object, such as a tri-state `{ status }`, is not folded "
+    "to a boolean because nothing says which of its states the removed flag means"
+)
+
+
 def decide(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> tuple[str, str]:
     """``(decision, why)``; ``why`` says what stopped a LEAVE."""
     top, promise_cast = _unwrap(call)
@@ -1444,10 +1477,19 @@ def decide(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> t
         return LITERAL, ""
     if promise_cast:
         return LEAVE, "it is cast to a type other than boolean"
-    if _use_site_promise(top):
-        return LEAVE, "its result is used as a Promise or as an object"
-    if _bound_read_promise(top):
+    use = _use_site_kind(top)
+    if use == PROMISE_USE:
+        return LEAVE, "its result is used as a Promise"
+    if use == OBJECT_USE:
+        return LEAVE, f"{OBJECT_RESULT} (a property is read from it), not as a boolean{_OBJECT_ADVICE}"
+    bound = _bound_read_kind(top)
+    if bound == PROMISE_USE:
         return LEAVE, "its result is bound to a name that is later used as a Promise"
+    if bound == OBJECT_USE:
+        return LEAVE, (
+            f"{OBJECT_RESULT} once bound to a name (a property is read from it, or it is destructured), "
+            f"not as a boolean{_OBJECT_ADVICE}"
+        )
     function, composite = _returned(top)
     if function is not None:
         if _has_async_token(function):
@@ -1493,10 +1535,11 @@ def refusal(sites: list[Site]) -> tuple[str, list[str]] | None:
     if not left:
         return None
     first = left[0]
-    reason = (
-        f"an un-awaited read of {first.accessor} whose result may be a Promise: {first.why}"
-        f" ({len(left)} such read{'s' if len(left) != 1 else ''})"
-    )
+    count = f"({len(left)} such read{'s' if len(left) != 1 else ''})"
+    if first.why.startswith(OBJECT_RESULT):
+        reason = f"a read of {first.accessor} whose result is an object, not a boolean: {first.why} {count}"
+    else:
+        reason = f"an un-awaited read of {first.accessor} whose result may be a Promise: {first.why} {count}"
     return reason, sorted({site.path for site in left})
 
 

@@ -168,6 +168,7 @@ def path_is_safe(
     flag_key: str,
     accessors: tuple[str, ...] | frozenset[str] = (),
     treatment: bool | None = None,
+    kept_branches: bool = False,
 ) -> bool:
     """Whether the key-const rules may run over this file.
 
@@ -188,6 +189,12 @@ def path_is_safe(
     of one of the file's own removable reads deletes (see
     :func:`dead_references`): it goes with the block. The runner must then
     check the rewritten file, since this only predicts the fold.
+
+    ``kept_branches``, with a ``treatment``, also leaves out a reference inside
+    the block the fold KEEPS. That answers a different question: not "may the
+    declaration go" but "does anything beyond the file's own reads stop the
+    reads from folding when the declaration is kept". The caller must then
+    strip the delete rules (see ``_FOLDS_KEPT_CONSTANTS``).
     """
     accessor_names = frozenset(accessors)
     profile = _PROFILES.get(language)
@@ -203,6 +210,10 @@ def path_is_safe(
         if treatment is not None and dead_branches.supported(language)
         else []
     )
+    if kept_branches and treatment is not None and dead_branches.supported(language):
+        blocks = blocks + _dead_blocks(
+            root, source_bytes, language, consts, profile, accessor_names, not treatment
+        )
 
     declared_ids = {node.id for const in consts for node in const.name_nodes}
     # Computed once for the whole file rather than per candidate node.
@@ -1807,16 +1818,16 @@ def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     so counting such a read as removable here would let the delete rule strand
     a reference the engine deliberately left standing.
     """
-    arguments = identifier.parent
-    if arguments is None or arguments.type != "arguments" or not arguments.named_children:
+    slot = ts_syntax.read_slot(identifier)
+    if slot is None:
         return False
-    index = next((i for i, c in enumerate(arguments.named_children) if c.id == identifier.id), None)
-    if index is None:
+    call, index = slot
+    if call.type != "call_expression":
         return False
-    call = arguments.parent
-    if call is None or call.type != "call_expression":
-        return False
-    if ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
+    if isinstance(index, str):
+        if ts_syntax.declined_by_object_key_rules(call, index):
+            return False
+    elif ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
         return False
     function = call.child_by_field_name("function")
     if function is None:

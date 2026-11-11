@@ -82,7 +82,7 @@ from typing import Callable, Iterable, Mapping
 
 from tree_sitter import Node
 
-from flag_cleanup import cs_param_pins, go_setters, jvm_matchers, key_const, kotlin_sentinel, syntax, ts_syntax, unused
+from flag_cleanup import cs_param_pins, go_defaults, go_setters, jvm_matchers, key_const, kotlin_sentinel, syntax, ts_syntax, ts_tests, unused
 from flag_cleanup.key_const import (
     _CSHARP_FLAG_READ_CALLEES,
     _DART_FLAG_READ_CALLEES,
@@ -103,6 +103,17 @@ SIBLING_TEST = "sibling test"
 #: A Go test deleted because it pinned the removed value with a test setter
 #: (:mod:`flag_cleanup.go_setters`); carries the test's name.
 SETTER_TEST = "setter test"
+#: A Go table row deleted because its title names the flag in the removed
+#: state and the guard left the flag unset (:mod:`flag_cleanup.go_defaults`);
+#: carries ``Test/title``.
+DEFAULT_ROW = go_defaults.DEFAULT_ROW
+#: A Go table row that never set the flag, so ran its registry default, which
+#: was the removed branch; carries ``Test/title``.
+RELIED_ON_DEFAULT = go_defaults.RELIED_ON_DEFAULT
+#: A Go setter of the REMOVED value that stays (outside any test): the read it
+#: was meant to steer is folded, so it no longer has an effect. A ``bindings``
+#: row carrying the statement (:func:`flag_cleanup.go_setters.inert`).
+INERT_OVERRIDE = "override without effect"
 #: A C# test helper's parameter removed by a pin (:mod:`flag_cleanup.cs_param_pins`),
 #: one per helper; carries its signature and how many calls lost the argument.
 PINNED_PARAMETER = "pinned parameter"
@@ -1945,6 +1956,7 @@ def resolve(
     targets: Mapping[str, StubTargets] | None = None,
     checkout: tuple[str, str] | None = None,
     key_texts: frozenset[str] = frozenset(),
+    removed_default: ts_tests.FlagDefault | None = None,
 ) -> tuple[str, list[Removal]]:
     """``source`` with every decidable test-double line resolved; what went.
 
@@ -2033,6 +2045,11 @@ def resolve(
         if setter_names:
             names = "|".join(re.escape(n) for n in sorted(setter_names, key=len, reverse=True))
             setter_mention = re.compile(f"(?<![\\w$])(?:{names})\\s*\\((?:[^()]|\\([^()]*\\))*?{key}")
+            if "Update" in setter_names:
+                # LaunchDarkly test data: `td.Update(td.Flag(H.Key()).VariationForAll(v))`.
+                setter_mention = re.compile(
+                    setter_mention.pattern + rf"|(?<![\w$])Update\s*\([^;\n]*?{key}\s*\.\s*Key\s*\(\s*\)"
+                )
             spellings = frozenset(
                 {*(f'"{flag_key}"', f"`{flag_key}`"), *("".join(c.split()) for c in consts), *("".join(t.split()) for t in key_texts)}
             )
@@ -2072,7 +2089,7 @@ def resolve(
         source, language, profile, root, data, statements, patterns, treatment,
         wrapper=wrapper, siblings=siblings, fakes=bool(fakes), owners=owners,
         knob_writes=patterns[-1][1] if knob_holders else None, defaults=defaults, checkout=checkout,
-        decided=decided,
+        decided=decided, removed_default=removed_default, flag_key=flag_key,
     )
 
 
@@ -2124,6 +2141,8 @@ def _apply(
     defaults: dict[str, bool] | None = None,
     checkout: tuple[str, str] | None = None,
     decided: Mapping[tuple[int, int], bool] | None = None,
+    removed_default: ts_tests.FlagDefault | None = None,
+    flag_key: str = "",
 ) -> tuple[str, list[Removal]]:
     """Decide each test or statement from its stubs and delete what goes, with
     the ``extra`` spans another recogniser already decided. ``siblings``,
@@ -2437,12 +2456,31 @@ def _apply(
         lines = _ruby_emptied_hooks(lines, data)
     if language == "kt":
         tests = _kotlin_emptied_containers(tests, data)
+    rows: list[tuple[Node, str]] = []
+    relied: list[str] = []
+    if language == "go" and decided:
+        # The `if` a deleted setter empties goes with it, and so do the table
+        # rows that relied on a default that is the removed branch.
+        live_lines = [
+            (line, kind)
+            for line, kind in lines
+            if not any(t.start_byte <= line.start_byte and line.end_byte <= t.end_byte for t, _, _ in tests)
+        ]
+        settled = go_defaults.settle(root, live_lines, dict(decided), treatment, flag_key, removed_default)
+        lines = [entry for entry in lines if entry not in live_lines] + settled.lines
+        rows, relied = settled.rows, settled.relied
     extra = list(extra)
     # A pin whose every call keeps its test still edits: the parameter, the
     # arguments and a construction's literal.
     if not lines and not tests and not extra and not phases and not raw and not live:
         return source, []
     spans: list[tuple[int, int, Removal | None]] = []
+    for row, label in rows:
+        if any(t.start_byte <= row.start_byte and row.end_byte <= t.end_byte for t, _, _ in tests):
+            continue
+        start, end = _line_span(row, data)
+        comma = re.match(rb"[ \t]*,", data[end:])
+        spans.append((start, end + (comma.end() if comma else 0), Removal(DEFAULT_ROW, label)))
     for test, name, kind in tests:
         spans.append((_with_leading_comments(test, data), test.end_byte, Removal(kind, name)))
     spans += [p for p in phases if not any(t.start_byte <= p[0] and p[1] <= t.end_byte for t, _, _ in tests)]
@@ -2492,6 +2530,7 @@ def _apply(
     for _, _, removal in spans:
         if isinstance(removal, Removal) and not any(removal is listed for listed in removals):
             removals.append(removal)
+    removals += [Removal(RELIED_ON_DEFAULT, label) for label in relied]
     return result, removals + [_pin_removal(root, data, pin, deleted) for pin in _with_chained(root, data, live)] + [
         Removal(
             TEST_ROWS,
@@ -3280,6 +3319,9 @@ class Prepass:
     #: C#: the checkout, for a public test helper's calls in any file
     #: (:mod:`flag_cleanup.cs_shared_pins`).
     repo_dir: str | None = None
+    #: Go: the registry default when it is the removed branch
+    #: (:mod:`flag_cleanup.go_defaults`).
+    removed_default: ts_tests.FlagDefault | None = None
 
     def apply(self, paths: list[str]) -> None:
         forwards = self._forwards(paths)
@@ -3310,6 +3352,7 @@ class Prepass:
                 knob_receivers=knob_receivers,
                 targets=self.targets.get(path),
                 checkout=(self.repo_dir, os.path.abspath(path)) if self.repo_dir is not None else None,
+                removed_default=self.removed_default,
             )
             if not removed:
                 continue

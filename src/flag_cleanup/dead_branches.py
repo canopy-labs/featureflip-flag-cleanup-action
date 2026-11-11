@@ -19,6 +19,9 @@ must check the rewritten file afterwards and refuse the flag when a mention it
 left out is still there; that check, not this one, is what makes leaving a
 mention out safe. A wrong prediction then costs the flag, never the build.
 
+Go's ``if`` reads the same way (``call_expression``, ``unary_expression``);
+one with an initializer is left alone.
+
 Only the plainest shape is predicted: an ``if`` whose whole condition is the
 read, perhaps negated and parenthesised, and whose deleted branch is a braced
 block. A read under ``&&``, ``||``, ``await`` or a comparison, an ``else if``
@@ -47,6 +50,7 @@ class _Spec:
 _SPECS = {
     "csharp": _Spec(call="invocation_expression", negation="prefix_unary_expression"),
     "java": _Spec(call="method_invocation", negation="unary_expression"),
+    "go": _Spec(call="call_expression", negation="unary_expression"),
 }
 
 
@@ -114,7 +118,9 @@ def dead_blocks(
         if node.type != "if_statement":
             continue
         condition = node.child_by_field_name("condition")
-        if condition is None:
+        # Go's `if v := read(); cond {`: what the fold leaves of the header is
+        # not predicted.
+        if condition is None or node.child_by_field_name("initializer") is not None:
             continue
         hit = _condition_call(condition, spec)
         if hit is None or not is_read(hit[0]):

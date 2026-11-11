@@ -84,6 +84,12 @@ LAST_CALL = "constructor-last-call"
 #: An argument of the handle's constructor call calls something, which
 #: deleting the declaration would stop running.
 ARGUMENT_CALL = "handle-argument-call"
+#: ``X.Fallback()``: the constructor's default, a read of the handle that is
+#: not the flag's value under either treatment. Folding it to the constructor's
+#: literal would need the handle type's ``Fallback`` proven to return the field
+#: the constructor set from that argument, and nothing assigned to it since;
+#: none of that is proven, so the call is named and the handle kept.
+FALLBACK_READ = "handle-fallback"
 #: ``bindings`` kind: a handle deleted although its constructor does more
 #: than build it. ``text`` is the declaration.
 SIDE_EFFECTS = "handle constructor"

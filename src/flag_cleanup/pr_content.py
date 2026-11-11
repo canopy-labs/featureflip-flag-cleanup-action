@@ -40,6 +40,7 @@ from flag_cleanup import go_emptied, go_handles
 from flag_cleanup.mock_stubs import (
     DUPLICATE_TEST,
     FALSE_TITLE,
+    INERT_OVERRIDE,
     FOLDED_TEST,
     GATE_NAMED,
     PINNED_PARAMETER,
@@ -220,6 +221,7 @@ REPORTED_BINDING_KINDS = frozenset(
         STALE_TITLE,
         UNWRAPPED_PROVIDER,
         REMOVED_DEFAULT,
+        INERT_OVERRIDE,
         DECLARED_LOAD,
         REMOVED_FEATURE_CLASS,
         DISCARDED_CALL,
@@ -1223,6 +1225,28 @@ def _removed_defaults(bindings: tuple[tuple[str, str, str], ...]) -> list[tuple[
     return [(path, text) for path, kind, text in bindings if kind == REMOVED_DEFAULT]
 
 
+def _inert_override_lines(
+    bindings: tuple[tuple[str, str, str], ...], kept: str, deleted: str
+) -> list[str]:
+    """The callout for setters of the removed value that stay: the read each
+    steered is folded to the kept branch, so they no longer have an effect."""
+    rows = [(path, text) for path, kind, text in bindings if kind == INERT_OVERRIDE]
+    if not rows:
+        return []
+    count = len(rows)
+    return [
+        f"> **⚠️ {count} {'override' if count == 1 else 'overrides'} no longer "
+        f"{'has' if count == 1 else 'have'} an effect.** Each sets the flag to "
+        f"the **{deleted}** value, but every read of the flag now returns the "
+        f"**{kept}** one, so whatever switches it on (a command-line option, a "
+        "test helper) silently does nothing. The lines were left in place:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
 def _removed_default_lines(
     defaults: list[tuple[str, str]], kept: str, deleted: str, any_deleted: bool
 ) -> list[str]:
@@ -1511,6 +1535,7 @@ def pr_body(
     kept, deleted = ("on", "off") if candidate.treatment else ("off", "on")
     renamed_tests = _renamed_tests(bindings)
     removed_defaults = _removed_defaults(bindings)
+    inert_overrides = tuple(b for b in bindings if b[1] == INERT_OVERRIDE)
     code_key = config.code_key(candidate.key)
     flag_url = (
         f"{_without_userinfo(config.api_url)}/api/v1/orgs/{quote(config.org, safe='')}"
@@ -2509,6 +2534,7 @@ def pr_body(
             "",
         ]
     lines += _removed_default_lines(removed_defaults, kept, deleted, bool(deleted_tests))
+    lines += _inert_override_lines(inert_overrides, kept, deleted)
     lines += _renamed_test_lines(renamed_tests, kept)
     if wrapper_findings:
         lines += _wrapper_lines(wrapper_findings)

@@ -1387,16 +1387,16 @@ def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = Tr
     constructed object holding the key) is read by a configured accessor
     only: an SDK call takes the key itself.
     """
-    args = argument.parent
-    if args is None or args.type != "arguments" or not args.named_children:
+    slot = ts_syntax.read_slot(argument)
+    if slot is None:
         return False
-    index = next((i for i, c in enumerate(args.named_children) if c.id == argument.id), None)
-    if index is None or (index and not positioned):
+    call, index = slot
+    if (index and not positioned and not isinstance(index, str)) or call.type != "call_expression":
         return False
-    call = args.parent
-    if call is None or call.type != "call_expression":
-        return False
-    if ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
+    if isinstance(index, str):
+        if ts_syntax.declined_by_object_key_rules(call, index):
+            return False
+    elif ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
         return False
     function = call.child_by_field_name("function")
     if function is None:
@@ -3406,6 +3406,7 @@ def _enum_escapes(
         return module if module in by_module else None
 
     workspace: dict[str, object] = {}
+    from flag_cleanup.ts_workspace import compile_only as ts_workspace_compile_only
 
     def _workspace_reach(text: str):
         from flag_cleanup import ts_workspace
@@ -3971,9 +3972,11 @@ def _enum_escapes(
             judge_specifier(node)
             # A string naming a package of the checkout whose entry is not
             # proven (a deep import, a pattern export) may load any of its
-            # files, wherever it stands.
-            for module in workspace_reached(_leading_text(node)):
-                escape(node, every(module))
+            # files, wherever it stands: unless it only says how a tool
+            # compiles the package (`transpilePackages` in a Next config).
+            if not ts_workspace_compile_only(path, node):
+                for module in workspace_reached(_leading_text(node)):
+                    escape(node, every(module))
         elif node.type == "call_expression":
             function = node.child_by_field_name("function")
             if function is not None and function.type == "identifier" and _text(function) == "eval":

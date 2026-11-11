@@ -48,7 +48,7 @@ from pathlib import Path
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import go_module, go_scope, go_setters, key_const, source_index, syntax
+from flag_cleanup import go_handles, go_module, go_scope, go_setters, key_const, source_index, syntax
 from flag_cleanup.unused import go_import_name
 
 #: The SDK reads ``go_const.toml`` folds; the run's accessors are added per call.
@@ -286,6 +286,22 @@ def _named_example(reader: _Reader) -> bool:
     return False
 
 
+def _fallback_call(node: Node) -> bool:
+    """Whether ``node`` is the handle of ``<node>.Fallback()``, the call that
+    returns the constructor's default."""
+    method = node.parent
+    if method is None or method.type != "selector_expression":
+        return False
+    operand, field = method.child_by_field_name("operand"), method.child_by_field_name("field")
+    call = method.parent
+    return (
+        operand is not None and operand.id == node.id and field is not None and _text(field) == "Fallback"
+        and call is not None and call.type == "call_expression"
+        and call.child_by_field_name("function") is not None
+        and call.child_by_field_name("function").id == method.id
+    )
+
+
 def _setter_pin(path: str, source: str, root: Node, node: Node, spelling: str, repo_dir: str) -> bool:
     """Whether ``node`` is the key of a test setter (:mod:`flag_cleanup.go_setters`)
     the test-double pass will delete under EITHER treatment, so that the
@@ -295,14 +311,23 @@ def _setter_pin(path: str, source: str, root: Node, node: Node, spelling: str, r
     without the constant. The runner re-checks the rewritten file with the
     setters suspended, which refuses the flag if one survived."""
     names = go_setters.declared()
-    if not names or not path.endswith("_test.go"):
+    if not names:
         return False
     spellings = frozenset({"".join(spelling.split())})
-    if not any(site.key.id == node.id for site in go_setters.sites(path, root, spellings, repo_dir, names)):
+    found = [site for site in go_setters.sites(path, root, spellings, repo_dir, names) if site.key.id == node.id]
+    if not found:
         return False
+    kept = go_setters.treatment()
+    if kept is not None and not path.endswith("_test.go"):
+        for site in found:
+            if site.value is not kept:
+                go_setters.note_inert(path, site.statement)
     from flag_cleanup import mock_stubs
 
-    for treatment in (True, False):
+    # In a test file either value clears (the one that goes deletes its test).
+    # Anywhere else only the kept value does, so the run's own is asked.
+    kept = go_setters.treatment()
+    for treatment in (True, False) if path.endswith("_test.go") or kept is None else (kept,):
         resolved, _ = mock_stubs.resolve(
             source, "go", "\x00no-such-key", treatment, key_texts=frozenset(spellings), checkout=(repo_dir, path)
         )
@@ -312,7 +337,19 @@ def _setter_pin(path: str, source: str, root: Node, node: Node, spelling: str, r
 
 
 def references(path, source, declarations, accessors, repo_dir):
+    return _references(path, source, declarations, accessors, repo_dir, False)
+
+
+def reads_beside_mentions(path, source, declarations, accessors, repo_dir):
+    """:func:`references` with every ``not-a-read`` mention set aside: what a
+    reader whose mentions stay (the declaration is kept) still reads."""
+    return _references(path, source, declarations, accessors, repo_dir, True)
+
+
+def _references(path, source, declarations, accessors, repo_dir, lenient):
     """The proven reads of ``declarations`` in ``path``, and its refusals.
+
+    ``lenient`` sets ``not-a-read`` mentions aside (no refusal, no read).
 
     A file with any refusal yields no reads (see :func:`xk.resolve`), so
     every mention the reader rules could match by text is either proven here
@@ -352,9 +389,18 @@ def references(path, source, declarations, accessors, repo_dir):
             if parent is not None and parent.type == "selector_expression":
                 if parent.child_by_field_name("operand") is not None and parent.child_by_field_name("operand").id == node.id:
                     # `NAME.x`: a use of the constant's value (a typed key's
-                    # method), never a read the rules fold.
-                    if any(reader.same_package(d) for d in by_name[name]):
-                        refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
+                    # method), never a read the rules fold. Except `HANDLE.Key()`
+                    # as the key of a test-data setter.
+                    if (
+                        _text(parent.child_by_field_name("field")) == "Key"
+                        and any(reader.same_package(d) for d in by_name[name])
+                        and _setter_pin(path, source, root, node, name, repo_dir)
+                    ):
+                        reads.append(xk.KeyReference(path, None, name))
+                        bare_proven = True
+                    elif not lenient and any(reader.same_package(d) for d in by_name[name]):
+                        reason = go_handles.FALLBACK_READ if _fallback_call(node) else xk.NOT_A_READ
+                        refused.append(xk.refusal(path, node, reason, source))
                 continue
             for decl in by_name[name]:
                 if reader.same_package(decl):
@@ -367,7 +413,8 @@ def references(path, source, declarations, accessors, repo_dir):
                             reads.append(xk.KeyReference(path, None, name))
                             bare_proven = True
                             break
-                        refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
+                        if not lenient:
+                            refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
                         break
                     reason = _position_reason(call)
                     if reason is not None:
@@ -427,7 +474,9 @@ def references(path, source, declarations, accessors, repo_dir):
                     reads.append(xk.KeyReference(path, qualifier, name))
                     owners.add(qualifier)
                     break
-                refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
+                if not lenient:
+                    reason = go_handles.FALLBACK_READ if _fallback_call(node) else xk.NOT_A_READ
+                    refused.append(xk.refusal(path, node, reason, source))
                 break
             reason = _position_reason(call)
             if reason is None:
@@ -512,6 +561,7 @@ xk.register(
         language_family=frozenset({"go"}),
         declarations=declarations,
         references=references,
+        reads_beside_mentions=reads_beside_mentions,
         entry_findings=entry_findings,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,

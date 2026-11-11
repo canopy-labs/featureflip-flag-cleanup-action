@@ -57,6 +57,43 @@ def declaring(names: Iterable[str]) -> Iterator[None]:
         _DECLARED.reset(token)
 
 
+_TREATMENT: ContextVar[bool | None] = ContextVar("go_test_setters_treatment", default=None)
+
+
+_INERT: ContextVar[list[tuple[str, str]] | None] = ContextVar("go_test_setters_inert", default=None)
+
+
+@contextlib.contextmanager
+def treating(treatment: bool) -> Iterator[None]:
+    """The value the run keeps, which decides a setter OUTSIDE a test: there
+    only the kept value can be deleted (:func:`treatment`)."""
+    token = _TREATMENT.set(treatment)
+    found = _INERT.set([])
+    try:
+        yield
+    finally:
+        _INERT.reset(found)
+        _TREATMENT.reset(token)
+
+
+def note_inert(path: str, statement: Node) -> None:
+    """Record a proven setter of the REMOVED value that stays outside a test:
+    the read it steered is folded, so it has no effect any more."""
+    found = _INERT.get()
+    row = (path, " ".join(_text(statement).split()))
+    if found is not None and row not in found:
+        found.append(row)
+
+
+def inert() -> list[tuple[str, str]]:
+    """``(path, statement)`` of each :func:`note_inert` row of this run."""
+    return list(_INERT.get() or ())
+
+
+def treatment() -> bool | None:
+    return _TREATMENT.get()
+
+
 @contextlib.contextmanager
 def suspended() -> Iterator[None]:
     """Recognise no setter: a check of what a run left behind must count a
@@ -149,6 +186,104 @@ def _in_deferred_closure(statement: Node) -> bool:
     return False
 
 
+_LD_TESTDATA = re.compile(r"^github\.com/launchdarkly/[\w./-]*/ldtestdata$")
+
+
+def _imports_ldtestdata(file: go_scope.File, name: str) -> bool:
+    """Whether ``file`` binds ``name`` to LaunchDarkly's ``ldtestdata``."""
+    for spec in go_scope.import_specs(file.root):
+        path = spec.child_by_field_name("path")
+        alias = spec.child_by_field_name("name")
+        if path is None:
+            continue
+        written = _text(path).strip('"`')
+        if _LD_TESTDATA.match(written) and (_text(alias) if alias is not None else "ldtestdata") == name:
+            return True
+    return False
+
+
+def _is_data_source(value: Node | None, file: go_scope.File) -> bool:
+    """``ldtestdata.DataSource()`` where ``ldtestdata`` is that import."""
+    if value is None or value.type != "call_expression" or value.child_by_field_name("arguments") is None:
+        return False
+    if value.child_by_field_name("arguments").named_children:
+        return False
+    function = value.child_by_field_name("function")
+    if function is None or function.type != "selector_expression":
+        return False
+    operand, field = function.child_by_field_name("operand"), function.child_by_field_name("field")
+    return (
+        operand is not None
+        and field is not None
+        and operand.type == "identifier"
+        and _text(field) == "DataSource"
+        and not go_scope.local_binders(operand, _text(operand))
+        and _imports_ldtestdata(file, _text(operand))
+    )
+
+
+def _test_data_source(receiver: Node, file: go_scope.File, packages: go_scope.Packages, here: Path) -> bool:
+    """Whether ``receiver`` is a bare name proven to hold a
+    ``ldtestdata.DataSource()``: a local bound once, or a package-level
+    ``var`` declared once in this package. ``Update`` and ``Flag`` of that
+    type only write to an in-memory source."""
+    if receiver.type != "identifier" or file.clause is None:
+        return False
+    name = _text(receiver)
+    binding = go_scope.local_binding(receiver, name)
+    if binding is not None:
+        return not binding.opaque and _is_data_source(binding.value, file)
+    site = packages.package_var_binding(here.parent, file.clause, name)
+    return site is not None and _is_data_source(site[1].value, site[0])
+
+
+def _test_data_site(
+    node: Node, spellings: frozenset[str], file: go_scope.File, packages: go_scope.Packages, here: Path
+) -> Site | None:
+    """``td.Update(td.Flag(<key>).VariationForAll(<bool>))`` on a proven
+    LaunchDarkly test data source, where ``<key>`` is a spelling of the flag's
+    key or ``<handle>.Key()`` of a spelling of its handle."""
+    call = node.named_children[0]
+    function, arguments = call.child_by_field_name("function"), call.child_by_field_name("arguments")
+    if function is None or arguments is None or function.type != "selector_expression" or len(arguments.named_children) != 1:
+        return None
+    receiver, field = function.child_by_field_name("operand"), function.child_by_field_name("field")
+    if receiver is None or field is None or _text(field) != "Update":
+        return None
+    builder = arguments.named_children[0]
+    shape = _chain(builder, "VariationForAll")
+    if shape is None or shape[1].type not in ("true", "false"):
+        return None
+    flag_call = _chain(shape[0], "Flag")
+    if flag_call is None or _compact(flag_call[0]) != _compact(receiver):
+        return None
+    if not _test_data_source(receiver, file, packages, here):
+        return None
+    key = flag_call[1]
+    if _compact(key) in spellings:
+        return Site(node, key, shape[1].type == "true")
+    if key.type == "call_expression" and not key.child_by_field_name("arguments").named_children:
+        accessor = key.child_by_field_name("function")
+        if accessor is not None and accessor.type == "selector_expression":
+            handle, method = accessor.child_by_field_name("operand"), accessor.child_by_field_name("field")
+            if handle is not None and method is not None and _text(method) == "Key" and _compact(handle) in spellings:
+                return Site(node, handle, shape[1].type == "true")
+    return None
+
+
+def _chain(node: Node, method: str) -> tuple[Node, Node] | None:
+    """``(operand, only argument)`` of ``<operand>.<method>(<argument>)``."""
+    if node.type != "call_expression":
+        return None
+    function, arguments = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+    if function is None or arguments is None or function.type != "selector_expression" or len(arguments.named_children) != 1:
+        return None
+    operand, field = function.child_by_field_name("operand"), function.child_by_field_name("field")
+    if operand is None or field is None or _text(field) != method:
+        return None
+    return operand, arguments.named_children[0]
+
+
 def sites(
     path: str,
     root: Node,
@@ -183,6 +318,11 @@ def sites(
         arguments = call.child_by_field_name("arguments")
         if function is None or arguments is None:
             continue
+        if "Update" in names and function.type == "selector_expression":
+            found_site = _test_data_site(node, spellings, file, packages, here)
+            if found_site is not None:
+                found.append(found_site)
+                continue
         if function.type == "identifier":
             callee, qualifier = _text(function), None
         elif function.type == "selector_expression":
@@ -221,6 +361,14 @@ def sites(
     return found
 
 
+def _descendants(node: Node) -> Iterator[Node]:
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(current.named_children)
+
+
 def remaining(root: Node, names: frozenset[str], spellings: frozenset[str]) -> list[Node]:
     """Every call to one of ``names`` that has an argument spelling the key,
     proven or not."""
@@ -239,6 +387,12 @@ def remaining(root: Node, names: frozenset[str], spellings: frozenset[str]) -> l
             function = function.child_by_field_name("field")
         if function is None or _text(function) not in names:
             continue
-        if any(_compact(a) in spellings for a in arguments.named_children):
+        # An argument that holds the spelling anywhere counts: a test-data
+        # setter nests it (`td.Update(td.Flag(H.Key()).VariationForAll(true))`).
+        if any(
+            _compact(inner) in spellings
+            for a in arguments.named_children
+            for inner in _descendants(a)
+        ):
             out.append(node)
     return out

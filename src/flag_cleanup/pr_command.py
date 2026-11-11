@@ -69,6 +69,7 @@ from flag_cleanup.discarded_calls import DISCARDED_CALL
 from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.ts_test_providers import UNWRAPPED_PROVIDER
+from flag_cleanup.mock_stubs import INERT_OVERRIDE
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST, STALE_TITLE, VACUOUS_ASSERTION
 
 logger = logging.getLogger(__name__)
@@ -918,6 +919,7 @@ def _dry_run_caveats(
     renamed_tests = sum(1 for _, kind, _ in bindings if kind == RENAMED_TEST)
     scaffolding = sum(1 for _, kind, _ in bindings if kind in (VACUOUS_ASSERTION, STALE_TITLE))
     removed_defaults = sum(1 for _, kind, _ in bindings if kind == REMOVED_DEFAULT)
+    inert_overrides = sum(1 for _, kind, _ in bindings if kind == INERT_OVERRIDE)
     changed_ctor = sum(1 for _, kind, _ in bindings if kind == "changed constructor")
     unread_locals = sum(1 for _, kind, _ in bindings if kind == "unread local")
     kept_locals = sum(1 for _, kind, _ in bindings if kind == "kept argument local")
@@ -950,6 +952,7 @@ def _dry_run_caveats(
         - renamed_tests
         - scaffolding
         - removed_defaults
+        - inert_overrides
         - declared_loads
         - declared_calls
         - hook_calls
@@ -983,6 +986,8 @@ def _dry_run_caveats(
             f"{declared_loads} import(s) of a module listed in side-effect-free-modules "
             "would be deleted"
         )
+    if inert_overrides:
+        notes.append(f"{inert_overrides} override(s) of the removed value no longer have an effect (reported)")
     if removed_defaults:
         notes.append(
             "the flag's default is the branch being removed, so tests that never "

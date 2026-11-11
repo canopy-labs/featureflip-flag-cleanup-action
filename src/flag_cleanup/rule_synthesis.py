@@ -58,11 +58,14 @@ PENNANT_ACTIVE = "active"
 BLADE_FEATURE = "__blade_feature"
 
 
-_POSITIONED = re.compile(r"\A(?P<name>[A-Za-z_][A-Za-z0-9_]*)\[(?P<index>[1-9])\]\Z")
+_POSITIONED = re.compile(
+    r"\A(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\[(?P<index>[1-9])\]|\{(?P<prop>[A-Za-z_$][A-Za-z0-9_$]*)\})\Z"
+)
 
 
-def encode_positions(accessors, positions: Mapping[str, int] | None) -> tuple[str, ...]:
-    """``accessors`` with each one that has a key position spelled ``name[index]``.
+def encode_positions(accessors, positions: Mapping[str, int | str] | None) -> tuple[str, ...]:
+    """``accessors`` with each one that has a key position spelled ``name[index]``,
+    or ``name{prop}`` for a key that is a property of an object-literal argument.
 
     The passes that take a key to be the FIRST argument compare a callee's name
     with the accessor set, so ``get[1]`` never matches ``get(KEY, …)`` there,
@@ -71,16 +74,20 @@ def encode_positions(accessors, positions: Mapping[str, int] | None) -> tuple[st
     about positions cannot treat a positioned accessor as a first-argument one.
     """
     positions = positions or {}
-    return tuple(f"{name}[{positions[name]}]" if name in positions else name for name in accessors)
+    return tuple(_spelled(name, positions[name]) if name in positions else name for name in accessors)
 
 
-def positions_of(accessors) -> dict[str, int]:
-    """The ``{name: index}`` of the entries :func:`encode_positions` spelled."""
-    found = {}
+def _spelled(name: str, position: int | str) -> str:
+    return f"{name}{{{position}}}" if isinstance(position, str) else f"{name}[{position}]"
+
+
+def positions_of(accessors) -> dict[str, int | str]:
+    """The ``{name: index}`` (``{name: property}`` for a property key) of the entries :func:`encode_positions` spelled."""
+    found: dict[str, int | str] = {}
     for accessor in accessors:
         match = _POSITIONED.match(accessor)
         if match is not None:
-            found[match["name"]] = int(match["index"])
+            found[match["name"]] = int(match["index"]) if match["index"] else match["prop"]
     return found
 
 
@@ -252,15 +259,28 @@ _NO_ACCESSOR_TEMPLATE_MARKER = re.compile(
 #: ``__KEY_POSITION__`` becomes an anchored wildcard per argument before the
 #: key. Written inside the block, for the reason the marker above is.
 _KEY_POSITION_TEMPLATE_MARKER = re.compile(
-    r"^#\s*accessor-template:\s*key-position\b", re.MULTILINE
+    r"^#\s*accessor-template:\s*key-(?P<kind>position|property)\b", re.MULTILINE
 )
 _KEY_POSITION = "__KEY_POSITION__"
+#: ``key-property`` is the same for an accessor named with the property of its
+#: object-literal argument that holds the key (``getFlag{key}``): its
+#: ``__KEY_PROPERTY__`` becomes that property's name.
+_KEY_PROPERTY = "__KEY_PROPERTY__"
+#: The same name as regex source (no backslash: ``$`` becomes ``[$]``).
+_KEY_PROPERTY_RE = "__KEY_PROPERTY_RE__"
+
+
+def _as_regex(name: str) -> str:
+    # The one escape the Python predicate uses, so the two sides cannot drift.
+    from flag_cleanup.ts_syntax import regex_safe
+
+    return regex_safe(name)
 
 
 #: A seed whose query matches the ``await`` expression rather than the call.
 _AWAITED_QUERY = re.compile(r"^\s*\(await_expression\b", re.MULTILINE)
 
-def _seed_blocks(blocks: list[str], *, key_position: bool = False) -> list[_Block]:
+def _seed_blocks(blocks: list[str], *, kind: str | None = None) -> list[_Block]:
     seeds = []
     for block in blocks[1:]:
         match = _SDK_FN_PREDICATE.search(block)
@@ -268,7 +288,8 @@ def _seed_blocks(blocks: list[str], *, key_position: bool = False) -> list[_Bloc
             continue
         if _NO_ACCESSOR_TEMPLATE_MARKER.search(block) is not None:
             continue
-        if (_KEY_POSITION_TEMPLATE_MARKER.search(block) is not None) != key_position:
+        marker = _KEY_POSITION_TEMPLATE_MARKER.search(block)
+        if (marker["kind"] if marker is not None else None) != kind:
             continue
         name = re.search(r'^name = "(.*)"$', block, flags=re.MULTILINE)
         if name is None:
@@ -301,7 +322,7 @@ def with_accessors(
     *,
     templates_text: str | None = None,
     before_trailing_rules: bool = False,
-    key_positions: Mapping[str, int] | None = None,
+    key_positions: Mapping[str, int | str] | None = None,
     positional_text: str | None = None,
     async_accessors: frozenset[str] = frozenset(),
 ) -> str:
@@ -369,11 +390,9 @@ def with_accessors(
             seen_shapes.add(seed.shape)
             templates.append(seed)
     positions = dict(key_positions or {})
-    positional = (
-        _seed_blocks(blocks if positional_text is None else _split_blocks(positional_text), key_position=True)
-        if positions
-        else []
-    )
+    positional_blocks = blocks if positional_text is None else _split_blocks(positional_text)
+    positional = _seed_blocks(positional_blocks, kind="position") if positions else []
+    by_property = _seed_blocks(positional_blocks, kind="property") if positions else []
     awaited_templates = [t for t in templates if _AWAITED_QUERY.search(t.text)]
     if async_accessors and not awaited_templates:
         raise SynthesisError("an async accessor needs an awaited seed rule to clone")
@@ -385,14 +404,26 @@ def with_accessors(
         else:
             templates_for = templates
         index = positions.get(accessor, 0)
-        chosen = [
-            _Block(
-                text=template.text.replace(_KEY_POSITION, "(_) . " * index),
-                name=template.name,
-                callee=template.callee,
-            )
-            for template in positional
-        ] if index else templates_for
+        if isinstance(index, str):
+            chosen = [
+                _Block(
+                    text=t.text.replace(_KEY_PROPERTY_RE, _as_regex(index)).replace(_KEY_PROPERTY, index),
+                    name=t.name,
+                    callee=t.callee,
+                )
+                for t in by_property
+            ]
+        elif index:
+            chosen = [
+                _Block(
+                    text=template.text.replace(_KEY_POSITION, "(_) . " * index),
+                    name=template.name,
+                    callee=template.callee,
+                )
+                for template in positional
+            ]
+        else:
+            chosen = templates_for
         names = generated_rule_names(accessor, len(chosen))
         for new_name, template in zip(names, chosen, strict=True):
             clone = re.sub(
@@ -488,7 +519,7 @@ def with_accessor_const_rules(
     accessors: tuple[str, ...],
     *,
     templates_text: str | None = None,
-    key_positions: Mapping[str, int] | None = None,
+    key_positions: Mapping[str, int | str] | None = None,
     positional_text: str | None = None,
 ) -> str:
     """Return ``const_rules_text`` plus one cloned rule per accessor per shape.
@@ -693,10 +724,10 @@ def cross_file_key_rules(
     positioned = positions_of(accessors)
     positional = {
         kind: [b for b in _split_blocks(_strip_comments_keep_markers(positional_text))[1:] if f"# xconst: {kind}" in b]
-        for kind in ("qualified", "bare")
+        for kind in ("qualified", "bare", "property-qualified", "property-bare")
     } if positional_text is not None and positioned else {}
     # A positioned accessor is not a first-argument one: the loops below see plain names only.
-    accessors = tuple(a for a in accessors if a not in {f"{n}[{i}]" for n, i in positioned.items()})
+    accessors = tuple(a for a in accessors if a not in {_spelled(n, i) for n, i in positioned.items()})
 
     clones: list[str] = []
     for index, (owner, member, accessor) in enumerate(distinct):
@@ -723,10 +754,14 @@ def cross_file_key_rules(
             chosen = qualified if owner is not None else bare
         if not accessor and not nested:
             for name, at in positioned.items():
-                for template in positional.get("qualified" if owner is not None else "bare", []):
+                shape = ("property-" if isinstance(at, str) else "") + ("qualified" if owner is not None else "bare")
+                for template in positional.get(shape, []):
                     block = template.replace("__XCONST_OWNER__", _query_text(owner_text))
                     block = block.replace("__XCONST_MEMBER__", _query_text(member))
-                    block = block.replace(_KEY_POSITION, "(_) . " * at)
+                    block = block.replace(_KEY_POSITION, "(_) . " * at if isinstance(at, int) else "")
+                    block = block.replace(_KEY_PROPERTY_RE, _as_regex(str(at))).replace(_KEY_PROPERTY, str(at))
+                    block = block.replace("__XCONST_OWNER_RE__", _as_regex(owner_text))
+                    block = block.replace("__XCONST_MEMBER_RE__", _as_regex(member))
                     clone = re.sub(
                         r'^name = "(.*)"$',
                         lambda m: f'name = "{m.group(1)}__{index}__accessor_{name}"',

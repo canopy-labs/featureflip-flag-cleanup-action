@@ -48,6 +48,7 @@ twice on this branch; differentials have not.
 from __future__ import annotations
 
 import difflib
+import re
 from functools import lru_cache
 
 import tree_sitter_typescript
@@ -171,6 +172,138 @@ def declined_by_const_rules(call: Node, *, positioned: bool) -> bool:
         if node.type != "call_expression" or any(c.type == "?." for c in node.children):
             return True
     return False
+
+
+#: The object-literal argument of a property-keyed read (``getFlag{key}``) is
+#: admitted by a WHITELIST over its text, not a list of what is forbidden: the
+#: call is replaced whole, so every other property is dropped with it and must be
+#: able to do nothing. The rules (`ts_key_positions.toml` and its two siblings)
+#: carry the same four regular expressions as `#match?` / `#not-match?`
+#: predicates, and `tests/test_ts_object_key_accessors.py` compares the text and
+#: runs both over the same generated objects.
+#:
+#: 1. ``OBJECT_TOKENS``: the text is only whitespace, ``{ } [ ] , :``, words
+#:    (identifiers, keywords, integers) and plain quoted strings. No ``.``, ``(``,
+#:    ``?``, operator, backtick, ``/`` (comment or regex), ``...`` or escape can
+#:    occur, so no member access, call, spread, unary, binary, template or arrow.
+#:    The one dotted token allowed is the key's own value (``Keys.X``), passed in.
+#: 2. ``OBJECT_ADJACENT`` and ``OBJECT_INDEXED`` must not match: two words in a row are ``new X``,
+#:    ``typeof x``, ``await x``, ``void 0``, ``delete x``.
+#: 3. ``OBJECT_KEYWORDS`` must not match: a lone ``this``, ``class {}``, ``__proto__``.
+#: 4. ``object_duplicate_key(prop)`` must not match: two properties named ``prop``
+#:    (identifier, string, shorthand, method or getter), of which the last wins.
+_WORD = "[A-Za-z0-9_$]"
+_WS = "[ \t\r\n]"
+OBJECT_ADJACENT = f"{_WORD}{_WS}+{_WORD}"
+#: A ``[`` right after a word, a quote or a ``]`` (blank space and newlines
+#: between included) is an index read, ``o[0]``, ``o['a']``, ``a\n[0]``; an array
+#: literal follows ``:``, ``,``, ``[`` or ``{`` instead.
+OBJECT_INDEXED = r"[A-Za-z0-9_$'\"\]][ \t\r\n]*\["
+OBJECT_KEYWORDS = (
+    r"(?:^|[ \t\r\n{,:\[])(?:this|super|class|function|async|import|await|yield|new)(?:[ \t\r\n{},:\]]|$)"
+    "|__proto__"
+)
+
+
+def regex_safe(text: str) -> str:
+    """``text`` as regex source with no backslash: ``$`` and ``.`` as one-char classes."""
+    return text.replace("$", "[$]").replace(".", "[.]")
+
+
+_regex_safe = regex_safe
+
+
+def object_tokens(dotted: str | None = None) -> str:
+    """The whole-text whitelist.
+
+    ``dotted`` (``Keys.X``) is the one dotted word allowed outside a string. A
+    string may hold ``.`` (a flag key such as ``'my.flag'``, which the rule cannot
+    exempt on its own: the key hole may sit only in an ``#eq?`` string), but
+    nothing that could end it early or escape: no quote, backslash or newline.
+    """
+    quoted = "'[A-Za-z0-9_$./:@#%+=-]*'"
+    double = '"[A-Za-z0-9_$./:@#%+=-]*"'
+    extra = r"|[ \t\r\n,:\[]" + _regex_safe(dotted) + r"[ \t\r\n,}\]]" if dotted else ""
+    return rf"^(?:[ \t\r\n]|[{{}},:\[\]]|{_WORD}+|{quoted}|{double}{extra})*$"
+
+
+def object_duplicate_key(prop: str) -> str:
+    """Two properties of the object named ``prop`` (the last one wins)."""
+    name = _regex_safe(prop)
+    s = f"(?:{name}|'{name}'|\"{name}\")"
+    w = _WS + "*"
+    return f"(?s)[{{,]{w}{s}{w}(?:[:}}].*[{{,]|,(?:.*[{{,])?){w}{s}{w}[:,}}]"
+
+
+def _object_regexes(prop: str, dotted: str | None) -> tuple[re.Pattern, ...]:
+    return (
+        re.compile(object_tokens(dotted)),
+        re.compile(OBJECT_ADJACENT),
+        re.compile(OBJECT_INDEXED),
+        re.compile(OBJECT_KEYWORDS),
+        re.compile(object_duplicate_key(prop)),
+    )
+
+
+def read_slot(argument: Node) -> tuple[Node, int | str] | None:
+    """``(call, slot)`` for the node that could hold a read's key, else ``None``.
+
+    The slot is the argument's index when ``argument`` is one, and for a value
+    of a ``name: value`` property of an object literal that is the FIRST
+    argument, the property's name.
+    """
+    parent = argument.parent
+    if parent is None:
+        return None
+    if parent.type == "arguments":
+        index = next((i for i, c in enumerate(parent.named_children) if c.id == argument.id), None)
+        return None if index is None or parent.parent is None else (parent.parent, index)
+    if parent.type != "pair" or parent.child_by_field_name("value") is None:
+        return None
+    key = parent.child_by_field_name("key")
+    value = parent.child_by_field_name("value")
+    obj = parent.parent
+    if key is None or key.type != "property_identifier" or value.id != argument.id:
+        return None
+    if obj is None or obj.type != "object" or obj.parent is None or obj.parent.type != "arguments":
+        return None
+    arguments = obj.parent
+    if not arguments.named_children or arguments.named_children[0].id != obj.id or arguments.parent is None:
+        return None
+    return arguments.parent, key.text.decode("utf-8")
+
+
+def declined_by_object_key_rules(call: Node, prop: str = "key") -> bool:
+    """Whether the property-key rules decline ``call``.
+
+    They match the ``await`` around it only, with the object its only argument,
+    and decline an optional call, a spread, a comment or a computed name
+    anywhere in it, and any object whose text is not admitted by the whitelist
+    above (see the regular expressions' comment).
+    """
+    awaited = call.parent
+    if awaited is None or awaited.type != "await_expression":
+        return True
+    if declined_by_const_rules(call, positioned=True):
+        return True
+    arguments = call.child_by_field_name("arguments")
+    obj = arguments.named_children[0] if arguments is not None and len(arguments.named_children) == 1 else None
+    if obj is None or obj.type != "object":
+        return True
+    if any(node.type == "computed_property_name" for node in _walk(awaited)):
+        return True
+    dotted = None
+    for pair in obj.named_children:
+        if pair.type != "pair":
+            continue
+        name, value = pair.child_by_field_name("key"), pair.child_by_field_name("value")
+        if name is not None and value is not None and name.text.decode("utf-8") == prop and value.type == "member_expression":
+            dotted = value.text.decode("utf-8")
+    tokens, adjacent, indexed, keywords, duplicate = _object_regexes(prop, dotted)
+    text = obj.text.decode("utf-8")
+    return not tokens.search(text) or any(
+        r.search(text) for r in (adjacent, indexed, keywords, duplicate)
+    )
 
 
 def _walk(node: Node):

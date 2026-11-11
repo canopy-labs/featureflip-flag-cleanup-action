@@ -187,6 +187,10 @@ class Resolution:
     #: kept is a mention spelling its name, and no file writes it. The runner
     #: folds the declaring file's own reads too, keeping the declaration.
     kept_reads_fold: frozenset[str] = frozenset()
+    #: Readers proven although they mention a kept declaration beside the read,
+    #: inside a branch the fold keeps (:attr:`Profile.reads_beside_mentions`).
+    #: Their mentions stay, so :func:`still_mentions` asks only about reads.
+    kept_mentions: frozenset[str] = frozenset()
 
 
 #: ``(module, owner, name)`` -- what a reader's import or qualifier names.
@@ -319,6 +323,17 @@ class Profile:
     #: :attr:`home_constant_names`).
     #: Off, a kept declaration leaves its proven reads folding.
     readers_need_deletable: bool = False
+    #: :attr:`references` with the ``not-a-read`` mentions set aside, for a
+    #: language whose constant cannot change (Go). Used for a reader whose
+    #: only such mentions sit in a branch the fold keeps: the declaration is
+    #: kept with them and the read beside them folds.
+    reads_beside_mentions: (
+        Callable[
+            [str, str, tuple[KeyDeclaration, ...], frozenset[str], str],
+            tuple[list[KeyReference], list[Refusal]],
+        ]
+        | None
+    ) = None
     #: ``(repo_dir, names)``: for a profile with :attr:`readers_need_deletable`,
     #: which of the constant ``names`` some file of the checkout may write.
     #: A constant no file writes holds its key wherever it is read, so a
@@ -875,6 +890,7 @@ def resolve(
         ext for lang in profile.language_family for ext in _extensions(lang)
     )
     readers: dict[str, tuple[KeyReference, ...]] = {}
+    kept_mentions: set[str] = set()
     # declaring files some mention stops from being deleted
     blocked: set[str] = set(kept_at_home)
     names = {decl.name for decl in unique}
@@ -1056,6 +1072,19 @@ def resolve(
                 )
                 if dead_reads:
                     reads, refused = dead_reads, dead_refused
+            if refused and profile.reads_beside_mentions is not None:
+                # What the fold KEEPS may name the constant too ("turn on X"
+                # in a branch it leaves). Those mentions stay and keep the
+                # declaration, which is why they remain refusals; the reads
+                # beside them are reads like any other, since a Go constant
+                # cannot change. Only a file whose every other mention is a
+                # read or inside a block qualifies.
+                kept = without_dead_blocks(path, source, visible, treatment, keep=True)
+                if kept != source:
+                    kept_reads, kept_refused = profile.references(path, kept, visible, accessor_set, repo_dir)
+                    if kept_reads and not kept_refused:
+                        reads = kept_reads
+                        kept_mentions.add(path)
         if reads:
             readers[path] = tuple(reads)
         if refused:
@@ -1169,6 +1198,7 @@ def resolve(
         readers_need_deletable=profile.readers_need_deletable,
         home_findings=home_findings,
         kept_reads_fold=kept_reads_fold,
+        kept_mentions=frozenset(kept_mentions),
     )
 
 
@@ -1544,11 +1574,15 @@ def _competing(
 
 
 #: The grammar each suffix whose dead blocks are predicted is read with.
-_DEAD_BLOCK_GRAMMARS = {".cs": "csharp", ".java": "java"}
+_DEAD_BLOCK_GRAMMARS = {".cs": "csharp", ".java": "java", ".go": "go"}
 
 
 def without_dead_blocks(
-    path: str, source: str, visible: tuple[KeyDeclaration, ...], treatment: bool
+    path: str,
+    source: str,
+    visible: tuple[KeyDeclaration, ...],
+    treatment: bool,
+    keep: bool = False,
 ) -> str:
     """``source`` with the inside of each block blanked that the fold of a
     call naming one of ``visible``'s constants deletes, when that call is an
@@ -1573,7 +1607,8 @@ def without_dead_blocks(
         stack = [call]
         while stack:
             node = stack.pop()
-            if node.type == "identifier" and node.text.decode("utf-8", "replace") in names:
+            # Go spells a package's constant `q.NAME`: a field_identifier.
+            if node.type in ("identifier", "field_identifier") and node.text.decode("utf-8", "replace") in names:
                 owner = dead_branches.nearest_call(node, language)
                 if owner is not None and owner.id == call.id:
                     return True
@@ -1581,6 +1616,10 @@ def without_dead_blocks(
         return False
 
     blocks = dead_branches.dead_blocks(root, language, treatment, is_read)
+    if keep:
+        # `keep`: the blocks the fold keeps as well. The block deleted under
+        # the opposite treatment is the one this treatment leaves.
+        blocks += dead_branches.dead_blocks(root, language, not treatment, is_read)
     return dead_branches.blank(source, blocks) if blocks else source
 
 
@@ -1607,9 +1646,11 @@ def still_mentions(
     visible = tuple(d for d in resolution.declarations if d.path != resolved)
     if not visible:
         return False
-    reads, refused = profile.references(
-        resolved, source, visible, frozenset(accessors), repo_dir
-    )
+    judge = profile.references
+    if resolved in resolution.kept_mentions and profile.reads_beside_mentions is not None:
+        # Its mentions stay with the kept declaration; only a read left unfolded counts.
+        judge = profile.reads_beside_mentions
+    reads, refused = judge(resolved, source, visible, frozenset(accessors), repo_dir)
     return bool(reads or refused)
 
 

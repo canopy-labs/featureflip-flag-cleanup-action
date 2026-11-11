@@ -99,6 +99,7 @@ from flag_cleanup import (
     cross_file_python,
     discarded_calls,
     failing_assertions,
+    go_defaults,
     go_emptied,
     go_handles,
     go_setters,
@@ -110,6 +111,7 @@ from flag_cleanup import (
     go_dead_code,
     go_initializers,
     go_arity,
+    go_handle_reads,
     go_two_value,
     go_inline,
     go_stranded,
@@ -1824,7 +1826,7 @@ def run_piranha(
     gates: tuple[ts_gates.Gate, ...] = (),
     inline_wrappers: bool = True,
     flag_default: ts_tests.FlagDefault | None = None,
-    key_positions: tuple[tuple[str, int], ...] = (),
+    key_positions: tuple[tuple[str, int | str], ...] = (),
     code_keys: frozenset[str] = frozenset(),
 ) -> str:
     """:func:`transform_flag`, keeping only the diff.
@@ -1866,7 +1868,7 @@ def transform_flag(
     read_elsewhere: bool = False,
     *,
     entries: bool = True,
-    key_positions: tuple[tuple[str, int], ...] = (),
+    key_positions: tuple[tuple[str, int | str], ...] = (),
     code_keys: frozenset[str] = frozenset(),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
@@ -1919,13 +1921,18 @@ def transform_flag(
     if language not in KEY_POSITION_LANGUAGES:
         accessors = tuple(name for name in accessors if name not in positions)
         positions = {}
+    elif language == "python":
+        # `getFlag{key}` (a property of an object argument) is a TypeScript/JavaScript shape.
+        properties = {name for name, at in positions.items() if isinstance(at, str)}
+        accessors = tuple(name for name in accessors if name not in properties)
+        positions = {name: at for name, at in positions.items() if name not in properties}
     doubles: list[mock_stubs.Prepass] = []
     # One listing of the checkout for every scan this transform makes, and for
     # the retry: nothing here adds or removes a file. Inside a run's scope,
     # the run's listing.
     with source_index.run_scope(), source_index.forgetting(), unused.prose_blind_scope(), ts_key_names.declaring(
         code_keys
-    ):
+    ), go_setters.treating(treatment):
         try:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
@@ -1965,7 +1972,7 @@ def _transform_flag(
     read_elsewhere: bool = False,
     *,
     entries: bool = True,
-    key_positions: dict[str, int] | None = None,
+    key_positions: dict[str, int | str] | None = None,
     code_keys: frozenset[str] = frozenset(),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
@@ -2104,10 +2111,19 @@ def _transform_flag(
     # after the engine, once it is known whether a real read was folded; see
     # :mod:`flag_cleanup.mock_stubs`. Before the entry and pinned-test reads
     # below, so neither describes a test this has already deleted.
+    # Go: a catalog whose default is the branch about to go, read off the
+    # customer's bytes before a pass edits a test beside it
+    # (:mod:`flag_cleanup.go_defaults`).
+    go_removed_default = None
+    if language == "go":
+        go_default = flag_default or registry_default(_registry_defaults(paths, language, flag_key, repo_dir))
+        if go_default.literal == (spec.false_literal if treatment else spec.true_literal):
+            go_removed_default = replace(go_default, siblings=go_default.siblings | known_flag_keys)
     if doubles is not None and mock_stubs.covers(language):
         stub_pass = mock_stubs.Prepass(
             language, flag_key, treatment, accessors, repo_dir=repo_dir if language == "go" else None
         )
+        stub_pass.removed_default = go_removed_default
         doubles.append(stub_pass)
         stub_pass.apply(paths)
 
@@ -2118,6 +2134,17 @@ def _transform_flag(
         two_value = go_two_value.Prepass(language, flag_key, treatment, accessors, repo_dir=repo_dir)
         doubles.append(two_value)
         two_value.apply(paths)
+
+    # A handle handed to a local closure that only forwards it to an accessor
+    # is written as the accessor call it stands for, so the resolution below
+    # reads it (see :mod:`flag_cleanup.go_handle_reads`). Same undo as above.
+    if doubles is not None and language == "go":
+        forwarded = go_handle_reads.Prepass(
+            language, flag_key, treatment, accessors, repo_dir=repo_dir,
+            names=go_handle_reads.declared_names(paths, flag_key),
+        )
+        doubles.append(forwarded)
+        forwarded.apply(paths)
 
     # Computed here, off the CUSTOMER's bytes, before anything rewrites them.
     # It is the only reading of the tree that has to happen first: every prong
@@ -2289,7 +2316,18 @@ def _transform_flag(
     kept_declarations = [
         p for p in without_const
         if language in _FOLDS_KEPT_CONSTANTS
-        and _const_safe_at(p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
+        and (
+            _const_safe_at(p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
+            # A mention in a branch the fold keeps (Go): the declaration stays
+            # with it, and the reads beside it are reads like any other.
+            or (
+                language == "go"
+                and _const_safe_at(
+                    p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors,
+                    treatment, kept_branches=True,
+                )
+            )
+        )
     ]
     if kept_declarations and language == "python":
         # Only a declaration the resolution kept for mentions that spell its
@@ -2317,6 +2355,7 @@ def _transform_flag(
             language, flag_key, treatment, accessors, key_texts=key_texts,
             repo_dir=repo_dir if language == "go" else None,
         )
+        stub_pass.removed_default = go_removed_default
         doubles.append(stub_pass)
         stub_pass.apply(sorted(key_texts))
 
@@ -2658,6 +2697,14 @@ def _transform_flag(
     summaries, test_doubles = _settle_test_doubles(
         summaries, doubles, language, planned_accessors, repo_dir, unprocessable, read_elsewhere
     )
+    # Go table rows decided by a registry default that is the removed branch:
+    # the deleted ones are reported like the TypeScript family's deleted tests,
+    # the unset ones that stayed with the registry entry they relied on.
+    default_rows = tuple((p, t) for p, k, t in test_doubles if k == mock_stubs.DEFAULT_ROW)
+    relied_rows = tuple((p, ts_tests.REMOVED_DEFAULT, t) for p, k, t in test_doubles if k == mock_stubs.RELIED_ON_DEFAULT)
+    test_doubles = tuple(
+        row for row in test_doubles if row[1] not in (mock_stubs.DEFAULT_ROW, mock_stubs.RELIED_ON_DEFAULT)
+    )
     # Listed with the mock lines: each checked a flag read this removal folded.
     engine_guards = tuple(row for row in engine_assertions if row[1] == CONSTANT_GUARD)
     test_doubles = test_doubles + tuple(row for row in engine_assertions if row[1] != CONSTANT_GUARD)
@@ -2774,6 +2821,7 @@ def _transform_flag(
     summaries, deleted_tests = _delete_pinned_tests(
         summaries, language, pinned_tests, repo_dir
     )
+    deleted_tests = tuple(deleted_tests) + default_rows
 
     # Drop the flag's condition from the titles of the tests that survive
     # because they test the KEPT branch: "renders X when the k flag is on"
@@ -3005,7 +3053,12 @@ def _transform_flag(
     )
     bindings = bindings + unread_constructor + removed_constructor
     bindings = bindings + dropped_parameters + unread_bindings
-    bindings = bindings + renamed_tests
+    bindings = bindings + renamed_tests + relied_rows
+    # A Go setter of the removed value that stays steers a read this run
+    # folded: it no longer has an effect (:func:`flag_cleanup.go_setters.inert`).
+    bindings = bindings + tuple(
+        (os.path.relpath(path, repo_dir), mock_stubs.INERT_OVERRIDE, text) for path, text in go_setters.inert()
+    )
     # A registry entry whose default was the branch the fold removed: every
     # test that left the flag unset ran that branch, and now runs the kept
     # one. The deletion above takes those whose titles say so; the pull
@@ -3258,6 +3311,10 @@ def _transform_flag(
         # one literal: it parses, and Go rejects the count.
         if reason is None and _grammar_of(s.path, language) == "go":
             reason = go_arity.refusal_reason(s.original_content, s.content)
+            if reason is not None:
+                reason = go_two_value.declined_reason(
+                    [p for p in doubles or () if isinstance(p, go_two_value.Prepass)], s.path
+                ) or reason
         if reason is None and _grammar_of(s.path, language) == "go":
             reason = go_two_value.survivors(
                 [p for p in doubles or () if isinstance(p, go_two_value.Prepass)], s.path, s.content
@@ -3834,7 +3891,7 @@ def _check_attribute_gates(
     resolution: cross_file_keys.Resolution,
     treatment: bool,
     *,
-    key_positions: dict[str, int] | None = None,
+    key_positions: dict[str, int | str] | None = None,
 ) -> dict[str, frozenset[str]]:
     """The files holding a C# attribute gate or a Python decorator gate on this
     flag, with how each spells its key. Raises if ``treatment`` cannot remove
@@ -3889,7 +3946,7 @@ def _delete_attribute_gates(
     accessors: tuple[str, ...],
     language: str = "csharp",
     *,
-    key_positions: dict[str, int] | None = None,
+    key_positions: dict[str, int | str] | None = None,
 ) -> list:
     """Delete the gates :func:`_check_attribute_gates` found, adding a summary
     for any file the engine did not touch."""
@@ -4749,6 +4806,17 @@ def _registry_defaults(
     ``flag_key``'s boolean default; empty outside the TypeScript family.
     ``path`` is relative to ``repo_dir``. An unreadable file yields nothing,
     as in :func:`_find_pinned_tests`."""
+    if language == "go":
+        found = []
+        for path in paths:
+            if path.endswith("_test.go"):
+                continue
+            try:
+                source = Path(path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            found.extend((os.path.relpath(path, repo_dir), entry) for entry in go_defaults.registry_defaults(source, flag_key))
+        return found
     if not ts_tests.covers(language):
         return []
     found = []
@@ -5239,6 +5307,15 @@ def _resolve_cross_file(
         resolution = cross_file_keys.resolve(
             repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
         )
+        if language == "go" and resolution.blocked and go_setters.declared():
+            # A declaration some refusal keeps (a `.Fallback()` read, say)
+            # still means something to a setter of it: deleting the setter on
+            # its own would change what the kept code does. So the setters
+            # stay mentions, like any other, and the declaration stays.
+            with go_setters.suspended():
+                resolution = cross_file_keys.resolve(
+                    repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
+                )
     finally:
         ts_barrels.editable.reset(editable)
     proven = _proven_readers(resolution, paths)
@@ -5825,7 +5902,7 @@ def _write_generated_rules(
     const_rules_file: Path,
     accessors: tuple[str, ...],
     *,
-    key_positions: dict[str, int] | None = None,
+    key_positions: dict[str, int | str] | None = None,
     async_accessors: frozenset[str] = frozenset(),
 ) -> tuple[Path, Path]:
     """Write accessor-extended copies of the rule files and return their paths.
@@ -7248,11 +7325,11 @@ def _referenced_elsewhere(
     return hits
 
 
-def _const_safe_at(path: str, *args) -> bool:
+def _const_safe_at(path: str, *args, **kwargs) -> bool:
     """:func:`const_path_is_safe` for the file at ``path``: a Go handle's
     constructor is proven from the repository around it."""
     with key_const.go_file(path):
-        return const_path_is_safe(*args)
+        return const_path_is_safe(*args, **kwargs)
 
 
 def _partition_by_const_safety(

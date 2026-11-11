@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.11.0"
+version = "2.12.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,9 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.50.0. Go: the grammar is now canopy-labs/tree-sitter-go (upstream 0.25.0
+    # plus Go 1.26 `new(<expression>)`), so a file using `new(int32(101))` is no
+    # longer refused. The tree-sitter-go pin below moves with it.
     # 0.49.0. C#: the grammar moves to canopy-labs/tree-sitter-c-sharp
     # 87435a0, and the C# wheel below with it to `+canopy.3`. A verbatim `""`
     # straight after a hole is an escaped quote, so `$@"a ""{t}"""` no longer
@@ -581,7 +584,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.49.0",
+    "polyglot-piranha==0.50.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -637,7 +640,16 @@ dependencies = [
     # against stock across 52 constructs: 9 fixed, 43 identical, 0 made worse.
     "tree-sitter-typescript==0.23.2+canopy.3",
     "tree-sitter-java>=0.23,<0.24",
-    "tree-sitter-go>=0.23,<0.26",
+    # Go. NOT a PyPI release, pinned EXACTLY for the same reason as the
+    # TypeScript and C# grammars above: Gate 1 must parse what the engine
+    # rewrites. polyglot-piranha bundles upstream 0.25.0 plus ONE grammar patch
+    # (canopy-labs/tree-sitter-go): the first argument of `new` is a type OR an
+    # expression, so Go 1.26's `new(int32(101))` / `new(cfg.Timeout)` /
+    # `new("x")` parse. Stock 0.25.0 gives an ERROR node there, and the gate
+    # would refuse the whole file. `node-types.json` is unchanged. Resolves only
+    # from wheels/ (PEP 440 local segment), filled by
+    # scripts/fetch_piranha_wheels.py. Bump the segment when the engine's pin moves.
+    "tree-sitter-go==0.25.0+canopy.1",
     "tree-sitter-swift>=0.7,<0.8",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",

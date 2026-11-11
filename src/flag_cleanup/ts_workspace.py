@@ -197,6 +197,14 @@ class _Checkout:
     capable: frozenset[Path] | None = None
     #: Those capable on their own (rules 1, 2, 4, 5), not only as imported.
     primary: set[Path] = field(default_factory=set)
+    #: Primary script naming a mapper -> the keys of its literal Jest
+    #: ``moduleNameMapper`` maps, compiled, or None when they cannot be read
+    #: (:func:`_mapper_keys`); worked out on first need.
+    mapper_keys: dict[Path, tuple[re.Pattern[str], ...] | None] | None = None
+    #: The first resolver-capable script that could redirect a deep subpath
+    #: without naming the package (:func:`_deep_redirect`); ``""`` for none,
+    #: None until worked out.
+    deep_redirect: str | None = None
 
 
 def _memo() -> dict | None:
@@ -557,8 +565,9 @@ def _unreachable_root(directory: Path, checkout: _Checkout) -> bool:
 
 def bundled(specifier: str, repo_dir: str) -> bool:
     """Whether bare ``specifier`` names a package of the checkout that a
-    bundler may build (:func:`_bundled`), or whose manifest cannot be read:
-    what it loads at run time may then do more than its source shows."""
+    bundler may build (:func:`_bundled`, unless nothing builds it at all:
+    :func:`_unbuilt`), or whose manifest cannot be read: what it loads at
+    run time may then do more than its source shows."""
     from flag_cleanup import source_index
 
     name = package_part(specifier)
@@ -569,7 +578,15 @@ def bundled(specifier: str, repo_dir: str) -> bool:
     for directory in _named(checkout, name):
         manifest = checkout.manifests.get(directory)
         try:
-            if not isinstance(manifest, dict) or _bundled(directory, manifest, stop):
+            if not isinstance(manifest, dict):
+                return True
+            # With no build at all, the TypeScript source the specifier names
+            # is what loads: no bundler writes `.ts`, so it cannot be one's
+            # output. A JavaScript entry may be, whatever build it is that
+            # this reading cannot see (a root script, a task runner's file).
+            if _bundled(directory, manifest, stop) and not (
+                _unbuilt(directory, manifest, stop) and _typescript_source(entry(specifier, repo_dir))
+            ):
                 return True
         except OSError:
             return True
@@ -627,6 +644,10 @@ def _resolve(reader_path: str, parsed: tuple[str, str], specifier: str, stop: Pa
         if package is None:
             return None
         directory, manifest = package
+        if _mapped(specifier, _checkout(stop)):
+            return None  # a test runner sends it elsewhere
+        if subpath != "." and _deep_redirect(_checkout(stop)):
+            return None  # a pattern may match the subpath alone
         if not _compiler_reads_package(Path(reader_path), specifier, stop):
             return None
         return _entry(directory, manifest, subpath, stop)
@@ -840,6 +861,8 @@ def _mentioned(name: str, checkout: _Checkout) -> str:
                 # the name, or a pattern over its scope, redirects only where
                 # it stands like a redirect.
                 mentioned = bool(hits + patterns) and _redirect_shaped(path, data, hits + patterns)
+            if mappers and _mapper_keys(checkout).get(path) is not None:
+                mappers = []  # a literal Jest map: judged per specifier (`_mapped`)
             blocked = mentioned or (bool(mappers) and _outside_comments(path, data, mappers))
             # An alias map computed at build time (a variable, a spread of an
             # incoming config, `Object.fromEntries`) is not inspected: see the
@@ -974,7 +997,798 @@ def _specifiers_only(path: Path, data: bytes, hits: list[tuple[int, int]]) -> bo
             node = node.parent
         if node is None or node.type in ("template_string", "regex", "program"):
             return False
-        if node.type != "comment" and not _specifier(node):
+        if node.type != "comment" and not _specifier(node) and not _compile_only(path, node):
+            return False
+    return True
+
+
+#: Options whose value lists package names a tool only COMPILES or leaves to
+#: Node, by the config file that reads them: they say how the package is
+#: built, never where its name leads. A whitelist: an entry here lets a
+#: mention through, so a key that can redirect (webpack's ``externals``,
+#: Rollup's ``external`` with ``output.globals``: a global another script
+#: provides) must never join it. Each is a key path from the exported config
+#: object, which :func:`_proven_config` must prove nothing else reads.
+_COMPILE_ONLY = (
+    ("next", re.compile(r"^next\.config\.[cm]?[jt]s$"), (("transpilePackages",), ("serverExternalPackages",))),
+    (
+        "vite",
+        re.compile(r"^vite(?:st)?\.config(?:\.[\w-]+)?\.[cm]?[jt]s$"),
+        (("optimizeDeps", "include"), ("optimizeDeps", "exclude")),
+    ),
+)
+#: Calls an exported config may be wrapped in, by tool, as (import source,
+#: imported name): looked through to their FIRST argument, one level. Each
+#: Next plugin was read at the version noted in the internal notes and never
+#: reads ``transpilePackages`` or ``serverExternalPackages`` into an alias or
+#: resolution (``@serwist/turbopack`` and ``@sentry/nextjs`` append to
+#: ``serverExternalPackages``). ``"default"`` is a default import or a
+#: ``require`` of the module.
+_CONFIG_WRAPPERS = {
+    "next": frozenset({("@serwist/turbopack", "withSerwist"), ("@sentry/nextjs", "withSentryConfig")}),
+    "vite": frozenset({("vite", "defineConfig"), ("vitest/config", "defineConfig")}),
+}
+#: Plugin factories: a default export called with options returns the wrapper
+#: (``const withBundleAnalyzer = bundleAnalyzer({ enabled })``).
+_CONFIG_WRAPPER_FACTORIES = {
+    "next": frozenset({"@next/bundle-analyzer", "@serwist/next"}),
+    "vite": frozenset(),
+}
+#: Next hooks that receive the resolved config (``webpack(config, { config })``).
+_CONFIG_HOOKS = frozenset({"webpack"})
+
+
+def compile_only(path: str | Path, string) -> bool:
+    """Whether ``string``, a parsed string node of the script at ``path``, is
+    a plain element of the literal list under one of :data:`_COMPILE_ONLY`'s
+    options, on a config object no code but the tool can read: no load of the
+    package it names, and no redirect of it."""
+    return _compile_only(Path(path), string)
+
+
+def _compile_only(path: Path, string) -> bool:
+    if string.type != "string":
+        return False
+    tool = next(((t, keys) for t, pattern, keys in _COMPILE_ONLY if pattern.match(path.name)), None)
+    array = string.parent
+    if tool is None or array is None or array.type != "array":
+        return False
+    # The key path from the list up to the outermost object literal.
+    names: list[str] = []
+    node, holder = array, None
+    while True:
+        while node.parent is not None and node.parent.type in _SEE_THROUGH:
+            node = node.parent
+        pair = node.parent
+        if pair is None or pair.type != "pair" or pair.child_by_field_name("value") != node:
+            break
+        key = pair.child_by_field_name("key")
+        if key is None or key.type not in ("property_identifier", "string"):
+            return False
+        names.insert(0, key.text.decode("utf-8", "replace").strip("'\""))
+        holder = pair.parent
+        if holder is None or holder.type != "object":
+            return False
+        node = holder
+    if tuple(names) not in tool[1] or holder is None:
+        return False
+    root = holder
+    while root.parent is not None:
+        root = root.parent
+    proven = _proven_config(root, tool[0], path)
+    return proven is not None and (proven.start_byte, proven.end_byte) == (holder.start_byte, holder.end_byte)
+
+
+def _proven_config(root, tool: str, path: Path):
+    """The object literal a config script exports when no code but the tool
+    (and a whitelisted wrapper) can read it; None otherwise. Sound by
+    construction, by the ways an object reaches code:
+
+    * the export: the file's one ``export default`` or ``module.exports =``
+      (no other ``module.exports``/``exports`` in the file), whose value is
+      the object, a top-level ``const`` bound to it, or a call of a
+      :data:`_CONFIG_WRAPPERS` wrapper whose FIRST argument is either;
+    * a binding: the ``const`` name appears in the file only where it is
+      declared and once in the export;
+    * ``this``: none anywhere inside the object;
+    * a spread into it: only of a whitelisted wrapper's call;
+    * a hook the tool hands the resolved config to: every Next ``webpack``
+      in the file is a function literal whose options parameter is absent
+      or destructured by plain names other than ``config``, and that never
+      names ``arguments``, nor reads ``module`` or ``options`` off its
+      first parameter (the loader rules carry the config too); Vite hands
+      it to every plugin, so a Vite config with a ``plugins`` key anywhere
+      is refused;
+    * the module system: no primitive that reaches the file's own exports
+      or its loader (:func:`_reaches_itself`).
+
+    Wrappers count only as an ``import`` binding or a ``const`` bound to a
+    ``require`` of their package, never declared or assigned again, and
+    only while no package of the checkout has their package's name."""
+    if _reaches_itself(root, path):
+        return None
+    bindings: dict[bytes, list] = {}
+    imports: dict[bytes, tuple[str, str]] = {}
+    imported: set[bytes] = set()  # bound by an `import` statement, not a `const`
+    for child in root.named_children:
+        declaration = child.child_by_field_name("declaration") if child.type == "export_statement" else child
+        if child.type == "import_statement":
+            source = child.child_by_field_name("source")
+            spec = _string_value(source) if source is not None else None
+            clause = next((c for c in child.named_children if c.type == "import_clause"), None)
+            if spec is None or clause is None:
+                continue
+            for part in clause.named_children:
+                if part.type == "identifier":
+                    imports[part.text] = (spec, "default")
+                    imported.add(part.text)
+                elif part.type == "named_imports":
+                    for item in part.named_children:
+                        if item.type == "import_specifier":
+                            name, alias = item.child_by_field_name("name"), item.child_by_field_name("alias")
+                            if name is not None:
+                                imports[(alias or name).text] = (spec, name.text.decode("utf-8"))
+                                imported.add((alias or name).text)
+        elif declaration is not None and declaration.type in ("lexical_declaration", "variable_declaration"):
+            constant = declaration.type == "lexical_declaration" and declaration.children[0].type == "const"
+            for declarator in declaration.named_children:
+                if declarator.type != "variable_declarator":
+                    continue
+                name, value = declarator.child_by_field_name("name"), declarator.child_by_field_name("value")
+                required = _required(value) if constant else None
+                if name is not None and name.type == "identifier":
+                    bindings.setdefault(name.text, []).append(value if constant else None)
+                    if required is not None:
+                        imports[name.text] = (required, "default")
+                elif name is not None and name.type == "object_pattern" and required is not None:
+                    for item in name.named_children:
+                        if item.type == "shorthand_property_identifier_pattern":
+                            imports[item.text] = (required, item.text.decode("utf-8"))
+                        elif item.type == "pair_pattern":
+                            key, local = item.child_by_field_name("key"), item.child_by_field_name("value")
+                            if key is not None and local is not None and local.type == "identifier":
+                                imports[local.text] = (required, key.text.decode("utf-8"))
+
+    def bound(name: bytes):
+        values = bindings.get(name, [])
+        return values[0] if len(values) == 1 else None
+
+    def wrapper(callee) -> bool:
+        if callee is None or callee.type != "identifier":
+            return False
+        source = imports.get(callee.text)
+        if source in _CONFIG_WRAPPERS[tool]:
+            return not _rebound(root, callee.text, 0 if callee.text in imported else 1) and not _in_checkout(path, source[0])
+        return not _rebound(root, callee.text, 1) and _factory_product(callee)
+
+    def _factory_product(callee) -> bool:
+        value = bound(callee.text)
+        if value is None or value.type != "call_expression":
+            return False
+        made = value.child_by_field_name("function")
+        if made is not None and made.type == "identifier":
+            source = imports.get(made.text)
+            package = (
+                source[0]
+                if source is not None and source[1] == "default" and not _rebound(root, made.text, 0 if made.text in imported else 1)
+                else None
+            )
+        else:
+            package = _required(made) if made is not None else None
+        return package in _CONFIG_WRAPPER_FACTORIES[tool] and not _in_checkout(path, package)
+
+    exports = []
+    for node in _walk(root):
+        if node.type == "export_statement" and any(c.type == "default" for c in node.children):
+            exports.append(node.child_by_field_name("value"))
+        elif node.type == "identifier" and node.text == b"exports":
+            exports.append(None)  # `exports.webpack = ...` changes what is exported
+        elif node.type == "member_expression" and node.text.replace(b" ", b"") == b"module.exports":
+            parent = node.parent
+            if (
+                parent is not None
+                and parent.type == "assignment_expression"
+                and parent.child_by_field_name("left") == node
+                and parent.parent is not None
+                and parent.parent.type == "expression_statement"
+                and parent.parent.parent == root
+            ):
+                exports.append(parent.child_by_field_name("right"))
+            else:
+                exports.append(None)  # any other use of the CommonJS export
+    if len(exports) != 1 or exports[0] is None:
+        return None
+    value = _unwrapped(exports[0])
+    binding = None
+    if value is not None and value.type == "call_expression":
+        if not wrapper(value.child_by_field_name("function")):
+            return None
+        arguments = value.child_by_field_name("arguments")
+        first = arguments.named_children[0] if arguments is not None and arguments.named_children else None
+        value = _unwrapped(first)
+    if value is not None and value.type == "identifier":
+        binding = value.text
+        value = _unwrapped(bound(binding))
+    if value is None or value.type != "object":
+        return None
+    if binding is not None and sum(1 for n in _walk(root) if n.type in ("identifier", "shorthand_property_identifier") and n.text == binding) != 2:
+        return None  # read, written or handed on somewhere else
+    for item in value.named_children:
+        if item.type == "spread_element":
+            spread = _unwrapped(item.named_children[0] if item.named_children else None)
+            if spread is None or spread.type != "call_expression" or not wrapper(spread.child_by_field_name("function")):
+                return None
+    for node in _walk(value):
+        # A getter or setter runs code on a read; a computed key hides which
+        # option (`['web' + 'pack']`) it sets.
+        if node.type == "computed_property_name":
+            return None
+        if node.type == "method_definition" and any(c.type in ("get", "set") for c in node.children):
+            return None
+    # The option names may be spelled only as the list's own keys.
+    own_keys = {
+        (key.start_byte, key.end_byte)
+        for item in value.named_children
+        if item.type == "pair" and (key := item.child_by_field_name("key")) is not None
+    }
+    for node in _walk(root):
+        if node.type in ("identifier", "property_identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern", "string", "template_string"):
+            text = node.text.decode("utf-8", "replace")
+            if any(name in text for name in _COMPILE_OPTION_NAMES):
+                if node.type in ("property_identifier", "string") and (node.start_byte, node.end_byte) in own_keys:
+                    continue
+                if node.type == "string" and node.parent is not None and node.parent.type == "string":
+                    continue
+                return None
+        elif node.type == "string_fragment" and any(name in node.text.decode("utf-8", "replace") for name in _COMPILE_OPTION_NAMES):
+            parent = node.parent
+            if parent is not None and (parent.start_byte, parent.end_byte) in own_keys:
+                continue
+            return None
+    for node in _walk(root):
+        if tool == "vite" and node.type in ("pair", "shorthand_property_identifier") and _key_text(node) == "plugins":
+            return None
+        if tool == "next" and not _hook_blind(node):
+            return None
+    return value
+
+
+#: Names through which code reaches its own module, the loader, or code
+#: built at run time; or (``defaultLoaders``) the config Next hands its
+#: hooks. Any one, anywhere in a compile-only config, refuses it.
+_SELF_REACHING = frozenset(
+    {
+        b"exports", b"createRequire", b"__filename", b"__dirname", b"arguments", b"eval", b"Function",
+        b"globalThis", b"global", b"Reflect", b"Proxy", b"defaultLoaders",
+    }
+)
+#: Node's built-in modules, as ``require('module').builtinModules`` lists
+#: them (Node 22), plus any ``node:`` specifier: a config may load only
+#: :data:`_ALLOWED_BUILTINS` of them. The rest reach the loader
+#: (``module._cache``), the process, or files and code at run time.
+_NODE_BUILTINS = frozenset(
+    """_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex
+    _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap
+    assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram
+    diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector
+    inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring
+    readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys
+    timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib""".split()
+)
+_ALLOWED_BUILTINS = frozenset({"path", "node:path", "url", "node:url"})
+#: Property names that reach the same: ``process.mainModule``, Next's
+#: ``defaultLoaders``.
+_SELF_REACHING_PROPERTIES = frozenset({b"mainModule", b"defaultLoaders"})
+
+
+def _reaches_itself(root, path: Path) -> bool:
+    """Whether a config script can reach its own exports, its loader or the
+    config a tool hands its hooks, by any primitive JavaScript has for it:
+
+    * ``module``, except as the one top-level ``module.exports =`` target
+      (``module['exports']``, ``module.children``, ``module.require``);
+    * ``exports``; ``this`` anywhere (``module.exports`` at the top of a
+      CommonJS file, the config itself in a method);
+    * ``require`` other than called with one plain string naming a package
+      or a relative path that is not this file (so no ``require.cache``,
+      ``require.main``, ``require.resolve``, ``require(__filename)``, no
+      ``const r = require``); ``import(...)`` likewise; ``import.meta``;
+      ``createRequire``;
+    * ``__filename``, ``__dirname``, ``arguments`` (the CommonJS wrapper's
+      ``module`` is ``arguments[2]``), ``eval``, ``Function``,
+      ``globalThis``, ``global``, ``Reflect``, ``Proxy``, ``with``,
+      ``process.mainModule``;
+    * ``defaultLoaders`` (Next's Babel loader options carry the config);
+    * ``process`` (``process.getBuiltinModule('module')._cache``) but as a
+      read of one environment variable (:func:`_env_read`: strings, which
+      reach nothing), and any Node built-in but ``path`` and ``url``, by
+      ``import``, ``require`` or ``import()``
+      (``require('node:module')._cache``), but ``readFileSync`` imported by
+      name from ``fs`` and only ever called on a literal ``.json`` path
+      inside ``JSON.parse`` (:func:`_json_read_only`);
+    * an enumeration (:data:`_ENUMERATORS`, ``Object.assign`` from anything
+      but object literals, ``for...in``) or ``JSON``, except ``JSON.parse``
+      of a string literal or of ``readFileSync`` of a literal ``.json``
+      path; and (judged by :func:`_proven_config`, which knows the list's
+      own key) any other spelling of the compile options' names.
+
+    The internal notes give why this set is closed."""
+    for node in _walk(root):
+        kind = node.type
+        if kind in ("this", "with_statement", "meta_property"):
+            return True
+        if kind == "identifier":
+            text = node.text
+            if text in _SELF_REACHING:
+                return True
+            if text == b"module" and not _the_export_target(node, root):
+                return True
+            if text == b"require" and not _plain_load(node, path, "function"):
+                return True
+            if text == b"process" and not _env_read(node):
+                return True
+            if text == b"readFileSync" and not _json_read_only(node):
+                return True
+        elif kind in ("property_identifier", "shorthand_property_identifier_pattern", "shorthand_property_identifier"):
+            if node.text in _SELF_REACHING_PROPERTIES:
+                return True
+        elif kind == "string" and (_string_value(node) or "").encode("utf-8") in _SELF_REACHING_PROPERTIES:
+            return True
+        elif kind == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and function.type == "import" and not _plain_load(function, path, "function"):
+                return True
+        elif kind == "import_statement" and not any(c.type == "type" for c in node.children):
+            source = node.child_by_field_name("source")
+            if source is None or (_builtin(_string_value(source)) and not _imports_read_file_sync(node)):
+                return True
+        elif kind == "for_in_statement" and any(c.type == "in" for c in node.children):
+            return True
+        elif kind == "subscript_expression":
+            index = node.child_by_field_name("index")
+            if index is None or index.type not in ("string", "number"):
+                return True  # `x['constr' + 'uctor']` names what no check can see
+        if kind in ("property_identifier", "shorthand_property_identifier_pattern") and node.text in _PROTOTYPE_NAMES:
+            return True
+        if kind == "string" and (_string_value(node) or "").encode("utf-8") in _PROTOTYPE_NAMES:
+            return True
+        if kind == "member_expression":
+            obj, prop = node.child_by_field_name("object"), node.child_by_field_name("property")
+            if obj is not None and prop is not None and obj.text in (b"Object", b"JSON"):
+                if obj.text == b"Object" and prop.text in _ENUMERATORS:
+                    return True
+                if obj.text == b"Object" and prop.text == b"assign" and not _assigns_literals(node):
+                    return True
+                if obj.text == b"JSON" and not _parses_a_literal(node):
+                    return True
+        if kind == "string" and node.parent is not None and node.parent.type == "arguments":
+            call = node.parent.parent
+            function = call.child_by_field_name("function") if call is not None and call.type == "call_expression" else None
+            if function is not None and function.type in ("identifier", "import") and function.text in (b"require", b"import"):
+                if _builtin(_string_value(node)) and not _requires_read_file_sync(call):
+                    return True
+    return False
+
+
+def _builtin(spec: str | None) -> bool:
+    """Whether ``spec`` names a Node built-in a config may not load."""
+    if spec is None:
+        return True
+    if spec in _ALLOWED_BUILTINS:
+        return False
+    return spec.startswith("node:") or spec in _NODE_BUILTINS
+
+
+#: Properties that reach a value's constructor or prototype: every function's
+#: ``constructor`` is ``Function`` (``[].map.constructor('code')``), which
+#: runs a string no check reads.
+_PROTOTYPE_NAMES = frozenset({b"constructor", b"__proto__", b"prototype"})
+#: ``Object.prototype``'s members: names an environment read may not take,
+#: since ``process.env`` inherits them.
+_OBJECT_PROTOTYPE_MEMBERS = frozenset(
+    {
+        b"constructor", b"__proto__", b"hasOwnProperty", b"isPrototypeOf", b"propertyIsEnumerable",
+        b"toLocaleString", b"toString", b"valueOf", b"__defineGetter__", b"__defineSetter__",
+        b"__lookupGetter__", b"__lookupSetter__",
+    }
+)
+#: An environment variable's name, as such names are written.
+_ENV_NAME = re.compile(rb"[A-Z_][A-Z0-9_]*\Z")
+
+#: The modules the one ``fs`` binding a config may take comes from.
+_FS_MODULES = frozenset({"fs", "node:fs"})
+
+
+def _env_read(process) -> bool:
+    """Whether ``process`` is read only as one environment variable by name
+    (a property, or a string-literal index): a name written like one
+    (``API_URL``) or any identifier that is not an ``Object.prototype``
+    member, whose value is a string used as one: never assigned, deleted,
+    used whole, called, indexed or read into (``.constructor``)."""
+    env = process.parent
+    if env is None or env.type != "member_expression" or env.child_by_field_name("object") != process:
+        return False
+    prop = env.child_by_field_name("property")
+    read = env.parent
+    if prop is None or prop.text != b"env" or read is None:
+        return False
+    if read.type == "member_expression":
+        named = read.child_by_field_name("property")
+        if read.child_by_field_name("object") != env or named is None or named.type != "property_identifier":
+            return False
+        variable = named.text
+    elif read.type == "subscript_expression":
+        index = read.child_by_field_name("index")
+        if read.child_by_field_name("object") != env or index is None or index.type != "string":
+            return False
+        variable = (_string_value(index) or "").encode("utf-8")
+    else:
+        return False
+    if not (_ENV_NAME.match(variable) or (variable and variable not in _OBJECT_PROTOTYPE_MEMBERS)):
+        return False
+    if _ENV_NAME.match(variable) is None and not re.fullmatch(rb"[A-Za-z_$][\w$]*", variable):
+        return False
+    outer = read.parent
+    if outer is None:
+        return True
+    # The value is a string: used as one, never called, indexed or read into.
+    if outer.type == "call_expression" and outer.child_by_field_name("function") == read:
+        return False
+    if outer.type in ("member_expression", "subscript_expression") and outer.child_by_field_name("object") == read:
+        return False
+    if outer.type in ("assignment_expression", "augmented_assignment_expression") and outer.child_by_field_name("left") == read:
+        return False
+    if outer.type == "update_expression" or (outer.type == "unary_expression" and outer.children[0].type == "delete"):
+        return False
+    return True
+
+
+def _imports_read_file_sync(statement) -> bool:
+    """Whether an ``import`` takes exactly ``readFileSync``, by name and
+    unrenamed, from ``fs`` or ``node:fs``."""
+    source = statement.child_by_field_name("source")
+    if source is None or _string_value(source) not in _FS_MODULES:
+        return False
+    clause = next((c for c in statement.named_children if c.type == "import_clause"), None)
+    parts = clause.named_children if clause is not None else []
+    if len(parts) != 1 or parts[0].type != "named_imports":
+        return False  # a default or namespace import hands on the whole module
+    specifiers = [c for c in parts[0].named_children if c.type == "import_specifier"]
+    return (
+        len(specifiers) == 1
+        and specifiers[0].child_by_field_name("alias") is None
+        and specifiers[0].child_by_field_name("name").text == b"readFileSync"
+    )
+
+
+def _requires_read_file_sync(call) -> bool:
+    """Whether a ``require('fs')`` is ``const { readFileSync } = require('fs')``."""
+    declarator = call.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("value") != call:
+        return False
+    declaration = declarator.parent
+    pattern = declarator.child_by_field_name("name")
+    return (
+        _required(call) in _FS_MODULES
+        and declaration is not None
+        and declaration.type == "lexical_declaration"
+        and declaration.children[0].type == "const"
+        and pattern is not None
+        and pattern.type == "object_pattern"
+        and [c.type for c in pattern.named_children] == ["shorthand_property_identifier_pattern"]
+        and pattern.named_children[0].text == b"readFileSync"
+    )
+
+
+def _json_read_only(name) -> bool:
+    """Whether an identifier ``readFileSync`` is its own binding (by
+    :func:`_imports_read_file_sync` or :func:`_requires_read_file_sync`),
+    or a call on a literal ``.json`` path that is ``JSON.parse``'s one
+    argument (:func:`_parses_a_literal`)."""
+    parent = name.parent
+    if parent is not None and parent.type == "import_specifier":
+        return True
+    call = parent
+    if call is None or call.type != "call_expression" or call.child_by_field_name("function") != name:
+        return False
+    arguments = call.parent
+    parse = arguments.parent if arguments is not None and arguments.type == "arguments" else None
+    member = parse.child_by_field_name("function") if parse is not None and parse.type == "call_expression" else None
+    return (
+        member is not None
+        and member.type == "member_expression"
+        and member.text == b"JSON.parse"
+        and _parses_a_literal(member)
+    )
+
+
+def _parses_a_literal(member) -> bool:
+    """Whether ``JSON.<x>`` is ``JSON.parse`` of a string literal, or of
+    ``readFileSync('<literal>.json', ...)``: data, never the config."""
+    prop = member.child_by_field_name("property")
+    call = member.parent
+    if prop is None or prop.text != b"parse" or call is None or call.type != "call_expression":
+        return False
+    arguments = call.child_by_field_name("arguments")
+    listed = [a for a in arguments.named_children if a.type != "comment"] if arguments is not None else []
+    if len(listed) != 1:
+        return False
+    first = listed[0]
+    if first.type == "string":
+        return True
+    if first.type != "call_expression":
+        return False
+    read = first.child_by_field_name("function")
+    inner = first.child_by_field_name("arguments")
+    read_args = [a for a in inner.named_children if a.type != "comment"] if inner is not None else []
+    return (
+        read is not None
+        and read.type == "identifier"
+        and read.text == b"readFileSync"
+        and bool(read_args)
+        and read_args[0].type == "string"
+        and (_string_value(read_args[0]) or "").endswith(".json")
+    )
+
+
+def _the_export_target(module, root) -> bool:
+    """Whether ``module`` is the object of the one top-level ``module.exports
+    = ...`` the file exports with."""
+    member = module.parent
+    if member is None or member.type != "member_expression" or member.child_by_field_name("object") != module:
+        return False
+    prop = member.child_by_field_name("property")
+    assignment = member.parent
+    return (
+        prop is not None
+        and prop.text == b"exports"
+        and assignment is not None
+        and assignment.type == "assignment_expression"
+        and assignment.child_by_field_name("left") == member
+        and assignment.parent is not None
+        and assignment.parent.type == "expression_statement"
+        and assignment.parent.parent == root
+    )
+
+
+def _plain_load(callee, path: Path, field: str) -> bool:
+    """Whether ``callee`` (``require`` or ``import``) is called with one plain
+    string naming a package, or a relative path to another file."""
+    call = callee.parent
+    if call is None or call.type != "call_expression" or call.child_by_field_name(field) != callee:
+        return False
+    arguments = call.child_by_field_name("arguments")
+    listed = [a for a in arguments.named_children if a.type != "comment"] if arguments is not None else []
+    if len(listed) != 1 or listed[0].type != "string":
+        return False
+    spec = _string_value(listed[0])
+    if not spec:
+        return False
+    if spec.startswith((".", "/")):
+        target = Path(os.path.normpath(path.parent / spec))
+        stem = path.name.split(".")[0]
+        own = {path, path.with_suffix(""), path.parent / stem, path.parent / ".".join(path.name.split(".")[:-1])}
+        if target in own or target == path.parent:
+            return False  # this file, or its directory's index
+    return True
+
+
+def _rebound(root, name: bytes, allowed: int) -> bool:
+    """Whether ``name`` is declared or assigned anywhere beyond its own
+    binding (``allowed`` declarators: 1 for a ``const``, 0 for an
+    ``import``): another ``let``/``var``/``const`` or parameter of the name
+    (a shadow, over-refused), a ``function`` or ``class`` of it, an
+    assignment or an update."""
+    declared = 0
+    for node in _walk(root):
+        kind = node.type
+        if kind in ("assignment_expression", "augmented_assignment_expression", "update_expression"):
+            target = node.child_by_field_name("left") if kind != "update_expression" else node
+            if target is not None and any(n.type == "identifier" and n.text == name for n in _walk(target)):
+                return True
+        elif kind in ("function_declaration", "generator_function_declaration", "class_declaration"):
+            declared_name = node.child_by_field_name("name")
+            if declared_name is not None and declared_name.text == name:
+                return True
+        else:
+            if kind == "variable_declarator":
+                target = node.child_by_field_name("name")
+            elif kind == "formal_parameters":
+                target = node
+            elif kind in ("arrow_function", "catch_clause"):
+                target = node.child_by_field_name("parameter")
+            else:
+                continue
+            if target is not None and any(
+                n.type in ("identifier", "shorthand_property_identifier_pattern") and n.text == name for n in _walk(target)
+            ):
+                declared += 1
+    return declared > allowed
+
+
+def _in_checkout(path: Path, package: str) -> bool:
+    """Whether a ``package.json`` of the checkout is named ``package``: the
+    name may then resolve to it rather than to the published wrapper."""
+    from flag_cleanup import source_index
+
+    try:
+        stop = Path(source_index.checkout_root(str(path.parent))).resolve()
+        return bool(_named(_checkout(stop), package))
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def _walk(node):
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(current.children)
+
+
+def _unwrapped(node):
+    while node is not None and node.type in _SEE_THROUGH:
+        node = node.named_children[0] if node.named_children else None
+    return node
+
+
+def _key_text(node) -> str | None:
+    """The plain key of a pair, method or shorthand property."""
+    if node.type == "shorthand_property_identifier":
+        return node.text.decode("utf-8", "replace")
+    key = node.child_by_field_name("key") if node.type == "pair" else node.child_by_field_name("name")
+    if key is None or key.type not in ("property_identifier", "string"):
+        return None
+    return key.text.decode("utf-8", "replace").strip("'\"`")
+
+
+def _required(value) -> str | None:
+    """``m`` of a ``require("m")`` call."""
+    if value is None or value.type != "call_expression":
+        return None
+    function = value.child_by_field_name("function")
+    arguments = value.child_by_field_name("arguments")
+    if function is None or function.text != b"require" or arguments is None or len(arguments.named_children) != 1:
+        return None
+    first = arguments.named_children[0]
+    return _string_value(first) if first.type == "string" else None
+
+
+#: Property names a Next ``webpack`` hook may not READ: the loader options
+#: (``rule.use[].options``, ``rule.options``, a ``oneOf`` branch's) carry
+#: Next's config, ``transpilePackages`` included. Writing them as keys of a
+#: rule the hook adds (``use: [{ loader, options }]``) is fine.
+_LOADER_READS = frozenset({b"options", b"use", b"loader", b"oneOf"})
+#: ``Object`` methods that enumerate an object's properties, or copy them.
+_ENUMERATORS = frozenset(
+    {b"values", b"entries", b"keys", b"getOwnPropertyDescriptors", b"getOwnPropertyDescriptor", b"getOwnPropertyNames"}
+)
+#: The option names a hook may not spell at all.
+_COMPILE_OPTION_NAMES = frozenset({"transpilePackages", "serverExternalPackages"})
+
+
+def _loader_rules_unread(function, first) -> bool:
+    """Whether a Next ``webpack`` hook cannot dig the config out of the loader
+    rules it is handed. Its first parameter (the webpack config) is used only
+    through a property (``config.module.rules.find(...)``,
+    ``config.resolve.alias[...] = ...``, ``config.plugins.push(...)``) or
+    returned; never destructured, aliased or handed to other code. And
+    nowhere in the hook: a read of :data:`_LOADER_READS` (by member, by a
+    computed index, or by destructuring), a computed index that is not a
+    literal (``rule['opt' + 'ions']``), an ``Object`` enumeration
+    (:data:`_ENUMERATORS`) or ``Object.assign`` from anything but an object
+    literal, ``for...in``, ``JSON``, or any spelling of the compile options'
+    names. What remains, an accepted residual (README): spreading or
+    rest-destructuring a found rule object and using the result as an
+    alias, and a rule object handed to a helper outside the hook."""
+    if first.type in ("required_parameter", "optional_parameter"):
+        first = first.child_by_field_name("pattern")
+    if first is None or first.type != "identifier":
+        return False
+    name = first.text
+    for node in _walk(function):
+        kind = node.type
+        if kind == "identifier" and node.text == name and node != first:
+            parent = node.parent
+            if parent is not None and parent.type == "member_expression" and parent.child_by_field_name("object") == node:
+                continue
+            if parent is not None and (
+                parent.type == "return_statement"
+                or (parent.type == "arrow_function" and parent.child_by_field_name("body") == node)
+            ):
+                continue
+            return False
+        if kind == "member_expression":
+            prop = node.child_by_field_name("property")
+            obj = node.child_by_field_name("object")
+            if prop is not None and prop.text in _LOADER_READS:
+                return False
+            if obj is not None and obj.text in (b"Object", b"JSON") and prop is not None:
+                if obj.text == b"JSON" or prop.text in _ENUMERATORS:
+                    return False
+                if prop.text == b"assign" and not _assigns_literals(node):
+                    return False
+        elif kind == "subscript_expression":
+            index = node.child_by_field_name("index")
+            if index is None or index.type not in ("string", "number"):
+                return False
+            if index.type == "string" and (_string_value(index) or "").encode("utf-8") in _LOADER_READS:
+                return False
+        elif kind in ("shorthand_property_identifier_pattern",) and node.text in _LOADER_READS:
+            return False
+        elif kind == "pair_pattern":
+            key = node.child_by_field_name("key")
+            if key is None or key.type not in ("property_identifier", "string") or key.text.strip(b"'\"") in _LOADER_READS:
+                return False
+        elif kind == "for_in_statement" and any(c.type == "in" for c in node.children):
+            return False
+        elif kind in ("identifier", "property_identifier", "shorthand_property_identifier") and node.text.decode(
+            "utf-8", "replace"
+        ) in _COMPILE_OPTION_NAMES:
+            return False
+        elif kind in ("string", "template_string") and any(n in node.text.decode("utf-8", "replace") for n in _COMPILE_OPTION_NAMES):
+            return False
+    return True
+
+
+def _assigns_literals(member) -> bool:
+    """Whether an ``Object.assign`` call copies only object literals in."""
+    call = member.parent
+    if call is None or call.type != "call_expression" or call.child_by_field_name("function") != member:
+        return False
+    arguments = call.child_by_field_name("arguments")
+    listed = [a for a in arguments.named_children if a.type != "comment"] if arguments is not None else []
+    return all(_unwrapped(a) is not None and _unwrapped(a).type == "object" for a in listed[1:])
+
+
+def _hook_blind(node) -> bool:
+    """Whether ``node`` is not a Next hook, or is one that cannot read the
+    resolved config it is handed: see :func:`_proven_config`."""
+    if node.type == "assignment_expression":
+        left = node.child_by_field_name("left")
+        prop = left.child_by_field_name("property") if left is not None and left.type == "member_expression" else None
+        return prop is None or prop.text.decode("utf-8", "replace") not in _CONFIG_HOOKS
+    if node.type == "shorthand_property_identifier":
+        return node.text.decode("utf-8", "replace") not in _CONFIG_HOOKS
+    if node.type not in ("pair", "method_definition") or _key_text(node) not in _CONFIG_HOOKS:
+        return True
+    function = _unwrapped(node.child_by_field_name("value")) if node.type == "pair" else node
+    if function is None or function.type not in ("arrow_function", "function_expression", "function", "method_definition"):
+        return False
+    if any(n.type == "identifier" and n.text == b"arguments" for n in _walk(function)):
+        return False
+    parameters = function.child_by_field_name("parameters")
+    if parameters is None:
+        return function.type == "arrow_function"  # `config => ...`: one parameter
+    listed = [p for p in parameters.named_children if p.type != "comment"]
+    if len(listed) > 2:
+        return False
+    if listed and not _loader_rules_unread(function, listed[0]):
+        return False
+    if len(listed) < 2:
+        return True
+    options = listed[1]
+    if options.type in ("required_parameter", "optional_parameter"):
+        options = options.child_by_field_name("pattern")
+    if options is None or options.type != "object_pattern":
+        return False
+    for item in options.named_children:
+        if item.type == "object_assignment_pattern":
+            item = item.child_by_field_name("left")
+        if item is None:
+            return False
+        if item.type == "shorthand_property_identifier_pattern":
+            name = item.text
+        elif item.type == "pair_pattern":
+            key = item.child_by_field_name("key")
+            if key is None or key.type not in ("property_identifier", "string"):
+                return False
+            name = key.text.strip(b"'\"")
+        elif item.type == "comment":
+            continue
+        else:
+            return False  # a rest element, a computed key
+        if name == b"config":
             return False
     return True
 
@@ -992,6 +1806,262 @@ _LOOKUP_METHODS = frozenset({"includes", "has", "get", "indexOf"})
 _TABLES = frozenset({b"Map", b"Set"})
 #: Option keys whose value is a redirect's pattern.
 _PATTERN_KEYS = frozenset({"find", "filter", "test"})
+
+
+#: Escapes a mapper key may hold that a JavaScript and a Python pattern read
+#: alike on an ASCII specifier: a quoted metacharacter, a digit, a word char.
+_MAPPER_ESCAPES = frozenset(r"./-\^$*+?()[]|dw")
+#: How a JavaScript string spells a character by escape, for the ones a key
+#: may use; any other escape is not read.
+_STRING_ESCAPES = {"\\\\": "\\", "\\'": "'", '\\"': '"', "\\/": "/"}
+
+
+def _literal_mapper(path: Path, data: bytes, hits: list[tuple[int, int]]) -> tuple[re.Pattern[str], ...] | None:
+    """The keys of every Jest ``moduleNameMapper`` at ``hits`` in a script,
+    compiled, when each hit outside a comment is the key of an option whose
+    value is an object literal of plain keys, every one a pattern JavaScript
+    and Python match alike (:func:`_mapper_pattern`); None otherwise (a
+    spread, a computed key, a variable, an assignment, another mapper option,
+    a pattern this cannot read the same way), and then the script refuses."""
+    from flag_cleanup import cross_file_ts as ts
+    from flag_cleanup import ts_syntax
+
+    try:
+        root = ts_syntax._parse(data.decode("utf-8"), ts._language(str(path)))
+    except UnicodeDecodeError:
+        return None
+    if root.has_error:
+        return None
+    keys: list[re.Pattern[str]] = []
+    for start, end in hits:
+        if data[start:end] != b"moduleNameMapper":
+            return None
+        node = root.descendant_for_byte_range(start, end)
+        while node is not None and node.type not in ("comment", "property_identifier", "string", "program"):
+            node = node.parent
+        if node is None or node.type == "program":
+            return None
+        if node.type == "comment":
+            continue
+        if node.type == "string" and _string_value(node) != "moduleNameMapper":
+            return None
+        pair = node.parent
+        if pair is None or pair.type != "pair" or pair.child_by_field_name("key") != node:
+            return None
+        value = pair.child_by_field_name("value")
+        if value is None or value.type != "object":
+            return None
+        for item in value.named_children:
+            if item.type == "comment":
+                continue
+            key = item.child_by_field_name("key") if item.type == "pair" else None
+            if key is None:
+                return None  # a spread, a method, a shorthand property
+            if key.type == "property_identifier":
+                text = key.text.decode("utf-8")
+            elif key.type == "string":
+                text = _string_value(key)
+            else:
+                return None
+            pattern = _mapper_pattern(text) if text is not None else None
+            if pattern is None:
+                return None
+            keys.append(pattern)
+    return tuple(keys)
+
+
+def _string_value(string) -> str | None:
+    """The value of a plain string literal, when every escape in it is one of
+    :data:`_STRING_ESCAPES`; None otherwise."""
+    parts: list[str] = []
+    for child in string.named_children:
+        text = child.text.decode("utf-8", "replace")
+        if child.type == "string_fragment":
+            parts.append(text)
+        elif child.type == "escape_sequence" and text in _STRING_ESCAPES:
+            parts.append(_STRING_ESCAPES[text])
+        else:
+            return None
+    return "".join(parts)
+
+
+def _mapper_pattern(source: str) -> re.Pattern[str] | None:
+    """``source``, a Jest mapper key (a JavaScript pattern, no flags), as a
+    Python pattern that matches an ASCII specifier exactly where it does; None
+    when it holds syntax the two may read apart. Sound by construction, not by
+    a list of known differences: only printable ASCII, no braces, no group but
+    ``(?:``, ``(?=``, ``(?!``, escapes only of punctuation, ``\\d`` and ``\\w``,
+    and a character class only as :func:`_class_end` reads it."""
+    if not source or any(not (" " <= c <= "~") for c in source) or "{" in source or "}" in source:
+        return None
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        if c == "\\":
+            if i + 1 >= n or source[i + 1] not in _MAPPER_ESCAPES:
+                return None
+            i += 2
+            continue
+        if c == "[":
+            end = _class_end(source, i)
+            if end is None:
+                return None
+            i = end
+            continue
+        if c == "(" and source.startswith("(?", i) and not source.startswith(("(?:", "(?=", "(?!"), i):
+            return None
+        i += 1
+    try:
+        return re.compile(source)
+    except re.error:
+        return None
+
+
+def _class_end(source: str, start: int) -> int | None:
+    """The index past the character class opening at ``start``, when it is one
+    JavaScript and Python read alike: an optional ``^``, then at least one
+    member before the closing ``]`` (so neither ``[]``, which JavaScript reads
+    as matching nothing, nor ``[^]``, which it reads as matching anything,
+    while Python reads a ``]`` there as a member), each member a literal
+    character other than ``[``, ``]`` and ``\\``, an escape of punctuation,
+    ``\\d``, ``\\w``, or a range between two letters or two digits of one
+    kind. Doubled ``-``, ``&``, ``~`` or ``|`` (a set operation Python may
+    adopt) and anything else is None."""
+    n = len(source)
+    j = start + 1
+    if j < n and source[j] == "^":
+        j += 1
+    members = 0
+    while j < n:
+        c = source[j]
+        if c == "]":
+            return j + 1 if members else None
+        if c == "[":
+            return None
+        if c in "-&~|" and j + 1 < n and source[j + 1] == c:
+            return None
+        if c == "\\":
+            if j + 1 >= n or source[j + 1] not in _MAPPER_ESCAPES:
+                return None
+            j += 2
+            if j + 1 < n and source[j] == "-" and source[j + 1] != "]":
+                return None  # a range from an escape
+            members += 1
+            continue
+        j += 1
+        if j + 1 < n and source[j] == "-" and source[j + 1] != "]":
+            low, high = c, source[j + 1]
+            if not any(low in k and high in k for k in _RANGE_KINDS) or low > high:
+                return None
+            j += 2
+        members += 1
+    return None  # unterminated
+
+
+#: The character kinds a class range may span.
+_RANGE_KINDS = ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0123456789")
+
+
+def _mapper_keys(checkout: _Checkout) -> dict[Path, tuple[re.Pattern[str], ...] | None]:
+    """Every primary resolver script of the checkout that names a mapper,
+    with its literal Jest mapper keys (:func:`_literal_mapper`), worked out
+    once per run. Only a primary script's map is read this way: anywhere
+    else a mapper refuses on sight."""
+    if checkout.mapper_keys is None:
+        found: dict[Path, tuple[re.Pattern[str], ...] | None] = {}
+        capable = _capable(checkout)
+        for path in checkout.files:
+            if _resolver_kind(path) != "script" or path.resolve() not in capable:
+                continue
+            if path.resolve() not in checkout.primary:
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue  # `_mentioned` refuses an unreadable file itself
+            hits = [m.span() for m in _MAPPERS.finditer(data)]
+            if hits:
+                found[path] = _literal_mapper(path, data, hits)
+        checkout.mapper_keys = found
+    return checkout.mapper_keys
+
+
+#: Text in a resolver's config that can redirect a subpath without naming
+#: the package: webpack's replacement plugin (its pattern is often a string).
+_DEEP_REDIRECT_TEXT = re.compile(rb"NormalModuleReplacementPlugin")
+
+
+def _deep_redirect(checkout: _Checkout) -> str:
+    """The first resolver-capable script of the checkout (one a tool loads as
+    its config, one that loads a resolver's API, or anything such a script
+    imports or names: an alias table kept in a helper) holding a regex literal, a
+    ``RegExp(...)``, ``NormalModuleReplacementPlugin`` or a ``resolver``
+    property, or that does not parse; ``""`` for none. Any of them may send
+    ``@acme/flags/src/keys`` elsewhere by matching ``/src/keys`` alone (a
+    Vite alias ``find: /\\/src\\/keys$/``, a Jest ``resolver``), which the
+    checks on the package's name cannot see. Refuses more than it must, on
+    purpose: a deep subpath is only followed where nothing like it exists."""
+    if checkout.deep_redirect is None:
+        from flag_cleanup import cross_file_ts as ts
+        from flag_cleanup import ts_syntax
+
+        found = ""
+        capable = _capable(checkout)
+        for path in checkout.files:
+            resolved = path.resolve()
+            if _resolver_kind(path) != "script" or resolved not in capable:
+                continue
+            try:
+                data = path.read_bytes()
+                root = ts_syntax._parse(data.decode("utf-8"), ts._language(str(path)))
+            except (OSError, UnicodeDecodeError):
+                found = str(path)
+                break
+            if root.has_error or _DEEP_REDIRECT_TEXT.search(data) or _redirects_by_pattern(root):
+                found = str(path)
+                break
+        checkout.deep_redirect = found
+    return checkout.deep_redirect
+
+
+def _redirects_by_pattern(root) -> bool:
+    """Whether a parsed script holds a regex literal, a ``RegExp`` call or
+    construction, or a ``resolver`` property (a key, or ``x.resolver``)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "regex":
+            return True
+        if node.type in ("new_expression", "call_expression"):
+            callee = node.child_by_field_name("constructor" if node.type == "new_expression" else "function")
+            if callee is not None and callee.text in (b"RegExp", b"globalThis.RegExp"):
+                return True
+        if node.type == "pair":
+            key = node.child_by_field_name("key")
+            if key is not None and key.text.strip(b"'\"`") == b"resolver":
+                return True
+        if node.type == "member_expression":
+            prop = node.child_by_field_name("property")
+            if prop is not None and prop.text == b"resolver":
+                return True
+        if node.type in ("shorthand_property_identifier", "method_definition") and (
+            node.text == b"resolver" or node.child_by_field_name("name") is not None and node.child_by_field_name("name").text == b"resolver"
+        ):
+            return True
+        stack.extend(node.children)
+    return False
+
+
+def _mapped(specifier: str, checkout: _Checkout) -> bool:
+    """Whether a Jest mapper of the checkout may send ``specifier``
+    elsewhere: a literal key that matches it, any key when it is not plain
+    ASCII, or a map that cannot be read."""
+    keys = _mapper_keys(checkout)
+    if not keys:
+        return False
+    if any(k is None for k in keys.values()) or not specifier.isascii():
+        return True
+    return any(p.search(specifier) for patterns in keys.values() for p in patterns)
 
 
 def _outside_comments(path: Path, data: bytes, hits: list[tuple[int, int]]) -> bool:
@@ -1274,7 +2344,7 @@ def _entry(directory: Path, manifest: dict, subpath: str, stop: Path) -> str:
                 raise _Unknown(field_name)
             leaves.append(value)
     elif exports is None:
-        raise _Unknown(subpath)
+        return _named_file(directory, manifest, subpath, stop)
     if not leaves:
         raise _Unknown(str(directory))
     emits = _emits(directory, stop)
@@ -1365,6 +2435,12 @@ def _bundled(directory: Path, manifest: dict, stop: Path) -> bool:
     built = built or any(isinstance(b, dict) and _tsc_executor(b.get("targets", {})) for b in targets[:own])
     if not built:
         return True  # no build of the package says it is tsc's
+    return _root_bundler(directory, stop)
+
+
+def _root_bundler(directory: Path, stop: Path) -> bool:
+    """Whether a bundler config at the root of a workspace holding the
+    package (or of the checkout) may build it: any but a Vitest-only one."""
     roots = [r for r in _checkout(stop).roots if directory.is_relative_to(r)] + [stop]
     for root in roots:
         for entry in root.iterdir() if root.is_dir() else ():
@@ -1373,6 +2449,31 @@ def _bundled(directory: Path, manifest: dict, stop: Path) -> bool:
             if not _vitest_only(entry, root):
                 return True
     return False
+
+
+#: TypeScript source, which no bundler emits.
+_TYPESCRIPT_SOURCE = (".ts", ".tsx", ".mts", ".cts")
+
+
+def _typescript_source(path: str | None) -> bool:
+    return path is not None and path.endswith(_TYPESCRIPT_SOURCE) and not path.endswith(tuple(_DECLARATION_SUFFIXES))
+
+
+def _unbuilt(directory: Path, manifest: dict, stop: Path) -> bool:
+    """Whether nothing builds the package at all: no build script (by
+    :data:`_BUILD_SCRIPT`'s names), no Nx project or workspace, no bundler
+    config in its directory or at a root holding it. Then what a bare
+    specifier loads is what its manifest names, and when that is source no
+    bundle stands between."""
+    scripts = manifest.get("scripts", {})
+    if not isinstance(scripts, dict) or any(_BUILD_SCRIPT.match(str(name)) for name in scripts):
+        return False
+    if "nx" in manifest or (directory / "project.json").exists() or (stop / "nx.json").exists():
+        return False
+    for entry in directory.iterdir():
+        if _BUNDLER_CONFIG.match(entry.name) or entry.name.lower().startswith("webpack."):
+            return False
+    return not _root_bundler(directory, stop)
 
 
 def _runs_tsc(name: str, scripts: dict, seen: set[str]) -> bool:
@@ -1473,6 +2574,37 @@ def _vitest_only(config: Path, root: Path) -> bool:
     return isinstance(scripts, dict) and not any(
         isinstance(v, str) and re.search(r"(?:^|[\s;&|(/])vite(?=\s|$)", v) for v in scripts.values()
     )
+
+
+def _named_file(directory: Path, manifest: dict, subpath: str, stop: Path) -> str:
+    """The source file a subpath names in a package without ``exports``: with
+    nothing to map it, Node, TypeScript and a bundler all look it up as a
+    path in the package. A ``browser`` or ``react-native`` map may send it
+    elsewhere for one bundler, so either one refuses; so does a path naming
+    no file, or more than one (``keys.ts`` beside ``keys.js``, a
+    ``keys.json`` a bundler may try first), a declaration file, or a build
+    output of the package's own configs."""
+    from flag_cleanup import cross_file_ts as ts
+
+    if any(not isinstance(manifest.get(f), (str, type(None))) for f in _ENTRY_FIELDS):
+        raise _Unknown(subpath)
+    try:
+        hits = ts._candidates(os.path.normpath(directory / subpath))
+    except ts._Unknown as error:
+        raise _Unknown(subpath) from error
+    if len(hits) != 1 or not hits[0].endswith(_SCRIPT_SUFFIXES) or hits[0].endswith(tuple(_DECLARATION_SUFFIXES)):
+        raise _Unknown(subpath)
+    hit = Path(hits[0]).resolve()
+    written = Path(os.path.normpath(directory / subpath))
+    if written.is_file() and written.resolve() != hit:
+        raise _Unknown(subpath)  # Node and bundlers try the path as written first
+    if not hit.is_relative_to(directory.resolve()) or any(
+        hit.is_relative_to(e.out) or hit.is_relative_to(e.declarations) for e in _emits(directory, stop)
+    ):
+        raise _Unknown(subpath)
+    if not _typescript_source(str(hit)) and _bundled(directory, manifest, stop):
+        raise _Unknown(subpath)  # a committed file some bundler may rewrite
+    return str(hit)
 
 
 def _exported(exports: object, subpath: str) -> object:

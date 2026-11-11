@@ -3460,6 +3460,7 @@ def const_path_is_safe(
     flag_key: str,
     accessors: tuple[str, ...] = (),
     treatment: bool | None = None,
+    kept_branches: bool = False,
 ) -> bool:
     """Whether the const-propagation rules may run over ``source`` (Gate 2).
 
@@ -3526,7 +3527,7 @@ def const_path_is_safe(
     else:
         return True
     return key_const.path_is_safe(
-        root, source.encode("utf-8"), language, flag_key, accessors, treatment
+        root, source.encode("utf-8"), language, flag_key, accessors, treatment, kept_branches
     )
 
 

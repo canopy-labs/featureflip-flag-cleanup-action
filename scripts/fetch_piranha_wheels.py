@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch the forked wheels this tool pins into wheels/.
 
-THREE packages here exist only as GitHub-release wheels, and for the SAME
+FOUR packages here exist only as GitHub-release wheels, and for the SAME
 underlying reason -- each is a canopy-labs fork whose PyPI name belongs to
 upstream:
 
@@ -21,6 +21,9 @@ upstream:
   in `$"{{{x}}}"` the hole after the escaped `{{` is an expression for the
   engine and string text for the stock grammar -- an ERROR when the hole holds
   a string literal, and a silently different tree when it does not.
+* **tree-sitter-go**, Gate 1's Go grammar, for the same reason. PyPI has stock
+  0.25.0; the engine bundles 0.25.0 plus one grammar patch, so Go 1.26's
+  `new(int32(101))` parses for the engine and is an ERROR for the stock grammar.
 
 Every `pip install` of this tool therefore needs `--find-links wheels`, and
 every Docker build bind-mounts the same directory; this script is the one
@@ -123,6 +126,13 @@ _WHEEL_SOURCES = (
         distribution="tree-sitter-c-sharp",
         repo="canopy-labs/tree-sitter-c-sharp",
         pattern=r"^tree_sitter_c_sharp-{version}-cp310-abi3-manylinux.*\.whl$",
+    ),
+    #: abi3 `cp310` like the C# grammar (the fork's setup.py floors it at 3.10),
+    #: one wheel per architecture.
+    _WheelSource(
+        distribution="tree-sitter-go",
+        repo="canopy-labs/tree-sitter-go",
+        pattern=r"^tree_sitter_go-{version}-cp310-abi3-manylinux.*\.whl$",
     ),
 )
 

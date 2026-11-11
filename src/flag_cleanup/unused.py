@@ -607,6 +607,7 @@ def _ts_import_candidates(
     guarded: bool = True,
     configured: Callable[[], dict[str, frozenset[str | None]]] | None = None,
     automatic: Callable[[], bool] | None = None,
+    key_constants: frozenset[str] = frozenset(),
 ) -> list[Candidate]:
     """Every binding an `import_statement` introduces, at specifier granularity.
 
@@ -721,6 +722,14 @@ def _ts_import_candidates(
     answer, handed to it as the file's ``jsx_runtime`` fact, so it removes
     a specifier its fold stranded first, and this branch is the backstop for
     what the engine withholds and for strands this side's own edits make.
+
+    ``key_constants`` names the local bindings of key constants this file
+    was proven to read from another file (see :func:`blind_prose`). The
+    classic-runtime guard does not hold one of those back in a shared group:
+    a string constant is never what an element calls, and keeping its import
+    points at a declaration the run may delete, which refuses the whole
+    flag. The factory filter still applies to it, so a name that is also
+    the file's factory or fragment factory (or a pragma's) stays.
     """
     if guarded and _spells_eval(root):
         return []
@@ -828,12 +837,16 @@ def _ts_import_candidates(
                 emptied = (
                     (node if solo else child) if len(specifiers) == 1 else None
                 )
-                if holds_jsx and emptied is None:
-                    continue
                 for specifier in specifiers:
                     alias = specifier.child_by_field_name("alias")
                     local = alias if alias is not None else specifier.child_by_field_name("name")
                     if local is None:
+                        continue
+                    if (
+                        holds_jsx
+                        and emptied is None
+                        and local.text.decode("utf-8", "replace") not in key_constants
+                    ):
                         continue
                     candidates.append(
                         _candidate(
@@ -1435,6 +1448,7 @@ def _import_candidates(
     guarded: bool = True,
     configured: Callable[[], dict[str, frozenset[str | None]]] | None = None,
     automatic: Callable[[], bool] | None = None,
+    key_constants: frozenset[str] = frozenset(),
 ) -> list[Candidate]:
     """Every import binding in ``source`` whose usage this pass can decide.
 
@@ -1446,7 +1460,9 @@ def _import_candidates(
     delete the text a guard read, and the bindings it held back then count.
     ``configured`` reads the file's JSX factory options for the JSX guard,
     and ``automatic`` whether its configs set the automatic runtime, which
-    lifts it (see ``_ts_import_candidates``).
+    lifts it (see ``_ts_import_candidates``). ``key_constants`` names the
+    file's cross-file key-constant locals, which the JSX guard does not hold
+    back (see there).
     """
     source_bytes = source.encode("utf-8")
     root = _parse(source, language)
@@ -1469,7 +1485,9 @@ def _import_candidates(
         # `import Combine` is what makes `publisher.sink { … }` resolve.
         return []
     if language in {"ts", "tsx", "js"}:
-        return _ts_import_candidates(root, source_bytes, before, guarded, configured, automatic)
+        return _ts_import_candidates(
+            root, source_bytes, before, guarded, configured, automatic, key_constants
+        )
     if language == "csharp":
         return _csharp_import_candidates(root, source_bytes)
     return []
@@ -5065,8 +5083,6 @@ _PROSE_BLIND: ContextVar[dict[str, frozenset[str]] | None] = ContextVar(
 #: The languages :func:`blind_prose` applies to.
 _PROSE_BLIND_LANGUAGES = frozenset({"ts", "tsx", "js"})
 
-_BRACED = re.compile(r"\{[^{}]*\}")
-
 #: A comment whose body opens like this is code to some checker: a Flow
 #: annotation (``/*: T */``), Flow code (``/*:: ... */``,
 #: ``/*flow-include ... */``).
@@ -5075,13 +5091,17 @@ _CODE_COMMENT = re.compile(r"(?://+|/\*+)\s*(?::|flow-include\b)")
 #: Any JSDoc-style tag. Only the ones in :data:`_PROSE_TAGS` are prose.
 _COMMENT_TAG = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
 
-#: The tags whose text is prose to every checker: whatever follows them is
-#: never resolved as a type. Any other tag (``@type``, ``@this``, ``@enum``,
-#: ``@param``, ``@extends``, ``@typedef``, ``@link`` ...) may be one.
-_PROSE_TAGS = frozenset(
-    {"see", "deprecated", "todo", "example", "description", "remarks", "since", "author"}
-)
+#: Tags whose text is prose to every checker: whatever follows them is
+#: never resolved as a type or a reference.
+_PROSE_TAGS = frozenset({"deprecated", "todo", "description", "remarks", "since", "author"})
 
+#: Tags with an optional braced type and a description. The braced type is
+#: code; the description after it is prose. For the ones that name something
+#: (``@param {T} name``) the name is code too.
+_DESCRIBED_TAGS = frozenset(
+    {"returns", "return", "throws", "throw", "yields", "yield", "param", "arg", "argument", "property", "prop"}
+)
+_NAMING_TAGS = frozenset({"param", "arg", "argument", "property", "prop"})
 
 @contextmanager
 def prose_blind_scope() -> Iterator[None]:
@@ -5116,32 +5136,66 @@ def blind_prose(names: Mapping[str, frozenset[str]]) -> None:
     current.update(names)
 
 
-def _unbraced(text: str) -> str:
-    """``text`` without anything inside braces, nested ones included. An
-    unmatched ``{`` hides the rest of the text: a JSDoc type wrapped across
-    lines of another comment is still a type."""
-    while True:
-        stripped = _BRACED.sub(" ", text)
-        if stripped == text:
-            break
-        text = stripped
-    return text.split("{", 1)[0]
+#: What may appear inside a braced span. Nothing here can hide a brace (no
+#: quote, backtick, ``/`` or ``\\``), so counting braces is exact.
+_BRACE_SAFE = re.compile(r"[\w\s*.,:;|&<>\[\]()?!=\-@#$]")
+
+
+def _mask_braces(text: str) -> str | None:
+    """``text`` with everything inside braces (the braces too) blanked, in one
+    pass, or None when the braces do not balance or a braced span holds a
+    character outside :data:`_BRACE_SAFE`. Tags are found only in the masked
+    text, so an ``@`` inside a braced type never starts one."""
+    depth = 0
+    out = []
+    for char in text:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                return None
+            out.append(" ")
+            continue
+        elif depth and not _BRACE_SAFE.match(char):
+            return None
+        out.append(("\n" if char == "\n" else " ") if depth else char)
+        if char == "{":
+            out[-1] = " "
+    return "".join(out) if depth == 0 else None
 
 
 def _prose_only(comment: str) -> str:
-    """The part of ``comment`` whose mentions are only prose; empty unless
-    the comment is plainly prose.
+    """The part of ``comment`` whose mentions are only prose.
 
-    WHITELIST. A comment counts as prose only if its body does not open as
-    a comment type (:data:`_CODE_COMMENT`) and every tag in it is one of
-    :data:`_PROSE_TAGS`. Any other comment is left to count in full as a use
-    of the name, as it did before. Inside a prose comment, a span in braces
-    (``{typeof K}``, ``{@link K}``) still counts too (:func:`_unbraced`)."""
+    Judged per part, as a WHITELIST. Braced spans are always code
+    (``{typeof K}``, ``{@link K}``) and are blanked in one pass; unbalanced
+    braces, or a character in a braced span that could hide a brace (a quote,
+    a backtick, ``/``, ``\\``), make the whole comment code. Text before the first tag and the
+    text of :data:`_PROSE_TAGS` are prose. A :data:`_DESCRIBED_TAGS` tag is
+    code only in its braced type and (for the naming ones) its name; its
+    description is prose. ``@see`` is a reference whose name may sit on a
+    later line, so all of it counts, and ``@example`` is code. Every other
+    tag (``@type``, ``@typedef``, ``@extends``, ``@this``, ``@enum`` ...)
+    counts in full, and so does a comment that opens as a comment type
+    (:data:`_CODE_COMMENT`)."""
     if _CODE_COMMENT.match(comment):
         return ""
-    if any(tag not in _PROSE_TAGS for tag in _COMMENT_TAG.findall(comment)):
+    masked = _mask_braces(comment)
+    if masked is None:
         return ""
-    return _unbraced(comment)
+    tags = list(_COMMENT_TAG.finditer(masked))
+    parts = [masked[: tags[0].start()] if tags else masked]
+    for index, tag in enumerate(tags):
+        end = tags[index + 1].start() if index + 1 < len(tags) else len(masked)
+        name, text = tag.group(1), masked[tag.end() : end]
+        if name in _PROSE_TAGS:
+            parts.append(text)
+        elif name in _DESCRIBED_TAGS:
+            if name in _NAMING_TAGS:
+                text = re.sub(r"^[\s*]*\S+", "", text, count=1)
+            parts.append(text)
+    return " ".join(parts)
 
 
 def _prose_mentions(source: str, name: str, language: str) -> int:
@@ -5231,6 +5285,129 @@ def unread_locals(before: str, after: str, language: str) -> list[Candidate]:
     return sorted(found, key=lambda c: c.start)
 
 
+def _closure_tokens(function: Node) -> dict[str, list[tuple[str, Node]]]:
+    """Per closure HEADER (``func(f T) bool``), in source order, each local
+    closure declaration (``name := func…``, ``var name = func…``) as
+    ``("decl", node)`` and each ``_ = func…`` discard as ``("discard", node)``."""
+    found: dict[str, list[tuple[str, Node]]] = {}
+
+    def header(literal: Node) -> str | None:
+        body = literal.child_by_field_name("body")
+        if body is None:
+            return None
+        return " ".join(literal.text[: body.start_byte - literal.start_byte].decode("utf-8").split())
+
+    for node in _walk_nodes_of(function, ("short_var_declaration", "var_spec", "assignment_statement")):
+        if node.type == "short_var_declaration":
+            left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+            kind = "decl"
+        elif node.type == "var_spec":
+            left, right = node.child_by_field_name("name"), node.child_by_field_name("value")
+            names = node.children_by_field_name("name")
+            left = None if len(names) != 1 else names[0]
+            kind = "decl"
+        else:
+            left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+            operator = node.child_by_field_name("operator")
+            if operator is None or operator.text != b"=":
+                continue
+            kind = "discard"
+        if left is None or right is None:
+            continue
+        names = [left] if left.type == "identifier" else list(left.named_children)
+        values = list(right.named_children) if right.type == "expression_list" else [right]
+        if len(names) != 1 or len(values) != 1 or values[0].type != "func_literal" or names[0].type != "identifier":
+            continue
+        blank = names[0].text == b"_"
+        if (kind == "discard") != blank:
+            continue
+        head = header(values[0])
+        if head is not None:
+            found.setdefault(head, []).append((kind, node))
+    return found
+
+
+def _drop_closure_discards(before: str, after: str) -> tuple[str, list[Candidate]]:
+    """Go: delete each ``_ = func(...) {...}`` the ENGINE made of a local closure.
+
+    The engine turns a local closure whose last call the fold removed into a
+    discard of its value. A closure nobody can call is dead (making it runs
+    nothing), so the statement goes. Only a discard standing where the
+    pre-engine text declared a closure (``name := func…``, same function, same
+    header, same place among the closures and discards of that header) is the
+    engine's; a customer's own ``_ = func…`` is never touched, whatever the
+    fold did to its body, and whatever its text equals. Anything not matched
+    exactly (a different number of functions, or of closures under a header)
+    keeps the stub. The locals its body read are then offered to the
+    stranded-binding rounds like any other."""
+    if "_ = func" not in after:
+        return after, []
+    old_root, new_root = _parse(before, "go"), _parse(after, "go")
+    kinds = ("function_declaration", "method_declaration")
+    olds = [n for n in old_root.named_children if n.type in kinds]
+    news = [n for n in new_root.named_children if n.type in kinds]
+    if len(olds) != len(news):
+        return after, []
+    marked: list[Node] = []
+    for old, new in zip(olds, news):
+        was, now = _closure_tokens(old), _closure_tokens(new)
+        for head, tokens in now.items():
+            earlier = was.get(head, [])
+            if len(earlier) != len(tokens):
+                continue
+            marked.extend(
+                node for (was_kind, _), (kind, node) in zip(earlier, tokens)
+                if was_kind == "decl" and kind == "discard"
+            )
+    marked = [
+        m for m in marked
+        if not any(o.id != m.id and o.start_byte <= m.start_byte and m.end_byte <= o.end_byte for o in marked)
+    ]
+    data = after.encode("utf-8")
+    found: list[tuple[int, int, Node]] = []
+    for node in marked:
+        parent = node.parent
+        if (
+            parent is None or parent.type not in ("statement_list", "block")
+            or any(c.type == "comment" for c in _walk_nodes(node, "comment"))
+        ):
+            continue
+        start = data.rfind(b"\n", 0, node.start_byte) + 1
+        if data[start:node.start_byte].strip():
+            continue
+        end = data.find(b"\n", node.end_byte)
+        end = len(data) if end == -1 else end + 1
+        if data[node.end_byte:end].strip():
+            continue
+        found.append((start, end, node))
+    removed: list[Candidate] = []
+    for start, end, node in sorted(found, key=lambda f: -f[0]):
+        before_text = data[:start]
+        if (before_text.rstrip(b" \t").endswith(b"{\n") or before_text.endswith(b"\n\n")) and data[end:end + 1] == b"\n":
+            end += 1
+        removed.append(Candidate(name="_", start=node.start_byte, end=node.end_byte, kind="variable", text=node.text.decode("utf-8")))
+        data = data[:start] + data[end:]
+    return data.decode("utf-8"), removed[::-1]
+
+
+def _walk_nodes_of(root: Node, kinds: tuple[str, ...]):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in kinds:
+            yield node
+        stack.extend(reversed(node.children))
+
+
+def _walk_nodes(root: Node, kind: str):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == kind:
+            yield node
+        stack.extend(reversed(node.children))
+
+
 def remove_stranded_bindings(
     before: str,
     after: str,
@@ -5313,6 +5490,9 @@ def remove_stranded_bindings(
     """
     if language not in SUPPORTED:
         return after, []
+    dropped: list[Candidate] = []
+    if language == "go":
+        after, dropped = _drop_closure_discards(before, after)
     methods = _method_candidates if include_methods else (lambda _s, _l: [])
     resolve = (
         dart_namespace.resolver(path, root)
@@ -5360,7 +5540,13 @@ def remove_stranded_bindings(
             _variable_candidates(current, language)
             + methods(current, language)
             + _import_candidates(
-                current, language, original, resolve, configured=configured, automatic=automatic
+                current,
+                language,
+                original,
+                resolve,
+                configured=configured,
+                automatic=automatic,
+                key_constants=blind,
             )
         ):
             if candidate.kind == "private method":
@@ -5474,4 +5660,4 @@ def remove_stranded_bindings(
             "is looping; refusing rather than returning a file that is only "
             "part-cleaned"
         )
-    return current, removed
+    return current, [*dropped, *removed]

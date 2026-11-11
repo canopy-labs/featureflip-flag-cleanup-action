@@ -61,3 +61,103 @@ not_contains = ["""((spread_element) @spread)"""]
 
 [[rules.filters]]
 not_contains = ["""((comment) @comment)"""]
+
+# --- The property form: `getFlag{key}` is `await getFlag({ ..., key: KEY, ... })`.
+# `rule_synthesis.with_accessors` clones this block once per such accessor, with
+# `__KEY_PROPERTY__` (and `__KEY_PROPERTY_RE__`, the same name as regex source)
+# replaced by the property's name. It is narrower than the first-argument and
+# positioned reads on purpose:
+#
+# * AWAITED only, matched at the `await_expression`. Nothing proves the read is
+#   not a Promise (`ts_async_reads` decides per site for first-argument
+#   accessors and does not see this one), and `await true` is what the
+#   expression becomes anyway, so the await goes with the call.
+# * The call is replaced whole, so every other property is dropped with it. The
+#   object is admitted by a WHITELIST over its text (four predicates, written
+#   once in `ts_syntax.object_tokens`, `OBJECT_ADJACENT`, `OBJECT_KEYWORDS` and
+#   `object_duplicate_key`): only literals, plain names and nested objects and
+#   arrays of those, exactly one property named like the key, no `__proto__`.
+#   The structural filters add what text cannot see: spread, comment, computed
+#   name, optional call. `key_const.py`/`cross_file_ts.py` decline the same
+#   objects (`ts_syntax.declined_by_object_key_rules`); a test runs both.
+
+[[rules]]
+# xconst: property-qualified
+name = "xconst_qualified_key_in_property"
+# accessor-template: key-property
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments
+        . (object
+            (pair key: (property_identifier) @key_prop
+                  value: (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))) @key_object .))
+  ) @await
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @key_prop "__KEY_PROPERTY__")
+  (#eq? @key_owner "__XCONST_OWNER__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#match? @key_object "^(?:[ \\\\t\\\\r\\\\n]|[{},:\\\\[\\\\]]|[A-Za-z0-9_$]+|'[A-Za-z0-9_$./:@#%+=-]*'|\\"[A-Za-z0-9_$./:@#%+=-]*\\"|[ \\\\t\\\\r\\\\n,:\\\\[]__XCONST_OWNER_RE__[.]__XCONST_MEMBER_RE__[ \\\\t\\\\r\\\\n,}\\\\]])*$")
+  (#not-match? @key_object "[A-Za-z0-9_$][ \\t\\r\\n]+[A-Za-z0-9_$]")
+  (#not-match? @key_object "[A-Za-z0-9_$'\\\\\\"\\\\]][ \\\\t\\\\r\\\\n]*\\\\[")
+  (#not-match? @key_object "(?:^|[ \\\\t\\\\r\\\\n{,:\\\\[])(?:this|super|class|function|async|import|await|yield|new)(?:[ \\\\t\\\\r\\\\n{},:\\\\]]|$)|__proto__")
+  (#not-match? @key_object "(?s)[{,][ \\t\\r\\n]*(?:__KEY_PROPERTY_RE__|'__KEY_PROPERTY_RE__'|\\"__KEY_PROPERTY_RE__\\")[ \\t\\r\\n]*(?:[:}].*[{,]|,(?:.*[{,])?)[ \\t\\r\\n]*(?:__KEY_PROPERTY_RE__|'__KEY_PROPERTY_RE__'|\\"__KEY_PROPERTY_RE__\\")[ \\t\\r\\n]*[:,}]")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+not_contains = ["""((spread_element) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules.filters]]
+not_contains = ["""((computed_property_name) @computed)"""]
+
+[[rules]]
+# xconst: property-bare
+name = "xconst_bare_key_in_property"
+# accessor-template: key-property
+query = """(
+  (await_expression
+    (call_expression
+      function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
+                 (identifier) @sdk_fn]
+      arguments: (arguments
+        . (object
+            (pair key: (property_identifier) @key_prop
+                  value: (identifier) @key_member)) @key_object .))
+  ) @await
+  (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
+  (#eq? @key_prop "__KEY_PROPERTY__")
+  (#eq? @key_member "__XCONST_MEMBER__")
+  (#match? @key_object "^(?:[ \\\\t\\\\r\\\\n]|[{},:\\\\[\\\\]]|[A-Za-z0-9_$]+|'[A-Za-z0-9_$./:@#%+=-]*'|\\"[A-Za-z0-9_$./:@#%+=-]*\\")*$")
+  (#not-match? @key_object "[A-Za-z0-9_$][ \\t\\r\\n]+[A-Za-z0-9_$]")
+  (#not-match? @key_object "[A-Za-z0-9_$'\\\\\\"\\\\]][ \\\\t\\\\r\\\\n]*\\\\[")
+  (#not-match? @key_object "(?:^|[ \\\\t\\\\r\\\\n{,:\\\\[])(?:this|super|class|function|async|import|await|yield|new)(?:[ \\\\t\\\\r\\\\n{},:\\\\]]|$)|__proto__")
+  (#not-match? @key_object "(?s)[{,][ \\t\\r\\n]*(?:__KEY_PROPERTY_RE__|'__KEY_PROPERTY_RE__'|\\"__KEY_PROPERTY_RE__\\")[ \\t\\r\\n]*(?:[:}].*[{,]|,(?:.*[{,])?)[ \\t\\r\\n]*(?:__KEY_PROPERTY_RE__|'__KEY_PROPERTY_RE__'|\\"__KEY_PROPERTY_RE__\\")[ \\t\\r\\n]*[:,}]")
+)"""
+replace_node = "await"
+replace = "@treated"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["treated"]
+
+[[rules.filters]]
+not_contains = ["""((call_expression "?." arguments: (arguments)) @optional_call)"""]
+
+[[rules.filters]]
+not_contains = ["""((spread_element) @spread)"""]
+
+[[rules.filters]]
+not_contains = ["""((comment) @comment)"""]
+
+[[rules.filters]]
+not_contains = ["""((computed_property_name) @computed)"""]

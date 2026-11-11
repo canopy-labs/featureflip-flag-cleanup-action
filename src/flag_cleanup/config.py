@@ -152,8 +152,10 @@ class Config:
     #: Accessors whose key is not their first argument, with its index:
     #: ``flag_is_active[1]`` in the input is ``("flag_is_active", 1)`` here, and
     #: its bare name is in ``accessors``. Python, TypeScript and JavaScript; see
-    #: :func:`flag_cleanup.rule_synthesis.with_accessors`.
-    key_positions: tuple[tuple[str, int], ...] = ()
+    #: :func:`flag_cleanup.rule_synthesis.with_accessors`. ``getFlag{key}`` is
+    #: ``("getFlag", "key")``: the key is the property of that name in the
+    #: object-literal argument (TypeScript and JavaScript only).
+    key_positions: tuple[tuple[str, int | str], ...] = ()
     ignore: frozenset[str] = frozenset()
     #: Flag keys this run may propose, as an ALLOWlist. Empty — the default —
     #: means no filtering, so an existing workflow is unaffected.
@@ -272,12 +274,20 @@ class Config:
             )
 
         accessors, gates, key_positions = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
+        properties = [name for name, at in key_positions if isinstance(at, str)]
+        if properties and not {"ts", "tsx", "js"} & set(languages):
+            raise ConfigError(
+                f"FEATUREFLIP_ACCESSORS value(s) "
+                f"{', '.join(repr(f'{name}{{{dict(key_positions)[name]}}}') for name in properties)} "
+                "name a property of an object-literal argument, which only a TypeScript or "
+                "JavaScript run reads, but FEATUREFLIP_LANGUAGES includes neither"
+            )
         if key_positions and not KEY_POSITION_LANGUAGES & set(languages):
             # Every other language's run drops them, so the input would be
             # read and then silently match nothing.
             raise ConfigError(
                 f"FEATUREFLIP_ACCESSORS value(s) "
-                f"{', '.join(repr(f'{name}[{index}]') for name, index in key_positions)} "
+                f"{', '.join(repr(f'{name}[{index}]') for name, index in key_positions if isinstance(index, int))} "
                 "name the position of the key, which only a Python, TypeScript or "
                 "JavaScript run reads, but FEATUREFLIP_LANGUAGES includes none of them"
             )
@@ -392,12 +402,14 @@ _ACCESSOR_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*[?!]?\Z")
 #: ``flag_is_active[1]``: a Python accessor whose key is the argument at that
 #: index, counting from 0. Up to 9, which is further than any real read puts
 #: it; each index is one more anchored wildcard in the generated rule.
-_KEY_POSITION_RE = re.compile(r"\A(?P<name>[A-Za-z_][A-Za-z0-9_]*)\[(?P<index>[0-9])\]\Z")
+_KEY_POSITION_RE = re.compile(
+    r"\A(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\[(?P<index>[0-9])\]|\{(?P<prop>[A-Za-z_$][A-Za-z0-9_$]*)\})\Z"
+)
 
 
 def _parse_accessors(
     value: str,
-) -> tuple[tuple[str, ...], tuple[Gate, ...], tuple[tuple[str, int], ...]]:
+) -> tuple[tuple[str, ...], tuple[Gate, ...], tuple[tuple[str, int | str], ...]]:
     """Split, validate and de-duplicate ``FEATUREFLIP_ACCESSORS``.
 
     Returns the function names and, separately, the gate components
@@ -417,7 +429,7 @@ def _parse_accessors(
     names = _split_csv(value, default=())
     gates = {gate: None for name in names if (gate := parse_gate(name)) is not None}
     names = tuple(name for name in names if parse_gate(name) is None)
-    positions: dict[str, int] = {}
+    positions: dict[str, int | str] = {}
     plain: list[str] = []
     for name in names:
         match = _KEY_POSITION_RE.match(name)
@@ -425,7 +437,7 @@ def _parse_accessors(
             plain.append(name)
             continue
         plain.append(match["name"])
-        index = int(match["index"])
+        index = match["prop"] if match["prop"] else int(match["index"])
         if index and positions.get(match["name"], index) != index:
             raise ConfigError(
                 f"FEATUREFLIP_ACCESSORS names {match['name']!r} with two key positions; "
