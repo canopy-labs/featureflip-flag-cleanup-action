@@ -89,7 +89,14 @@ def deleted_names(changed, repo_dir: str, flag_key: str, grammar_of, deleted) ->
     if reach is None:
         return {}
     scoped: dict[str, set[str]] = {}
+    rebound: dict[str, set[str]] = {}
     for declaring, name in reach.gone:
+        # The declaring file may bind the name a second time (a parameter, a
+        # constant in another block): a comment there may mean that one.
+        if declaring not in rebound:
+            rebound[declaring] = _rebound_names(reach, declaring)
+        if name in rebound[declaring]:
+            continue
         scoped.setdefault(declaring, set()).add(name)
     every = set().union(*reach.exposed.values())
     for path, resolved, _text in reach.files:
@@ -105,6 +112,50 @@ def deleted_names(changed, repo_dir: str, flag_key: str, grammar_of, deleted) ->
         if names:
             scoped.setdefault(resolved, set()).update(names)
     return {path: frozenset(names) for path, names in scoped.items()}
+
+
+def _rebound_names(reach, declaring: str) -> set[str]:
+    """The names the declaring file's ORIGINAL text binds more than once, or
+    assigns to; an unparseable original rebinds every name (nothing is proven)."""
+    original = reach.originals.get(declaring, "")
+    root = reach.parse(original, reach.grammar_for(declaring))
+    if not original or root.has_error:
+        return {name for d, name in reach.gone if d == declaring}
+    counts: dict[str, int] = {}
+    for binding in _all_bindings(root):
+        counts[binding.text.decode("utf-8")] = counts.get(binding.text.decode("utf-8"), 0) + 1
+    return {name for name, count in counts.items() if count > 1} | _assigned_names(root)
+
+
+def _assigned_names(root) -> set[str]:
+    """Every name that is the target of an assignment (``x = ...``,
+    ``x += ...``, ``[x] = ...``, ``({ x } = ...)``, ``x++``, ``for (x of ...)``):
+    an assignment is no binding node, but it makes the name hold another value."""
+    found: set[str] = set()
+
+    def targets(node) -> None:
+        if node.type in ("identifier", "shorthand_property_identifier_pattern"):
+            found.add(node.text.decode("utf-8"))
+        elif node.type in ("member_expression", "subscript_expression", "call_expression"):
+            return  # `ns.x = 1` writes a member, not the local
+        else:
+            for child in node.named_children:
+                targets(child)
+
+    for node in _walk(root):
+        if node.type in ("assignment_expression", "augmented_assignment_expression"):
+            left = node.child_by_field_name("left")
+            if left is not None:
+                targets(left)
+        elif node.type == "update_expression":
+            argument = node.child_by_field_name("argument")
+            if argument is not None:
+                targets(argument)
+        elif node.type == "for_in_statement" and not any(c.type in ("const", "let", "var") for c in node.children):
+            left = node.child_by_field_name("left")
+            if left is not None:
+                targets(left)
+    return found
 
 
 def _taken_names(root, path: str, exposed, resolve) -> set[str]:
@@ -178,6 +229,7 @@ def _taken_names(root, path: str, exposed, resolve) -> set[str]:
                             takes.append((text_of(value), value.id))
 
     bindings = _all_bindings(root)
+    assigned = _assigned_names(root)
     if namespaces:
         for node in _walk(root):
             if node.type != "member_expression":
@@ -192,13 +244,17 @@ def _taken_names(root, path: str, exposed, resolve) -> set[str]:
             # binding could make this `ns` some other object.
             if [b for b in bindings if text_of(b) == text_of(obj) and b.id != bound[0]]:
                 continue
+            if text_of(obj) in assigned:
+                continue
             takes.append((text_of(prop), None))
 
     found: set[str] = set()
     for local, own in takes:
         if not any(text_of(b) == local and b.id != own for b in bindings):
             found.add(local)
-    return found
+    # A `let` namespace assigned again may hold another module's exports at
+    # the read; an assignment is no binding node, so it is checked here.
+    return {name for name in found if name not in assigned} if assigned else found
 
 
 def _all_bindings(root) -> list:

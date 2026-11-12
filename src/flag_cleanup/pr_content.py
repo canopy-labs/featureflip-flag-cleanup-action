@@ -46,6 +46,8 @@ from flag_cleanup.mock_stubs import (
     PINNED_PARAMETER,
     REBUILT,
     RENAMED_METHOD,
+    EMPTIED_SUITE,
+    OWN_TEST,
     SETTER_TEST,
     SIBLING_TEST,
     TEST,
@@ -2185,6 +2187,8 @@ def pr_body(
     mocked_tests = [(path, text) for path, kind, text in test_doubles if kind == "test"]
     setter_tests = [(path, text) for path, kind, text in test_doubles if kind == SETTER_TEST]
     sibling_tests = [(path, text) for path, kind, text in test_doubles if kind == SIBLING_TEST]
+    own_tests = [(path, text) for path, kind, text in test_doubles if kind == OWN_TEST]
+    emptied_suites = [(path, text) for path, kind, text in test_doubles if kind == EMPTIED_SUITE]
     pinned = [(path, text) for path, kind, text in test_doubles if kind == PINNED_PARAMETER]
     phases = [(path, text) for path, kind, text in test_doubles if kind == TEST_PHASE]
     rows = [(path, text) for path, kind, text in test_doubles if kind == TEST_ROWS]
@@ -2260,6 +2264,34 @@ def pr_body(
             *[
                 f"> - {_md_code(path)} — {_md_code(text)}"
                 for path, text in sibling_tests[:20]
+            ],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if emptied_suites:
+        count = len(emptied_suites)
+        lines += [
+            f"> **⚠️ {count} test {'suite was' if count == 1 else 'suites were'} deleted.** "
+            "Deleting the tests above left each with no test, which Jest and Vitest report as a failure:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in emptied_suites[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if own_tests:
+        count = len(own_tests)
+        noun = "test was" if count == 1 else "tests were"
+        lines += [
+            f"> **⚠️ {count} {noun} deleted with the wrapper member it tested.** Each "
+            "built its own object with an injected fake and asserted only about one "
+            "wrapper member this pull request removes or reduces to a constant "
+            "(its result, or what it passed the fake). It tested only the member's "
+            "forwarding of the flag read, which the removal folds, so the assertion "
+            "no longer tests anything:",
+            ">",
+            *[
+                f"> - {_md_code(path)} — {_md_code(text)}"
+                for path, text in own_tests[:20]
             ],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
@@ -2572,7 +2604,7 @@ _WRAPPER_STATUSES = ("complete", "partial")
 _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-prose")
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
-    TEST, SETTER_TEST, SIBLING_TEST, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
+    TEST, SETTER_TEST, SIBLING_TEST, OWN_TEST, EMPTIED_SUITE, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
     FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST, FOLDED_TEST,
 )
 
@@ -2991,6 +3023,8 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     as lines gone.
     """
     sibling_tests = [(p, t) for p, kind, t in test_doubles if kind == SIBLING_TEST]
+    own_tests = [(p, t) for p, kind, t in test_doubles if kind == OWN_TEST]
+    emptied_suites = [(p, t) for p, kind, t in test_doubles if kind == EMPTIED_SUITE]
     pinned = [(p, t) for p, kind, t in test_doubles if kind == PINNED_PARAMETER]
     phases = [(p, t) for p, kind, t in test_doubles if kind == TEST_PHASE]
     rows = [(p, t) for p, kind, t in test_doubles if kind == TEST_ROWS]
@@ -3071,6 +3105,20 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
             len(sibling_tests),
             "" if len(sibling_tests) == 1 else "s",
             "; ".join(f"{p}: {_one_line(t)}" for p, t in sibling_tests),
+        )
+    if emptied_suites:
+        logger.warning(
+            "%d test suite%s left with no test deleted: %s",
+            len(emptied_suites),
+            "" if len(emptied_suites) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in emptied_suites),
+        )
+    if own_tests:
+        logger.warning(
+            "%d test%s deleted with the wrapper member it tested: %s",
+            len(own_tests),
+            "" if len(own_tests) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in own_tests),
         )
     if pinned:
         logger.warning(

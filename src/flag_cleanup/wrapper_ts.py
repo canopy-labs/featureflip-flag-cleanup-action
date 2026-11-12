@@ -44,7 +44,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_scope, ts_tests, ts_workspace
+from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_emptied_tests, ts_scope, ts_tests, ts_workspace
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.ts_scope import text as _text
 
@@ -545,7 +545,7 @@ def _mocks_module(
             hides = (
                 owner is not None
                 and (held is None or bool(owner.search(held)))
-                and (not factory or _factory_hides(node, None))
+                and (not factory or _factory_hides(node, None, wrapper.name if ts_scope.factory_name(wrapper.owner) else None))
             )
         if hides:
             found.append(node)
@@ -1775,6 +1775,14 @@ def _getter_returning(reference: Node) -> Node | None:
     """The name of the top-level function of no parameters whose whole body
     is ``return <reference>;``."""
     statement = reference.parent
+    if statement is not None and statement.type == "binary_expression" and statement.child_by_field_name("right") == reference:
+        # `return x ?? reference;`: the fallback of a reassigned `let` (the
+        # `let` itself is proven by `ts_scope.Files.held_let`).
+        left = statement.child_by_field_name("left")
+        operator = statement.child_by_field_name("operator")
+        if left is None or left.type != "identifier" or operator is None or _text(operator) not in ("??", "||"):
+            return None
+        reference, statement = statement, statement.parent
     if statement is None or statement.type != "return_statement":
         return None
     block = statement.parent
@@ -1839,6 +1847,7 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
     seen: set[tuple[str, str]] = set()
     modules: set[str] = set()
     calls: list[tuple[str, Node, Node | None, bool]] = []  # the factory's: (path, call, const name, production file)
+    writes: set[int] = set()  # ids of the calls assigned to a proven private `let`
     while pending:
         module, name, role = pending.pop()
         if (module, name) in seen:
@@ -1858,6 +1867,16 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
                     found.append((path, 1, name))
                 continue
             file = files.file(path, text)
+            if file is not None and file.root.has_error and not word.search(text):
+                # Syntax this parser cannot read (`export type * from`), in a
+                # file that never spells the name: it matters only if it
+                # re-exports the module, which its `from` clauses say.
+                if any(
+                    (target := ts_scope.resolve(path, spec, repo_dir)) is None or _same_file(target, module)
+                    for spec in _FROM_CLAUSES.findall(text)
+                ):
+                    found.append((path, 1, ""))
+                continue
             if file is None or file.root.has_error:
                 found.append((path, 1, ""))
                 continue
@@ -1865,6 +1884,8 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
             locals_ = {name} if home else {i.local for i in file.imports if i.imported == name and i.module == module}
             namespaces = set() if home else {i.local for i in file.imports if i.imported is None and i.module == module}
             for node in cross_file_keys.walk(file.root):
+                if node.type == "export_statement" and _type_only_export(node):
+                    continue  # `export type { Flags } from "./flags"`: no value at run time
                 if node.type == "export_statement" and node.child_by_field_name("source") is not None:
                     target = ts_scope.resolve(path, cross_file_ts._string_value(node.child_by_field_name("source")) or "", repo_dir)
                     if (target is None and word.search(_text(node))) or (target is not None and _same_file(target, module)):
@@ -1904,10 +1925,14 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
                         continue
                 elif role == _FACTORY:
                     call = _call_of(reference)
+                    if call is not None and _test_local_instance(call, file):
+                        continue  # a test's own object: its test is judged at the member's call
                     if call is not None:
                         held = _const_holding(call)
                         top = held is not None and ts_scope.top_level(held.parent.parent)
                         calls.append((file.path, call, held if top else None, not _stubs(path, text)))
+                        if held is None and _let_write(call, file, files):
+                            writes.add(id(call))
                         continue
                 else:
                     call = _call_of(reference)
@@ -1917,8 +1942,15 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
                         continue
                 found.append((path, wi.line_of(reference), wi.text_of(reference.parent or reference)))
         if role == _FACTORY:
-            if len(calls) == 1 and calls[0][2] is not None and calls[0][3]:
-                pending.append((calls[0][0], _text(calls[0][2]), _INSTANCE))
+            consts = [c for c in calls if c[2] is not None]
+            others = [c for c in calls if c[2] is None]
+            # The `let` form: one fallback const, and every other call an
+            # assignment to a private `let` that only a getter's
+            # `x ?? fallback` reads (see ``ts_scope.Files.held_let``).
+            let_form = bool(others) and all(id(c[1]) in writes for c in others)
+            if len(consts) == 1 and consts[0][3] and (not others or let_form) and all(c[3] for c in others):
+                pending.append((consts[0][0], _text(consts[0][2]), _INSTANCE))
+                found += _test_reachable_writers(repo_dir, others, files)
             else:
                 found += [(path, wi.line_of(call), wi.text_of(call)) for path, call, _, _ in calls]
     # A module mock of one of these modules is the index's to find: every
@@ -1934,6 +1966,252 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
         if home is None or any(_exports(home.root, name) for name in names):
             found += handed_on(repo_dir, module)
     return found
+
+
+def _test_local_instance(call: Node, file: ts_scope.File) -> bool:
+    """Whether a factory call is ``const x = F(<fake>)`` directly in the body of
+    an ``it(...)`` of a test file, and every other use of ``x`` in that body
+    is a member's receiver: an object only that test sees, none of whose uses
+    hands it on. (Whether the test is about the member alone is judged at each
+    call of the member, :func:`_owned_test`.)"""
+    if not _stubs(file.path, file.source):
+        return False
+    held = _const_holding(call)
+    if held is None:
+        return False
+    data = file.source.encode("utf-8")
+    found = _test_body(call, data)
+    if found is None or held.parent.parent.parent != found[1]:
+        return False
+    name = _text(held)
+    if file.binding_of(held) != held:
+        return False
+    if not _owned_arguments(call):
+        return False
+    for node in cross_file_keys.walk(found[1]):
+        if node.type in ("identifier", "shorthand_property_identifier") and _text(node) == name and node != held:
+            if node.type != "identifier" or not _receiver_only(node):
+                return False
+    return True
+
+
+def _owned_arguments(call: Node) -> bool:
+    arguments = call.child_by_field_name("arguments")
+    return arguments is not None and all(
+        a.type in ("object", "arrow_function", "identifier", "call_expression", "as_expression") or a.type in _PLAIN_VALUES
+        for a in arguments.named_children
+        if a.type != "comment"
+    )
+
+
+def _let_write(call: Node, file: ts_scope.File, files: ts_scope.Files) -> bool:
+    """Whether ``call`` is a factory call assigned to a module-level ``let``
+    that :meth:`ts_scope.Files.held_let` proves holds only that factory's
+    objects."""
+    assignment = call.parent
+    if assignment is None or assignment.type != "assignment_expression" or assignment.child_by_field_name("right") != call:
+        return False
+    left = assignment.child_by_field_name("left")
+    if left is None or left.type != "identifier":
+        return False
+    held = files.held_let(file, _text(left))
+    return held is not None and any(c == call for c in held[1])
+
+
+#: How many calls up from a writer of a private `let` are followed.
+_CALLER_DEPTH = 4
+_NO_FUNCTION = object()
+
+
+def _top_owner(node: Node) -> str | object | None:
+    """The top-level function a node sits in, by name: the outermost function
+    around it, when that is a top-level declaration or the arrow/function of a
+    top-level ``const``. ``_NO_FUNCTION`` for a node run at module load, and
+    ``None`` for a method, a class field or anything else unnameable."""
+    outer = None
+    current = node.parent
+    while current is not None:
+        if current.type in _FUNCTION_LIKE:
+            outer = current
+        current = current.parent
+    if outer is None:
+        return _NO_FUNCTION
+    if outer.type == "function_declaration" and ts_scope.top_level(outer):
+        if outer.parent is not None and outer.parent.type == "export_statement" and _has(outer.parent, "default"):
+            return None  # importers name a default export as they like
+        name = outer.child_by_field_name("name")
+        return None if name is None else _text(name)
+    holder = outer.parent
+    if (
+        outer.type in ("arrow_function", "function_expression", "function")
+        and holder is not None
+        and holder.type == "variable_declarator"
+        and holder.parent is not None
+        and ts_scope.top_level(holder.parent)
+        and (name := holder.child_by_field_name("name")) is not None
+        and name.type == "identifier"
+    ):
+        return _text(name)
+    return None
+
+
+def _writer_callers(
+    repo_dir: str, files: ts_scope.Files, home: str, name: str, found: list[tuple[str, int, str]]
+) -> list[tuple[str, str]]:
+    """The top-level functions calling ``name`` (declared in ``home``), by name,
+    and in ``found`` every use that may let a test choose the argument: any
+    mention in a test or stubbing file, a use that is not a call (an alias, a
+    re-export, a stored or passed function), a method calling it, a file that
+    cannot be read, and a method or class field that holds the call."""
+    from flag_cleanup import source_index
+
+    word = _word(name)
+    callers: list[tuple[str, str]] = []
+    for other in cross_file_keys.mention_files(
+        repo_dir, [name], exclude=(), also=_REEXPORT, extra_suffixes=source_index.COMPONENT_SUFFIXES
+    ):
+        if not other.endswith(ts_scope.FAMILY_EXTENSIONS):
+            continue  # prose and data name things without calling them
+        text = _read(other)
+        if text is None:
+            found.append((other, 1, name))
+            continue
+        if not word.search(text):
+            continue
+        local = _same_file(other, home)
+        if not local and _unrelated_name(other, text, name, home, files):
+            continue
+        file = files.file(other, text)
+        if file is None or file.root.has_error:
+            found.append((other, 1, name))
+            continue
+        stub = _stubs(other, text)
+        namespaces = {i.local for i in file.imports if i.imported is None and i.module is not None and _same_file(i.module, home)}
+        for node in cross_file_keys.walk(file.root):
+            if node.type == "property_identifier" and _text(node) == name and namespaces:
+                member = node.parent
+                holder = None if member is None or member.type != "member_expression" else member.child_by_field_name("object")
+                if holder is None or holder.type != "identifier" or _text(holder) not in namespaces:
+                    continue  # another object's member of the same name
+                if stub or _call_of(member) is None:
+                    found.append((other, wi.line_of(node), wi.text_of(member)))
+                    continue
+                owner = _top_owner(node)
+                if owner is None:
+                    found.append((other, wi.line_of(node), wi.text_of(member)))
+                elif owner is not _NO_FUNCTION:
+                    callers.append((other, str(owner)))
+                continue
+            if node.type not in ("identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern", "export_specifier"):
+                continue
+            if node.type == "export_specifier":
+                if word.search(_text(node)):
+                    found.append((other, wi.line_of(node), wi.text_of(node)))
+                continue
+            if _text(node) != name:
+                continue
+            parent = node.parent
+            if parent is not None and (parent.type in ("import_specifier", "import_clause", "namespace_import") or _member_name(parent) == node):
+                continue
+            if local and parent is not None and parent.type == "function_declaration" and parent.child_by_field_name("name") == node:
+                continue
+            if stub:
+                found.append((other, wi.line_of(node), wi.text_of(parent or node)))
+                continue
+            if node.type != "identifier" or _call_of(node) is None:
+                found.append((other, wi.line_of(node), wi.text_of(parent or node)))
+                continue
+            owner = _top_owner(node)
+            if owner is None:
+                found.append((other, wi.line_of(node), wi.text_of(parent or node)))
+            elif owner is not _NO_FUNCTION:
+                callers.append((other, str(owner)))
+    return callers
+
+
+def _test_reachable_writers(
+    repo_dir: str, writes: list[tuple[str, Node, Node | None, bool]], files: ts_scope.Files
+) -> list[tuple[str, int, str]]:
+    """The writes of a private `let` that a test may reach with a fake: the
+    write is not inside a top-level function, or that function, or any
+    function calling it (up to ``_CALLER_DEPTH`` calls up, by name), is
+    mentioned in a test or stubbing file; or a link of the chain is aliased,
+    re-exported, stored, called from a method, or not followed far enough.
+    A test installing an instance of its own choosing would see the folded
+    member answer from the literal."""
+    found: list[tuple[str, int, str]] = []
+    frontier: list[tuple[str, str]] = []
+    for path, call, _, _ in writes:
+        owner = _top_owner(call)
+        if owner is None or owner is _NO_FUNCTION:
+            found.append((path, wi.line_of(call), wi.text_of(call.parent or call)))
+        else:
+            frontier.append((path, str(owner)))
+    seen: set[tuple[str, str]] = set()
+    depth = 0
+    while frontier:
+        if depth >= _CALLER_DEPTH:
+            found += [(path, 1, name) for path, name in frontier if (path, name) not in seen]
+            break
+        following: list[tuple[str, str]] = []
+        for home, name in frontier:
+            if (home, name) in seen:
+                continue
+            seen.add((home, name))
+            following += _writer_callers(repo_dir, files, home, name, found)
+        frontier = following
+        depth += 1
+    return found
+
+
+def _unrelated_name(path: str, text: str, name: str, home: str, files: ts_scope.Files) -> bool:
+    """Whether a file's mentions of ``name`` are plainly some other function: a
+    string, a member of another object, a declaration of its own, or an import
+    from a module that is not ``home`` and re-exports nothing (a generic name
+    such as ``initialize`` is common)."""
+    file = files.file(path, text)
+    if file is None or file.root.has_error:
+        return False
+    if any(i.imported is None and i.module is not None and _same_file(i.module, home) for i in file.imports):
+        return False  # `ns.initialize()` through a namespace import of the module
+    spelled = [
+        n for n in cross_file_keys.walk(file.root)
+        if n.type in ("identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern")
+        and _text(n) == name
+    ]
+    if not spelled:
+        return True
+    imports = [i for i in file.imports if i.local == name]
+    if not imports:
+        return file.binding(name) is not None
+    for imported in imports:
+        if imported.imported is None or (imported.module is not None and _same_file(imported.module, home)):
+            return False
+        if imported.module is None:
+            if imported.specifier is None or not _is_package(imported.specifier, lambda: installable_packages(files.repo_dir)):
+                return False
+            continue
+        target = _read(imported.module)
+        if target is None or _REEXPORT.search(target):
+            return False
+    return True
+
+
+#: The module specifiers an unparsed file re-exports from or imports.
+_FROM_CLAUSES = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)['"]([^'"]+)['"]""")
+
+
+def _type_only_export(node: Node) -> bool:
+    """``export type { T } from "./m"`` / ``export type * from``: erased, so it
+    hands on no value. (A specifier-level ``type`` is not judged.)"""
+    if node.child_by_field_name("source") is None:
+        return False
+    for child in node.children:
+        if child.type == "type":
+            return True
+        if child.type in ("export_clause", "*", "namespace_export", "string"):
+            return False
+    return False
 
 
 def _exports(root: Node, name: str) -> bool:
@@ -2018,7 +2296,7 @@ _MOCKED = frozenset({"vi.mocked", "jest.mocked"})
 _MOCKITO = frozenset({"when", "verify"})
 #: The packages whose ``mock`` makes an instance of the class it is given.
 _MOCK_LIBRARIES = frozenset({"jest-mock-extended", "vitest-mock-extended", "ts-mockito", "@typestrong/ts-mockito"})
-_RETURNS = frozenset({"mockReturnValue", "mockReturnValueOnce"})
+_RETURNS = frozenset({"mockReturnValue", "mockReturnValueOnce", "mockResolvedValue", "mockResolvedValueOnce"})
 
 
 def _same_file(a: str, b: str) -> bool:
@@ -2050,7 +2328,24 @@ def _names_wrapper_file(specifier: str, wrapper_path: str) -> bool:
     return last == stem or (stem == "index" and last == path.parent.name)
 
 
-def _factory_hides(call: Node, name: str | None) -> bool:
+def _object_without(entry: Node, name: str) -> bool:
+    """Whether an entry is a function returning an object literal that has no
+    member ``name`` and no spread or computed key: a getter handed such an
+    object has no such member to answer with."""
+    function = entry.child_by_field_name("value") if entry.type == "pair" else entry
+    literal = None if function is None else mock_stubs.ts_function_object(function)
+    if literal is None:
+        return False
+    for member in literal.named_children:
+        if member.type == "comment":
+            continue
+        key = mock_stubs.ts_entry_name(member)
+        if key is None or key == name:
+            return False
+    return True
+
+
+def _factory_hides(call: Node, name: str | None, member: str | None = None) -> bool:
     """Whether a module mock may hand its importers something else for the
     wrapper. An automock does, and so does a factory this cannot read, or one
     spreading anything but the real module. With ``name`` (a function
@@ -2064,6 +2359,8 @@ def _factory_hides(call: Node, name: str | None) -> bool:
     for entry in [c for c in found.named_children if c.type != "comment"]:
         if mock_stubs.ts_actual_spread(entry, specifier):
             continue
+        if member is not None and mock_stubs.ts_entry_name(entry) is not None and _object_without(entry, member):
+            continue  # a factory member's getter, handed an object lacking it
         if entry.type == "spread_element" or name is None or mock_stubs.ts_entry_name(entry) in (None, name):
             return True
     return False
@@ -2107,7 +2404,14 @@ def _stub_receivers(root: Node, name: str) -> list[Node]:
             continue
         returns = function.child_by_field_name("property")
         stubbed = function.child_by_field_name("object")
-        if returns is None or _text(returns) not in _RETURNS or stubbed is None or stubbed.type != "member_expression":
+        if returns is None or _text(returns) not in _RETURNS or stubbed is None:
+            continue
+        if stubbed.type == "call_expression" and mock_stubs.ts_callee(stubbed) in _MOCKED:
+            # `vi.mocked(x.name).mockResolvedValue(v)`
+            inner = next(iter(mock_stubs.ts_arguments(stubbed)), None) if len(mock_stubs.ts_arguments(stubbed)) == 1 else None
+            if inner is not None and inner.type == "member_expression":
+                stubbed = inner
+        if stubbed.type != "member_expression":
             continue
         prop = stubbed.child_by_field_name("property")
         if prop is not None and _is_name(prop, name):
@@ -2223,9 +2527,34 @@ def stub_targets(wrapper: wi.Wrapper, index: Index) -> dict[str, mock_stubs.Stub
                 target = None if specifier is None else ts_scope.resolve(path, specifier, index.repo_dir)
                 if target is not None and _same_file(target, wrapper.path):
                     modules.add(specifier)
-        if receivers or modules:
-            found[file.path] = mock_stubs.StubTargets(receivers, frozenset(modules), resolved=wrapper.promise)
+        getters = _getter_mocks(file, path, wrapper, index) if ts_scope.factory_name(wrapper.owner) is not None else frozenset()
+        if receivers or modules or getters:
+            found[file.path] = mock_stubs.StubTargets(
+                receivers, frozenset(modules), resolved=wrapper.promise, getters=getters
+            )
     return found
+
+
+def _getter_mocks(file: ts_scope.File, path: str, wrapper: wi.Wrapper, index: Index) -> frozenset[tuple[str, str]]:
+    """``(specifier, getter)`` of each entry of a module mock's factory in
+    ``file`` that replaces a getter proven to return the wrapper's factory
+    object: an exported top-level function of the mocked module for which
+    :meth:`ts_scope.Files.getter_type` names that factory."""
+    files = index.files if index.files is not None else ts_scope.Files(index.repo_dir)
+    owner = ts_scope.TypeRef(wrapper.path, wrapper.owner)
+    found: set[tuple[str, str]] = set()
+    for call in _module_mock_calls(file.root):
+        specifier = mock_stubs.ts_module_specifier(next(iter(mock_stubs.ts_arguments(call)), None))
+        target = None if specifier is None else ts_scope.resolve(path, specifier, index.repo_dir)
+        module = None if target is None else files.file(target)
+        factory = mock_stubs.ts_factory_object(call)
+        if specifier is None or module is None or factory is None:
+            continue
+        for entry in [c for c in factory.named_children if c.type != "comment"]:
+            key = mock_stubs.ts_entry_name(entry)
+            if key is not None and files.getter_type(module, key) == owner:
+                found.add((specifier, key))
+    return frozenset(found)
 
 
 # --- Class mocks a round settles --------------------------------------------------
@@ -2808,12 +3137,14 @@ def _judge(path: str, node: Node, wrapper: wi.Wrapper, file: ts_scope.File, file
         reason = _function_reason(_text(node), receiver, wrapper, file, files)
     else:
         reason = _method_reason(receiver, wrapper, file, files)
-        if (
-            reason is None
-            and not wrapper.static
-            and ts_scope.factory_name(wrapper.owner) is None
-            and _built_by_the_test(receiver, file)
-        ):
+        if reason is None and not wrapper.static and _built_by_the_test(receiver, file, wrapper):
+            # The wrapper's own unit test goes with the member when the member
+            # is all it is about; any other test of an object it built keeps it.
+            title = _owned_test(call, receiver, wrapper, file)
+            if title is not None:
+                return wi.Occurrence(
+                    path, wi.line_of(node), wi.text_of(call), None, wi.SIBLING_RECEIVER, _text(receiver), True, scope=title
+                )
             reason = wi.TEST_DOUBLE
     if reason is None and (_argument_has_call(call) or _default_does_work(wrapper, files)):
         reason = wi.ARGUMENT_HAS_CALL
@@ -2825,7 +3156,7 @@ def _judge(path: str, node: Node, wrapper: wi.Wrapper, file: ts_scope.File, file
     return wi.Occurrence(path, wi.line_of(node), wi.text_of(call), (callee.start_byte, callee.end_byte), None)
 
 
-def _built_by_the_test(receiver: Node | None, file: ts_scope.File) -> bool:
+def _built_by_the_test(receiver: Node | None, file: ts_scope.File, wrapper: wi.Wrapper | None = None) -> bool:
     """Whether a test reaches a CLASS's instance member through an object it
     may have built itself: ``new Flags(fakeClient)`` in the test, a typed
     parameter it is handed, a field of its own.
@@ -2841,8 +3172,265 @@ def _built_by_the_test(receiver: Node | None, file: ts_scope.File) -> bool:
     and a test imports still passes it."""
     if receiver is None or not _stubs(file.path, file.source):
         return False
+    if wrapper is not None and ts_scope.factory_name(wrapper.owner) is not None:
+        # A factory's object is the test's own when the test binds it to a
+        # local `const x = buildFlags(...)`; the instance a test imports or is
+        # handed is the one-instance rule's (:func:`factory_escapes`).
+        return receiver.type == "identifier" and _local_factory_call(receiver, file) is not None
     root = receiver.child_by_field_name("function") if receiver.type == "call_expression" else receiver
     return root is None or root.type != "identifier" or file.import_of(_text(root)) is None
+
+
+def _local_factory_call(receiver: Node, file: ts_scope.File) -> Node | None:
+    """The call ``F(...)`` in the ``const x = F(...)`` that a receiver ``x``
+    is bound by."""
+    bound = file.binding_of(receiver)
+    declarator = None if bound is None else bound.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("name") != bound:
+        return None
+    value = declarator.child_by_field_name("value")
+    declaration = declarator.parent
+    if value is None or value.type != "call_expression" or declaration is None or not _has(declaration, "const"):
+        return None
+    return value
+
+
+#: What a test may chain after `vi.fn()`/`jest.fn()` to script a fake.
+_FAKE_CHAIN = frozenset(
+    {"mockResolvedValue", "mockResolvedValueOnce", "mockReturnValue", "mockReturnValueOnce", "mockImplementation", "mockImplementationOnce"}
+)
+_FAKE_FUNCTIONS = frozenset({"vi.fn", "jest.fn"})
+_PLAIN_VALUES = frozenset({"true", "false", "null", "undefined", "number", "string", "template_string", "regex"})
+_WRAPPING = frozenset({"as_expression", "satisfies_expression", "non_null_expression", "parenthesized_expression"})
+
+
+def _inert_value(node: Node | None, known: set[str]) -> bool:
+    """Whether an expression only builds a fake or states a literal: a literal,
+    a function, `vi.fn()` scripted with `mock*` calls, an object of such, or a
+    name of a local already declared that way (``known``). Nothing is called
+    but the mocking library's own functions."""
+    if node is None:
+        return False
+    if node.type in _PLAIN_VALUES or node.type in ("arrow_function", "function_expression", "function"):
+        return node.type != "template_string" or not any(c.type == "template_substitution" for c in node.named_children)
+    if node.type in _WRAPPING:
+        inner = [c for c in node.named_children if c.type not in ("comment", "type_annotation") and c.is_named]
+        return bool(inner) and _inert_value(inner[0], known)
+    if node.type == "identifier":
+        return _text(node) in known or _text(node) == "undefined"
+    if node.type == "array":
+        return all(_inert_value(c, known) for c in node.named_children if c.type != "comment")
+    if node.type == "object":
+        for member in node.named_children:
+            if member.type == "comment":
+                continue
+            if member.type == "method_definition":
+                continue
+            if member.type == "shorthand_property_identifier":
+                if _text(member) not in known:
+                    return False
+                continue
+            if member.type != "pair":
+                return False
+            key = member.child_by_field_name("key")
+            if key is None or key.type == "computed_property_name" or not _inert_value(member.child_by_field_name("value"), known):
+                return False
+        return True
+    if node.type == "call_expression":
+        function = node.child_by_field_name("function")
+        if function is None:
+            return False
+        if mock_stubs.ts_callee(node) in _FAKE_FUNCTIONS:
+            return all(_inert_value(a, known) for a in mock_stubs.ts_arguments(node))
+        if function.type == "member_expression" and (prop := function.child_by_field_name("property")) is not None:
+            if _text(prop) in _FAKE_CHAIN:
+                return _inert_value(function.child_by_field_name("object"), known) and all(
+                    _inert_value(a, known) for a in mock_stubs.ts_arguments(node)
+                )
+    return False
+
+
+def _test_body(node: Node, data: bytes) -> tuple[Node, Node, str] | None:
+    """``(statement, body, title)`` of the ``it("title", () => { ... })``
+    around ``node``, when ``node`` is in that callback's own body."""
+    current = node.parent
+    while current is not None:
+        if current.type == "statement_block" and current.parent is not None and current.parent.type in (
+            "arrow_function", "function_expression", "function"
+        ):
+            call = current.parent.parent.parent if current.parent.parent is not None else None
+            statement = call.parent if call is not None else None
+            if statement is not None and statement.type == "expression_statement":
+                title = mock_stubs._ts_test(statement, data)
+                if title is not None:
+                    return statement, current, title
+            # A nested function: not the test's own body.
+            return None
+        current = current.parent
+    return None
+
+
+def _owned_test(call: Node, receiver: Node | None, wrapper: wi.Wrapper, file: ts_scope.File) -> str | None:
+    """The title of the test whose ONLY subject is this wrapper's member, called
+    on an instance the test builds itself with an injected fake; else ``None``.
+
+    The test builds the object (``const flags = new Flags(fake)`` or
+    ``buildFlags(fake)``) from literals and `vi.fn()` fakes, and every other
+    statement is an assertion about a call of this member on it, or about the
+    fake it was given. A call of anything else (production code, another
+    member), a reference to the instance that is not a call of this member, or
+    a hook, a helper or a ``describe``-level instance keeps the test: it
+    asserts more than the member forwards. The title must be the file's only
+    one of that name."""
+    if receiver is None or receiver.type != "identifier":
+        return None
+    data = file.source.encode("utf-8")
+    found = _test_body(call, data)
+    if found is None:
+        return None
+    statement, body, title = found
+    if ".only" in "".join(statement.named_children[0].child_by_field_name("function").text.decode().split()):
+        return None  # a focused test: deleting it would let the rest of the file run
+    bound = file.binding_of(receiver)
+    declarator = None if bound is None else bound.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.parent is None:
+        return None
+    if declarator.parent.parent is None or declarator.parent.parent != body:
+        return None
+    titles = [
+        mock_stubs._ts_test(n, data)
+        for n in cross_file_keys.walk(file.root)
+        if n.type == "expression_statement"
+    ]
+    if titles.count(title) != 1:
+        return None
+    if not ts_emptied_tests.survives(file.source, ts_scope.grammar(file.path), wrapper.name):
+        return None  # deleting it would leave a test file with no test that cannot go
+    instance = _text(receiver)
+    known: set[str] = set()
+    subjects: set[str] = set()  # locals holding a result of the member
+    fakes: set[str] = set()
+    for item in [c for c in body.named_children if c.type != "comment"]:
+        if item.type == "lexical_declaration" and _has(item, "const"):
+            for declared in [c for c in item.named_children if c.type == "variable_declarator"]:
+                name, value = declared.child_by_field_name("name"), declared.child_by_field_name("value")
+                if name is None or name.type != "identifier" or value is None:
+                    return None
+                label = _text(name)
+                if label == instance:
+                    construction = value
+                    while construction.type in _WRAPPING:
+                        inner = [c for c in construction.named_children if c.is_named and c.type != "comment"]
+                        construction = inner[0] if inner else construction
+                        if not inner:
+                            break
+                    if construction.type == "new_expression":
+                        arguments = construction.child_by_field_name("arguments")
+                    elif construction.type == "call_expression":
+                        arguments = construction.child_by_field_name("arguments")
+                    else:
+                        return None
+                    if arguments is None or not all(_inert_value(a, known) for a in arguments.named_children if a.type != "comment"):
+                        return None
+                    known.add(label)
+                elif _inert_value(value, known):
+                    known.add(label)
+                    fakes.add(label)
+                elif _member_result(value, instance, wrapper.name):
+                    subjects.add(label)
+                else:
+                    return None
+            continue
+        if item.type != "expression_statement" or not _subject_assertion(item, instance, wrapper.name, subjects, fakes, known):
+            return None
+    return title if instance in known else None
+
+
+def _member_result(value: Node, instance: str, member: str) -> bool:
+    """``[await] instance.member(<plain arguments>)``."""
+    if value.type == "await_expression":
+        inner = [c for c in value.named_children if c.type != "comment"]
+        value = inner[0] if len(inner) == 1 else value
+    if value.type != "call_expression" or value.child_by_field_name("type_arguments") is not None:
+        return False
+    function = value.child_by_field_name("function")
+    if function is None or function.type != "member_expression" or function.child_by_field_name("optional_chain") is not None:
+        return False
+    obj, prop = function.child_by_field_name("object"), function.child_by_field_name("property")
+    if obj is None or prop is None or obj.type != "identifier" or _text(obj) != instance or _text(prop) != member:
+        return False
+    return all(_plain_argument(a) for a in mock_stubs.ts_arguments(value))
+
+
+def _plain_argument(node: Node) -> bool:
+    return node.type in _PLAIN_VALUES or (
+        node.type == "object" and all(_plain_argument(c.child_by_field_name("value") or c) for c in node.named_children if c.type == "pair")
+    )
+
+
+def _subject_assertion(
+    statement: Node, instance: str, member: str, subjects: set[str], fakes: set[str], known: set[str]
+) -> bool:
+    """``expect(<subject>).matcher(<literals>)`` (``await``/``.resolves`` and
+    ``.not`` allowed), the subject being a call of the member on the
+    instance, a local holding one's result, or an injected fake."""
+    chain = statement.named_children[0] if statement.named_children else None
+    if chain is not None and chain.type == "await_expression":
+        inner = [c for c in chain.named_children if c.type != "comment"]
+        chain = inner[0] if len(inner) == 1 else None
+    expect = None
+    node = chain
+    # Walk down `.a.b(...)` to the `expect(...)` at the base.
+    while node is not None:
+        if node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            if function is not None and function.type == "identifier" and _text(function) == "expect":
+                expect = node
+                break
+            for argument in mock_stubs.ts_arguments(node):
+                if not _plain_matcher_argument(argument):
+                    return False
+            node = function
+        elif node.type == "member_expression":
+            node = node.child_by_field_name("object")
+        else:
+            return False
+    if expect is None:
+        return False
+    arguments = mock_stubs.ts_arguments(expect)
+    if len(arguments) != 1:
+        return False
+    subject = arguments[0]
+    if subject.type == "identifier":
+        return _text(subject) in subjects or _text(subject) in fakes
+    held = subject
+    while held.type == "member_expression" and held.child_by_field_name("optional_chain") is None:
+        held = held.child_by_field_name("object")
+        if held is None:
+            return False
+    if held.type == "identifier" and held != subject:
+        return _text(held) in fakes  # `client.isEnabled`: a member of the injected fake
+    return _member_result(subject, instance, member)
+
+
+def _plain_matcher_argument(node: Node) -> bool:
+    """A matcher's argument: a literal, or an object, array or ``expect.<m>()``
+    of those."""
+    if node.type in _PLAIN_VALUES:
+        return node.type != "template_string" or not any(c.type == "template_substitution" for c in node.named_children)
+    if node.type == "object":
+        return all(
+            c.type == "pair" and _plain_matcher_argument(c.child_by_field_name("value") or c)
+            for c in node.named_children
+            if c.type != "comment"
+        )
+    if node.type == "array":
+        return all(_plain_matcher_argument(c) for c in node.named_children if c.type != "comment")
+    if node.type == "call_expression":
+        return mock_stubs.ts_callee(node).startswith("expect.") and all(
+            _plain_matcher_argument(a) for a in mock_stubs.ts_arguments(node)
+        )
+    return False
 
 
 def _is_import_binding(node: Node, file: ts_scope.File) -> bool:

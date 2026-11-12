@@ -273,24 +273,28 @@ def read_slot(argument: Node) -> tuple[Node, int | str] | None:
     return arguments.parent, key.text.decode("utf-8")
 
 
-def declined_by_object_key_rules(call: Node, prop: str = "key") -> bool:
+def declined_by_object_key_rules(call: Node, prop: str = "key", *, awaited: bool = True) -> bool:
     """Whether the property-key rules decline ``call``.
 
     They match the ``await`` around it only, with the object its only argument,
     and decline an optional call, a spread, a comment or a computed name
     anywhere in it, and any object whose text is not admitted by the whitelist
-    above (see the regular expressions' comment).
+    above (see the regular expressions' comment). ``awaited=False`` asks the
+    question of an un-awaited read, which ``ts_async_reads`` decides per site
+    and the sentinel pass folds: everything but the ``await`` requirement.
     """
-    awaited = call.parent
-    if awaited is None or awaited.type != "await_expression":
+    wrapper = call.parent
+    if awaited and (wrapper is None or wrapper.type != "await_expression"):
         return True
+    if not awaited:
+        wrapper = call
     if declined_by_const_rules(call, positioned=True):
         return True
     arguments = call.child_by_field_name("arguments")
     obj = arguments.named_children[0] if arguments is not None and len(arguments.named_children) == 1 else None
     if obj is None or obj.type != "object":
         return True
-    if any(node.type == "computed_property_name" for node in _walk(awaited)):
+    if any(node.type == "computed_property_name" for node in _walk(wrapper)):
         return True
     dotted = None
     for pair in obj.named_children:

@@ -280,6 +280,27 @@ _THIS_BARRIERS = frozenset(
 _PARAMETER_PROPERTY = ("accessibility_modifier", "readonly", "override_modifier")
 
 
+def _nothing(value: Node | None) -> bool:
+    """Whether a value is ``undefined`` or ``null``."""
+    return value is not None and (
+        value.type == "null" or (value.type in ("undefined", "identifier") and text(value) == "undefined")
+    )
+
+
+def _tested_only(node: Node) -> bool:
+    """Whether a reference is only asked whether it is set: ``!x`` or the
+    condition ``if (x)`` itself. Nothing is handed on."""
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "unary_expression":
+        operator = parent.child_by_field_name("operator")
+        return operator is not None and text(operator) == "!"
+    if parent.type == "parenthesized_expression" and parent.parent is not None:
+        return parent.parent.type in ("if_statement", "while_statement") and parent.parent.child_by_field_name("condition") == parent
+    return False
+
+
 def top_level(node: Node) -> bool:
     parent = node.parent
     if parent is not None and parent.type == "export_statement":
@@ -744,14 +765,151 @@ class Files:
         found = self._function_named(text(function), file)
         if found is None:
             return None
-        module, getter = found
+        return self._getter_type(*found)
+
+    def getter_type(self, module: File, name: str) -> TypeRef | None:
+        """What the exported getter ``name`` of ``module`` returns, as
+        :meth:`getter_call` proves it for a call spelled ``name()``."""
+        getter = _top_function(module.root, name)
+        if (
+            getter is None
+            or module.binding(name) != getter.child_by_field_name("name")
+            or not _exports_directly(module.root, name)
+        ):
+            return None
+        return self._getter_type(module, getter)
+
+    def _getter_type(self, module: File, getter: Node) -> TypeRef | None:
         parameters = getter.child_by_field_name("parameters")
         if parameters is None or any(c.type != "comment" for c in parameters.named_children):
             return None
         returned = _returned(getter)
-        if returned is None or returned.type != "identifier":
+        if returned is None:
             return None
-        return self._held(module, text(returned))
+        if returned.type == "identifier":
+            return self._held(module, text(returned))
+        return self._fallback(module, returned)
+
+    def _fallback(self, module: File, returned: Node) -> TypeRef | None:
+        """``x ?? c`` (or ``x || c``) where ``x`` is the module's reassigned
+        ``let`` (:meth:`held_let`) and ``c`` a ``const`` a factory call
+        initialises, both made by the same factory: every value the getter
+        can return is that factory's object."""
+        if returned.type != "binary_expression":
+            return None
+        operator = returned.child_by_field_name("operator")
+        left, right = returned.child_by_field_name("left"), returned.child_by_field_name("right")
+        if operator is None or text(operator) not in ("??", "||"):
+            return None
+        if left is None or right is None or left.type != "identifier" or right.type != "identifier":
+            return None
+        fallback = self._held(module, text(right))
+        held = self.held_let(module, text(left))
+        return fallback if fallback is not None and held is not None and held[0] == fallback else None
+
+    def held_let(self, module: File, name: str) -> tuple[TypeRef, list[Node]] | None:
+        """What a module-level ``let name`` holds besides ``undefined``, and the
+        factory calls assigned to it, when the variable is private to the
+        file and every value it can take is a call of one factory.
+
+        Not exported; declared once at the top, with no initialiser or a
+        factory call; and every other spelling of the name in the file is
+        ``name = F(...)`` (the same factory) or the left operand of a
+        ``??``/``||`` in a ``return``. A compound assignment, an update, a
+        destructuring write, a read that hands the value on, or a shadowing
+        binding is none of these, so the variable is not followed."""
+        declarators = []
+        for node in _top_nodes(module.root):
+            if node is None or node.type != "lexical_declaration" or not any(c.type == "let" for c in node.children):
+                continue
+            declarators += [
+                d
+                for d in node.named_children
+                if d.type == "variable_declarator"
+                and (n := d.child_by_field_name("name")) is not None
+                and n.type == "identifier"
+                and text(n) == name
+            ]
+        if len(declarators) != 1:
+            return None
+        if _exports_directly(module.root, name):
+            return None
+        declarator = declarators[0]
+        calls: list[Node] = []
+        targets = {declarator.child_by_field_name("name").start_byte}
+        reads: list[Node] = []
+        kinds: set[TypeRef | None] = set()
+        initial = declarator.child_by_field_name("value")
+        if initial is not None and not _nothing(initial):
+            kinds.add(self.made(initial, module))
+            calls.append(initial)
+        stack = [module.root]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            if text(node) != name or node.type not in (
+                "identifier",
+                "shorthand_property_identifier",
+                "shorthand_property_identifier_pattern",
+                "property_identifier",
+            ):
+                continue
+            parent = node.parent
+            if node.type == "property_identifier":
+                continue  # `o.name`: another object's member
+            if parent == declarator and declarator.child_by_field_name("name") == node:
+                continue
+            if node.type != "identifier" or parent is None:
+                return None
+            if parent.type == "assignment_expression" and parent.child_by_field_name("left") == node:
+                value = parent.child_by_field_name("right")
+                if parent.parent is None or parent.parent.type != "expression_statement":
+                    return None  # the assignment's value is used
+                targets.add(node.start_byte)
+                if _nothing(value):
+                    continue  # `x = undefined`: the getter's fallback answers
+                kinds.add(self.made(value, module))
+                calls.append(value)
+                continue
+            if _tested_only(node):
+                continue
+            if (
+                parent.type == "binary_expression"
+                and parent.child_by_field_name("left") == node
+                and (op := parent.child_by_field_name("operator")) is not None
+                and text(op) in ("??", "||")
+                and parent.parent is not None
+                and parent.parent.type == "return_statement"
+            ):
+                reads.append(parent)
+                continue
+            return None
+        if len(kinds) != 1 or None in kinds:
+            return None
+        # The `??` reads hand the value on, so each must be a getter the
+        # escape scan follows: a top-level function of no parameters whose
+        # whole body is `return x ?? c`, `c` a const the same factory made.
+        for read in reads:
+            right = read.child_by_field_name("right")
+            function = read.parent.parent.parent if read.parent is not None and read.parent.parent is not None else None
+            parameters = None if function is None else function.child_by_field_name("parameters")
+            if (
+                right is None
+                or right.type != "identifier"
+                or function is None
+                or function.type != "function_declaration"
+                or not top_level(function)
+                or _returned(function) != read
+                or parameters is None
+                or any(c.type != "comment" for c in parameters.named_children)
+                or self._held(module, text(right)) != next(iter(kinds))
+            ):
+                return None
+        # Every binding of the name in the file is the declaration or one of
+        # those assignments: no parameter, local or import shadows it.
+        if {b.start_byte for b in bindings(module.root, name)} != targets:
+            return None
+        return next(iter(kinds)), calls
 
     def _exported(self, module: File, name: str) -> TypeRef | None:
         """``name`` at the top of ``module``: the class itself, the object a
@@ -777,7 +935,10 @@ class Files:
 
     def _identifier_type(self, node: Node, file: File) -> TypeRef | None:
         name = text(node)
-        bound = file.binding(name)
+        # The binding this use means: the file's one, or the `const` of the
+        # block around it when nothing else in that block binds the name (two
+        # tests may each declare their own `flags`).
+        bound = file.binding_of(node)
         parent = None if bound is None else bound.parent
         if parent is None:
             return None

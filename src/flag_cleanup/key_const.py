@@ -315,15 +315,16 @@ def dead_reference_survived(
         return False
     from flag_cleanup import syntax
 
+    parse = ts_syntax._parse if language in ("ts", "tsx", "js") else syntax._parse
     left_out = dead_references(
-        syntax._parse(original, language), original.encode("utf-8"), language, flag_key,
+        parse(original, language), original.encode("utf-8"), language, flag_key,
         accessors, treatment,
     )
     if not left_out:
         return False
     data = rewritten.encode("utf-8")
     return bool(
-        dangling_names(syntax._parse(rewritten, language), data, language, flag_key, set(left_out))
+        dangling_names(parse(rewritten, language), data, language, flag_key, set(left_out))
     )
 
 

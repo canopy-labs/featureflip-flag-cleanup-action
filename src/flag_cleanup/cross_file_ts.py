@@ -465,6 +465,26 @@ def declaration_file(path: str) -> str | None:
     return path[: len(path) - len(suffix)] + DECLARATION_SUFFIXES[suffix]
 
 
+#: Longest path (PATH_MAX) and path component (NAME_MAX) a probe may use.
+_PATH_MAX = 4095
+_NAME_MAX = 255
+
+
+def probable_path(text: str) -> bool:
+    """Whether ``text`` could name a file at all: no NUL or newline, within
+    PATH_MAX, and every component within NAME_MAX. A string literal in code is
+    judged as a specifier, so an over-long one (a minified blob, a data URL)
+    must be told apart here, before any probe raises ``File name too long``
+    (or ``embedded null byte``) and aborts the flag."""
+    if "\0" in text or "\n" in text:
+        return False
+    try:
+        raw = os.fsencode(text)
+    except UnicodeEncodeError:
+        return False
+    return len(raw) <= _PATH_MAX and all(len(part) <= _NAME_MAX for part in raw.split(b"/"))
+
+
 def _candidates(base: str, beside_declarations: bool = False) -> list[str]:
     """The one existing file ``base`` names, as a one-item list, or ``[]``.
 
@@ -474,6 +494,15 @@ def _candidates(base: str, beside_declarations: bool = False) -> list[str]:
     compiler types the import from the declarations, and the code that runs
     is the JavaScript.
     """
+    if not probable_path(base):
+        return []  # not a module: no file can have this name
+    try:
+        return _probe_candidates(base, beside_declarations)
+    except (OSError, ValueError):
+        return []  # ENAMETOOLONG / ELOOP / ENOTDIR / EINVAL: the OS cannot stat it
+
+
+def _probe_candidates(base: str, beside_declarations: bool) -> list[str]:
     path = Path(base)
     suffix = path.suffix
     if suffix in _WRITTEN_EXTENSIONS and not base.endswith(".d.ts"):
@@ -762,6 +791,8 @@ def _resolve(
     solution: bool = False,
     workspace: bool = False,
 ) -> str | None:
+    if not probable_path(specifier):
+        return None  # no file has this name
     if workspace and not specifier.startswith((".", "/")):
         found = _resolve(reader_path, specifier, stop, beside_declarations, base_url, strict, solution)
         if found is not None:
@@ -1737,8 +1768,11 @@ def generated_target(from_file: str, specifier: str, repo_dir: str) -> bool:
     variants = [
         stem + ext for ext in (".ts", ".tsx")
     ] + [f"{stem}/index{ext}" for ext in (".ts", ".tsx")]
-    if any(Path(v).exists() for v in [base, *variants]):
-        return False
+    try:
+        if any(Path(v).exists() for v in [base, *variants]):
+            return False
+    except (OSError, ValueError):
+        return False  # a name the OS cannot stat names no absent file either
     root = Path(source_index.checkout_root(repo_dir)).resolve()
     directory = os.path.dirname(base)
     try:
@@ -2913,7 +2947,7 @@ def component_match(path: str, source: str, patterns: tuple[re.Pattern[str], ...
 def _relative_root(reader: str, spec: str | None) -> Path | None:
     """The directory ``spec`` names from ``reader``'s, followed through links;
     None when it is not a plain relative path (computed, an alias, root-relative)."""
-    if spec is None or not (spec in (".", "..") or spec.startswith(("./", "../"))):
+    if spec is None or not (spec in (".", "..") or spec.startswith(("./", "../"))) or not probable_path(spec):
         return None
     return Path(os.path.normpath(Path(reader).parent / spec)).resolve()
 
@@ -4165,10 +4199,20 @@ def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:
     return set()
 
 
+def reads_beside_mentions(path, source, declarations, accessors, repo_dir):
+    """:func:`references` with every ``not-a-read`` mention set aside: what a
+    reader whose mentions stay (the declaration is kept) still reads. A TS
+    constant cannot be reassigned, so a mention in a branch the fold keeps
+    cannot change what the folded read would have said."""
+    reads, refused = references(path, source, declarations, accessors, repo_dir)
+    return reads, [r for r in refused if r.reason != xk.NOT_A_READ]
+
+
 _PROFILE = xk.Profile(
     language_family=frozenset({"ts", "tsx", "js"}),
     declarations=declarations,
     references=references,
+    reads_beside_mentions=reads_beside_mentions,
     declared_names=declared_names,
     declared_classifiers=declared_classifiers,
     entry_findings=entry_findings,

@@ -81,6 +81,12 @@ def _spelled(name: str, position: int | str) -> str:
     return f"{name}{{{position}}}" if isinstance(position, str) else f"{name}[{position}]"
 
 
+def plain_name(accessor: str) -> str:
+    """``accessor`` without the position :func:`encode_positions` spelled onto it."""
+    match = _POSITIONED.match(accessor)
+    return match["name"] if match is not None else accessor
+
+
 def positions_of(accessors) -> dict[str, int | str]:
     """The ``{name: index}`` (``{name: property}`` for a property key) of the entries :func:`encode_positions` spelled."""
     found: dict[str, int | str] = {}

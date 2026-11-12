@@ -781,6 +781,10 @@ def sibling_receivers(
                 if o.reason == SIBLING_RECEIVER and o.in_test_double and o.receiver and o.scope:
                     found.setdefault(path, set()).add((o.scope, o.receiver))
                     proven.setdefault((wrapper.label, path), set()).add((o.scope, o.receiver))
+    if language in ("ts", "tsx", "js"):
+        # Judged where the test is built (`wrapper_ts._owned_test`): the
+        # whole test is about this member, so no other wrapper's read is in it.
+        return {path: frozenset(pairs) for path, pairs in found.items()}
     from flag_cleanup import cross_file_keys, mock_stubs
 
     result: dict[str, frozenset[tuple[str, str]]] = {}

@@ -20,7 +20,7 @@ left out is still there; that check, not this one, is what makes leaving a
 mention out safe. A wrong prediction then costs the flag, never the build.
 
 Go's ``if`` reads the same way (``call_expression``, ``unary_expression``);
-one with an initializer is left alone.
+one with an initializer is left alone. So is TypeScript's and JavaScript's.
 
 Only the plainest shape is predicted: an ``if`` whose whole condition is the
 read, perhaps negated and parenthesised, and whose deleted branch is a braced
@@ -42,6 +42,14 @@ class _Spec:
     call: str
     #: The node a logical negation is, whose first child is the ``!`` token.
     negation: str
+    #: The node a braced body is.
+    block: str = "block"
+    #: A node wrapping the alternative (``else`` and its statement), if the grammar has one.
+    else_clause: str | None = None
+    #: The token that negates, the first child of a ``negation`` node.
+    not_token: str = "!"
+    #: An indented body (Python) has no braces to keep: the whole block is blank.
+    indented: bool = False
 
 
 #: Measured on the bundled grammars: both put the condition, the consequence
@@ -52,6 +60,20 @@ _SPECS = {
     "java": _Spec(call="method_invocation", negation="unary_expression"),
     "go": _Spec(call="call_expression", negation="unary_expression"),
 }
+#: TypeScript and JavaScript: the same `if_statement` and `!` as Java's, a
+#: `statement_block` body, and an `else_clause` around the alternative.
+for _ts in ("ts", "tsx", "js"):
+    _SPECS[_ts] = _Spec(
+        call="call_expression", negation="unary_expression", block="statement_block", else_clause="else_clause"
+    )
+
+
+#: Python: an `if` with a `not_operator`, an indented `block`, and an
+#: `else_clause` around the `else` body. `elif` is another alternative and is
+#: left alone, as `else if` is elsewhere.
+_SPECS["python"] = _Spec(
+    call="call", negation="not_operator", else_clause="else_clause", not_token="not", indented=True
+)
 
 
 def supported(language: str) -> bool:
@@ -77,7 +99,7 @@ def _condition_call(condition: Node, spec: _Spec) -> tuple[Node, bool] | None:
         elif (
             current.type == spec.negation
             and current.child_count == 2
-            and current.children[0].type == "!"
+            and current.children[0].type == spec.not_token
         ):
             negated = not negated
             current = current.children[1]
@@ -127,8 +149,13 @@ def dead_blocks(
             continue
         holds = treatment != hit[1]
         dead = node.child_by_field_name("alternative" if holds else "consequence")
-        if dead is not None and dead.type == "block":
-            found.append((dead.start_byte, dead.end_byte))
+        if dead is not None and dead.type == spec.else_clause and dead.named_child_count == 1:
+            dead = dead.named_children[0]
+        if dead is not None and dead.type == spec.block:
+            # `blank` keeps the first and last byte of a braced block; an
+            # indented one has none to keep.
+            widen = 1 if spec.indented else 0
+            found.append((dead.start_byte - widen, dead.end_byte + widen))
     return found
 
 

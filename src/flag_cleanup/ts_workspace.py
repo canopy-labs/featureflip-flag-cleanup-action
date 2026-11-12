@@ -166,7 +166,7 @@ _DECLARATION_SUFFIXES = {".d.ts": ".js", ".d.mts": ".mjs", ".d.cts": ".cjs"}
 
 # Something this module would need to read cannot be read for certain: the
 # resolver's own exception, so the helpers it lends raise the same one.
-from flag_cleanup.cross_file_ts import _Unknown  # noqa: E402
+from flag_cleanup.cross_file_ts import _Unknown, probable_path  # noqa: E402
 
 
 @dataclass
@@ -570,7 +570,7 @@ def bundled(specifier: str, repo_dir: str) -> bool:
     run time may then do more than its source shows."""
     from flag_cleanup import source_index
 
-    name = package_part(specifier)
+    name = package_part(specifier) if probable_path(specifier) else None
     if name is None:
         return False
     stop = Path(source_index.checkout_root(repo_dir)).resolve()
@@ -619,8 +619,8 @@ def resolve(reader_path: str, specifier: str, stop: Path) -> str | None:
     """The source file bare ``specifier`` reaches from ``reader_path`` through
     a workspace package of the checkout rooted at ``stop``; None unless every
     reading the module docstring lists is certain."""
-    if not _follow.get():
-        return None  # `workspace-packages: off`
+    if not _follow.get() or not probable_path(specifier):
+        return None  # `workspace-packages: off`, or a name no file has
     parsed = _package_name(specifier)
     if parsed is None:
         return None

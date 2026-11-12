@@ -1574,7 +1574,11 @@ def _competing(
 
 
 #: The grammar each suffix whose dead blocks are predicted is read with.
-_DEAD_BLOCK_GRAMMARS = {".cs": "csharp", ".java": "java", ".go": "go"}
+_DEAD_BLOCK_GRAMMARS = {
+    ".cs": "csharp", ".java": "java", ".go": "go",
+    ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx",
+    ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+}
 
 
 def without_dead_blocks(
@@ -1595,20 +1599,21 @@ def without_dead_blocks(
     blanked verdict only for a file it leaves a proven reader, and every
     proven reader is asked again, unblanked, by :func:`still_mentions`.
     """
-    from flag_cleanup import dead_branches, syntax
+    from flag_cleanup import dead_branches, syntax, ts_syntax
 
     language = _DEAD_BLOCK_GRAMMARS.get(Path(path).suffix)
     names = {d.name for d in visible if d.kind == CONSTANT}
     if language is None or not names or not any(name in source for name in names):
         return source
-    root = syntax._parse(source, language)
+    root = (ts_syntax._parse if language in ("ts", "tsx", "js") else syntax._parse)(source, language)
 
     def is_read(call: Node) -> bool:
         stack = [call]
         while stack:
             node = stack.pop()
             # Go spells a package's constant `q.NAME`: a field_identifier.
-            if node.type in ("identifier", "field_identifier") and node.text.decode("utf-8", "replace") in names:
+            # TypeScript's `Keys.NAME` is a property_identifier.
+            if node.type in ("identifier", "field_identifier", "property_identifier") and node.text.decode("utf-8", "replace") in names:
                 owner = dead_branches.nearest_call(node, language)
                 if owner is not None and owner.id == call.id:
                     return True

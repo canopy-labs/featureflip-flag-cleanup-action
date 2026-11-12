@@ -100,6 +100,13 @@ STUB, VERIFICATION, TEST = "stub", "verification", "test"
 #: A C# test that read a keyless wrapper's member through a receiver typed as
 #: a sibling implementation; carries the test's name.
 SIBLING_TEST = "sibling test"
+#: A TypeScript or JavaScript test whose only subject was a removed wrapper
+#: member, called on an object the test built with an injected fake; carries
+#: the test's title.
+OWN_TEST = "own unit test"
+#: A suite (``describe``) or a whole test file a removal left with no test; the
+#: row carries what was left and what went.
+EMPTIED_SUITE = "emptied suite"
 #: A Go test deleted because it pinned the removed value with a test setter
 #: (:mod:`flag_cleanup.go_setters`); carries the test's name.
 SETTER_TEST = "setter test"
@@ -680,6 +687,12 @@ class StubTargets:
     #: answering ``mockResolvedValue(<bool>)`` decides the test as
     #: ``mockReturnValue(<bool>)`` does for a synchronous one.
     resolved: bool = False
+    #: TypeScript and JavaScript, a factory member: ``(module specifier,
+    #: getter name)`` of each entry of a module mock's factory in this file
+    #: that replaces a getter proven to return the factory's object
+    #: (``vi.mock("./flags", () => ({ getFlags: () => ({ isX: mocks.isX }) }))``).
+    #: The member's value there is a reference the test stubs by name.
+    getters: frozenset[tuple[str, str]] = frozenset()
 
 
 #: The calls that replace a whole module, with a factory or without one.
@@ -727,9 +740,17 @@ def ts_factory_object(call: Node) -> Node | None:
     ``None`` for an automock, an ``async`` factory, a factory held in a
     variable, or anything else."""
     args = ts_arguments(call)
-    if len(args) != 2 or args[1].type not in ("arrow_function", "function_expression", "function"):
+    if len(args) != 2:
         return None
-    factory = args[1]
+    return ts_function_object(args[1])
+
+
+def ts_function_object(factory: Node) -> Node | None:
+    """The object literal a function returns when written out as one:
+    ``() => ({...})``, ``() => { return {...}; }`` or a method of that body.
+    ``None`` for an ``async`` function or any other body."""
+    if factory.type not in ("arrow_function", "function_expression", "function", "method_definition"):
+        return None
     if any(c.type == "async" for c in factory.children):
         return None
     body = factory.child_by_field_name("body")
@@ -970,6 +991,14 @@ def _spelled(receiver: str) -> str:
     return r"\s*".join(re.escape(token) for token in re.findall(r"[\w$]+|\S", receiver))
 
 
+def _ts_ref_patterns(refs: str, resolved: bool = False) -> list[tuple[str, str]]:
+    """A stub written on the reference a module mock's factory hands the
+    wrapper (``mocks.isX.mockResolvedValue(true)``). ``refs`` are spelled."""
+    answer = "(?:mockResolvedValue|mockReturnValue)" if resolved else "mockReturnValue"
+    returns = rf"\s*\.\s*{answer}(?:Once)?\(\s*{_BOOL}\s*\)"
+    return [(STUB, rf"(?<![\w$.])(?:{refs}){returns}")]
+
+
 def _ts_wrapper_patterns(name: str, receivers: str, resolved: bool = False) -> list[tuple[str, str]]:
     """Jest and Vitest spies, Sinon stubs, a mock's member (jest-mock-extended,
     ``vi.mocked``), and ts-mockito, each on a receiver the wrapper pass
@@ -987,6 +1016,8 @@ def _ts_wrapper_patterns(name: str, receivers: str, resolved: bool = False) -> l
         (STUB, spy + rf"\s*\.\s*mockImplementation\(\s*\(\s*\)\s*=>\s*{_BOOL}\s*\)"),
         (STUB, rf"sinon\s*\.\s*stub\(\s*{target}\s*,\s*{member}\s*\)\s*\.\s*returns\(\s*{_BOOL}\s*\)"),
         (STUB, rf"{target}\s*\.\s*{name}{returns}"),
+        # `vi.mocked(f.m).mockResolvedValue(v)`: the member typed as its mock.
+        (STUB, rf"(?:jest|vi)\s*\.\s*mocked\(\s*{target}\s*\.\s*{name}\s*\)" + returns),
         (
             STUB,
             rf"when\(\s*{target}\s*\.\s*{name}\(\s*{_BALANCED}\)\s*\)\s*\.\s*thenReturn\(\s*{_BOOL}\s*\)",
@@ -1374,6 +1405,151 @@ def _ts_factory(
     return spans
 
 
+def _module_mock_of(statement: Node) -> Node | None:
+    """The ``jest.mock``/``vi.mock`` call a top-level statement is."""
+    if statement.type != "expression_statement" or not statement.named_children:
+        return None
+    call = statement.named_children[0]
+    return call if call.type == "call_expression" and ts_callee(call) in TS_MODULE_MOCKS else None
+
+
+def _cut_entries(entries: list[Node], gone: set[int], data: bytes) -> list[tuple[int, int, Removal]] | None:
+    """The spans cutting the entries whose ids are in ``gone``, adjacent ones
+    as one run; ``None`` when a comment between an entry and its comma makes
+    a cut undecidable."""
+    runs: list[list[Node]] = []
+    for index, entry in enumerate(entries):
+        if entry.id not in gone:
+            continue
+        if runs and index > 0 and entries[index - 1].id == runs[-1][-1].id:
+            runs[-1].append(entry)
+        else:
+            runs.append([entry])
+    spans = []
+    for run in runs:
+        span = _run_span(run[0], run[-1], data)
+        if span is None:
+            return None
+        text = data[run[0].start_byte : run[-1].end_byte].decode("utf-8")
+        spans.append((*span, Removal(STUB, " ".join(text.split()))))
+    return spans
+
+
+def _reference_text(entry: Node) -> str | None:
+    """What an object entry hands on as a plain reference: ``k: a.b`` or
+    ``k: b`` gives ``a.b`` / ``b``, and the shorthand ``k`` gives ``k``."""
+    if entry.type == "shorthand_property_identifier":
+        return _text_of(entry)
+    value = entry.child_by_field_name("value") if entry.type == "pair" else None
+    if value is None or value.type not in ("identifier", "member_expression"):
+        return None
+    parts = _text_of(value)
+    return None if "(" in parts or "?" in parts else "".join(parts.split())
+
+
+def _text_of(node: Node) -> str:
+    return node.text.decode("utf-8", "replace")
+
+
+def _ts_getter_mock(
+    statement: Node, data: bytes, getters: Mapping[str, frozenset[tuple[str, str]]]
+) -> tuple[list[tuple[int, int, Removal]], dict[str, set[str]]] | None:
+    """A top-level module mock replacing a getter of a factory member's
+    object (``getFlags: () => ({ isX: mocks.isX })``): the spans cutting each
+    wrapper's entry from the object the getter returns, and the references
+    those entries handed on, per wrapper name.
+
+    ``None`` when the statement is not such a mock. Otherwise the pair is
+    empty when a factory cannot be read, or an entry of a wrapper is not a
+    plain reference (``isX: vi.fn().mockResolvedValue(true)``): the entry
+    stays, and the wrapper is refused."""
+    call = _module_mock_of(statement)
+    if call is None:
+        return None
+    args = ts_arguments(call)
+    specifier = ts_module_specifier(args[0]) if args else None
+    mine = {name: {g for s, g in pairs if s == specifier} for name, pairs in getters.items()}
+    mine = {name: found for name, found in mine.items() if found}
+    if not mine:
+        return None
+    found = ts_factory_object(call)
+    if found is None:
+        return [], {}
+    spans: list[tuple[int, int, Removal]] = []
+    refs: dict[str, set[str]] = {}
+    for entry in [c for c in found.named_children if c.type != "comment"]:
+        key = ts_entry_name(entry)
+        wanted = {name for name, getter in mine.items() if key in getter}
+        if not wanted:
+            continue
+        function = entry.child_by_field_name("value") if entry.type == "pair" else entry
+        inner = ts_function_object(function) if function is not None else None
+        if inner is None:
+            return [], {}
+        members = [c for c in inner.named_children if c.type != "comment"]
+        ours = [m for m in members if ts_entry_name(m) in wanted]
+        for member in ours:
+            ref = _reference_text(member)
+            if ref is None:
+                return [], {}
+            refs.setdefault(ts_entry_name(member) or "", set()).add(ref)
+        if len(ours) == len(members) and not any(c.type == "comment" for c in inner.named_children):
+            # Nothing else is left in the object: empty it, `({})`.
+            text = " ".join(data[inner.start_byte + 1 : inner.end_byte - 1].decode("utf-8").split())
+            spans.append((inner.start_byte + 1, inner.end_byte - 1, Removal(STUB, text)))
+            continue
+        cut = _cut_entries(members, {m.id for m in ours}, data)
+        if cut is None:
+            return [], {}
+        spans += cut
+    return spans, refs
+
+
+def _ts_hoisted(
+    statement: Node, data: bytes, refs: Mapping[str, set[str]]
+) -> list[tuple[int, int, Removal]] | None:
+    """A top-level ``const mocks = vi.hoisted(() => ({ isX: vi.fn(), ... }))``
+    holding the references of :func:`_ts_getter_mock`: the spans cutting each
+    ``name: vi.fn()`` entry. ``None`` when the statement is not one or an
+    entry is anything but a bare ``vi.fn()`` (the statement then stays a
+    line of the double that nothing resolves)."""
+    if statement.type != "lexical_declaration":
+        return None
+    spans: list[tuple[int, int, Removal]] = []
+    touched = False
+    for declarator in [c for c in statement.named_children if c.type == "variable_declarator"]:
+        holder = declarator.child_by_field_name("name")
+        value = declarator.child_by_field_name("value")
+        if holder is None or holder.type != "identifier" or value is None or value.type != "call_expression":
+            continue
+        if ts_callee(value) not in ("vi.hoisted", "jest.hoisted"):
+            continue
+        arguments = ts_arguments(value)
+        found = ts_function_object(arguments[0]) if len(arguments) == 1 else None
+        if found is None:
+            continue
+        entries = [c for c in found.named_children if c.type != "comment"]
+        gone: set[int] = set()
+        for entry in entries:
+            key = ts_entry_name(entry)
+            if not key or f"{_text_of(holder)}.{key}" not in {r for found in refs.values() for r in found}:
+                continue
+            made = entry.child_by_field_name("value") if entry.type == "pair" else None
+            if made is None or made.type != "call_expression" or ts_callee(made) not in ("vi.fn", "jest.fn") or ts_arguments(made):
+                return None
+            gone.add(entry.id)
+        if not gone:
+            continue
+        if len(gone) == len(entries):
+            return None
+        cut = _cut_entries(entries, gone, data)
+        if cut is None:
+            return None
+        spans += cut
+        touched = True
+    return spans if touched else None
+
+
 def _resolve_ts_wrappers(
     source: str, language: str, treatment: bool, wrapper: WrapperStub, targets: Mapping[str, StubTargets]
 ) -> tuple[str, list[Removal]]:
@@ -1385,11 +1561,19 @@ def _resolve_ts_wrappers(
     left to the fold. The decisions are :func:`_apply`'s, as for the SDK.
     """
     names = [n for n in wrapper.names if n in targets]
-    if not names:
+    if not names and not wrapper.siblings:
         return source, []
+    profile = _PROFILES[language]
+    data = source.encode("utf-8")
+    if not names:
+        # Only the wrapper's own unit tests, which go whole.
+        root = profile.parse(source, language)
+        return _apply(
+            source, language, profile, root, data, [], [], treatment, wrapper=wrapper, siblings=wrapper.siblings
+        )
     words = _alternation(names)
     word = re.compile(rf"(?<![\w$])(?:{words})(?![\w$])")
-    if not word.search(source):
+    if not word.search(source) and not wrapper.siblings:
         return source, []
     call = re.compile(rf"(?<![\w$])(?:{words})\s*\(")
 
@@ -1397,8 +1581,6 @@ def _resolve_ts_wrappers(
         mentions = len(word.findall(text))
         return mentions > 0 and (bool(_TS_DOUBLE.search(text)) or mentions > len(call.findall(text)))
 
-    profile = _PROFILES[language]
-    data = source.encode("utf-8")
     root = profile.parse(source, language)
     statements = _statements(root, data, replace(_TS, blocks=_TS_WRAPPER_BLOCKS), describes)
     patterns = [
@@ -1412,8 +1594,10 @@ def _resolve_ts_wrappers(
         )
     ]
     modules = {name: targets[name].modules for name in names if targets[name].modules}
+    getters = {name: targets[name].getters for name in names if targets[name].getters}
     factories: list[tuple[int, int, Removal]] = []
     claimed: list[Node] = []
+    references: dict[str, set[str]] = {}
     for statement in statements:
         if statement.parent is None or statement.parent.type != "program":
             continue
@@ -1421,12 +1605,66 @@ def _resolve_ts_wrappers(
         if decided is not None:
             claimed.append(statement)
             factories += decided
+            continue
+        taken = _ts_getter_mock(statement, data, getters) if getters else None
+        if taken is not None:
+            claimed.append(statement)
+            factories += taken[0]
+            for name, found in taken[1].items():
+                references.setdefault(name, set()).update(found)
+    # The references a getter's mock handed on, stubbed by name. Their
+    # declaration is cut too, or the statement stays a line of the double.
+    spelled_refs = ""
+    if references:
+        spelled_refs = "|".join(
+            _spelled(r) for r in sorted({r for found in references.values() for r in found}, key=len, reverse=True)
+        )
+        by_ref = re.compile(rf"(?<![\w$.])(?:{spelled_refs})(?![\w$])")
+        # A reference need not carry the member's name (`mockIsTools`): every
+        # statement spelling one is a line of the double as well.
+        statements = _statements(
+            root, data, replace(_TS, blocks=_TS_WRAPPER_BLOCKS), lambda text: describes(text) or bool(by_ref.search(text))
+        )
+        for statement in root.named_children:
+            if any(statement.id == c.id for c in claimed):
+                continue
+            cut = _ts_hoisted(statement, data, references)
+            if cut is not None:
+                claimed.append(statement)
+                factories += cut
+        statements = [
+            s for s in statements
+            if not any(c.start_byte <= s.start_byte and s.end_byte <= c.end_byte for c in claimed)
+        ]
+        patterns += [
+            (kind, re.compile(pattern))
+            for name, found in references.items()
+            if name in targets
+            for kind, pattern in _ts_ref_patterns(
+                "|".join(_spelled(r) for r in sorted(found, key=len, reverse=True)), targets[name].resolved
+            )
+        ]
     # A factory's own lines (a `return {...}` in its body) are the factory's.
     statements = [
         s for s in statements
         if not any(c.start_byte <= s.start_byte and s.end_byte <= c.end_byte for c in claimed)
     ]
-    return _apply(source, language, profile, root, data, statements, patterns, treatment, factories)
+    resolved, removed = _apply(
+        source, language, profile, root, data, statements, patterns, treatment, factories,
+        wrapper=wrapper, siblings=wrapper.siblings,
+    )
+    if spelled_refs and removed:
+        # The entry is cut, so nothing may still use the reference it handed
+        # the wrapper: bar its bare `const r = vi.fn()`, every spelling that
+        # is left is a stub or check this pass could not decide. Edit nothing.
+        left = re.sub(
+            rf"(?m)^[ \t]*(?:const|let|var)\s+(?:{spelled_refs})\s*(?::[^=\n]+)?=\s*(?:vi|jest)\s*\.\s*fn\(\s*\)\s*;?",
+            "",
+            resolved,
+        )
+        if re.search(rf"(?<![\w$.])(?:{spelled_refs})(?![\w$])", left):
+            return source, []
+    return resolved, removed
 
 
 def _go_patterns(read: str, key: str) -> list[tuple[str, str]]:
@@ -2183,7 +2421,7 @@ def _apply(
             and csharp_receiver_read(names, wrapper.kept, reads_only=False).search(text)
         ):
             continue
-        sibling_tests.append((node, test_name, SIBLING_TEST))
+        sibling_tests.append((node, test_name, OWN_TEST if language in _TS_LANGUAGES else SIBLING_TEST))
     # A statement naming a wrapper that stays describes a read that still
     # happens, so its whole unit -- stub, verification, test -- is left as is.
     kept_word = (

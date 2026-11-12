@@ -112,11 +112,13 @@ from flag_cleanup import (
     go_initializers,
     go_arity,
     go_handle_reads,
+    go_read_effects,
     go_two_value,
     go_inline,
     go_stranded,
     jvm_constant_fields,
     jvm_emptied_tests,
+    ts_emptied_tests,
     jvm_test_titles,
     jvm_class_eligibility,
     jvm_unread_members,
@@ -146,9 +148,11 @@ from flag_cleanup import (
     ts_dead_code,
     ts_default_arguments,
     ts_exported_props,
+    ts_hook_deps,
     ts_list_join,
     ts_unread_props,
     ts_fold,
+    ts_saga_yield,
     ts_gates,
     ts_object_reads,
     ts_key_survivors,
@@ -1629,6 +1633,11 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "stranded_type_switch_alias": "alias",
     "stranded_if_init": "init",
     "stranded_switch_init": "init",
+    "delete_stranded_assignment_func_literal_body": "stmt",
+    "delete_stranded_assignment_before_sibling": "stmt",
+    "delete_stranded_assignment_after_sibling": "stmt",
+    "delete_stranded_assignment": "stmt",
+    "blank_stranded_assignment": "stmt",
     "delete_stranded_ruby_local": "a",
     "discard_stranded_ruby_local": "a",
     "delete_stranded_dart_local": "decl",
@@ -2102,7 +2111,7 @@ def _transform_flag(
     # flag is refused, before anything is written.
     refused_reads = ts_async_reads.refusal(first_sites)
     async_names = ts_async_reads.managed_accessors(first_sites)
-    accessors = tuple(a for a in accessors if a not in async_names)
+    accessors = tuple(a for a in accessors if rule_synthesis.plain_name(a) not in async_names)
 
     # Resolve the test doubles that stub or verify this read, on the customer's
     # bytes and BEFORE everything below reads them: Mockito, MockK, Dart
@@ -2315,17 +2324,17 @@ def _transform_flag(
     # constant may hold something else by then.
     kept_declarations = [
         p for p in without_const
-        if language in _FOLDS_KEPT_CONSTANTS
-        and (
-            _const_safe_at(p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
-            # A mention in a branch the fold keeps (Go): the declaration stays
-            # with it, and the reads beside it are reads like any other.
-            or (
-                language == "go"
-                and _const_safe_at(
-                    p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors,
-                    treatment, kept_branches=True,
-                )
+        if (
+            language in _FOLDS_KEPT_CONSTANTS
+            and _const_safe_at(p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors)
+        )
+        # A mention in a branch the fold keeps (Go, TypeScript, JavaScript): the
+        # declaration stays with it, and the reads beside it are reads like any other.
+        or (
+            language in ("go", "ts", "tsx", "js")
+            and _const_safe_at(
+                p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors,
+                treatment, kept_branches=True,
             )
         )
     ]
@@ -2363,6 +2372,18 @@ def _transform_flag(
         two_value = go_two_value.Prepass(language, flag_key, treatment, accessors, key_texts=key_texts, repo_dir=repo_dir)
         doubles.append(two_value)
         two_value.apply(sorted(key_texts))
+
+    # A read's receiver and arguments that do work, kept as `_ = <expr>` on the
+    # lines before its statement, since the fold drops them (see
+    # :mod:`flag_cleanup.go_read_effects`). Last of the pre-passes, so it sees
+    # the reads the engine will, the two-value pass's included.
+    if doubles is not None and language == "go":
+        effects = go_read_effects.Prepass(
+            language, flag_key, treatment, accessors, key_texts=key_texts or {}, repo_dir=repo_dir,
+            names=go_handle_reads.declared_names(paths, flag_key),
+        )
+        doubles.append(effects)
+        effects.apply(sorted({*paths, *(key_texts or {})}))
 
     # Each TypeScript-family file's line width, for the engine's joins (see
     # :func:`_print_width_facts`), off the customer's bytes: nothing below has
@@ -2419,7 +2440,9 @@ def _transform_flag(
     # Kept apart from `wrappers.spans`, which feeds the wrapper counts and
     # reports: these marks are not wrappers, and exist only to be consumed.
     read_marks: dict[str, list] = {}
-    if language in ("ts", "tsx", "js") and (async_names or reader_paths):
+    if language in ("ts", "tsx", "js") and (
+        async_names or reader_paths or any(isinstance(v, str) for v in (key_positions or {}).values())
+    ):
         read_sites = ts_async_reads.plan(
             repo_dir, [*paths, *sibling_readers, *reader_paths], flag_key, planned_accessors, language
         )
@@ -2957,6 +2980,9 @@ def _transform_flag(
     # which owns the imports this strands.
     summaries, emptied_tests = jvm_emptied_tests.remove(summaries, language, repo_dir, Rewrite)
     test_doubles = test_doubles + emptied_tests
+    # A `describe` whose last test went, and a test file with no test left.
+    summaries, emptied_suites = ts_emptied_tests.remove(summaries, language, repo_dir, Rewrite)
+    test_doubles = test_doubles + emptied_suites
     # A wait for the flags to load in a function this run took the last flag
     # read out of: the guard goes, and a gate component it leaves rendering
     # only its children goes with its files, unwrapped wherever it is used.
@@ -3076,6 +3102,7 @@ def _transform_flag(
     # they read the bytes that stay on disk.
     # What the checkout's mocks allow, per callee, for both passes below.
     mocks: dict = {}
+    summaries = _drop_literal_hook_dependencies(summaries, language, repo_dir)
     summaries, emptied_rows, dropped_options = _drop_default_arguments(
         summaries, language, flag_key, repo_dir, mocks
     )
@@ -3319,6 +3346,13 @@ def _transform_flag(
             reason = go_two_value.survivors(
                 [p for p in doubles or () if isinstance(p, go_two_value.Prepass)], s.path, s.content
             )
+        # A read whose receiver or arguments do work, folded without that
+        # work kept, or kept and then not folded.
+        if reason is None and _grammar_of(s.path, language) == "go":
+            reason = go_read_effects.refusal_reason(
+                doubles or (), s.path, _gate_baseline(doubles, s.path, s.original_content),
+                s.content, flag_key, accessors,
+            )
         # Gate 2 let a reference in a block the fold deletes go with the
         # block, which only predicted the fold. If the declaration went and
         # such a name is still referenced, the build fails on it.
@@ -3343,6 +3377,13 @@ def _transform_flag(
             and substitutions["marker"] in s.content
         ):
             reason = "the engine left an internal marker in place of a flag read"
+        if reason is None and language in ("ts", "tsx", "js") and ts_saga_yield.delegates_to_literal(
+            s.original_content, s.content, _grammar_of(s.path, language)
+        ):
+            reason = (
+                "a delegating `yield*` read would become `yield* <boolean>`, which throws "
+                "because a boolean is not iterable"
+            )
         if reason is not None:
             reasons[s.path] = reason
     # A proven cross-file reader must come out naming none of the constants it
@@ -4555,6 +4596,29 @@ def _flag_state_comments(
             )
             rows.append((relative, kind, f"{found.line}: {found.text}"))
     return tuple(rows)
+
+
+def _drop_literal_hook_dependencies(summaries, language: str, repo_dir: str) -> list:
+    """Take a literal the fold wrote out of a React hook's dependency array;
+    TypeScript family only. See :mod:`~flag_cleanup.ts_hook_deps`."""
+    if not ts_tests.covers(language):
+        return summaries
+    result = []
+    for summary in summaries:
+        if summary.original_content == summary.content or file_deletion.deleted(summary):
+            result.append(summary)
+            continue
+        text = ts_hook_deps.drop_literal_dependencies(
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
+        )
+        if text == summary.content:
+            result.append(summary)
+            continue
+        git_ops.before_writing([summary.path])
+        with open(summary.path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result.append(Rewrite(summary.path, summary.original_content, text))
+    return result
 
 
 def _drop_default_arguments(
@@ -6192,6 +6256,9 @@ def _inline_ts_bindings(
     strands them. Last of all, a test helper's parameter every call now
     passes ``{}`` to (:func:`flag_cleanup.ts_constant_params.drop_empty_object_params`),
     which leaves ``flags={{}}`` for the passes after the engine."""
+    inlined = ts_saga_yield.unwrap_yielded_literals(before, after, language, marker, path, repo_dir)
+    if inlined != after:
+        return inlined
     inlined = ts_fold.inline_literal_bindings(before, after, language, marker)
     if inlined != after:
         return inlined

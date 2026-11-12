@@ -58,6 +58,8 @@ awaited read through a key constant is not folded for a managed accessor.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable
@@ -66,7 +68,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import kotlin_sentinel, ts_syntax
+from flag_cleanup import kotlin_sentinel, rule_synthesis, ts_syntax
 
 _EXTENSIONS = {".ts": "ts", ".tsx": "tsx", ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js", ".mts": "ts", ".cts": "ts"}
 
@@ -187,6 +189,29 @@ def _member_kind(node: Node) -> str | None:
             return "other" if kind == "none" else kind
         return "other"
     return None
+
+
+def _may_return_promise(node: Node) -> bool:
+    """Whether one declared member's annotation allows a Promise: ``async``, or a
+    return type that is not a primitive keyword/literal type or a union of them
+    (``boolean | Promise<boolean>``, ``MaybePromise<boolean>``, an alias that
+    cannot be expanded here). No annotation says nothing."""
+    if node.type in _CALLABLE_KINDS:
+        if _has_async_token(node):
+            return True
+        annotation = node.child_by_field_name("return_type")
+    elif node.type in _VALUE_KINDS:
+        value = node.child_by_field_name("value")
+        if value is not None and value.type in _FUNCTION_VALUES:
+            if _has_async_token(value):
+                return True
+            annotation = value.child_by_field_name("return_type")
+        else:
+            ftype = _function_type(node.child_by_field_name("type"))
+            annotation = ftype.child_by_field_name("return_type") if ftype is not None else None
+    else:
+        return False
+    return annotation is not None and not _primitive_return(annotation)
 
 
 _LOGICAL = frozenset({"&&", "||", "??"})
@@ -953,6 +978,10 @@ class Site:
     keyed: bool = True
     #: Why a LEAVE decision was made.
     why: str = ""
+    #: The key is a property of an object argument (``getFlag{key}``). The
+    #: awaited reads have rules of their own, so these sites are un-awaited ones
+    #: and a LITERAL decision is marked too: no bare-call rule exists to fold it.
+    prop: bool = False
 
 
 class _Repo:
@@ -969,7 +998,14 @@ class _Repo:
         #: The same, of bindings only: all a bare ``name(...)`` read can call.
         self.binding_async: dict[str, tuple[str, int]] = {}
         self.trees: dict[str, Node] = {}
+        #: Per accessor name, what each declaration in the repository says it returns.
+        self.declared_kinds: dict[str, set[str]] = defaultdict(set)
+        #: The same, of plain functions and function-valued bindings only (a bare call reaches no method).
+        self.declared_function_kinds: dict[str, set[str]] = defaultdict(set)
+        #: The same, per file: (resolved path, name) -> kinds.
+        self.function_kinds_in: dict[tuple[str, str], set[str]] = defaultdict(set)
         root = Path(repo_dir)
+        self.root = root
         files = [root] if root.is_file() else source_files(root, _EXTENSIONS, _SKIP_DIRS)
         sources = []
         for path in files:
@@ -1004,6 +1040,11 @@ class _Repo:
                             verdict = None  # a fake in test support code that only reads
                         if verdict:
                             note(name, node, node.type in _BINDING_KINDS)
+                        kind = "async" if verdict else (_member_kind(node) or "other")
+                        self.declared_kinds[name].add(kind)
+                        if node.type in _BINDING_KINDS:
+                            self.declared_function_kinds[name].add(kind)
+                            self.function_kinds_in[(str(Path(path).resolve()), name)].add(kind)
                 if node.type in _ASSIGNMENTS or node.type == "call_expression":
                     # A write is a declaration too (`o.enabled = async …`,
                     # `exports.enabled = …`, `enabled = asyncFn`), judged on
@@ -1172,6 +1213,20 @@ class _Repo:
         if not kinds:
             return None
         return kinds.pop() if len(kinds) == 1 else "other"
+
+    def receiver_may_return_promise(self, path: str, call: Node, callee: Node, accessor: str) -> bool:
+        """Whether any member ``accessor`` of the receiver's declared type, overloads
+        and unions included, may return a Promise (see :func:`_may_return_promise`)."""
+        if callee.type != "member_expression":
+            return False
+        receiver = callee.child_by_field_name("object")
+        if receiver is None or receiver.type != "identifier":
+            return False
+        type_name = _parameter_type(call, _text(receiver))
+        declarations = self.resolve_type(path, type_name) if type_name is not None else []
+        return any(
+            _may_return_promise(member) for decl in declarations for member in self._members(decl, accessor)
+        )
 
     def receiver_kind(self, path: str, call: Node, callee: Node, accessor: str) -> str | None:
         """``promise`` / ``sync`` / ``other``, or None when the receiver is not soundly resolved.
@@ -1458,6 +1513,32 @@ def _first_argument(call: Node) -> tuple[str | None, bool]:
     return None, first.type in {"identifier", "member_expression", "template_string", "subscript_expression"}
 
 
+def _property_argument(call: Node, prop: str) -> tuple[str | None, bool]:
+    """:func:`_first_argument` for an accessor whose key is the ``prop`` property of its object argument.
+
+    A read whose object the property-key rules decline (a spread, a computed
+    name, code that could run) is none of this pass's: it is not a read it can
+    fold, so it is left as it always was.
+    """
+    if ts_syntax.declined_by_object_key_rules(call, prop, awaited=False):
+        return None, False
+    args = call.child_by_field_name("arguments")
+    obj = args.named_children[0] if args is not None and args.named_children else None
+    if obj is None or obj.type != "object":
+        return None, False
+    for pair in obj.named_children:
+        key = pair.child_by_field_name("key") if pair.type == "pair" else None
+        value = pair.child_by_field_name("value") if pair.type == "pair" else None
+        if key is None or value is None or _text(key) != prop:
+            continue
+        if value.type == "string":
+            if value.child_count == 3 and value.children[1].type == "string_fragment":
+                return _text(value.children[1]), False
+            return None, False
+        return None, value.type in {"identifier", "member_expression", "template_string", "subscript_expression"}
+    return None, False
+
+
 def _is_optional(call: Node, callee: Node) -> bool:
     if any(c.type == "optional_chain" for c in callee.children):
         return True
@@ -1470,10 +1551,647 @@ _OBJECT_ADVICE = (
 )
 
 
+_HOOK_NAME = re.compile(r"\Ause[A-Z]")
+
+
+def _sync_evidence(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> bool:
+    """Positive evidence that a property-keyed read returns a boolean: a
+    React-hook-shaped callee (``useFlag``), a receiver whose declared type gives
+    it an explicit ``boolean`` return, or a read returned from a function
+    annotated ``boolean``."""
+    name = callee.child_by_field_name("property") if callee.type == "member_expression" else callee
+    if name is not None and _HOOK_NAME.match(_text(name)):
+        return True
+    if repo.receiver_kind(path, call, callee, accessor) == "sync":
+        return True
+    top, _cast = _unwrap(call)
+    function, _composite = _returned(top)
+    return function is not None and return_kind(function.child_by_field_name("return_type")) == "sync"
+
+
+def _function_name(function: Node) -> Node | None:
+    """The name node of ``function`` as a caller would spell it, else ``None``."""
+    own = function.child_by_field_name("name")
+    if own is not None and function.type in {"function_declaration", "generator_function_declaration", "method_definition"}:
+        return own
+    holder = function.parent
+    if holder is not None and holder.type == "variable_declarator" and holder.child_by_field_name("value") == function:
+        name = holder.child_by_field_name("name")
+        return name if name is not None and name.type == "identifier" else None
+    if holder is not None and holder.type == "pair" and holder.child_by_field_name("value") == function:
+        key = holder.child_by_field_name("key")
+        return key if key is not None and key.type == "property_identifier" else None
+    return None
+
+
+def _returned_function(top: Node) -> Node | None:
+    """The function whose result the read is: returned directly, or bound to a
+    local that the function returns (``const on = read; return on;``)."""
+    function, _composite = _returned(top)
+    if function is not None:
+        return function
+    parent = top.parent
+    if parent is None or parent.type != "variable_declarator" or parent.child_by_field_name("value") != top:
+        return None
+    target = parent.child_by_field_name("name")
+    if target is None or target.type != "identifier":
+        return None
+    function = _enclosing_function(parent)
+    if function is None:
+        return None
+    for node in ts_syntax._walk(function):
+        if node.type == "identifier" and _text(node) == _text(target) and node != target:
+            returned, _c = _returned(node)
+            if returned == function:
+                return function
+    return None
+
+
+_RESOLVE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+
+
+def _names_module(importer: str, specifier: str, target: str) -> bool:
+    """Whether the relative ``specifier`` of a file at ``importer`` names the module at ``target``."""
+    if not specifier.startswith("."):
+        return False
+    base = (Path(importer).parent / specifier).resolve()
+    goal = Path(target).resolve()
+    stems = [base]
+    if base.suffix in {".js", ".mjs", ".cjs", ".jsx"}:
+        stems += [base.with_suffix(suffix) for suffix in _RESOLVE_SUFFIXES]
+    options = [*stems, *(Path(f"{base}{suffix}") for suffix in _RESOLVE_SUFFIXES)]
+    options += [base / f"index{suffix}" for suffix in _RESOLVE_SUFFIXES]
+    return goal in options
+
+
+def _module_candidates(importer: str, specifier: str) -> list[Path]:
+    base = (Path(importer).parent / specifier).resolve()
+    stems = [base]
+    if base.suffix in {".js", ".mjs", ".cjs", ".jsx"}:
+        stems += [base.with_suffix(suffix) for suffix in _RESOLVE_SUFFIXES]
+    options = [*stems, *(Path(f"{base}{suffix}") for suffix in _RESOLVE_SUFFIXES)]
+    options += [base / f"index{suffix}" for suffix in _RESOLVE_SUFFIXES]
+    return options
+
+
+def _resolves_in_repo(repo: _Repo, importer: str, specifier: str) -> bool:
+    """Whether the relative ``specifier`` names a TS/JS source this pass has parsed."""
+    return any(str(c) in repo.trees for c in _module_candidates(importer, specifier))
+
+
+def _workspace(repo: _Repo) -> tuple[dict[str, Path], tuple[str, ...]]:
+    """``(workspace package name -> its directory, path-alias prefixes)``, read once."""
+    cached = getattr(repo, "_workspace_facts", None)
+    if cached is not None:
+        return cached
+    packages: dict[str, Path] = {}
+    prefixes: list[str] = ["@/", "~/", "#"]
+    root = getattr(repo, "root", None)
+    if root is not None and Path(root).is_dir():
+        from flag_cleanup.piranha_runner import _SKIP_DIRS
+
+        for current, directories, files in os.walk(root):
+            directories[:] = [d for d in directories if d not in _SKIP_DIRS]
+            for file in files:
+                if file == "package.json":
+                    try:
+                        name = json.loads((Path(current) / file).read_text(encoding="utf-8")).get("name")
+                    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+                        continue
+                    if isinstance(name, str):
+                        packages[name] = Path(current).resolve()
+                elif file in {"tsconfig.json", "jsconfig.json"} or (file.startswith("tsconfig.") and file.endswith(".json")):
+                    try:
+                        text = (Path(current) / file).read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    prefixes += [m.rstrip("*") for m in re.findall(r'"([^"]+)"\s*:\s*\[', text) if "*" in m or m.startswith(("@", "~", "#", "$"))]
+    facts = (packages, tuple(p for p in prefixes if p))
+    repo._workspace_facts = facts  # type: ignore[attr-defined]
+    return facts
+
+
+def _may_name_module(
+    repo: _Repo, importer: str, specifier: str, target: str, depth: int = 0, seen: frozenset[str] = frozenset()
+) -> bool:
+    """Whether ``specifier`` (in ``importer``) may be the module at ``target``:
+    it resolves to it, or to a barrel that re-exports it (``export * from``,
+    ``export { … } from``, ``export * as``, followed to ``_BARREL_DEPTH`` hops,
+    cycle-safe, an unresolvable hop counting as naming it), or it is a relative
+    specifier that resolves to nothing parsed, or a bare specifier naming a
+    workspace package that holds the target or a configured path alias (neither
+    can be resolved here)."""
+    if not specifier:
+        return False
+    if _names_module(importer, specifier, target):
+        return True
+    if specifier.startswith("."):
+        resolved = next((str(c) for c in _module_candidates(importer, specifier) if str(c) in repo.trees), None)
+        if resolved is None:
+            return True
+        tree = repo.trees.get(resolved)
+        if tree is None or depth >= _BARREL_DEPTH or resolved in seen:
+            return tree is None or depth >= _BARREL_DEPTH
+        for node in tree.children:
+            if node.type == "export_statement" and node.child_by_field_name("source") is not None:
+                hop = _string_value(node.child_by_field_name("source"))
+                if hop and _may_name_module(repo, resolved, hop, target, depth + 1, seen | {resolved}):
+                    return True
+        return False
+    packages, prefixes = _workspace(repo)
+    if any(specifier.startswith(prefix) for prefix in prefixes):
+        return True
+    parts = specifier.split("/")
+    name = "/".join(parts[:2]) if specifier.startswith("@") else parts[0]
+    directory = packages.get(name)
+    return directory is not None and directory in Path(target).resolve().parents
+
+
+def _string_value(node: Node | None) -> str | None:
+    if node is None or node.type != "string" or node.child_count != 3:
+        return None
+    return _text(node.children[1])
+
+
+def _default_names(repo: _Repo, path: str, name: str) -> set[str]:
+    """The local names other files give ``name`` when they import it as the
+    module's default (``export default isRbac``, ``module.exports = isRbac``)."""
+    tree = repo.trees.get(str(Path(path).resolve())) or repo.trees.get(path)
+    if tree is None:
+        return set()
+    default = False
+    commonjs = False
+    for node in ts_syntax._walk(tree):
+        if node.type == "export_statement" and any(c.type == "default" for c in node.children):
+            declared = node.child_by_field_name("declaration") or node.child_by_field_name("value")
+            if declared is not None and (
+                (declared.type == "identifier" and _text(declared) == name)
+                or (declared.type in {"function_declaration", "generator_function_declaration"}
+                    and declared.child_by_field_name("name") is not None
+                    and _text(declared.child_by_field_name("name")) == name)
+            ):
+                default = True
+        elif node.type == "assignment_expression":
+            left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+            if left is not None and _text(left) == "module.exports" and right is not None and right.type == "identifier" and _text(right) == name:
+                commonjs = True
+    if not default and not commonjs:
+        return set()
+    found: set[str] = set()
+    for other_path, other in repo.trees.items():
+        if other is None:
+            continue
+        for node in ts_syntax._walk(other):
+            if default and node.type == "import_clause":
+                local = next((c for c in node.children if c.type == "identifier"), None)
+                source = node.parent.child_by_field_name("source") if node.parent is not None else None
+                if local is not None and _names_module(other_path, _string_value(source) or "", path):
+                    found.add(_text(local))
+            elif node.type == "variable_declarator":
+                target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
+                if target is None or target.type != "identifier" or value is None or value.type != "call_expression":
+                    continue
+                callee, args = value.child_by_field_name("function"), value.child_by_field_name("arguments")
+                if callee is not None and _text(callee) == "require" and args is not None and args.named_children:
+                    if _names_module(other_path, _string_value(args.named_children[0]) or "", path):
+                        found.add(_text(target))
+    return found
+
+
+def _alias_names(repo: _Repo, path: str, name: str) -> tuple[set[str], str | None]:
+    """Every name the function is reached under: itself, a renamed import or
+    re-export, a destructured rename, a plain alias, and a default import."""
+    names = {name}
+    frontier = [name]
+    reason: str | None = None
+    while frontier:
+        current = frontier.pop()
+        for other_path, tree in repo.trees.items():
+            if tree is None:
+                continue
+            for node in ts_syntax._walk(tree):
+                added = None
+                if node.type in {"import_specifier", "export_specifier"}:
+                    imported, alias = node.child_by_field_name("name"), node.child_by_field_name("alias")
+                    if imported is not None and alias is not None and _text(imported) == current:
+                        added = _text(alias)
+                        if _text(alias) == "default":
+                            reason = reason or "it is reached through a default export, whose importers can't all be found"
+                        source = _module_source(node)
+                        if source is not None and not _resolves_in_repo(repo, other_path, source):
+                            reason = reason or (
+                                f"it is re-exported or imported under another name through {source!r}, which can't be resolved"
+                            )
+                elif node.type == "pair_pattern":
+                    key, value = node.child_by_field_name("key"), node.child_by_field_name("value")
+                    if key is not None and value is not None and _text(key) == current and value.type == "identifier":
+                        added = _text(value)
+                elif node.type == "variable_declarator":
+                    target, value = node.child_by_field_name("name"), node.child_by_field_name("value")
+                    if target is not None and target.type == "identifier" and value is not None:
+                        if value.type == "identifier" and _text(value) == current:
+                            added = _text(target)
+                        elif value.type == "member_expression":
+                            prop = value.child_by_field_name("property")
+                            if prop is not None and _text(prop) == current:
+                                added = _text(target)
+                if added is not None and added not in names:
+                    names.add(added)
+                    frontier.append(added)
+    return names, reason
+
+
+#: Parents under which a mention of a name is a declaration or a binding, not a use.
+_NAME_POSITIONS = frozenset(
+    {
+        "function_declaration", "generator_function_declaration", "method_definition", "method_signature",
+        "property_signature", "abstract_method_signature", "function_signature", "public_field_definition",
+        "import_specifier", "export_specifier", "import_clause", "namespace_import", "pair_pattern",
+        "required_parameter", "optional_parameter", "type_query",
+    }
+)
+_FOREIGN_SUFFIXES = (".vue", ".svelte", ".astro", ".mdx")
+_MAX_DEPTH = 4
+_BARREL_DEPTH = 5
+_COMPARISON = frozenset({"===", "!==", "==", "!="})
+
+
+def _boolean_only(top: Node) -> bool:
+    """Whether the call's value is only tested or discarded: a statement, a
+    condition (see :func:`_boolean_consumed`), a comparison with ``true`` or
+    ``false``, or the left operand of ``&&`` in a JSX expression."""
+    parent = top.parent
+    if parent is None:
+        return False
+    if parent.type == "expression_statement":
+        return True
+    if _boolean_consumed(top):
+        return True
+    if parent.type == "binary_expression":
+        operator = parent.child_by_field_name("operator")
+        op = _text(operator) if operator is not None else ""
+        other = parent.child_by_field_name("right") if parent.child_by_field_name("left") == top else parent.child_by_field_name("left")
+        if op in _COMPARISON and other is not None and other.type in {"true", "false"}:
+            return True
+        if op == "&&" and parent.child_by_field_name("left") == top and parent.parent is not None and parent.parent.type == "jsx_expression":
+            return True
+    return False
+
+
+def _bound_boolean_only(top: Node) -> bool:
+    """``const on = call()`` where every other use of ``on`` in the scope is boolean-only."""
+    parent = top.parent
+    if parent is None or parent.type != "variable_declarator" or parent.child_by_field_name("value") != top:
+        return False
+    target = parent.child_by_field_name("name")
+    scope = parent.parent.parent if parent.parent is not None else None
+    if target is None or target.type != "identifier" or scope is None:
+        return False
+    for node in ts_syntax._walk(scope):
+        if node.type == "identifier" and _text(node) == _text(target) and node != target and not _boolean_only(node):
+            return False
+    return True
+
+
+def _name_mentions(repo: _Repo, names: set[str]) -> str | None:
+    """A reason when a name is mentioned in a file this pass cannot read."""
+    for path, tree in repo.trees.items():
+        if tree is None:
+            return f"{Path(path).name} could not be parsed, so its uses of the function cannot be checked"
+        if tree.has_error and any(name in tree.text.decode("utf-8", "replace") for name in names):
+            return f"{Path(path).name} does not parse cleanly and names the function"
+    root = getattr(repo, "root", None)
+    if root is not None and Path(root).is_dir():
+        from flag_cleanup.piranha_runner import _SKIP_DIRS
+
+        for current, directories, files in os.walk(root):
+            directories[:] = [d for d in directories if d not in _SKIP_DIRS]
+            for file in files:
+                if file.endswith(_FOREIGN_SUFFIXES):
+                    try:
+                        text = (Path(current) / file).read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        return f"{file} could not be read, so its uses of the function cannot be checked"
+                    if any(re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text) for name in names):
+                        return f"{file} (a template this pass cannot read) names the function"
+    return None
+
+
+def _module_source(node: Node) -> str | None:
+    """The module specifier of the import or export statement ``node`` sits in."""
+    current: Node | None = node
+    while current is not None and current.type not in {"import_statement", "export_statement"}:
+        current = current.parent
+    if current is None:
+        return None
+    return _string_value(current.child_by_field_name("source"))
+
+
+def _whole_module_uses(tree: Node, binding: Node, local: str) -> str | None:
+    """A reason when ``local`` (a name bound to a whole module) is used other than
+    as ``local.member``."""
+    for node in ts_syntax._walk(tree):
+        if node.type != "identifier" or _text(node) != local or node == binding:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type in {"import_clause", "namespace_import", "import_require_clause", "namespace_export"}:
+            continue
+        if parent is not None and parent.type == "member_expression" and parent.child_by_field_name("object") == node:
+            continue
+        return f"line {node.start_point[0] + 1}"
+    return None
+
+
+def _unseen_importers(repo: _Repo, path: str, names: set[str]) -> str | None:
+    """A reason when a use of the function could be out of sight: it is a default
+    export in any form, or a file takes the declaring module as a whole (a
+    namespace, ``require``, ``import()``, ``export * as``) and does anything but
+    call a member of it. A specifier that cannot be resolved and may name the
+    module counts as naming it."""
+    for other_path, tree in repo.trees.items():
+        if tree is None:
+            continue
+        shown = Path(other_path).name
+        for node in ts_syntax._walk(tree):
+            kind = node.type
+            if kind == "export_statement" and any(c.type == "default" for c in node.children):
+                declared = node.child_by_field_name("declaration") or node.child_by_field_name("value")
+                named = declared.child_by_field_name("name") if declared is not None else None
+                if declared is not None and (
+                    (declared.type == "identifier" and _text(declared) in names)
+                    or (named is not None and _text(named) in names)
+                ):
+                    return f"it is reached through a default export ({shown}:{node.start_point[0] + 1}), whose importers can't all be found"
+            elif kind == "assignment_expression":
+                left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+                if left is not None and _text(left) == "module.exports" and right is not None and right.type == "identifier" and _text(right) in names:
+                    return f"it is reached through a default export ({shown}:{node.start_point[0] + 1}), whose importers can't all be found"
+            elif kind == "export_specifier":
+                alias = node.child_by_field_name("alias")
+                imported = node.child_by_field_name("name")
+                if alias is not None and imported is not None and _text(alias) == "default" and _text(imported) in names:
+                    return f"it is reached through a default export ({shown}:{node.start_point[0] + 1}), whose importers can't all be found"
+            # a whole-module take
+            binding: Node | None = None
+            specifier: str | None = None
+            if kind == "namespace_import":
+                binding = next((c for c in node.children if c.type == "identifier"), None)
+                specifier = _module_source(node)
+            elif kind == "import_require_clause":
+                binding = next((c for c in node.children if c.type == "identifier"), None)
+                specifier = _string_value(next((c for c in node.children if c.type == "string"), None))
+            elif kind == "namespace_export":
+                specifier = _module_source(node)
+                if _may_name_module(repo, other_path, specifier or "", path):
+                    return f"the module is re-exported as a namespace at {shown}:{node.start_point[0] + 1}"
+                continue
+            elif kind == "call_expression":
+                callee = node.child_by_field_name("function")
+                args = node.child_by_field_name("arguments")
+                if callee is None or args is None or not args.named_children:
+                    continue
+                if callee.type == "import" or (callee.type == "identifier" and _text(callee) == "require"):
+                    specifier = _string_value(args.named_children[0])
+                    if specifier is None and callee.type == "import":
+                        return f"a dynamic import with a computed specifier at {shown}:{node.start_point[0] + 1}"
+                    # A computed `require(...)` may be the declaring module.
+                    if specifier is not None and not _may_name_module(repo, other_path, specifier, path):
+                        continue
+                    holder = node.parent
+                    if callee.type == "import" or holder is not None and holder.type == "await_expression" and callee.type == "import":
+                        return f"the module is imported dynamically at {shown}:{node.start_point[0] + 1}"
+                    if holder is not None and holder.type == "variable_declarator" and holder.child_by_field_name("value") == node:
+                        target = holder.child_by_field_name("name")
+                        if target is not None and target.type == "identifier":
+                            binding = target
+                        elif target is not None and any(c.type == "rest_pattern" for c in target.children):
+                            return f"the module is destructured with a rest element at {shown}:{node.start_point[0] + 1}"
+                        else:
+                            continue
+                    elif holder is not None and holder.type == "member_expression" and holder.child_by_field_name("object") == node:
+                        continue
+                    else:
+                        return f"the module is required without a name at {shown}:{node.start_point[0] + 1}"
+                    specifier = None
+                else:
+                    continue
+            if binding is None:
+                continue
+            if specifier is not None and not _may_name_module(repo, other_path, specifier, path):
+                continue
+            bad = _whole_module_uses(tree, binding, _text(binding))
+            if bad is not None:
+                return f"the module is bound to {_text(binding)!r} in {shown} and used other than as a member call ({shown}, {bad})"
+    return None
+
+
+def _imported_as(tree: Node, local: str) -> tuple[str, str] | None:
+    """``(module specifier, imported name)`` when ``local`` is bound by a named import."""
+    for node in ts_syntax._walk(tree):
+        if node.type != "import_specifier":
+            continue
+        imported, alias = node.child_by_field_name("name"), node.child_by_field_name("alias")
+        bound = alias or imported
+        if bound is not None and imported is not None and _text(bound) == local:
+            source = _module_source(node)
+            return (source, _text(imported)) if source is not None else None
+    return None
+
+
+def _declared_boolean(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> bool:
+    """Whether THIS call reaches a declaration annotated ``boolean``. A method call
+    needs its receiver to resolve to one (``receiver_kind == "sync"``). A bare call
+    needs the callee identifier to resolve to one: a function of that name declared
+    in the same file, or a named import through a relative specifier that resolves
+    to a file declaring it. A package import, or a name declared elsewhere in the
+    repository and not imported, never qualifies."""
+    if callee.type == "member_expression":
+        return repo.receiver_kind(path, call, callee, accessor) == "sync"
+    if callee.type != "identifier":
+        return False
+    here = str(Path(path).resolve())
+    if repo.function_kinds_in.get((here, accessor)) == {"sync"}:
+        return True
+    tree = repo.trees.get(here)
+    imported = _imported_as(tree, accessor) if tree is not None else None
+    if imported is None or not imported[0].startswith("."):
+        return False
+    for candidate in _module_candidates(path, imported[0]):
+        if str(candidate) in repo.trees:
+            return repo.function_kinds_in.get((str(candidate), imported[1])) == {"sync"}
+    return False
+
+
+def _classic_script(repo: _Repo, path: str, function: Node) -> str | None:
+    """A reason when ``function`` is a top-level function of a file with no
+    import, export, ``require`` or ``module.exports``: a classic script, whose
+    top-level functions are properties of the global object, reachable by a
+    computed key."""
+    tree = repo.trees.get(str(Path(path).resolve()))
+    if tree is None or function.parent is None or function.parent.type not in {"program", "lexical_declaration", "variable_declarator"}:
+        return None
+    if function.parent.type != "program" and (function.parent.parent is None or function.parent.parent.parent is None or function.parent.parent.parent.type != "program"):
+        return None
+    if any(child.type in {"import_statement", "export_statement"} for child in tree.children):
+        return None
+    text = tree.text.decode("utf-8", "replace")
+    if re.search(r"\brequire\s*\(|\bmodule\.exports\b|\bexports\.", text):
+        return None
+    return "it is a top-level function of a classic script, which is a global reachable by a computed key"
+
+
+def _plain_function(function: Node) -> str | None:
+    """A reason when ``function`` is not a plain named function: a declaration, or
+    a ``const`` (or never-reassigned ``let``/``var``) bound function or arrow.
+    Methods, object property functions and class fields can be reached by a
+    computed key or by dispatch."""
+    if function.type in {"function_declaration", "generator_function_declaration"}:
+        return None
+    holder = function.parent
+    if function.type in {"arrow_function", "function_expression", "function"} and holder is not None and holder.type == "variable_declarator":
+        declaration = holder.parent
+        name = holder.child_by_field_name("name")
+        if name is not None and name.type == "identifier" and declaration is not None:
+            if declaration.type == "lexical_declaration" and _text(declaration.children[0]) == "const":
+                return None
+            return None if not _reassigned(function, _text(name)) else "it is returned from a function bound to a variable that is reassigned"
+    if function.type in {"method_definition"} or (holder is not None and holder.type in {"pair", "public_field_definition"}):
+        return "a method can be reached by a computed key or dispatch that cannot be followed"
+    return "it is returned from a function with no name a caller can be found by (anonymous, a default export or a class field)"
+
+
+def _reassigned(function: Node, name: str) -> bool:
+    root = function
+    while root.parent is not None:
+        root = root.parent
+    return any(
+        node.type in {"assignment_expression", "augmented_assignment_expression"}
+        and node.child_by_field_name("left") is not None
+        and _text(node.child_by_field_name("left")) == name
+        for node in ts_syntax._walk(root)
+    )
+
+
+def _quoted_names(repo: _Repo, names: set[str]) -> str | None:
+    """A reason when a name appears in a string literal or template chunk anywhere
+    (``obj['isRbac']``, ``this[name]`` dispatch tables)."""
+    pattern = re.compile("|".join(rf"(?<![\w$]){re.escape(n)}(?![\w$])" for n in sorted(names)))
+    for path, tree in repo.trees.items():
+        if tree is None:
+            continue
+        for node in ts_syntax._walk(tree):
+            if node.type == "string_fragment" and pattern.search(_text(node)):
+                return f"its name appears in a string at {Path(path).name}:{node.start_point[0] + 1}, so it may be reached by a computed key"
+    return None
+
+
+def _result_only_tested(
+    repo: _Repo, path: str, function: Node, depth: int = 0, seen: frozenset[int] = frozenset()
+) -> str | None:
+    """Why the fold of a read returned from ``function`` is not proven safe, or ``None``.
+
+    A bare literal is proven only when ``function`` has a name and EVERY
+    reference to that name (and its aliases) in the repository is a call whose
+    result is only tested or discarded, or is returned from a function for
+    which the same holds (to ``_MAX_DEPTH`` levels). Anything else (passed on,
+    stored, chained on, awaited, an unreadable file, a template) is a reason."""
+    if function.id in seen:
+        return None
+    if depth > _MAX_DEPTH:
+        return "the chain of functions returning the read is too deep to check"
+    name_node = _function_name(function)
+    if name_node is None:
+        return "it is returned from a function with no name a caller can be found by (anonymous, a default export or a class field)"
+    plain = _plain_function(function)
+    if plain is not None:
+        return plain
+    script = _classic_script(repo, path, function)
+    if script is not None:
+        return script
+    names, hop = _alias_names(repo, path, _text(name_node))
+    quoted = _quoted_names(repo, names)
+    if quoted is not None:
+        return quoted
+    if hop is not None:
+        return hop
+    unreadable = _name_mentions(repo, names)
+    if unreadable is not None:
+        return unreadable
+    unseen = _unseen_importers(repo, path, names)
+    if unseen is not None:
+        return unseen
+    for other_path, tree in repo.trees.items():
+        for node in ts_syntax._walk(tree):
+            if node.type not in {"identifier", "property_identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"}:
+                continue
+            if _text(node) not in names or node == name_node:
+                continue
+            where = f"{Path(other_path).name}:{node.start_point[0] + 1}"
+            parent = node.parent
+            if parent is None:
+                continue
+            if node.type == "shorthand_property_identifier_pattern":
+                continue  # a destructured import: its calls are found by the name
+            if parent.type in _NAME_POSITIONS:
+                continue  # a declaration, a parameter or an import/export binding
+            if parent.type == "variable_declarator" and parent.child_by_field_name("name") == node:
+                continue
+            if parent.type == "pair" and parent.child_by_field_name("key") == node:
+                continue
+            if node.type == "shorthand_property_identifier":
+                owner = parent.parent
+                if parent.type == "object" and owner is not None and owner.type == "assignment_expression" and _text(owner.child_by_field_name("left")) == "module.exports":
+                    continue
+                return f"it is stored in an object at {where}"
+            if parent.type == "variable_declarator" and parent.child_by_field_name("value") == node:
+                continue  # an alias: its own name is followed
+            callee = parent if parent.type == "member_expression" and parent.child_by_field_name("property") == node else node
+            if callee is not node and callee.parent is not None and callee.parent.type == "variable_declarator" and callee.parent.child_by_field_name("value") == callee:
+                continue  # `const r = ns.name`
+            call = callee.parent
+            if call is None or call.type != "call_expression" or call.child_by_field_name("function") != callee:
+                return f"it is used as a value at {where}"
+            top, cast = _unwrap(call)
+            if cast:
+                return f"its result is cast at {where}"
+            if _boolean_only(top) or _bound_boolean_only(top):
+                continue
+            returned = _returned_function(top)
+            if returned is not None:
+                reason = _result_only_tested(repo, other_path, returned, depth + 1, seen | {function.id})
+                if reason is not None:
+                    return reason
+                continue
+            return f"its result is used other than as a test at {where}"
+    return None
+
+
+def _promise_evidence(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> str | None:
+    """Why the read may be a Promise, or ``None``: the receiver's declared type
+    says so, or a declaration of the accessor in the repository is, or could be, async."""
+    kind = repo.receiver_kind(path, call, callee, accessor)
+    if kind == "promise":
+        return "the receiver's declared type makes it return a Promise"
+    if kind == "sync":
+        return None
+    if kind == "other" and repo.receiver_may_return_promise(path, call, callee, accessor):
+        return "the receiver's declared type may return a Promise (a union, an overload or an alias)"
+    bare = callee.type == "identifier" and not repo.has_with(path) and repo.locally_declared(path, callee)
+    at = repo.binding_async.get(accessor) if bare else repo.async_at.get(accessor)
+    if at is not None:
+        return f"a declaration of {accessor} in the repository is, or could be, async ({at[0]}:{at[1]})"
+    return None
+
+
 def decide(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> tuple[str, str]:
     """``(decision, why)``; ``why`` says what stopped a LEAVE."""
     top, promise_cast = _unwrap(call)
     if _boolean_consumed(top):
+        # A Promise in a condition is always truthy: folding the read to the
+        # flag's value would change which branch the customer's code takes.
+        evidence = _promise_evidence(repo, path, call, callee, accessor)
+        if evidence is not None:
+            return LEAVE, f"a Promise in a condition is always truthy, and {evidence}"
         return LITERAL, ""
     if promise_cast:
         return LEAVE, "it is cast to a type other than boolean"
@@ -1522,6 +2240,16 @@ def decide(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> t
     at = repo.binding_async.get(accessor) if bare else repo.async_at.get(accessor)
     if at is not None:
         return LEAVE, f"a declaration of {accessor} in the repository is, or could be, async ({at[0]}:{at[1]})"
+    # Declared nowhere in the repository, and returned from a function nothing
+    # annotates: the literal is proven only when every use of that function is
+    # a call whose result is only tested (see `_result_only_tested`).
+    owner = _returned_function(top)
+    # The call itself reaches a declaration annotated `boolean`: positive
+    # evidence, nothing to prove about the callers.
+    if owner is not None and not _declared_boolean(repo, path, call, callee, accessor):
+        why = _result_only_tested(repo, path, owner)
+        if why is not None:
+            return LEAVE, f"{why}, and nothing says the read is synchronous"
     return LITERAL, ""
 
 
@@ -1547,8 +2275,9 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
     """Every un-awaited accessor read in ``paths`` that is, or may be, of ``flag_key``, with its decision."""
     if language not in ("ts", "tsx", "js") or not accessors:
         return []
-    names = frozenset(accessors)
-    repo = _Repo(repo_dir, names)
+    props = {n: p for n, p in rule_synthesis.positions_of(accessors).items() if isinstance(p, str)}
+    names = frozenset(a for a in accessors if rule_synthesis.plain_name(a) == a)
+    repo = _Repo(repo_dir, names | frozenset(props))
     sites: list[Site] = []
     for path in dict.fromkeys(paths):
         if _EXTENSIONS.get(Path(path).suffix) is None:
@@ -1557,7 +2286,7 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
             source = Path(path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if not any(n in source for n in names):
+        if not any(n in source for n in (*names, *props)):
             continue
         tree = repo.tree(path)
         if tree is None:
@@ -1575,18 +2304,29 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
                 name = _text(callee)
             else:
                 continue
-            if name not in names or _is_optional(node, callee):
+            if _is_optional(node, callee):
                 continue
-            literal, could_name_key = _first_argument(node)
+            prop = props.get(name) if name not in names else None
+            if prop is not None:
+                literal, could_name_key = _property_argument(node, prop)
+            elif name in names:
+                literal, could_name_key = _first_argument(node)
+            else:
+                continue
             if literal != flag_key and not could_name_key:
                 continue
             top, _cast = _unwrap(node)
             if top.parent is not None and top.parent.type == "await_expression":
                 continue
             decision, why = decide(repo, path, node, callee, name)
+            if prop is not None and decision == LITERAL and not _sync_evidence(repo, path, node, callee, name):
+                # Nothing says the read is not a Promise: a result that is
+                # returned or passed on may be awaited or `.then`-ed by a
+                # caller. Left as it always was, and listed by the residual scan.
+                continue
             sites.append(
                 Site(path, name, (callee.start_byte, callee.end_byte), (node.start_byte, node.end_byte),
-                     decision, literal == flag_key, why)
+                     decision, literal == flag_key, why, prop is not None)
             )
     return sites
 
@@ -1601,7 +2341,7 @@ def marks(sites: list[Site], managed: frozenset[str], path: str) -> list[kotlin_
     data = Path(path).read_bytes()
     out = []
     for site in sites:
-        if site.path != path or site.accessor not in managed or not site.keyed:
+        if site.path != path or not site.keyed or (site.accessor not in managed and not site.prop):
             continue
         if site.decision == LITERAL:
             out.append(kotlin_sentinel.mark(data, *site.callee))

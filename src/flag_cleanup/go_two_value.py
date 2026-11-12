@@ -23,10 +23,12 @@ left whole and the existing arity refusal speaks, exactly as before:
   at all), declared with ``:=`` as a statement of a block;
 * a single call on the right whose callee is a flag read and that names the
   flag's key. Its arguments either cannot do work (names, selectors, literals,
-  operators on them) or are calls, which the fold would drop: each such call is
-  kept, as ``_ = call`` on the line before the declaration, in order. Any other
-  argument that can do work (an index, a receive, a call inside an operator, a
-  function literal) is a refusal that says so;
+  operators on them) or are calls, which the fold would drop: each such call
+  (and a receiver that does work) is kept by :mod:`flag_cleanup.go_read_effects`,
+  which runs after this pass, as ``_ = call`` on the line before the
+  declaration, in order. Any other argument that can do work (an index, a
+  receive, a call inside an operator, a function literal) is a refusal that
+  says so;
 * the very next statement is ``if err != nil { … }`` with no initializer, whose
   block holds no ``goto`` or label, and either no ``else`` or an ``else`` block
   of plain statements (no declaration, label or multi-line raw string, and no
@@ -81,7 +83,7 @@ class _Pair:
     names: Node
     guard: Node | None
     call: Node
-    #: Calls among the read's arguments, kept as ``_ = call`` before it.
+    #: Calls among the read's arguments, kept by ``go_read_effects`` after this pass.
     hoisted: tuple[Node, ...] = ()
     #: The ``else`` block of the guard, whose statements replace it.
     otherwise: Node | None = None
@@ -520,10 +522,6 @@ def rewrite(
             if pair.otherwise is not None:
                 replacement = _dedented(source, pair.declaration, pair.otherwise) or ""
             edits.append((pair.declaration.end_byte, pair.guard.end_byte, replacement.encode("utf-8")))
-        if pair.hoisted:
-            indent = _indent_of(source, pair.declaration)
-            lines = "".join(f"_ = {_text(c)}\n{indent}" for c in pair.hoisted)
-            edits.append((pair.declaration.start_byte, pair.declaration.start_byte, lines.encode("utf-8")))
         calls.append(" ".join(_text(pair.call).split()))
     for start, end, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
         data = data[:start] + text + data[end:]
