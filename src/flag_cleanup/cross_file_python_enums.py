@@ -9,6 +9,12 @@ refuses to assign or delete a member through its class, and an enum with
 members cannot be subclassed, so ``Flags.X.value`` is that literal unless
 something writes the member's ``_value_``, which :func:`enum_escapes`
 refuses. A member is never deleted, so its readers fold although it is kept.
+
+A top-level class with no base holding ``NAME = "key"`` literals is the same
+kind of declaration (:func:`_plain_kind`), read as ``Flags.X`` itself. Python
+lets any code assign to a plain class, so the proof is wider than an enum's:
+the class body runs nothing, nothing in the checkout stores to the class or
+hands it on (:func:`enum_escapes`), and a read in the declaring file folds too.
 """
 
 from __future__ import annotations
@@ -79,9 +85,11 @@ def entries(
     refused: list[xk.Refusal] = []
     for cls, member in _holders(root, xk.key_token(flag_key), _aliased_enums(tree)):
         owner = _text(cls.child_by_field_name("name"))
+        plain = _is_plain(cls)
         decl = xk.KeyDeclaration(
             path, _text(member.child_by_field_name("left")), owner, path,
-            kind=xk.ENUM_ENTRY, accessors=frozenset({"value"}),
+            kind=xk.ENUM_ENTRY, accessors=frozenset({""} if plain else {"value"}),
+            same_file_reads=plain,
         )
         node = _class_node(tree, cls) if tree is not None else None
         kind = _class_kind(node, tree) if node is not None else None
@@ -94,6 +102,8 @@ def entries(
             refused.append(xk.Refusal(path, line, xk.ENUM_UNPROVEN, _line(source, line), decl.entry))
             continue
         found.append(decl)
+        if plain:
+            continue  # its own file is read like any other: `references` judges each mention
         for refusal in _in_file_mentions(path, source, root, decl, member):
             if refusal not in refused:
                 refused.append(refusal)
@@ -130,7 +140,8 @@ def _holders(root: Node, key: re.Pattern[str], aliased: set[tuple[int, int]]) ->
         bases = cls.child_by_field_name("superclasses")
         body = cls.child_by_field_name("body")
         at = (cls.start_point[0] + 1, cls.start_point[1])
-        if bases is None or body is None or not (_ENUM_LIKE.search(_text(bases)) or at in aliased):
+        enum_like = bases is not None and (_ENUM_LIKE.search(_text(bases)) or at in aliased)
+        if body is None:
             continue
         for statement in body.named_children:
             if statement.type != "expression_statement":
@@ -140,9 +151,31 @@ def _holders(root: Node, key: re.Pattern[str], aliased: set[tuple[int, int]]) ->
                     continue
                 left = assignment.child_by_field_name("left")
                 right = assignment.child_by_field_name("right")
-                if left is not None and left.type == "identifier" and right is not None and key.search(_text(right)):
+                if left is None or left.type != "identifier" or right is None or not key.search(_text(right)):
+                    continue
+                # An enum judges any value spelling the key. Another class
+                # (a plain one, or one with a base) only a value that is
+                # visibly a string: a call that happens to pass the key is
+                # not a constant holder.
+                if enum_like or (right.type in ("string", "concatenated_string", "binary_operator") and _namespace_shape(cls)):
                     found.append((cls, assignment))
     return found
+
+
+def _namespace_shape(cls: Node) -> bool:
+    """Whether a class could be a flag namespace: no base but ``object`` and
+    no method. Any other class holding the key as a string (a settings model,
+    a test case) is not reported, as before."""
+    body = cls.child_by_field_name("body")
+    return _is_plain(cls) and body is not None and not any(
+        c.type in ("function_definition", "decorated_definition", "class_definition") for c in body.named_children
+    )
+
+
+def _is_plain(cls: Node) -> bool:
+    """Whether ``cls`` names no base or only ``object``: a plain class."""
+    bases = cls.child_by_field_name("superclasses")
+    return bases is None or _text(bases).replace(" ", "") in ("()", "(object)")
 
 
 def _class_node(tree: ast.Module, cls: Node) -> ast.ClassDef | None:
@@ -208,6 +241,10 @@ def _class_kind(cls: ast.ClassDef, tree: ast.Module) -> str | None:
     counts = _bound_counts(tree)
     if counts[_nfkc(cls.name)] != 1 or cls.keywords:
         return None
+    if not cls.bases or (
+        len(cls.bases) == 1 and isinstance(cls.bases[0], ast.Name) and cls.bases[0].id == "object" and counts["object"] == 0
+    ):
+        return "plain" if not cls.decorator_list and _plain_body(cls) else None
     bases = [_meaning(base, imports, counts) for base in cls.bases]
     if len(bases) == 1 and bases[0] in _STR_ENUMS:
         kind = "enum"
@@ -228,6 +265,30 @@ def _class_kind(cls: ast.ClassDef, tree: ast.Module) -> str | None:
     if not all(_allowed(s, i, kind, imports, counts) for i, s in enumerate(cls.body)):
         return None
     return kind
+
+
+def _plain_body(cls: ast.ClassDef) -> bool:
+    """Whether a plain class's body is a docstring, ``pass`` and ``NAME = literal``
+    assignments (annotated or not), each name once: nothing runs at class
+    creation and no method can assign through ``cls``."""
+    names: set[str] = set()
+    for index, statement in enumerate(cls.body):
+        if index == 0 and isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
+            continue
+        if isinstance(statement, ast.Pass):
+            continue
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target, value = statement.targets[0], statement.value
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None and statement.simple:
+            target, value = statement.target, statement.value
+            if any(isinstance(n, (ast.Call, ast.NamedExpr, ast.Lambda)) for n in ast.walk(statement.annotation)):
+                return False
+        else:
+            return False
+        if not isinstance(target, ast.Name) or target.id in names or not _constant(value):
+            return False
+        names.add(target.id)
+    return True
 
 
 def _allowed(
@@ -468,13 +529,17 @@ def references(
         if len(proven) != len(bindings):
             continue
         owners = {(b.local if b.kind == "bare" else f"{b.owner}.{decl.owner}"): b for b in proven}
+        # A plain class is read in its own file by its own name.
+        own = decl.same_file_reads and path == decl.path
+        if own:
+            owners[decl.owner] = None
         word = xk.mention_pattern([decl.name])
         for node in _walk(root):
             if node.type == "string_content" and word.search(_text(node)):
                 # `Flags["X"]`, `getattr(Flags, "X")`; or, where nothing binds
                 # the owner, `mock.patch("app.flags.Flags.X")`.
-                refuse(node, xk.NOT_A_READ if proven else xk.UNSUPPORTED_FORM, decl)
-        if proven:
+                refuse(node, xk.NOT_A_READ if proven or own else xk.UNSUPPORTED_FORM, decl)
+        if proven or own:
             for node in stars:
                 refuse(node, xk.IMPORT_UNRESOLVED, decl)
             for node in namespace + sys_modules:
@@ -484,6 +549,13 @@ def references(
                 refusal = xk.Refusal(path, line, xk.UNSUPPORTED_FORM, _line(plain, line), decl.entry)
                 if refusal not in refused:
                     refused.append(refusal)
+        if decl.same_file_reads:
+            # Python lets any code assign to a plain class, so one handed to
+            # code can be rewritten without spelling a member.
+            for spelled in owners:
+                for node in _spellings(root, spelled):
+                    if _handed_on_by(node):
+                        refuse(node, xk.UNSUPPORTED_FORM, decl)
         for binding in proven:
             if binding.kind == "bare":
                 for node in _walk(root):
@@ -517,7 +589,7 @@ def references(
             if spelled in owners:
                 reason = _member_read(parent, spelled, decl, accessors)
                 if reason is None:
-                    reads.append(xk.KeyReference(path, spelled, decl.name, "value", decl))
+                    reads.append(xk.KeyReference(path, spelled, decl.name, "" if decl.same_file_reads else "value", decl))
                 else:
                     refuse(node, reason, decl)
             elif stars:
@@ -529,6 +601,55 @@ def references(
     return reads, refused
 
 
+def _spellings(root: Node, spelled: str) -> list[Node]:
+    """Every node that spells ``spelled`` (``Flags`` or ``m.Flags``) as a name:
+    an identifier, or the attribute chain ``m.Flags`` that is not itself part
+    of a longer chain's head."""
+    if "." not in spelled:
+        return [
+            n for n in _walk(root)
+            if n.type == "identifier" and _text(n) == spelled and not _not_a_mention(n)
+            and _in_import(n) is None and not key_const._python_is_binding(n)
+        ]
+    return [
+        n for n in _walk(root)
+        if n.type == "attribute" and _text(n).replace(" ", "") == spelled and _in_import(n) is None
+    ]
+
+
+def _is_base_list(node: Node | None) -> bool:
+    """Whether ``node`` is the parenthesised bases of a class definition."""
+    owner = node.parent if node is not None else None
+    return (
+        node is not None
+        and node.type == "argument_list"
+        and owner is not None
+        and owner.type == "class_definition"
+        and owner.child_by_field_name("superclasses").id == node.id
+    )
+
+
+def _handed_on_by(node: Node) -> bool:
+    """Whether the class spelled at ``node`` is handed to code: anything but
+    reading an attribute of it, calling it, subscripting or iterating it,
+    annotating with it, or naming it as a base."""
+    if _in_annotation(node):
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "attribute" and parent.child_by_field_name("attribute").id == node.id:
+        return False  # the tail of a longer chain: `m.Flags` is judged whole
+    field = {
+        "attribute": "object",
+        "call": "function",
+        "subscript": "value",
+        "for_statement": "right",
+        "for_in_clause": "right",
+    }.get(parent.type)
+    return field is None or parent.child_by_field_name(field).id != node.id
+
+
 def _member_read(attribute: Node, owner: str, decl: xk.KeyDeclaration, accessors: frozenset[str]) -> str | None:
     """None when ``owner.X`` at ``attribute`` is a proven read, else the refusal."""
     if _raw(attribute) != f"{owner}.{decl.name}":
@@ -536,6 +657,11 @@ def _member_read(attribute: Node, owner: str, decl: xk.KeyDeclaration, accessors
         # owner's, but the reader rule's `#eq?` compares the text as written.
         return xk.UNSUPPORTED_FORM
     outer = attribute.parent
+    if decl.same_file_reads:
+        # The member is the key itself: any attribute taken of it is a str's.
+        if outer is not None and outer.type == "attribute" and outer.child_by_field_name("object").id == attribute.id:
+            return xk.UNSUPPORTED_FORM
+        return None if _is_read_at(attribute, accessors, positioned=False) else xk.NOT_A_READ
     if outer is None or outer.type != "attribute" or outer.child_by_field_name("object").id != attribute.id:
         return xk.NOT_A_READ  # the member itself, handed on
     if _text(outer.child_by_field_name("attribute")) != "value" or _raw(outer) != f"{owner}.{decl.name}.value":
@@ -704,6 +830,7 @@ _INTERNALS = re.compile(r"(?<!\w)(?:_value_|_member_map_|_value2member_map_)(?!\
 #: ``setattr``, ``delattr``, ``monkeypatch.setattr``, ``mock.patch``,
 #: ``mock.patch.object``.
 _WRITERS = frozenset({"setattr", "delattr", "patch", "object"})
+_SETTERS = frozenset({"setattr", "delattr", "__setattr__", "__delattr__"})
 
 
 def enum_escapes(
@@ -726,7 +853,55 @@ def enum_escapes(
                     found.append(refusal)
 
     owners = {d.owner for d in entries if d.owner is not None}
+    plain = {d.owner for d in entries if d.owner is not None and d.same_file_reads}
+    # Member names of a plain class: a store of one of them through ANY
+    # receiver (`type(f).X = ...`, `f.__class__.X`, `More.__mro__[1].X`,
+    # `setattr(b, "X", ...)`) may reach the class, so none is told apart.
+    member_owners: dict[str, set[str]] = defaultdict(set)
+    for d in entries:
+        if d.owner in plain:
+            for member in _members(d.path, d.owner) | {d.name}:
+                member_owners[member].add(d.owner)
+    # A plain class imported under another name is the same class under it:
+    # `from m import Flags as F` then `F.X = "other"`.
+    renamed = {
+        _text(n.child_by_field_name("alias")): _alias_of(n)
+        for n in (_walk(root) if plain else ())
+        if n.type == "aliased_import" and _alias_of(n) in plain and n.child_by_field_name("alias") is not None
+    }
+    held = plain | set(renamed)
     for node in _walk(root):
+        if plain and node.type == "identifier" and _text(node) in held and _in_import(node) is None:
+            # A plain class can be rewritten by any code holding it, under any
+            # name: handed on (`configure(Flags)`), or renamed (`F = Flags`).
+            keyword = node.parent is not None and node.parent.type == "keyword_argument" and _not_a_mention(node)
+            use = node.parent if _tail_of_chain(node) else node  # `m.Flags` is one use
+            if not keyword and not key_const._python_is_binding(node) and not _in_annotation(node) and _handed_on_by(use):
+                refuse(node, {renamed.get(_text(node), _text(node))})
+            elif _stored_target(node, held):
+                refuse(node, {renamed.get(_text(node), _text(node))})
+        if plain and node.type == "string_content":
+            # Any string that is only the class's name (`getattr(fm, "Flags")`,
+            # `import_module("app.flags").Flags`): no guess at what it is used for.
+            quoted = _text(node).strip()
+            for owner in plain if not _in_dunder_all(node) else ():
+                if re.fullmatch(rf"(?:\w+\.)*{re.escape(owner)}", quoted):
+                    refuse(node, {owner})
+        if member_owners and node.type == "type_alias_statement":
+            # tree-sitter reads `type(f).X = v` as a `type` alias statement.
+            for member in member_owners:
+                if re.search(rf"\.\s*{re.escape(member)}\s*=(?!=)", _text(node)):
+                    refuse(node, member_owners[member])
+        elif member_owners and node.type == "attribute" and _stored_or_deleted(node):
+            attr = node.child_by_field_name("attribute")
+            if attr is not None and _text(attr) in member_owners:
+                refuse(node, member_owners[_text(attr)])
+        elif member_owners and node.type == "call" and _callee(node) in _SETTERS:
+            arguments = node.child_by_field_name("arguments")
+            second = arguments.named_children[1] if arguments is not None and len(arguments.named_children) > 1 else None
+            text = _plain_string(second) if second is not None and second.type == "string" else None
+            if text in member_owners:
+                refuse(node, member_owners[text])
         if node.type in ("identifier", "string_content") and _INTERNALS.search(_text(node)):
             refuse(node, owners)
         elif node.type == "attribute":
@@ -738,7 +913,7 @@ def enum_escapes(
                 refuse(node, {_text(name)})
             elif target in owners:
                 refuse(node, {target})
-        elif node.type == "call" and _callee(node) in ("setattr", "delattr"):
+        elif node.type == "call" and _callee(node) in ("setattr", "delattr", "__setattr__", "__delattr__"):
             arguments = node.child_by_field_name("arguments")
             first = arguments.named_children[0] if arguments is not None and arguments.named_children else None
             if first is not None and _last_name(first) in owners:
@@ -748,6 +923,54 @@ def enum_escapes(
             if named:
                 refuse(node, named)
     return found
+
+
+def _in_dunder_all(node: Node) -> bool:
+    """Whether a string is a DIRECT element of a list or tuple literal that is
+    the whole value of ``__all__ = ...`` / ``__all__ += ...``: it names an
+    export and hands nothing on. A string inside a call, a walrus or a
+    comprehension on that right-hand side is not."""
+    string = node.parent
+    container = string.parent if string is not None else None
+    if container is None or container.type not in ("list", "tuple", "expression_list"):
+        return False
+    statement = container.parent
+    if statement is None or statement.type not in ("assignment", "augmented_assignment"):
+        return False
+    left = statement.child_by_field_name("left")
+    right = statement.child_by_field_name("right")
+    return (
+        left is not None
+        and left.type == "identifier"
+        and _text(left) == "__all__"
+        and right is not None
+        and right.id == container.id
+    )
+
+
+def _stored_target(node: Node, held: set[str]) -> bool:
+    """Whether ``node`` (a held class name) is the object of an attribute that
+    is stored or deleted: ``F.X = ...`` through an alias."""
+    attribute = node.parent
+    return (
+        attribute is not None
+        and attribute.type == "attribute"
+        and attribute.child_by_field_name("object").id == node.id
+        and _stored_or_deleted(attribute)
+    )
+
+
+def _tail_of_chain(node: Node) -> bool:
+    """Whether ``node`` is the attribute after a dot (``m.Flags``'s ``Flags``):
+    the chain is judged whole by the caller that sees its head."""
+    parent = node.parent
+    return parent is not None and parent.type == "attribute" and parent.child_by_field_name("attribute").id == node.id
+
+
+def _alias_of(node: Node) -> str | None:
+    """The imported name an ``import ... as`` / ``from m import X as Y`` entry renames."""
+    name = node.child_by_field_name("name")
+    return _text(name.named_children[-1]) if name is not None and name.named_children else None
 
 
 def _last_name(node: Node | None) -> str | None:

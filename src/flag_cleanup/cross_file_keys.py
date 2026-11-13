@@ -108,6 +108,11 @@ class KeyDeclaration:
     #: ``vendor/``). Its reads still fold, but the pull request never lists it
     #: as safe to delete: it is not the reviewer's code.
     third_party: bool = False
+    #: A read in the declaring file itself is judged and folded like any other
+    #: (Python's plain class: ``Flags.X`` is the key whichever file spells it).
+    #: Every other kind is read from other files only; its own file is the
+    #: in-file check's business.
+    same_file_reads: bool = False
     #: A constant holding the key in a constructed object rather than as its
     #: value (TypeScript's ``new Feature("key", false)``): only a configured
     #: accessor reads it, never an SDK call, which takes the key itself.
@@ -1054,7 +1059,7 @@ def resolve(
             continue
         # A declaring file is still a reader of the OTHER declarations; its
         # mentions of its own are the in-file check's business.
-        visible = tuple(d for d in live if d.path != path)
+        visible = tuple(d for d in live if d.path != path or d.same_file_reads)
         if not visible:
             continue
         reads, refused = profile.references(path, source, visible, accessor_set, repo_dir)

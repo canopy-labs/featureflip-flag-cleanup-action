@@ -551,6 +551,7 @@ def discover_all(
     accessors: tuple[str, ...],
     folded_files: dict[str, tuple[bool, frozenset[str]]],
     promise_reads: frozenset[tuple[str, int, int]] = frozenset(),
+    managed: frozenset[str] = frozenset(),
 ) -> list[Wrapper]:
     """Every wrapper declared in a file whose reads this run folds.
 
@@ -562,7 +563,9 @@ def discover_all(
 
     ``promise_reads`` holds ``(resolved path, start, end)`` of each read
     decided to keep its Promise (``Promise.resolve(<literal>)``), which a
-    profile that takes them may count as a wrapper's body too.
+    profile that takes them may count as a wrapper's body too, and
+    ``managed`` the accessors whose un-awaited reads are decided one by one
+    (TypeScript's), whose awaited reads still fold.
     """
     found: list[Wrapper] = []
     lang = profile(language)
@@ -572,8 +575,10 @@ def discover_all(
         source = _read(path)
         if source is None:
             continue
-        if promise_reads:
-            is_read = lang.read_test(path, source, flag_key, accessors, const_ok, external, promise_reads=promise_reads)
+        if promise_reads or managed:
+            is_read = lang.read_test(
+                path, source, flag_key, accessors, const_ok, external, promise_reads=promise_reads, managed=managed
+            )
         else:
             is_read = lang.read_test(path, source, flag_key, accessors, const_ok, external)
         found.extend(

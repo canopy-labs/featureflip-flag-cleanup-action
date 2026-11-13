@@ -25,6 +25,10 @@ from tree_sitter import Language, Node, Parser
 #: The ``bindings`` kind of a call the run kept running as a discard.
 DISCARDED_CALL = "discarded call"
 
+#: The ``bindings`` kind of a receiver or argument of a folded read that calls
+#: something, kept as ``_ = <expr>`` before the statement (``go_read_effects``).
+HOISTED_CALL = "hoisted call"
+
 
 @lru_cache(maxsize=1)
 def _parser() -> Parser:

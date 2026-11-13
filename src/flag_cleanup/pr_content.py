@@ -23,7 +23,7 @@ from dataclasses import replace
 from flag_cleanup import call_site_comments, comment_sentences, report_paths, stale_comments
 from flag_cleanup.client import Candidate
 from flag_cleanup.config import Config
-from flag_cleanup.discarded_calls import DISCARDED_CALL
+from flag_cleanup.discarded_calls import DISCARDED_CALL, HOISTED_CALL
 from flag_cleanup.failing_assertions import FLAG_VALUE_ASSERTION
 from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
 from flag_cleanup.ts_unread_members import UNREAD_FACTORY_PARAMETER
@@ -227,6 +227,7 @@ REPORTED_BINDING_KINDS = frozenset(
         DECLARED_LOAD,
         REMOVED_FEATURE_CLASS,
         DISCARDED_CALL,
+        HOISTED_CALL,
         DECLARED_CALL,
         go_handles.SIDE_EFFECTS,
         INLINED_FORWARDER,
@@ -776,6 +777,35 @@ def _discarded_call_lines(discarded: list[tuple[str, str]]) -> list[str]:
         "`side-effect-free-calls` has later removals delete such calls themselves:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in discarded[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _hoisted_call_lines(hoisted: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each receiver or argument of a folded flag read that
+    calls something, kept as `_ = …` ahead of the statement, or nothing.
+
+    Go runs a call's receiver and arguments before the call, so they ran
+    whatever the flag said; folding the read would have stopped them. Very
+    often the call only built a context or fetched a client for the read
+    (`r.Context()`, `getClient()`), which the reviewer can tell and the run
+    cannot.
+    """
+    if not hoisted:
+        return []
+    count = len(hoisted)
+    noun = "call is" if count == 1 else "calls are"
+    return [
+        f"> **{count} {noun} kept from the removed flag read.** "
+        f"{'It was' if count == 1 else 'Each was'} a receiver or an argument of the read "
+        "and called something, which Go ran before the read whatever the flag said, so "
+        f"{'it was' if count == 1 else 'each was'} kept as `_ = …` ahead of the statement, "
+        "in the order Go ran it. If it only built a context or fetched a client for the "
+        "read, delete the line, and then anything only it used. Naming the function in "
+        "`side-effect-free-calls` has later removals delete such calls themselves:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in hoisted[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -1994,6 +2024,9 @@ def pr_body(
     discarded_calls = [
         (path, text) for path, kind, text in bindings if kind == DISCARDED_CALL
     ]
+    hoisted_calls = [
+        (path, text) for path, kind, text in bindings if kind == HOISTED_CALL
+    ]
     declared_calls = [
         (path, text) for path, kind, text in bindings if kind == DECLARED_CALL
     ]
@@ -2057,6 +2090,7 @@ def pr_body(
     lines += _kept_hook_call_lines(kept_hook_calls)
     lines += _unwrapped_provider_lines(unwrapped_providers)
     lines += _discarded_call_lines(discarded_calls)
+    lines += _hoisted_call_lines(hoisted_calls)
     lines += _unread_binding_lines(unread_bindings)
     emptied_rows = [b for b in bindings if b[1] in (go_emptied.FUNCTION, go_emptied.CALL)]
     if emptied_rows:
@@ -2102,6 +2136,7 @@ def pr_body(
         function_count = sum(1 for _, kind, _ in bindings if kind == "private function")
         parameter_count = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
         option_count = sum(1 for _, kind, _ in bindings if kind == "unused option")
+        guard_count = sum(1 for _, kind, _ in bindings if kind == "guard method")
         variable_count = (
             len(bindings)
             - import_count
@@ -2109,6 +2144,7 @@ def pr_body(
             - function_count
             - parameter_count
             - option_count
+            - guard_count
         )
 
         def _plural(n: int, noun: str) -> str:
@@ -2127,6 +2163,8 @@ def pr_body(
             counted.append(_plural(parameter_count, "parameter"))
         if option_count:
             counted.append(_plural(option_count, "function option"))
+        if guard_count:
+            counted.append(_plural(guard_count, "callback guard method"))
 
         sentences = [
             # Go is the only unconditionally-true claim here: javac has no
@@ -2176,6 +2214,16 @@ def pr_body(
                 "its last reader, it is the last parameter of a function that "
                 "nothing outside its file can call, and no remaining call "
                 "passes it."
+            )
+        if guard_count:
+            sentences.append(
+                "A callback guard method the fold emptied is deleted with the "
+                "`before_action` that names it, only when that callback is a "
+                "plain statement of the same class, the method is private or "
+                "protected, and the name is spelled nowhere else in the "
+                "checkout, not even in a string, a symbol or a comment. A "
+                "guard reached only by a computed `send(\"...#{x}...\")` "
+                "cannot be seen."
             )
         if option_count:
             sentences.append(
@@ -3255,7 +3303,7 @@ def _enum_lines(
     if refused:
         lines += [
             f"> **⚠️ {len(refused)} reference(s) to this flag through an enum entry "
-            "could not be resolved**, so those places were left as they are and "
+            "or class attribute could not be resolved**, so those places were left as they are and "
             "still evaluate the flag. Each line names the place and the reason. "
             "Rewrite them by hand before archiving the flag:",
             ">",

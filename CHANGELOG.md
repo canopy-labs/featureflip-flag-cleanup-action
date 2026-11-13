@@ -8,6 +8,45 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.14.0
+
+### Added
+
+- Python: a flag key held by a plain class (`class Flags: NEW_CHECKOUT = "new-checkout"`) and read as `Flags.NEW_CHECKOUT` is now folded, in the class's own file and through `from pkg.flags import Flags` (or `as F`, `import pkg.flags`, `from pkg import flags`), like an enum member's read. Python lets any code assign to a class, so the entry is proven by the whole checkout: a store to the class, `setattr`, a `mock.patch` of it, or the class handed to other code refuses the entry and says where. A class that cannot be proven (a base, a decorator, a method, a computed value) is now reported as `enum-unproven` at the member instead of leaving only the generic "still references the flag" warning. A subclass of the class, a store to an attribute of one of its members' names through any object, or the class's name written as a string (outside a plain `__all__` list) refuses the entry too. A class or module reached through a name computed at run time (`getattr(mod, name)`) cannot be seen.
+- Ruby: a Rails callback guard that the fold empties is now cleaned up. A method left as a bare `return` becomes an empty method, and an empty method named by a `before_action` is deleted together with its callback(s), listed in the pull request as a callback guard method. It is kept when the name is spelled anywhere else in the checkout (a subclass's `skip_before_action`, `send(:name)`, a string or a comment), when a callback names another symbol too or sits outside the class body, or when a comment sits in or above it. Only a guard in a `private` or `protected` section is deleted (a public one keeps its method and loses only the bare `return`), and only when every callback naming it carries no option but `only`, `except`, `prepend` or a symbol `if:`/`unless:`; an access modifier left with nothing under it goes with the method. A guard reached only through a computed name (`send("ensure_#{name}")`) cannot be seen, so check for one before merging.
+
+### Changed
+
+- The transform engine is now 0.53.0, which carries the Go and Swift changes
+  noted alongside this release.
+- Go: a read that is a whole statement and has a receiver or argument that calls something (`getClient().BoolVariation("KEY", buildCtx(u), false)` on its own line) is now replaced by just those calls, kept as `_ = getClient()` and `_ = buildCtx(u)` in the order Go ran them, instead of refusing the flag.
+- Go: `context.Background()` and `context.TODO()` (with `context` the standard library's) and a one-argument conversion to a predeclared type (`string(id)`, `int64(limit)`) among a folded read's arguments no longer leave an `_ = …` line behind. A type name your package declares itself is still a call.
+- Go: the pull request lists a receiver or argument of a folded read that was kept as `_ = …` in its own note, which says it was part of the removed read, instead of describing it as a variable the read last used. The `side-effect-free-calls` section now names the functions a Go codebase usually needs to list (`Context`, `WithContext`, `New`).
+- Go: a type assertion among a read's arguments (`x.(T)`) is kept as `_ = x.(T)`, since it panics when it fails, in both the single-value and the `(bool, error)` fold. An index expression is still dropped with the read.
+- Go: whether `len`, `string`, `context.Background()` and the like mean what Go predeclares is now decided by where the file spells the name, not by a list of declaration forms, so a type-switch alias (`switch context := v.(type)`) or any other binding can no longer make a real call look inert.
+- Go: a `(bool, error)` read whose arguments receive from a channel is folded with the receive kept, and one whose arguments do no work (an index, a function literal that is not called) with those dropped, the same as any other read. Before, either refused the flag.
+
+### Fixed
+
+- Go: a read whose last argument spreads a call (`client.Enabled("key", opts()...)`) kept `_ = opts()...`, which is not Go, and the run ended in an engine error that blamed your file. It keeps `_ = opts()`. Any kept line that could not be parsed now refuses the flag with a message naming that, instead of reaching the engine.
+- TypeScript and JavaScript: deleting a statement from between two blank lines (a `const` the removal left unread, say) no longer leaves both: the run is shortened to the longest the file had there, so a file that passed `prettier --check` still does. If you merged a TypeScript or JavaScript removal made by an earlier version, `prettier --write` the files it changed.
+- TypeScript and JavaScript: a top-level function wrapper whose call is a Promise of the read is now removed like a synchronous one: one returning `Promise<boolean>` (or no written type) over a read that keeps its Promise, and an `async` one that returns or awaits the read. Awaited calls fold to the value, other calls become `Promise.resolve(<value>)`, and its own tests go with it. Before, the read inside it was folded while the wrapper and its callers stayed, and its own test failed for the value the flag no longer serves. If you merged a TypeScript or JavaScript removal made by an earlier version where a function returning a Promise read the removed flag, run that function's tests.
+- TypeScript and JavaScript: more ways a test changes the client a function wrapper reads now refuse the flag instead of leaving that test failing. A read through a React hook (`useFeatureIsOn`, `useLDClient`, `usePostHog`, an in-repo `useFlags()`) is always one, whoever renders the provider. So is a test file using what it imports from the client's package for anything but a read (`new GrowthBook(...)`, `<GrowthBookProvider>`, `<LDProvider>`, a cast or an alias such as `const ph = posthog`), an assignment, spy or `jest.replaceProperty` through any name initialised from the package's binding, and a client imported through a bare specifier that a bundler alias or workspace package may map into your repository (a `vite.config` alias of `@lib/client`, say). If you merged a removal made by an earlier version where a test rendered the client's provider, stubbed the client package or reached it through an alias, run that test.
+- TypeScript and JavaScript: a fenced code block, an inline code span or the frontmatter of an `.mdx` document no longer counts as code. A JSON sample holding `"from": { … }` used to keep every keyless function wrapper in the repository partial, and key constants with it. The document's top-level `import` and `export` lines still count.
+- TypeScript and JavaScript: a wrapper call alone in parentheses and compared with a literal (`(isFooEnabled(c)) === true`, `(await isFooEnabled(c)) === false`) now folds to the comparison's value. Before, it became `(true) === false`, which `tsc` rejects. If you merged a removal made by an earlier version, run `tsc` on the files it changed.
+- Go: a variable whose value does no work (`&Options{…}`, `string(id)`,
+  `int64(n)`, `len(items)`) is deleted with the branch that read it instead of
+  being kept as `_ = …`, unless the file or its package declares its own
+  `len`, `max`, `string` or the like.
+- Go: a variable left only written to once the flag's branch is gone is
+  removed with its writes: one target of `x, err = load()` (which becomes
+  `_, err = load()`, where the flag used to be refused), `x++`, `x += v`, and a
+  field of a struct value. A counter only a flagged log printed no longer
+  stays behind for a linter to reject.
+- Go: an `else` the removal left empty is deleted, and so is an `if` or a
+  trailing `else if` it left empty when the condition does no work.
+- Swift files that use `x as? T ?? d` (an optional cast followed by `??`, such as `let v = json["k"] as? Bool ?? false`) are no longer skipped as unparsable, so flag reads in them are removed. When such a file was the only Swift file in a run, the run used to end in an engine error.
+
 ## 2.13.1
 
 ### Added

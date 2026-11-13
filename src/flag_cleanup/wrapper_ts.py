@@ -125,6 +125,7 @@ def read_test(
     *,
     loose: bool = False,
     promise_reads: frozenset[tuple[str, int, int]] = frozenset(),
+    managed: frozenset[str] = frozenset(),
 ) -> Callable[[Node], bool]:
     """Whether a ``call_expression`` is a read of ``flag_key`` this run folds.
 
@@ -134,8 +135,16 @@ def read_test(
 
     The test carries a second one, ``promise_read``: whether a call is one of
     ``promise_reads`` (``(resolved path, start, end)``), a read the run folds
-    to ``Promise.resolve(<literal>)``. Only a factory's members take it as a
-    body (:func:`_factory_wrappers`)."""
+    to ``Promise.resolve(<literal>)``. A factory's members and a function
+    that is not ``async`` take it as a body (:func:`_factory_wrappers`,
+    :func:`_async_read`).
+
+    And a third, ``async_read``: whether a call is a read of one of the
+    ``managed`` accessors (those whose un-awaited reads are decided one by
+    one) by the key's string literal. Folded to the literal when awaited or
+    when an ``async`` function returns it, which is the only place an
+    ``async`` function wrapper's body is asked about it. ``loose`` makes both
+    the same superset as the first."""
     root = ts_scope.parse(source, path)
     consts = (
         {c.name for c in key_const.key_consts(root, source.encode("utf-8"), ts_scope.grammar(path), flag_key)}
@@ -173,7 +182,19 @@ def read_test(
     def promise_read(node: Node) -> bool:
         return node.type == "call_expression" and (node.start_byte, node.end_byte) in promised
 
-    is_read.promise_read = promise_read  # type: ignore[attr-defined]
+    def async_read(node: Node) -> bool:
+        if node.type != "call_expression" or node.child_by_field_name("type_arguments") is not None:
+            return False
+        if _has(node, "?.") or _callee_name(node) not in managed:
+            return False
+        arguments = node.child_by_field_name("arguments")
+        first = next(
+            (c for c in ([] if arguments is None else arguments.named_children) if c.type != "comment"), None
+        )
+        return first is not None and cross_file_ts._string_value(first) == flag_key
+
+    is_read.promise_read = is_read if loose else promise_read  # type: ignore[attr-defined]
+    is_read.async_read = is_read if loose else async_read  # type: ignore[attr-defined]
     return is_read
 
 
@@ -205,12 +226,70 @@ def _plain_function(node: Node) -> bool:
     return not _has(node, "async", "*") and node.child_by_field_name("type_parameters") is None
 
 
-def _function_wrapper(node: Node, is_read: Callable[[Node], bool]) -> Node | None:
-    """The name node of a top-level function wrapper ``node`` declares."""
-    if node.type == "function_declaration":
-        if _plain_function(node) and _returns_boolean(node) and _single_read(node.child_by_field_name("body"), is_read):
-            return node.child_by_field_name("name")
+def _returns_promised_boolean(declaration: Node) -> bool:
+    """No written return type, or exactly ``Promise<boolean>``."""
+    written = declaration.child_by_field_name("return_type")
+    if written is None:
+        return True
+    inner = next((c for c in written.named_children if c.type != "comment"), None)
+    return inner is not None and re.fullmatch(r"Promise\s*<\s*boolean\s*>", _text(inner)) is not None
+
+
+def _returned(body: Node | None) -> Node | None:
+    """What ``body`` returns when it is exactly ``{ return <x>; }`` or an
+    arrow's expression body ``<x>``."""
+    if body is None or body.type != "statement_block":
+        return body
+    statements = [c for c in body.named_children if c.type != "comment"]
+    if len(statements) != 1 or statements[0].type != "return_statement":
         return None
+    returned = [c for c in statements[0].named_children if c.type != "comment"]
+    return returned[0] if len(returned) == 1 else None
+
+
+def _async_read(function: Node, is_read: Callable[[Node], bool]) -> bool:
+    """Whether ``function`` is a Promise wrapper: its call is a Promise of the
+    read's value once the read is folded.
+
+    * not ``async``, and its body is a read the run keeps a Promise
+      (``promise_read``: folded to ``Promise.resolve(<literal>)``);
+    * ``async``, and its body is ``<read>`` or ``await <read>`` of a read the
+      run folds to the literal (``is_read``, or ``async_read``: a managed
+      accessor's read, which an ``async`` function's return folds to the
+      literal and the awaited rules fold under ``await``). The function wraps
+      the literal in its Promise.
+
+    Either way the written return type is none or exactly ``Promise<boolean>``,
+    and there is no ``*`` or type parameter."""
+    if _has(function, "*") or function.child_by_field_name("type_parameters") is not None:
+        return False
+    if not _returns_promised_boolean(function):
+        return False
+    returned = _returned(function.child_by_field_name("body"))
+    if returned is None:
+        return False
+    promise_read = getattr(is_read, "promise_read", None)
+    if not _has(function, "async"):
+        return promise_read is not None and promise_read(returned)
+    if returned.type == "await_expression":
+        inner = [c for c in returned.named_children if c.type != "comment"]
+        returned = inner[0] if len(inner) == 1 else None
+        if returned is None:
+            return False
+    async_read = getattr(is_read, "async_read", None)
+    return is_read(returned) or (async_read is not None and async_read(returned))
+
+
+def _function_wrapper(node: Node, is_read: Callable[[Node], bool]) -> tuple[Node, bool] | None:
+    """``(name node, promise)`` of a top-level function wrapper ``node``
+    declares; ``promise`` when its call is a Promise (:func:`_async_read`)."""
+    if node.type == "function_declaration":
+        name = node.child_by_field_name("name")
+        if name is None:
+            return None
+        if _plain_function(node) and _returns_boolean(node) and _single_read(node.child_by_field_name("body"), is_read):
+            return name, False
+        return (name, True) if _async_read(node, is_read) else None
     if node.type != "lexical_declaration" or not _has(node, "const"):
         return None
     declarators = [c for c in node.named_children if c.type == "variable_declarator"]
@@ -220,9 +299,11 @@ def _function_wrapper(node: Node, is_read: Callable[[Node], bool]) -> Node | Non
     value = declarators[0].child_by_field_name("value")
     if name is None or name.type != "identifier" or declarators[0].child_by_field_name("type") is not None:
         return None
-    if value is None or value.type not in _FUNCTION_VALUES or not _plain_function(value) or not _returns_boolean(value):
+    if value is None or value.type not in _FUNCTION_VALUES:
         return None
-    return name if _single_read(value.child_by_field_name("body"), is_read) else None
+    if _plain_function(value) and _returns_boolean(value) and _single_read(value.child_by_field_name("body"), is_read):
+        return name, False
+    return (name, True) if _async_read(value, is_read) else None
 
 
 def _decorator_name(decorator: Node) -> str:
@@ -391,12 +472,14 @@ def discover(path: str, source: str, is_read: Callable[[Node], bool]) -> list[wi
         node = statement.child_by_field_name("declaration") if statement.type == "export_statement" else statement
         if node is None:
             continue
-        name = _function_wrapper(node, is_read)
-        if name is not None:
+        function = _function_wrapper(node, is_read)
+        if function is not None:
+            name, promise = function
             found.append(
                 wi.Wrapper(
                     path=path, language=ts_scope.grammar(path), name=_text(name), owner=module, package=path,
                     line=wi.line_of(statement), start=statement.start_byte, end=statement.end_byte, kind="function",
+                    promise=promise,
                 )
             )
             continue
@@ -3166,10 +3249,41 @@ def _judge(path: str, node: Node, wrapper: wi.Wrapper, file: ts_scope.File, file
         reason = wi.ARGUMENT_HAS_CALL
     if reason is not None:
         return wi.Occurrence(path, wi.line_of(node), wi.text_of(call), None, reason)
+    held = _parenthesised(call, awaited=wrapper.promise)
+    if held is not None:
+        # `(await isX(c)) === false`: marked callee-only, the fold would leave
+        # `(true) === false`, a comparison tsc rejects (TS2367) and no engine
+        # rule folds. The whole parenthesised call becomes `<sentinel>()`, so
+        # the literal stands bare and the comparison folds.
+        return wi.Occurrence(path, wi.line_of(node), wi.text_of(call), (held.start_byte, held.end_byte), None, suffix="()")
     if wrapper.promise:
         span, suffix = _promise_span(call, callee)
         return wi.Occurrence(path, wi.line_of(node), wi.text_of(call), span, None, suffix=suffix)
     return wi.Occurrence(path, wi.line_of(node), wi.text_of(call), (callee.start_byte, callee.end_byte), None)
+
+
+def _parenthesised(call: Node, awaited: bool) -> Node | None:
+    """The outermost parentheses holding nothing but ``call`` (for a Promise
+    wrapper, ``await call``, and only that), when there are any: the folded
+    value is a literal there, and a literal needs none."""
+    inner = call
+    if awaited:
+        if inner.parent is None or inner.parent.type != "await_expression":
+            return None  # its value is the Promise: `Promise.resolve(<literal>)`
+        inner = inner.parent
+    held = None
+    while inner.parent is not None and inner.parent.type == "parenthesized_expression":
+        named = [c for c in inner.parent.named_children if c.type != "comment"]
+        if len(named) != 1 or len(inner.parent.named_children) != 1 or named[0] != inner:
+            break
+        if inner.parent.parent is not None and inner.parent.parent.type in _HEADED:
+            break  # `if (isX(c))`: those parentheses are the statement's own
+        inner = held = inner.parent
+    return held
+
+
+#: Statements whose condition the grammar holds in a `parenthesized_expression`.
+_HEADED = frozenset({"if_statement", "while_statement", "do_statement", "switch_statement", "with_statement"})
 
 
 #: Nodes that hand on their operand's value unchanged: the receiver of a
@@ -3255,6 +3369,8 @@ def module_receiver(
             ):
                 return False
             node = node.child_by_field_name("function")
+            if _calls_a_hook(node):
+                return False
         elif node.type == "identifier":
             name = _text(node)
             if name in params:
@@ -3266,6 +3382,53 @@ def module_receiver(
         else:
             return False
     return False
+
+
+#: A React hook's name: ``useFeatureIsOn``, ``useLDClient``, ``React.useContext``.
+_HOOK = re.compile(r"\Ause[A-Z0-9]")
+
+
+def _calls_a_hook(function: Node | None) -> bool:
+    """Whether a call's function is a React hook (by the naming rule React
+    itself enforces). What a hook returns is chosen by the tree it renders in,
+    and a test chooses that tree: whatever provider it renders above (a
+    ``GrowthBookProvider``, an ``LDProvider``, a ``PostHogProvider``, an
+    in-repo context), directly or through a helper of its own. So a read
+    reached through one is never a module client's, whoever exports the hook."""
+    if function is None:
+        return False
+    if function.type == "member_expression":
+        function = function.child_by_field_name("property")
+    return function is not None and function.type in ("identifier", "property_identifier") and bool(
+        _HOOK.match(_text(function))
+    )
+
+
+def _initial_root(declarator: Node) -> Node | None:
+    """The identifier a ``const``'s initialiser is a value of, through
+    member, index and call chains, ``new``, ``await`` and
+    :data:`_TRANSPARENT` (``posthog`` for ``const ph = posthog as X``, and
+    for ``const c = OpenFeature.getClient()`` the ``OpenFeature``), or
+    ``None`` when it starts from no name (a literal, an object, a function)."""
+    node = declarator.child_by_field_name("value")
+    seen = 0
+    while node is not None and seen < 64:
+        seen += 1
+        if node.type == "identifier":
+            return node
+        if node.type in ("member_expression", "subscript_expression"):
+            node = node.child_by_field_name("object")
+        elif node.type == "call_expression":
+            node = node.child_by_field_name("function")
+        elif node.type == "new_expression":
+            node = node.child_by_field_name("constructor")
+        elif node.type == "await_expression":
+            node = next((c for c in node.named_children if c.type != "comment"), None)
+        elif node.type in _TRANSPARENT:
+            node = _operand(node)
+        else:
+            return None
+    return None
 
 
 def _stable_declaration(bound: Node) -> bool:
@@ -3298,10 +3461,27 @@ def _stable_name(
         return False
     imported = file.import_of(name)
     if imported is not None:
-        if _npm_package(imported.specifier, imported.module):
+        if _npm_package(imported.specifier, imported.module, file.path, files.repo_dir):
             return not _package_driven(imported.specifier, files, accessors)
         return _stable_export(imported.module, imported.imported, files, depth + 1, accessors)
-    return _top_level_binding(bound) and _stable_declaration(bound)
+    if not (_top_level_binding(bound) and _stable_declaration(bound)):
+        return False
+    # A `const` holds what its initialiser named: `const ph = posthog` and
+    # `const client = OpenFeature.getClient()` are as driveable as
+    # `posthog` and `OpenFeature` are.
+    declarator = bound.parent
+    if declarator is None or declarator.type != "variable_declarator":
+        return True
+    value = declarator.child_by_field_name("value")
+    if value is not None and any(
+        n.type == "call_expression" and _calls_a_hook(n.child_by_field_name("function"))
+        for n in cross_file_keys.walk(value)
+    ):
+        return False
+    root = _initial_root(declarator)
+    if root is None or _text(root) == name:
+        return True
+    return _stable_name(file, _text(root), files, depth + 1, accessors)
 
 
 def _stable_export(
@@ -3334,7 +3514,7 @@ def _stable_export(
                 continue
             if source is not None:
                 spec_text = cross_file_ts._string_value(source)
-                if _npm_package(spec_text, target):
+                if _npm_package(spec_text, target, held.path, files.repo_dir):
                     return not _package_driven(spec_text, files, accessors)
                 return _stable_export(target, _text(local), files, depth + 1, accessors)
             return _stable_name(held, _text(local), files, depth + 1, accessors)
@@ -3344,15 +3524,20 @@ def _stable_export(
     return bool(stars) and all(_stable_export(t, name, files, depth + 1, accessors) for t in stars)
 
 
-def _npm_package(spec: str | None, module: str | None) -> bool:
+def _npm_package(spec: str | None, module: str | None, reader: str, repo_dir: str) -> bool:
     """Whether an import specifier names an npm package: bare (not relative
     or absolute), and resolving outside the repository (into
-    ``node_modules``) or not at all. A bare specifier that resolves to a
-    file of the repository (a ``paths`` alias, a workspace package) is an
-    in-repo module."""
+    ``node_modules``), or resolving to nothing while it can only be a package
+    (:func:`cross_file_ts.package_outside`: declared by a version or
+    installed, and no ``paths``, workspace package or bundler alias can read
+    it as a file of the checkout). A bare specifier that resolves to a file
+    of the repository, or that a bundler may alias to one (``@lib/client`` in
+    a ``vite.config``), is an in-repo module."""
     if spec is None or spec.startswith((".", "/")) or not spec:
         return False
-    return module is None or "/node_modules/" in module.replace("\\", "/")
+    if module is not None:
+        return "/node_modules/" in module.replace("\\", "/")
+    return cross_file_ts.package_outside(reader, spec, repo_dir)
 
 
 #: Calls that replace a module for the tests that follow.
@@ -3367,7 +3552,7 @@ _MEMBER_STUBS = frozenset(
     {
         "vi.spyOn", "jest.spyOn", "spyOn", "sinon.stub", "sinon.replace", "sinon.spy", "td.replace",
         "Object.defineProperty", "Object.defineProperties", "Object.assign", "Reflect.set",
-        "vi.mocked", "jest.mocked",
+        "vi.mocked", "jest.mocked", "jest.replaceProperty",
     }
 )
 
@@ -3432,7 +3617,9 @@ def _scan_package_doubles(name: str, files: ts_scope.Files, accessors: frozenset
         if file is None:
             return True  # unreadable: assume the worst
         test = _stubs(path, source)
-        bound = {i.local for i in file.imports if _names_package(i.specifier, name)}
+        bound = _package_bindings(file, name)
+        if test and bound and _mentions_beyond_reads(file, bound, accessors):
+            return True  # (c)
         for node in cross_file_keys.walk(file.root):
             if node.type == "call_expression":
                 callee = mock_stubs.ts_callee(node)
@@ -3448,14 +3635,6 @@ def _scan_package_doubles(name: str, files: ts_scope.Files, accessors: frozenset
                     if root_name is not None and root_name in bound:
                         return True  # (b)
                     continue
-                if test and bound:
-                    function = node.child_by_field_name("function")
-                    root_name = _root_identifier(function) if function is not None else None
-                    if root_name in bound:
-                        last = function.child_by_field_name("property") if function.type == "member_expression" else function
-                        called = _text(last) if last is not None else ""
-                        if called not in accessors:
-                            return True  # (c)
             elif node.type in ("assignment_expression", "augmented_assignment_expression") and bound:
                 left = node.child_by_field_name("left")
                 if left is not None and left.type != "identifier" and _root_identifier(left) in bound:
@@ -3464,6 +3643,81 @@ def _scan_package_doubles(name: str, files: ts_scope.Files, accessors: frozenset
                 operand = next((c for c in node.named_children if c.type != "comment"), None)
                 if operand is not None and _root_identifier(operand) in bound:
                     return True  # (b)
+    return False
+
+
+def _package_bindings(file: ts_scope.File, name: str) -> set[str]:
+    """The names ``file`` binds to what package ``name`` exports: its value
+    imports (a type-only one holds nothing), and any binding initialised or
+    assigned from one of those, through member, call and ``new`` chains
+    (``const ph = posthog``, ``const c = OpenFeature.getClient()``, ``ph =
+    posthog``, ``const { client } = sdk``), to a fixed point. Scopes are not
+    told apart: a same-named local elsewhere in the file only counts more."""
+    bound = {i.local for i in file.imports if _names_package(i.specifier, name) and not i.type_only}
+    if not bound:
+        return bound
+    # (names the holder binds, the name its value starts from)
+    holders: list[tuple[set[str], str]] = []
+    for node in cross_file_keys.walk(file.root):
+        if node.type == "variable_declarator":
+            target, root = node.child_by_field_name("name"), _initial_root(node)
+            source = None if root is None else _text(root)
+        elif node.type == "assignment_expression":
+            target, source = node.child_by_field_name("left"), _root_identifier(node.child_by_field_name("right"))
+            if target is not None and target.type != "identifier":
+                continue
+        else:
+            continue
+        if target is None or source is None:
+            continue
+        names = {
+            _text(n)
+            for n in cross_file_keys.walk(target)
+            if n.type in ("identifier", "shorthand_property_identifier_pattern")
+        }
+        holders.append((names, source))
+    grew = True
+    while grew:
+        grew = False
+        for names, source in holders:
+            if source in bound and not names <= bound:
+                bound |= names
+                grew = True
+    return bound
+
+
+#: Where a name is not a value: an import or export clause.
+_NOT_A_USE = frozenset({"import_specifier", "import_clause", "namespace_import", "export_specifier"})
+
+
+def _mentions_beyond_reads(file: ts_scope.File, bound: Set[str], accessors: Set[str]) -> bool:
+    """Whether a test file uses anything it holds from a package other than
+    by calling one of the read ``accessors`` on it (``posthog.isFeatureEnabled(...)``).
+
+    Any other use may set what the client answers, and none of them has to be
+    a call: ``new GrowthBook({...})`` handed to ``<GrowthBookProvider
+    growthbook={gb}>``, ``<LDProvider>``, ``const ph = posthog; ph.x = ...``,
+    ``posthog.init(...)``, ``setClient(fake)``. So no position is listed: a
+    name the test takes from the package and uses for anything but a read
+    counts."""
+    for node in cross_file_keys.walk(file.root):
+        if node.type not in ("identifier", "shorthand_property_identifier") or _text(node) not in bound:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type in _NOT_A_USE:
+            continue
+        if parent is not None and parent.type == "variable_declarator" and parent.child_by_field_name("name") == node:
+            continue  # the binding itself; its uses are judged
+        # A read: the name is the root of `x.accessor(...)` or `accessor(...)`.
+        chain = node
+        while chain.parent is not None and chain.parent.type == "member_expression" and chain.parent.child_by_field_name("object") == chain:
+            chain = chain.parent
+        call = chain.parent
+        if call is not None and call.type == "call_expression" and call.child_by_field_name("function") == chain:
+            last = chain.child_by_field_name("property") if chain.type == "member_expression" else chain
+            if last is not None and _text(last) in accessors:
+                continue
+        return True
     return False
 
 
@@ -3552,7 +3806,10 @@ def _reads_through_parameter(wrapper: wi.Wrapper, files: ts_scope.Files) -> bool
         and d.child_by_field_name("name").type == "identifier"
         and d.child_by_field_name("value") is not None
     }
-    return not module_receiver(read.child_by_field_name("function"), home, names, locals_, files, wrapper.accessors)
+    callee = read.child_by_field_name("function")
+    if _calls_a_hook(callee):
+        return True  # `useFeatureIsOn(k)`: the tree the caller renders in chooses
+    return not module_receiver(callee, home, names, locals_, files, wrapper.accessors)
 
 
 #: ``(path, source, owner, wrapper path)`` -> :func:`_builds_owner`'s answer:

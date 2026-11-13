@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.13.1"
+version = "2.14.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,16 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.53.0. Go: a stranded local whose value does no work (`&T{…}`, a
+    # conversion to a predeclared type, `len(xs)`) is deleted instead of kept as
+    # `_ = …`, where the `go_unshadowed` file facts (`go_predeclared`) say no
+    # declaration rebinds those names; a local left only stored into (one target
+    # of a multi-value assignment, `x++`, `x += v`, a struct value's field) goes
+    # with its stores; an `else`, trailing `else if` or `if` those deletions
+    # emptied goes (piranha#307). Swift: `x as? T ?? d` parses (grammar
+    # canopy-labs/tree-sitter-swift `+canopy.2`, piranha#308), and the
+    # tree-sitter-swift pin below moves with it. No other grammar rev moved.
+    #
     # 0.52.0. Swift: the grammar is now canopy-labs/tree-sitter-swift (upstream
     # 0.7.3 plus the empty tuple `()` as an expression), so a file using
     # `completion(.success(()))` is no longer refused at input. The
@@ -596,7 +606,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.52.0",
+    "polyglot-piranha==0.53.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -665,15 +675,17 @@ dependencies = [
     # Swift. NOT a PyPI release, pinned EXACTLY for the same reason as the
     # grammars above: Gate 1 must parse what the engine rewrites.
     # polyglot-piranha bundles upstream 0.7.3 (exactly 0.7.3: 0.7.4 moves the `!`
-    # of a negated method call out of the callee) plus ONE grammar patch
-    # (canopy-labs/tree-sitter-swift): the empty tuple `()` is an expression, so
-    # `completion(.success(()))`, `f(x: ())` and `(1, ())` parse. Stock 0.7.3
-    # and PyPI's 0.7.4 report a MISSING node on each. The only node-types change
-    # is `tuple_expression.value` becoming optional. Until this pin, the gate
-    # took PyPI's 0.7.4 and so disagreed with the engine about the `!` too.
+    # of a negated method call out of the callee) plus TWO grammar patches
+    # (canopy-labs/tree-sitter-swift). `+canopy.1`: the empty tuple `()` is an
+    # expression, so `completion(.success(()))`, `f(x: ())` and `(1, ())` parse;
+    # stock 0.7.3 and PyPI's 0.7.4 report a MISSING node on each. `+canopy.2`:
+    # `x as? T ?? d` parses (upstream's fix for it, ported onto the 0.7.3
+    # scanner); stock 0.7.3 reports an ERROR. Neither changes a node type the
+    # rules match. Until the first pin, the gate took PyPI's 0.7.4 and so
+    # disagreed with the engine about the `!` too.
     # Resolves only from wheels/ (PEP 440 local segment), filled by
     # scripts/fetch_piranha_wheels.py. Bump the segment when the engine's pin moves.
-    "tree-sitter-swift==0.7.3+canopy.1",
+    "tree-sitter-swift==0.7.3+canopy.2",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the

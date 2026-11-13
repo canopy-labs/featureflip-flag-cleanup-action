@@ -2017,11 +2017,25 @@ proven unless something in the repository lets a test change it: a module
 mock of the package (`vi.mock("posthog-js", ...)` and the like), a
 `__mocks__/<package>` file, a test runner's `automock` or a
 `moduleNameMapper`/`alias` naming it, a spy, stub or assignment on what is
-imported from it (`vi.spyOn(posthog, ...)`, `posthog.x = ...`), or a test
-calling anything it exports other than your `accessors`
-(`posthog.init(...)`). A caller may always choose for
-`client.isEnabled` on a parameter, `(client ?? fallback).isEnabled`,
-`pick(ctx).isEnabled` and `this.client.isEnabled`. Only the
+imported from it (`vi.spyOn(posthog, ...)`, `posthog.x = ...`,
+`jest.replaceProperty(posthog, ...)`), in any file and through any name
+initialised from it (`const ph = posthog`), or a test file using anything it
+imports from the package other than by calling one of your `accessors` on it:
+`posthog.init(...)`, `new GrowthBook(...)`, `<GrowthBookProvider>`,
+`<LDProvider>`, a cast or an alias (`const ph = posthog as any`). A bare
+specifier counts as an npm package only when it can be nothing else: it
+resolves into `node_modules`, or no `paths` entry, workspace package or
+bundler alias can read it as a file of your repository and a `package.json`
+declares it (or it is installed). So `@lib/client` aliased by a
+`vite.config` to an in-repo module with a setter is not proven. A `const`
+initialised from a name (`const ph = posthog`, `const client =
+OpenFeature.getClient()`) is proven only when that name is. A caller may
+always choose for `client.isEnabled` on a parameter, `(client ??
+fallback).isEnabled`, `pick(ctx).isEnabled`, `this.client.isEnabled`, and a
+read through a React hook (`useFeatureIsOn("foo")`,
+`useLDClient().variation(...)`, `usePostHog()`, an in-repo `useFlags()`),
+whatever exports it: the provider a test renders above it, itself or through
+a helper, chooses what it returns. Only the
 receiver counts, so a module-level client read with a parameter among its
 arguments (`client.isEnabled("x", false, user.id)`) is inlined as before. A
 mention that cannot call the wrapper does not refuse: `vi.mocked(isFooEnabled)
@@ -2045,7 +2059,15 @@ a statement of its own is deleted, and any other call becomes
 `Promise.resolve(<value>)` (`(id) => getFlags().isFooEnabled(id)` becomes
 `(id) => Promise.resolve(true)`). A spy on it answering
 `mockResolvedValue(<value>)` or `mockReturnValue(<value>)` decides its test.
-This applies to a factory's members only; any other wrapper of such a read is
+A top-level function wrapper may return a Promise too, and is inlined the same
+way: one whose read there becomes `Promise.resolve(<value>)`, with no return
+type written or exactly `Promise<boolean>`
+(`function isFooEnabled(c: Client): Promise<boolean> { return c.isEnabled("foo", false); }`),
+and an `async` one whose body returns the read or awaits it
+(`async function isFooEnabled(c) { return await c.isEnabled("foo"); }`), with
+no return type written or exactly `Promise<boolean>`. Its own tests go with
+it, and a test that drives it refuses the flag, as for a synchronous wrapper.
+A class's or an object's `async` method, and one returning such a read, is
 not inlined.
 
 TypeScript's class types are structural. Anything with the same members can
@@ -2165,8 +2187,11 @@ or re-exported. It also applies to `export * as`, a dynamic `import()`,
 such use is reported as `receiver-unproven`. The wrapper's callers are still
 inlined, and the removal is partial. An `export * from` the module (a
 barrel) is followed rather than refused, so a namespace of the barrel handed
-on keeps the wrapper too. A method wrapper is reached through an instance,
-so this does not apply to it.
+on keeps the wrapper too. In an MDX document only its top-level `import`
+and `export` lines and its JSX count: a fenced code block, an inline code
+span or the frontmatter (a JSON sample's `"from": { … }`, say) hands nothing
+on. A method wrapper is reached through an instance, so this does not apply
+to it.
 
 The wrapper's own run also rewrites callers in another file type of the
 family, such as `Checkout.tsx` calling `flags.ts`. Two conditions apply: that
@@ -4364,6 +4389,20 @@ becomes `_ = featureflags.GetClient(platform)` in Go, and a bare
 lists each one. Most are getters that fetched the flag client or built an
 evaluation context for the read that just went, and do nothing once it is gone.
 
+In Go, a value that does no work is deleted with its variable instead:
+building a struct (`&Options{Limit: 10}`), a conversion to a built-in type
+(`string(id)`, `int64(n)`, `[]byte(s)`), and `len`, `cap`, `min`, `max`,
+`real`, `imag`, `complex` or `new` of operands that do no work themselves.
+That holds unless the file, or another file of its package, declares one of
+those names itself (a package's own `max`, say), when the call is kept. A Go
+variable the removal leaves only written to goes too, with each write: `x = v`,
+one target of `x, err = load()` (which becomes `_, err = load()`), `x++`,
+`x--`, `x += v` and the other compound assignments that cannot panic (`/=`,
+`%=`, `<<=` and `>>=` are kept), and a field of a struct value whose type the
+same file declares. A write whose value calls something keeps it as `_ = …`. An
+`else` these deletions leave empty goes, and so does an `if` or a trailing
+`else if` they leave empty when its condition does no work.
+
 Name those functions in `side-effect-free-calls` and the run deletes them:
 
 ```yaml
@@ -5127,6 +5166,7 @@ client.boolVariation(Flags.NEW_CHECKOUT.key(), ctx, false);
 | Kotlin | a top-level `enum class Flags(val key: String)` with no secondary constructor; the entry passes the key positionally and has no body | `Flags.X.key`; bare `X.key` under `import pkg.Flags.X`, or `Y.key` under `import pkg.Flags.X as Y`. Only an alias of the entry's own import counts: `F.X.key` under `import pkg.Flags as F` is not resolved (`unsupported-form`) |
 | PHP | a string-backed `enum Flags: string` declared at the top of its file or of a braced namespace, with `case X = 'key';` as a plain string | `Flags::X->value` (or the import alias, a fully qualified `\Ns\Flags::X->value`, or `Flags::X->value` in the enum's own namespace). `?->value`, `->name` and methods of the enum are not resolved (`unsupported-form`); a read inside the enum's own file is not resolved either, nor is a Twig, Latte or Smarty template or Symfony YAML (`!php/enum`, an `enum('...')` expression) or XML configuration that names the case |
 | Python | a top-level `class Flags(StrEnum)`, `(str, Enum)`, `(Enum)` or Django `(models.TextChoices)` whose body holds only members (literals, `auto()`, or for `TextChoices` a `"key", "Label"` or `"key", _("Label")` pair), a docstring and public methods, with no metaclass and no decorator but `@unique`; the member is `X = "key"` as a plain string | `Flags.X.value` through `from pkg.flags import Flags` (or `as F`), `import pkg.flags` (`pkg.flags.Flags.X.value`), `import pkg.flags as m` (`m.Flags.X.value`) or `from pkg import flags` (`flags.Flags.X.value`). A bare `Flags.X` passed as the key is not resolved (`not-a-read`): a `(str, Enum)` member formats as `Flags.X`, and a wrapper receiving the member may read `.name` or `.value` from it. `.name`, `.label` and methods are `unsupported-form`, as is a read inside the enum's own file |
+| Python (plain class) | a top-level `class Flags:` (or `Flags(object)`) with no decorator or metaclass whose body is only a docstring, `pass` and `NAME = literal` assignments, annotated or not, each name once, with the member as `X = "key"` as a plain string and no method. Python lets any code assign to a class, so the whole checkout is checked: a store to the class (`Flags.X = ...`, `del Flags.X`, `setattr(Flags, ...)`, `mock.patch.object(Flags, ...)`, `mock.patch("pkg.Flags.X", ...)`), the class handed on (`configure(Flags)`, `F = Flags`, `[Flags]`), or the class rebound refuses the entry and every read of it (`unsupported-form`); calling, subscripting, iterating and annotating with it are fine | `Flags.X` as the key, through the same imports as an enum member, and in the class's own file. `Flags.X.upper()` and `Flags.X.value` are `unsupported-form`; `Flags.X` passed anywhere but as the key is `not-a-read`. A class with no base and no method that fails the proof (a decorator, a computed value) is reported as `enum-unproven` at the member; a class with a method or a base is not reported. A class that names it among its bases, and a store of an attribute named like one of its members through any object (`type(f).X = ...`, `f.__class__.X = ...`, `setattr(b, "X", ...)`), refuse the entry, and so does any string that is only the class's name (`getattr(fm, "Flags")`, `"app.flags.Flags"`). A computed attribute name (`setattr(type(f), attr, v)`), and a module reached by a computed name (`getattr(mod, mod.__all__[0])`, `vars(mod)[n]`), cannot be seen |
 | Swift | a case of an `enum` declared at the top level or nested in a struct, class, enum or actor, in a module read from `Package.swift` or an Xcode project; the enum and every type around it are not `private` or `fileprivate`, carry no attribute and sit outside `#if`, and the case is alone in its `case` clause with no associated values. Either a raw value, `enum Flags: String` (or `Swift.String`) with `case X = "key"` as a plain single-line string, or a computed `var key: String` (any name; not `static`, `private` or `fileprivate`, no attribute, outside `#if`, declared in the enum's own body) whose getter is one `switch self` whose arms name the enum's cases as `.X` only (no binding, `where`, `_` or other member; `default:` is fine) and whose arm for `X` is `return "key"` or just `"key"`. A raw-value enum's other conformances must be protocols the repository declares or `Equatable`, `Hashable`, `Comparable`, `CaseIterable`, `Codable`, `Encodable`, `Decodable`, `CodingKey`, `Sendable`, `Identifiable`, `CustomStringConvertible` or `CustomDebugStringConvertible`, and nothing in the repository may declare a `rawValue` the enum could pick up instead of its own: in the enum's body, in a protocol it conforms to, or in any extension at all, of any type and however it is spelled (an extension of an unrelated type counts too). With either shape, no member of the enum, and no member of an extension that could reach it, may carry an attribute other than `@available`, `@objc`, `@nonobjc`, `@discardableResult`, `@inlinable`, `@usableFromInline`, `@inline`, `@frozen`, `@preconcurrency`, `@warn_unqualified_access`, `@_disfavoredOverload`, `@Sendable` or `@MainActor` (the last only while the repository declares no macro named `MainActor`): an attached macro there may add members | `Flags.X.rawValue`, or `Flags.X.key` through the property, with `Flags` resolved as a constant's owner is: in the enum's module with no import, from another module after a plain `import` that allows the access. Also `Outer.Flags.X.rawValue` for a nested enum, and `Module.Flags.X.rawValue` when no type, member or local named like the module is in scope. An implicit member (`.X`, anywhere in the repository, `case .X:` included), `Flags.X` passed as a value, another member of the case (`.hashValue`), a read inside the enum's own file, and a read in a module holding an extension of the enum that declares a member named like the accessor are not resolved (`unsupported-form` or `not-a-read`). Neither is a read whose `Flags` (or `Module.Flags`) a typealias in the repository may stand for: one in the reading module, at the top level or inside a type, and for `Module.Flags` one declared anywhere (`import-unresolved`) |
 | TypeScript / TSX / JavaScript | an `export enum` (or `export const enum`) declared once in its file, with `X = "key"`; or an `export const Flags = { X: "key" } as const` object (see below) | `Flags.X` (or the alias's text) through `import { Flags }`, `const { Flags } = require(...)` or `const { Flags: F } = require(...)` (read as `F.X`); `ns.Flags.X` through `import * as ns` or `const ns = require(...)`. A read of an entry off an object that spreads the enum (`ax.features.X` after `features: { ...Flags, enabled }`, or `useAnalytics().features.X` when the hook builds such an object) is not followed: it is refused as `import-unresolved` at its line, and the entry is reported as left. `import { Flags }` is also followed through a barrel and a workspace package (`export * from "./flags"`, `import { Flags } from "@acme/shared"`) as a key constant's import is; its reads fold, and the entry is kept, since the barrel's re-export hands the enum on |
 
@@ -5293,7 +5333,13 @@ module (`{#await import("./flags")}`) or holds a specifier that could name the
 file (`from "./flags"`). Other text in the markup does not count. A file whose
 scripts cannot be told apart from its markup leaves the entries in place
 wherever it mentions the enum or its file. An MDX document has no script
-block, so only the imports and loads it holds count there, as in markup. Prose
+block, so only the imports and loads it holds count there, as in markup. Its
+fenced code blocks, inline code spans and frontmatter are text MDX prints and
+never runs, so nothing in them counts (a JSON sample's `"from": { … }`, an
+`import` in a code block); its top-level `import` and `export` blocks do,
+through to the blank line that ends the statement (a fence line inside an
+exported template literal opens no fence there). A fence or frontmatter that
+never closes, and a code span that runs into an `import` line, count as code. Prose
 that quotes code after the word `from` (``from `bg-{color}-600` ``) is not an
 import: a specifier is always quoted with `'` or `"`.
 The reads that could be resolved are still folded.
@@ -6738,6 +6784,35 @@ left alone:
 * any other write (`+=`, `||= compute`, `a, b = …`);
 * a statement sharing its line with another (`limit = 3; go`).
 
+A Rails callback **guard** the fold empties is cleaned up. A method whose only
+statement is left as a bare `return` becomes an empty method (both return
+`nil`; a bare `return` after other statements stays, since dropping it would
+change the value the method returns). An empty method named by a
+`before_action` (or `before_filter`, `prepend_before_action`,
+`append_before_action`, with or without `only:`/`except:`/`if:`) is deleted
+together with every such callback, the pull request lists it as a callback guard
+method, and it must have had a body before the run. It is kept, and so are its
+callbacks, when:
+
+* the name is spelled anywhere else, in this file or in any Ruby or ERB file of
+  the checkout: a `skip_before_action :name` in a subclass (which raises once
+  the callback is gone), `send(:name)`, `respond_to?`, a string, a comment;
+* no `before_action` names it, since a method with no callback may be an action
+  or a hook the framework calls by name, or the method is public (only a
+  `private` or `protected` guard is deleted; a public one may be routed to);
+* a callback names it with an `if:` or `unless:` that is not a plain symbol (a string is eval'd on old Rails;
+  a lambda, proc or block may do more than decide);
+* a callback names another symbol too (`before_action :name, :other`), takes a
+  block, has a receiver, or is not a plain statement of the same class body
+  (inside `included do`, say);
+* the method takes parameters, or there is a comment inside it or directly
+  above it or above one of its callbacks;
+* it was already empty before the run.
+
+A `private` or `protected` left with nothing after it goes too. A guard reached
+only through a computed call such as `send("ensure_#{name}_enabled")` cannot be
+seen, and is deleted if nothing spells its name.
+
 A `require` is never removed: it runs the file it names.
 
 ## Supported ERB flag-read shapes
@@ -7153,11 +7228,21 @@ Go runs a method call's receiver, then its arguments, before the call, and the
 fold replaces the whole call. So a receiver or argument that calls something or
 receives from a channel (`getClient().BoolVariation("KEY", buildCtx(u), false)`)
 is kept, as `_ = getClient()` and then `_ = buildCtx(u)` on the lines before the
-statement holding the read, and still runs once, first. A receiver or argument
-that only names something (`s.client.BoolVariation("KEY", u, false)`), or only
-computes a constant (`1<<len(arr)`), folds with the read as before. A `len`,
-`cap`, `min`, `max`, `real`, `imag` or `complex` that your package declares
-itself, in any of its files, is a call like any other and is kept. A kept
+statement holding the read, and still runs once, first. When the read is a whole
+statement (`getClient().BoolVariation("KEY", buildCtx(u), false)` on its own
+line), the kept lines take its place and nothing else is left of it. A spread
+argument (`opts()...`) is kept without its dots (`_ = opts()`). A receiver or
+argument that only names something (`s.client.BoolVariation("KEY", u, false)`),
+or only computes a constant (`1<<len(arr)`), folds with the read as before, and
+so does one that does nothing a reader needs to see: `context.Background()` and
+`context.TODO()` (when `context` is the standard library's), and a conversion of
+one value to a predeclared type (`string(id)`, `int64(limit)`). A `len`, `cap`,
+`min`, `max`, `real`, `imag`, `complex` or predeclared type name that your
+package declares itself, in any of its files, is a call like any other and is
+kept. A call the tool cannot know is harmless, such as `r.Context()` or
+`ldcontext.New(…)`, is kept too; the names a Go codebase usually needs in
+[`side-effect-free-calls`](#discarded-calls) for these are `Context`,
+`WithContext` and `New`. A kept
 expression is written the way gofmt writes it on its own line
 (`"org-"+org()` becomes `_ = "org-" + org()`). The calls can only move ahead of
 the statement when nothing in it runs before the read and the read always runs,
@@ -7166,7 +7251,8 @@ is in an `else if`, a `case` value, a loop header, the condition of an `if` or
 `switch` that has an initializer (`if v := …; read(f(v))`), on the right of `&&`
 or `||`, after another call in the same statement, at package level, on a line
 shared with another statement, or when the call spans several lines. Each kept call is listed in the pull
-request with the other [discarded calls](#discarded-calls), and
+request, in its own note ("kept from the removed flag read") apart from the
+[discarded calls](#discarded-calls) a stranded variable leaves, and
 `side-effect-free-calls` deletes the ones you name.
 
 `var useNew = client.BoolVariation(…)` is **not** inlined: the read is replaced
@@ -7244,9 +7330,10 @@ parameter or named result. A call among the read's arguments
 (`c.IsFlagEnabled(ctx, "k", org, groupsFor(org))`) is kept, as `_ = groupsFor(org)`
 on the line before, since it may have side effects, and so is a receiver that
 calls something (`getClient().IsFlagEnabled(…)`), ahead of the arguments' calls,
-as described above; any other argument that can do
-work (an index, a receive, a function literal) leaves the read, and the run says
-so. `err` must appear nowhere else in the function, or be declared earlier
+as described above, and so is an argument that receives from a channel; an
+argument that does no work (an index, a function literal that is not called) goes
+with the read. When the kept work cannot be placed, the run refuses the flag and
+says why. `err` must appear nowhere else in the function, or be declared earlier
 (`o, err := lookup(…)`, then `on, err := read(…)`, which assigns the same `err`) when
 that earlier `err` is read somewhere, no closure or loop can see it, and its next
 mention after the check assigns it again. Beside a blank error (`on, _ := …`) the
@@ -8504,6 +8591,13 @@ means no PR.
   `[isEnabled, id]` becomes `[id]`, and `[isEnabled]` becomes `[]`. A literal
   you wrote there, an array on several lines or with a comment, and an array
   anywhere but a hook's dependency argument are left as they are.
+
+  In TypeScript and JavaScript, a run of blank lines that a removal makes
+  longer than the file had at that spot (a `const` deleted from between two
+  blank lines leaves both) is shortened to the longest run the file had
+  there, so a file Prettier accepted before the run still passes. A run of
+  blank lines you wrote away from the change, and blank lines inside a
+  template literal, are left as they are.
 
   Two layouts a formatter wraps only because a line was too long are put back
   on one line the same way once the removal shortens it enough. In Python, a

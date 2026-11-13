@@ -1038,6 +1038,162 @@ def strip_introduced_trailing_whitespace(before: str, after: str, language: str)
     return "".join(out)
 
 
+def _blank_runs(lines: list[str]) -> list[tuple[int, int]]:
+    """``(first, end)`` of each run of blank lines (whitespace only)."""
+    runs: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip():
+            index += 1
+            continue
+        first = index
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        runs.append((first, index))
+    return runs
+
+
+def _line_opcodes(old: list[str], new: list[str]) -> list[tuple[str, int, int, int, int]]:
+    """``difflib``-style opcodes of two line lists, cheap on a big file.
+
+    The common first and last lines are cut off first, and what lies between
+    is split at the lines that occur exactly once on each side and keep their
+    order (patience anchors: a function's signature, an import), so each
+    ``SequenceMatcher`` runs on the few lines between two anchors. Without
+    its junk heuristic (blank lines are the popular line it would drop) it
+    is quadratic in what it is given: a 16,000-line file took 4 s and a
+    24,000-line file of repeated braces 24 s whole."""
+    limit = min(len(old), len(new))
+    head = 0
+    while head < limit and old[head] == new[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and old[len(old) - 1 - tail] == new[len(new) - 1 - tail]:
+        tail += 1
+    blocks: list[tuple[str, int, int, int, int]] = []
+
+    def equal(i1: int, i2: int, j1: int, j2: int) -> None:
+        if i2 > i1:
+            blocks.append(("equal", i1, i2, j1, j2))
+
+    def segment(i1: int, i2: int, j1: int, j2: int) -> None:
+        if i1 == i2 and j1 == j2:
+            return
+        if i1 == i2 or j1 == j2:
+            blocks.append(("insert" if i1 == i2 else "delete", i1, i2, j1, j2))
+            return
+        matcher = difflib.SequenceMatcher(None, old[i1:i2], new[j1:j2], autojunk=False)
+        blocks.extend((tag, a + i1, b + i1, c + j1, d + j1) for tag, a, b, c, d in matcher.get_opcodes())
+
+    equal(0, head, 0, head)
+    i_end, j_end = len(old) - tail, len(new) - tail
+    counts: dict[str, list[int]] = {}
+    for index in range(head, i_end):
+        counts.setdefault(old[index], [0, 0, -1])[0] += 1
+        counts[old[index]][2] = index
+    positions: dict[str, int] = {}
+    for index in range(head, j_end):
+        entry = counts.get(new[index])
+        if entry is not None:
+            entry[1] += 1
+            positions[new[index]] = index
+    pairs = sorted(
+        (entry[2], positions[line]) for line, entry in counts.items() if entry[0] == 1 and entry[1] == 1
+    )
+    # The longest run of pairs increasing on both sides (patience sorting).
+    tops: list[int] = []
+    links: list[int] = []
+    for number, (_i, j) in enumerate(pairs):
+        place = _place(pairs, tops, j)
+        links.append(tops[place - 1] if place else -1)
+        if place == len(tops):
+            tops.append(number)
+        else:
+            tops[place] = number
+    anchors: list[tuple[int, int]] = []
+    current = tops[-1] if tops else -1
+    while current >= 0:
+        anchors.append(pairs[current])
+        current = links[current]
+    anchors.reverse()
+    i, j = head, head
+    for ai, aj in anchors:
+        segment(i, ai, j, aj)
+        equal(ai, ai + 1, aj, aj + 1)
+        i, j = ai + 1, aj + 1
+    segment(i, i_end, j, j_end)
+    equal(i_end, len(old), j_end, len(new))
+    return blocks
+
+
+def _place(pairs: list[tuple[int, int]], tops: list[int], j: int) -> int:
+    """Where ``j`` goes among the pile tops (whose ``j`` values increase)."""
+    low, high = 0, len(tops)
+    while low < high:
+        middle = (low + high) // 2
+        if pairs[tops[middle]][1] < j:
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
+def collapse_introduced_blank_runs(before: str, after: str, language: str) -> str:
+    """Shorten each run of blank lines a deletion made longer than the file
+    had at that spot, to the longest run there before: deleting a top-level
+    statement that sat between two blank lines leaves both, and Prettier
+    (and every formatter of the TypeScript family) keeps one.
+
+    "At that spot" is decided from a line diff of ``before`` and ``after``:
+    a run that lies wholly in unchanged lines is the customer's own and is
+    left as found, so is any run no longer than the longest blank run the
+    original had in or beside the changed lines it touches. Never lengthens,
+    never touches a line the run did not change the neighbourhood of, and
+    never removes a blank line inside a token (a template literal, a block
+    comment: :func:`_leaf_spans`)."""
+    if after == before or not supported(language):
+        return after
+    old = before.splitlines(keepends=True)
+    new = after.splitlines(keepends=True)
+    runs = [(a, b) for a, b in _blank_runs(new) if b - a >= 2]
+    if not runs:
+        return after
+    old_runs = _blank_runs(old)
+    blocks = _line_opcodes(old, new)
+    drop: set[int] = set()
+    for first, end in runs:
+        touched: set[int] = set()
+        unchanged = False
+        for tag, i1, i2, j1, j2 in blocks:
+            if j2 <= first - 1 or j1 > end:
+                continue  # neither in the run nor beside it
+            if tag == "equal":
+                if j1 <= first and end <= j2:
+                    unchanged = True
+                    break
+                lo, hi = max(j1, first), min(j2, end)
+                touched.update(range(i1 + lo - j1, i1 + hi - j1))
+            else:
+                touched.update(range(max(i1 - 1, 0), i2 + 1))
+        if unchanged:
+            continue
+        longest = max((b - a for a, b in old_runs if any(a <= i < b for i in touched)), default=1)
+        excess = (end - first) - max(longest, 1)
+        drop.update(range(end - excess, end))
+    if not drop:
+        return after
+    leaves = _leaf_spans(after, language)
+    out: list[str] = []
+    offset = 0
+    for index, line in enumerate(new):
+        if index in drop and not any(begin <= offset < finish for begin, finish in leaves):
+            offset += len(line.encode("utf-8"))
+            continue
+        out.append(line)
+        offset += len(line.encode("utf-8"))
+    return "".join(out)
+
+
 #: The three runs a single-line keyed-entry deletion leaves behind. The engine
 #: swallows the entry and its separator but not the space that preceded the
 #: entry, so what remains is the separator followed by two spaces, or an

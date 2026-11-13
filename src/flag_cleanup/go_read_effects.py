@@ -15,9 +15,10 @@ the read, in that order::
 
 The read is left whole; the engine folds it as before, and the kept statements
 run where the read's evaluation started. A receiver or argument that does no
-work (a name, a field chain, a literal, an operator on those, a builtin that can
-be constant such as ``len`` unless its package declares that name) is left to the
-fold unchanged, so ``s.c.IsFlagEnabled(…)`` folds exactly as it did, and
+work (a name, a field chain, a literal, an operator on those, an index, a builtin
+that can be constant such as ``len`` unless the file or its package spells that name
+otherwise, ``context.Background()``, a conversion to a predeclared type) is left to
+the fold unchanged, and a type assertion (``x.(T)``) is work and is kept, so ``s.c.IsFlagEnabled(…)`` folds exactly as it did, and
 ``1<<len(arr)`` is not kept as ``_ = 1 << len(arr)``, which would give the
 constant the default type. Each kept expression is written as gofmt writes it
 alone on the right of ``_ =`` (:func:`kept_text`: go/printer spaces binary
@@ -49,7 +50,7 @@ from dataclasses import dataclass, field
 
 from tree_sitter import Node
 
-from flag_cleanup import go_handle_reads, mock_stubs
+from flag_cleanup import discarded_calls, go_handle_reads, go_predeclared, mock_stubs
 from flag_cleanup.syntax import _parse, _walk
 
 KIND = "kept receiver or argument"
@@ -87,6 +88,9 @@ class _Hoist:
     #: writes each on the right of ``_ =``.
     expressions: tuple[str, ...]
     call: Node
+    #: The read is the whole statement (a discarded read): the kept lines take
+    #: its place, since nothing is left to fold.
+    bare: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,78 +103,110 @@ class _Declined:
 #: and as ``_ = 1 << len(arr)`` it takes the default type and can overflow.
 _CONSTANT_BUILTINS = frozenset({"len", "cap", "min", "max", "real", "imag", "complex"})
 
+#: Predeclared types a one-argument conversion may name without running code:
+#: ``string(id)``, ``int64(limit)``. Unless the file or package declares the name.
+_BASIC_TYPES = frozenset(
+    "bool string byte rune int int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 uintptr "
+    "float32 float64 complex64 complex128".split()
+)
 
-def _declared_names(root: Node) -> frozenset[str]:
+#: The names whose meaning :func:`does_work` assumes, so a declaration of one is a shadow.
+_SHADOWABLE = _CONSTANT_BUILTINS | _BASIC_TYPES | {"unsafe"}
+
+#: The standard library calls that take no argument and do nothing but return a
+#: value (``context.Background()``, ``context.TODO()``), by import path.
+_INERT_STDLIB_CALLS = {"context": frozenset({"Background", "TODO"})}
+
+
+def _declared_names(root: Node, imports: bool = True) -> frozenset[str]:
     """Every name ``root`` declares anywhere: a builtin it shadows is a call like any other."""
     found: set[str] = set()
     for node in _walk(root):
         if node.type in ("function_declaration", "var_spec", "const_spec", "type_spec",
                          "parameter_declaration", "variadic_parameter_declaration", "type_parameter_declaration"):
             found.update(_text(n) for n in node.children_by_field_name("name"))
+        elif node.type == "type_switch_statement":
+            alias = node.child_by_field_name("alias")
+            if alias is not None:
+                found.update(_text(n) for n in alias.named_children if n.type == "identifier")
         elif node.type in ("short_var_declaration", "range_clause", "receive_statement"):
             left = node.child_by_field_name("left")
             if left is not None:
                 found.update(_text(n) for n in left.named_children if n.type == "identifier")
-        elif node.type == "import_spec":
+        elif imports and node.type == "import_spec":
             name = node.child_by_field_name("name")
             if name is not None:
                 found.add(_text(name))
     return frozenset(found)
 
 
-#: A file that never spells one of the names cannot declare it; the parse decides
-#: the rest (a grouped `var (` puts the keyword and the name on different lines).
-_SHADOW_HINT = re.compile(rb"\b(?:len|cap|min|max|real|imag|complex)\b")
+def shadowed_names(root: Node) -> frozenset[str]:
+    """The names :func:`does_work` assumes that ``root`` itself declares."""
+    return _declared_names(root) & _SHADOWABLE
 
 
-def _package_clause(root: Node) -> str | None:
-    clause = next((c for c in root.named_children if c.type == "package_clause"), None)
-    if clause is None:
-        return None
-    name = next((c for c in clause.named_children if c.type == "package_identifier"), None)
-    return _text(name) if name is not None else None
+def inert_packages(root: Node) -> frozenset[str]:
+    """``name=path`` for each name this file gives a standard-library package whose
+    argument-less constructors do nothing (``context`` for ``context.Background()``).
+
+    Like :mod:`flag_cleanup.go_predeclared`, not a list of binding sites: the
+    import must be exactly that path, unaliased or aliased by a plain name, and the
+    name must be spelled nowhere else as an ``identifier`` (a package-qualified
+    type spells it as a ``package_identifier``) except as the operand of a
+    selector (``context.Background``). Whatever else binds the name (a parameter,
+    a local, a type-switch alias, a range variable) is an identifier that is not
+    that operand, so it withholds; a use of something that does withholds too."""
+    imports: list[tuple[str, str, Node]] = []
+    for node in _walk(root):
+        if node.type != "import_spec":
+            continue
+        path = node.child_by_field_name("path")
+        if path is None or _text(path)[1:-1] not in _INERT_STDLIB_CALLS:
+            continue
+        alias = node.child_by_field_name("name")
+        name = _text(alias) if alias is not None else _text(path)[1:-1]
+        if name in ("_", "."):
+            continue
+        imports.append((name, _text(path)[1:-1], alias if alias is not None else path))
+    found: set[str] = set()
+    for name, path, spelled in imports:
+        clean = True
+        for node in _walk(root):
+            if node.type not in ("identifier", "package_identifier") or _text(node) != name:
+                continue
+            if node.id == spelled.id or node.type == "package_identifier":
+                continue
+            parent = node.parent
+            if parent is not None and parent.type == "selector_expression":
+                operand = parent.child_by_field_name("operand")
+                if operand is not None and operand.id == node.id:
+                    continue
+            clean = False
+            break
+        # Another import of the same name is a build error, not a case to handle.
+        if clean and sum(1 for n, _, _ in imports if n == name) == 1:
+            found.add(f"{name}={path}")
+    return frozenset(found)
 
 
 def package_shadows(path: str | None, source: str) -> frozenset[str]:
-    """The builtins that can be constant (``len``, ``max``, …) which a package-level
-    declaration in another file of ``path``'s package redeclares: every ``.go``
-    file in its directory with the same package clause (a test file in the
-    package's own clause counts, an external ``_test`` package does not).
-    ``unsafe`` is an import, so file-scoped, and is not asked about here."""
+    """The names :func:`does_work` assumes (``len``, ``string``, …) that this file
+    cannot be trusted to mean what Go predeclares them as. Decided by
+    :mod:`flag_cleanup.go_predeclared`, which withholds a kind (the builtins, the
+    predeclared types) when the file spells one of its names anywhere but as a call's
+    callee, when another file of the package declares one, or when the file or such a
+    sibling does not parse; then every name of that kind counts as shadowed.
+    Without a path nothing can be said about siblings, and the answer is the
+    file's own declarations (:func:`shadowed_names`) alone."""
     if path is None:
         return frozenset()
-    package = _package_clause(_parse(source, "go"))
-    directory = os.path.dirname(os.path.abspath(path))
-    found: set[str] = set()
-    try:
-        entries = sorted(os.listdir(directory))
-    except OSError:
-        return frozenset()
-    for entry in entries:
-        sibling = os.path.join(directory, entry)
-        if not entry.endswith(".go") or sibling == os.path.abspath(path) or not os.path.isfile(sibling):
-            continue
-        try:
-            data = open(sibling, "rb").read()
-        except OSError:
-            continue
-        if not _SHADOW_HINT.search(data):
-            continue
-        try:
-            root = _parse(data.decode("utf-8"), "go")
-        except UnicodeDecodeError:
-            continue
-        if _package_clause(root) != package:
-            continue
-        for declaration in root.named_children:
-            specs: list[Node] = []
-            if declaration.type == "function_declaration":
-                specs = [declaration]
-            elif declaration.type in ("var_declaration", "const_declaration", "type_declaration"):
-                specs = [n for n in _walk(declaration) if n.type in ("var_spec", "const_spec", "type_spec", "type_alias")]
-            for spec in specs:
-                found.update(_text(n) for n in spec.children_by_field_name("name"))
-    return frozenset(found) & _CONSTANT_BUILTINS
+    granted = {fact["go_unshadowed"] for fact in go_predeclared.unshadowed_facts(path, source)}
+    shadowed: set[str] = set()
+    if "builtins" not in granted:
+        shadowed |= _CONSTANT_BUILTINS
+    if "types" not in granted:
+        shadowed |= _BASIC_TYPES
+    return frozenset(shadowed)
 
 
 def _is_constant_builtin(call: Node, shadowed: frozenset[str]) -> bool:
@@ -188,22 +224,67 @@ def _is_constant_builtin(call: Node, shadowed: frozenset[str]) -> bool:
     return False
 
 
-def does_work(node: Node, shadowed: frozenset[str] = frozenset()) -> bool:
+def _is_inert_stdlib_call(call: Node, inert: frozenset[str]) -> bool:
+    """``context.Background()`` / ``context.TODO()`` with ``context`` the standard library's."""
+    function = call.child_by_field_name("function")
+    arguments = call.child_by_field_name("arguments")
+    if function is None or function.type != "selector_expression" or arguments is None:
+        return False
+    if arguments.named_children:
+        return False
+    operand, field_ = function.child_by_field_name("operand"), function.child_by_field_name("field")
+    if operand is None or field_ is None or operand.type != "identifier":
+        return False
+    for entry in inert:
+        name, _, path = entry.partition("=")
+        if name == _text(operand) and _text(field_) in _INERT_STDLIB_CALLS[path]:
+            return True
+    return False
+
+
+def _is_basic_conversion(call: Node, shadowed: frozenset[str]) -> bool:
+    """``string(x)``, ``int64(x)``: a conversion to a predeclared type, one argument.
+    The argument still counts. A file or package that declares the name has a call."""
+    function = call.child_by_field_name("function")
+    arguments = call.child_by_field_name("arguments")
+    return (
+        function is not None and function.type == "identifier" and _text(function) in _BASIC_TYPES
+        and _text(function) not in shadowed and arguments is not None
+        and len([a for a in arguments.named_children if a.type != "comment"]) == 1
+        and not any(a.type == "variadic_argument" for a in arguments.named_children)
+    )
+
+
+def does_work(node: Node, shadowed: frozenset[str] = frozenset(), inert: frozenset[str] = frozenset()) -> bool:
     """Whether evaluating ``node`` calls something or receives from a channel.
     A function literal's body is not evaluated there; calling one is. A builtin
-    that can be constant (``len``, ``unsafe.Sizeof``, …) does no work of its own,
-    unless its file or package declares the name; its arguments still count. A generic
-    type's "conversion" (``f[int](x)``) may be a call of a generic function."""
+    that can be constant (``len``, ``unsafe.Sizeof``, …), a one-argument
+    conversion to a predeclared type (``string(id)``) and ``context.Background()``
+    (``inert``, see :func:`inert_packages`) do no work of their own, unless the file
+    or package declares the name; their arguments still count. A generic
+    type's "conversion" (``f[int](x)``) may be a call of a generic function. A
+    type assertion (``x.(T)``) counts as work: it panics when it fails, which is
+    usually the point of writing it, and ``_ = x.(T)`` keeps that. An index
+    expression does not (``xs[i]``, ``m[k]``): it can only panic by accident, a map
+    cannot be told from a slice without types, and the single-value fold has always
+    dropped it."""
     stack = [node]
     while stack:
         current = stack.pop()
-        if current.type == "call_expression" and not _is_constant_builtin(current, shadowed):
+        if (
+            current.type == "call_expression"
+            and not _is_constant_builtin(current, shadowed)
+            and not _is_basic_conversion(current, shadowed)
+            and not _is_inert_stdlib_call(current, inert)
+        ):
             return True
         if current.type == "type_conversion_expression":
             kind = current.child_by_field_name("type")
             if kind is not None and kind.type == "generic_type":
                 return True
         if current.type == "unary_expression" and _text(current).lstrip().startswith("<-"):
+            return True
+        if current.type == "type_assertion_expression":
             return True
         if current.type == "func_literal":
             continue
@@ -410,18 +491,29 @@ def _is_read(call: Node, flag_key: str, readers: dict[int, frozenset[str]], spel
     return False
 
 
-def _working_parts(call: Node, shadowed: frozenset[str]) -> list[Node]:
-    """The receiver and arguments of ``call`` that do work, in evaluation order."""
+def _operand(argument: Node) -> Node:
+    """What an argument evaluates: the operand of ``f()...`` without the dots,
+    which are not an expression of their own."""
+    if argument.type == "variadic_argument":
+        inner = _named(argument)
+        if len(inner) == 1:
+            return inner[0]
+    return argument
+
+
+def _working_parts(call: Node, shadowed: frozenset[str], inert: frozenset[str] = frozenset()) -> list[Node]:
+    """The receiver and arguments of ``call`` that do work, in evaluation order.
+    A spread argument (``opts()...``) is its operand."""
     parts: list[Node] = []
     function = call.child_by_field_name("function")
     if function is not None and function.type == "selector_expression":
         operand = function.child_by_field_name("operand")
-        if operand is not None and does_work(operand, shadowed):
+        if operand is not None and does_work(operand, shadowed, inert):
             parts.append(operand)
     arguments = call.child_by_field_name("arguments")
     for argument in (c for c in (arguments.named_children if arguments is not None else []) if c.type != "comment"):
-        if does_work(argument, shadowed):
-            parts.append(argument)
+        if does_work(argument, shadowed, inert):
+            parts.append(_operand(argument))
     return parts
 
 
@@ -429,11 +521,11 @@ def _left_of(parent: Node, child: Node) -> list[Node]:
     return [c for c in parent.children if c.end_byte <= child.start_byte]
 
 
-def _statement(call: Node, shadowed: frozenset[str]) -> Node | str:
+def _statement(call: Node, shadowed: frozenset[str], inert: frozenset[str] = frozenset()) -> Node | str:
     """The statement the kept expressions go in front of, or why there is none."""
 
     def does_work(node: Node | None) -> bool:
-        return node is not None and _does_work(node, shadowed)
+        return node is not None and _does_work(node, shadowed, inert)
 
     child, parent = call, call.parent
     while parent is not None:
@@ -499,6 +591,22 @@ def _starts_its_line(data: bytes, node: Node) -> bool:
     return data[line:node.start_byte].strip(b" \t") == b""
 
 
+def _is_bare(statement: Node, call: Node) -> bool:
+    """Whether ``call`` is all of the expression statement ``statement``."""
+    if statement.type != "expression_statement":
+        return False
+    inner = [c for c in statement.named_children if c.type != "comment"]
+    return len(inner) == 1 and inner[0].id == call.id
+
+
+def _line_ends_after(data: bytes, node: Node) -> bool:
+    """Nothing but blanks or a ``//`` comment follows ``node`` on its line."""
+    end = data.find(b"\n", node.end_byte)
+    rest = data[node.end_byte:] if end == -1 else data[node.end_byte:end]
+    rest = rest.strip(b" \t\r")
+    return rest == b"" or rest.startswith(b"//")
+
+
 def _newline_of(data: bytes, node: Node) -> str:
     """The line ending of ``node``'s first line: the file's own, CRLF or LF."""
     end = data.find(b"\n", node.start_byte)
@@ -508,6 +616,11 @@ def _newline_of(data: bytes, node: Node) -> str:
 def _indent_of(data: bytes, node: Node) -> str:
     line = data.rfind(b"\n", 0, node.start_byte) + 1
     return data[line:node.start_byte].decode("utf-8")
+
+
+def _errors(source: str) -> int:
+    """How many syntax errors ``source`` has (a missing or unexpected token counts)."""
+    return sum(1 for n in _walk(_parse(source, "go")) if n.is_error or n.is_missing)
 
 
 def _mentions(source: str, flag_key: str, spellings: frozenset[str]) -> bool:
@@ -527,16 +640,17 @@ def scan(
     readers = go_handle_reads.readers_of(accessors)
     data = source.encode("utf-8")
     root = _parse(source, "go")
-    shadowed = (_declared_names(root) & (_CONSTANT_BUILTINS | {"unsafe"})) | package
+    shadowed = shadowed_names(root) | package
+    inert = inert_packages(root)
     hoists: list[_Hoist] = []
     declines: list[_Declined] = []
     for node in _walk(root):
         if node.type != "call_expression" or not _is_read(node, flag_key, readers, spellings):
             continue
-        parts = _working_parts(node, shadowed)
+        parts = _working_parts(node, shadowed, inert)
         if not parts:
             continue
-        statement = _statement(node, shadowed)
+        statement = _statement(node, shadowed, inert)
         texts = [kept_text(p, data) for p in parts]
         if isinstance(statement, str):
             declines.append(_Declined(node, statement))
@@ -547,7 +661,11 @@ def scan(
         elif any(t is None for t in texts):
             declines.append(_Declined(node, "a receiver or argument that does work could not be laid out as gofmt would"))
         else:
-            hoists.append(_Hoist(statement, tuple(t for t in texts if t is not None), node))
+            bare = _is_bare(statement, node)
+            if bare and not _line_ends_after(data, statement):
+                declines.append(_Declined(node, "the statement holding it shares its line with another"))
+                continue
+            hoists.append(_Hoist(statement, tuple(t for t in texts if t is not None), node, bare))
     # Two reads that do work in one statement: the second one's work would
     # move ahead of the first read's.
     by_statement: dict[int, list[_Hoist]] = {}
@@ -574,19 +692,33 @@ def rewrite(
     package: frozenset[str] = frozenset(),
 ) -> tuple[str, list[str]]:
     """``(rewritten source, the texts of the reads whose work was kept)``."""
+    text, calls, _ = _rewrite(source, flag_key, accessors, spellings, package)
+    return text, calls
+
+
+def _rewrite(
+    source: str, flag_key: str, accessors: Iterable[str], spellings: Iterable[str] = (),
+    package: frozenset[str] = frozenset(),
+) -> tuple[str, list[str], bool]:
+    """:func:`rewrite`, and whether a discarded read was replaced outright."""
     hoists, _ = scan(source, flag_key, accessors, spellings, package)
     if not hoists:
-        return source, []
+        return source, [], False
     data = source.encode("utf-8")
-    edits: list[tuple[int, bytes]] = []
+    edits: list[tuple[int, int, bytes]] = []
     for hoist in hoists:
         indent = _indent_of(data, hoist.statement)
         newline = _newline_of(data, hoist.statement)
+        if hoist.bare:
+            lines = (newline + indent).join(f"_ = {p}" for p in hoist.expressions)
+            edits.append((hoist.statement.start_byte, hoist.statement.end_byte, lines.encode("utf-8")))
+            continue
         lines = "".join(f"_ = {p}{newline}{indent}" for p in hoist.expressions)
-        edits.append((hoist.statement.start_byte, lines.encode("utf-8")))
-    for start, text in sorted(edits, reverse=True):
-        data = data[:start] + text + data[start:]
-    return data.decode("utf-8"), [_flat(_text(h.call)) for h in hoists]
+        start = hoist.statement.start_byte
+        edits.append((start, start, lines.encode("utf-8")))
+    for start, end, text in sorted(edits, reverse=True):
+        data = data[:start] + text + data[end:]
+    return data.decode("utf-8"), [_flat(_text(h.call)) for h in hoists], any(h.bare for h in hoists)
 
 
 @dataclass
@@ -595,6 +727,14 @@ class Prepass(mock_stubs.Prepass):
 
     #: The bare names this flag's key is declared under in the candidate files.
     names: frozenset[str] = field(default_factory=frozenset)
+    #: Per file, why the rewrite was not written: its output would not parse.
+    unparseable: dict[str, str] = field(default_factory=dict)
+    #: A discarded read was replaced by its kept work: that is the fold, so the
+    #: run did fold a read although the engine saw none.
+    removed_a_read: bool = False
+    #: Per file, the ``_ = <call>`` statements this pass wrote, so the pull
+    #: request can tell them from a stranded local that was kept as a discard.
+    kept_lines: dict[str, list[str]] = field(default_factory=dict)
 
     def spellings(self, path: str) -> frozenset[str]:
         return self.names | self.key_texts.get(path, frozenset())
@@ -611,11 +751,21 @@ class Prepass(mock_stubs.Prepass):
             spellings = self.spellings(path)
             if not _mentions(source, self.flag_key, spellings):
                 continue
-            resolved, calls = rewrite(
+            resolved, calls, bare = _rewrite(
                 source, self.flag_key, self.accessors, spellings, package_shadows(path, source)
             )
             if not calls:
                 continue
+            # Whatever this pass writes, the engine has to read: a copy that is
+            # not Go would abort it with an error that blames the customer's
+            # file. The file is left as it is and the run refuses, naming this.
+            if _errors(resolved) > _errors(source):
+                self.unparseable[key] = (
+                    "the receivers and arguments kept ahead of it are not valid Go, which the engine could not read"
+                )
+                continue
+            self.removed_a_read = self.removed_a_read or bare
+            self.kept_lines[key] = discarded_calls.introduced(source, resolved)
             self.spelled[key] = path
             self.originals[key] = source
             self.removals[key] = [mock_stubs.Removal(KIND, c) for c in calls]
@@ -655,7 +805,10 @@ def refusal_reason(
     found = [(h.call, "it was not rewritten before the fold") for h in hoists]
     found += [(d.call, d.reason) for d in declines]
     unclaimed = list(kept)
+    broken = next((p.unparseable[key] for p in mine if key in p.unparseable), None)
     for call, why in sorted(found, key=lambda f: f[0].start_byte):
+        if broken is not None:
+            why = broken
         text = _flat(_text(call))
         if text in unclaimed:
             unclaimed.remove(text)

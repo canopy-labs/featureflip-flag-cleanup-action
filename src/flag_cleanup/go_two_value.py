@@ -22,13 +22,13 @@ left whole and the existing arity refusal speaks, exactly as before:
 * two plain names on the left (the second may be ``_``, which needs no handling
   at all), declared with ``:=`` as a statement of a block;
 * a single call on the right whose callee is a flag read and that names the
-  flag's key. Its arguments either cannot do work (names, selectors, literals,
-  operators on them) or are calls, which the fold would drop: each such call
-  (and a receiver that does work) is kept by :mod:`flag_cleanup.go_read_effects`,
-  which runs after this pass, as ``_ = call`` on the line before the
-  declaration, in order. Any other argument that can do work (an index, a
-  receive, a call inside an operator, a function literal) is a refusal that
-  says so;
+  flag's key. An argument that does work (a call, a receive, a call inside an
+  operator: :func:`go_read_effects.does_work` decides, so this pass and that
+  one cannot disagree) and a receiver that does work are kept by
+  :mod:`flag_cleanup.go_read_effects`, which runs after this pass, as
+  ``_ = expr`` on the line before the declaration, in order. Whether they can
+  be placed there is that pass's to say, and it refuses with its own reason
+  when they cannot. An argument that does no work is dropped with the read;
 * the very next statement is ``if err != nil { … }`` with no initializer, whose
   block holds no ``goto`` or label, and either no ``else`` or an ``else`` block
   of plain statements (no declaration, label or multi-line raw string, and no
@@ -58,21 +58,10 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import key_const, mock_stubs, source_index
+from flag_cleanup import go_read_effects, key_const, mock_stubs, source_index
 from flag_cleanup.syntax import _parse, _walk
 
 _FUNCTIONS = ("function_declaration", "method_declaration", "func_literal")
-#: Argument node types that cannot do work.
-_INERT_ARGUMENTS = frozenset(
-    {
-        "identifier", "selector_expression", "interpreted_string_literal", "raw_string_literal",
-        "int_literal", "float_literal", "true", "false", "nil", "rune_literal", "imaginary_literal",
-    }
-)
-#: Operator expressions that do no work when none of their operands does.
-_PURE_OPERATORS = frozenset({"unary_expression", "binary_expression", "parenthesized_expression", "composite_literal"})
-
-
 def _text(node: Node) -> str:
     return node.text.decode("utf-8")
 
@@ -83,7 +72,7 @@ class _Pair:
     names: Node
     guard: Node | None
     call: Node
-    #: Calls among the read's arguments, kept by ``go_read_effects`` after this pass.
+    #: Arguments that do work, kept by ``go_read_effects`` after this pass.
     hoisted: tuple[Node, ...] = ()
     #: The ``else`` block of the guard, whose statements replace it.
     otherwise: Node | None = None
@@ -125,13 +114,15 @@ def scan(
     readers = key_const._GO_FLAG_READ_CALLEES | {a.split("[", 1)[0] for a in accessors}
     spellings = {t for t in key_texts}
     root = _parse(source, "go")
+    shadowed = go_read_effects.shadowed_names(root)
+    inert = go_read_effects.inert_packages(root)
     comments = [n for n in _walk(root) if n.type == "comment"]
     found: list[_Pair] = []
     reasons: list[str] = []
     for node in _walk(root):
         if node.type != "short_var_declaration":
             continue
-        pair = _pair(node, source, flag_key, readers, spellings)
+        pair = _pair(node, source, flag_key, readers, spellings, shadowed, inert)
         if isinstance(pair, str):
             reasons.append(pair)
             continue
@@ -220,7 +211,10 @@ def _declared_results(declaration: Node) -> tuple[str, ...]:
     return tuple(types)
 
 
-def _pair(node: Node, source: str, flag_key: str, readers: set[str], spellings: set[str]) -> _Pair | str | None:
+def _pair(
+    node: Node, source: str, flag_key: str, readers: set[str], spellings: set[str],
+    shadowed: frozenset[str] = frozenset(), inert: frozenset[str] = frozenset(),
+) -> _Pair | str | None:
     """The pair at ``node``; a reason string when it is a two-value read of the
     flag that cannot be rewritten; ``None`` when it is not one at all."""
     left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
@@ -242,11 +236,9 @@ def _pair(node: Node, source: str, flag_key: str, readers: set[str], spellings: 
         return _reason(call, f"`{on}` or `{err}` is a parameter or a named result")
     if _occurrences(function, on, before=node.start_byte):
         return _reason(call, f"`{on}` is already spelled before the read")
-    hoisted = _argument_calls(call)
-    if isinstance(hoisted, str):
-        return _reason(call, hoisted)
+    hoisted = _working_arguments(call, shadowed, inert)
     if hoisted and not _starts_its_line(source, node):
-        return _reason(call, "the read shares its line with another statement, so the calls among its arguments cannot be kept")
+        return _reason(call, "the read shares its line with another statement, so the arguments that do work cannot be kept")
     if err == "_":
         if hoisted:
             return _Pair(node, left, None, call, tuple(hoisted))
@@ -298,29 +290,13 @@ def _is_read(call: Node, flag_key: str, readers: set[str], spellings: set[str]) 
     return False
 
 
-def _argument_calls(call: Node) -> list[Node] | str:
-    """The calls among the read's arguments, which the fold would drop, or why
-    some argument cannot be dropped."""
+def _working_arguments(call: Node, shadowed: frozenset[str], inert: frozenset[str]) -> list[Node]:
+    """The arguments of the read that do work, which the fold would drop."""
     arguments = call.child_by_field_name("arguments")
-    found: list[Node] = []
-    for argument in (c for c in (arguments.named_children if arguments is not None else []) if c.type != "comment"):
-        if argument.type in _INERT_ARGUMENTS:
-            continue
-        if argument.type == "call_expression":
-            found.append(argument)
-            continue
-        if argument.type in _PURE_OPERATORS and not any(
-            n.type in ("call_expression", "func_literal", "index_expression", "slice_expression",
-                       "type_assertion_expression")
-            or (n.type == "unary_expression" and _text(n).startswith("<-"))
-            for n in _walk(argument)
-        ):
-            continue
-        return (
-            f"the argument `{' '.join(_text(argument).split())}` can do work the fold would drop, and "
-            "only a plain call, name or literal among them is kept"
-        )
-    return found
+    return [
+        argument for argument in (c for c in (arguments.named_children if arguments is not None else []) if c.type != "comment")
+        if go_read_effects.does_work(argument, shadowed, inert)
+    ]
 
 
 def _starts_its_line(source: str, node: Node) -> bool:

@@ -2961,7 +2961,9 @@ _MARKUP_LOADER = re.compile(_GLOB_LOADERS)
 #: inside a template literal. Quoted with ``'`` or ``"`` only: a static
 #: specifier is never a template literal, and prose quoting code after the
 #: word ("from `bg-{color}-600`", in an ``.mdx`` document) is not one.
-_MARKUP_SPECIFIER = re.compile(r"""\b(?:from|import)(?:\s|/\*[\s\S]*?\*/|//[^\n]*)*(["'])[^"'`\n]*\1""")
+#: Not after a quote or a ``.``: ``"from": {`` is a JSON key and
+#: ``Array.from("…")`` a call, neither a specifier.
+_MARKUP_SPECIFIER = re.compile(r"""(?<!["'`.])\b(?:from|import)(?:\s|/\*[\s\S]*?\*/|//[^\n]*)*(["'])[^"'`\n]*\1""")
 _SCRIPT_OPEN = re.compile(r"<script\b", re.IGNORECASE)
 #: A whole ``<script ...>`` opening tag, past quoted attribute values.
 _SCRIPT_TAG = re.compile(r"""<script\b(?:[^>"']|"[^"]*"|'[^']*')*>""", re.IGNORECASE)
@@ -2974,6 +2976,163 @@ _TEMPLATE_TAG = re.compile(r"""<template\b(?:[^>"']|"[^"]*"|'[^']*')*>""", re.IG
 _SRC = re.compile(r"\ssrc\s*=", re.IGNORECASE)
 #: A script tag's ``lang`` attribute.
 _LANG = re.compile(r"""\blang\s*=\s*["']?([\w-]+)""", re.IGNORECASE)
+
+
+#: A Markdown code fence's opening line: three or more backticks or tildes,
+#: indented by at most three spaces, and its info string.
+_MD_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+#: An MDX ESM line: ``import``/``export`` at the start of a line.
+_MDX_ESM = re.compile(r"(?:import|export)\b")
+#: An inline code span: a run of backticks closed by a run of the same
+#: length, inside one paragraph.
+_MD_CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n)[\s\S])*?(?<!`)\1(?!`)")
+_OPENERS = {"(": ")", "[": "]", "{": "}"}
+
+
+def _lines(source: str) -> list[tuple[int, int, str]]:
+    """``(start, end, text)`` of each line, ``end`` past its newline, ``text``
+    without its line ending."""
+    found = []
+    position = 0
+    for line in source.splitlines(keepends=True):
+        found.append((position, position + len(line), line.rstrip("\r\n")))
+        position += len(line)
+    return found
+
+
+def _esm_end(source: str, start: int) -> int:
+    """Where an MDX ESM block starting at ``start`` ends: at the first blank
+    line reached with every bracket, string, template literal (``${}`` holes
+    included) and block comment of the JavaScript so far closed; else at the
+    end of the document. A blank line inside an exported template literal is
+    still ESM, so a ``~~~`` or a fence line below it is no fence."""
+    stack: list[str] = []
+    index = start
+    length = len(source)
+    while index < length:
+        char = source[index]
+        top = stack[-1] if stack else None
+        if top == "`":
+            if char == "\\":
+                index += 2
+                continue
+            if char == "`":
+                stack.pop()
+            elif source.startswith("${", index):
+                stack.append("${")
+                index += 2
+                continue
+            index += 1
+            continue
+        if top == "/*":
+            if source.startswith("*/", index):
+                stack.pop()
+                index += 2
+                continue
+            index += 1
+            continue
+        if char in "'\"":
+            close = index + 1
+            while close < length and source[close] not in (char, "\n"):
+                close += 2 if source[close] == "\\" else 1
+            index = close + 1
+            continue
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = length if newline < 0 else newline
+            continue
+        if source.startswith("/*", index):
+            stack.append("/*")
+            index += 2
+            continue
+        if char == "`":
+            stack.append("`")
+        elif char in _OPENERS:
+            stack.append(char)
+        elif char in ")]}" and stack:
+            if stack[-1] == "${" and char == "}":
+                stack.pop()  # back in the template literal
+            elif _OPENERS.get(stack[-1]) == char:
+                stack.pop()
+        elif char == "\n" and not stack:
+            line_end = source.find("\n", index + 1)
+            following = source[index + 1 : length if line_end < 0 else line_end]
+            if not following.strip():
+                return index + 1
+        index += 1
+    return length
+
+
+def _mdx_layout(source: str) -> list[tuple[int, int, str]]:
+    """An MDX document cut into ``(start, end, kind)`` regions, in one pass
+    over its lines: ``"text"`` for the leading YAML frontmatter and each
+    closed fenced code block (MDX prints them and never runs them),
+    ``"code"`` for each ESM block (:func:`_esm_end`), ``"prose"`` for the
+    rest, markup and JSX.
+
+    ESM and fences are found in the same scan, so a fence never starts inside
+    ESM, nor ESM inside a fence. A fence is CommonMark's: a backtick fence
+    whose info string holds a backtick is no fence. Anything in doubt stays
+    code or prose, never text: an unclosed fence or frontmatter is not text
+    (CommonMark would run it to the end, and a mistake there would hide real
+    imports)."""
+    lines = _lines(source)
+    regions: list[tuple[int, int, str]] = []
+    index = 0
+    if lines and lines[0][2].rstrip() == "---":
+        closing = next((n for n in range(1, len(lines)) if lines[n][2].rstrip() == "---"), None)
+        if closing is not None:
+            regions.append((0, lines[closing][1], "text"))
+            index = closing + 1
+    while index < len(lines):
+        start, end, text = lines[index]
+        fence = _MD_FENCE.fullmatch(text)
+        if fence is not None and not (fence.group(1)[0] == "`" and "`" in fence.group(2)):
+            marker = fence.group(1)
+            closer = re.compile(rf" {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*")
+            closing = next((n for n in range(index + 1, len(lines)) if closer.fullmatch(lines[n][2])), None)
+            if closing is not None:
+                regions.append((start, lines[closing][1], "text"))
+                index = closing + 1
+                continue
+        if _MDX_ESM.match(text):
+            block_end = _esm_end(source, start)
+            regions.append((start, block_end, "code"))
+            while index < len(lines) and lines[index][0] < block_end:
+                index += 1
+            continue
+        if regions and regions[-1][2] == "prose":
+            regions[-1] = (regions[-1][0], end, "prose")
+        else:
+            regions.append((start, end, "prose"))
+        index += 1
+    return regions
+
+
+def _component_view(path: str, source: str) -> str:
+    """The source a component scan reads: as it is, except that an MDX
+    document's fenced code blocks, its frontmatter and the inline code spans
+    of its prose are blanked (every character but a newline turned to a
+    space). They are text MDX prints and never runs, so ``"from": {`` in a
+    JSON sample or ``import("./flags")`` in a code span is no use of a module.
+    Its ESM stays (:func:`_mdx_layout`): an MDX document is never rewritten,
+    so a static import there that names the module is a use of it
+    (:func:`component_match`). A code span counts only with both ends in one
+    stretch of prose."""
+    if not path.endswith(".mdx"):
+        return source
+    blank: list[tuple[int, int]] = []
+    for start, end, kind in _mdx_layout(source):
+        if kind == "text":
+            blank.append((start, end))
+        elif kind == "prose":
+            blank.extend(span.span() for span in _MD_CODE_SPAN.finditer(source, start, end))
+    out = list(source)
+    for start, end in blank:
+        for index in range(start, end):
+            if out[index] not in "\r\n":
+                out[index] = " "
+    return "".join(out)
 
 
 def _script_regions(path: str, source: str) -> list[tuple[int, int, int]] | None:
@@ -3014,7 +3173,9 @@ def component_match(path: str, source: str, patterns: tuple[re.Pattern[str], ...
     literal, and the imports after it land in the markup. Markup text
     (``<h1>Feature flags</h1>``) is no use. Its code is judged by
     :func:`component_escapes`. When that code cannot be found (see
-    :func:`_script_regions`), a match anywhere is one."""
+    :func:`_script_regions`), a match anywhere is one. An MDX document's
+    code samples are not markup (:func:`_component_view`)."""
+    source = _component_view(path, source)
     regions = _script_regions(path, source)
     if regions is None:
         return min((m.start() for p in patterns if (m := p.search(source))), default=None)
@@ -4172,8 +4333,10 @@ def component_escapes(
     itself; at a Vue ``<template src>``, whose markup is another file's,
     every such name escapes. Loads in the
     markup are :func:`component_match`'s, and so is a file whose code cannot
-    be found: then this finds nothing.
+    be found: then this finds nothing. An MDX document's code samples are
+    neither code nor markup (:func:`_component_view`).
     """
+    source = _component_view(path, source)
     regions = _script_regions(path, source)
     if regions is None:
         return []

@@ -65,7 +65,7 @@ from flag_cleanup.github_ops import GitHubApi, GitHubEnv, flag_key_from_branch
 from flag_cleanup.pr_event import PullRequestComment, commented_pull_request
 from flag_cleanup.run_context import github_env_from
 from flag_cleanup.residue import Residue
-from flag_cleanup.discarded_calls import DISCARDED_CALL
+from flag_cleanup.discarded_calls import DISCARDED_CALL, HOISTED_CALL
 from flag_cleanup.inert_calls import DECLARED_CALL, HOOK_CALL, HOOK_CALL_KEPT
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.ts_test_providers import UNWRAPPED_PROVIDER
@@ -930,6 +930,7 @@ def _dry_run_caveats(
     kept_hooks = sum(1 for _, kind, _ in bindings if kind == HOOK_CALL_KEPT)
     providers = sum(1 for _, kind, _ in bindings if kind == UNWRAPPED_PROVIDER)
     discarded_calls = sum(1 for _, kind, _ in bindings if kind == DISCARDED_CALL)
+    hoisted_calls = sum(1 for _, kind, _ in bindings if kind == HOISTED_CALL)
     inlined_forwarders = sum(1 for _, kind, _ in bindings if kind == forwarder_csharp.INLINED)
     kept_forwarders = sum(1 for _, kind, _ in bindings if kind == forwarder_csharp.KEPT)
     state_comments = sum(
@@ -959,6 +960,7 @@ def _dry_run_caveats(
         - kept_hooks
         - providers
         - discarded_calls
+        - hoisted_calls
         - inlined_forwarders
         - kept_forwarders
     )
@@ -981,6 +983,8 @@ def _dry_run_caveats(
         notes.append(f"{hook_calls} discarded call(s) to a read-only framework hook would be deleted")
     if discarded_calls:
         notes.append(f"{discarded_calls} call(s) would be kept only as a discard (reported)")
+    if hoisted_calls:
+        notes.append(f"{hoisted_calls} receiver or argument call(s) of a folded read would be kept (reported)")
     if declared_loads:
         notes.append(
             f"{declared_loads} import(s) of a module listed in side-effect-free-modules "

@@ -103,6 +103,7 @@ from flag_cleanup import (
     go_defaults,
     go_emptied,
     go_handles,
+    go_predeclared,
     go_setters,
     inert_calls,
     jvm_matchers,
@@ -134,6 +135,7 @@ from flag_cleanup import (
     python_gates,
     report_paths,
     residue,
+    ruby_guard_methods,
     ruby_owner_reach,
     source_index,
     call_site_comments,
@@ -170,6 +172,7 @@ from flag_cleanup import python_constant_function
 from flag_cleanup.python_fold import inline_literal_bindings, marker_for
 from flag_cleanup.key_const_visibility import VisibleKeyConst
 from flag_cleanup.syntax import (
+    collapse_introduced_blank_runs,
     collapse_introduced_carriage_returns,
     collapse_introduced_double_spaces,
     const_path_is_safe,
@@ -1395,19 +1398,30 @@ def _failing_assertions(summaries, language: str, repo_dir: str) -> tuple[tuple[
 FAILING_ASSERTION = "failing assertion"
 
 
-def _discarded_calls(summaries, language: str, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
+def _discarded_calls(
+    summaries, language: str, repo_dir: str, doubles=None
+) -> tuple[tuple[str, str, str], ...]:
     """``(relative_path, "discarded call", text)`` for each `_ = <call>` this
     run's Go output holds more of than the customer's file did
-    (:func:`flag_cleanup.discarded_calls.introduced`)."""
+    (:func:`flag_cleanup.discarded_calls.introduced`). One that
+    :mod:`flag_cleanup.go_read_effects` wrote ahead of a folded read is a
+    ``hoisted call`` instead: it was an argument or receiver of the read, not
+    a variable the read was the last user of."""
     rows = []
     for summary in summaries:
         if _grammar_of(summary.path, language) != "go":
             continue
         found = discarded_calls.introduced(summary.original_content, summary.content)
-        rows.extend(
-            (os.path.relpath(summary.path, repo_dir), discarded_calls.DISCARDED_CALL, text)
-            for text in found
-        )
+        hoisted: Counter[str] = Counter()
+        for p in doubles or ():
+            if isinstance(p, go_read_effects.Prepass):
+                hoisted.update(p.kept_lines.get(os.path.abspath(summary.path), ()))
+        for text in found:
+            kind = discarded_calls.DISCARDED_CALL
+            if hoisted[text] > 0:
+                hoisted[text] -= 1
+                kind = discarded_calls.HOISTED_CALL
+            rows.append((os.path.relpath(summary.path, repo_dir), kind, text))
     if rows:
         logger.warning(
             "%d call(s) kept running only to be discarded, because each could "
@@ -1639,6 +1653,9 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_assignment_after_sibling": "stmt",
     "delete_stranded_assignment": "stmt",
     "blank_stranded_assignment": "stmt",
+    "blank_stranded_assignment_target": "stmt",
+    "blank_stranded_header_name_before_witness": "n",
+    "blank_stranded_header_name_after_witness": "n",
     "delete_stranded_ruby_local": "a",
     "discard_stranded_ruby_local": "a",
     "delete_stranded_dart_local": "decl",
@@ -2443,6 +2460,7 @@ def _transform_flag(
             promise_reads=_promise_reads(
                 repo_dir, paths, flag_key, planned_accessors, language, async_names, first_sites, doubles
             ),
+            managed=async_names if language in ("ts", "tsx", "js") else frozenset(),
         )
         # A call-site file that neither holds the key nor reads its constant
         # is in no engine group yet; the marks are its only reads.
@@ -3073,6 +3091,8 @@ def _transform_flag(
     # An argument deleted at the end of a line strands the space before it,
     # and these passes all run after the first tidy.
     summaries = _tidy_trailing_whitespace(summaries, language)
+    # A statement deleted from between two blank lines leaves both.
+    summaries = _collapse_blank_runs(summaries, language)
     # Go: a statement deleted from (or a line without a comment put into) a
     # run of trailing comments leaves the rest in the old column, which
     # `gofmt -l` lists (:mod:`flag_cleanup.go_comment_columns`).
@@ -3163,6 +3183,7 @@ def _transform_flag(
             )
         )
         summaries, provider_bindings = _remove_stranded_bindings(summaries, language, repo_dir)
+        summaries = _collapse_blank_runs(summaries, language)
         bindings = bindings + provider_rows + provider_bindings
 
     # What a kept test still says about the removed branch: a negative
@@ -3240,6 +3261,12 @@ def _transform_flag(
         summaries, using_rows = cs_orphan_usings.remove(summaries, deleted_files, repo_dir, Rewrite)
         bindings = bindings + using_rows
 
+    # A Rails guard method the fold emptied, with the `before_action` naming
+    # it: after the comment passes, before Gate 1.
+    if language == "ruby":
+        summaries, guard_rows = ruby_guard_methods.remove(summaries, repo_dir, Rewrite)
+        bindings = bindings + guard_rows
+
     # Comments beside the changes that describe a flag's state without naming
     # it ("while the flag is off"): reported, never edited. After every edit,
     # so the lines named are the ones that stay on disk.
@@ -3280,7 +3307,7 @@ def _transform_flag(
     # A Go local whose initializer calls something was kept running as
     # `_ = <call>`: reported, so the reviewer can delete a getter that only
     # fed the removed read.
-    bindings = bindings + _discarded_calls(summaries, language, repo_dir)
+    bindings = bindings + _discarded_calls(summaries, language, repo_dir, doubles)
 
     # Every report row is in by now: drop those about a file the readiness
     # pass deleted (see where it runs).
@@ -3633,6 +3660,7 @@ def _plan_wrappers(
     reader_const: frozenset[str],
     doubles: list[mock_stubs.Prepass] | None,
     promise_reads: frozenset[tuple[str, int, int]] = frozenset(),
+    managed: frozenset[str] = frozenset(),
 ) -> wrapper_inline.WrapperPlan:
     """Discover, qualify and prove this flag's keyless wrappers.
 
@@ -3656,7 +3684,7 @@ def _plan_wrappers(
         p: (p in const_ok, external(p))
         for p in [*with_const, *without_const, *reader_paths]
     }
-    found = wrapper_inline.discover_all(language, flag_key, accessors, folded, promise_reads)
+    found = wrapper_inline.discover_all(language, flag_key, accessors, folded, promise_reads, managed)
     qualified, refusals = wrapper_inline.qualify_all(repo_dir, found, treatment)
     by_resolved = {str(Path(p).resolve()): p for p in paths}
     stub_pass: mock_stubs.Prepass | None = None
@@ -6171,6 +6199,29 @@ def _tidy_trailing_whitespace(summaries, language: str) -> list:
     return tidied
 
 
+def _collapse_blank_runs(summaries, language: str) -> list:
+    """TypeScript family: shorten each run of blank lines a deletion made
+    longer than the file had there (:func:`collapse_introduced_blank_runs`),
+    which Prettier would otherwise report. Every other language's passes
+    take the blank lines with what they delete."""
+    if language not in _TS_GRAMMARS:
+        return summaries
+    tidied = []
+    for summary in summaries:
+        if summary.original_content == summary.content or file_deletion.deleted(summary):
+            tidied.append(summary)
+            continue
+        cleaned = collapse_introduced_blank_runs(
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
+        )
+        if cleaned == summary.content:
+            tidied.append(summary)
+            continue
+        Path(summary.path).write_text(cleaned, encoding="utf-8")
+        tidied.append(Rewrite(summary.path, summary.original_content, cleaned))
+    return tidied
+
+
 def _collapse_entry_double_spaces(summaries, language: str, entry_paths: set[str]) -> list:
     """Collapse the mid-line double space an entry deletion leaves.
 
@@ -7285,7 +7336,7 @@ def _settle_test_doubles(
     if not passes:
         return summaries, ()
     changed = [s for s in summaries if s.original_content != s.content]
-    if read_elsewhere or any(
+    if read_elsewhere or any(getattr(p, "removed_a_read", False) for p in passes) or any(
         mock_stubs.folded_a_read(
             s.original_content, s.content, _grammar_of(s.path, language), accessors
         )
@@ -7781,7 +7832,9 @@ def _module_scope_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[
 
 
 def _go_file_facts(paths: list[str]) -> dict[str, list[dict[str, str]]]:
-    """:func:`~flag_cleanup.unused.go_import_facts` for each Go file in ``paths``, by absolute path."""
+    """:func:`~flag_cleanup.unused.go_import_facts` and
+    :func:`~flag_cleanup.go_predeclared.unshadowed_facts` for each Go file in
+    ``paths``, by absolute path."""
     facts = {}
     for path in paths:
         if not path.endswith(".go"):
@@ -7790,7 +7843,7 @@ def _go_file_facts(paths: list[str]) -> dict[str, list[dict[str, str]]]:
             source = Path(path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        found = go_import_facts(source)
+        found = go_import_facts(source) + go_predeclared.unshadowed_facts(path, source)
         if found:
             facts[os.path.abspath(path)] = found
     return facts
