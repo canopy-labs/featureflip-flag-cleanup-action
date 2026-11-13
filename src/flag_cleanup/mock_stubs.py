@@ -509,6 +509,47 @@ def _ts_test(node: Node, data: bytes) -> str | None:
     return "".join(_text(c, data) for c in title.named_children)
 
 
+def ts_each_rows(node: Node) -> Node | None:
+    """The rows argument of ``it.each(<rows>)("title", cb)`` (``test.each``, and
+    with ``.only``/``.skip``/``.concurrent`` before ``.each``) when ``node`` is
+    that statement; else ``None``. A tagged-template table is not read."""
+    if node.type != "expression_statement" or not node.named_children:
+        return None
+    call = node.named_children[0]
+    if call.type != "call_expression":
+        return None
+    each = call.child_by_field_name("function")
+    if each is None or each.type != "call_expression":
+        return None
+    member = each.child_by_field_name("function")
+    rows = each.child_by_field_name("arguments")
+    if member is None or member.type != "member_expression" or rows is None or rows.type != "arguments":
+        return None
+    prop = member.child_by_field_name("property")
+    if prop is None or prop.text != b"each":
+        return None
+    root = member.child_by_field_name("object")
+    while root is not None and root.type == "member_expression":
+        root = root.child_by_field_name("object")
+    if root is None or root.type != "identifier" or root.text.decode("utf-8", "replace") not in _TS_TEST_CALLEES:
+        return None
+    named = [c for c in rows.named_children if c.type != "comment"]
+    return named[0] if len(named) == 1 else None
+
+
+def ts_owned_test(node: Node, data: bytes) -> str | None:
+    """:func:`_ts_test`, and also the title of a parametrised ``it.each(rows)``
+    test (:func:`ts_each_rows`): the shapes a wrapper's own unit test may take."""
+    title = _ts_test(node, data)
+    if title is not None or ts_each_rows(node) is None:
+        return title
+    arguments = node.named_children[0].child_by_field_name("arguments")
+    first = arguments.named_children[0] if arguments is not None and arguments.named_children else None
+    if first is None or first.type != "string":
+        return None
+    return "".join(_text(c, data) for c in first.named_children)
+
+
 #: RSpec's examples and ActiveSupport's ``test "…" do``, each with its focused
 #: and skipped spellings: a single test.
 _RUBY_TEST_CALLEES = frozenset(
@@ -2405,12 +2446,22 @@ def _apply(
     for method, receiver in siblings:
         by_test.setdefault(method, set()).add(receiver)
     for node in _walk(root) if by_test else ():
-        test_name = _any_test_name(node, data, language, profile)
+        # A TS/JS own unit test may be parametrised (`it.each(rows)`).
+        test_name = (
+            ts_owned_test(node, data) if language in _TS_LANGUAGES else _any_test_name(node, data, language, profile)
+        )
         names = by_test.get(test_name) if test_name is not None else None
         if not names:
             continue
         text = _text(node, data)
-        if not reads_through(text, csharp_receiver_read(names, wrapper.names, reads_only=True)):
+        receivers = {n for n in names if n}
+        # `""`: a TS/JS function wrapper's own test, which calls it bare. The
+        # profile proved the test is about the wrapper alone, and its title
+        # is the file's only one of that name.
+        bare = "" in names and language in _TS_LANGUAGES
+        if not bare and (
+            not receivers or not reads_through(text, csharp_receiver_read(receivers, wrapper.names, reads_only=True))
+        ):
             continue
         # Deciding what STAYS: any spelling counts, qualified or not.
         # On the JVM the read is through the wrapper's own class, whose body

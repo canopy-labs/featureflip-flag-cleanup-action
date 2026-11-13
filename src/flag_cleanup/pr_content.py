@@ -2099,10 +2099,16 @@ def pr_body(
         # deletion would tell the customer something false about their own PR.
         import_count = sum(1 for _, kind, _ in bindings if kind == "import")
         method_count = sum(1 for _, kind, _ in bindings if kind == "private method")
+        function_count = sum(1 for _, kind, _ in bindings if kind == "private function")
         parameter_count = sum(1 for _, kind, _ in bindings if kind == "unused parameter")
         option_count = sum(1 for _, kind, _ in bindings if kind == "unused option")
         variable_count = (
-            len(bindings) - import_count - method_count - parameter_count - option_count
+            len(bindings)
+            - import_count
+            - method_count
+            - function_count
+            - parameter_count
+            - option_count
         )
 
         def _plural(n: int, noun: str) -> str:
@@ -2115,6 +2121,8 @@ def pr_body(
             counted.append(_plural(variable_count, "local variable"))
         if method_count:
             counted.append(_plural(method_count, "private method"))
+        if function_count:
+            counted.append(_plural(function_count, "module-private function"))
         if parameter_count:
             counted.append(_plural(parameter_count, "parameter"))
         if option_count:
@@ -2151,6 +2159,16 @@ def pr_body(
                 "above it, only when nothing else in its file still names it; "
                 "a method in a `partial` type, an overloaded one, or one "
                 "carrying an attribute or annotation is never touched."
+            )
+        if function_count:
+            sentences.append(
+                "A function declared at the top level of an ES module and not "
+                "exported is deleted, with the `/** */` comment directly above "
+                "it, only when nothing else in its file names it, not even in a "
+                "string, a comment or a type. One under any other comment is "
+                "kept, and so is every function in a script, in a CommonJS file, "
+                "in a file holding JSX that is not proven to compile with the "
+                "automatic runtime, and in a repository that uses rewire."
             )
         if parameter_count:
             sentences.append(
@@ -2202,8 +2220,11 @@ def pr_body(
     duplicates = [(path, *text.split(": ", 1)) for path, kind, text in test_doubles if kind == DUPLICATE_TEST and ": " in text]
     folded = [(path, *text.split("\n")) for path, kind, text in test_doubles if kind == FOLDED_TEST and text.count("\n") == 4]
     mock_lines = [
-        (path, text) for path, kind, text in test_doubles if kind not in _NOT_MOCK_LINES
+        (path, text)
+        for path, kind, text in test_doubles
+        if kind not in _NOT_MOCK_LINES and kind != _TRIVIAL_ASSERTION
     ]
+    trivial = [(path, text) for path, kind, text in test_doubles if kind == _TRIVIAL_ASSERTION]
     if mocked_tests:
         count = len(mocked_tests)
         noun = "test was" if count == 1 else "tests were"
@@ -2282,12 +2303,13 @@ def pr_body(
         count = len(own_tests)
         noun = "test was" if count == 1 else "tests were"
         lines += [
-            f"> **⚠️ {count} {noun} deleted with the wrapper member it tested.** Each "
-            "built its own object with an injected fake and asserted only about one "
-            "wrapper member this pull request removes or reduces to a constant "
-            "(its result, or what it passed the fake). It tested only the member's "
-            "forwarding of the flag read, which the removal folds, so the assertion "
-            "no longer tests anything:",
+            f"> **⚠️ {count} {noun} deleted with the wrapper it tested.** Each "
+            "called one wrapper this pull request removes or reduces to a constant "
+            "(a member of an object the test built with an injected fake, or a "
+            "function called with arguments built from literals and fakes) and "
+            "asserted only about its result, or what it passed the fake. It tested "
+            "only the wrapper's forwarding of the flag read, which the removal "
+            "folds, so the assertion no longer tests anything:",
             ">",
             *[
                 f"> - {_md_code(path)} — {_md_code(text)}"
@@ -2438,6 +2460,19 @@ def pr_body(
             "call passed the value the flag serves:",
             ">",
             *[f"> - {_md_code(path)} — {_one_line(text)}" for path, text in pinned[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if trivial:
+        count = len(trivial)
+        noun = "assertion was" if count == 1 else "assertions were"
+        lines += [
+            f"> **{count} {noun} deleted.** Each became trivially true once "
+            "the flag read it checked was replaced with a literal, so it no "
+            "longer tested anything. The tests around them still run, against "
+            "the kept branch:",
+            ">",
+            *[f"> - {_md_code(path)} — {_md_code(text)}" for path, text in trivial[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -2602,6 +2637,10 @@ _WRAPPER_STATUSES = ("complete", "partial")
 #: the C# residue pass did with what the family left behind. Grouped with
 #: the refusals, and told apart from them on rendering.
 _WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-prose")
+#: The ``test_doubles`` kind of an assertion the fold made trivially true and
+#: the engine deleted (``piranha_runner.TRIVIAL_ASSERTION``): listed apart
+#: from the mock lines, since it neither stubbed nor verified anything.
+_TRIVIAL_ASSERTION = "assertion"
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
     TEST, SETTER_TEST, SIBLING_TEST, OWN_TEST, EMPTIED_SUITE, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
@@ -3115,7 +3154,7 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
         )
     if own_tests:
         logger.warning(
-            "%d test%s deleted with the wrapper member it tested: %s",
+            "%d test%s deleted with the wrapper it tested: %s",
             len(own_tests),
             "" if len(own_tests) == 1 else "s",
             "; ".join(f"{p}: {_one_line(t)}" for p, t in own_tests),

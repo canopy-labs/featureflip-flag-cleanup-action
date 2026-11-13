@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch the forked wheels this tool pins into wheels/.
 
-FOUR packages here exist only as GitHub-release wheels, and for the SAME
+FIVE packages here exist only as GitHub-release wheels, and for the SAME
 underlying reason -- each is a canopy-labs fork whose PyPI name belongs to
 upstream:
 
@@ -24,6 +24,11 @@ upstream:
 * **tree-sitter-go**, Gate 1's Go grammar, for the same reason. PyPI has stock
   0.25.0; the engine bundles 0.25.0 plus one grammar patch, so Go 1.26's
   `new(int32(101))` parses for the engine and is an ERROR for the stock grammar.
+* **tree-sitter-swift**, Gate 1's Swift grammar, for the same reason. The
+  engine bundles 0.7.3 plus one grammar patch, so the empty tuple `()` as an
+  expression (`completion(.success(()))`) parses for the engine; stock 0.7.3
+  and PyPI's 0.7.4 report a MISSING node there, and 0.7.4 also places the `!`
+  of a negated method call differently from the engine.
 
 Every `pip install` of this tool therefore needs `--find-links wheels`, and
 every Docker build bind-mounts the same directory; this script is the one
@@ -133,6 +138,14 @@ _WHEEL_SOURCES = (
         distribution="tree-sitter-go",
         repo="canopy-labs/tree-sitter-go",
         pattern=r"^tree_sitter_go-{version}-cp310-abi3-manylinux.*\.whl$",
+    ),
+    #: abi3, tagged `cp38`: the Swift grammar's setup.py floors its abi3 tag
+    #: (and limited API) at 3.8, as upstream's own PyPI wheels do. One wheel per
+    #: architecture.
+    _WheelSource(
+        distribution="tree-sitter-swift",
+        repo="canopy-labs/tree-sitter-swift",
+        pattern=r"^tree_sitter_swift-{version}-cp38-abi3-manylinux.*\.whl$",
     ),
 )
 

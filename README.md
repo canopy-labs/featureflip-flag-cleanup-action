@@ -1388,45 +1388,65 @@ annotated function. An awaited read through a key constant is not folded for an
 accessor that has any un-awaited read decided this way.
 
 A read returned from a function nothing annotates (`function isRbac(svc) { return
-svc.getFlag("key"); }`) folds to a literal only when every use of that function is
-provably a test. The function must be a plain named function: a function
-declaration, or a function or arrow bound to a `const` (or a `let` that is never
-reassigned). A class method, an object method or property function, a class field
-arrow, an anonymous function and a `export default` of one keep the read, because
-a method can be reached by a computed key or by dispatch that cannot be followed.
-A name that appears inside a string or template anywhere in the sources keeps the
-read for the same reason. So does a top-level function of a classic script (a file with no
-import, export, `require` or `module.exports`), which is a global reachable by a
-computed key. A barrel that re-exports the module (`export * from`, `export { f }
-from`, up to five hops) counts as the module when a file imports it as a whole. Every
-reference to that name, and to the names it is imported, re-exported,
-destructured, aliased or default-imported under, anywhere in the repository's
-TypeScript and JavaScript sources must be a call whose result is only tested or
-discarded: an `if`, `while`, `for` or ternary test, `!`, an operand of
-`&&`/`||`/`??` in such a position, a comparison with `true` or `false`, a
-statement, the left of `&&` in JSX, a local used only that way, or a return from
-another function for which the same holds (up to four levels). Anything else
-(passed as an argument, stored in an object or map, chained with `.then`,
-awaited, a property read off the result, a file that does not parse, or a `.vue`,
-`.svelte`, `.astro` or `.mdx` file that names the function) keeps the read and
-refuses the flag, naming the first such use. The check is by name, so a
-same-named function elsewhere counts too, and test files count like any other.
-A function that is default-exported in any form (`export default`, `export { f as
-default }`, `module.exports = f`) keeps the read, as does one whose module a file
-takes as a whole (a namespace import, `import x = require()`, `require()` bound to
-a name, `import()`, `export * as`) and then uses as anything but `ns.member(...)`
-(passed on, spread, computed access, `Object.values(ns)`). A specifier that cannot
-be resolved and may be the module (a relative path that matches no file, a
-workspace package name, a configured path alias) counts as naming it, and so does
-a rename through a specifier that cannot be resolved. A read returned from an
-`async` function or one annotated `boolean` is
-unaffected, and so is a call that reaches a declaration annotated `boolean`: a
-method call whose receiver's declared type gives it that return type, or a call of a
-function declared in the same file or imported through a relative path from a file
-that declares it so (a package import, or a same-named function nobody imports,
-never counts). A `require(...)` with a
-computed argument is treated like a namespace that may be the module. `typeof f` in
-a type is not a use of `f`.
+svc.getFlag("key"); }`) folds to a literal only on evidence that the read is
+synchronous, because a caller anywhere may treat the function's result as a Promise
+(`isRbac(svc).then(...)`), and every way another file can reach the function can't
+be followed. The evidence is any one of these:
+
+- the read is a synchronous accessor of a known SDK, imported from its package:
+  GrowthBook's `useFeatureIsOn`, `useFeatureValue` and `useGrowthBook()`'s `isOn`,
+  `isOff` and `getFeatureValue` (`@growthbook/growthbook-react` 0.17 and later, up
+  to 2.x); PostHog's `useFeatureFlagEnabled`, `useFeatureFlagVariantKey`,
+  `useFeatureFlagPayload` (`posthog-js/react`) and `posthog.isFeatureEnabled`,
+  `getFeatureFlag`, `getFeatureFlagPayload` (`posthog-js` 1.50 and later); Unleash's
+  `useFlag` and `useVariant` (`@unleash/proxy-client-react` 1.x to 6.x);
+  LaunchDarkly's `useFlags` and `useLDClient()`'s `variation`/`variationDetail`
+  (`launchdarkly-react-client-sdk` 2.29 and later, 2.x to 3.x) and an `initialize(...)`
+  client's (`launchdarkly-js-client-sdk` 2.x to 3.x); Flagsmith's
+  `flagsmith.hasFeature` and `getValue` (`flagsmith` 1.7 and later, to 10.x); and
+  `@featureflip/react`'s `useFeatureFlag` and `useFeatureflipClient()`'s
+  `boolVariation`, `stringVariation` and `numberVariation`. The version your
+  `package.json` files declare (or `node_modules` holds) must fall in those ranges;
+  a spec that does not bound the version (`*`, `>=2`, a tag, a path or an `npm:`
+  alias) does not count, and neither does a package your repository never declares
+  (unless it has no `package.json` at all). A package that something in the
+  repository may replace is not trusted either: a workspace package or root named
+  like it, an `overrides`, `resolutions` or `pnpm.overrides` entry (or a
+  `pnpm-workspace.yaml`) naming it, a `browser` field mapping it, a `package.json`
+  that does not parse, a `tsconfig` `paths` entry, a bundler, Jest or Babel alias,
+  or a Jest `moduleDirectories`/`modulePaths` or webpack `resolve.modules` entry
+  besides `node_modules` when any directory of that name in the repository holds
+  the package (Jest settings are read from config files, `jest.config.json` and
+  the `"jest"` key of `package.json`). Not detected, so keep them in mind: a bundler plugin that
+  resolves the name itself (Vite's `resolveId`), a Deno or HTML import map, and a
+  `node_modules` copy committed with a version it doesn't hold. Server SDKs whose reads return a Promise
+  (`@launchdarkly/node-server-sdk`, ConfigCat's `getValueAsync`) are deliberately
+  not on the list;
+- the call reaches a declaration in your repository annotated `boolean`;
+- the wrapper declares its own return type as `boolean` or another primitive or
+  literal type (`boolean | undefined`, `'on' | 'off'`), on the function or on the
+  `const` it is assigned to. `any`, `unknown`, an object or a Promise type are not
+  evidence.
+
+A declaration of the accessor in your repository that is, or could be, async still
+keeps the read, whatever the evidence. Without evidence, the read folds only when
+the wrapper is a plain named function private to its module (not exported in any
+form, in a file that is a module rather than a classic script), every mention of
+it is in its own file and is a call whose result is only tested or discarded (an
+`if`, `while`, `for` or ternary test, `!`, an operand of `&&`/`||`/`??` in such a
+position, a comparison with `true` or `false`, a statement, the left of `&&` in JSX,
+a local used only that way, or a return from another such function), the file uses
+no `eval`, `Function` or `with` and reads no computed member of `this` or the global
+object, and nothing in the repository uses rewire. Otherwise the read is kept and
+the flag refused with the reason; to unblock it, declare the wrapper's return type
+(`: boolean`) or read the flag through a known synchronous SDK accessor. A
+`: boolean` wrapper over an accessor TypeScript types as `any` is trusted the same
+way TypeScript trusts it, so a JavaScript caller (or a cast) that treats its result
+as a Promise is not seen; nor is a non-strict-mode function that reaches its caller
+through `.caller`. A file is a classic script, whose top-level functions are
+globals, when it has no `import` or `export` and no unconditional CommonJS export
+or `require` (a UMD file guarded by `typeof module` counts as a classic script), or
+when an HTML `<script src>` loads it. `typeof f` in a type is not a use of `f`.
 
 **Ruby predicate methods are named with their `?`.** Ruby flag libraries and
 wrappers read through predicates, so name them as Ruby spells them:
@@ -1935,28 +1955,86 @@ and so is its `vi.fn()` in a `vi.hoisted` holder. Any other use of the
 reference keeps the member (`test-double`). `vi.mocked(getFlags().isFooEnabled)
 .mockResolvedValue(<value>)` is a stub too.
 
-A test that is only about one removed member is deleted with it, for a class
-method or a factory's member alike, and the pull request lists it. The test
-builds the object itself inside the test with an injected fake
-(`const flags = new Flags({ isEnabled: vi.fn() })` or `buildFlags(...)`, whose
-arguments are literals, functions and `vi.fn()` fakes), and every other
-statement is an assertion about a call of that member on it, the result of
-one, or the fake it was given (`expect(isEnabled).toHaveBeenCalledWith(...)`).
-Its title must be the file's only one of that name, and it must not be
-`it.only`. When deleting tests leaves a plain `describe` (or `suite`) holding only
-residue, the `describe` goes too, recursively (the pull request lists it).
-Residue is a short whitelist: an import, a comment, a `vi.mock`/`vi.hoisted`
-call (at the top of the file only), a hook that registers no test, and a
-declaration whose initializer makes no call and no `new`. Anything else (any
+A test that is only about one removed wrapper is deleted with it, for a plain
+function, a class method or a factory's member alike, and the pull request
+lists it. For a member, the test builds the object itself inside the test
+with an injected fake (`const flags = new Flags({ isEnabled: vi.fn() })` or
+`buildFlags(...)`, whose arguments are literals, functions and `vi.fn()`
+fakes). For a function, it calls it by name with arguments built the same way
+(`isFooEnabled({ isEnabled: () => true })`). Every other statement is an
+assertion about a call of the wrapper, the result of one, or the fake it was
+given (`expect(isEnabled).toHaveBeenCalledWith(...)`), and none compares
+against a snapshot. A parametrised `it.each([true, false])(...)` (or
+`test.each`) counts when every row is a literal and the callback's parameters
+are plain names, so the rows can feed the fake and the expected value. Its
+title must be the file's only one of that name, and neither it nor a suite
+around it may be focused (`it.only`, `fit`, `fdescribe`, `describe.only`):
+deleting a focused test changes which tests run. A skipped one (`it.skip`,
+`xit`, `describe.skip`, `xdescribe`) never runs, and is deleted like any other. In plain JavaScript a function
+wrapper's own test does not reach this rule yet: its call is refused first,
+while the run decides whether the read may return a Promise (see "A
+TypeScript or JavaScript accessor that may return a Promise keeps its type"
+under "Wrapping the SDK"). When deleting tests leaves a plain `describe` (or `suite`, or an
+`xdescribe`) holding only residue, the `describe` goes too, recursively (the
+pull request lists it). Residue is a short whitelist: an import, a comment, a
+`vi.mock`/`vi.hoisted` call (at the top of the file only), a hook that
+registers no test, a declaration whose initializer makes no call and no `new`,
+a `declare` (a type only), and `export {};`. Anything else (any
 other call, a loop, a function, a `describe.each`, `it.todo`, a test with a
 computed title) keeps it, since it may build tests this cannot name. A test
 file left with only residue and no export is deleted, and the pull request
-lists it. A test file that exports something, or keeps anything outside that
-whitelist, and has no other test is not emptied: the test stays and the member
-is kept (`test-double`). A test that also calls
-another member or other code, hands the object on (`Object.keys(flags)`), or
-gets the object from a hook, a `describe` or a parameter, stays, and keeps
-the member (`test-double`).
+lists it.
+
+A test that drives a wrapper with a value it chose but cannot be deleted
+refuses the flag, and nothing is changed. The wrapper's own read is folded
+whether the wrapper goes or stays, so such a test would be left asserting what
+the read used to return. That covers a test that also calls another member or
+other code, hands the object on (`Object.keys(flags)`), gets the object from a
+hook, a `describe` or a parameter, or compares against a snapshot; an
+`it.each` whose rows are not literals; a focused test; a test file
+that exports something, or keeps anything outside the residue whitelist
+(`vi.stubEnv(...)`, say), and has no other test. For a function wrapper whose
+caller may choose what its read goes through, it also covers any other use of
+it in a test file (`[fake].map(isFooEnabled)`, `isFooEnabled.call(null, fake)`,
+`const check = isFooEnabled`), including one imported through a barrel
+(`export * from`, `export { isFooEnabled } from`, or a CommonJS
+`module.exports = require(...)`) or loaded with `require` (`require("./flags")
+.isFooEnabled`, `const { isFooEnabled: on } = require(...)`, and any other use
+of the required module: a computed member, a spread, passing it on,
+`jest.requireActual`, or a specifier that is not a literal; `import x =
+require(...)` is a namespace), or named by its module's path anywhere else in a
+test file (a helper's argument, a variable, `import("./flags")`,
+`createRequire(...)("./flags")`); only an import source, `require`, a module
+mock's path and a type leave it alone. A re-export of it under
+another name (`export { isFooEnabled as on }`, `export default isFooEnabled`).
+A caller may choose unless the read's receiver is proven to start from a
+module-level `const`, function or class, declared in the file or imported
+from a module that declares it so (`client.isEnabled(...)` with `const
+client` at the top, `getClient().isEnabled(...)`); an `export let client`
+with a setter or a `var` is not proven. A client imported from an npm
+package (`import posthog from "posthog-js"`, `import * as ld from ...`) is
+proven unless something in the repository lets a test change it: a module
+mock of the package (`vi.mock("posthog-js", ...)` and the like), a
+`__mocks__/<package>` file, a test runner's `automock` or a
+`moduleNameMapper`/`alias` naming it, a spy, stub or assignment on what is
+imported from it (`vi.spyOn(posthog, ...)`, `posthog.x = ...`), or a test
+calling anything it exports other than your `accessors`
+(`posthog.init(...)`). A caller may always choose for
+`client.isEnabled` on a parameter, `(client ?? fallback).isEnabled`,
+`pick(ctx).isEnabled` and `this.client.isEnabled`. Only the
+receiver counts, so a module-level client read with a parameter among its
+arguments (`client.isEnabled("x", false, user.id)`) is inlined as before. A
+mention that cannot call the wrapper does not refuse: `vi.mocked(isFooEnabled)
+.mockReturnValue(...)` beside a module mock (the stub pass's own shape),
+`typeof isFooEnabled`, and `expect(isFooEnabled)` with a matcher that does not
+call it (`toBeDefined`, `toBeTypeOf`, `toHaveBeenCalled`...). Outside test
+files, any use of such a wrapper as a value refuses: an alias
+(`export const on = isFooEnabled`), an object or array holding it, or an
+argument, since a test may call it through whatever holds it. Exporting it
+under its own name (`export { isFooEnabled }`, `module.exports = {
+isFooEnabled }`, `exports.isFooEnabled = isFooEnabled`) and `typeof
+isFooEnabled` in a type are not uses as a value. The refusal names the test
+and its line. Delete or rewrite that test, then run the removal again.
 
 A factory's member may also return the read's Promise: one of your
 `accessors` whose read there becomes `Promise.resolve(<value>)` (see "A
@@ -2047,12 +2125,12 @@ In a test file (and any file that calls a mocking library), a class's
 instance method is proven only through an instance imported from the code
 under test. A local `new Flags(fakeClient)`, a typed parameter or a field
 there is the test's own object, reading the flag through what the test
-injected; such a call is left and reported (`test-double`), and the member
-stays. An instance a helper module builds with a fake and a test imports is
-not recognised. Either way the member's own read is still folded, so a test
-of the member itself (`expect(new Flags(alwaysOn).isFooEnabled()).toBe(true)`,
-or a factory's `buildFlags(alwaysOn)` test, which keeps the factory's members)
-fails for the value the flag no longer serves, as it would for a read
+injected. A test that is only about the member is deleted with it (below);
+any other such call, or a call the proof cannot type in a test file that
+builds the class or calls the factory itself, refuses the flag. An instance a
+helper module builds with a fake and a test imports is not recognised, and
+the member's own read is still folded, so a test that gets its object that
+way fails for the value the flag no longer serves, as it would for a read
 folded anywhere else. Delete or rewrite such a test in the pull request.
 
 Imports resolve the way cross-file key constants' do: relative paths,
@@ -5643,7 +5721,12 @@ always left standing rather than guessed at. In a codebase built out of
 arrow-function components, that is most functions.
 
 A local whose value does work (`const params = useParams()`) keeps that work:
-the declaration becomes the call alone, `useParams();`. A destructured name left
+the declaration becomes the call alone, `useParams();`. A value that starts with
+`function`, `class`, `{`, `async function` or `let [` becomes the call in
+parentheses (`(function () { … }.bind(null));`), since a statement starting
+with one of those is a declaration or a block; when the statement above it has
+no semicolon, the parenthesis would continue that statement, so the declaration
+is kept. A destructured name left
 unused leaves its pattern when the pattern keeps another name
 (`const { orgId, tab } = useParams()` becomes `const { tab } = useParams()`),
 and a pattern it was the only name of is treated like the plain local above.
@@ -5662,6 +5745,48 @@ in it is reachable from nowhere else and this tool can see its whole scope. A
 file with none of those is a plain script whose top-level `const` is shared
 with every other script on the page, and its bindings are left alone. Exported
 bindings are left alone in either case.
+
+A **function** at the top level of a module that the fold left unused is
+deleted too: a `function`, `async function` or `function*` declaration, or a
+`const`, `let` or `var` holding an arrow function, a function expression or a
+generator, that is not exported. This is the context builder passed beside the
+key (`client.boolVariation("key", contextFor(user), false)`), or the helper
+redux-saga is handed with the key in the next argument (`call(isEnabled,
+"key")`, `select(selectFlag, "key")`). Declaring a function runs nothing, so
+deleting one changes nothing at run time. Here only an `import` or `export`
+statement makes the file a module: a script's top-level function is a global
+that another script or an HTML `onclick` can call, and a file that only calls
+`require` or assigns `module.exports` may be a script too, so both keep their
+functions. The function must be named nowhere else in its file, outside its own
+body. A call above it, `export { f }`, `export default f`, a `typeof f`, a JSX
+element `<F />`, a decorator, an overload signature, a `namespace` or
+`interface` of the same name, a property `o.f` and a string `"f"` each keep it.
+So does a comment naming it, a file using `eval`, and a file holding JSX unless
+its `tsconfig.json` or `jsconfig.json` sets the automatic runtime
+(`react-jsx`), since a classic-runtime element calls its factory without
+naming it. A repository that uses rewire keeps every such function, and every
+top-level binding the cleanup would otherwise remove, since a test there reads
+them by name from another file. It counts as using rewire when a source file
+calls babel-plugin-rewire's API (`__get__(…)`, `__set__(…)`, `__with__(…)`,
+`__Rewire__`, `__RewireAPI__`, `__ResetDependency__`, `__GetDependency__`) or
+loads the `rewire` or `babel-plugin-rewire` package (`require`, `import`, or a
+dynamic `import()`), when any `package.json` lists either package among its
+dependencies, dev, peer or optional dependencies or names `rewire` in its
+`"babel"` key, or when a `.babelrc`, `.babelrc.*` or `babel.config.*` in the
+checkout names `rewire`. The word alone, in a comment or a test title, does not
+count. Rewire turned on only inside a third-party Babel preset, or by a
+config outside the checkout, cannot be seen from the checkout; in such a
+repository, list the plugin in your own Babel config. A `/** … */` comment directly above, with no blank line between,
+goes with the function. Any other comment between the statement before the
+function and the function keeps it, across blank lines and including one at the
+end of the line above: a directive such as `// @ts-expect-error` (which
+TypeScript applies across blank lines), `/* istanbul ignore next */` or
+`// biome-ignore` would otherwise apply to the next statement, and a comment may
+describe it. A function under a `/** … */` comment that opens the file, which
+may be the file's header, or one carrying `@typedef`, `@callback`, `@import`
+or a licence, stays. Whatever the deletion leaves unused goes in turn: a helper
+only it called, and an import only it used. The pull request names each
+function deleted.
 
 Deleting a whole import statement can also stop its module from loading in
 this file. That matters when loading the module does work, such as creating a
@@ -7241,6 +7366,12 @@ flag-keyed map entry or key constant was the longest, the lines left are
 re-padded as `gofmt` pads them, so `gofmt -l` stays clean. A block that was not
 `gofmt`-formatted before the run is left as the removal leaves it.
 
+**Trailing comments on consecutive statements keep `gofmt`'s column.** `gofmt` lines up the `//`
+comments of consecutive one-line statements. When a removal deletes one of those statements, or the
+argument-call hoist puts a comment-less line between them, the comments of that run are realigned so
+`gofmt -l` stays clean. Runs the edit did not touch are not reformatted, and a run that was not
+`gofmt`-formatted before the run is left as the edit leaves it.
+
 Files under a `go mod vendor` tree are skipped, detected by the
 `vendor/modules.txt` manifest rather than by directory name.
 
@@ -8157,7 +8288,7 @@ means no PR.
   keep working — so there is no rule that could refuse the assertion without
   refusing those too. Where the assertion is one of the test-framework calls
   the tool knows, and a statement of its own, the vacuous assertion is deleted
-  and listed with the deleted mock lines; one the removal made FAIL
+  and listed in the pull request under a heading of its own; one the removal made FAIL
   (`assertTrue(false)`) is left in place and named in the pull request. The
   calls it knows: xUnit, NUnit and MSTest `Assert.True`/`IsTrue`/`That`,
   `False`/`IsFalse`, `Equal`/`AreEqual`; JUnit and kotlin.test
@@ -8309,6 +8440,17 @@ means no PR.
   enough to prove it unused. The same binding in a module IS cleaned up (see
   [above](#supported-jsts-flag-read-shapes)); so is
   TypeScript's `import x = require("…")`.
+
+  A **function** the fold leaves unused stays, and `no-unused-vars` reports
+  it, in a file without an `import` or `export` statement (a script, or a
+  CommonJS file), when a string, a comment or `eval` in its file might name it,
+  in a file holding JSX not proven to use the automatic runtime, in a
+  repository that uses rewire, when a `namespace`, `interface` or overload
+  signature shares its name, and when any comment but a single adjacent
+  `/** … */` sits between it and the statement before it, blank lines
+  included, or under a `/** … */` that opens the file. Each is a case where
+  this file alone cannot prove nothing else calls it. Delete it yourself if
+  nothing does.
 
   A top-level binding whose initializer is a **call** is rewritten to just that
   call — `OpenFeature.getClient();` where `const client = OpenFeature.getClient();`

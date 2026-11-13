@@ -9,7 +9,7 @@ test, what stays is imports and mocks: "No test suite found in file".
 Only a suite that held a test before this run goes, and only one whose
 remaining statements cannot matter once it holds no test: hooks, comments and
 declarations. Any other statement (a ``vi.mock``, which applies to the whole
-file wherever it is written) keeps it. Only a plain ``describe``/``suite`` is
+file wherever it is written) keeps it. Only a plain ``describe``/``suite`` (or ``xdescribe``) is
 removed; a ``describe.each`` is left alone. A file goes when no test is left
 in it and it exports nothing, so nothing else can depend on it.
 """
@@ -27,7 +27,7 @@ from flag_cleanup import file_deletion, mock_stubs, ts_scope, ts_syntax, ts_test
 LANGUAGES = frozenset({"ts", "tsx", "js"})
 #: Kind of the report row.
 EMPTIED = mock_stubs.EMPTIED_SUITE
-_PLAIN_SUITE = re.compile(r"^(?:describe|suite)(?:\.(?:skip|only|concurrent|sequential))*$")
+_PLAIN_SUITE = re.compile(r"^(?:(?:describe|suite)(?:\.(?:skip|only|concurrent|sequential))*|xdescribe)$")
 _ANY_SUITE = re.compile(r"^(?:describe|suite)\b")
 _HOOKS = frozenset({"beforeEach", "afterEach", "beforeAll", "afterAll"})
 #: Names that register a test or a suite, in any member form (`it.each(x)(...)`,
@@ -119,7 +119,9 @@ def _residue(statement: Node, top: bool = False) -> bool:
     no test, a declaration whose initializer calls and constructs nothing, a
     comment or an empty statement. Anything else (any other call, a loop, a
     function, a test or suite in any form) may be, or build, a test."""
-    if statement.type in ("import_statement", "comment", "empty_statement"):
+    if statement.type in ("import_statement", "comment", "empty_statement", "ambient_declaration"):
+        return True  # `declare const xdescribe: ...` is a type only: nothing runs
+    if statement.type == "export_statement" and _empty_export(statement):
         return True
     if statement.type in ("lexical_declaration", "variable_declaration"):
         hoisted = [] if not top else [
@@ -218,10 +220,22 @@ def _without(source: str, language: str, before: dict[tuple[str, ...], int]) -> 
         emptied.append(title)
 
 
+def _empty_export(statement: Node) -> bool:
+    """``export {};``: it only keeps a file a module, and exports nothing (the
+    run writes it when it deletes a file's last import)."""
+    named = [c for c in statement.named_children if c.type != "comment"]
+    return (
+        statement.child_by_field_name("source") is None
+        and len(named) == 1
+        and named[0].type == "export_clause"
+        and not any(c.type == "export_specifier" for c in named[0].named_children)
+    )
+
+
 def _exports(source: str, language: str) -> bool:
     root = ts_syntax._parse(source, language)
     return any(
-        c.type == "export_statement"
+        (c.type == "export_statement" and not _empty_export(c))
         or (c.type == "expression_statement" and re.match(r"(?:module\.)?exports\b", c.text.decode("utf-8", "replace")))
         for c in root.named_children
     )

@@ -133,6 +133,13 @@ SIBLING_NOT_INERT = "sibling-not-inert"
 #: The member is read through a receiver typed as an inert sibling, whose
 #: member goes with the wrapper.
 SIBLING_RECEIVER = "sibling-receiver"
+#: A test drives the wrapper with a value it chose (an object it built with a
+#: fake, a fake handed to a function wrapper that reads through its
+#: parameter), and the test cannot be deleted with the wrapper. Folding the
+#: wrapper's read would leave the test asserting what the read used to
+#: return, so the profile's runner refuses the flag instead (TypeScript and
+#: JavaScript).
+DRIVEN_BY_TEST = "driven-by-test"
 
 #: Annotations that say nothing about who calls a member. Not ``JvmName``:
 #: Java calls the member by the name it gives, which no scan here looks for.
@@ -778,7 +785,9 @@ def sibling_receivers(
             if not same:
                 continue
             for o in occurrences:
-                if o.reason == SIBLING_RECEIVER and o.in_test_double and o.receiver and o.scope:
+                # A TS/JS function wrapper's own test calls it bare: receiver "".
+                bare = o.receiver == "" and language in ("ts", "tsx", "js")
+                if o.reason == SIBLING_RECEIVER and o.in_test_double and (o.receiver or bare) and o.scope:
                     found.setdefault(path, set()).add((o.scope, o.receiver))
                     proven.setdefault((wrapper.label, path), set()).add((o.scope, o.receiver))
     if language in ("ts", "tsx", "js"):

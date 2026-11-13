@@ -1357,8 +1357,9 @@ def _is_read(value: Node, accessors: frozenset[str]) -> bool:
     if call is None or call.type != "call_expression" or _text(call).startswith("!!"):
         return False
     callee = call.named_children[0]
-    # The gate grammar wraps a negated callee in a prefix `!`; the engine's
-    # nests it differently, and both seed rules accept both.
+    # The engine's grammar (which the gate now shares) nests a negated
+    # callee's `!` inside its navigation target; tree-sitter-swift 0.7.4 wraps
+    # the callee in a prefix `!` instead. Both seed rules accept both.
     if callee.type == "prefix_expression" and _text(callee.child_by_field_name("operation")) == "!":
         callee = callee.child_by_field_name("target")
     if callee is None:

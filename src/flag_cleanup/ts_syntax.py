@@ -541,6 +541,35 @@ def _asi_merged_statements(before: str, after: str, language: str) -> bool:
     return False
 
 
+#: The text an expression statement may not start with, because in statement
+#: position JavaScript reads that token as the start of something else: a
+#: `function`/`async function`/`class` declaration, a `{` block, a `let [`
+#: destructuring declaration (ECMAScript's ExpressionStatement lookahead
+#: restriction). `function () {…}.bind(null);` is a SyntaxError to `node` and
+#: `tsc`, yet tree-sitter's grammars parse it as an `expression_statement` with no
+#: ERROR node, so the first four checks pass it. A rewrite that turns a
+#: declaration's value into a statement (a discarded initializer) is how one
+#: arrives. `async` and `function` must share a line: across a line break
+#: `async` is an expression statement of its own.
+RESTRICTED_STATEMENT_START = re.compile(
+    r"(?:function\b|class\b|\{|async[ \t]+function\b|let[ \t\r\n]*\[)"
+)
+
+
+def _restricted_statements(source: str, language: str) -> int:
+    """How many expression statements in ``source`` start with a token that
+    statement position reads as a declaration or a block."""
+    source_bytes = source.encode("utf-8")
+    return sum(
+        1
+        for node in _walk(_parse(source, language))
+        if node.type == "expression_statement"
+        and RESTRICTED_STATEMENT_START.match(
+            source_bytes[node.start_byte : node.end_byte].decode("utf-8", "replace")
+        )
+    )
+
+
 def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     """Whether rewriting ``before`` into ``after`` produced invalid source.
 
@@ -555,7 +584,9 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
        that strips a statement out from under its keyword, leaving that keyword
        stranded as an expression;
     4. two surviving statements fused by Automatic Semicolon Insertion — see
-       :func:`_asi_merged_statements`.
+       :func:`_asi_merged_statements`;
+    5. more expression statements starting with `function`, `class`, `{`,
+       `async function` or `let [` — see ``RESTRICTED_STATEMENT_START``.
 
     Checks 2, 3 and 4 exist because the ERROR-node count is not a sufficient
     signal: tree-sitter grammars are deliberately error-tolerant, so a
@@ -581,7 +612,7 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
 def refusal_reason(before: str, after: str, language: str) -> str | None:
     """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
 
-    The same four checks in the same order, each worded for the person reading
+    The same five checks in the same order, each worded for the person reading
     the run's output — a refusal that names no cause sends them looking for a
     syntax error in a file that may parse perfectly well.
     """
@@ -595,6 +626,11 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
         return "a keyword was left stranded where an expression is read"
     if _asi_merged_statements(before, after, language):
         return "two statements would run together without a semicolon"
+    if _restricted_statements(after, language) > _restricted_statements(before, language):
+        return (
+            "a statement would start with `function`, `class` or `{`, which "
+            "JavaScript reads as a declaration or a block"
+        )
     return None
 
 

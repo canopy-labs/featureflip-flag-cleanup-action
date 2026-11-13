@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.13.0"
+version = "2.13.1"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,14 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.52.0. Swift: the grammar is now canopy-labs/tree-sitter-swift (upstream
+    # 0.7.3 plus the empty tuple `()` as an expression), so a file using
+    # `completion(.success(()))` is no longer refused at input. The
+    # tree-sitter-swift pin below moves with it, to `0.7.3+canopy.1`.
+    # TypeScript/JavaScript: a module-private function the fold strands (a
+    # `function` declaration, or a `const`/`let`/`var` holding a function) is
+    # deleted, with what it leaves unused in turn (piranha#304). No other
+    # grammar rev moved.
     # 0.51.0. Go: a local the fold leaves only assigned (`var g T`, then
     # `g = f()`) is removed instead of refused: each plain assignment goes
     # (`_ = f()` when it calls something) and then the declaration
@@ -588,7 +596,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.51.0",
+    "polyglot-piranha==0.52.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -654,7 +662,18 @@ dependencies = [
     # from wheels/ (PEP 440 local segment), filled by
     # scripts/fetch_piranha_wheels.py. Bump the segment when the engine's pin moves.
     "tree-sitter-go==0.25.0+canopy.1",
-    "tree-sitter-swift>=0.7,<0.8",
+    # Swift. NOT a PyPI release, pinned EXACTLY for the same reason as the
+    # grammars above: Gate 1 must parse what the engine rewrites.
+    # polyglot-piranha bundles upstream 0.7.3 (exactly 0.7.3: 0.7.4 moves the `!`
+    # of a negated method call out of the callee) plus ONE grammar patch
+    # (canopy-labs/tree-sitter-swift): the empty tuple `()` is an expression, so
+    # `completion(.success(()))`, `f(x: ())` and `(1, ())` parse. Stock 0.7.3
+    # and PyPI's 0.7.4 report a MISSING node on each. The only node-types change
+    # is `tuple_expression.value` becoming optional. Until this pin, the gate
+    # took PyPI's 0.7.4 and so disagreed with the engine about the `!` too.
+    # Resolves only from wheels/ (PEP 440 local segment), filled by
+    # scripts/fetch_piranha_wheels.py. Bump the segment when the engine's pin moves.
+    "tree-sitter-swift==0.7.3+canopy.1",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the

@@ -116,7 +116,7 @@ import tree_sitter_swift
 import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
-from flag_cleanup import cross_file_csharp, cross_file_ts, dart_namespace, inert_load
+from flag_cleanup import cross_file_csharp, cross_file_ts, dart_namespace, inert_load, ts_syntax
 
 #: ``js`` maps to the TSX grammar deliberately, for the same reason
 #: ``ts_syntax._parser`` does: the engine rewrote with it, and JSX in a ``.js``
@@ -2047,6 +2047,18 @@ def _deletes_last_module_marker(source: str, candidate: Candidate, language: str
     return covered
 
 
+def _declared_at_top_level(source: str, candidate: Candidate, language: str) -> bool:
+    """Whether ``candidate`` is declared directly in a TS/JS file's program: the
+    nearest declaration around its span is the program's child."""
+    root = _shared_parse(source, language)
+    node: Node | None = _covering(root, candidate.start, candidate.end)
+    if node == root:
+        return True  # not found: doubt keeps it
+    while node is not None and node.type not in ("lexical_declaration", "variable_declaration"):
+        node = node.parent
+    return node is not None and node.parent is not None and node.parent.type == _TS_PROGRAM
+
+
 def _top_level_bindings_are_private(root: Node, language: str) -> bool:
     """Whether a declaration sitting directly in ``root`` is file-private.
 
@@ -3267,6 +3279,19 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
         return None
     elif prefix is None and not _is_statement_expression(source, candidate, language):
         return None
+    if language in _TS_MODULE_LANGUAGES:
+        # `function () {…}.bind(null);` is a declaration in statement position,
+        # and a SyntaxError; the parenthesised discard is the expression. Any
+        # discard starting with `(`, `[`, a backtick or an operator -- the
+        # parenthesised one, an IIFE `(function () {…})()`, `[a, b].map(f)` --
+        # is continued by a statement above it that does not end in `;`, so
+        # the declaration is kept then rather than discarded.
+        if ts_syntax.RESTRICTED_STATEMENT_START.match(initializer):
+            initializer = f"({initializer})"
+        if _ASI_CONTINUES.match(initializer) and not _parenthesis_starts_a_statement(
+            source, candidate, language
+        ):
+            return None
     replacement = f"{prefix or ''}{initializer}"
     if language not in _NO_STATEMENT_TERMINATOR:
         replacement += ";"
@@ -3759,6 +3784,62 @@ def _fills_a_parent_slot(
         if parent.field_name_for_child(index) == field
     )
     return siblings == 1
+
+
+#: Statements that end where their closing `}` does: a `(` on the next line
+#: starts a new statement after them rather than calling them.
+_CLOSED_DECLARATIONS = frozenset({
+    "function_declaration", "generator_function_declaration", "class_declaration",
+    "abstract_class_declaration", "interface_declaration", "enum_declaration",
+    "statement_block",
+})
+
+
+#: What a statement may start with and still be read as the continuation of the
+#: statement before it when that one has no `;` (automatic semicolon insertion
+#: does not fire): the class Gate 1's ASI probe and the engine's ASI guards use.
+_ASI_CONTINUES = re.compile(r"[\[(`/+<-]")
+
+
+def _last_real_token(node: Node) -> Node | None:
+    """The last leaf of ``node`` that is not inside a comment."""
+    last = None
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == "comment":
+            continue
+        if current.child_count == 0:
+            if last is None or current.end_byte > last.end_byte:
+                last = current
+            continue
+        stack.extend(current.children)
+    return last
+
+
+def _parenthesis_starts_a_statement(
+    source: str, candidate: Candidate, language: str
+) -> bool:
+    """Whether a statement starting with ``(`` in place of ``candidate`` starts a
+    statement of its own: nothing before it in its block, or a statement before
+    it whose last token that is not a comment is ``;``, or a declaration closed
+    by its ``}``. Anything else may be continued by the ``(`` (`run()` then `(f)`
+    is `run()(f)`); a ``;`` inside a comment (`f() // done;`) is no ``;``."""
+    declaration = _node_at(source, language, candidate.start, candidate.end)
+    if declaration is None:
+        return False
+    previous = declaration.prev_named_sibling
+    while previous is not None and previous.type == "comment":
+        previous = previous.prev_named_sibling
+    if previous is None:
+        return True
+    last = _last_real_token(previous)
+    if last is not None and last.type == ";":
+        return True
+    if previous.type == "export_statement":
+        inner = previous.child_by_field_name("declaration")
+        return inner is not None and inner.type in _CLOSED_DECLARATIONS
+    return previous.type in _CLOSED_DECLARATIONS
 
 
 def _is_statement_expression(
@@ -5524,6 +5605,13 @@ def remove_stranded_bindings(
         if language in _PROSE_BLIND_LANGUAGES and path is not None
         else frozenset()
     )
+    # The rewire API reads a module's top-level binding by name from another
+    # file, so this file's count no longer proves one unused.
+    reflected = (
+        language in _TS_MODULE_LANGUAGES
+        and root is not None
+        and cross_file_ts.module_scope_reflection(root)
+    )
     removed: list[Candidate] = []
     current = after
     original = _parse(before, language)
@@ -5560,6 +5648,12 @@ def remove_stranded_bindings(
                 removed.append(candidate)
                 acted = True
                 break
+            if (
+                reflected
+                and candidate.kind == "variable"
+                and _declared_at_top_level(current, candidate, language)
+            ):
+                continue
             if candidate.kind == "import":
                 before_count = _import_references(before, candidate, language, blind)
                 current_count = _import_references(current, candidate, language, blind)

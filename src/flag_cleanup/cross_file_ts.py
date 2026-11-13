@@ -1026,6 +1026,99 @@ def jsx_factories(reader_path: str, repo_dir: str) -> dict[str, frozenset[str | 
 #: compares them: an element calls a function the compiler imports itself.
 AUTOMATIC_JSX = frozenset({"react-jsx", "react-jsxdev"})
 
+#: What reaches a module's top-level bindings by NAME from another file, as code
+#: spells it: babel-plugin-rewire's API on a module (`__RewireAPI__`, `__Rewire__`,
+#: `__ResetDependency__`, `__GetDependency__`, and the calls `__get__(`, `__set__(`,
+#: `__with__(`), and a load of the `rewire` package or the plugin itself
+#: (`require("rewire")`, `import … from "rewire"`, `import("babel-plugin-rewire")`).
+#: Never the bare word: "nor rewire this resource's state" in a comment and an
+#: `it("should rewire graph")` title are not a use.
+_REWIRE = re.compile(
+    rb"__(?:RewireAPI|Rewire|ResetDependency|GetDependency)__"
+    rb"|__(?:get|set|with)__\s*\("
+    rb"|(?:\brequire|\bimport)\s*\(\s*['\"`](?:babel-plugin-)?rewire['\"`]\s*\)"
+    rb"|\b(?:from|import)\s*['\"](?:babel-plugin-)?rewire['\"]"
+)
+#: The packages whose presence in a manifest's dependencies is a use.
+_REWIRE_PACKAGES = frozenset({"rewire", "babel-plugin-rewire"})
+_DEPENDENCY_KEYS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+#: Every suffix a TypeScript-family reader of a module can sit in.
+_REFLECTION_SUFFIXES = (
+    frozenset({".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"})
+    | source_index.COMPONENT_SUFFIXES
+    | source_index.PAGE_SUFFIXES
+)
+
+
+def _is_babel_config(name: str) -> bool:
+    """A Babel config file: ``.babelrc`` and ``.babelrc.*``, ``babel.config.*``."""
+    return name == ".babelrc" or name.startswith((".babelrc.", "babel.config."))
+
+
+def _manifest_uses_rewire(data: bytes) -> bool:
+    """Whether a ``package.json`` depends on `rewire` or `babel-plugin-rewire`, or its
+    ``"babel"`` key names `rewire`. One that does not parse answers yes."""
+    try:
+        manifest = json.loads(data)
+    except ValueError:
+        return True
+    if not isinstance(manifest, dict):
+        return True
+    for key in _DEPENDENCY_KEYS:
+        dependencies = manifest.get(key)
+        if isinstance(dependencies, dict) and _REWIRE_PACKAGES & set(dependencies):
+            return True
+    return "babel" in manifest and "rewire" in json.dumps(manifest["babel"])
+
+
+def _config_mentions_rewire(root: str) -> bool:
+    """Whether any ``package.json`` in the checkout uses rewire
+    (:func:`_manifest_uses_rewire`) or any Babel config spells ``rewire`` (as text:
+    those files are small and only configure Babel). Every directory is walked but
+    ``node_modules`` and ``.git``; an unreadable file answers yes."""
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
+        for name in filenames:
+            manifest = name == "package.json"
+            if not manifest and not _is_babel_config(name):
+                continue
+            try:
+                data = (Path(directory) / name).read_bytes()
+            except OSError:
+                return True
+            if _manifest_uses_rewire(data) if manifest else b"rewire" in data:
+                return True
+    return False
+
+
+def module_scope_reflection(repo_dir: str) -> bool:
+    """Whether anything in the checkout may reach a module's top-level binding
+    by name from another file, so that one file's spellings no longer prove the
+    binding unused: a source calling the rewire API or loading the `rewire` package
+    (``_REWIRE``), a ``package.json`` depending on `rewire` or `babel-plugin-rewire`
+    or naming it in its `"babel"` key, or a Babel config naming it. Answered
+    once per run. A file that cannot be read answers yes: the question is what a
+    deletion may rely on, and doubt keeps the binding. Not seen: rewire turned on
+    only inside a third-party preset or a config outside the checkout."""
+    memo = source_index.run_memo("module_scope_reflection")
+    root = source_index.checkout_root(repo_dir)
+    if memo is not None and root in memo:
+        return memo[root]
+    found = _config_mentions_rewire(root)
+    if not found:
+        for source in source_index.files(repo_dir, _REFLECTION_SUFFIXES, with_ignored=True):
+            try:
+                data = source.path.read_bytes()
+            except OSError:
+                found = True
+                break
+            if _REWIRE.search(data):
+                found = True
+                break
+    if memo is not None:
+        memo[root] = found
+    return found
+
 
 def jsx_automatic(reader_path: str, repo_dir: str) -> bool:
     """Whether every config that may compile ``reader_path`` sets ``jsx`` to

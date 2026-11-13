@@ -99,6 +99,7 @@ from flag_cleanup import (
     cross_file_python,
     discarded_calls,
     failing_assertions,
+    go_comment_columns,
     go_defaults,
     go_emptied,
     go_handles,
@@ -1311,7 +1312,7 @@ _ENGINE_UNREACHABLE_RULES = frozenset(
 #: (``Assert.True(true)``, ``expect(true).toBe(true)``, ``assert True``), or
 #: write ``pass`` for one that was the only statement of a Python block. Each
 #: is reached only by an edge from the fold's own literal, and the pull request
-#: lists what it deleted with the mock lines (:func:`_engine_assertions`).
+#: lists what it deleted under a heading of its own (:func:`_engine_assertions`).
 _TRIVIAL_ASSERTION_RULES = frozenset(
     {
         "delete_trivially_true_assertion",
@@ -1668,6 +1669,19 @@ _ENGINE_STRANDED_METHOD_RULES = {
 }
 
 
+#: The engine rules that delete a TypeScript/JavaScript function its own fold
+#: left with no use: a ``function``/``function*`` declaration or a
+#: function-valued ``const``/``let``/``var`` declared directly in an ES module's
+#: program and not exported, in a file carrying the ``module_scope_reflection``
+#: fact (:func:`_module_scope_facts`). Named by the whole declaration
+#: (``decl``), never the match: the ``_documented`` rule's match also holds the
+#: ``/** */`` comment it deletes above it.
+_ENGINE_STRANDED_FUNCTION_RULES = {
+    "delete_stranded_ts_function_documented": "decl",
+    "delete_stranded_ts_function": "decl",
+}
+
+
 def _engine_bindings(summaries, repo_dir: str) -> tuple[tuple[str, str, str], ...]:
     """``((relative_path, kind, text), …)`` for each import, local or private
     method the engine removed because its own fold stranded it.
@@ -1685,6 +1699,7 @@ def _engine_bindings(summaries, repo_dir: str) -> tuple[tuple[str, str, str], ..
                 ("import", _ENGINE_STRANDED_IMPORT_RULES),
                 ("variable", _ENGINE_STRANDED_LOCAL_RULES),
                 ("private method", _ENGINE_STRANDED_METHOD_RULES),
+                ("private function", _ENGINE_STRANDED_FUNCTION_RULES),
             ):
                 capture = rules.get(edit.matched_rule)
                 if capture is not None:
@@ -2728,7 +2743,7 @@ def _transform_flag(
     test_doubles = tuple(
         row for row in test_doubles if row[1] not in (mock_stubs.DEFAULT_ROW, mock_stubs.RELIED_ON_DEFAULT)
     )
-    # Listed with the mock lines: each checked a flag read this removal folded.
+    # Listed under their own heading: each checked a flag read this removal folded.
     engine_guards = tuple(row for row in engine_assertions if row[1] == CONSTANT_GUARD)
     test_doubles = test_doubles + tuple(row for row in engine_assertions if row[1] != CONSTANT_GUARD)
 
@@ -3058,6 +3073,11 @@ def _transform_flag(
     # An argument deleted at the end of a line strands the space before it,
     # and these passes all run after the first tidy.
     summaries = _tidy_trailing_whitespace(summaries, language)
+    # Go: a statement deleted from (or a line without a comment put into) a
+    # run of trailing comments leaves the rest in the old column, which
+    # `gofmt -l` lists (:mod:`flag_cleanup.go_comment_columns`).
+    if language == "go":
+        summaries = _realign_go_comment_columns(summaries)
     # A `const` left unread is deleted by the stranded-binding pass above like
     # any other local; only what is still on disk is reported as unread.
     on_disk = {os.path.relpath(s.path, repo_dir): s.content for s in summaries}
@@ -3721,9 +3741,56 @@ def _plan_wrappers(
         kept |= staying
         stub_pass.reapply(replace(stub_pass.wrapper, kept=kept, **fakes(kept)))
         plan = prove()
+    if doubles is not None and language in ("ts", "tsx", "js"):
+        _refuse_driven_wrappers(repo_dir, flag_key, found, qualified)
     plan.spans = {by_resolved[r]: spans for r, spans in plan.spans.items()}
     plan.receivers = {by_resolved[r]: names for r, names in plan.receivers.items() if r in by_resolved}
     return plan
+
+
+def _refuse_driven_wrappers(
+    repo_dir: str, flag_key: str, found: list[wrapper_inline.Wrapper], qualified: list
+) -> None:
+    """Refuse the flag when a TS/JS test drives one of its wrappers with a
+    value it chose and stays: every wrapper's read is folded, kept or not,
+    so the test would assert what the read used to return (see
+    ``wrapper_ts.driven``). Raised before the engine writes; the caller
+    undoes the test-double pass."""
+    from flag_cleanup import wrapper_ts
+
+    indexes = {w.label: index for w, index in qualified}
+    culprits: dict[str, str] = {}
+    tested = False
+    for wrapper in found:
+        index = indexes.get(wrapper.label) or wrapper_ts.Index.build(repo_dir, wrapper)
+        for path, line, text, kind in wrapper_ts.driven(wrapper, index):
+            if kind == wrapper_ts.HANDED_ON:
+                reason = (
+                    f"line {line}: the keyless wrapper {wrapper.label} is handed on as a value "
+                    f"(`{text}`), so its callers can't be seen, and one may hand it a client of its own"
+                )
+            else:
+                tested = True
+                reason = (
+                    f"line {line}: a test drives the keyless wrapper {wrapper.label} through a value it "
+                    f"chose (`{text}`) and cannot be deleted with it, so folding the read would fail it"
+                )
+            culprits.setdefault(path, reason)
+    if not culprits:
+        return
+    refused = sorted(culprits)
+    named = "; ".join(f"{path} ({culprits[path]})" for path in refused)
+    logger.warning("refusing to transform for flag %r: %s", flag_key, named)
+    raise UnsafeRewriteError(
+        (
+            f"a test of a keyless wrapper of flag {flag_key!r} would fail once its read is folded: {named}"
+            if tested
+            else f"a keyless wrapper of flag {flag_key!r} is handed on where its callers can't be seen: {named}"
+        ),
+        refused=refused,
+        discarded=[],
+        reasons=culprits,
+    )
 
 
 def _resolve_wrapper_doubles(
@@ -6810,6 +6877,22 @@ def _remove_orphans(summaries, language: str) -> list:
     return cleaned
 
 
+def _realign_go_comment_columns(summaries) -> list:
+    """:func:`flag_cleanup.go_comment_columns.realign` over each changed Go file."""
+    realigned = []
+    for summary in summaries:
+        if summary.original_content == summary.content or _grammar_of(summary.path, "go") != "go":
+            realigned.append(summary)
+            continue
+        result = go_comment_columns.realign(summary.original_content, summary.content)
+        if result == summary.content:
+            realigned.append(summary)
+            continue
+        Path(summary.path).write_text(result, encoding="utf-8")
+        realigned.append(Rewrite(summary.path, summary.original_content, result))
+    return realigned
+
+
 #: ``bindings`` kinds that say code was kept, whose text is that code.
 _KEPT_CODE_KINDS = frozenset({inert_calls.HOOK_CALL_KEPT, "bare import"})
 
@@ -7673,12 +7756,28 @@ def _jsx_runtime_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[s
 
 
 def _ts_file_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[str, str]]]:
-    """:func:`_print_width_facts` and :func:`_jsx_runtime_facts` together, by
-    absolute path: one fact each, side by side in the file's list."""
+    """:func:`_print_width_facts`, :func:`_jsx_runtime_facts` and
+    :func:`_module_scope_facts` together, by absolute path: one fact each, side
+    by side in the file's list."""
     facts = _print_width_facts(paths, repo_dir)
-    for path, found in _jsx_runtime_facts(paths, repo_dir).items():
-        facts.setdefault(path, []).extend(found)
+    for found in (_jsx_runtime_facts(paths, repo_dir), _module_scope_facts(paths, repo_dir)):
+        for path, more in found.items():
+            facts.setdefault(path, []).extend(more)
     return facts
+
+
+def _module_scope_facts(paths: list[str], repo_dir: str) -> dict[str, list[dict[str, str]]]:
+    """The ``module_scope_reflection = "none"`` fact for every file in ``paths``,
+    by absolute path, when nothing in the checkout reaches a module's top-level
+    binding by name from another file
+    (:func:`~flag_cleanup.cross_file_ts.module_scope_reflection`, the rewire API).
+    The engine deletes a module-private function the fold stranded only in a file
+    carrying it; without it, every such function stays."""
+    from flag_cleanup import cross_file_ts
+
+    if cross_file_ts.module_scope_reflection(repo_dir):
+        return {}
+    return {os.path.abspath(path): [{"module_scope_reflection": "none"}] for path in paths}
 
 
 def _go_file_facts(paths: list[str]) -> dict[str, list[dict[str, str]]]:
