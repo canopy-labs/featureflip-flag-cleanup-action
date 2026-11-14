@@ -275,9 +275,12 @@ def _dangling_modifiers(data: bytes, body: Node, deleted: set[int]) -> list[tupl
     """The lines of a bare ``private``/``protected`` that nothing stands under
     once ``deleted`` methods go: only deleted methods lie between it and the
     next access modifier or the end of the body (RuboCop's
-    Lint/UselessAccessModifier). One with a comment directly above it stays."""
-    out = []
+    Lint/UselessAccessModifier). A comment line and a ``class << self`` between
+    them are not members of the section (the modifier does not reach a
+    singleton class's methods). One with a comment directly above it stays.
+    A ``public`` the drop leaves with no non-public section above it goes too."""
     children = body.named_children
+    dropped: dict[int, tuple[int, int]] = {}
     for index, statement in enumerate(children):
         if statement.type != "identifier" or _text(statement) not in _MODIFIERS:
             continue
@@ -285,12 +288,30 @@ def _dangling_modifiers(data: bytes, body: Node, deleted: set[int]) -> list[tupl
         for later in children[index + 1 :]:
             if later.type == "identifier" and _text(later) in (*_MODIFIERS, "public"):
                 break
+            if later.type == "comment" or later.type == "singleton_class":
+                continue
             segment.append(later)
         if segment and all(c.id in deleted for c in segment):
             span = _line_span(data, statement)
             if span is not None and not _commented_above(data, span[0]):
-                out.append((span[0], span[1], b""))
-    return out
+                dropped[statement.id] = span
+    if not dropped:
+        return []
+    before = after = "public"
+    for statement in children:
+        if statement.type != "identifier" or _text(statement) not in (*_MODIFIERS, "public"):
+            continue
+        mode = _text(statement)
+        if mode == "public" and before != "public" and after == "public":
+            span = _line_span(data, statement)
+            if span is not None and not _commented_above(data, span[0]):
+                dropped[statement.id] = span
+                before = mode
+                continue
+        before = mode
+        if statement.id not in dropped:
+            after = mode
+    return [(start, end, b"") for start, end in dropped.values()]
 
 
 def _callbacks(body: Node, name: str) -> list[Node] | None:

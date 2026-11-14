@@ -859,30 +859,57 @@ def _enum_member(node: Node, language: str) -> Node | None:
             return current
         if kind == "enum_assignment" and current.type == "pair" and _as_const_property(current, node):
             return current
+        if kind == "enum_assignment" and current.type == "public_field_definition" and _static_field(current, node):
+            return current
         if any(m in current.type for m in _BODY_MARKERS):
             return None
         current = current.parent
     return None
 
 
-def _as_const_property(pair: Node, mention: Node) -> bool:
-    """Whether ``mention`` is the plain string value of ``pair``, a property of
-    an ``as const`` object literal. Not its name (a registry keyed by the
-    flag), and not something nested in its value: no entry holds those."""
-    value = pair.child_by_field_name("value")
+def _static_field(field: Node, mention: Node) -> bool:
+    """Whether ``mention`` is the plain string value (also ``as const``) of
+    ``field``, a ``static readonly`` field of a class declared at the top of
+    its file: a key registry read as ``Owner.FIELD``, like an ``as const``
+    object's property."""
+    value = field.child_by_field_name("value")
+    if value is not None and value.type == "as_expression" and any(c.type == "const" for c in value.children):
+        value = next((c for c in value.named_children if c.type != "comment"), None)
     if value is None or value.type != "string" or not (value.start_byte <= mention.start_byte < value.end_byte):
         return False
-    obj = pair.parent
-    outer = obj
-    while outer is not None and outer.parent is not None and outer.parent.type == "parenthesized_expression":
-        outer = outer.parent
+    if not {"static", "readonly"} <= {c.type for c in field.children}:
+        return False
+    body = field.parent
+    declaration = body.parent if body is not None else None
+    top = declaration.parent if declaration is not None else None
+    if top is not None and top.type == "export_statement":
+        top = top.parent
     return (
-        obj is not None
-        and obj.type == "object"
-        and outer is not None
-        and outer.parent is not None
-        and cross_file_ts.as_const_object(outer.parent) is not None
+        body is not None
+        and body.type == "class_body"
+        and declaration is not None
+        and declaration.type in ("class_declaration", "abstract_class_declaration")
+        and top is not None
+        and top.type == "program"
     )
+
+
+def _as_const_property(pair: Node, mention: Node) -> bool:
+    """Whether ``mention`` is the string value of ``pair``, a property holding
+    it as its literal type: a plain string in an ``as const`` object literal,
+    or one under ``as const`` (``X: "<key>" as const``) in any object literal
+    (see :func:`cross_file_ts.entry_string`). Not its name (a registry keyed
+    by the flag), and not something nested in its value: no entry holds
+    those."""
+    obj = pair.parent
+    if obj is None or obj.type != "object":
+        return False
+    outer = obj
+    while outer.parent is not None and outer.parent.type == "parenthesized_expression":
+        outer = outer.parent
+    const_object = outer.parent is not None and cross_file_ts.as_const_object(outer.parent) is not None
+    value = cross_file_ts.entry_string(pair.child_by_field_name("value"), const_object)
+    return value is not None and value.start_byte <= mention.start_byte < value.end_byte
 
 
 def _enum_held(root: Node, mention: re.Pattern[str], language: str) -> str | None:

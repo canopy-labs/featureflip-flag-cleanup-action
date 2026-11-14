@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.14.0"
+version = "2.15.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,31 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.55.0. Go: a `select` whose every clause returns is terminating, so what
+    # follows it is deleted up to the next label; a stranded target of an
+    # explicitly instantiated generic call (`v, ok = pair[int](4)`) is blanked.
+    # TypeScript/JavaScript: a parenthesised boolean literal is unwrapped where
+    # it is an operand (`(true) === false`), and every boolean fold now checks
+    # that no identifier character touches what it replaces, so `return(read)`
+    # can no longer become `return1`; an object or array literal a deletion
+    # empties is written `{}` / `[]`; only a kept block's own-level declarations
+    # keep it from being spliced, and a block whose first statement is a string
+    # is never spliced (it would become a directive); a stranded last element of
+    # an array pattern goes for an array literal or a proven tuple hook. Swift:
+    # a boolean literal left of `??` (with a boolean-literal right side) and a
+    # `Bool` cast of a literal fold; only a one-element, unlabelled tuple is
+    # unwrapped to its literal (`(read, y)` used to collapse to the literal).
+    # Ruby: an identity operand (`x || false`) is dropped at any depth of a
+    # condition, never where its value is used. No grammar rev moved.
+    #
+    # 0.54.0. Swift: the grammar is canopy-labs/tree-sitter-swift on upstream main
+    # (after 0.7.4) plus one patch that gives binary operators, calls and casts
+    # Swift's precedence. Upstream parsed `a == b || c` as `a == (b || c)`, so a
+    # fold of `c` produced `a == true`; `!client.boolVariation(…)` is now a `!`
+    # around the whole call, and a custom prefix operator (`√read`, `!!read`)
+    # keeps its operand's fold. The tree-sitter-swift pin below moves with it,
+    # to `0.7.4+canopy.1`. No other grammar rev moved.
+    #
     # 0.53.0. Go: a stranded local whose value does no work (`&T{…}`, a
     # conversion to a predeclared type, `len(xs)`) is deleted instead of kept as
     # `_ = …`, where the `go_unshadowed` file facts (`go_predeclared`) say no
@@ -606,7 +631,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.53.0",
+    "polyglot-piranha==0.55.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -674,18 +699,14 @@ dependencies = [
     "tree-sitter-go==0.25.0+canopy.1",
     # Swift. NOT a PyPI release, pinned EXACTLY for the same reason as the
     # grammars above: Gate 1 must parse what the engine rewrites.
-    # polyglot-piranha bundles upstream 0.7.3 (exactly 0.7.3: 0.7.4 moves the `!`
-    # of a negated method call out of the callee) plus TWO grammar patches
-    # (canopy-labs/tree-sitter-swift). `+canopy.1`: the empty tuple `()` is an
-    # expression, so `completion(.success(()))`, `f(x: ())` and `(1, ())` parse;
-    # stock 0.7.3 and PyPI's 0.7.4 report a MISSING node on each. `+canopy.2`:
-    # `x as? T ?? d` parses (upstream's fix for it, ported onto the 0.7.3
-    # scanner); stock 0.7.3 reports an ERROR. Neither changes a node type the
-    # rules match. Until the first pin, the gate took PyPI's 0.7.4 and so
-    # disagreed with the engine about the `!` too.
+    # polyglot-piranha bundles upstream main (after 0.7.4: the empty tuple `()` as
+    # an expression and `x as? T ?? d`, which PyPI's 0.7.4 reports as a MISSING
+    # node and an ERROR) plus ONE grammar patch (canopy-labs/tree-sitter-swift):
+    # binary operators, calls and casts take Swift's precedence, so `a == b || c`
+    # is `(a == b) || c` and `!f()` is `!(f())`. `node-types.json` is unchanged.
     # Resolves only from wheels/ (PEP 440 local segment), filled by
     # scripts/fetch_piranha_wheels.py. Bump the segment when the engine's pin moves.
-    "tree-sitter-swift==0.7.3+canopy.2",
+    "tree-sitter-swift==0.7.4+canopy.1",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the

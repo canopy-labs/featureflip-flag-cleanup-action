@@ -18,10 +18,13 @@ every use of its file and of the enum, in any file, must be one
 
 A property of a top-level ``export const Flags = { EnableX: "<key>" } as
 const`` is an entry the same way, and everything said of an enum holds for
-the object. Only ``as const`` qualifies, and only an object of plain
-``name: value`` pairs whose names are all known: a spread, a computed key, a
-shorthand, a method or an accessor can supply or replace a property unseen,
-and so can a second pair of the same name.
+the object. So is one written ``{ EnableX: "<key>" as const }``: the
+property's own ``as const`` types it as the key, as the object's does. Only
+``as const`` qualifies, on the object or the property, and only an object of
+plain ``name: value`` pairs whose names are all known: a spread, a computed
+key, a shorthand, a method or an accessor can supply or replace a property
+unseen, and so can a second pair of the same name. A property of an exported
+object with neither, whose value is the key, is refused by name.
 
 A mention in another file is proven only when that file can mean nothing else:
 
@@ -238,11 +241,15 @@ def _enum_entries(
     with an unquoted name whose initialiser is the key as a plain string.
 
     Or a property of an ``export const`` at the top of the file whose value
-    is an ``as const`` object literal (:func:`as_const_object`) made only of
-    ``name: value`` pairs with known names, the property's name unquoted and
-    given once, and its value the key as a plain string. A top-level object
-    that is not, or a ``let``, is refused like an unprovable enum; an object
-    anywhere else, or without ``as const``, is not considered at all.
+    is an object literal made only of ``name: value`` pairs with known names,
+    the property's name unquoted and given once, and its value the key with
+    the key's literal type (:func:`entry_string`): the object ``as const``
+    (:func:`as_const_object`), or the property's own value ``"<key>" as
+    const``. A top-level ``as const`` object that is not, or a ``let``, is
+    refused like an unprovable enum, and so is every property of an exported
+    object without ``as const`` (:func:`_plain_registry`) whose value is the
+    key otherwise; an object anywhere else, or a property of a plain object
+    that does not hold the key itself, is not considered at all.
     """
     names: dict[str, int] = {}
     for node in _walk(root):
@@ -312,12 +319,28 @@ def _enum_entries(
         for declarator in declaration.named_children:
             if declarator.type != "variable_declarator":
                 continue
-            obj = as_const_object(declarator.child_by_field_name("value"))
+            value = declarator.child_by_field_name("value")
+            obj = as_const_object(value)
+            const_object = obj is not None
+            plain = None if const_object else _plain_registry(value)
+            if plain is not None:
+                obj = plain
             if obj is None:
                 continue
             pairs = [p for p in obj.named_children if p.type == "pair"]
             held = xk.key_token(flag_key)
             holding = [p for p in pairs if held.search(_text(p.child_by_field_name("value") or p))]
+            if plain is not None:
+                # An object without `as const` is a registry only where a
+                # property's value IS the key (`X: "<key>"`, wrapped or not);
+                # a key named deeper inside is configuration, and stays out
+                # of it as before. And only when it is exported or a property
+                # asks for its literal type (`"<key>" as const`): no other
+                # file reads a plain local object, and the in-file gate
+                # judges the file's own reads of it.
+                holding = [p for p in holding if _string_value(_unwrap(p.child_by_field_name("value"))) == flag_key]
+                if not exported and not any(entry_string(p.child_by_field_name("value"), False) for p in holding):
+                    continue
             if not holding:
                 continue
             named = declarator.child_by_field_name("name")
@@ -345,6 +368,10 @@ def _enum_entries(
                 and closed
                 and owner not in names
                 and not root.has_error
+                # `Object.freeze(...)` is a call: what it returns is its
+                # callee's to say, and `Object` can be rebound.
+                and obj.parent is not None
+                and obj.parent.type != "arguments"
             )
             for member in holding:
                 key = member.child_by_field_name("key")
@@ -358,7 +385,7 @@ def _enum_entries(
                 if (
                     not provable
                     or keys.count(_text(key)) != 1
-                    or _string_value(member.child_by_field_name("value")) != flag_key
+                    or _string_value(entry_string(member.child_by_field_name("value"), const_object)) != flag_key
                 ):
                     refused.append(xk.refusal(path, member, xk.ENUM_UNPROVEN, source, entry))
                     continue
@@ -368,7 +395,166 @@ def _enum_entries(
                         key=flag_key,
                     )
                 )
+    _static_entries(path, root, source, flag_key, names, found, refused)
     return found, refused
+
+
+#: The class declarations a top-level statement may be.
+_CLASS_DECLARATIONS = frozenset({"class_declaration", "abstract_class_declaration"})
+
+
+def _static_entries(
+    path: str,
+    root: Node,
+    source: str,
+    flag_key: str,
+    names: dict[str, int],
+    found: list[xk.KeyDeclaration],
+    refused: list[xk.Refusal],
+) -> None:
+    """The ``static readonly`` fields of a top-level class holding
+    ``flag_key``, read as ``Owner.FIELD`` exactly as an ``as const`` object's
+    property is (:func:`_enum_entries`), and a refusal for every other one.
+
+    Provable: an ``export class`` (or ``export abstract class``) at the top
+    of the file, not ``default`` and not ``declare``d, with no decorator, no ``extends`` and no
+    namespace or enum of its name, whose body is nothing but ``static
+    readonly`` fields with known names and literal values (:func:`_inert_field`)
+    and, at most, an empty constructor with no parameters. A class is a value
+    whose body runs when it is defined, so anything else in it (a static
+    block, a method or accessor that ``this`` reaches, an initialiser that
+    calls, an instance member) could set the field, and a decorator or a base
+    class can replace the class. The field's name is given once, unquoted,
+    and its value is the key as a plain string or ``"<key>" as const``.
+
+    A class field holding the key that is not provable is refused with the
+    entry named, so a run that leaves its reads says why: a constructed
+    holder (``static readonly X = new Feature("<key>")``) is
+    ``unsupported-form``, anything else ``enum-unproven``.
+    """
+    held = xk.key_token(flag_key)
+    classes: dict[str, int] = {}
+    tops: list[tuple[Node, Node | None, bool]] = []
+    for statement in root.named_children:
+        export = statement if statement.type == "export_statement" else None
+        declaration = (
+            next((c for c in statement.named_children if c.type not in ("comment", "decorator")), None)
+            if export is not None
+            else statement
+        )
+        # `declare class` holds no code of its own: its fields are whatever
+        # the code it describes makes them, so it is named, never proven.
+        ambient = declaration is not None and declaration.type == "ambient_declaration"
+        if ambient:
+            declaration = next((c for c in declaration.named_children if c.type in _CLASS_DECLARATIONS), None)
+        if declaration is None or declaration.type not in _CLASS_DECLARATIONS:
+            continue
+        named = declaration.child_by_field_name("name")
+        if named is not None:
+            classes[_text(named)] = classes.get(_text(named), 0) + 1
+        tops.append((declaration, export, ambient))
+    for declaration, export, ambient in tops:
+        body = declaration.child_by_field_name("body")
+        members = [m for m in body.named_children if m.type != "comment"] if body is not None else []
+        holding = [
+            m
+            for m in members
+            if m.type == "public_field_definition"
+            and m.child_by_field_name("value") is not None
+            and held.search(_text(m.child_by_field_name("value")))
+        ]
+        if not holding:
+            continue
+        named = declaration.child_by_field_name("name")
+        owner = _text(named) if named is not None else "?"
+        spelled = [_key_name(m.child_by_field_name("name")) for m in members if m.type == "public_field_definition"]
+        heritage = any(
+            c.type == "class_heritage" and any(h.type == "extends_clause" for h in c.named_children)
+            for c in declaration.named_children
+        )
+        decorated = any(c.type == "decorator" for c in declaration.named_children) or (
+            export is not None and any(c.type == "decorator" for c in export.named_children)
+        )
+        provable = (
+            export is not None
+            # `export default class` is imported under any name, which the
+            # escape scan does not follow.
+            and not any(c.type == "default" for c in export.children)
+            and not ambient
+            and named is not None
+            and not heritage
+            and not decorated
+            and classes.get(owner, 0) == 1
+            and names.get(owner, 0) == 0
+            and not root.has_error
+            and None not in spelled
+            and all(_inert_member(m) for m in members)
+        )
+        for member in holding:
+            name = member.child_by_field_name("name")
+            value = member.child_by_field_name("value")
+            label = _key_name(name) if name is not None else None
+            entry = f"{owner}.{label or '?'}"
+            if name is None or name.type != "property_identifier" or (value is not None and value.type == "new_expression"):
+                refused.append(xk.refusal(path, member, xk.UNSUPPORTED_FORM, source, entry))
+                continue
+            if not provable or spelled.count(_text(name)) != 1 or _literal_key(value) != flag_key:
+                refused.append(xk.refusal(path, member, xk.ENUM_UNPROVEN, source, entry))
+                continue
+            found.append(
+                xk.KeyDeclaration(
+                    path, _text(name), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""}), key=flag_key
+                )
+            )
+
+
+def _literal_key(value: Node | None) -> str | None:
+    """A plain string's value, also as ``"<key>" as const``."""
+    if value is not None and value.type == "as_expression" and any(c.type == "const" for c in value.children):
+        value = next((c for c in value.named_children if c.type != "comment"), None)
+    return _string_value(value) if value is not None and value.type == "string" else None
+
+
+def _inert_member(member: Node) -> bool:
+    """Whether a class member can neither run code nor be anything but a
+    field fixed when the class is defined: a ``static readonly`` field with
+    no decorator, ``declare``, ``accessor``, ``override``, ``?`` or ``!``,
+    whose value is a literal (:func:`_inert_field`), or a constructor with no
+    parameters and an empty body (which only ``new``, an escape, runs)."""
+    tokens = {c.type for c in member.children}
+    if member.type == "method_definition":
+        name = member.child_by_field_name("name")
+        parameters = member.child_by_field_name("parameters")
+        body = member.child_by_field_name("body")
+        return (
+            name is not None
+            and _text(name) == "constructor"
+            and "static" not in tokens
+            and parameters is not None
+            and not parameters.named_children
+            and body is not None
+            and not [c for c in body.named_children if c.type != "comment"]
+        )
+    if member.type != "public_field_definition":
+        return False
+    if not {"static", "readonly"} <= tokens or tokens & {"decorator", "declare", "accessor", "override_modifier", "?", "!"}:
+        return False
+    return _inert_field(member.child_by_field_name("value"))
+
+
+def _inert_field(value: Node | None) -> bool:
+    """A string, a number (signed too), ``true``/``false``/``null``, or a
+    template with no substitution, alone or ``as const``."""
+    if value is not None and value.type == "as_expression" and any(c.type == "const" for c in value.children):
+        value = next((c for c in value.named_children if c.type != "comment"), None)
+    if value is None:
+        return False
+    if value.type == "unary_expression" and _text(value)[:1] in "-+":
+        value = next((c for c in value.named_children if c.type != "comment"), None)
+        return value is not None and value.type == "number"
+    if value.type == "template_string":
+        return not any(c.type == "template_substitution" for c in value.named_children)
+    return value.type in ("string", "number", "true", "false", "null")
 
 
 def as_const_object(value: Node | None) -> Node | None:
@@ -388,6 +574,60 @@ def as_const_object(value: Node | None) -> Node | None:
         inner = [c for c in operand.named_children if c.type != "comment"]
         operand = inner[0] if len(inner) == 1 else None
     return operand if operand is not None and operand.type == "object" else None
+
+
+def entry_string(value: Node | None, const_object: bool) -> Node | None:
+    """The string literal a property's ``value`` holds as its own literal
+    type, or None.
+
+    In an ``as const`` object (``const_object``) the plain string is one, and so is
+    a string under ``as const`` or ``satisfies T``. In any other object only
+    a string under ``as const`` (``X: "<key>" as const``, also behind
+    ``satisfies T``) is: the object's ``as const`` and the property's give
+    the property the same literal type, so the key is the only value the
+    compiler lets any code write to it. ``satisfies`` alone checks the value
+    and leaves its type ``string``, and any other assertion
+    (``"<key>" as string``) widens it.
+    """
+    pinned = const_object
+    while value is not None:
+        if value.type == "parenthesized_expression":
+            inner = [c for c in value.named_children if c.type != "comment"]
+            value = inner[0] if len(inner) == 1 else None
+        elif value.type == "satisfies_expression":
+            value = next((c for c in value.named_children if c.type != "comment"), None)
+        elif value.type == "as_expression" and any(c.type == "const" for c in value.children):
+            pinned = True
+            value = next((c for c in value.named_children if c.type != "comment"), None)
+            while value is not None and value.type == "parenthesized_expression":
+                inner = [c for c in value.named_children if c.type != "comment"]
+                value = inner[0] if len(inner) == 1 else None
+            return value if value is not None and value.type == "string" else None
+        else:
+            return value if pinned and value.type == "string" else None
+    return None
+
+
+def _plain_registry(value: Node | None) -> Node | None:
+    """The object literal of an object written without ``as const``: bare,
+    parenthesized, behind ``satisfies T``, or as ``Object.freeze({ ... })``;
+    None for anything else.
+
+    Its entries are only those :func:`entry_string` reads with
+    ``const_object`` off, and a frozen one has none: every property holding
+    the key in it is refused by name, so that a registry the run cannot read
+    is never passed over as if it held nothing.
+    """
+    while value is not None and value.type in ("parenthesized_expression", "satisfies_expression"):
+        value = next((c for c in value.named_children if c.type != "comment"), None)
+    if value is not None and value.type == "call_expression":
+        callee = value.child_by_field_name("function")
+        arguments = value.child_by_field_name("arguments")
+        args = [c for c in arguments.named_children if c.type != "comment"] if arguments is not None else []
+        if callee is None or _text(callee) != "Object.freeze" or len(args) != 1:
+            return None
+        value = args[0]
+    return value if value is not None and value.type == "object" else None
 
 
 def _key_name(key: Node | None) -> str | None:
@@ -4225,14 +4465,14 @@ def _enum_escapes(
         declared = _declared(node) if node.type == "export_statement" else None
         if declared is None:
             continue
-        if declared.type == "enum_declaration":
+        if declared.type == "enum_declaration" or declared.type in _CLASS_DECLARATIONS:
             names = [declared.child_by_field_name("name")]
         elif declared.type == "lexical_declaration":
             names = [d.child_by_field_name("name") for d in declared.named_children if d.type == "variable_declarator"]
         else:
             continue
         for name in names:
-            if name is not None and name.type == "identifier" and _text(name) in by_module.get(path, {}):
+            if name is not None and name.type in ("identifier", "type_identifier") and _text(name) in by_module.get(path, {}):
                 follow_enum(_text(name), name, by_module[path][_text(name)])
     for node in _walk(root):
         if node.type == "import_statement":

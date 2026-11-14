@@ -62,6 +62,7 @@ from flag_cleanup.cross_file_php_features import REMOVED_FEATURE_CLASS
 from flag_cleanup.ts_readiness_gates import EDITED_COMMENT, KEPT_GUARD, NAMED_IN_COMMENT, REMOVED_GATE, REMOVED_GUARD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
 from flag_cleanup.ts_test_providers import UNWRAPPED_PROVIDER
+from flag_cleanup.ts_hook_deps import EMPTIED_EFFECT
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST, STALE_TITLE, VACUOUS_ASSERTION
 from flag_cleanup.urls import without_userinfo
 
@@ -222,6 +223,7 @@ REPORTED_BINDING_KINDS = frozenset(
         VACUOUS_ASSERTION,
         STALE_TITLE,
         UNWRAPPED_PROVIDER,
+        EMPTIED_EFFECT,
         REMOVED_DEFAULT,
         INERT_OVERRIDE,
         DECLARED_LOAD,
@@ -711,6 +713,25 @@ def _unwrapped_provider_lines(unwrapped: list[tuple[str, str]]) -> list[str]:
         f"so {'it was' if count == 1 else 'each was'} replaced by what it wrapped:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in unwrapped[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _emptied_effect_lines(effects: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each React effect this run deleted because the
+    fold left its callback empty, or nothing."""
+    if not effects:
+        return []
+    count = len(effects)
+    noun = "effect was" if count == 1 else "effects were"
+    return [
+        f"> **{count} emptied React {noun} deleted.** Folding the flag out left "
+        f"{'its' if count == 1 else 'each'} callback with nothing to run. Every hook "
+        "after it in the component moves up one place, the same in every render, "
+        "which React allows:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in effects[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
         "",
     ]
@@ -2051,6 +2072,9 @@ def pr_body(
     unwrapped_providers = [
         (path, text) for path, kind, text in bindings if kind == UNWRAPPED_PROVIDER
     ]
+    emptied_effects = [
+        (path, text) for path, kind, text in bindings if kind == EMPTIED_EFFECT
+    ]
     vacuous_assertions = [
         (path, text) for path, kind, text in bindings if kind == VACUOUS_ASSERTION
     ]
@@ -2089,6 +2113,7 @@ def pr_body(
     lines += _hook_call_lines(hook_calls)
     lines += _kept_hook_call_lines(kept_hook_calls)
     lines += _unwrapped_provider_lines(unwrapped_providers)
+    lines += _emptied_effect_lines(emptied_effects)
     lines += _discarded_call_lines(discarded_calls)
     lines += _hoisted_call_lines(hoisted_calls)
     lines += _unread_binding_lines(unread_bindings)

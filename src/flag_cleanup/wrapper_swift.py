@@ -81,7 +81,7 @@ _OPEN_WORDS = frozenset({"open", "class", "override", "dynamic", "optional", "re
 _PLAIN = frozenset({
     "simple_identifier", "navigation_expression", "navigation_suffix", "self_expression",
     "line_string_literal", "line_str_text", "integer_literal", "real_literal", "boolean_literal",
-    "value_argument_label", ".",
+    "nil_literal", "value_argument_label", ".",
 })
 #: Parents of an expression where a literal can stand in its place. Not a
 #: statement: a bare ``true`` is a warning.
@@ -151,8 +151,9 @@ def read_test(
     loose: bool = False,
 ) -> Callable[[Node], bool]:
     """Whether an expression is exactly one read of ``flag_key`` this run
-    folds: never negated (the gate grammar puts a leading ``!`` inside the
-    call), never optional-chained, with no trailing closure. ``loose``
+    folds: never negated (a leading ``!`` wraps the call, and older grammars
+    put it inside the callee), never optional-chained, with no trailing
+    closure. ``loose``
     accepts any name as the key."""
     root = parse(source)
     consts = (
@@ -886,8 +887,9 @@ def _judge(path: str, node: Node, root: Node, wrapper: wi.Wrapper, index: Index)
         receiver = target
     else:
         head = node
-    # `!x.m()` parses as `(!x).m()`, `!m()` as `(!m)()`: the bang sits inside
-    # the callee, so it is stepped over, and the mark starts after it.
+    # Older grammars parsed `!x.m()` as `(!x).m()` and `!m()` as `(!m)()`, with
+    # the bang inside the callee; that shape is still stepped over here. The
+    # current grammar wraps the whole call in the `!` instead.
     outer = head.parent
     call: Node | None = None
     if outer is not None and outer.type == "call_expression" and xs._code(outer)[0].id == head.id:

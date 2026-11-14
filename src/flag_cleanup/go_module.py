@@ -289,6 +289,25 @@ _MODULE_LINE = re.compile(r"^[ \t]*module\b", re.MULTILINE)
 _WORK_LINE = re.compile(r"^[ \t]*(?:go|use)\b", re.MULTILINE)
 
 
+#: ``work`` as a whole dot-separated part of a name (``ci.work.local``), not
+#: the start of a longer word: ``foo.worker.js`` and ``ci.workflow.yml`` name
+#: no workspace file.
+_WORK_PART = re.compile(r"\.work(?:\.|$)")
+
+#: A web or script source file is never a workspace file, however it is named.
+_NOT_A_WORKFILE_SUFFIXES = frozenset(
+    {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".map", ".json", ".css", ".html", ".vue", ".svelte"}
+)
+
+
+def _loose_workfile_name(name: str) -> bool:
+    """Whether a name that does not end in ``.work`` may still be a workspace
+    file (``GOWORK`` takes any name): ``go.work.ci``, ``ci.work.local``."""
+    if name == "go.work.sum" or os.path.splitext(name)[1].lower() in _NOT_A_WORKFILE_SUFFIXES:
+        return False
+    return name.startswith("go.work") or _WORK_PART.search(name) is not None
+
+
 def _build_files(stop: Path) -> tuple[list[Path], list[Path], list[Path]]:
     """``(modfiles, workfiles, opaque)`` of the checkout, walked once per run.
 
@@ -317,7 +336,7 @@ def _build_files(stop: Path) -> tuple[list[Path], list[Path], list[Path]]:
                 continue
             is_mod = name.endswith(".mod")
             is_work = name.endswith(".work")
-            loose = not is_work and name != "go.work.sum" and (".work" in name or name.startswith("go.work"))
+            loose = not is_work and _loose_workfile_name(name)
             if not (is_mod or is_work or loose):
                 continue
             if is_work:

@@ -2010,8 +2010,11 @@ another name (`export { isFooEnabled as on }`, `export default isFooEnabled`).
 A caller may choose unless the read's receiver is proven to start from a
 module-level `const`, function or class, declared in the file or imported
 from a module that declares it so (`client.isEnabled(...)` with `const
-client` at the top, `getClient().isEnabled(...)`); an `export let client`
-with a setter or a `var` is not proven. A client imported from an npm
+client` at the top); an `export let client` with a setter or a `var` is not
+proven. A call of a function of your repository (`getClient().isEnabled(...)`)
+is proven only when that function's body is one `return` of a value proven
+the same way: a getter returning a `let` that `setClient` assigns, or one
+reading a React context (`return useContext(ClientContext)`), is not. A client imported from an npm
 package (`import posthog from "posthog-js"`, `import * as ld from ...`) is
 proven unless something in the repository lets a test change it: a module
 mock of the package (`vi.mock("posthog-js", ...)` and the like), a
@@ -2022,14 +2025,24 @@ imported from it (`vi.spyOn(posthog, ...)`, `posthog.x = ...`,
 initialised from it (`const ph = posthog`), or a test file using anything it
 imports from the package other than by calling one of your `accessors` on it:
 `posthog.init(...)`, `new GrowthBook(...)`, `<GrowthBookProvider>`,
-`<LDProvider>`, a cast or an alias (`const ph = posthog as any`). A bare
+`<LDProvider>`, a cast or an alias (`const ph = posthog as any`). A setup
+file your Jest or Vitest configuration names (`setupFiles`,
+`setupFilesAfterEnv`, `setupFilesAfterEach`, `globalSetup`) counts as a test
+file, and so does every file when a configuration gives one of those options
+a value that is not a string or a list of strings. Any other file counts too
+when it also spells the flag's key, except as a read's argument (a test
+utility calling `posthog.init(..., { bootstrap: { featureFlags: { "foo":
+true } } })`). So does a test file loading the package with `import("...")`,
+or with a `require("...")` that is not the whole value of a declaration. A bare
 specifier counts as an npm package only when it can be nothing else: it
 resolves into `node_modules`, or no `paths` entry, workspace package or
 bundler alias can read it as a file of your repository and a `package.json`
 declares it (or it is installed). So `@lib/client` aliased by a
 `vite.config` to an in-repo module with a setter is not proven. A `const`
 initialised from a name (`const ph = posthog`, `const client =
-OpenFeature.getClient()`) is proven only when that name is. A caller may
+OpenFeature.getClient()`) is proven only when that name is, and one
+initialised with `??`, `||`, `&&` or a ternary only when every name either
+side may yield is (`globalThis.__flags ?? fallback` is not). A caller may
 always choose for `client.isEnabled` on a parameter, `(client ??
 fallback).isEnabled`, `pick(ctx).isEnabled`, `this.client.isEnabled`, and a
 read through a React hook (`useFeatureIsOn("foo")`,
@@ -5168,7 +5181,7 @@ client.boolVariation(Flags.NEW_CHECKOUT.key(), ctx, false);
 | Python | a top-level `class Flags(StrEnum)`, `(str, Enum)`, `(Enum)` or Django `(models.TextChoices)` whose body holds only members (literals, `auto()`, or for `TextChoices` a `"key", "Label"` or `"key", _("Label")` pair), a docstring and public methods, with no metaclass and no decorator but `@unique`; the member is `X = "key"` as a plain string | `Flags.X.value` through `from pkg.flags import Flags` (or `as F`), `import pkg.flags` (`pkg.flags.Flags.X.value`), `import pkg.flags as m` (`m.Flags.X.value`) or `from pkg import flags` (`flags.Flags.X.value`). A bare `Flags.X` passed as the key is not resolved (`not-a-read`): a `(str, Enum)` member formats as `Flags.X`, and a wrapper receiving the member may read `.name` or `.value` from it. `.name`, `.label` and methods are `unsupported-form`, as is a read inside the enum's own file |
 | Python (plain class) | a top-level `class Flags:` (or `Flags(object)`) with no decorator or metaclass whose body is only a docstring, `pass` and `NAME = literal` assignments, annotated or not, each name once, with the member as `X = "key"` as a plain string and no method. Python lets any code assign to a class, so the whole checkout is checked: a store to the class (`Flags.X = ...`, `del Flags.X`, `setattr(Flags, ...)`, `mock.patch.object(Flags, ...)`, `mock.patch("pkg.Flags.X", ...)`), the class handed on (`configure(Flags)`, `F = Flags`, `[Flags]`), or the class rebound refuses the entry and every read of it (`unsupported-form`); calling, subscripting, iterating and annotating with it are fine | `Flags.X` as the key, through the same imports as an enum member, and in the class's own file. `Flags.X.upper()` and `Flags.X.value` are `unsupported-form`; `Flags.X` passed anywhere but as the key is `not-a-read`. A class with no base and no method that fails the proof (a decorator, a computed value) is reported as `enum-unproven` at the member; a class with a method or a base is not reported. A class that names it among its bases, and a store of an attribute named like one of its members through any object (`type(f).X = ...`, `f.__class__.X = ...`, `setattr(b, "X", ...)`), refuse the entry, and so does any string that is only the class's name (`getattr(fm, "Flags")`, `"app.flags.Flags"`). A computed attribute name (`setattr(type(f), attr, v)`), and a module reached by a computed name (`getattr(mod, mod.__all__[0])`, `vars(mod)[n]`), cannot be seen |
 | Swift | a case of an `enum` declared at the top level or nested in a struct, class, enum or actor, in a module read from `Package.swift` or an Xcode project; the enum and every type around it are not `private` or `fileprivate`, carry no attribute and sit outside `#if`, and the case is alone in its `case` clause with no associated values. Either a raw value, `enum Flags: String` (or `Swift.String`) with `case X = "key"` as a plain single-line string, or a computed `var key: String` (any name; not `static`, `private` or `fileprivate`, no attribute, outside `#if`, declared in the enum's own body) whose getter is one `switch self` whose arms name the enum's cases as `.X` only (no binding, `where`, `_` or other member; `default:` is fine) and whose arm for `X` is `return "key"` or just `"key"`. A raw-value enum's other conformances must be protocols the repository declares or `Equatable`, `Hashable`, `Comparable`, `CaseIterable`, `Codable`, `Encodable`, `Decodable`, `CodingKey`, `Sendable`, `Identifiable`, `CustomStringConvertible` or `CustomDebugStringConvertible`, and nothing in the repository may declare a `rawValue` the enum could pick up instead of its own: in the enum's body, in a protocol it conforms to, or in any extension at all, of any type and however it is spelled (an extension of an unrelated type counts too). With either shape, no member of the enum, and no member of an extension that could reach it, may carry an attribute other than `@available`, `@objc`, `@nonobjc`, `@discardableResult`, `@inlinable`, `@usableFromInline`, `@inline`, `@frozen`, `@preconcurrency`, `@warn_unqualified_access`, `@_disfavoredOverload`, `@Sendable` or `@MainActor` (the last only while the repository declares no macro named `MainActor`): an attached macro there may add members | `Flags.X.rawValue`, or `Flags.X.key` through the property, with `Flags` resolved as a constant's owner is: in the enum's module with no import, from another module after a plain `import` that allows the access. Also `Outer.Flags.X.rawValue` for a nested enum, and `Module.Flags.X.rawValue` when no type, member or local named like the module is in scope. An implicit member (`.X`, anywhere in the repository, `case .X:` included), `Flags.X` passed as a value, another member of the case (`.hashValue`), a read inside the enum's own file, and a read in a module holding an extension of the enum that declares a member named like the accessor are not resolved (`unsupported-form` or `not-a-read`). Neither is a read whose `Flags` (or `Module.Flags`) a typealias in the repository may stand for: one in the reading module, at the top level or inside a type, and for `Module.Flags` one declared anywhere (`import-unresolved`) |
-| TypeScript / TSX / JavaScript | an `export enum` (or `export const enum`) declared once in its file, with `X = "key"`; or an `export const Flags = { X: "key" } as const` object (see below) | `Flags.X` (or the alias's text) through `import { Flags }`, `const { Flags } = require(...)` or `const { Flags: F } = require(...)` (read as `F.X`); `ns.Flags.X` through `import * as ns` or `const ns = require(...)`. A read of an entry off an object that spreads the enum (`ax.features.X` after `features: { ...Flags, enabled }`, or `useAnalytics().features.X` when the hook builds such an object) is not followed: it is refused as `import-unresolved` at its line, and the entry is reported as left. `import { Flags }` is also followed through a barrel and a workspace package (`export * from "./flags"`, `import { Flags } from "@acme/shared"`) as a key constant's import is; its reads fold, and the entry is kept, since the barrel's re-export hands the enum on |
+| TypeScript / TSX / JavaScript | an `export enum` (or `export const enum`) declared once in its file, with `X = "key"`; or an `export const Flags = { X: "key" } as const` object, or an `export class Flags { static readonly X = "key" }` (see below) | `Flags.X` (or the alias's text) through `import { Flags }`, `const { Flags } = require(...)` or `const { Flags: F } = require(...)` (read as `F.X`); `ns.Flags.X` through `import * as ns` or `const ns = require(...)`. A read of an entry off an object that spreads the enum (`ax.features.X` after `features: { ...Flags, enabled }`, or `useAnalytics().features.X` when the hook builds such an object) is not followed: it is refused as `import-unresolved` at its line, and the entry is reported as left. `import { Flags }` is also followed through a barrel and a workspace package (`export * from "./flags"`, `import { Flags } from "@acme/shared"`) as a key constant's import is; its reads fold, and the entry is kept, since the barrel's re-export hands the enum on |
 
 A C# member holds the key because `nameof` turns its name into the key, so
 any enum with a member of that name counts, and a read through a `using static`
@@ -5205,16 +5218,64 @@ The object must be an `export const` at the top of its file, written
 `{ ... } as const` (`as const satisfies T` is fine), and contain only plain
 `Name: value` properties. The property holding the key must have an unquoted
 name that appears once in the object, and its value must be the key as a plain
-string. A spread (`...Base`), a computed key (`[k]: ...`), a shorthand
+string (`"key" as const` and `"key" satisfies T` are fine too). A spread
+(`...Base`), a computed key (`[k]: ...`), a shorthand
 property, a method, a getter, a `__proto__` property or a name written with an
 escape (`EnableX`) can add, replace or hand out a property the run cannot
 see, so any of them makes every entry of the object `enum-unproven`, and so
 does a `let`, an object that is not exported, or a type annotation on the
 constant (`Flags: Record<string, string>`), which lets other files write the
 property. A property whose name appears twice is `enum-unproven` as well, and
-so is an enum member whose name appears twice. An
-object without `as const` (including `Object.freeze({ ... })`), and one declared
-inside a function, is not resolved at all.
+so is an enum member whose name appears twice.
+
+A registry that leaves the object unfrozen and marks each property instead is
+read the same way, since the property's type is the key either way:
+
+```ts
+export const Flags = {
+  NewCheckout: "new-checkout" as const,
+  Other: "other",
+};
+```
+
+Here the property holding the key must be written `"key" as const` (`"key" as
+const satisfies T` is fine); every other rule above applies unchanged.
+
+An exported object with `as const` on neither the object nor the property
+(including `Object.freeze({ ... })`) is not resolved, and each property whose
+value is the key (`"key"`, or `"key" satisfies T`, whose type stays `string`)
+is reported as `enum-unproven`, so that its reads are not passed over in
+silence. Add `as const` to the object or to that property to have them folded.
+Such an object that is not exported, or that names the key deeper than a
+property's own value (`Checkout: { key: "key" }`), and any object declared
+inside a function, is not resolved or reported.
+
+A `static readonly` field of a class is treated the same way, the common Angular
+and NestJS way to write a key registry:
+
+```ts
+export class FeatureFlags {
+  static readonly NEW_CHECKOUT = "new-checkout";
+}
+
+client.isEnabled(FeatureFlags.NEW_CHECKOUT);
+```
+
+The class must be an `export class` (or `export abstract class`) at the top of
+its file, not `export default` or `declare`, with no decorator, no `extends`
+and no namespace of the same name. Its body may hold only `static readonly`
+fields whose values are literals (a string, a number, `true`, `false`, `null`,
+alone or `as const`), with names written once, plus at most an empty
+constructor with no parameters (`private constructor() {}`). A class body runs
+when the class is defined, so a static block, a method, an accessor, an
+instance member, a decorator or an initialiser that calls anything could set
+the field unseen, and any of them makes the class's field `enum-unproven`. A
+field holding a constructed object (`static readonly NEW_CHECKOUT = new
+FeatureFlag("new-checkout")`, read as `FeatureFlags.NEW_CHECKOUT.key`) is not
+resolved and is reported as `unsupported-form`. Every use of the class other
+than `FeatureFlags.<field>` or a type (`new FeatureFlags()`, `extends
+FeatureFlags`, `Object.values(FeatureFlags)`, passing it on) is a use of the
+whole enum, as above.
 
 The reads are folded and **the entry is left in place**. Removing an enum
 entry can change stored values (a Java ordinal, a PHP backing value read back
@@ -5393,7 +5454,7 @@ reason:
 | `other-language` | the constant is mentioned, in a way that can reach it, from a file in another JVM language (Java reading a Kotlin constant, Kotlin reading a Java one, or a Groovy or Scala file reading either), from a Razor, XAML, VB or F# file reading a C# constant, from a Twig, Latte or Smarty template or Symfony YAML or XML configuration reading a PHP constant or enum case, or a read of it that would be resolved sits in another file type of the family than the declaration (a `.tsx` or `.js` file reading a `.ts` constant) and is not rewritten with it: its language is not configured, or another run rewrites the file |
 | `unsupported-form` | a shape outside the table above, such as a fully qualified `pkg.Owner.NAME` or a `?.` qualifier; the name inside a string or string template; a Kotlin named argument; a renaming `require` destructure (`const { NAME: X } = require(...)`), whose pattern would still name the constant after the read is folded; any Java or Kotlin file that spells the name or its owner but cannot be read or parsed; a mention that can reach the constant from a file outside the directory the run transforms, which is never rewritten and so keeps the declaration alive; a `.kts` script; for an enum entry, a nested enum (outside Swift), a Swift implicit member (`.X`) or a Swift read in a module holding an extension of the enum that declares a member named like the accessor, a quoted TypeScript member, a read of an entry inside the file that declares it, a proven accessor called with anything but an empty argument list (`Flags.X.key(arg)`; a call that is not an accessor, such as `.name()`, is `not-a-read`), a Kotlin read through an alias of the enum's import (`F.X.key` under `import pkg.Flags as F`), a TypeScript spelling of the entry outside the table (`Flags["X"]`, `(Flags).X`, `Flags!.X`, `(Flags as T).X`, `const { X } = Flags`), a TypeScript enum taken off anything but a name (`use(require("./flags").Flags)`, `let F = require("./flags").Flags`), or any other use of a TypeScript enum's file or of the enum that hands it on (see Enum entries); any use that hands a TypeScript key constant's module on as an object (see Declared in another file); any use that takes a Java or Kotlin key constant's owner whole, by reflection or as a value (see Declared in another file); a Python import of the declaring module nested in a function or a `try`, or a sole-name import whose private alias is already used in the file (or sits beside a submodule of that name in a package `__init__.py` reader), or a relative one through a package `__init__.py` that is not plain, or one whose line cannot take a comment; a Python declaring file with a star import or a route to its own namespace; a Swift file whose module cannot be read from `Package.swift` or an Xcode project; a Go read under `go` or `defer`, a discarded Go read whose arguments call something or receive from a channel, or any Go read in an external test package that declares a named `Example` function, a parenthesised discarded Go read or one in an `if`, `switch` or `for` header, or a Go example function named after the constant; a Go file that does not parse |
 | `declaration-kept` | Python and Ruby only: a read of the constant that would have been folded, left as it is because another refusal listed beside it keeps the declaration it reads. A Python or Ruby constant can be reassigned, so a kept declaration keeps every read of it in another file, unless, in Python, nothing in the checkout spells a write of it and only mentions of its name keep it (see the note on a kept Python declaration above). For an enum entry, a read left because its file also reads a kept constant, or because an escape listed beside it can change the member's value (see Enum entries) |
-| `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name, a PHP enum that is not string-backed (pure or `int`), a PHP case whose value is not the key as a plain string (concatenated, interpolated or a constant expression), a PHP enum file that does not parse, a Python enum whose class is nested, has another base, a metaclass, a decorator other than `@unique`, a `value`, `name` or `label` method or one whose name starts with `_` (`__init__`, `__new__`), `_ignore_`, or a member valued by code, a Python enum its own module hands to other code, a Python member whose value is not the key as a plain string, or a Python enum file with a star import or a route to its own namespace, a Dart enum with more than one constructor (a factory or a second generative one), a field with an initializer or assigned twice, an argument that is not the key as a plain string (interpolated or concatenated), the key at a position the constructor does not store, type arguments on the entry, no public accessor of the field, a private enum or entry, a Dart enum in a part or in a file that does not parse, or a Swift case whose enum (or a type around it) is `private`, `fileprivate`, attributed or inside `#if`, or has a type around it with a supertype, or sits in a file whose module cannot be read or that does not parse, whose clause declares another case or associated values, whose raw type is not `String` (a typealias of it included), whose raw value is not the key as a plain single-line string, whose enum conforms to a protocol outside the list above or may pick up another `rawValue` (any extension in the repository declaring one counts), or could gain members from an attached macro: on an attributed extension anywhere in the repository that extends the enum, a typealias or protocol the repository declares, a type the enum's clause names, `RawRepresentable`, `Encodable`, `Decodable` or a protocol on the list above, or on a member of the enum or of such an extension carrying an attribute outside the built-in list above, or whose switch property is `static`, `private`, `fileprivate`, attributed, inside `#if`, has a setter, is declared in an extension, or has an arm with a binding, `where`, `_` or a name that is not a case of the enum |
+| `enum-unproven` | an enum entry holds the key, but its accessor cannot be proven to return it: more than one constructor, a constructor that writes its own parameter, a non-`final` field or a Kotlin `var`, an entry with a body, a named or computed argument, a TypeScript enum that is not exported directly, is `declare`d or merges with another declaration of its name, a TypeScript object property holding the key whose object and value both lack `as const` (or whose object is `Object.freeze`d), a PHP enum that is not string-backed (pure or `int`), a PHP case whose value is not the key as a plain string (concatenated, interpolated or a constant expression), a PHP enum file that does not parse, a Python enum whose class is nested, has another base, a metaclass, a decorator other than `@unique`, a `value`, `name` or `label` method or one whose name starts with `_` (`__init__`, `__new__`), `_ignore_`, or a member valued by code, a Python enum its own module hands to other code, a Python member whose value is not the key as a plain string, or a Python enum file with a star import or a route to its own namespace, a Dart enum with more than one constructor (a factory or a second generative one), a field with an initializer or assigned twice, an argument that is not the key as a plain string (interpolated or concatenated), the key at a position the constructor does not store, type arguments on the entry, no public accessor of the field, a private enum or entry, a Dart enum in a part or in a file that does not parse, or a Swift case whose enum (or a type around it) is `private`, `fileprivate`, attributed or inside `#if`, or has a type around it with a supertype, or sits in a file whose module cannot be read or that does not parse, whose clause declares another case or associated values, whose raw type is not `String` (a typealias of it included), whose raw value is not the key as a plain single-line string, whose enum conforms to a protocol outside the list above or may pick up another `rawValue` (any extension in the repository declaring one counts), or could gain members from an attached macro: on an attributed extension anywhere in the repository that extends the enum, a typealias or protocol the repository declares, a type the enum's clause names, `RawRepresentable`, `Encodable`, `Decodable` or a protocol on the list above, or on a member of the enum or of such an extension carrying an attribute outside the built-in list above, or whose switch property is `static`, `private`, `fileprivate`, attributed, inside `#if`, has a setter, is declared in an extension, or has an arm with a binding, `where`, `_` or a name that is not a case of the enum |
 | `feature-unproven` | a PHP class holds the key in Laravel Pennant's `#[Name]` attribute or its `$name` property, but cannot be proven to be named by it: the property is not public or is static, nothing declares `resolve` or `__invoke`, the class is abstract, extends a class or uses a trait, something in it touches `$this->name`, the value is not a plain string, or the class is declared conditionally or in a file that does not parse. Its reads are left, and so is the class |
 | `enum-dynamic` | not a refusal: a Dart, Java, Kotlin, PHP, Python or Swift use of the whole enum that can reach the entry without naming it. Listed so it can be checked before the flag is archived |
 | `kept`, `left`, `left-competing` | not refusals: what happened to an enum entry, reported at its own declaration. `kept`: every read through it found was folded. `left`: a refusal above names it, and those reads stay. `left-competing`: only a competing declaration (`name-not-unique`) names it, so no read through it was resolved, and those reads are not listed |
@@ -7236,7 +7297,10 @@ argument that only names something (`s.client.BoolVariation("KEY", u, false)`),
 or only computes a constant (`1<<len(arr)`), folds with the read as before, and
 so does one that does nothing a reader needs to see: `context.Background()` and
 `context.TODO()` (when `context` is the standard library's), and a conversion of
-one value to a predeclared type (`string(id)`, `int64(limit)`). A `len`, `cap`,
+one value to a predeclared type (`string(id)`, `int64(limit)`) or to a type that
+the same file declares once over one (`type ID string`, then `string(ID(raw))`). A
+comment inside a whole-statement read stays above the kept lines. A float constant
+shifted by a call (`1.0<<n()`) keeps only the call (`_ = n()`). A `len`, `cap`,
 `min`, `max`, `real`, `imag`, `complex` or predeclared type name that your
 package declares itself, in any of its files, is a call like any other and is
 kept. A call the tool cannot know is harmless, such as `r.Context()` or
@@ -8583,7 +8647,10 @@ means no PR.
   `<Panel\n  a={1}\n  b\n/>` with `b` removed becomes `<Panel a={1} />`.
   Every attribute left must fit on one line and no comment may sit inside
   the element. Other lists keep the layout the removal left: object and
-  array literals, and every other language.
+  array literals, and every other language. The one exception is an object
+  or array literal the removal emptied (its last entry deleted, with any
+  comment that described it): it is written `{}` or `[]`, as Prettier writes
+  an empty one. A literal that still holds a comment keeps its lines.
 
   In TypeScript and JavaScript, a boolean the run wrote into the dependency
   array of a React hook (`useEffect`, `useLayoutEffect`, `useInsertionEffect`,
@@ -8591,6 +8658,16 @@ means no PR.
   `[isEnabled, id]` becomes `[id]`, and `[isEnabled]` becomes `[]`. A literal
   you wrote there, an array on several lines or with a comment, and an array
   anywhere but a hook's dependency argument are left as they are.
+
+  An effect (`useEffect`, `useLayoutEffect`, `useInsertionEffect`, imported
+  from React or Preact) whose callback the removal left empty is deleted, as a
+  statement of its own, with the hook's import when that was its last use.
+  Every hook after it moves up one place, the same in every render, which
+  React allows. An effect stays when you wrote it empty, when it is not a
+  statement of its own or holds a comment, when its dependency array calls
+  anything or names something nothing else in the function reads (a parameter
+  would be left unused), and in a JSX file under the classic runtime when the
+  hook's import would be left behind unused.
 
   In TypeScript and JavaScript, a run of blank lines that a removal makes
   longer than the file had at that spot (a `const` deleted from between two
@@ -8623,12 +8700,22 @@ means no PR.
   statement's line (`if (ready) {`). A `return (…)` keeps its parentheses
   and its layout, since Prettier would drop the parentheses instead.
 * **A comparison against a non-literal is propagated but not folded.**
-  `if (on === true)` reduces fully, because both sides end up literal. But
+  `if (on === true)` reduces fully, because both sides end up literal, and so
+  does a read in parentheses (`if ((await on) === false)`). But
   `if (on === other)` becomes `if (true === other)` and stops — correct, and
   deliberately not reduced further: `===` produces a boolean while `other`
   produces whatever it is, so folding it away would change the expression's
   value. Rewrite it as a plain truthiness test if you want the `if` to
   disappear too.
+* **A read written directly against a word keeps its parentheses.** In
+  TypeScript and JavaScript, `return(<read>) ? 1 : 2` becomes
+  `return(true) ? 1 : 2` and stops there, because dropping the parentheses
+  would join the two words into `return1`, which parses as a name. The same
+  goes for `throw(`, `yield(`, `case(`, `else(`, `do(` and a word written after
+  the closing parenthesis (`(<read>)in obj`). Add the space
+  (`return (<read>) ? 1 : 2`) and the expression folds. As a backstop, a
+  rewrite that joins two words anyway is refused (`unsafe-rewrite`) rather
+  than written.
 * **The transform engine's TypeScript grammar is older than TypeScript.**
   Piranha bundles its own parser, and a file it cannot parse makes it abort
   before any rule runs. Such files are **quarantined**: they are left untouched,

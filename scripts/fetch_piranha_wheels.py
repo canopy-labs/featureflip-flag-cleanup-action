@@ -25,10 +25,10 @@ upstream:
   0.25.0; the engine bundles 0.25.0 plus one grammar patch, so Go 1.26's
   `new(int32(101))` parses for the engine and is an ERROR for the stock grammar.
 * **tree-sitter-swift**, Gate 1's Swift grammar, for the same reason. The
-  engine bundles 0.7.3 plus one grammar patch, so the empty tuple `()` as an
-  expression (`completion(.success(()))`) parses for the engine; stock 0.7.3
-  and PyPI's 0.7.4 report a MISSING node there, and 0.7.4 also places the `!`
-  of a negated method call differently from the engine.
+  engine bundles upstream main (after 0.7.4) plus one grammar patch giving
+  binary operators, calls and casts Swift's precedence; PyPI's 0.7.4 reports a
+  MISSING node on the empty tuple `()` as an expression, and parses
+  `a == b || c` as `a == (b || c)`.
 
 Every `pip install` of this tool therefore needs `--find-links wheels`, and
 every Docker build bind-mounts the same directory; this script is the one

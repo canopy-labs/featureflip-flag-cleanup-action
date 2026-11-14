@@ -46,13 +46,12 @@
 # reassignable binding: its value cannot be read off the declaration, so the key
 # it names is not knowable.
 #
-# THE BANG SPLIT APPLIES HERE TOO. Swift's grammar puts a prefix `!` inside the
-# `call_expression` (see rules/swift.toml — it is the whole reason that file has
-# two seed rules), and that is a property of the call, not of how the key is
-# spelled. So the const path needs the same pair, for the same reason and with
-# the same predicates: without it a negated read through a hoisted key folds to
-# `@treated` with the bang deleted, INVERTED, which is the exact defect the
-# literal path was fixed for.
+# THE BANG SPLIT APPLIES HERE TOO. Older Swift grammars put a prefix `!` inside
+# the `call_expression` (see rules/swift.toml, the reason that file has two seed
+# rules), and that is a property of the call, not of how the key is spelled. So
+# the const path keeps the same pair, with the same predicates: under such a
+# grammar a negated read through a hoisted key would otherwise fold to
+# `@treated` with the bang deleted, INVERTED.
 #
 # Holes: @stale_flag_name (the flag key), @treated ("true" | "false").
 

@@ -87,7 +87,7 @@ _LAST_IS_A_VALUE = frozenset({"kt", "swift", "ruby"})
 _INERT_LEAVES = frozenset({
     "identifier", "simple_identifier", "field_identifier", "property_identifier",
     "name", "constant", "this", "self", "super", "type_identifier",
-    "true", "false", "nil", "null", "null_literal", "boolean_literal", "boolean",
+    "true", "false", "nil", "nil_literal", "null", "null_literal", "boolean_literal", "boolean",
     "integer", "float", "int_literal", "float_literal", "imaginary_literal", "rune_literal",
     "integer_literal", "real_literal", "decimal_integer_literal", "hex_integer_literal",
     "decimal_floating_point_literal", "character_literal", "number", "number_literal",

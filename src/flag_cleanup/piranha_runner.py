@@ -152,6 +152,7 @@ from flag_cleanup import (
     ts_default_arguments,
     ts_exported_props,
     ts_hook_deps,
+    ts_fused_words,
     ts_list_join,
     ts_unread_props,
     ts_fold,
@@ -617,11 +618,12 @@ _LANGUAGES: dict[str, _Language] = {
     #    treatments, zero aborts, RSS flat at ~44.9 MB. The tree-sitter 0.25
     #    Swift redesign (piranha#5) is the likely fix.
     # 3. THE INVERSION, which was the disqualifying one and was recorded as
-    #    unexplained. It is explained: tree-sitter-swift gives prefix `!` the
-    #    wrong precedence, so the bang parses INSIDE the call expression the
-    #    seed rule replaces and was silently deleted. It has nothing to do with
-    #    the edge wiring it was attributed to. Fixed by the matched rule pair in
-    #    rules/swift.toml — read that file before touching either half.
+    #    unexplained. It is explained: the Swift grammar then gave prefix `!`
+    #    the wrong precedence, so the bang parsed INSIDE the call expression
+    #    the seed rule replaces and was silently deleted. It had nothing to do
+    #    with the edge wiring it was attributed to. The grammar now puts the
+    #    `!` around the call; rules/swift.toml explains the rule pair that
+    #    handled both shapes.
     "swift": _Language("swift", "swift", (".swift",), display_name="Swift"),
 }
 
@@ -1670,6 +1672,8 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_ts_var": "decl",
     "delete_stranded_ts_pattern_name": "n",
     "delete_stranded_ts_pattern_name_last": "n",
+    "delete_stranded_ts_array_pattern_last": "n",
+    "delete_stranded_ts_hook_tuple_last": "n",
 }
 
 
@@ -3143,6 +3147,17 @@ def _transform_flag(
     # What the checkout's mocks allow, per callee, for both passes below.
     mocks: dict = {}
     summaries = _drop_literal_hook_dependencies(summaries, language, repo_dir)
+    # An effect the fold left with nothing to run goes, and the hook's import
+    # with it when that was its last use.
+    before_effects = summaries
+    summaries, effect_rows = _remove_emptied_effects(summaries, language, repo_dir)
+    if effect_rows:
+        summaries, effect_bindings = _remove_stranded_bindings(summaries, language, repo_dir)
+        summaries, kept = _keep_effects_whose_import_stays(before_effects, summaries, language, repo_dir)
+        effect_rows = tuple(r for r in effect_rows if r[0] not in kept)
+        effect_bindings = tuple(b for b in effect_bindings if b[0] not in kept)
+        summaries = _collapse_blank_runs(summaries, language)
+        bindings = bindings + effect_rows + effect_bindings
     summaries, emptied_rows, dropped_options = _drop_default_arguments(
         summaries, language, flag_key, repo_dir, mocks
     )
@@ -3424,6 +3439,15 @@ def _transform_flag(
             and substitutions["marker"] in s.content
         ):
             reason = "the engine left an internal marker in place of a flag read"
+        # A word the rewrite wrote against another (`return(<read>) ? 1 : 2`
+        # folded to `return1`): it parses as a name, so nothing above sees it.
+        if reason is None and language in ("ts", "tsx", "js"):
+            fused = ts_fused_words.fused_names(s.original_content, s.content, _grammar_of(s.path, language))
+            if fused:
+                reason = (
+                    "the rewrite joined a word to its neighbour, leaving a name the file never spelled: "
+                    + ", ".join(f"`{name}`" for name in fused[:3])
+                )
         if reason is None and language in ("ts", "tsx", "js") and ts_saga_yield.delegates_to_literal(
             s.original_content, s.content, _grammar_of(s.path, language)
         ):
@@ -4714,6 +4738,59 @@ def _drop_literal_hook_dependencies(summaries, language: str, repo_dir: str) -> 
             handle.write(text)
         result.append(Rewrite(summary.path, summary.original_content, text))
     return result
+
+
+def _remove_emptied_effects(summaries, language: str, repo_dir: str) -> tuple[list, tuple]:
+    """Delete each React effect the fold emptied; TypeScript family only. See
+    :func:`~flag_cleanup.ts_hook_deps.remove_emptied_effects`."""
+    if not ts_tests.covers(language):
+        return summaries, ()
+    result = []
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if summary.original_content == summary.content or file_deletion.deleted(summary):
+            result.append(summary)
+            continue
+        text, removed = ts_hook_deps.remove_emptied_effects(
+            summary.original_content, summary.content, _grammar_of(summary.path, language)
+        )
+        if not removed:
+            result.append(summary)
+            continue
+        git_ops.before_writing([summary.path])
+        with open(summary.path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        result.append(Rewrite(summary.path, summary.original_content, text))
+        path = os.path.relpath(summary.path, repo_dir)
+        rows.extend((path, ts_hook_deps.EMPTIED_EFFECT, statement) for statement in removed)
+    return result, tuple(rows)
+
+
+def _keep_effects_whose_import_stays(before, summaries, language: str, repo_dir: str) -> tuple[list, set[str]]:
+    """Put back, as ``before`` had it, each file where deleting an emptied
+    effect left its hook's import unused (the stranded-import pass withholds
+    one in a classic-runtime JSX file); return the files put back, relative
+    to ``repo_dir``. See :func:`~flag_cleanup.ts_hook_deps.unused_effect_imports`."""
+    earlier = {s.path: s for s in before}
+    result = []
+    kept: set[str] = set()
+    for summary in summaries:
+        prior = earlier.get(summary.path)
+        if prior is None or prior.content == summary.content or file_deletion.deleted(summary):
+            result.append(summary)
+            continue
+        grammar = _grammar_of(summary.path, language)
+        if not ts_hook_deps.unused_effect_imports(summary.content, grammar) - ts_hook_deps.unused_effect_imports(
+            prior.content, grammar
+        ):
+            result.append(summary)
+            continue
+        git_ops.before_writing([summary.path])
+        with open(summary.path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(prior.content)
+        result.append(prior)
+        kept.add(os.path.relpath(summary.path, repo_dir))
+    return result, kept
 
 
 def _drop_default_arguments(

@@ -345,6 +345,19 @@ def references(
     return reads, refused
 
 
+def reads_beside_mentions(
+    path: str,
+    source: str,
+    declarations: tuple[xk.KeyDeclaration, ...],
+    accessors: frozenset[str],
+    repo_dir: str,
+) -> tuple[list[xk.KeyReference], list[xk.Refusal]]:
+    """:func:`references` with every ``not-a-read`` mention set aside: what a
+    reader whose mentions stay (the declaration is kept) still reads."""
+    reads, refused = references(path, source, declarations, accessors, repo_dir)
+    return reads, [r for r in refused if r.reason != xk.NOT_A_READ]
+
+
 def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:
     """Empty: a Python key constant has no owner, so no owner can compete."""
     return set()
@@ -356,6 +369,7 @@ xk.register(
         language_family=frozenset({"python"}),
         declarations=declarations,
         references=references,
+        reads_beside_mentions=reads_beside_mentions,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,
         entry_findings=entry_findings,

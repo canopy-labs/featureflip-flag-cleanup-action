@@ -2928,8 +2928,8 @@ def _swift_is_removable_read(identifier: Node, accessors: frozenset[str]) -> boo
         return False
     # The three callee shapes swift_const.toml matches: a method
     # (`client.boolVariation`), a bare accessor (`useFlag`), and a negated bare
-    # accessor, where the grammar's `!` precedence bug wraps the callee in a
-    # `prefix_expression` (see rules/swift.toml).
+    # accessor in older grammars, which wrapped the callee rather than the call
+    # in the `!` (see rules/swift.toml).
     if callee.type == "navigation_expression":
         suffixes = [c for c in callee.named_children if c.type == "navigation_suffix"]
         if not suffixes:

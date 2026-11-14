@@ -1339,8 +1339,9 @@ def _segments(nav: Node) -> list[Node] | None:
 def _is_read(value: Node, accessors: frozenset[str]) -> bool:
     """Whether ``value`` is the whole key argument of a read the seeds match:
     the first argument of ``recv.boolVariation(...)``, a bare
-    ``boolVariation(...)`` or an accessor, plain or negated once; never
-    optional-chained, and never behind a comment."""
+    ``boolVariation(...)`` or an accessor, plain or as the operand of a prefix
+    operator (``!read``, a custom ``!!read``); never optional-chained, and never
+    behind a comment."""
     argument = value.parent
     if argument is None or argument.type != "value_argument":
         return False
@@ -1354,16 +1355,11 @@ def _is_read(value: Node, accessors: frozenset[str]) -> bool:
         return False
     suffix = arguments.parent
     call = suffix.parent if suffix is not None and suffix.type == "call_suffix" else None
-    if call is None or call.type != "call_expression" or _text(call).startswith("!!"):
+    if call is None or call.type != "call_expression":
         return False
+    # A prefix operator wraps the whole call (`!c.boolVariation(…)` is
+    # `!(c.boolVariation(…))`), so the call is the read and the operator stays.
     callee = call.named_children[0]
-    # The engine's grammar (which the gate now shares) nests a negated
-    # callee's `!` inside its navigation target; tree-sitter-swift 0.7.4 wraps
-    # the callee in a prefix `!` instead. Both seed rules accept both.
-    if callee.type == "prefix_expression" and _text(callee.child_by_field_name("operation")) == "!":
-        callee = callee.child_by_field_name("target")
-    if callee is None:
-        return False
     if callee.type == "navigation_expression":
         if "?" in _text(callee):
             return False

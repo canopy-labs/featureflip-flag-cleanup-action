@@ -1650,7 +1650,7 @@ _SWIFT_INERT_NODES = frozenset({
     "integer_literal", "real_literal", "boolean_literal", "hex_literal",
     "oct_literal", "bin_literal", "line_string_literal",
     "multi_line_string_literal", "raw_string_literal", "array_literal",
-    "tuple_expression",
+    "tuple_expression", "nil_literal",
 })
 
 #: What a PHP local may hold and still be deleted: a literal, for Swift's

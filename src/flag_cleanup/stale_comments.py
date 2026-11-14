@@ -432,9 +432,11 @@ def rewrite(source: str, grammar: str, names: re.Pattern[bytes]) -> tuple[str, l
 def _cut(data: bytes, root: Node, removals: list[Removal], grammar: str) -> bytes | None:
     """``data`` without ``removals`` (and the blank lines they would double),
     or ``None`` when the result would change a code token."""
+    spans = _tidy(data, removals, grammar)
+    spans = sorted(spans + _emptied_literals(root, spans, grammar))
     out = bytearray()
     at = 0
-    for start, end in _tidy(data, removals, grammar):
+    for start, end in spans:
         if start < at:
             start = at
         out += data[at:start]
@@ -444,6 +446,24 @@ def _cut(data: bytes, root: Node, removals: list[Removal], grammar: str) -> byte
     if _code_tokens(_parse(after, grammar)) != _code_tokens(root):
         return None
     return after
+
+
+def _emptied_literals(root: Node, spans: list[tuple[int, int]], grammar: str) -> list[tuple[int, int]]:
+    """The insides of the TypeScript-family object and array literals whose
+    every element is a comment ``spans`` remove: once they go, the literal is
+    written ``{}`` / ``[]``, as Prettier writes an empty one."""
+    if grammar not in ("ts", "tsx", "js"):
+        return []
+    found = []
+    for node in _descendants(root):
+        if node.type not in ("object", "array") or not node.named_children or node.child_count < 2:
+            continue
+        if all(
+            child.type == "comment" and any(s <= child.start_byte and child.end_byte <= e for s, e in spans)
+            for child in node.named_children
+        ):
+            found.append((node.children[0].end_byte, node.children[-1].start_byte))
+    return found
 
 
 def follow(row_text: str, source: str, removals: list[Removal]) -> int | None:

@@ -8,6 +8,98 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.15.0
+
+### Added
+
+- TypeScript: a flag registry written as a plain exported object whose
+  property is marked `"key" as const` (`export const Flags = { NewCheckout:
+  "new-checkout" as const }`) is now resolved like an `as const` object: reads
+  through `Flags.NewCheckout` are folded and the property is kept and reported.
+  Inside an `as const` object, a property written `"key" as const` or
+  `"key" satisfies T` is accepted as well.
+- TypeScript: a flag key held in a class's `static readonly` field
+  (`export class FeatureFlags { static readonly NEW_CHECKOUT = "new-checkout" }`,
+  read as `client.isEnabled(FeatureFlags.NEW_CHECKOUT)`) is now resolved like a
+  key in an `as const` object: its reads are folded and the field is kept and
+  reported. A class whose body could change the field (a static block, a
+  method, a decorator, `extends`), or a field holding a constructed object, is
+  reported with the reason instead of being passed over without a word.
+
+### Changed
+
+- The transform engine is now 0.54.0, which carries the Swift changes noted
+  alongside this release.
+- The transform engine is now 0.55.0, which carries the Go, TypeScript/JavaScript,
+  Swift and Ruby changes noted alongside this release.
+- TypeScript: a property of an exported object without `as const` whose value
+  is the flag's key is now reported as `enum-unproven`, instead of the run
+  saying nothing about the reads through it.
+- TypeScript and JavaScript: a React effect (`useEffect`, `useLayoutEffect`,
+  `useInsertionEffect`) whose callback the removal left empty is now deleted,
+  with the hook's import when nothing else uses it, instead of being left as
+  `useEffect(() => {}, [])`. The pull request lists each one.
+
+### Fixed
+
+- Go: when a removal leaves one target of a multi-value assignment unread and the right-hand side is a generic call with explicit type arguments (`v, ok = pair[int](4)`), that target now becomes `_` (`_, ok = pair[int](4)`) like it does for an ordinary call. Before, the unread local made the flag refuse with "neither cleanup could remove it".
+- Go: an argument of a folded read that shifts an untyped float constant by a call (`1.0<<n()`, in a parameter typed `uint64`) is no longer kept as `_ = 1.0 << n()`, which does not build; only the call is kept (`_ = n()`).
+- Go: a comment between the arguments of a folded read that stood alone on its line is kept above the kept `_ = …` lines instead of being lost with the read.
+- Go: a conversion chain over types your file declares from a predeclared type (`string(Key(ID(raw)))` with `type ID string`, `type Key ID`) is no longer kept as `_ = string(Key(ID(raw)))`; a conversion runs no code. A type declared in another file of the package, or a name that is also a function or declared twice, keeps the call.
+- Go: a web or script source file whose name merely starts a word with `.work` (`foo.worker.js`, `ci.workflow.yml`) is no longer taken for a Go workspace file, so one that does not parse no longer makes every cross-module Go lookup in the repository come back unknown (and refuse flags it could have removed).
+- Go: when a fold leaves every clause of a `select` returning, the statement after the `select` is now deleted as unreachable, with or without a `default` clause. Before, a lone `case <-ch: if <read> { return a }` followed by `return b` kept `return b`, which `go build` accepts and `go vet` reports as unreachable code. A `select` with a `break`, an empty clause, or a clause that can fall out keeps its tail.
+- Python: a read whose key constant is imported from another module is now folded even when the branch it decides also names that constant, for example `raise RuntimeError('turn on ' + FLAG)` in an `if not client.variation(FLAG, ...)` guard. When the fold deletes that branch the constant goes with it. When the fold keeps it, the read folds and the declaration and import stay. A constant another file assigns, a mention outside the branches, an `elif` read and an aliased import named in the branch still leave the file as it was.
+- Ruby: deleting an emptied guard method no longer leaves a useless access
+  modifier behind. A `private` or `protected` now goes when only the deleted
+  method, comment lines or a `class << self` body follow it before the next
+  modifier, and a `public` that no longer follows any non-public section goes
+  with it. A modifier with a comment directly above it still stays.
+- Ruby: an identity operand a fold leaves (`|| false`, `&& true`) is now dropped wherever only the truth of the value is read, however deep the parentheses and `&&`/`||` go. `return 0 if blank? || (!collab? && (bears? || read))` becomes `... (bears?))` for a removal at `false`, where it used to keep `|| false`. In a value position (an assignment, an argument, a comparison, a method's last line) the literal is still kept, because there `nil || false` is not `nil`.
+- Swift: a flag read folded into `true ?? false` or `true as? Bool ?? false` now becomes `true`, so the enclosing `if` folds too instead of staying behind with a compiler warning ("right side is never used"). `<literal> as Bool` and `as! Bool` also drop the cast. `x ?? true`, a bare `true as? Bool` (an optional), casts to other types and anything next to an operator your code declares itself are left as they were.
+- Swift: a flag read on the right of a comparison followed by `||` or `&&` (`a == b || flagOn`, `x < y && flagOff`) is now folded on its own. Before, the read was taken as part of the comparison's right-hand side, so `a == b || <read>` became `a == true` instead of `true`, which changes behaviour when `a` and `b` are `Bool` and fails to compile otherwise. The same applies to `!=`, `<`, `>=`, `??` and the other binary operators. A read next to an operator your code declares itself (`x <~ a || read`) is folded but its `||`/`&&` is kept, because that operator's precedence group decides what the `||` belongs to. If you merged a Swift removal made by an earlier version, check any comparison it left next to `||` or `&&` for a `== true` or `== false` that used to be a whole condition.
+- Swift: a custom prefix operator applied to a read (`√read`, or `!!read`, which Swift reads as one operator) now keeps the operator around the folded literal. `!!read` used to be left in place.
+- Swift: a local declared with a type and `nil` (`let x: Foo = nil`, with `Foo` your own `ExpressibleByNilLiteral` type) that the fold leaves unread is now kept, as every other typed local is. It used to be deleted, which skipped the `init(nilLiteral:)` of a type that declares one.
+- Swift: a flag read that is one member of a tuple (`let t = (client.boolVariation(...), y)`, `return (read, y)`, `chk(1, (a: read, b: y))`, or the read in second position) no longer turns the whole tuple into the literal. Before, the other members were dropped and the type changed from `(Bool, Bool)` to `Bool`, so the result did not compile. Only a parenthesised single value, `(read)`, is unwrapped now. If you merged a Swift removal from an earlier release, check it for a tuple that became a bare `true` or `false`.
+- TypeScript and JavaScript: a function wrapper whose test changes what the
+  wrapper's client answers through a route the run did not see now refuses the
+  flag instead of leaving that test failing. The routes are a setup file your
+  Jest or Vitest configuration names, a test utility that spells the flag's key
+  while initialising the client, the client package loaded with `import()` or
+  `require()` inside a test, an in-repo `getClient()` that returns a `let` a
+  setter assigns or reads a React context, and a client declared as
+  `globalThis.__flags ?? fallback`. If you merged a removal made by an earlier version where a setup file, test utility or in-repo client getter reached the flag client, run those tests.
+- TypeScript and JavaScript: an object or array literal the removal emptied
+  is written `{}` or `[]`. Deleting the only flag-keyed entry of a multi-line
+  object used to leave `{` and `};` on two lines, which `prettier --check`
+  rejects.
+- TypeScript and JavaScript: a branch kept by the removal is no longer left
+  wrapped in a bare `{ … }` block when both branches declare the same name
+  inside a callback (`const err` in each branch's closure, say). Only a name the
+  branch declares at its own level can collide once its braces go.
+- TypeScript and JavaScript: a kept branch whose first statement is a string
+  (`"use strict";`, say) keeps its braces. Spliced into the start of a function,
+  the string would have become that function's directive and switched it to
+  strict mode, which changes what the code does. If you merged a TypeScript or JavaScript removal made by an earlier version, check the functions it changed for a string statement that is now their first line.
+- TypeScript and JavaScript: a flag read in parentheses compared to `true` or
+  `false` (`if ((await client.boolVariation(...)) === false)`) is now folded and
+  its `if` removed. It used to be left as `(true) === false`, which `tsc`
+  rejects. The same goes for `await (read)` and for a condition like
+  `x > 1 && (read)`.
+- TypeScript and JavaScript: a read written directly against a keyword, as in
+  `return(client.boolVariation(...)) ? 1 : 2`, used to come out as `return1`,
+  which parses but names nothing. The literal now stays in its parentheses
+  there (`return(true) ? 1 : 2`), and a rewrite that would join two words
+  anyway is refused instead of written. If you merged a TypeScript or JavaScript removal made by an earlier version, run `tsc` (or your linter's `no-undef`) on the files it changed.
+- TypeScript and JavaScript: a state setter whose only reads the removal
+  deleted is dropped from its destructuring, so
+  `const [count, setCount] = useState(0)` becomes `const [count] = useState(0)`
+  instead of failing `no-unused-vars`. This covers the last element of an
+  array pattern whose value is an array literal or a call of `useState`,
+  `useReducer`, `useTransition`, `useOptimistic` or `useActionState` imported
+  from React or Preact. Anything else that is destructured, such as a
+  generator, is left as it is, since reading fewer elements from it could
+  change what runs.
+
 ## 2.14.0
 
 ### Added

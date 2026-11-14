@@ -91,6 +91,9 @@ class _Hoist:
     #: The read is the whole statement (a discarded read): the kept lines take
     #: its place, since nothing is left to fold.
     bare: bool = False
+    #: Comments inside a discarded read's own text, outside the kept expressions:
+    #: the read goes, and they stay, above the first kept line.
+    comments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,26 +121,65 @@ _SHADOWABLE = _CONSTANT_BUILTINS | _BASIC_TYPES | {"unsafe"}
 _INERT_STDLIB_CALLS = {"context": frozenset({"Background", "TODO"})}
 
 
-def _declared_names(root: Node, imports: bool = True) -> frozenset[str]:
-    """Every name ``root`` declares anywhere: a builtin it shadows is a call like any other."""
-    found: set[str] = set()
+def _declarations(root: Node, imports: bool = True) -> Iterable[str]:
+    """Every name ``root`` declares anywhere, once per declaration."""
     for node in _walk(root):
-        if node.type in ("function_declaration", "var_spec", "const_spec", "type_spec",
+        if node.type in ("function_declaration", "var_spec", "const_spec", "type_spec", "type_alias",
                          "parameter_declaration", "variadic_parameter_declaration", "type_parameter_declaration"):
-            found.update(_text(n) for n in node.children_by_field_name("name"))
+            yield from (_text(n) for n in node.children_by_field_name("name"))
         elif node.type == "type_switch_statement":
             alias = node.child_by_field_name("alias")
             if alias is not None:
-                found.update(_text(n) for n in alias.named_children if n.type == "identifier")
+                yield from (_text(n) for n in alias.named_children if n.type == "identifier")
         elif node.type in ("short_var_declaration", "range_clause", "receive_statement"):
             left = node.child_by_field_name("left")
             if left is not None:
-                found.update(_text(n) for n in left.named_children if n.type == "identifier")
+                yield from (_text(n) for n in left.named_children if n.type == "identifier")
         elif imports and node.type == "import_spec":
             name = node.child_by_field_name("name")
             if name is not None:
-                found.add(_text(name))
-    return frozenset(found)
+                yield _text(name)
+
+
+def _declared_names(root: Node, imports: bool = True) -> frozenset[str]:
+    """Every name ``root`` declares anywhere: a builtin it shadows is a call like any other."""
+    return frozenset(_declarations(root, imports))
+
+
+def inert_types(root: Node) -> frozenset[str]:
+    """``type:Name=basic`` for each package-level ``type Name basic`` (or ``type Name
+    Other`` of one already listed) that this file declares exactly once and spells
+    nowhere else as a declaration: ``Name(x)`` is then a conversion, which runs no
+    code, to a type whose underlying type is the predeclared ``basic``. Only this
+    file is read, so a type declared in a sibling file is not known and its
+    conversion stays a call."""
+    counts: dict[str, int] = {}
+    for name in _declarations(root):
+        counts[name] = counts.get(name, 0) + 1
+    declared: dict[str, str] = {}
+    for node in root.children:
+        if node.type != "type_declaration":
+            continue
+        for spec in node.named_children:
+            if spec.type != "type_spec" or spec.child_by_field_name("type_parameters") is not None:
+                continue
+            name, under = spec.child_by_field_name("name"), spec.child_by_field_name("type")
+            if name is not None and under is not None and under.type == "type_identifier":
+                declared[_text(name)] = _text(under)
+    found: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name, under in declared.items():
+            if name in found or counts.get(name) != 1:
+                continue
+            if under in _BASIC_TYPES and counts.get(under, 0) == 0:
+                found[name] = under
+                changed = True
+            elif under in found and under != name:
+                found[name] = found[under]
+                changed = True
+    return frozenset(f"type:{name}={under}" for name, under in found.items())
 
 
 def shadowed_names(root: Node) -> frozenset[str]:
@@ -237,19 +279,27 @@ def _is_inert_stdlib_call(call: Node, inert: frozenset[str]) -> bool:
         return False
     for entry in inert:
         name, _, path = entry.partition("=")
-        if name == _text(operand) and _text(field_) in _INERT_STDLIB_CALLS[path]:
+        if path in _INERT_STDLIB_CALLS and name == _text(operand) and _text(field_) in _INERT_STDLIB_CALLS[path]:
             return True
     return False
 
 
-def _is_basic_conversion(call: Node, shadowed: frozenset[str]) -> bool:
+def _is_basic_conversion(call: Node, shadowed: frozenset[str], inert: frozenset[str] = frozenset()) -> bool:
     """``string(x)``, ``int64(x)``: a conversion to a predeclared type, one argument.
-    The argument still counts. A file or package that declares the name has a call."""
+    The argument still counts. A file or package that declares the name has a call.
+    So is ``ID(x)`` for a type this file declares over a predeclared one
+    (:func:`inert_types`), unless that predeclared name is shadowed."""
     function = call.child_by_field_name("function")
     arguments = call.child_by_field_name("arguments")
+    if function is None or function.type != "identifier" or arguments is None:
+        return False
+    name = _text(function)
+    spelled = name in _BASIC_TYPES and name not in shadowed
+    declared = any(
+        e.startswith(f"type:{name}=") and e.partition("=")[2] not in shadowed for e in inert
+    )
     return (
-        function is not None and function.type == "identifier" and _text(function) in _BASIC_TYPES
-        and _text(function) not in shadowed and arguments is not None
+        (spelled or declared)
         and len([a for a in arguments.named_children if a.type != "comment"]) == 1
         and not any(a.type == "variadic_argument" for a in arguments.named_children)
     )
@@ -274,7 +324,7 @@ def does_work(node: Node, shadowed: frozenset[str] = frozenset(), inert: frozens
         if (
             current.type == "call_expression"
             and not _is_constant_builtin(current, shadowed)
-            and not _is_basic_conversion(current, shadowed)
+            and not _is_basic_conversion(current, shadowed, inert)
             and not _is_inert_stdlib_call(current, inert)
         ):
             return True
@@ -501,6 +551,63 @@ def _operand(argument: Node) -> Node:
     return argument
 
 
+_FLOAT_LITERALS = frozenset({"float_literal", "imaginary_literal"})
+_LITERALS = _FLOAT_LITERALS | {"int_literal", "rune_literal"}
+
+
+def _literal_constant(node: Node) -> bool | None:
+    """Whether ``node`` is an expression of literals and operators only; ``True``
+    when one of them is a float or imaginary literal, ``False`` when none is, and
+    ``None`` when it is anything else (a name could be a typed constant)."""
+    found = False
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in _LITERALS:
+            found = found or current.type in _FLOAT_LITERALS
+        elif current.type in ("parenthesized_expression", "unary_expression", "binary_expression"):
+            stack.extend(c for c in current.named_children if c.type != "comment")
+        else:
+            return None
+    return found
+
+
+def _float_shift(node: Node) -> bool:
+    """``1.0<<n()``: a shift of an untyped FLOAT constant. In an argument it takes
+    the parameter's type (``uint64``); as ``_ = 1.0 << n()`` it defaults to
+    ``float64``, which cannot be shifted."""
+    if node.type != "binary_expression" or _operator(node) not in ("<<", ">>"):
+        return False
+    left = node.child_by_field_name("left")
+    return left is not None and _literal_constant(left) is True
+
+
+def _holds_float_shift(node: Node) -> bool:
+    """A float shift reachable through parentheses, unary and binary operators
+    only: through a call it is typed by the callee's parameter, as it was."""
+    if _float_shift(node):
+        return True
+    if node.type in ("parenthesized_expression", "unary_expression", "binary_expression"):
+        return any(_holds_float_shift(c) for c in _named(node))
+    return False
+
+
+def _kept_nodes(node: Node, shadowed: frozenset[str], inert: frozenset[str]) -> list[Node]:
+    """What of an argument that does work is written as ``_ = <it>``: the argument
+    itself, or, when it holds a float shift, only the operands that do work, in
+    evaluation order (the shift's constant operand runs nothing)."""
+    if not _holds_float_shift(node):
+        return [node]
+    if _float_shift(node):
+        right = node.child_by_field_name("right")
+        return _kept_nodes(right, shadowed, inert) if right is not None and does_work(right, shadowed, inert) else []
+    parts: list[Node] = []
+    for child in _named(node):
+        if does_work(child, shadowed, inert):
+            parts.extend(_kept_nodes(child, shadowed, inert))
+    return parts
+
+
 def _working_parts(call: Node, shadowed: frozenset[str], inert: frozenset[str] = frozenset()) -> list[Node]:
     """The receiver and arguments of ``call`` that do work, in evaluation order.
     A spread argument (``opts()...``) is its operand."""
@@ -513,7 +620,7 @@ def _working_parts(call: Node, shadowed: frozenset[str], inert: frozenset[str] =
     arguments = call.child_by_field_name("arguments")
     for argument in (c for c in (arguments.named_children if arguments is not None else []) if c.type != "comment"):
         if does_work(argument, shadowed, inert):
-            parts.append(_operand(argument))
+            parts.extend(_kept_nodes(_operand(argument), shadowed, inert))
     return parts
 
 
@@ -627,6 +734,14 @@ def _mentions(source: str, flag_key: str, spellings: frozenset[str]) -> bool:
     return flag_key in source or any(s in source for s in spellings)
 
 
+def _inner_comments(statement: Node, parts: list[Node]) -> tuple[str, ...]:
+    """The comments inside ``statement`` that no kept expression holds, in order."""
+    return tuple(
+        _text(n) for n in _walk(statement)
+        if n.type == "comment" and not any(p.start_byte <= n.start_byte and n.end_byte <= p.end_byte for p in parts)
+    )
+
+
 def scan(
     source: str, flag_key: str, accessors: Iterable[str], spellings: Iterable[str] = (),
     package: frozenset[str] = frozenset(),
@@ -641,7 +756,7 @@ def scan(
     data = source.encode("utf-8")
     root = _parse(source, "go")
     shadowed = shadowed_names(root) | package
-    inert = inert_packages(root)
+    inert = inert_packages(root) | inert_types(root)
     hoists: list[_Hoist] = []
     declines: list[_Declined] = []
     for node in _walk(root):
@@ -665,7 +780,11 @@ def scan(
             if bare and not _line_ends_after(data, statement):
                 declines.append(_Declined(node, "the statement holding it shares its line with another"))
                 continue
-            hoists.append(_Hoist(statement, tuple(t for t in texts if t is not None), node, bare))
+            comments = _inner_comments(statement, parts) if bare else ()
+            if any("\n" in c for c in comments):
+                declines.append(_Declined(node, "a comment inside it spans several lines"))
+                continue
+            hoists.append(_Hoist(statement, tuple(t for t in texts if t is not None), node, bare, comments))
     # Two reads that do work in one statement: the second one's work would
     # move ahead of the first read's.
     by_statement: dict[int, list[_Hoist]] = {}
@@ -710,7 +829,7 @@ def _rewrite(
         indent = _indent_of(data, hoist.statement)
         newline = _newline_of(data, hoist.statement)
         if hoist.bare:
-            lines = (newline + indent).join(f"_ = {p}" for p in hoist.expressions)
+            lines = (newline + indent).join([*hoist.comments, *(f"_ = {p}" for p in hoist.expressions)])
             edits.append((hoist.statement.start_byte, hoist.statement.end_byte, lines.encode("utf-8")))
             continue
         lines = "".join(f"_ = {p}{newline}{indent}" for p in hoist.expressions)

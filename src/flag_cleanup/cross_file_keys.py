@@ -1580,7 +1580,7 @@ def _competing(
 
 #: The grammar each suffix whose dead blocks are predicted is read with.
 _DEAD_BLOCK_GRAMMARS = {
-    ".cs": "csharp", ".java": "java", ".go": "go",
+    ".cs": "csharp", ".java": "java", ".go": "go", ".py": "python",
     ".ts": "ts", ".mts": "ts", ".cts": "ts", ".tsx": "tsx",
     ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
 }

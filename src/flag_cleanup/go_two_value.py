@@ -115,7 +115,7 @@ def scan(
     spellings = {t for t in key_texts}
     root = _parse(source, "go")
     shadowed = go_read_effects.shadowed_names(root)
-    inert = go_read_effects.inert_packages(root)
+    inert = go_read_effects.inert_packages(root) | go_read_effects.inert_types(root)
     comments = [n for n in _walk(root) if n.type == "comment"]
     found: list[_Pair] = []
     reasons: list[str] = []
