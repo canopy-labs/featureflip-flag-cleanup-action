@@ -104,6 +104,68 @@ def constant_condition_ifs(source: str, language: str) -> int:
     )
 
 
+def constant_condition_ternaries(source: str, language: str) -> int:
+    """Conditional expressions whose test is constant (``false ? a : b``).
+
+    The engine folds every one it makes, unless it withholds the fold: a
+    discarded ``c ? "a" : "b";`` first in a function would leave a string that
+    became the function's directive. What stays is the flag half-removed and
+    ``no-constant-condition`` failing, so Gate 1 refuses when this count grows.
+    """
+    return sum(
+        1
+        for node in _walk(_parse(source, language))
+        if node.type == "ternary_expression"
+        and _constant_truth(node.child_by_field_name("condition")) is not None
+    )
+
+
+def constant_condition_logicals(source: str, language: str) -> int:
+    """Expression statements that are a ``&&``/``||`` whose left operand is a
+    boolean literal (``false || 'fallback';``, ``true && go();``), parentheses
+    looked through: what a withheld fold of a discarded logical leaves, and
+    what ``no-constant-binary-expression`` rejects."""
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type != "expression_statement":
+            continue
+        inner = [c for c in node.named_children if c.type != "comment"]
+        expression = inner[0] if len(inner) == 1 else None
+        while expression is not None and expression.type == "parenthesized_expression":
+            nested = [c for c in expression.named_children if c.type != "comment"]
+            expression = nested[0] if len(nested) == 1 else None
+        if expression is None or expression.type != "binary_expression":
+            continue
+        operator = expression.child_by_field_name("operator")
+        if operator is None or operator.type not in ("&&", "||"):
+            continue
+        left = expression.child_by_field_name("left")
+        while left is not None and left.type == "parenthesized_expression":
+            nested = [c for c in left.named_children if c.type != "comment"]
+            left = nested[0] if len(nested) == 1 else None
+        if left is not None and left.type in ("true", "false"):
+            count += 1
+    return count
+
+
+def literal_statements(source: str, language: str) -> int:
+    """Expression statements that are only a boolean literal (``false;``),
+    parentheses looked through: a discarded flag read the engine folded but
+    withheld deleting."""
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type != "expression_statement":
+            continue
+        inner = [c for c in node.named_children if c.type != "comment"]
+        expression = inner[0] if len(inner) == 1 else None
+        while expression is not None and expression.type == "parenthesized_expression":
+            nested = [c for c in expression.named_children if c.type != "comment"]
+            expression = nested[0] if len(nested) == 1 else None
+        if expression is not None and expression.type in ("true", "false"):
+            count += 1
+    return count
+
+
 def _constant_truth(condition: Node | None) -> bool | None:
     """The truth of a condition decided by a boolean literal, else ``None``.
 

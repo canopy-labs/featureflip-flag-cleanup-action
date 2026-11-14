@@ -84,6 +84,7 @@ parses as intended, and a wrong rewrite can pass that. It is a net, not a proof
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -1053,8 +1054,28 @@ def _blank_runs(lines: list[str]) -> list[tuple[int, int]]:
     return runs
 
 
-def _line_opcodes(old: list[str], new: list[str]) -> list[tuple[str, int, int, int, int]]:
+#: The most line pairs one ``SequenceMatcher`` call of :func:`_line_opcodes`
+#: may be given (the product of its two segments' lengths): it is quadratic
+#: there (1,200 lines a side of repeated braces took 0.17 s, 24,000 took 23 s),
+#: and 1,500 a side is a quarter of a second. Over it
+#: the caller is told (:class:`_SegmentTooLarge`) rather than kept waiting.
+_SEGMENT_PAIRS_CAP = 2_250_000
+
+
+class _SegmentTooLarge(Exception):
+    """A stretch with no unique line in it is too long to diff in time."""
+
+
+def _line_opcodes(
+    old: list[str], new: list[str], sure: dict[int, int] | None = None
+) -> list[tuple[str, int, int, int, int]]:
     """``difflib``-style opcodes of two line lists, cheap on a big file.
+
+    ``sure``, when given, is filled with the lines whose pairing does not
+    depend on how ``difflib`` aligns duplicates (``new`` index to ``old``
+    index): the common first and last lines, and the anchors. Raises
+    :class:`_SegmentTooLarge` when a stretch between two of them is over
+    :data:`_SEGMENT_PAIRS_CAP`.
 
     The common first and last lines are cut off first, and what lies between
     is split at the lines that occur exactly once on each side and keep their
@@ -1082,6 +1103,8 @@ def _line_opcodes(old: list[str], new: list[str]) -> list[tuple[str, int, int, i
         if i1 == i2 or j1 == j2:
             blocks.append(("insert" if i1 == i2 else "delete", i1, i2, j1, j2))
             return
+        if (i2 - i1) * (j2 - j1) > _SEGMENT_PAIRS_CAP:
+            raise _SegmentTooLarge
         matcher = difflib.SequenceMatcher(None, old[i1:i2], new[j1:j2], autojunk=False)
         blocks.extend((tag, a + i1, b + i1, c + j1, d + j1) for tag, a, b, c, d in matcher.get_opcodes())
 
@@ -1116,6 +1139,10 @@ def _line_opcodes(old: list[str], new: list[str]) -> list[tuple[str, int, int, i
         anchors.append(pairs[current])
         current = links[current]
     anchors.reverse()
+    if sure is not None:
+        sure.update((k, k) for k in range(head))
+        sure.update((len(new) - 1 - k, len(old) - 1 - k) for k in range(tail))
+        sure.update((aj, ai) for ai, aj in anchors)
     i, j = head, head
     for ai, aj in anchors:
         segment(i, ai, j, aj)
@@ -1150,7 +1177,22 @@ def collapse_introduced_blank_runs(before: str, after: str, language: str) -> st
     original had in or beside the changed lines it touches. Never lengthens,
     never touches a line the run did not change the neighbourhood of, and
     never removes a blank line inside a token (a template literal, a block
-    comment: :func:`_leaf_spans`)."""
+    comment: :func:`_leaf_spans`).
+
+    Nor does it shorten a run below any blank run the original had between the
+    lines on either side of it whose pairing is sure (the common first and last
+    lines, and lines that occur once in each file). Beside duplicate lines
+    ``difflib`` can pair the run with blank lines of another run, and the
+    customer's own run of two or three used to shrink. The floor is that wide
+    because the diff's own idea of what changed is the thing that cannot be
+    trusted there, so it can KEEP a doubled blank line a deletion made when the
+    original has such a run elsewhere between the same two sure lines (a
+    repetitive stretch, or a function holding one): the trade is a cosmetic
+    double blank line left in the removal's output, never one taken from the
+    customer's. Bounded the same way:
+    two such lines far apart with nothing unique between them would take the
+    quadratic diff too long, and then the file is left as the removal wrote
+    it, which at worst keeps a doubled blank line."""
     if after == before or not supported(language):
         return after
     old = before.splitlines(keepends=True)
@@ -1159,7 +1201,11 @@ def collapse_introduced_blank_runs(before: str, after: str, language: str) -> st
     if not runs:
         return after
     old_runs = _blank_runs(old)
-    blocks = _line_opcodes(old, new)
+    sure: dict[int, int] = {}
+    try:
+        blocks = _line_opcodes(old, new, sure)
+    except _SegmentTooLarge:
+        return after
     drop: set[int] = set()
     for first, end in runs:
         touched: set[int] = set()
@@ -1178,6 +1224,11 @@ def collapse_introduced_blank_runs(before: str, after: str, language: str) -> st
         if unchanged:
             continue
         longest = max((b - a for a, b in old_runs if any(a <= i < b for i in touched)), default=1)
+        low = next((sure[k] for k in range(first - 1, -1, -1) if k in sure), -1)
+        high = next((sure[k] for k in range(end, len(new)) if k in sure), len(old))
+        longest = max(
+            [longest, *(b - a for a, b in old_runs if low < b and a < high)]
+        )
         excess = (end - first) - max(longest, 1)
         drop.update(range(end - excess, end))
     if not drop:
@@ -1412,6 +1463,318 @@ def _stranded_keywords(source: str, language: str) -> int:
         and source_bytes[node.start_byte : node.end_byte].decode("utf-8", "replace")
         in profile.keywords
     )
+
+
+#: Ruby's statement modifiers: each is a STATEMENT, which an expression
+#: position holds only inside parentheses.
+_RUBY_MODIFIERS = frozenset(
+    {"rescue_modifier", "if_modifier", "unless_modifier", "while_modifier", "until_modifier"}
+)
+
+#: The constructs whose ``condition`` field reads everything up to ``then``,
+#: ``do`` or the line's end: an ``and``/``or``/``not`` there means the same
+#: with or without its pair.
+_RUBY_HEADERS = frozenset(
+    {"if", "elsif", "unless", "while", "until", "if_modifier", "unless_modifier", "while_modifier", "until_modifier"}
+)
+
+
+def _ruby_operator(node) -> str:
+    op = node.child_by_field_name("operator")
+    return op.text.decode("utf-8", "replace") if op is not None else ""
+
+
+def _ruby_loose(node) -> str | None:
+    """The kind of a Ruby node that binds looser than an operand (a
+    modifier, ``and``/``or``/``not``), or ``None``."""
+    if node.type in _RUBY_MODIFIERS:
+        return node.type
+    if node.type == "binary" and _ruby_operator(node) in ("and", "or"):
+        return "binary " + _ruby_operator(node)
+    if node.type == "unary" and _ruby_operator(node) == "not":
+        return "unary not"
+    return None
+
+
+def _ruby_context(node) -> str:
+    """Where a loose node stands: the kind of its nearest ancestor that is
+    not itself a loose node or a ``&&``/``||``/``!`` around it."""
+    parent = node.parent
+    while parent is not None and (
+        _ruby_loose(parent) is not None
+        or (parent.type == "binary" and _ruby_operator(parent) in ("&&", "||"))
+        or (parent.type == "unary" and _ruby_operator(parent) == "!")
+    ):
+        parent = parent.parent
+    return parent.type if parent is not None else ""
+
+
+def _ruby_whole_condition(node):
+    """The header ``node`` is the whole condition of, bare or as the sole
+    child of a pair that is; ``None`` if it is neither."""
+    parent = node.parent
+    if parent is not None and parent.type == "parenthesized_statements" and parent.named_child_count == 1:
+        node, parent = parent, parent.parent
+    if parent is None or parent.type not in _RUBY_HEADERS:
+        return None
+    condition = parent.child_by_field_name("condition")
+    return parent if condition is not None and condition.id == node.id else None
+
+
+def reads_flag(text: str, read_markers: tuple[str, ...]) -> bool:
+    """Whether ``text`` holds a read of the flag: its key as the code spells
+    it, or one of the run's accessors as a whole word."""
+    for marker in read_markers:
+        if not marker:
+            continue
+        if marker[0].isalpha() or marker[0] == "_":
+            if re.search(r"(?<![A-Za-z0-9_$])" + re.escape(marker) + r"(?![A-Za-z0-9_$?!])", text):
+                return True
+        elif marker in text:
+            return True
+    return False
+
+
+def _ruby_header_conditions(
+    source: str, read_markers: tuple[str, ...]
+) -> frozenset[tuple[str, str]]:
+    """The ``and``/``or``/``not`` nodes of ``source`` a header may hold whole
+    without a pair after the rewrite, as ``(kind, text)``: each a pair holds
+    alone where that pair is a direct operand of ``&&``/``||``/``and``/``or``
+    whose other operand reads the flag. A header unwrap is legitimate only
+    there: the fold took the read away beside the pair, and the pair's whole
+    content became the condition (``unless <read> && (a or b)`` read
+    ``unless a or b``). A regrouping always adds text (``if <read> && x &&
+    (a or b)`` read ``if x && a or b``, whose ``or`` is ``x && a or b``), and
+    a same-text pair or header anywhere else in the file proves nothing."""
+    found = set()
+    for node in _walk(_parse(source, "ruby")):
+        kind = _ruby_loose(node)
+        if kind is None or kind.endswith("modifier"):
+            continue
+        pair = node.parent
+        if pair is None or pair.type != "parenthesized_statements" or pair.named_child_count != 1:
+            continue
+        operator = pair.parent
+        if operator is None or operator.type != "binary" or _ruby_operator(operator) not in ("&&", "||", "and", "or"):
+            continue
+        others = [c for c in (operator.child_by_field_name("left"), operator.child_by_field_name("right")) if c is not None and c.id != pair.id]
+        if any(reads_flag(other.text.decode("utf-8", "replace"), read_markers) for other in others):
+            found.add((kind, node.text.decode("utf-8", "replace")))
+    return frozenset(found)
+
+
+def _ruby_exposed(
+    source: str, exempt: frozenset[tuple[str, str]] | None = None
+) -> list[tuple[str, str, str, tuple[str, ...], int]]:
+    """Every loose node of ``source`` that no pair of parentheses holds alone,
+    as ``(kind, context, text, operand texts, line)``. A bare ``and``/``or``/
+    ``not`` that is a header's whole condition is left out when ``exempt``
+    (:func:`_ruby_header_conditions` of the source) holds its kind and whole
+    text: there it means the same either way. One whose text the rewrite
+    made is not (``if <read> && x && (a or b)`` read ``if x && a or b``).
+    ``None`` exempts every header's whole ``and``/``or``/``not``: with no
+    pair-held material changed, none can have been regrouped out of a pair."""
+    found = []
+    for node in _walk(_parse(source, "ruby")):
+        kind = _ruby_loose(node)
+        if kind is None:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "parenthesized_statements" and parent.named_child_count == 1:
+            continue
+        text = node.text.decode("utf-8", "replace")
+        if (
+            not kind.endswith("modifier")
+            and (exempt is None or (kind, text) in exempt)
+            and parent is not None
+            and parent.type in _RUBY_HEADERS
+            and parent.child_by_field_name("condition") is not None
+            and parent.child_by_field_name("condition").id == node.id
+        ):
+            continue
+        operands = tuple(
+            child.text.decode("utf-8", "replace") for child in node.named_children if child.type != "comment"
+        )
+        found.append((kind, _ruby_context(node), text, operands, node.start_point[0] + 1))
+    return found
+
+
+def _ruby_exposed_statement(before: str, after: str, language: str) -> str | None:
+    """A Ruby modifier or ``and``/``or``/``not`` the rewrite left standing where
+    only parentheses let it, as its text; ``None`` if there is none.
+
+    Such a node is a statement or binds looser than any operand, so a pair is
+    what lets it sit inside an expression. Dropped, the pair takes the
+    program's meaning with it: ``if (a rescue b) || <read>`` read
+    ``if a rescue b`` (which Ruby rejects although tree-sitter does not),
+    ``x = (a if b) && <read>`` read ``x = a if b`` (``(x = a) if b``), and
+    ``y = (a or b) && <read>`` read ``y = a or b`` (``(y = a) or b``).
+
+    Asked by construction rather than by shape: every such node the rewrite
+    leaves outside a pair must be one the source already had outside a pair,
+    of the same kind, standing in the same kind of place, and with its text or
+    one of its operands unchanged (a fold edits the other one). Each node of
+    the source answers for at most one of the rewrite's, so deleting one
+    elsewhere in the file cannot pay for another (``call rescue nil if <read>``
+    beside the first example). A header's whole condition is the one place an
+    ``and``/``or``/``not`` means the same without its pair.
+    """
+    profile = _PROFILES[language]
+    if profile.code_view is not None:
+        return _ruby_exposed_statement(
+            _code_view(before, language), _code_view(after, language), profile.code_view
+        )
+    if language != "ruby" or before == after:
+        return None
+    pool = _ruby_exposed(before)
+    for kind, context, text, operands, _ in _ruby_exposed(after):
+        same = [i for i, (k, c, _, _, _) in enumerate(pool) if k == kind and c == context]
+        # The unedited twin first, so an edited node cannot take the one an
+        # unedited node needs.
+        match = next((i for i in same if pool[i][2] == text), None)
+        if match is None:
+            match = next((i for i in same if any(a == b for a, b in zip(pool[i][3], operands))), None)
+        if match is None:
+            return text
+        pool.pop(match)
+    return None
+
+
+#: The nodes a body-level `rescue` clause hangs from (a method's, class's,
+#: module's or `do` block's body, or a `begin`).
+_RUBY_RESCUE_BODIES = frozenset({"body_statement", "begin"})
+
+
+def _ruby_rescue_clauses(source: str, language: str) -> list[int]:
+    """The lines of the ``rescue`` clauses ``source`` has at the level of a
+    body."""
+    profile = _PROFILES[language]
+    if profile.code_view is not None:
+        return _ruby_rescue_clauses(_code_view(source, language), profile.code_view)
+    if language != "ruby":
+        return []
+    return [
+        node.start_point[0] + 1
+        for node in _walk(_parse(source, language))
+        if node.type == "rescue" and node.is_named and node.parent is not None
+        and node.parent.type in _RUBY_RESCUE_BODIES
+    ]
+
+
+def _ruby_raw_material(source: str) -> tuple[Counter, Counter, dict[str, frozenset[str]]]:
+    """What the two Ruby hazards below can be made of, as text multisets:
+    every pair of parentheses with a loose node anywhere inside it, whatever
+    the pair holds directly (an assignment, a call, the loose node itself),
+    keyed by the pair's full text; and every ``rescue`` modifier whose body is
+    a modifier statement, by text. Also, for each pair, the loose kinds
+    inside it."""
+    paired: Counter = Counter()
+    rescued: Counter = Counter()
+    nested: dict[str, frozenset[str]] = {}
+    for node in _walk(_parse(source, "ruby")):
+        if node.type == "parenthesized_statements":
+            kinds = frozenset(k for inner in _walk(node) if (k := _ruby_loose(inner)) is not None)
+            if kinds:
+                key = node.text.decode("utf-8", "replace")
+                paired[key] += 1
+                nested[key] = nested.get(key, frozenset()) | kinds
+        elif node.type == "rescue_modifier":
+            body = node.child_by_field_name("body")
+            if body is not None and body.type in _RUBY_MODIFIERS - {"rescue_modifier"}:
+                rescued[node.text.decode("utf-8", "replace")] += 1
+    return paired, rescued, nested
+
+
+def _ruby_hazard(
+    before: str, after: str, language: str, read_markers: tuple[str, ...] = ()
+) -> tuple[str, ...] | None:
+    """Which hazard a Ruby rewrite may have left, or ``None``: ``("changed",
+    <changed kind>, <hazard kind>, <line>)``, ``("rescue", "changed" |
+    "added", <line>)`` or ``("exposed", <node text>)``. Asked by where each
+    hazard can come from, never by pairing.
+
+    Two hazards. (1) A loose node -- a ``rescue``/``if``/``unless``/``while``/
+    ``until`` modifier, or an ``and``/``or``/``not`` -- outside any pair (the
+    whole condition of a header aside, where ``and``/``or``/``not`` mean the
+    same without one): ``if (a rescue b) || <read>`` read ``if a rescue b``
+    (Ruby rejects it), ``x = (a if b) && <read>`` read ``x = a if b``
+    (``(x = a) if b``). (2) A ``rescue`` clause at the level of a body:
+    deleting the dead modifier of ``x = 1 if <read> rescue nil`` left
+    ``rescue nil``, and the statements after it became the body's rescue
+    clause. tree-sitter reads every one of them without an error.
+
+    The argument. A rewrite makes hazard (1) of kind K only by taking a pair
+    away from around a K node, so a pair whose subtree holds K goes from the
+    file as it was (by full text). A rewrite could MASK that: a pair of the
+    same full text appearing elsewhere keeps the count (``(v = a rescue
+    nil)`` with ``v`` inlined is ``(a rescue nil)``; ``(a rescue nil unless
+    <read>)`` served false is ``(a rescue nil)``). But no rule writes a pair:
+    neither the engine's Ruby rules nor this tool's Ruby rule files write
+    ``(`` or ``)`` in any replacement, and its Ruby passes only delete code or
+    write literals. So a pair can only appear by being changed from one the
+    file had, and that pair, holding K too, went. Either way a pair holding K
+    went or appeared, and the gate refuses whenever the rewritten file holds
+    a loose node of such a kind outside a pair. Hazard (2) is made only out
+    of a ``rescue`` modifier whose body is a modifier statement, by deleting
+    that body; so whenever that material differs at all, any body-level
+    ``rescue`` clause refuses. Nothing in the source vouches for a hazard: a
+    twin deleted or rebuilt elsewhere can pair with anything. The cost is a
+    refusal when a rewrite changes a pair beside the customer's own unrelated
+    modifier or ``and``/``or`` of a kind the pair held (``log if b``,
+    ``save or raise``), and the refusal says so.
+
+    A header's whole ``and``/``or``/``not`` is no hazard when the source had
+    that same node, by kind and whole text, alone in a pair that is a direct
+    operand of an operator whose other operand reads the flag
+    (:func:`_ruby_header_conditions`). Ruby's modifier and
+    statement ``if``/``unless``/``while``/``until`` read their condition up
+    to ``then``, ``do`` or the line's end, and bind more loosely than
+    ``not``/``and``/``or``, so a whole condition that is exactly a former
+    pair's content means what the pair did; a regrouping with a neighbour
+    always adds text to the node (``if <read> && x && (a or b)`` read
+    ``if x && a or b``, whose ``or`` is ``x && a or b``), so it never
+    matches.
+
+    The scope of the argument is what the transform engine's Ruby rules and
+    this tool's Ruby rule files write (no ``replace`` of either holds a
+    parenthesis) and what this tool's Ruby passes do (delete code, write
+    literals); a rule or pass that wrote a pair of its own would fall outside
+    it. Beyond it, each hazard must still be
+    one the source had at that place (:func:`_ruby_exposed_statement`), and
+    the rewrite may add no ``rescue`` clause: refusals only.
+    """
+    profile = _PROFILES[language]
+    if profile.code_view is not None:
+        return _ruby_hazard(
+            _code_view(before, language), _code_view(after, language), profile.code_view, read_markers
+        )
+    if language != "ruby" or before == after:
+        return None
+    paired_before, rescued_before, nested_before = _ruby_raw_material(before)
+    paired_after, rescued_after, nested_after = _ruby_raw_material(after)
+    # The kinds an exposure can be of: every loose kind inside a pair that
+    # went or appeared (by full text and count).
+    kinds = {k for key in paired_before - paired_after for k in nested_before[key]} | {
+        k for key in paired_after - paired_before for k in nested_after[key]
+    }
+    for kind, _, _, _, line in _ruby_exposed(after, _ruby_header_conditions(before, read_markers)):
+        if kind in kinds:
+            return ("changed", _ruby_kind_name(kind), _ruby_kind_name(kind), str(line))
+    clauses = _ruby_rescue_clauses(after, "ruby")
+    if clauses and rescued_before != rescued_after:
+        return ("rescue", "changed", str(clauses[0]))
+    if len(clauses) > len(_ruby_rescue_clauses(before, "ruby")):
+        return ("rescue", "added", str(clauses[-1]))
+    unmatched = _ruby_exposed_statement(before, after, "ruby")
+    return ("exposed", unmatched) if unmatched is not None else None
+
+
+def _ruby_kind_name(kind: str) -> str:
+    """How a refusal names a loose node's kind."""
+    if kind.endswith("_modifier"):
+        return f"`{kind.removesuffix('_modifier')}` modifier"
+    return f"`{kind.split()[-1]}`"
 
 
 def _native_parse_fails(source: str, language: str) -> bool:
@@ -3014,7 +3377,8 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
 
 
 def refusal_reason(
-    before: str, after: str, language: str, *, excused_initializers: int = 0
+    before: str, after: str, language: str, *, excused_initializers: int = 0,
+    read_markers: tuple[str, ...] = (),
 ) -> str | None:
     """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
 
@@ -3093,6 +3457,18 @@ def refusal_reason(
             after, language
         ) > ts_dead_code.constant_condition_ifs(before, language):
             return "an if was left testing a constant condition"
+        if ts_dead_code.constant_condition_ternaries(
+            after, language
+        ) > ts_dead_code.constant_condition_ternaries(before, language):
+            return "a conditional expression was left testing a constant condition"
+        if ts_dead_code.constant_condition_logicals(
+            after, language
+        ) > ts_dead_code.constant_condition_logicals(before, language):
+            return "a logical expression statement was left starting with true or false"
+        if ts_dead_code.literal_statements(after, language) > ts_dead_code.literal_statements(
+            before, language
+        ):
+            return "a flag read was left as a bare true or false statement"
         return ts_syntax.refusal_reason(before, after, language)
     if language not in _PROFILES:
         raise ValueError(f"unsupported language {language!r}")
@@ -3100,6 +3476,31 @@ def refusal_reason(
         return "the result has a syntax error the original did not"
     if _stranded_keywords(after, language) > _stranded_keywords(before, language):
         return "a keyword was left stranded where an expression is read"
+    hazard = _ruby_hazard(before, after, language, read_markers)
+    if hazard is not None and hazard[0] == "changed":
+        return (
+            f"a pair of parentheses holding a {hazard[1]} was changed, and the file holds unparenthesised "
+            f"{hazard[2]} code (line {hazard[3]}), so the rewrite cannot be proven to keep "
+            "its meaning: had the parentheses gone, Ruby would reject the result or read "
+            "it as a different statement"
+        )
+    if hazard is not None and hazard[0] == "rescue":
+        what = (
+            "a `rescue` modifier around a modifier statement was changed, and the file holds"
+            if hazard[1] == "changed"
+            else "the rewrite added"
+        )
+        return (
+            f"{what} a `rescue` clause starting a line (line {hazard[2]}): had it come from "
+            "that modifier, the statements after it would be the body's rescue clause and "
+            "run only when something raises"
+        )
+    if hazard is not None:
+        return (
+            "the rewrite left a `rescue`, `if`, `unless`, `while` or `until` modifier, "
+            "or an `and`, `or` or `not`, outside the parentheses that held it "
+            f"(`{hazard[1][:60]}`): Ruby rejects the result, or reads it as a different statement"
+        )
     if _native_parse_fails(after, language) and not _native_parse_fails(before, language):
         return "the language's own compiler rejects the result"
     if _attribute_residues(after, language) > _attribute_residues(before, language):

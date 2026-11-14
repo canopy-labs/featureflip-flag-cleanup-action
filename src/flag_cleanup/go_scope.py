@@ -108,6 +108,57 @@ def _statement_sites(statement: Node) -> list[tuple[Node, Binding]]:
     return []
 
 
+#: What Go calls a block: a statement list (a `{ … }` or a clause's statements) and
+#: the implicit block of each statement that has a header.
+_BLOCKS = (
+    "statement_list",
+    "if_statement",
+    "for_statement",
+    "expression_switch_statement",
+    "type_switch_statement",
+    "select_statement",
+)
+
+
+def block_of(node: Node) -> Node | None:
+    """The nearest enclosing Go block of ``node``: a statement list, or the
+    implicit block of an ``if``, ``for``, ``switch``, type switch or ``select``
+    statement, which holds its header. Everything else on the way up (a label, an
+    expression, a statement) is climbed through. ``None`` at file level."""
+    scope = node.parent
+    while scope is not None and scope.type not in _BLOCKS:
+        scope = scope.parent
+    return scope
+
+
+def _defined_by_short_var(name: Node) -> bool:
+    """Whether ``name`` is on the left of a ``:=``."""
+    holder = name.parent.parent if name.parent is not None and name.parent.type == "expression_list" else None
+    return (
+        holder is not None
+        and holder.type == "short_var_declaration"
+        and holder.child_by_field_name("left") == name.parent
+    )
+
+
+def clause_names(block: Node) -> set[str]:
+    """The names declared in the block ``block`` BY the header of the clause it is
+    the statement list of: a ``select`` clause's ``case v := <-ch:`` and a type
+    switch's alias, each declared once per clause, in the clause's own block. A
+    ``:=`` directly in that block (a label in front does not matter) that names one
+    of them again assigns it; only a ``:=`` in a nested block declares another."""
+    clause = block.parent
+    if clause is None:
+        return set()
+    if clause.type == "communication_case":
+        communication = clause.child_by_field_name("communication")
+        return set() if communication is None else {_text(n) for n, _ in _statement_sites(communication)}
+    switch = clause.parent
+    if clause.type in ("type_case", "default_case") and switch is not None and switch.type == "type_switch_statement":
+        return {_text(n) for n in _identifiers(switch.child_by_field_name("alias"))}
+    return set()
+
+
 def _type_parameter_sites(function: Node) -> list[tuple[Node, Binding]]:
     """A generic function's type parameters, and the ones a method names in
     its receiver's type arguments: each shadows a function of its name."""
@@ -149,12 +200,15 @@ def _sites_in(scope: Node, child: Node, use: Node) -> list[tuple[Node, Binding]]
         return _parameter_sites(scope) if child == scope.child_by_field_name("body") else []
     if scope.type == "statement_list":
         # A declaration is visible after it ENDS: in `x := x` the right side
-        # is the outer `x`.
+        # is the outer `x`. A `:=` that names the clause's own header variable
+        # declares nothing by that name: it assigns it.
+        reused = clause_names(scope)
         return [
             site
             for statement in scope.named_children
             if statement.end_byte <= use.start_byte
             for site in _statement_sites(statement)
+            if not (_text(site[0]) in reused and _defined_by_short_var(site[0]))
         ]
     if scope.type == "communication_case":
         communication = scope.child_by_field_name("communication")

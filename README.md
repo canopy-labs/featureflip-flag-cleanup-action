@@ -4491,7 +4491,7 @@ What counts as a resolvable constant, per language:
 
 | Language | Shape |
 | --- | --- |
-| JavaScript / TypeScript / JSX / TSX | `const K = 'key'`, including `export const`. A `let` or `var` is **not** — it may be reassigned. A top-level `const K = new Feature('key', false)` holds the key too, when its class is proven (see the cross-file table below) |
+| JavaScript / TypeScript / JSX / TSX | `const K = 'key'`, including `export const`, also written `'key' as const`, `'key' satisfies T` or `'key' as const satisfies T`, each optionally in one pair of parentheses; any other wrapper (`'key' as string`, `'key'!`) is refused as `unsupported-form`. A `let` or `var` is **not** — it may be reassigned. A top-level `const K = new Feature('key', false)` holds the key too, when its class is proven (see the cross-file table below) |
 | Java | `static final String K = "key"`, a `final` local, or an interface field (implicitly `final`). A non-`final` field is **not** |
 | Go | `const k = "key"`, alone or as one entry of a `const ( … )` block, where that entry's line is removed and the others stay. A `var` is **not**, except a typed flag handle (see below), and a block that uses `iota` or has an entry with no value (which repeats the one above it) is left alone, since removing one entry could change the others |
 | C# | `const string K = "key"`. `static readonly` is **not** a compile-time constant — it may be assigned in a static constructor |
@@ -5808,7 +5808,20 @@ The same goes for a condition the read leaves decided by a literal, such as
 condition, and when `x` could run code (a call, `new`, `await`, an assignment,
 a property read) it cannot be dropped, so a removal that would leave
 `if (req.path() !== "/health" && false)` standing is **refused** rather than
-shipped. Your own conditions of that shape are left alone.
+shipped. Your own conditions of that shape are left alone. The same goes
+for a conditional expression left testing a literal (`false ? 'a' : 'b';`), a
+statement such as `false || 'fallback';` (`no-constant-binary-expression`),
+and a flag read left as a bare `true;` or `false;` statement. These are left
+when removing them would make a string after them the function's directive,
+and the removal is refused instead.
+
+Where only the truth of the value is read (an `if`, `while`, `do … while` or
+`for` condition, a ternary's condition, the operand of `!`), the identity
+operands go too, at any depth of parentheses and `&&`/`||`:
+`if (p.live() && (p.paid() || <read>))` served **false** becomes
+`if (p.live() && p.paid())`, and `if (a || b || <read>)` becomes
+`if (a || b)`. As a value (`const v = x || <read>`, an argument, a `return`)
+the literal stays, since `0 || false` is `false`, not `0`.
 
 Two leftovers are removed without a mention, since nothing of yours goes with
 them: a label whose last `break label` or `continue label` the fold removed
@@ -7462,7 +7475,17 @@ When the fold strands one name of several declared together with `:=` and
 another is still read, the stranded one becomes `_`: `x, err := pair()`
 becomes `_, err := pair()`, and `a, b, err := triple()` becomes
 `a, _, err := triple()`. Every value still runs. Three names that are all
-stranded go like two. A local that the fold leaves only assigned, never read
+stranded go like two. The same holds for one name of `var a, b = f()` (or
+`var a, b T = f()`) when the right side is a single call, receive, map index or
+type assertion: `var gv, ok = pair(4)` becomes `var _, ok = pair(4)`. The
+stranded name of any statement header (`if` or `switch` initializer, `for`
+range, `select` receive, type switch alias) goes the same way, also when the
+statement declares a name of its own under the same spelling (`v := 3` in the
+body, `else if v := 5`, a function literal's parameter `v`); a read or an
+assignment that means the header's name keeps it. A `:=` that names it again
+directly in a `select` or type switch clause (`v, err := g()` under
+`case v := <-ch:`) assigns the same variable, so it keeps the name too. A local
+that the fold leaves only assigned, never read
 (`var groups T` and then `groups = groupsFor(org)`), loses each assignment and
 then its declaration: `groups = groupsFor(org)` becomes `_ = groupsFor(org)`,
 and an assignment that calls nothing (`retries = 3`) is deleted. That needs
@@ -7472,10 +7495,12 @@ a plain name or literal (`groups = a / b`), since `_ = …` could change the
 value's type. Some declarations are not removed at all: a `:=` whose
 other names were all declared before it (`n, err := step()` where `err` is a
 named result), so that `_` would leave it declaring nothing; one name of
-several declared with `var`; four or more names that are all stranded;
-several names on one spec inside a `var ( … )` group; and a local whose name
-is also a struct literal key whose type cannot be resolved in the file. If a fold leaves one of those declared and unused,
-no pull request is opened for the flag: it is refused as `[unsafe-rewrite]`,
+several declared with `var` when the values are a list
+(`var p, err = (*T)(nil), load()`) or sit in a `var ( … )` group; four or more
+names that are all stranded; several names on one spec inside a `var ( … )`
+group; and a local whose name is also a struct literal key whose type cannot be
+resolved in the file. If a fold leaves one of those declared and unused, no pull
+request is opened for the flag: it is refused as `[unsafe-rewrite]`,
 and the output names the file, the local and the function it is in. Remove or
 use that declaration by hand (or add the key to `ignore`) and the next run
 cleans the flag.
@@ -7991,16 +8016,22 @@ code that parses the whole file:
   the diff is produced. The transform is discarded — entirely, across all files
   — if it introduced a syntax error, put a reserved word in a binding position,
   stranded a keyword where an expression can be read, or let two surviving
-  statements fuse under Automatic Semicolon Insertion. All four checks are
-  differential against the input, so a file the grammar already disliked stays
+  statements fuse under Automatic Semicolon Insertion. For TypeScript and
+  JavaScript it is also discarded if a statement would start with a token
+  JavaScript reads as a declaration or a block, a comma would be left with
+  nothing before it outside an array or a type (`{ /* note */, b: 2 }`), or a
+  directive would change: a bare string left first in a function or file
+  becomes one (`"use strict"`), and code put ahead of one, or deleting it,
+  stops it being one.
+  All of these checks are differential against the input, so a file the grammar already disliked stays
   eligible and only new breakage is rejected. Measured false-positive rate: 0 of
   833 simulated deletions across 463 real `.ts`/`.tsx` files, in both
   semicolon-terminated and semicolon-free style.
 
   **Gate 1 is a strong net over specific failure classes, not a correctness
-  proof.** Three of its four checks ask whether the result still parses as
-  intended, which a wrong rewrite can pass; the fourth (ASI) and Gate 2
-  (shadowed references) each close one known parses-but-wrong case. A new one
+  proof.** Most of its checks ask whether the result still parses as
+  intended, which a wrong rewrite can pass; the ASI and directive checks and
+  Gate 2 (shadowed references) each close one known parses-but-wrong case. A new one
   needs its own check. Every check here was added after a real escape, and each
   of them left the ERROR-node count untouched. Read the diff.
 * **Gate 2 — pre-flight shadow check.** If the identifier bound to the flag read
@@ -8078,6 +8109,16 @@ means no PR.
 
 ### Known gaps
 
+* **A TypeScript or JavaScript file whose code holds the same string both as
+  a directive and as an ordinary statement is refused whenever the removal
+  rewrites it.** For example, a legacy `var x; 'use strict';` (an ordinary
+  statement, since code comes first) beside a function that starts with
+  `'use strict'`. The check that no string statement became a directive, or
+  stopped being one, compares those strings by text, and one text in both
+  roles is a case it cannot tell apart, so the refusal is the safe answer. The
+  same goes for a discarded `cond ? 'a' : 'b';` or `cond && 'a';` whose string
+  would be left behind by the removal while another `'a';` statement stays in
+  the file. Edit the string by hand, or add the key to `ignore`.
 * **A file that still mentions the key after the rewrite is named in the PR
   body**, under "still reference this flag". That is the caveat to read before
   merging: it means the pull request does not remove every trace of the flag.
@@ -8708,14 +8749,29 @@ means no PR.
   value. Rewrite it as a plain truthiness test if you want the `if` to
   disappear too.
 * **A read written directly against a word keeps its parentheses.** In
-  TypeScript and JavaScript, `return(<read>) ? 1 : 2` becomes
-  `return(true) ? 1 : 2` and stops there, because dropping the parentheses
-  would join the two words into `return1`, which parses as a name. The same
-  goes for `throw(`, `yield(`, `case(`, `else(`, `do(` and a word written after
-  the closing parenthesis (`(<read>)in obj`). Add the space
-  (`return (<read>) ? 1 : 2`) and the expression folds. As a backstop, a
-  rewrite that joins two words anyway is refused (`unsafe-rewrite`) rather
-  than written.
+  every language, `return(<read>) ? 1 : 2` becomes `return(true) ? 1 : 2`
+  and stops there, because dropping the parentheses would join the two words
+  into `return1`, which in most languages parses as a name. The same goes
+  for any keyword written against the opening parenthesis (`throw(`,
+  `yield(`, `case(`, `else(`, Ruby's `x if(<read>) && y`, Python's
+  `return(<read>) or x`, Go's and Swift's `if(<read>) && y {`) and a word
+  written after the closing one (`(<read>)in obj`, Ruby's `(<read>)then`).
+  Add the space (`return (<read>) ? 1 : 2`) and the expression folds. As a
+  backstop, a rewrite that joins two words anyway is refused
+  (`unsafe-rewrite`) rather than written. The check is made on the words
+  around each removed read, not on one position, so in rare cases a name
+  of your own elsewhere in the file that spells such a joined pair is
+  refused too.
+* **Ruby: a flag read inside parentheses that hold a modifier or an
+  `and`/`or`/`not` can refuse the whole file.** When the removal changes
+  such a parenthesised `rescue`, `if`, `unless`, `while` or `until` modifier,
+  or `and`, `or` or `not` (`y = (a if <read> && b)`), and the file also has
+  unparenthesised code of the same kind elsewhere (`log if b`,
+  `save or raise`), the rewrite is refused (`unsafe-rewrite`): which of them
+  the parentheses held cannot be told apart, and dropping them changes what
+  Ruby runs. The refusal names the line of that other code. The same holds
+  for an ERB output tag (`<%= (a or b) && <read> %>`), even where dropping
+  the parentheses would be harmless.
 * **The transform engine's TypeScript grammar is older than TypeScript.**
   Piranha bundles its own parser, and a file it cannot parse makes it abort
   before any rule runs. Such files are **quarantined**: they are left untouched,

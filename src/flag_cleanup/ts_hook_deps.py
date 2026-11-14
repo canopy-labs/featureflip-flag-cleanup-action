@@ -134,6 +134,23 @@ def _dependency_arrays(root: Node) -> list[tuple[str, Node]]:
     return found
 
 
+def _slots(array: Node) -> list[Node | None]:
+    """The slots of an array literal with no comment in it, in order: each
+    element, or ``None`` for a hole. A trailing comma after an element ends it
+    and opens no slot; one after a hole ends that hole."""
+    slots: list[Node | None] = []
+    current: Node | None = None
+    for child in array.children[1:-1]:
+        if child.type == ",":
+            slots.append(current)
+            current = None
+        else:
+            current = child
+    if current is not None:
+        slots.append(current)
+    return slots
+
+
 def _literal(node: Node) -> bool:
     return node.type in ("true", "false")
 
@@ -161,9 +178,17 @@ def drop_literal_dependencies(original: str, rewritten: str, grammar: str) -> st
         drop = [i for i, (o, n) in enumerate(zip(olds, news, strict=True)) if _literal(n) and not _literal(o)]
         if not drop:
             continue
-        keep = [n for i, n in enumerate(news) if i not in drop]
-        # The array re-spelled from the elements that stay, in their own text.
-        text = "[" + ", ".join(data[n.start_byte : n.end_byte].decode("utf-8") for n in keep) + "]"
+        dropped = {news[i].start_byte for i in drop}
+        keep = [n for n in _slots(new) if n is None or n.start_byte not in dropped]
+        # The array re-spelled from the slots that stay, each element in its own
+        # text. A hole (`[a, , b]`) is a slot too, and stays one: written last, it
+        # needs the comma that ends it (`[a, ,]`), or the array loses its length.
+        text = ", ".join(
+            "" if n is None else data[n.start_byte : n.end_byte].decode("utf-8") for n in keep
+        )
+        if keep and keep[-1] is None:
+            text += ","
+        text = "[" + text + "]"
         cuts.append((new.start_byte, new.end_byte, text))
     if not cuts:
         return rewritten
@@ -335,6 +360,15 @@ def remove_emptied_effects(original: str, rewritten: str, grammar: str) -> tuple
         end = len(data) if end < 0 else end + 1
         if data[start : statement.start_byte].strip() or data[statement.end_byte : end].strip():
             continue
+        # The blank lines the deletion would move to just inside the block's
+        # `{` or `}` go with it, as the engine's own deletions take them: the
+        # ones after an effect that is the block's first statement (a fold
+        # already took the binding above it), the ones before its last. A
+        # comment is a statement here, so one beside the effect keeps them.
+        if statement.prev_named_sibling is None:
+            end = _blank_lines_from(data, end)
+        if statement.next_named_sibling is None:
+            start = _blank_lines_back_to(data, start)
         cuts.append((start, end))
         removed.append(" ".join(data[statement.start_byte : statement.end_byte].decode("utf-8").split()))
     if not cuts:
@@ -343,6 +377,26 @@ def remove_emptied_effects(original: str, rewritten: str, grammar: str) -> tuple
     for start, end in sorted(cuts, reverse=True):
         del out[start:end]
     return out.decode("utf-8"), removed
+
+
+def _blank_lines_from(data: bytes, at: int) -> int:
+    """The end of the whitespace-only lines starting at ``at`` (a line start)."""
+    while at < len(data):
+        newline = data.find(b"\n", at)
+        if newline < 0 or data[at:newline].strip():
+            break
+        at = newline + 1
+    return at
+
+
+def _blank_lines_back_to(data: bytes, at: int) -> int:
+    """The start of the whitespace-only lines ending at ``at`` (a line start)."""
+    while at > 0:
+        start = data.rfind(b"\n", 0, at - 1) + 1
+        if data[start : at - 1].strip():
+            break
+        at = start
+    return at
 
 
 def unused_effect_imports(text: str, grammar: str) -> frozenset[str]:

@@ -1235,6 +1235,97 @@ _TS_AWAITED_ONLY_CALLEES = frozenset({"getBooleanValue"})
 _TS_REFERENCE_TYPES = ("identifier", "shorthand_property_identifier")
 
 
+def _ts_ascription(node: Node, kind: str) -> Node | None:
+    """The operand of ``node`` when it is a ``kind`` expression that does not
+    change the value: ``X as const`` or ``X satisfies T``. ``as T`` (any other
+    type) is not one -- it can widen or retype the value, so it is not accepted."""
+    if node.type != kind:
+        return None
+    if kind == "as_expression" and not (node.children and node.children[-1].type == "const"):
+        return None
+    return next((c for c in node.named_children if c.type != "comment"), None)
+
+
+def ts_key_literal(value: Node | None) -> Node | None:
+    """The string literal a key constant's initialiser is, or ``None``.
+
+    The accepted spellings must equal what ``ts_const.toml``'s value
+    alternation matches; ``test_every_rule_matches_exactly_what_the_gate_accepts``
+    runs the rule queries over a census of forms and fails on any difference,
+    so change the two together. An optional pair of parentheses, then
+    optionally ``satisfies T``, then optionally ``as const``, around the
+    literal (``"k"``, ``"k" as const``, ``("k" as const)``,
+    ``"k" as const satisfies T``, ...). A constant the gate accepted and the
+    rules cannot match would be a silent no-op, so anything wider than the
+    rules is refused here and named by :func:`ts_unaccepted_key_forms`."""
+    node = value
+    for kind in ("parenthesized_expression", "satisfies_expression", "as_expression"):
+        if node is None:
+            return None
+        if kind == "parenthesized_expression":
+            if node.type == kind:
+                inner = [c for c in node.named_children if c.type != "comment"]
+                node = inner[0] if len(inner) == 1 else None
+        else:
+            inner = _ts_ascription(node, kind)
+            if inner is not None:
+                node = inner
+    return node if node is not None and node.type == "string" else None
+
+
+def _ts_declared_literal(declarator: Node) -> Node | None:
+    """:func:`ts_key_literal` of a declarator's value, unless a comment follows
+    it (``const K = "k" /* c */``) or precedes it (``const /* c */ K = "k"``):
+    the rules anchor the declarator between ``const`` and the end of the
+    statement, so such a declaration is matched by none of them and would be a
+    silent no-op."""
+    after, before = declarator.next_sibling, declarator.prev_sibling
+    if any(n is not None and n.type == "comment" for n in (after, before)):
+        return None
+    return ts_key_literal(declarator.child_by_field_name("value"))
+
+
+_TS_VALUE_WRAPPERS = frozenset(
+    {"as_expression", "satisfies_expression", "parenthesized_expression", "non_null_expression", "type_assertion"}
+)
+
+
+def ts_unaccepted_key_forms(root: Node, source_bytes: bytes, flag_key: str) -> list[tuple[int, str]]:
+    """``(line, name)`` for every ``const`` declarator holding the key that the
+    rules cannot fold: its initialiser wraps the key in something
+    :func:`ts_key_literal` does not accept (``"k" as string``, ``"k"!``,
+    ``(("k"))``, ...), a comment follows or precedes it, or the declaration
+    names several bindings (``const K = "k", J = 1``), which the single-declarator
+    rules do not match. The run must say so rather than look as if nothing
+    matched."""
+    found: list[tuple[int, str]] = []
+    for node in _walk(root):
+        if node.type != "lexical_declaration" or not any(c.type == "const" for c in node.children):
+            continue
+        declarators = [c for c in node.named_children if c.type == "variable_declarator"]
+        for declarator in declarators:
+            name = declarator.child_by_field_name("name")
+            value = declarator.child_by_field_name("value")
+            if (
+                name is None
+                or name.type != "identifier"
+                or value is None
+                or value.type not in (*_TS_VALUE_WRAPPERS, "string")
+            ):
+                continue
+            if len(declarators) == 1 and _ts_declared_literal(declarator) is not None:
+                continue
+            inner = value
+            while inner is not None and inner.type in _TS_VALUE_WRAPPERS:
+                inner = next(
+                    (c for c in inner.named_children if c.type not in ("comment", "type_arguments")), None
+                )
+            if inner is not None and inner.type == "string" and len(inner.named_children) == 1:
+                if _text(inner.named_children[0], source_bytes) == flag_key:
+                    found.append((node.start_point[0] + 1, _text(name, source_bytes)))
+    return found
+
+
 def _ts_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
     """Every ``const`` binding whose initialiser is exactly ``flag_key``.
 
@@ -1262,11 +1353,12 @@ def _ts_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyCo
         value = declarator.child_by_field_name("value")
         if name is None or name.type != "identifier" or value is None:
             continue
-        if value.type != "string":
+        literal = _ts_declared_literal(declarator)
+        if literal is None:
             continue
-        fragment = value.named_child(0)
+        fragment = literal.named_child(0)
         # `''` has no fragment child. Not a key we could match either way.
-        if fragment is None or _text(fragment, source_bytes) != flag_key:
+        if fragment is None or len(literal.named_children) != 1 or _text(fragment, source_bytes) != flag_key:
             continue
         found.append(
             KeyConst(

@@ -674,6 +674,11 @@ def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
     found, refused = _enum_entries(path, root, source, flag_key)
     for site in key_const.ts_prototype_refusals(path, root, source.encode("utf-8"), flag_key):
         refused.append(xk.Refusal(site.path, site.line, xk.UNSUPPORTED_FORM, site.text))
+    # A key constant spelled in a form the rules cannot read (`"k" as string`,
+    # `"k"!`): never declared, so say why its reads stay.
+    lines = source.splitlines()
+    for line, _name in key_const.ts_unaccepted_key_forms(root, source.encode("utf-8"), flag_key):
+        refused.append(xk.Refusal(path, line, xk.UNSUPPORTED_FORM, lines[line - 1].strip()))
     for decl in found:
         spellings = _member_spellings(root, decl.name) + [
             node

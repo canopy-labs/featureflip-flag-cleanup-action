@@ -174,11 +174,15 @@ def _redeclared(declaration: Node, name: Node) -> bool:
     """Whether ``name`` in this ``:=`` assigns a variable already declared in
     the same scope: an earlier statement of its block, or, at a function's top
     level, a parameter or named result. Go then declares nothing by that name
-    here, and its uses belong to the earlier declaration."""
-    block = declaration.parent
+    here, and its uses belong to the earlier declaration. A ``select`` clause's
+    receive variable and a type switch's alias count as declared in the
+    clause's own block."""
+    block = go_scope.block_of(declaration)
     if block is None or block.type != "statement_list":
         return False
     text = _text(name)
+    if text in go_scope.clause_names(block):
+        return True
     earlier = [
         node
         for statement in block.named_children

@@ -40,16 +40,37 @@ enclosing_node = """(
      [(lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string . (string_fragment) @flag_name .)) .)
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
       (export_statement declaration: (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string . (string_fragment) @flag_name .)) .))])
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))])
    (statement_block
      (lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
-           value: (string . (string_fragment) @flag_name .)) .))] @scope
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""
@@ -117,16 +138,37 @@ enclosing_node = """(
      [(lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string . (string_fragment) @flag_name .)) .)
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
       (export_statement declaration: (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
-            value: (string . (string_fragment) @flag_name .)) .))])
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))])
    (statement_block
      (lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
-           value: (string . (string_fragment) @flag_name .)) .))] @scope
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))] @scope
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@key_const")
 )"""

@@ -69,10 +69,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -98,6 +99,7 @@ from flag_cleanup import (
     cross_file_php,
     cross_file_python,
     discarded_calls,
+    fused_words,
     failing_assertions,
     go_comment_columns,
     go_defaults,
@@ -152,7 +154,6 @@ from flag_cleanup import (
     ts_default_arguments,
     ts_exported_props,
     ts_hook_deps,
-    ts_fused_words,
     ts_list_join,
     ts_unread_props,
     ts_fold,
@@ -1004,6 +1005,63 @@ def _key_const_names(paths: Iterable[str], language: str, flag_key: str) -> set[
         )
         names.update(cross_file_keys.entry_names(path, source, language, flag_key))
     return names
+
+
+@lru_cache(maxsize=32)
+def _seed_read_methods(rules_file: Path, language: str) -> tuple[str, ...]:
+    """The SDK read methods the language's seed rules match: every name a
+    seed rule's ``#eq?`` or ``#any-of?`` compares a capture with."""
+    names: set[str] = {kotlin_sentinel.SDK_FUNCTION_NAME} if language == "kt" else set()
+    try:
+        rules = tomllib.loads(rules_file.read_text(encoding="utf-8")).get("rules", [])
+    except (OSError, tomllib.TOMLDecodeError):
+        return tuple(sorted(names))
+    for rule in rules:
+        if rule.get("is_seed_rule") is False:
+            continue
+        for match in re.finditer(r'#(?:eq|any-of)\?\s+@\w+((?:\s+"[^"]*")+)', rule.get("query", "")):
+            names.update(
+                value for value in re.findall(r'"([^"]*)"', match.group(1))
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*[?!]?", value)
+            )
+    return tuple(sorted(names))
+
+
+def _key_constant_names(
+    resolution: cross_file_keys.Resolution, summaries, keys: tuple[str, ...]
+) -> frozenset[str]:
+    """The names that hold the flag's key: the declarations the cross-file
+    pass resolved, and every ``NAME = "<key>"`` (any quote, a type between)
+    in a file of the run."""
+    found = {d.name for d in resolution.declarations}
+    for key in keys:
+        assignment = re.compile(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\n]{1,60})?=\s*[\"']" + re.escape(key) + r"[\"']"
+        )
+        for summary in summaries:
+            found.update(assignment.findall(summary.original_content or ""))
+    return frozenset(found)
+
+
+class _RunTokens:
+    """The tokens of every file of a run before it was rewritten
+    (:func:`fused_words.tokens`), read on first use: most runs write no new
+    name and never pay for it."""
+
+    def __init__(self, summaries, language: str) -> None:
+        self._summaries = summaries
+        self._language = language
+        self._tokens: frozenset[str] | None = None
+
+    def __iter__(self):
+        if self._tokens is None:
+            found: set[str] = set()
+            for summary in self._summaries:
+                found |= fused_words.tokens(
+                    summary.original_content or "", _grammar_of(summary.path, self._language)
+                )
+            self._tokens = frozenset(found)
+        return iter(self._tokens)
 
 
 def _grammar_of(path: str, language: str) -> str:
@@ -3367,6 +3425,18 @@ def _transform_flag(
     # local one of them removed is not named.
     bindings = bindings + _unread_locals(summaries, language, repo_dir)
     reasons: dict[str, str] = dict(barrel_reasons)
+    run_tokens = _RunTokens(summaries, language)
+    # What a read of the flag spells: its key, as the code spells it and as
+    # each alias does, the key constants that hold it, its keyless wrappers,
+    # the run's accessors and the SDK read methods the seed rules match.
+    read_markers = (
+        flag_key,
+        *sorted(code_keys),
+        *accessors,
+        *_seed_read_methods(rules_file, language),
+        *sorted(_key_constant_names(resolution, summaries, (flag_key, *code_keys))),
+        *sorted({w.name for w in wrappers.wrappers}),
+    )
     for s in changed:
         # A deleted file has no text left to judge: the pass that deleted it
         # proved every use of what it held was removed with it, and its own
@@ -3378,6 +3448,7 @@ def _transform_flag(
             s.content,
             _grammar_of(s.path, language),
             excused_initializers=engine_dead_inits.get(s.path, 0),
+            read_markers=read_markers,
         )
         # A surviving sentinel means the engine did not consume a read the
         # pre-pass marked. It parses, so Gate 1's checks are blind to it, and
@@ -3439,13 +3510,17 @@ def _transform_flag(
             and substitutions["marker"] in s.content
         ):
             reason = "the engine left an internal marker in place of a flag read"
-        # A word the rewrite wrote against another (`return(<read>) ? 1 : 2`
+        # A word the rewrite joined to its neighbour (`return(<read>) ? 1 : 2`
         # folded to `return1`): it parses as a name, so nothing above sees it.
-        if reason is None and language in ("ts", "tsx", "js"):
-            fused = ts_fused_words.fused_names(s.original_content, s.content, _grammar_of(s.path, language))
+        # Every language. The run's other files give the pieces an inlined
+        # helper's body brings.
+        if reason is None:
+            fused = fused_words.fused_names(
+                s.original_content, s.content, _grammar_of(s.path, language), run_tokens, read_markers
+            )
             if fused:
                 reason = (
-                    "the rewrite joined a word to its neighbour, leaving a name the file never spelled: "
+                    "the rewrite wrote a name the code never had, a word joined to its neighbour: "
                     + ", ".join(f"`{name}`" for name in fused[:3])
                 )
         if reason is None and language in ("ts", "tsx", "js") and ts_saga_yield.delegates_to_literal(

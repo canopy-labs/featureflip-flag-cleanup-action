@@ -47,8 +47,10 @@ twice on this branch; differentials have not.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
+from collections import Counter
 from functools import lru_cache
 
 import tree_sitter_typescript
@@ -570,6 +572,401 @@ def _restricted_statements(source: str, language: str) -> int:
     )
 
 
+#: The kinds whose `body` block starts with a directive prologue. A script
+#: (`program`) has one too; a class static block, a `catch` or a plain block
+#: does not.
+_FUNCTION_KINDS = frozenset(
+    {
+        "function_declaration",
+        "function_expression",
+        "generator_function",
+        "generator_function_declaration",
+        "arrow_function",
+        "method_definition",
+    }
+)
+
+#: A body's children that are not statements and do not end its prologue.
+_PROLOGUE_TRANSPARENT = frozenset({"comment", "html_comment", "hash_bang_line"})
+
+
+def _prologue_bodies(root: Node):
+    for node in _walk(root):
+        if node.type == "program":
+            yield node
+        elif (
+            node.type == "statement_block"
+            and node.parent is not None
+            and node.parent.type in _FUNCTION_KINDS
+            and (body := node.parent.child_by_field_name("body")) is not None
+            and body.start_byte == node.start_byte
+            and body.end_byte == node.end_byte
+        ):
+            yield node
+
+
+def _is_directive_shape(statement: Node) -> bool:
+    if statement.type != "expression_statement":
+        return False
+    named = [c for c in statement.named_children if c.type not in _PROLOGUE_TRANSPARENT]
+    return len(named) == 1 and named[0].type == "string"
+
+
+def _directives(source: str, language: str) -> list[tuple[bool, int, int, int, int, bytes]]:
+    """Every directive in ``source``: the bare strings each function body and
+    the script start with, as ``(whether the body is the script, header row,
+    row, column past the line's indent, body's last row, text)``.
+
+    The header row is where the body's owner starts (the `function`, the
+    arrow's parameters, the method's name), or 0 for the script. The column is
+    counted from the line's first non-blank byte, so a directive the fold
+    re-indented with its block is still the same directive.
+    """
+    data = source.encode("utf-8")
+    last_row = source.count("\n")
+    found: list[tuple[bool, int, int, int, int, bytes]] = []
+    for body in _prologue_bodies(_parse(source, language)):
+        if body.type == "program":
+            header, end = 0, last_row
+        else:
+            header, end = body.parent.start_point[0], body.end_point[0]
+        for child in body.named_children:
+            if child.type in _PROLOGUE_TRANSPARENT:
+                continue
+            if not _is_directive_shape(child):
+                break
+            line_start = data.rfind(b"\n", 0, child.start_byte) + 1
+            indent = len(data[line_start : child.start_byte]) - len(
+                data[line_start : child.start_byte].lstrip(b" \t")
+            )
+            found.append(
+                (
+                    body.type == "program",
+                    header,
+                    child.start_point[0],
+                    child.start_point[1] - indent,
+                    end,
+                    data[child.start_byte : child.end_byte],
+                )
+            )
+    return found
+
+
+#: Why a rewrite that changed a directive prologue is refused, by rule.
+_ADDED_STRING = (
+    "the rewrite would add a string statement (a conditional folded to one of "
+    'its strings), which first in a function becomes a directive such as "use strict"'
+)
+_NEW_DIRECTIVE = (
+    "a string statement after code would become the first statement of a function "
+    'or the file, where JavaScript reads it as a directive such as "use strict"'
+)
+_LOST_DIRECTIVE = (
+    'a directive such as "use strict" would no longer be the first statement '
+    "of its function or file"
+)
+_DIRECTIVES_UNCHECKED = (
+    "the file holds a directive such as \"use strict\", and it is too long and "
+    "repetitive for the check that the rewrite left its directives as they were"
+)
+
+
+def _bare_strings(source: str, language: str) -> tuple[Counter, set[bytes], set[bytes]]:
+    """Every string statement in ``source`` (an expression statement that is one
+    string literal, in any body or block), as the multiset of their texts, and
+    the texts of those that are directives and of those that are not."""
+    data = source.encode("utf-8")
+    root = _parse(source, language)
+    directive_starts = set()
+    for body in _prologue_bodies(root):
+        for child in body.named_children:
+            if child.type in _PROLOGUE_TRANSPARENT:
+                continue
+            if not _is_directive_shape(child):
+                break
+            directive_starts.add(child.start_byte)
+    every: Counter = Counter()
+    directives: set[bytes] = set()
+    others: set[bytes] = set()
+    for node in _walk(root):
+        if not _is_directive_shape(node):
+            continue
+        literal = next(c for c in node.named_children if c.type == "string")
+        text = data[literal.start_byte : literal.end_byte]
+        every[text] += 1
+        (directives if node.start_byte in directive_starts else others).add(text)
+    return every, directives, others
+
+
+_STRING_OPERAND_FOLDED = (
+    "a discarded conditional or logical statement would be folded to one of its "
+    'strings, which first in a function becomes a directive such as "use strict"'
+)
+
+
+def _string_operands(source: str, language: str) -> Counter:
+    """The texts of every string literal inside an expression statement that
+    is not itself one string literal, at any depth, as a multiset: the only
+    code a fold can make a NEW string statement of.
+
+    Conservative on purpose. Direct operands of a ternary or `&&`/`||` were
+    not enough (review: `<read> || (<read> || 'use strict');` folds to the
+    nested operand), and listing the shapes a fold can reach through
+    (`??`, a sequence, parentheses, a nested ternary) is the patching this
+    check exists to stop. A string in a call's arguments is counted too; it
+    only matters when its text vanishes AND a string statement of that text
+    stays."""
+    data = source.encode("utf-8")
+    found: Counter = Counter()
+    for node in _walk(_parse(source, language)):
+        if node.type != "expression_statement" or _is_directive_shape(node):
+            continue
+        for inner in _walk(node):
+            if inner.type == "string":
+                found[data[inner.start_byte : inner.end_byte]] += 1
+    return found
+
+
+def _directive_change(before: str, after: str, language: str) -> str | None:
+    """Why the rewrite changed a DIRECTIVE PROLOGUE, or ``None``.
+
+    The string statements a function body or a script starts with are its
+    directive prologue: `"use strict"` makes the function strict (`this` in a
+    plain call becomes `undefined`), and `"use client"`/`"use server"` mean
+    something to a bundler. Delete the statements ahead of a string statement,
+    splice it out of a block, or fold a discarded `c ? "a" : "b";` into one, and
+    an ordinary statement becomes a directive; put code ahead of a directive and
+    it stops being one. It parses, and nothing else here can see it.
+
+    Three rules that pair nothing, because two line-diff pairings were fooled
+    in review (a deleted twin holding the same `'use strict'` line, and the
+    common tail beside it):
+
+    1. the output's string statements, as a multiset of texts, are contained in
+       the input's: no rewrite needs to ADD one, so a fold that writes one is
+       refused;
+    2. no text that is a string statement but not a directive in the input is a
+       directive in the output: that string is the only other raw material a
+       new directive can be made of;
+    3. no text that is a directive in the input is a string statement but not a
+       directive in the output: a demoted directive leaves exactly that.
+
+    Rule 1 counts texts, so a fold writing a string statement of text T while
+    a deletion removes another statement of text T elsewhere passes it (review:
+    a deleted `if (<read>) { run(function () { 'use strict'; … }) }` ahead of
+    `<read> ? 'x' : 'use strict';`). So a fourth: a string statement can only be
+    CREATED from a string operand of a discarded conditional or logical
+    statement (at any depth inside it), and when such a string vanished from
+    the input, no string statement of its text may remain in the output.
+
+    Over-refuses a file holding the same text both as a directive and as an
+    ordinary string statement (legacy `var x; 'use strict';` beside a strict
+    function), and a fold of a string-valued discarded conditional. What they
+    do not see: a directive deleted while its function stays. The second
+    is what the line-diff net below is for, which no pass does and the engine
+    guards: an input directive must be kept (every line from its body's header
+    through its own line in one unchanged block, the same directive on the
+    other side) unless both its header and its own line were deleted with the
+    code around them. The diff is :func:`flag_cleanup.syntax._line_opcodes`,
+    bounded; a file it cannot diff in time is refused, never passed.
+    """
+    before_every, before_directives, before_others = _bare_strings(before, language)
+    after_every, after_directives, after_others = _bare_strings(after, language)
+    if after_every - before_every:
+        return _ADDED_STRING
+    # A string operand that left its discarded statement may have become a
+    # string statement whose text another one, deleted, had: the multiset above
+    # then counts the two as one. Any string statement of that text refuses.
+    vanished = _string_operands(before, language) - _string_operands(after, language)
+    if any(text in vanished for text in after_every):
+        return _STRING_OPERAND_FOLDED
+    if before_others & after_directives:
+        return _NEW_DIRECTIVE
+    if before_directives & after_others:
+        return _LOST_DIRECTIVE
+    return _directive_deleted(before, after, language)
+
+
+def _directive_deleted(before: str, after: str, language: str) -> str | None:
+    """The second net of :func:`_directive_change`: an input directive the
+    rewrite deleted or moved while the code holding it stayed."""
+    before_directives = _directives(before, language)
+    if not before_directives:
+        return None
+    from flag_cleanup.syntax import _line_opcodes, _SegmentTooLarge
+
+    old = [line.strip() for line in before.splitlines()]
+    new = [line.strip() for line in after.splitlines()]
+    try:
+        opcodes = _line_opcodes(old, new)
+    except _SegmentTooLarge:
+        return _DIRECTIVES_UNCHECKED
+    # Adjacent unchanged blocks at one offset are one block: an anchor line is
+    # an `equal` block of its own.
+    equal: list[tuple[int, int, int, int]] = []
+    deleted: set[int] = set()
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "delete":
+            deleted.update(range(i1, i2))
+        if tag != "equal":
+            continue
+        if equal and equal[-1][1] == i1 and equal[-1][3] == j1:
+            equal[-1] = (equal[-1][0], i2, equal[-1][2], j2)
+        else:
+            equal.append((i1, i2, j1, j2))
+    starts = [i1 for i1, _i2, _j1, _j2 in equal]
+    after_set = {(row, column, text) for _s, _h, row, column, _e, text in _directives(after, language)}
+    for script, header, row, column, _end, text in before_directives:
+        # The one block that can hold `header`: the last starting at or before it.
+        at = bisect.bisect_right(starts, header) - 1
+        there = None
+        if at >= 0 and row < equal[at][1]:
+            there = equal[at][2] + row - equal[at][0]
+        if there is not None:
+            if (there, column, text) not in after_set:
+                return _LOST_DIRECTIVE
+            continue
+        if script or header not in deleted or row not in deleted:
+            return _LOST_DIRECTIVE
+    return None
+
+
+#: The containers where a `,` may end an EMPTY slot: an array literal's hole
+#: (`[a, , b]`) and an array pattern's elision (`const [, b] = xs`).
+_HOLE_CONTAINERS = frozenset({"array", "array_pattern"})
+
+#: The member lists whose `;` separates members too: a leading one
+#: (`{ ; a: number }`) is a SyntaxError to tsc and no ERROR to the grammar. A
+#: class body is not one of them, where an empty `;` member is legal.
+_TYPE_MEMBER_LISTS = frozenset({"object_type", "interface_body"})
+
+
+def _empty_slots(source: str, language: str) -> int:
+    """How many commas in ``source`` end an empty slot outside an array.
+
+    A comma with no element before it (`{ , b: 1 }`, `f(a, , b)`) is a
+    SyntaxError everywhere but an array, yet the grammar's lists accept it
+    (`object`, `object_pattern`, `arguments` parse it with no ERROR node), so
+    the first check cannot see it. A deletion that takes an entry but leaves its
+    comma (behind a comment between the two: `{ k: 1 /* c */, b: 2 }`) writes
+    one. Comments between the commas do not count as an element. Nor, in an
+    object type or interface, does a leading `;` (`{ /* c */; a: number }`).
+    """
+    count = 0
+    for node in _walk(_parse(source, language)):
+        if node.type in _HOLE_CONTAINERS or node.type == "ERROR":
+            continue
+        previous = None
+        for child in node.children:
+            if child.type in _PROLOGUE_TRANSPARENT:
+                continue
+            if child.type == "," and (previous is None or previous.type in (",", "{", "(", "[")):
+                count += 1
+            elif (
+                child.type == ";"
+                and node.type in _TYPE_MEMBER_LISTS
+                and previous is not None
+                and previous.type == "{"
+            ):
+                count += 1
+            previous = child
+    return count
+
+
+def _array_holes(source: str, language: str) -> list[tuple[int, int, bytes, int]]:
+    """Each array literal and pattern in ``source`` that holds a hole (a comma
+    with no element before it, `[a, , b]`), as ``(row of its `[`, column past
+    the line's indent, the line's text before it with the indent stripped,
+    holes)``, sorted by row."""
+    data = source.encode("utf-8")
+    found: list[tuple[int, int, bytes, int]] = []
+    for node in _walk(_parse(source, language)):
+        if node.type not in _HOLE_CONTAINERS:
+            continue
+        holes = 0
+        previous = None
+        for child in node.children:
+            if child.type in _PROLOGUE_TRANSPARENT:
+                continue
+            if child.type == "," and (previous is None or previous.type in (",", "[")):
+                holes += 1
+            previous = child
+        if holes:
+            line_start = data.rfind(b"\n", 0, node.start_byte) + 1
+            ahead = data[line_start : node.start_byte]
+            indent = len(ahead) - len(ahead.lstrip(b" \t"))
+            found.append(
+                (node.start_point[0], node.start_point[1] - indent, ahead.strip(), holes)
+            )
+    found.sort()
+    return found
+
+
+def _new_holes(before: str, after: str, language: str) -> bool:
+    """Whether the rewrite left an array element behind as a hole.
+
+    No removal writes one: deleting an element keeps every other slot, a hole
+    included. A deletion that left an element's slot behind turns the element
+    into a hole (`[a, , k, b]` -> `[a, , , b]`): the array keeps its length but
+    `k` reads `undefined`. Checked per array, so a deleted array that held a
+    hole cannot mask a new one elsewhere: an output array on an unchanged line
+    may hold no more holes than the input array at the same `[`, and one on a
+    changed line no more than an input array of the stretch it replaced with
+    the same text ahead of it on its line (an element deleted ahead of it on
+    its line changes that, and is refused: over-refusal). It can still be
+    masked: a deleted `const r = [1, , 2];` beside a `const r = [a, k, b]`
+    that kept `k`'s slot has the same key. This pairs lines,
+    which twice let a directive check be fooled; it is acceptable here because
+    it is a second net: the engine checks every list deletion against the
+    slots it must leave (its own invariant). A lost hole is not seen here.
+    """
+    after_arrays = _array_holes(after, language)
+    if not after_arrays:
+        return False
+    before_arrays = _array_holes(before, language)
+    from flag_cleanup.syntax import _line_opcodes, _SegmentTooLarge
+
+    old = [line.strip() for line in before.splitlines()]
+    new = [line.strip() for line in after.splitlines()]
+    try:
+        opcodes = _line_opcodes(old, new)
+    except _SegmentTooLarge:
+        return sum(a[3] for a in after_arrays) > sum(b[3] for b in before_arrays)
+    before_rows = [array[0] for array in before_arrays]
+    after_rows = [array[0] for array in after_arrays]
+    before_at = {(row, column, ahead): holes for row, column, ahead, holes in before_arrays}
+
+    def within(arrays, rows, low, high):
+        return arrays[bisect.bisect_left(rows, low) : bisect.bisect_left(rows, high)]
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        written = within(after_arrays, after_rows, j1, j2)
+        if not written:
+            continue
+        if tag == "equal":
+            for row, column, ahead, holes in written:
+                if holes > before_at.get((i1 + row - j1, column, ahead), 0):
+                    return True
+            continue
+        # A changed stretch: each array there holding a hole must have one in
+        # the stretch it replaced with the same text ahead of it, at least as
+        # many holes, each used once.
+        had = sorted(
+            ((column, ahead, holes) for _r, column, ahead, holes in within(
+                before_arrays, before_rows, i1, i2
+            )),
+            key=lambda entry: -entry[2],
+        )
+        for _row, column, ahead, holes in written:
+            match = next(
+                (e for e in had if e[0] == column and e[1] == ahead and e[2] >= holes), None
+            )
+            if match is None:
+                return True
+            had.remove(match)
+    return False
+
+
 def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     """Whether rewriting ``before`` into ``after`` produced invalid source.
 
@@ -587,6 +984,11 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
        :func:`_asi_merged_statements`;
     5. more expression statements starting with `function`, `class`, `{`,
        `async function` or `let [` — see ``RESTRICTED_STATEMENT_START``.
+    6. more commas ending an empty slot outside an array (`{ , b: 1 }`) — see
+       :func:`_empty_slots` — or an array element left as a hole (:func:`_new_holes`);
+    7. a directive prologue the rewrite changed: a bare string that became a
+       directive (`"use strict"` left first in a function), or one that no
+       longer is — see :func:`_directive_change`.
 
     Checks 2, 3 and 4 exist because the ERROR-node count is not a sufficient
     signal: tree-sitter grammars are deliberately error-tolerant, so a
@@ -612,7 +1014,7 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
 def refusal_reason(before: str, after: str, language: str) -> str | None:
     """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
 
-    The same five checks in the same order, each worded for the person reading
+    The same seven checks in the same order, each worded for the person reading
     the run's output — a refusal that names no cause sends them looking for a
     syntax error in a file that may parse perfectly well.
     """
@@ -631,6 +1033,13 @@ def refusal_reason(before: str, after: str, language: str) -> str | None:
             "a statement would start with `function`, `class` or `{`, which "
             "JavaScript reads as a declaration or a block"
         )
+    if _empty_slots(after, language) > _empty_slots(before, language):
+        return "a comma was left with nothing before it, which only an array allows"
+    if _new_holes(before, after, language):
+        return "an array element would be left as a hole (`[a, , b]`)"
+    directive = _directive_change(before, after, language)
+    if directive is not None:
+        return directive
     return None
 
 

@@ -8,6 +8,109 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.16.0
+
+### Changed
+
+- The transform engine is now 0.56.0, which carries the Go, TypeScript/JavaScript
+  and Ruby changes noted alongside this release.
+- Go: a flag is no longer refused when a name an `if`, `switch`, `for` range or
+  `select` receive header declares (or a type switch's alias) is stranded and
+  the statement declares a name of its own under the same spelling (`v := 3`
+  in a nested block, an `else if v := 5`, a function literal's parameter), or
+  the type switch's operand has the alias's name (`switch v := v.(type)`). The
+  stranded header name becomes `_`; a read, an assignment or a `v, w := …`
+  that re-assigns it in the same `select` or type switch clause still keeps it.
+- Go: one name of `var gv, ok = pair(4)` that the removal leaves unread now
+  becomes `_` (`var _, ok = pair(4)`), as it already did for `gv, ok =
+  pair(4)`, when the right side is a single call, receive, map index or type
+  assertion.
+- Go: a `select` receive variable or type switch alias that a `:=` in the same
+  clause names again (`v, err := g()` under `case v := <-ch:`, also with a
+  label in front) is no longer counted as a second, new variable, so a removal
+  that leaves it read is not refused as an unused local. A `:=` in a nested
+  block, or in a clause naming a switch initializer's variable, still declares
+  another variable.
+- TypeScript and JavaScript: a `|| false` or `&& true` the removal leaves where
+  only the truth of the value is read (an `if`, `while`, `do … while` or `for`
+  condition, a ternary's condition, the operand of `!`) is now removed at any
+  depth: `if (p.live() && (p.paid() || <flag>))` served off becomes
+  `if (p.live() && p.paid())`, and `if (a || b || <flag>)` becomes
+  `if (a || b)`. A value (`const v = x || <flag>`) keeps the literal.
+- Python, Ruby, Java, Kotlin, Swift, PHP, Dart and C#: a flag read written in
+  parentheses directly against a keyword (`return(<flag>) ? 1 : 2`) keeps its
+  parentheses (`return(true) ? 1 : 2`) instead of being joined to the keyword.
+  In TypeScript, JavaScript and Go the constant condition this leaves is
+  refused. A Ruby condition
+  reduced to a parenthesised `rescue` or modifier (`if (load rescue nil)`)
+  keeps its parentheses, and a dead modifier that is the body of a `rescue`
+  modifier stays standing rather than leaving the `rescue` alone.
+
+### Fixed
+
+- Ruby: a removal that would leave a `rescue`, `if`, `unless`, `while` or
+  `until` modifier, or an `and`, `or` or `not`, outside the parentheses that
+  held it is now refused. Unwrapped, `if (load rescue nil) || <flag>` reads
+  `if load rescue nil`, which does not parse, and `x = (a if b) && <flag>`
+  reads `x = a if b`, which assigns only when `b` holds. A header's whole
+  condition is the one place `and`, `or` and `not` mean the same without the
+  parentheses (`if a or b`), so those are not refused. A file that also has
+  unparenthesised code of the same kind elsewhere (`log if b`) is refused
+  whenever such parenthesised code is changed, since the two cannot be told
+  apart; the refusal names that line. If a Ruby removal from an earlier
+  version already merged, check it for a `rescue`, `if`, `unless`, `while`,
+  `until`, `and`, `or` or `not` that lost its parentheses.
+- Ruby: a removal that would leave a `rescue` starting a line is now refused.
+  Deleting the dead `x = 1 if <flag>` from `x = 1 if <flag> rescue nil` left
+  `rescue nil` behind, which Ruby reads as the method's rescue clause, so the
+  statements after it ran only when something raised. If a Ruby removal from
+  an earlier version already merged, check it for a `rescue` that starts a
+  line.
+- Every language: a removal that would write a name the code never had, made
+  of the code's own words joined end to end, is now refused. A flag read in
+  parentheses directly against a keyword (`return(<flag>) or x`,
+  `x if(<flag>) && ready?`) could come out with the keyword joined to its
+  neighbour (`returnx`, `x ifready?`), which in most languages still parses,
+  as a call to a method that does not exist. If a removal from an earlier
+  version already merged, check it for a keyword joined to the word after it
+  where the flag read was written in parentheses against the keyword.
+- TypeScript and JavaScript: a removal that would change a directive is
+  refused: a bare string left as the first statement of a function, method or
+  file (`"use strict";`, `"use client";`) becomes one, which changes what the
+  code does (strict mode makes `this` `undefined` in a plain call), and code
+  put ahead of a directive, or deleting it, stops it being one. If a removal
+  from an earlier version already merged, check it for a bare string that is
+  now the first statement of a function, method or file.
+- TypeScript and JavaScript: a removal that would leave a comma with nothing
+  before it outside an array (`{ /* note */, other: 2 }`), or a `;` first in an
+  object type or interface, is refused instead of proposed: both are syntax
+  errors. So is one that would leave an array element behind as a hole
+  (`[a, , b]`). If a removal from an earlier version already merged, check it
+  for a comma with nothing before it.
+- TypeScript and JavaScript: a removal that would leave a conditional
+  expression testing `true` or `false`, a `true && …;` or `false || …;`
+  statement, or a flag read as a bare `true;` or `false;` statement, is
+  refused instead of proposed.
+- TypeScript and JavaScript: a hook's dependency array with a hole in it
+  (`[a, , b]`) keeps the hole when the flag's literal is left out of it, so
+  the array keeps its length. If a removal from an earlier version already
+  merged, check it for a dependency array that lost a hole.
+- TypeScript and JavaScript: deleting an emptied `useEffect` that became the
+  first statement of its component no longer leaves a blank line as the
+  component's first line.
+- TypeScript and JavaScript: the pass that removes doubled blank lines no
+  longer shortens a run of blank lines you wrote beside repeated lines, and
+  leaves a very large repetitive file as the removal wrote it instead of
+  taking seconds over it.
+- TypeScript and JavaScript: deleting a flag-keyed entry followed by a comment
+  and then its comma (`'old-key': 1 /* note */,`) takes the comment and the
+  comma with it. It used to leave `{ /* note */, other: 2 }`, a syntax error.
+- TypeScript and JavaScript: an array hole (`[a, , b]`) beside an element or
+  spread the removal deletes stays a hole, so the array keeps its length. If a
+  removal from an earlier version already merged, check it for an array that
+  lost a hole beside a deleted element.
+- TypeScript and JavaScript: a key constant written `const K = 'key' as const`, `('key' as const)`, `'key' satisfies T` or `'key' as const satisfies T` is now resolved like a bare `const K = 'key'`, in the same file and from another file. Before, such a declaration changed nothing and the run reported nothing, while the flag was still read. A constant that wraps the key in another form (`'key' as string`, `'key'!`, doubled parentheses) is now named in the pull request as an unsupported form, and its reads are kept.
+
 ## 2.15.0
 
 ### Added

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.15.0"
+version = "2.16.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,22 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.56.0. Ruby: unwrapping the parentheses around a folded header is a
+    # whitelist, so a modifier, a ternary or a `do` block keeps its pair, and a
+    # fold that would strand the body of a `rescue` modifier is withheld
+    # (piranha#324). Every language: `word_separated` on every boolean and
+    # ternary fold judges the edges of what the replacement is written into; in
+    # Ruby `?` and `!` are name characters (piranha#324). TypeScript/JavaScript:
+    # `truth_only`, so `|| false` and `&& true` fold at any depth of a
+    # condition (piranha#324); an edit that would change a directive prologue is
+    # withheld (piranha#325). Shared: a list-entry deletion is re-checked by a
+    # slot invariant with the same container kind, array holes keep their comma,
+    # and a comment before a comma goes with its entry (piranha#325). Go: header
+    # names are resolved by a model of the spec's blocks, with a `:=` in the
+    # same block read as reuse of the variable, and a stranded target of a `var`
+    # pair is blanked (piranha#323). No grammar rev moved, so the grammar pins
+    # below stay.
+    #
     # 0.55.0. Go: a `select` whose every clause returns is terminating, so what
     # follows it is deleted up to the next label; a stranded target of an
     # explicitly instantiated generic call (`v, ok = pair[int](4)`) is blanked.
@@ -631,7 +647,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.55.0",
+    "polyglot-piranha==0.56.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
