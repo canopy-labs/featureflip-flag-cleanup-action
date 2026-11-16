@@ -9,17 +9,23 @@
 
 # A flag read became a boolean literal: fold it into the expression around it,
 # into the enclosing `if`, or drop the statement it left behind.
+#
+# `spread_fold_gate` is FIRST on purpose, in both lists: Parent rules are tried
+# in list order and the first to match an ancestor wins, and this file's edges
+# are tried before the engine's own. Without it here, `...(flag && { a })` served
+# false is reached by `boolean_expression_simplify` first (`false && { a }` ->
+# `false`), the gate never sees the spread, and `...(false)` is left behind.
 [[edges]]
 scope = "Parent"
 from = "replace_expression_with_boolean_literal"
-to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
+to = ["spread_fold_gate", "boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
 
 # Simplifying an expression can expose another simplification (`!(a && true)`),
 # a foldable `if`, or a dead statement. Self-edge = cascade to a fixpoint.
 [[edges]]
 scope = "Parent"
 from = "boolean_expression_simplify"
-to = ["boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
+to = ["spread_fold_gate", "boolean_expression_simplify", "if_cleanup", "statement_cleanup"]
 
 # Folding an if can expose a statement that is now dead (`false;`) or another
 # foldable `if` (an `else if` chain collapses one level at a time).

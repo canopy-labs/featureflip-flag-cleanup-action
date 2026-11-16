@@ -49,6 +49,7 @@ the flag as still referenced, forever.
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections.abc import Iterator
 from contextvars import ContextVar
@@ -169,6 +170,7 @@ def path_is_safe(
     accessors: tuple[str, ...] | frozenset[str] = (),
     treatment: bool | None = None,
     kept_branches: bool = False,
+    fold_only: bool = False,
 ) -> bool:
     """Whether the key-const rules may run over this file.
 
@@ -195,6 +197,12 @@ def path_is_safe(
     declaration go" but "does anything beyond the file's own reads stop the
     reads from folding when the declaration is kept". The caller must then
     strip the delete rules (see ``_FOLDS_KEPT_CONSTANTS``).
+
+    ``fold_only`` asks the narrowest question: is every hoisted name bound
+    exactly once. Its references may then be anything (a log line, a defaults
+    map entry): the caller strips the delete rules, so the declaration stays
+    and every other use of it keeps resolving. Only a language whose constant
+    cannot be reassigned may ask it.
     """
     accessor_names = frozenset(accessors)
     profile = _PROFILES.get(language)
@@ -239,6 +247,8 @@ def path_is_safe(
         # `enclosing_node` filter cannot tell the difference.
         if bindings != 1:
             return False
+        if fold_only:
+            continue
         if not all(
             profile.is_removable_read(node, accessor_names) or dead_branches.inside(node, blocks)
             for node in references
@@ -1273,15 +1283,38 @@ def ts_key_literal(value: Node | None) -> Node | None:
     return node if node is not None and node.type == "string" else None
 
 
+#: A comment that may be a DIRECTIVE aimed at other code or a tool: deleting it
+#: with the declaration would drop a suppression, a pragma or a license notice.
+#: A deny PATTERN over the comment's text, markers included (tool names and
+#: `@`-pragmas anywhere in it), not a closed list of whole directives, so a new
+#: `eslint-*` or `@ts-*` spelling is covered; a leading `!` (license), `/`
+#: (triple-slash) or `global`/`globals`/`exported` counts too. Written without
+#: backslashes so the SAME text sits in the rules' `#not-match?` predicates
+#: (`ts_const.toml`, `ts_const_key_positions.toml`); a test pins the two.
+TS_DIRECTIVE_COMMENT_PATTERN = (
+    "(?i)eslint|jshint|jslint|jscs|@ts-|ts-ignore|ts-nocheck|ts-check|ts-expect-error|prettier-ignore|istanbul|c8 |v8 ignore|@vite-ignore|webpack|@jsx|@flow|@license|@preserve|#__PURE__|@__PURE__|biome-ignore|deno-lint-ignore|@refresh|sourceMappingURL|@vitest|@jest|dprint-ignore|cspell|noinspection|nolint|^(//|/[*])[ ]*[!/]|^(//|/[*])[ *]*(global|globals|exported) "
+)
+_TS_DIRECTIVE_COMMENT = re.compile(TS_DIRECTIVE_COMMENT_PATTERN)
+
+
+def _is_directive_comment(comment: Node) -> bool:
+    return _TS_DIRECTIVE_COMMENT.search(comment.text.decode("utf-8", "replace")) is not None
+
+
 def _ts_declared_literal(declarator: Node) -> Node | None:
-    """:func:`ts_key_literal` of a declarator's value, unless a comment follows
-    it (``const K = "k" /* c */``) or precedes it (``const /* c */ K = "k"``):
-    the rules anchor the declarator between ``const`` and the end of the
-    statement, so such a declaration is matched by none of them and would be a
-    silent no-op."""
+    """:func:`ts_key_literal` of a declarator's value, unless a comment precedes
+    it (``const /* c */ K = "k"``) or more than one follows it: the rules anchor
+    the declarator between ``const`` and the end of the statement, and let ONE
+    comment trail it (``const K = "k" // owner`` in a semicolon-free file, where
+    the comment is part of the declaration, or ``"k" /* c */;``). Any other
+    placement is matched by none of them and would be a silent no-op."""
     after, before = declarator.next_sibling, declarator.prev_sibling
-    if any(n is not None and n.type == "comment" for n in (after, before)):
+    if before is not None and before.type == "comment":
         return None
+    if after is not None and after.type == "comment":
+        following = after.next_named_sibling
+        if following is not None or _is_directive_comment(after):
+            return None
     return ts_key_literal(declarator.child_by_field_name("value"))
 
 
@@ -2286,6 +2319,122 @@ def _dart_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[Key
     return found
 
 
+#: Dart: the parents under which an identifier is a pure READ of a name, never
+#: a binder, a member name, a label or a pattern. Gate 2 refuses a file in which
+#: the constant's name occurs anywhere else (see :func:`_dart_withholds`), so a
+#: binder kind this list does not know is refused, not folded under.
+_DART_READ_PARENTS = frozenset({
+    "argument", "named_argument", "pair", "list_literal", "set_or_map_literal",
+    "template_substitution", "additive_expression", "multiplicative_expression",
+    "equality_expression", "relational_expression", "logical_and_expression",
+    "logical_or_expression", "if_null_expression", "unary_expression",
+    "type_cast_expression", "type_test_expression", "await_expression",
+    "throw_expression", "parenthesized_expression", "return_statement",
+    "expression_statement", "function_expression_body", "spread_element",
+    "bitwise_and_expression", "bitwise_or_expression", "bitwise_xor_expression",
+    "shift_expression",
+})
+#: Parents whose identifier is a read only in the named field.
+_DART_READ_FIELDS = {
+    "initialized_variable_definition": ("value",),
+    "assignment_expression": ("right",),
+    "conditional_expression": ("condition", "consequence", "alternative"),
+}
+
+
+#: Declarations with a body whose members the name could be looked up in first.
+_DART_BODIES = frozenset({
+    "class_definition", "mixin_declaration", "enum_declaration",
+    "extension_declaration", "extension_type_declaration",
+})
+_DART_OBJECT_MEMBERS = frozenset({"hashCode", "runtimeType", "toString", "noSuchMethod"})
+
+
+def _dart_inherits_here(node: Node, name: str, has_part: bool) -> bool:
+    """Whether ``name`` read at ``node`` could resolve to a member rather than
+    the top-level constant: Dart looks the enclosing class-like bodies up first,
+    including inherited members, and those can come from another file.
+
+    True inside any enclosing class, mixin, enum, extension or extension type
+    body that has a supertype clause (`extends`, `with`, `implements`, `on`) or
+    is an enum or extension (implicit members), when the name is public or the
+    library has `part` files (private names cross files there); and for an
+    `Object` member name inside any such body. An in-file supertype is not
+    followed: it can itself extend a type of another file."""
+    public = not name.startswith("_")
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type in _DART_BODIES:
+            if name in _DART_OBJECT_MEMBERS:
+                return True
+            risky = ancestor.type in (
+                "enum_declaration", "extension_declaration", "extension_type_declaration",
+            ) or any(
+                c.type in ("superclass", "interfaces", "mixins", "on", "mixin_application_class")
+                for c in ancestor.children
+            )
+            if risky and (public or has_part):
+                return True
+        ancestor = ancestor.parent
+    return False
+
+
+def _dart_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bool:
+    """Whether the constant's name occurs anywhere but its own declarator or a
+    pure read (an allow-list of positions, :data:`_DART_READ_PARENTS`).
+
+    The per-reference loop counts a handful of binder shapes, and every other
+    binder (a `for`/`catch`/pattern variable, a getter or method of the same
+    name, a field, an extension member) was invisible to it: a read inside such
+    a scope was folded as the constant. Asking the other question, "is every
+    occurrence a read", is sound by construction: nothing in the file can then
+    rebind the name."""
+    declared = {node.id for const in consts for node in const.name_nodes}
+    names = {const.name for const in consts}
+    has_part = any(c.type in ("part_directive", "part_of_directive") for c in root.children)
+    for node in _walk(root):
+        if node.type != "identifier" or node.id in declared:
+            continue
+        if _text(node, source_bytes) not in names:
+            continue
+        parent = node.parent
+        if parent is None:
+            return True
+        if parent.type in ("unconditional_assignable_selector", "conditional_assignable_selector"):
+            # `x.key`, `x?.key`, `this.key`: a member name, never the top-level constant.
+            continue
+        if _dart_inherits_here(node, _text(node, source_bytes), has_part):
+            logging.getLogger(__name__).warning(
+                "key constant %s is read at line %d inside a class, mixin, enum or "
+                "extension whose members the name could come from (a supertype, "
+                "an implicit member or a part file), so its reads are not folded "
+                "and its declaration is kept",
+                _text(node, source_bytes),
+                node.start_point[0] + 1,
+            )
+            return True
+        if parent.type in _DART_READ_PARENTS:
+            continue
+        fields = _DART_READ_FIELDS.get(parent.type)
+        if fields is not None:
+            index = next(i for i, c in enumerate(parent.children) if c.id == node.id)
+            if parent.field_name_for_child(index) in fields:
+                continue
+        if parent.type in ("static_final_declaration", "initialized_identifier"):
+            first = next((c for c in parent.named_children if c.type == "identifier"), None)
+            if first is not None and first.id != node.id:
+                continue
+        logging.getLogger(__name__).warning(
+            "key constant %s is also spelled at line %d as something other than a "
+            "read of it (a variable, parameter, member or pattern of that name), "
+            "so its reads are not folded and its declaration is kept",
+            _text(node, source_bytes),
+            node.start_point[0] + 1,
+        )
+        return True
+    return False
+
+
 def _dart_is_binding(node: Node) -> bool:
     parent = node.parent
     if parent is None:
@@ -3171,6 +3320,7 @@ _PROFILES.update(
             is_reference=lambda n, b, name: _is_named_identifier(n, b, name, ("identifier",)),
             is_binding=_dart_is_binding,
             is_removable_read=_dart_is_removable_read,
+            withholds=_dart_withholds,
         ),
         "ruby": _Profile(
             key_consts=_ruby_key_consts,

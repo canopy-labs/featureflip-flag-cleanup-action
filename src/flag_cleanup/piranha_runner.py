@@ -71,6 +71,7 @@ import sys
 import tempfile
 import tomllib
 from collections import Counter
+import contextlib
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
@@ -160,6 +161,7 @@ from flag_cleanup import (
     ts_saga_yield,
     ts_gates,
     ts_object_reads,
+    ts_expectations,
     ts_key_survivors,
     ts_param_pins,
     ts_readiness_gates,
@@ -178,6 +180,7 @@ from flag_cleanup.syntax import (
     collapse_introduced_carriage_returns,
     collapse_introduced_double_spaces,
     const_path_is_safe,
+    key_const_names,
     externally_visible_key_consts,
     remove_dead_loops,
     remove_unreachable_statements,
@@ -762,6 +765,20 @@ def unprocessed_extensions(languages: Iterable[str]) -> tuple[str, ...]:
 
 
 def candidate_files(
+    repo_dir: str,
+    language: str,
+    flag_key: str,
+    languages: Iterable[str] = (),
+    accessors: tuple[str, ...] = (),
+    inline_wrappers: bool = True,
+) -> list[str]:
+    """:func:`_candidate_files_for` under the same reading of the key as the
+    transform that follows (see :func:`_holder_named_like_key`)."""
+    with _holder_named_like_key(repo_dir, language, flag_key):
+        return _candidate_files_for(repo_dir, language, flag_key, languages, accessors, inline_wrappers)
+
+
+def _candidate_files_for(
     repo_dir: str,
     language: str,
     flag_key: str,
@@ -2035,7 +2052,7 @@ def transform_flag(
     # the run's listing.
     with source_index.run_scope(), source_index.forgetting(), unused.prose_blind_scope(), ts_key_names.declaring(
         code_keys
-    ), go_setters.treating(treatment):
+    ), go_setters.treating(treatment), _holder_named_like_key(repo_dir, language, flag_key):
         try:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
@@ -2054,6 +2071,18 @@ def transform_flag(
             for prepass in reversed(doubles):
                 prepass.restore_all()
             raise
+
+
+@contextlib.contextmanager
+def _holder_named_like_key(repo_dir: str, language: str, flag_key: str) -> Iterator[None]:
+    """A TS-family key that a member or constant is named like (``PublicMaps =
+    "PublicMaps"``) is read as a ``key-aliases`` spelling of the holder's name
+    is: a reader's ``Feature.PublicMaps`` is a name, not a mention of the key.
+    Held for the candidate listing and the transform alike, so both agree on
+    which file holds the key."""
+    named = language in ("ts", "tsx", "js") and ts_key_names.named_like_holder(repo_dir, flag_key)
+    with ts_key_names.declaring((flag_key,) if named else ()):
+        yield
 
 
 class _NoReadFolded(Exception):
@@ -2229,6 +2258,18 @@ def _transform_flag(
         stub_pass.removed_default = go_removed_default
         doubles.append(stub_pass)
         stub_pass.apply(paths)
+        if stub_pass.unresolved:
+            # A test double answers the accessor by key: the fold would leave
+            # it and its tests running the removed branch.
+            raise UnsafeRewriteError(
+                f"the {spec.display_name} transform refused flag {flag_key!r}: a test double "
+                "answers the flag accessor by flag key, which the removal cannot resolve; "
+                "remove the flag from the tests first ("
+                + "; ".join(f"{path}: {'; '.join(texts)}" for path, texts in sorted(stub_pass.unresolved.items()))
+                + ")",
+                refused=sorted(stub_pass.unresolved),
+                discarded=[],
+            )
 
     # A `(bool, error)` read and its `if err != nil` check, rewritten to the
     # single-valued read the engine folds (see :mod:`flag_cleanup.go_two_value`).
@@ -2277,7 +2318,7 @@ def _transform_flag(
     # cannot be unwrapped, and there is nothing to roll back yet. The test-
     # double pass above is undone by `transform_flag`, which catches this.
     gate_paths = _check_gates(paths, language, flag_key, gates, treatment)
-    _check_object_reads(paths, language, flag_key, all_accessors, repo_dir)
+    _check_object_reads(paths, language, flag_key, all_accessors, repo_dir, treatment)
     # After the object-read check, whose reason is more precise when both apply.
     if refused_reads is not None:
         reason, culprits = refused_reads
@@ -2431,6 +2472,16 @@ def _transform_flag(
                 treatment, kept_branches=True,
             )
         )
+        or (
+            language in _FOLDS_ANY_KEPT_CONSTANT
+            # A file that imports `dart:mirrors` keeps its key constants and
+            # their reads whole (`cross_file_dart.constant_escapes`).
+            and "dart:mirrors" not in Path(p).read_text(encoding="utf-8")
+            and _const_safe_at(
+                p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors,
+                fold_only=True,
+            )
+        )
     ]
     if kept_declarations and language == "python":
         # Only a declaration the resolution kept for mentions that spell its
@@ -2441,6 +2492,17 @@ def _transform_flag(
         # A Go constant cannot be assigned: `go build` rejects it.
         kept_declarations = []
     without_const = [p for p in without_const if p not in kept_declarations]
+    if language in _FOLDS_ANY_KEPT_CONSTANT:
+        for p in kept_declarations:
+            names = key_const_names(Path(p).read_text(encoding="utf-8"), language, flag_key)
+            if names:
+                logger.warning(
+                    "%s: key constant %s is also used outside a flag read or "
+                    "another file reads it, so its declaration is kept; the reads "
+                    "of it are folded",
+                    p,
+                    ", ".join(names),
+                )
 
     # An attribute gate is decided here, after the resolution, because a
     # constant may name its key. Its refusal comes before the engine writes
@@ -2921,6 +2983,9 @@ def _transform_flag(
         summaries, language, flag_key, repo_dir
     )
     restored = {path for path, _reason in kept}
+    # A file written back whole did not lose its deleted tests or stubs, so
+    # the report must not say it did.
+    test_doubles = tuple(row for row in test_doubles if row[0] not in restored)
     entries = tuple(entries) + tuple(
         entry
         for entry in parameter_entries + bound_entries
@@ -3566,11 +3631,46 @@ def _transform_flag(
             changed, repo_dir, flag_key, lambda p: _grammar_of(p, language), file_deletion.deleted
         ).items():
             reasons.setdefault(path, reason)
+    # An `expect(<read>)` assertion the fold made one that can only fail
+    # (`expect(true).toBeUndefined()`) tests the state this removal deletes.
+    # Deleting a test of the removed value is a bigger decision than the run
+    # should make, so the flag is refused naming the assertion.
+    if language in ("ts", "tsx", "js") and changed:
+        for summary in changed:
+            if summary.path in reasons:
+                continue
+            found = ts_expectations.failing(
+                summary.original_content, summary.content, _grammar_of(summary.path, language)
+            )
+            if found:
+                reasons[summary.path] = (
+                    f"the fold made {found[0]!r} an assertion that can only fail: the test asserts "
+                    "the state this removal deletes, so delete or rewrite it first"
+                    + (f" ({len(found)} such assertions)" if len(found) > 1 else "")
+                )
     if language == "python" and changed:
         for path, reason in py_key_survivors.refusals(
             changed, repo_dir, flag_key, file_deletion.deleted
         ).items():
             reasons.setdefault(path, reason)
+    # An assertion the fold made one that can only fail (`Assert.True(false)`,
+    # `assertNull(true)`) tests the branch this removal deletes. Deleting a test
+    # of the removed value is a bigger decision than the run should make, so the
+    # flag is refused naming the assertion; only a literal the run wrote counts
+    # (`failing_assertions.failing` compares with the customer's file).
+    if changed:
+        for summary in changed:
+            if summary.path in reasons:
+                continue
+            found = failing_assertions.failing(
+                summary.original_content, summary.content, _grammar_of(summary.path, language)
+            )
+            if found:
+                reasons[summary.path] = (
+                    f"the fold made {found[0]!r} an assertion that can only fail: the test asserts "
+                    "the state this removal deletes, so delete or rewrite it first"
+                    + (f" ({len(found)} such assertions)" if len(found) > 1 else "")
+                )
     # A django-waffle pin the test-double pass could not settle keeps a test
     # on the branch this removal deletes: on a class, in a fixture, or with a
     # value it cannot read. Asked only of a run that folded a read, as the
@@ -4053,6 +4153,7 @@ def _check_object_reads(
     flag_key: str,
     accessors: tuple[str, ...],
     repo_dir: str,
+    treatment: bool = True,
 ) -> None:
     """Refuse a TS/JS read of an accessor that returns an object.
 
@@ -4061,7 +4162,7 @@ def _check_object_reads(
     """
     if language not in ("ts", "tsx", "js") or not accessors:
         return
-    reasons = ts_object_reads.refusals(paths, flag_key, accessors, repo_dir)
+    reasons = ts_object_reads.refusals(paths, flag_key, accessors, repo_dir, treatment)
     if not reasons:
         return
     refused = sorted(reasons)
@@ -5618,7 +5719,7 @@ def _resolve_cross_file(
         resolution = cross_file_keys.resolve(
             repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
         )
-        if language == "go" and resolution.blocked and go_setters.declared():
+        if language == "go" and resolution.blocked and go_setters.declared() and not resolution.kept_by_setters:
             # A declaration some refusal keeps (a `.Fallback()` read, say)
             # still means something to a setter of it: deleting the setter on
             # its own would change what the kept code does. So the setters
@@ -5888,6 +5989,12 @@ def _reader_rules(
 #: seeding a store with the constant does the same. A Go constant cannot be
 #: assigned at all; a Ruby or Python one can, which `_rewrites_constants` asks.
 _FOLDS_KEPT_CONSTANTS = frozenset({"ruby", "go", "python"})
+
+#: Languages whose key constant folds its reads whatever else uses the name
+#: (a log line, a Remote Config defaults map entry), because the constant cannot
+#: be reassigned and a second binding of the name is refused: the declaration
+#: stays, so the other uses keep resolving. Dart `const`/`final` only.
+_FOLDS_ANY_KEPT_CONSTANT = frozenset({"dart"})
 
 #: What replaces a Ruby constant at run time without spelling its name. Spelled
 #: anywhere in a checkout, a kept constant may not hold the key when it is read.

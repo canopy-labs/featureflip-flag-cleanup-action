@@ -792,6 +792,67 @@ def _constructs(values: list[Node], owner: str) -> bool:
     return False
 
 
+#: Service locators whose generic call hands back an instance of the type
+#: argument: `getIt<T>()`, `GetIt.I<T>()`, `locator.get<T>()`. Spelled bare, no
+#: arguments (an `instanceName:` or a `param1:` could pick another registration).
+_LOCATOR_HEADS = frozenset({"getIt", "locator", "sl", "serviceLocator"})
+_LOCATOR_STATICS = frozenset({"GetIt.I", "GetIt.instance"})
+_PROVIDER_OF = re.compile(r"Provider\.of<(\w+)>\(context\)")
+
+
+def _located_type(values: list[Node]) -> str | None:
+    """The type argument of a service-locator lookup written as a variable's
+    initializer, or ``None``.
+
+    Accepted: ``context.read<T>()``, ``context.watch<T>()``,
+    ``Provider.of<T>(context[, listen: <bool>])``, and the locators of
+    ``_LOCATOR_HEADS`` / ``_LOCATOR_STATICS``, bare or through ``.get``, with
+    no arguments. Each names ONE plain type argument and nothing follows the
+    call (no ``.member``, ``!``, cascade or ``await``)."""
+    if len(values) == 1 and values[0].type == "relational_expression":
+        # The gate grammar reads the one-argument `Provider.of<T>(context)` as
+        # comparisons; the text is matched whole, so a comment or any other
+        # argument inside it is not a lookup.
+        found = _PROVIDER_OF.fullmatch(_text(values[0]))
+        return found.group(1) if found else None
+    if len(values) < 2 or values[0].type != "identifier" or values[-1].type != "selector":
+        return None
+    part = values[-1].named_children[0] if values[-1].named_child_count == 1 else None
+    if part is None or part.type != "argument_part":
+        return None
+    kinds = [c.type for c in part.named_children]
+    if kinds != ["type_arguments", "arguments"]:
+        return None
+    targs, arguments = part.named_children
+    if targs.named_child_count != 1 or targs.named_children[0].type != "type_identifier":
+        return None
+    members: list[str] = []
+    for middle in values[1:-1]:
+        if middle.type != "selector" or middle.named_child_count != 1:
+            return None
+        accessor = middle.named_children[0]
+        if accessor.type != "unconditional_assignable_selector" or accessor.named_child_count != 1:
+            return None
+        members.append(_text(accessor.named_children[0]))
+    chain = ".".join([_text(values[0]), *members])
+    inner = [c for c in arguments.named_children]
+    if chain in ("context.read", "context.watch"):
+        return _text(targs.named_children[0]) if not inner else None
+    if chain == "Provider.of":
+        if not inner or inner[0].type != "argument" or _text(inner[0]) != "context":
+            return None
+        for extra in inner[1:]:
+            if extra.type != "named_argument" or _text(extra).replace(" ", "") not in (
+                "listen:false", "listen:true",
+            ):
+                return None
+        return _text(targs.named_children[0])
+    head = chain.removesuffix(".get")
+    if (head in _LOCATOR_HEADS or head in _LOCATOR_STATICS) and not inner:
+        return _text(targs.named_children[0])
+    return None
+
+
 def _receiver_typed(receiver: Node, path: str, root: Node, data: bytes, wrapper: wi.Wrapper, index: Index) -> bool:
     """Whether ``receiver`` names a variable of the wrapper's class.
 
@@ -815,7 +876,7 @@ def _receiver_typed(receiver: Node, path: str, root: Node, data: bytes, wrapper:
         if written:
             if written != wrapper.owner:
                 return False
-        elif not _constructs(values, wrapper.owner):
+        elif not _constructs(values, wrapper.owner) and _located_type(values) != wrapper.owner:
             return False
         if scope.start_byte <= receiver.start_byte and receiver.end_byte <= scope.end_byte:
             enclosing = True

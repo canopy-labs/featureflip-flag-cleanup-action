@@ -45,11 +45,19 @@ _MESSAGE = rf"(?:\s*,\s*{_STRING})?"
 _LEADING_MESSAGE = rf"(?:{_STRING}\s*,\s*)?"
 #: The literal pairs an equality assertion fails on.
 _UNEQUAL = ((_T, _F), (_F, _T))
+#: A boolean literal, and a literal paired with the no-value the folded read can
+#: never equal.
+_BOOL = r"(?:true|false)"
+_NULL = r"null"
+_LIT_NULL = ((_BOOL, _NULL), (_NULL, _BOOL))
 
 _CSHARP = [
     _call(r"\bAssert\s*\.\s*(?:True|IsTrue|That)", _F + _MESSAGE),
     _call(r"\bAssert\s*\.\s*(?:False|IsFalse)", _T + _MESSAGE),
     *[_call(r"\bAssert\s*\.\s*(?:Equal|AreEqual)", pair) for pair in _either(*_UNEQUAL)],
+    # A literal is never null.
+    _call(r"\bAssert\s*\.\s*Null", _BOOL + _MESSAGE),
+    *[_call(r"\bAssert\s*\.\s*(?:Same|AreSame|Equal|AreEqual)", pair) for pair in _either(*_LIT_NULL)],
 ]
 
 _JVM_PREFIX = r"(?<![\w.])(?:(?:Assert|Assertions)\s*\.\s*)?"
@@ -60,6 +68,12 @@ _JVM = [
         _call(_JVM_PREFIX + "assertEquals", _LEADING_MESSAGE + pair + _MESSAGE)
         for pair in _either(*_UNEQUAL)
     ],
+    _call(_JVM_PREFIX + "assertNull", _LEADING_MESSAGE + _BOOL + _MESSAGE),
+    *[
+        _call(_JVM_PREFIX + "assert(?:Equals|Same)", _LEADING_MESSAGE + pair + _MESSAGE)
+        for pair in _either(*_LIT_NULL)
+    ],
+    _call(r"(?<![\w.])assertThat", _BOOL) + r"\s*\.\s*" + _call("isNull"),
 ]
 
 _TS = [
@@ -87,6 +101,12 @@ _PYTHON = [
         _call(r"\bself\s*\.\s*(?:assertEqual|assertIs)", pair + _PY_MESSAGE)
         for pair in _either(*_PY_UNEQUAL)
     ],
+    _call(r"\bself\s*\.\s*assertIsNone", r"(?:True|False)" + _PY_MESSAGE),
+    *[
+        _call(r"\bself\s*\.\s*(?:assertEqual|assertIs)", pair + _PY_MESSAGE)
+        for pair in _either((r"(?:True|False)", "None"), ("None", r"(?:True|False)"))
+    ],
+    r"^[ \t]*assert[ \t]+(?:True|False)[ \t]+(?:is|==)[ \t]+None\b",
 ]
 
 #: testify, on `assert` or `require`, test handle first; an optional single
@@ -97,6 +117,8 @@ _GO = [
     _call(_GO_PREFIX + "Truef?", r"\w+", _F + _GO_MESSAGE),
     _call(_GO_PREFIX + "Falsef?", r"\w+", _T + _GO_MESSAGE),
     *[_call(_GO_PREFIX + "Equalf?", r"\w+", pair + _GO_MESSAGE) for pair in _either(*_UNEQUAL)],
+    _call(_GO_PREFIX + "Nilf?", r"\w+", _BOOL + _GO_MESSAGE),
+    *[_call(_GO_PREFIX + "Equalf?", r"\w+", pair + _GO_MESSAGE) for pair in _either((_BOOL, "nil"), ("nil", _BOOL))],
 ]
 
 #: RSpec `expect(<literal>).to be|eq(<literal>)`, parenthesised or not, and the
@@ -129,6 +151,9 @@ _RUBY = [
     _rb_call("refute", _T),
     _rb_call("assert_not", _T),
     *[_rb_call("assert_equal", pair) for pair in _either(*_UNEQUAL)],
+    _rb_expect(_BOOL, r"(?:be_nil\b|(?:be|eq)(?:\s*\(\s*nil\s*\)|[ \t]+nil\b))"),
+    _rb_call("assert_nil", _BOOL),
+    *[_rb_call("assert_equal", pair) for pair in _either((_BOOL, "nil"), ("nil", _BOOL))],
 ]
 
 #: Pest `expect(<literal>)->matcher()`, and the same after `->not`. Only the
@@ -160,6 +185,12 @@ _PHP = [
         for pair in _either((_PHP_T, _PHP_F), (_PHP_F, _PHP_T))
     ],
     *_PHP_PEST,
+    _call(_PHP_PREFIX + "assertNull", r"(?i:true|false)" + _MESSAGE),
+    *[
+        _call(_PHP_PREFIX + "(?:assertSame|assertEquals)", pair + _MESSAGE)
+        for pair in _either((r"(?i:true|false)", r"(?i:null)"), (r"(?i:null)", r"(?i:true|false)"))
+    ],
+    _PEST + r"(?i:true|false)" + _PEST_PLAIN + r"toBeNull\s*\(\s*\)",
 ]
 
 #: XCTest, called bare, and Swift Testing's `#expect`; at most a string message.
@@ -168,6 +199,10 @@ _SWIFT = [
     _call(r"(?<![\w.])XCTAssertFalse", _T + _MESSAGE),
     *[_call(r"(?<![\w.])XCTAssertEqual", pair + _MESSAGE) for pair in _either(*_UNEQUAL)],
     _call(r"#expect", _F + _MESSAGE),
+    _call(r"(?<![\w.])XCTAssertNil", _BOOL + _MESSAGE),
+    *[_call(r"(?<![\w.])XCTAssertEqual", pair + _MESSAGE) for pair in _either((_BOOL, "nil"), ("nil", _BOOL))],
+    _call(r"#expect", r"(?:true|false)\s*==\s*nil" + _MESSAGE),
+    _call(r"#expect", r"(?:true\s*==\s*false|false\s*==\s*true)" + _MESSAGE),
 ]
 
 #: package:test / flutter_test `expect`, called bare, at most with a `reason:`.
@@ -178,6 +213,10 @@ _DART = [
     _call(_DART_EXPECT, _T, "isFalse" + _DART_REASON),
     *[_call(_DART_EXPECT, pair) for pair in _either(*_UNEQUAL)],
     *[_call(_DART_EXPECT, actual, _call("equals", expected)) for actual, expected in _UNEQUAL],
+    _call(_DART_EXPECT, _BOOL, "isNull" + _DART_REASON),
+    _call(_DART_EXPECT, _BOOL, _call("equals", "null")),
+    # A literal can only fail the negation of itself.
+    *[_call(_DART_EXPECT, a, _call("isNot", b)) for a, b in ((_T, _T), (_F, _F), (_T, "isTrue"), (_F, "isFalse"))],
 ]
 
 #: Per language, the failing forms of the assertions the rules delete in

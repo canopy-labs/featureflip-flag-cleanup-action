@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.16.0"
+version = "2.17.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,22 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.57.0. Ruby, Python, Swift, Kotlin: a flag read written directly against a
+    # keyword (`return(<flag>) || a`, `x if(<flag>) && a`, `guard(<flag>) || a
+    # else`) folds completely, the literal spaced from the word, where it used to
+    # stay in its parentheses as a constant condition (piranha#332). Python: `a or
+    # False` and `a and True` go from a condition at any depth (piranha#329).
+    # TypeScript/JavaScript: `x && true`, `x || false`, `x && false` and `x ||
+    # true` fold in a value position when `x` is a comparison or a `!`, and the
+    # pair a fold leaves around one goes, except where it would leave a bare `in`
+    # in a `for` initializer (piranha#334); a bare `return` followed only by
+    # comments goes (piranha#331); a JSX spread attribute a fold emptied goes
+    # (piranha#335); a tagged template call with type arguments parses (piranha#330,
+    # the tree-sitter-typescript pin below moves to `+canopy.5`). Go: a name a
+    # three-part `for` clause declares and nothing reads becomes `_` (piranha#328).
+    # Dart: a `=>` body and a `??`/`&&`/`||` chain `dart format` wrapped go back on
+    # one line once the fold lets them fit (piranha#333).
+    #
     # 0.56.0. Ruby: unwrapping the parentheses around a folded header is a
     # whitelist, so a modifier, a ternary or a `do` block keeps its pair, and a
     # fold that would strand the body of a `rescue` modifier is withheld
@@ -647,7 +663,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.56.0",
+    "polyglot-piranha==0.57.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -666,7 +682,7 @@ dependencies = [
     # TypeScript/TSX. NOT a PyPI release, and pinned EXACTLY for the same
     # reason tree-sitter-c-sharp is: Gate 1 must see the same node shapes the
     # engine rewrites against. polyglot-piranha bundles upstream 0.23.2 plus
-    # THREE grammar patches, and this wheel is cut from the same commit the
+    # FOUR grammar patches, and this wheel is cut from the same commit the
     # engine pins so the pair cannot drift:
     #
     #   a491d96  a bare `&` in JSX text (`<p>Terms & Conditions</p>`, which
@@ -684,6 +700,11 @@ dependencies = [
     #            ranked `call_expression` above the type-side rule in
     #            `precedences`, and a reduce/reduce conflict is settled by
     #            precedence before any declared conflict is consulted.
+    #   470db2d  a tagged template with type arguments whose type is not also an
+    #            expression (`sql<{ value: string }>`...``, `sql<string[]>`...``)
+    #            parses as a call with type arguments instead of leaving a
+    #            MISSING node. Arrives with the engine release that takes this
+    #            grammar commit; the local segment goes to `canopy.5`.
     #
     # When the two disagree, tree-sitter's error recovery re-partitions across
     # a rewrite and Gate 1's stranded-keyword and ASI-fusion checks read that
@@ -698,10 +719,10 @@ dependencies = [
     # versions, so it can NEVER be satisfied silently by upstream's
     # identically-numbered 0.23.2 -- it resolves only from wheels/, filled by
     # scripts/fetch_piranha_wheels.py. The GRAMMAR version stays 0.23.2 across
-    # all three patches, so the segment is the only thing that distinguishes the
+    # all four patches, so the segment is the only thing that distinguishes the
     # builds: bump it whenever the engine's pinned commit moves. Verified
     # against stock across 52 constructs: 9 fixed, 43 identical, 0 made worse.
-    "tree-sitter-typescript==0.23.2+canopy.3",
+    "tree-sitter-typescript==0.23.2+canopy.5",
     "tree-sitter-java>=0.23,<0.24",
     # Go. NOT a PyPI release, pinned EXACTLY for the same reason as the
     # TypeScript and C# grammars above: Gate 1 must parse what the engine

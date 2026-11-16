@@ -119,9 +119,17 @@ def return_kind(type_node: Node | None) -> str:
     text = _text(type_node).strip().lstrip(":").strip()
     if _PROMISE_TYPE.match(": " + text) and _whole_generic(text):
         return "promise"
-    if text == "boolean":
+    if text == "boolean" or _nullable_boolean(text):
         return "sync"
     return "other"
+
+
+def _nullable_boolean(text: str) -> bool:
+    """``boolean | undefined`` and ``boolean | null`` in any order: a hook that
+    has no value while its client loads. No Promise can be one of its
+    members, so it is the same evidence as ``boolean``."""
+    parts = {part.strip() for part in text.lstrip("|").split("|")}
+    return "boolean" in parts and parts <= {"boolean", "undefined", "null"}
 
 
 def _whole_generic(text: str) -> bool:
@@ -171,6 +179,50 @@ def _jsdoc_promise(node: Node) -> bool:
             return _JSDOC_PROMISE.search(_text(previous)) is not None
         current = current.parent
     return False
+
+
+#: The nodes a function's JSDoc comment can sit in front of instead of the
+#: function itself: the declaration, member or export that holds it.
+_DOC_HOLDERS = frozenset(
+    {
+        "variable_declarator", "lexical_declaration", "variable_declaration", "export_statement",
+        "pair", "public_field_definition", "assignment_expression", "expression_statement",
+        "parenthesized_expression",
+    }
+)
+_JSDOC_RETURN = re.compile(r"@returns?\s*\{([^}]*)\}")
+
+
+def _jsdoc_return(function: Node) -> str:
+    """``promise`` / ``sync`` / ``other`` for the ``@return {T}`` of the doc
+    comment in front of ``function`` (or of the declaration or export holding
+    it), ``none`` when it has no such tag. Only the function's own comment:
+    the climb stops at the first node that is not its holder, so an enclosing
+    function's tag is never read for a nested one."""
+    node: Node | None = function
+    while node is not None:
+        previous = node.prev_sibling
+        if previous is not None and previous.type == "comment":
+            tag = _JSDOC_RETURN.search(_text(previous))
+            if tag is None:
+                return "none"
+            kind = tag.group(1).strip().lstrip("?!").strip()
+            if kind.endswith("="):
+                return "other"
+            if re.match(r"Promise\s*<", kind) and _whole_generic(kind):
+                return "promise"
+            return "sync" if kind == "boolean" or _nullable_boolean(kind.replace(" ", "")) else "other"
+        node = node.parent
+        if node is None or node.type not in _DOC_HOLDERS:
+            return "none"
+    return "none"
+
+
+def declared_return_kind(function: Node) -> str:
+    """:func:`return_kind` of the function's annotation, or of its JSDoc
+    ``@return`` where it has none (a JavaScript file's only annotation)."""
+    kind = return_kind(function.child_by_field_name("return_type"))
+    return _jsdoc_return(function) if kind == "none" else kind
 
 
 def _member_kind(node: Node) -> str | None:
@@ -1376,7 +1428,7 @@ def _bound_read_kind(top: Node) -> str | None:
         holder = node.parent
         if holder is not None and holder.type == "return_statement":
             function = _enclosing_function(holder)
-            if function is not None and return_kind(function.child_by_field_name("return_type")) == "promise":
+            if function is not None and declared_return_kind(function) == "promise":
                 kind = PROMISE_USE
         if kind == PROMISE_USE:
             return PROMISE_USE
@@ -1549,7 +1601,7 @@ def _sync_evidence(repo: _Repo, path: str, call: Node, callee: Node, accessor: s
         return True
     top, _cast = _unwrap(call)
     function, _composite = _returned(top)
-    return function is not None and return_kind(function.child_by_field_name("return_type")) == "sync"
+    return function is not None and declared_return_kind(function) == "sync"
 
 
 def _function_name(function: Node) -> Node | None:
@@ -2359,7 +2411,7 @@ def _declared_sync(function: Node) -> bool:
     primitive and literal types (``boolean``, ``boolean | undefined``,
     ``'on' | 'off'``): never ``any``, ``unknown``, a Promise or an object. Its
     own annotation, or the function type its ``const`` is declared with."""
-    if _primitive_return(function.child_by_field_name("return_type")):
+    if _primitive_return(function.child_by_field_name("return_type")) or _jsdoc_return(function) == "sync":
         return True
     holder = function.parent
     if holder is not None and holder.type == "variable_declarator" and holder.child_by_field_name("value") == function:
@@ -2490,7 +2542,7 @@ def _private_only_tested(repo: _Repo, path: str, function: Node, depth: int = 0,
             continue
         returned = _returned_function(top)
         if returned is not None and _function_name(returned) is not None:
-            if _declared_sync(returned) or return_kind(returned.child_by_field_name("return_type")) == "sync":
+            if _declared_sync(returned) or declared_return_kind(returned) == "sync":
                 continue
             reason = _private_only_tested(repo, path, returned, depth + 1, seen | {function.id})
             if reason is not None:
@@ -2545,7 +2597,7 @@ def decide(repo: _Repo, path: str, call: Node, callee: Node, accessor: str) -> t
     if function is not None:
         if _has_async_token(function):
             return LITERAL, ""
-        annotated = return_kind(function.child_by_field_name("return_type"))
+        annotated = declared_return_kind(function)
         if composite:
             if annotated == "sync":
                 return (LEAVE, async_why) if async_why else (LITERAL, "")

@@ -93,6 +93,7 @@ This module owns its own parsers rather than borrowing ``syntax``'s, following
 
 from __future__ import annotations
 
+import bisect
 import codecs
 import re
 from collections import Counter
@@ -3294,7 +3295,7 @@ def _apply(source: str, candidate: Candidate, language: str) -> str | None:
             return None
     replacement = f"{prefix or ''}{initializer}"
     if language not in _NO_STATEMENT_TERMINATOR:
-        replacement += ";"
+        replacement += _terminator(source, candidate, language)
     return (
         data[: candidate.start] + replacement.encode("utf-8") + data[candidate.end :]
     ).decode("utf-8")
@@ -3650,8 +3651,96 @@ def _kept_require(source: str, candidate: Candidate, language: str) -> str | Non
     callee = node.child_by_field_name("function")
     if callee is None or callee.type != "identifier" or callee.text != b"require":
         return None
-    # `_apply`'s discard for these languages: the initializer, then `;`.
-    return source.encode("utf-8")[start:end].decode("utf-8") + ";"
+    # `_apply`'s discard for these languages: the initializer, then `;` (none
+    # in a file written without them).
+    return source.encode("utf-8")[start:end].decode("utf-8") + _terminator(
+        source, candidate, language
+    )
+
+
+#: Statements whose closing `;` a semicolon-free style leaves off.
+_TERMINATED_STATEMENTS = frozenset(
+    {
+        "expression_statement",
+        "lexical_declaration",
+        "variable_declaration",
+        "return_statement",
+        "throw_statement",
+        "break_statement",
+        "continue_statement",
+        "import_statement",
+    }
+)
+
+
+@lru_cache(maxsize=_SOURCE_CACHE)
+def _terminated_statements(
+    source: str, language: str
+) -> tuple[list[tuple[int, int, bool]], list[int]]:
+    """Every statement a semicolon-free style may leave unterminated, as
+    ``(start, end, ends with ;)`` sorted by start, and the starts alone: the
+    file's semicolon vote, taken in ONE walk however many candidates ask."""
+    found = sorted(
+        (
+            node.start_byte,
+            node.end_byte,
+            bool(node.children and node.children[-1].type == ";"),
+        )
+        for node in _walk(_shared_parse(source, language))
+        if node.type in _TERMINATED_STATEMENTS
+    )
+    return found, [entry[0] for entry in found]
+
+
+def _terminator(source: str, candidate: Candidate, language: str) -> str:
+    """The `;` that ends a statement written in place of ``candidate``.
+
+    TypeScript and JavaScript only: a file whose other statements mostly end
+    without one (Prettier ``semi: false``, StandardJS) gets none, since a
+    `;` there is a lint error and a style break. The `;` stays when the next
+    statement starts with a token a missing one would let the line continue
+    (``(``, ``[``, a backtick, ``/``, ``+``, ``-``): the file's own style
+    writes a leading `;` on that line, and this does not edit a line it did
+    not replace."""
+    if language not in _TS_MODULE_LANGUAGES:
+        return ";"
+    node = _node_at(source, language, candidate.start, candidate.end)
+    if node is None:
+        return ";"
+    statements = _terminated_statements(source, language)
+    ended = bare = 0
+    for _start, _end, was_ended in statements[0]:
+        ended += was_ended
+        bare += not was_ended
+    # Take back the statements this call must not vote on: the candidate's own
+    # span, and the node itself. A statement starting inside the span is found
+    # by bisecting the start-sorted list, so the cost is the span, not the file.
+    starts = statements[1]
+    skip: list[tuple[int, int, bool]] = []
+    for index in range(bisect.bisect_left(starts, candidate.start), len(starts)):
+        entry = statements[0][index]
+        if entry[0] >= candidate.end:
+            break
+        if entry[1] <= candidate.end:
+            skip.append(entry)
+    for entry in statements[0][bisect.bisect_left(starts, node.start_byte):]:
+        if entry[0] != node.start_byte:
+            break
+        if entry[1] == node.end_byte and entry not in skip:
+            skip.append(entry)
+    for _start, _end, was_ended in skip:
+        ended -= was_ended
+        bare -= not was_ended
+    if bare <= ended:
+        return ";"
+    following = node.next_named_sibling
+    while following is not None and following.type == "comment":
+        following = following.next_named_sibling
+    if following is not None and _ASI_CONTINUES.match(
+        source.encode("utf-8")[following.start_byte : following.end_byte].decode("utf-8")
+    ):
+        return ";"
+    return ""
 
 
 #: Every node type a name can be spelled as when it binds or reads ``require``.
@@ -5129,6 +5218,14 @@ def _delete_method(source: str, candidate: Candidate) -> str:
     data = source.encode("utf-8")
     start, end = _expand_to_whole_lines(data, candidate.start, candidate.end)
     if start == candidate.start and end == candidate.end:
+        # A statement that was the only one of a block written on one line
+        # (`func f() { Set(…) }`): `{}` is gofmt's form, `{  }` is not.
+        before = data[:start].rstrip(b" \t")
+        line_end = data.find(b"\n", end)
+        after = data[end : len(data) if line_end == -1 else line_end].lstrip(b" \t")
+        if before.endswith(b"{") and after.startswith(b"}") and b"\n" not in data[len(before) : start]:
+            start = len(before)
+            end += len(data[end : len(data) if line_end == -1 else line_end]) - len(after)
         return (data[:start] + data[end:]).decode("utf-8")
 
     def line_before(position: int) -> tuple[int, bytes]:
@@ -5287,18 +5384,23 @@ def _prose_mentions(source: str, name: str, language: str) -> int:
 
 
 def _import_references(
-    source: str, candidate: Candidate, language: str, blind: frozenset[str] = frozenset()
+    source: str,
+    candidate: Candidate,
+    language: str,
+    blind: frozenset[str] = frozenset(),
+    prose_blind: bool = False,
 ) -> int:
     """How often ``source`` spells any binding of the import ``candidate``,
-    not counting prose that spells a name in ``blind``. Both counts read the
-    same text, the one with the name's own declarations blanked."""
+    not counting prose that spells a name in ``blind`` (or any name, with
+    ``prose_blind``). Both counts read the same text, the one with the name's
+    own declarations blanked."""
     total = 0
     for name in candidate.names or (candidate.name,):
         text = _without_own_declaration(source, name, language)
         total += references(text, name, language)
         if language == "php":
             total -= _php_member_spellings(source, name)
-        if name in blind:
+        if prose_blind or name in blind:
             total -= _prose_mentions(text, name, language)
     return total
 
@@ -5600,6 +5702,10 @@ def remove_stranded_bindings(
         if language in {"ts", "tsx", "js"} and path is not None and root is not None
         else None
     )
+    # A comment is not a use to `no-unused-vars` or `noUnusedLocals`, in any
+    # TypeScript-family file: only what `_prose_only` proves is prose stops
+    # counting, so a JSDoc type or a Flow comment still keeps its import.
+    prose_blind = language in _PROSE_BLIND_LANGUAGES
     blind = (
         (_PROSE_BLIND.get() or {}).get(str(Path(path).resolve()), frozenset())
         if language in _PROSE_BLIND_LANGUAGES and path is not None
@@ -5655,8 +5761,12 @@ def remove_stranded_bindings(
             ):
                 continue
             if candidate.kind == "import":
-                before_count = _import_references(before, candidate, language, blind)
-                current_count = _import_references(current, candidate, language, blind)
+                before_count = _import_references(
+                    before, candidate, language, blind, prose_blind
+                )
+                current_count = _import_references(
+                    current, candidate, language, blind, prose_blind
+                )
             else:
                 if not _bound_name_occurs_once_in_own_span(
                     candidate, current, language

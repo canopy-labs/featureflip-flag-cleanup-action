@@ -352,7 +352,7 @@ enclosing_node = """(
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
                     (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
-      (export_statement declaration: (lexical_declaration "const"
+       (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
             value: [(string . (string_fragment) @flag_name .)
@@ -362,9 +362,31 @@ enclosing_node = """(
                     (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))])
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)
+      (export_statement declaration: [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+                                      (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])])
    (statement_block
-     (lexical_declaration "const"
+     [(lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
            value: [(string . (string_fragment) @flag_name .)
@@ -374,8 +396,20 @@ enclosing_node = """(
                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))] @scope
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+      (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])] @scope
   (#eq? @flag_name "@stale_flag_name")
+  (#not-match? @trail "(?i)eslint|jshint|jslint|jscs|@ts-|ts-ignore|ts-nocheck|ts-check|ts-expect-error|prettier-ignore|istanbul|c8 |v8 ignore|@vite-ignore|webpack|@jsx|@flow|@license|@preserve|#__PURE__|@__PURE__|biome-ignore|deno-lint-ignore|@refresh|sourceMappingURL|@vitest|@jest|dprint-ignore|cspell|noinspection|nolint|^(//|/[*])[ ]*[!/]|^(//|/[*])[ *]*(global|globals|exported) ")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -414,7 +448,7 @@ enclosing_node = """(
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
                     (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
-      (export_statement declaration: (lexical_declaration "const"
+       (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
             value: [(string . (string_fragment) @flag_name .)
@@ -424,9 +458,31 @@ enclosing_node = """(
                     (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))])
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)
+      (export_statement declaration: [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+                                      (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])])
    (statement_block
-     (lexical_declaration "const"
+     [(lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
            value: [(string . (string_fragment) @flag_name .)
@@ -436,8 +492,20 @@ enclosing_node = """(
                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))] @scope
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+      (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])] @scope
   (#eq? @flag_name "@stale_flag_name")
+  (#not-match? @trail "(?i)eslint|jshint|jslint|jscs|@ts-|ts-ignore|ts-nocheck|ts-check|ts-expect-error|prettier-ignore|istanbul|c8 |v8 ignore|@vite-ignore|webpack|@jsx|@flow|@license|@preserve|#__PURE__|@__PURE__|biome-ignore|deno-lint-ignore|@refresh|sourceMappingURL|@vitest|@jest|dprint-ignore|cspell|noinspection|nolint|^(//|/[*])[ ]*[!/]|^(//|/[*])[ *]*(global|globals|exported) ")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -475,7 +543,7 @@ enclosing_node = """(
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
                     (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
-      (export_statement declaration: (lexical_declaration "const"
+       (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
             value: [(string . (string_fragment) @flag_name .)
@@ -485,9 +553,31 @@ enclosing_node = """(
                     (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))])
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)
+      (export_statement declaration: [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+                                      (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])])
    (statement_block
-     (lexical_declaration "const"
+     [(lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
            value: [(string . (string_fragment) @flag_name .)
@@ -497,8 +587,20 @@ enclosing_node = """(
                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))] @scope
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+      (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])] @scope
   (#eq? @flag_name "@stale_flag_name")
+  (#not-match? @trail "(?i)eslint|jshint|jslint|jscs|@ts-|ts-ignore|ts-nocheck|ts-check|ts-expect-error|prettier-ignore|istanbul|c8 |v8 ignore|@vite-ignore|webpack|@jsx|@flow|@license|@preserve|#__PURE__|@__PURE__|biome-ignore|deno-lint-ignore|@refresh|sourceMappingURL|@vitest|@jest|dprint-ignore|cspell|noinspection|nolint|^(//|/[*])[ ]*[!/]|^(//|/[*])[ *]*(global|globals|exported) ")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -539,7 +641,7 @@ enclosing_node = """(
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
                     (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
-      (export_statement declaration: (lexical_declaration "const"
+       (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @decl_name
             value: [(string . (string_fragment) @flag_name .)
@@ -549,9 +651,31 @@ enclosing_node = """(
                     (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))])
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)
+      (export_statement declaration: [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+                                      (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @decl_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])])
    (statement_block
-     (lexical_declaration "const"
+     [(lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @decl_name
            value: [(string . (string_fragment) @flag_name .)
@@ -561,8 +685,20 @@ enclosing_node = """(
                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .))] @scope
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+      (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @decl_name
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)])] @scope
   (#eq? @flag_name "@stale_flag_name")
+  (#not-match? @trail "(?i)eslint|jshint|jslint|jscs|@ts-|ts-ignore|ts-nocheck|ts-check|ts-expect-error|prettier-ignore|istanbul|c8 |v8 ignore|@vite-ignore|webpack|@jsx|@flow|@license|@preserve|#__PURE__|@__PURE__|biome-ignore|deno-lint-ignore|@refresh|sourceMappingURL|@vitest|@jest|dprint-ignore|cspell|noinspection|nolint|^(//|/[*])[ ]*[!/]|^(//|/[*])[ *]*(global|globals|exported) ")
   (#eq? @decl_name "@key_const")
 )"""
 
@@ -591,7 +727,7 @@ query = """(
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
                     (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .) @declaration
-      (export_statement declaration: (lexical_declaration "const"
+       (lexical_declaration "const"
         . (variable_declarator
             name: (identifier) @variable_name
             value: [(string . (string_fragment) @flag_name .)
@@ -601,9 +737,31 @@ query = """(
                     (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                     (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                     (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)) @declaration])
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .) @declaration
+      (export_statement declaration: [(lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @variable_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+                                      (lexical_declaration "const"
+        . (variable_declarator
+            name: (identifier) @variable_name
+            value: [(string . (string_fragment) @flag_name .)
+                    (as_expression . (string . (string_fragment) @flag_name .) "const")
+                    (satisfies_expression . (string . (string_fragment) @flag_name .))
+                    (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                    (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)]) @declaration])
    (statement_block
-     (lexical_declaration "const"
+     [(lexical_declaration "const"
        . (variable_declarator
            name: (identifier) @variable_name
            value: [(string . (string_fragment) @flag_name .)
@@ -613,8 +771,20 @@ query = """(
                    (parenthesized_expression !type (string . (string_fragment) @flag_name .))
                    (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
                    (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
-                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .) @declaration)] @scope
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) .)
+      (lexical_declaration "const"
+       . (variable_declarator
+           name: (identifier) @variable_name
+           value: [(string . (string_fragment) @flag_name .)
+                   (as_expression . (string . (string_fragment) @flag_name .) "const")
+                   (satisfies_expression . (string . (string_fragment) @flag_name .))
+                   (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (string . (string_fragment) @flag_name .))
+                   (parenthesized_expression !type (as_expression . (string . (string_fragment) @flag_name .) "const"))
+                   (parenthesized_expression !type (satisfies_expression . (string . (string_fragment) @flag_name .)))
+                   (parenthesized_expression !type (satisfies_expression . (as_expression . (string . (string_fragment) @flag_name .) "const")))]) . (comment) @trail .)] @declaration)] @scope
   (#eq? @flag_name "@stale_flag_name")
+  (#not-match? @trail "(?i)eslint|jshint|jslint|jscs|@ts-|ts-ignore|ts-nocheck|ts-check|ts-expect-error|prettier-ignore|istanbul|c8 |v8 ignore|@vite-ignore|webpack|@jsx|@flow|@license|@preserve|#__PURE__|@__PURE__|biome-ignore|deno-lint-ignore|@refresh|sourceMappingURL|@vitest|@jest|dprint-ignore|cspell|noinspection|nolint|^(//|/[*])[ ]*[!/]|^(//|/[*])[ *]*(global|globals|exported) ")
 )"""
 replace_node = "declaration"
 replace = ""

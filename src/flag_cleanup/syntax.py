@@ -3376,6 +3376,13 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
     return refusal_reason(before, after, language) is not None
 
 
+# Strings the engine writes into a file as a hand-off between its own rules and
+# deletes again before it finishes. One that is still in the output means a rule
+# did not complete, so the rewrite is refused. Every marker the engine adds joins
+# this tuple.
+ENGINE_MARKERS: tuple[str, ...] = ("fc-jsx-spread",)
+
+
 def refusal_reason(
     before: str, after: str, language: str, *, excused_initializers: int = 0,
     read_markers: tuple[str, ...] = (),
@@ -3417,6 +3424,10 @@ def refusal_reason(
             return "the Blade view has a block whose opener and closer cannot be paired"
         if blade_code.balance(after, names) != 0:
             return "the rewrite left a Blade block without its opener or its closer"
+    for marker in ENGINE_MARKERS:
+        # Differential, so a repository that already contains the string is not refused.
+        if after.count(marker) > before.count(marker):
+            return "the engine left one of its own markers in the rewritten file"
     if _mock_stubbed_literals(after, language) > _mock_stubbed_literals(before, language):
         return _stub_refusal(before, after, language)
     if _literal_members(after, language) > _literal_members(before, language):
@@ -4018,6 +4029,7 @@ def const_path_is_safe(
     accessors: tuple[str, ...] = (),
     treatment: bool | None = None,
     kept_branches: bool = False,
+    fold_only: bool = False,
 ) -> bool:
     """Whether the const-propagation rules may run over ``source`` (Gate 2).
 
@@ -4084,7 +4096,8 @@ def const_path_is_safe(
     else:
         return True
     return key_const.path_is_safe(
-        root, source.encode("utf-8"), language, flag_key, accessors, treatment, kept_branches
+        root, source.encode("utf-8"), language, flag_key, accessors, treatment, kept_branches,
+        fold_only,
     )
 
 
@@ -4110,3 +4123,14 @@ def externally_visible_key_consts(
         return ()
     consts = key_const.key_consts(root, source.encode("utf-8"), language, flag_key)
     return visible_key_consts(consts, language)
+
+
+def key_const_names(source: str, language: str, flag_key: str) -> tuple[str, ...]:
+    """The names of the hoisted key constants in ``source`` (for messages)."""
+    if language not in key_const.supported_languages() or language in _TS_LANGUAGES:
+        return ()
+    profile = _PROFILES[language]
+    if profile.code_view is not None:
+        source, language = _code_view(source, language), profile.code_view
+    root = _parse(source, language)
+    return tuple(c.name for c in key_const.key_consts(root, source.encode("utf-8"), language, flag_key))

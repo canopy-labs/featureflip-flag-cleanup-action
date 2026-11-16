@@ -196,6 +196,11 @@ class Resolution:
     #: inside a branch the fold keeps (:attr:`Profile.reads_beside_mentions`).
     #: Their mentions stay, so :func:`still_mentions` asks only about reads.
     kept_mentions: frozenset[str] = frozenset()
+    #: Whether the only thing keeping a declaration is a setter no pass can
+    #: decide (:attr:`Profile.reads_beside_setters`): every refusal is in such
+    #: a file and every kept declaration is named there. The reads fold and the
+    #: setters that were proven go, since nothing kept reads the value.
+    kept_by_setters: bool = False
 
 
 #: ``(module, owner, name)`` -- what a reader's import or qualifier names.
@@ -333,6 +338,17 @@ class Profile:
     #: only such mentions sit in a branch the fold keeps: the declaration is
     #: kept with them and the read beside them folds.
     reads_beside_mentions: (
+        Callable[
+            [str, str, tuple[KeyDeclaration, ...], frozenset[str], str],
+            tuple[list[KeyReference], list[Refusal]],
+        ]
+        | None
+    ) = None
+    #: :attr:`references` with only the mentions inside a call to a declared
+    #: test setter set aside (Go): a test that pins the key from a variable
+    #: keeps its setter and the declaration, and the reads and proven setters
+    #: beside it still fold.
+    reads_beside_setters: (
         Callable[
             [str, str, tuple[KeyDeclaration, ...], frozenset[str], str],
             tuple[list[KeyReference], list[Refusal]],
@@ -896,6 +912,7 @@ def resolve(
     )
     readers: dict[str, tuple[KeyReference, ...]] = {}
     kept_mentions: set[str] = set()
+    kept_setters: set[str] = set()
     # declaring files some mention stops from being deleted
     blocked: set[str] = set(kept_at_home)
     names = {decl.name for decl in unique}
@@ -1090,6 +1107,17 @@ def resolve(
                     if kept_reads and not kept_refused:
                         reads = kept_reads
                         kept_mentions.add(path)
+            if refused and path not in kept_mentions and profile.reads_beside_setters is not None:
+                # A setter this cannot decide keeps its own mention and the
+                # declaration; it says nothing of the reads and the proven
+                # setters beside it (a helper pinning the kept value).
+                setter_reads, setter_refused = profile.reads_beside_setters(
+                    path, source, visible, accessor_set, repo_dir
+                )
+                if setter_reads and not setter_refused:
+                    reads = setter_reads
+                    kept_mentions.add(path)
+                    kept_setters.add(path)
         if reads:
             readers[path] = tuple(reads)
         if refused:
@@ -1192,6 +1220,9 @@ def resolve(
             readers, refusals, {d.path for d in holders}, holders, lambda path: sources.get(path)
         )
         blocked |= voided_by
+    setter_blocked: set[str] = set()
+    for path in kept_setters:
+        setter_blocked |= spelled_in(sources.get(path) or "", path)
     return Resolution(
         readers,
         tuple(refusals),
@@ -1204,6 +1235,10 @@ def resolve(
         home_findings=home_findings,
         kept_reads_fold=kept_reads_fold,
         kept_mentions=frozenset(kept_mentions),
+        kept_by_setters=bool(kept_setters)
+        and not home_findings
+        and all(r.path in kept_setters for r in refusals)
+        and blocked | duplicated <= setter_blocked,
     )
 
 

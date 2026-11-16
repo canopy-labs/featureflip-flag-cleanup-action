@@ -8,6 +8,102 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.17.0
+
+### Added
+
+- Dart: a wrapper's callers are now folded when the receiver is a local or
+  field initialised by a service lookup that names the wrapper's class as its
+  type argument: `context.read<Flags>()`, `context.watch<Flags>()`,
+  `Provider.of<Flags>(context[, listen: …])`, `getIt<Flags>()` and
+  `GetIt.I<Flags>()`. The lookup is kept as a statement once nothing reads
+  its result.
+- Go: LaunchDarkly test data reached through a struct field (`s.td.Update(s.td.Flag(X.Key()).VariationForAll(v))`) is a proven setter when the field is declared as `*ldtestdata.TestDataSource`, so the setter goes with the flag's handle like a local `td` does.
+
+### Changed
+
+- The transform engine is now 0.57.0, which carries the Go, Python, TypeScript/JavaScript,
+  Ruby, Swift, Kotlin and Dart changes noted alongside this release.
+- Ruby, Python, Swift and Kotlin: a flag read written directly against a keyword
+  (`return(<flag>) || x`, `x if(<flag>) && ready`, `guard(<flag>) || x else`,
+  `else(<flag>) || x`) is now removed completely. The literal the fold writes is
+  spaced from the word, where it used to be left behind in its parentheses as a
+  constant condition. A Ruby `?` or `!` written straight after the read
+  (`(<flag> && ok)?a: b`) is still left alone.
+- TypeScript and JavaScript: in a value position (an object property, an argument,
+  a return) `x && true`, `x || false`, `x && false` and `x || true` are now folded
+  when `x` is a comparison or a `!`, which are always booleans, for example
+  `n > 0 && <flag>` served false becomes `false`. A name or call of unknown type
+  keeps the literal, because `x && true` is not `x` unless `x` is a boolean.
+- Python: `a or False` and `a and True` left in a condition after a fold (`if a or
+  <flag>:` served false, `if (a or <flag>) and b:` served true) are now removed at
+  any depth in an `if`, `elif`, `while`, conditional-expression test or `not`.
+  Value positions (`x = a or False`) keep the literal.
+- Go: a name a three-part `for` clause declares and nothing reads any more
+  (`for i, v := 0, rd(); i < 3; i++`) now becomes `_`, where the flag used to be
+  refused as an unused variable. A read in the condition, the post statement or a
+  closure keeps it.
+- Dart: a `=>` body, and a `??`, `&&` or `||` chain `dart format` wrapped after its
+  operators, go back on one line once the fold lets them fit, so the result stays
+  `dart format`-clean.
+- TypeScript and JavaScript: a bare `return` that the fold leaves as a function's
+  last statement now goes even when a comment sits after it among the deleted
+  statements (`no-useless-return`). The comment stays.
+
+### Fixed
+
+- Dart: a key held in a `const` that something else also uses (a Remote Config
+  `setDefaults` map entry, a log line) no longer leaves the flag untouched
+  with only a generic "still references" line. The reads of it now fold, the
+  constant and its other uses are kept, and the log names the constant.
+
+- Dart: a read of a flag key held in a constant was folded as that constant
+  inside a scope that reuses the constant's name (a `for`, `catch`, `if case`,
+  `switch` or record-pattern variable, or a getter or field of that name),
+  which removed the wrong branch. A file where the name is spelled anywhere
+  other than the declaration and plain reads is now left untouched and the log
+  says where. If you merged a removal where a key constant's name was reused
+  that way, check it.
+- Dart: a key constant is also left alone when it is read inside a class, mixin,
+  enum or extension whose members the name could come from (a supertype in
+  another file, an implicit enum or extension member, or a `part` file), since
+  the read could mean that member.
+- TypeScript and JavaScript: a conditional object spread such as
+  `...(flag && { a: 1 })` is now folded when the flag is served `false` (the
+  whole spread goes, with its comma) and spread in place when served `true`.
+  Before, the `false` treatment left `...(false)`, so the run refused the flag.
+- JSX: a spread attribute such as `{...(flag && { a: 1 })}` served `false` is
+  removed instead of leaving `{...(false)}`.
+- C#, Java, Kotlin, Python, Go, Ruby, PHP, Swift and Dart: an assertion that the removal turns into one that can only fail (`Assert.True(false)`, `assertTrue(false)`, `self.assertTrue(False)`, `assert.True(t, false)`) no longer ships as a red test listed in the pull request. The flag is refused, naming the file and the assertion, so the test of the removed state can be deleted or rewritten first. An assertion that already could only fail in your code is not counted.
+- The same check now recognises the null and nil forms: `Assert.Null`/`Assert.Same(null, …)`, `assertNull`/`assertEquals(null, …)`/`assertThat(…).isNull()`, `assertIsNone`/`assertIs(…, None)`/`assert … is None`, `assert.Nil`/`assert.Equal(t, nil, …)`, `be_nil`/`assert_nil`, `assertNull`/`assertSame(null, …)`, `XCTAssertNil`/`XCTAssertEqual(…, nil)`/`#expect(… == nil)`, `isNull`/`isNot(…)`. A passing null check (`Assert.NotNull(true)`) is not refused.
+- Python: `assert <read> is not None` served false was rewritten to `assert False`, which turned a passing assertion into a failing one; the flag is now refused instead. If a removal from an earlier version already merged, check it for an `assert False` where the test asserted the flag's value `is not None`.
+- TypeScript and JavaScript: a Jest or Vitest `expect(<flag read>)` assertion that the removal turns into one that can only fail (`expect(useFlag("k")).toBeUndefined()` becoming `expect(true).toBeUndefined()`) no longer ships as a red test. The flag is refused, naming the file and the assertion, so the test of the removed state can be deleted or rewritten first. Assertions that pass are still deleted, and one that already failed in your code is not counted.
+- Go: a helper that pins only the kept value (`func enable(t, org) { featureflag.Set(org, Flag, true) }`) is cleaned up. Before, a helper was never deleted when the run could not tell which value it pinned for the other treatment, and one test setting the same flag from a variable kept every other setter of the file. The variable-valued setter and the constant it names now stay on their own, the proven setters beside them go, and the pull request lists the setter that was left.
+- **JavaScript / TypeScript:** a Jest or Vitest mock of your flag accessor that answers by key (`mock.mockImplementation((n) => n === 'flag')`) no longer lets the removal open a pull request whose tests fail. A test file that spells the flag's key, mocks a module the accessor comes from, and stubs a mock (or spells the key inside the mock's factory, or stubs the accessor with `vi.mocked` or `jest.spyOn`) now refuses the flag and names the file and line. Take the flag out of those tests first, then run the removal again. Resolving such tests automatically is future work.
+- A test file the run wrote back unchanged no longer appears in the pull request's list of deleted tests.
+- TypeScript and JavaScript: a key constant with a trailing comment and no
+  semicolon (`export const K = 'key' // owner: growth`) is now folded and
+  deleted with its comment, instead of being refused as `unsupported-form`.
+  One comment after the declaration is accepted, with or without a `;`.
+- JavaScript and TypeScript: a flag module that reads an environment variable
+  at load (`process.env.NODE_ENV === 'development'`, `import.meta.env.DEV`) is
+  now treated as doing nothing when it loads, so the bare `import './flags'`
+  left by a removal is deleted. Writes to the environment, calls such as
+  `dotenv.config()`, reading the whole table and computed or optional reads
+  still keep the import.
+- **JavaScript / TypeScript:** the call kept from a local the removal left unused is written without a `;` in a file whose statements have none, so the pull request no longer adds a `semi` lint error or a Prettier diff. The `;` stays when the next line starts with a token that would otherwise continue the call.
+- **JavaScript / TypeScript:** a plain comment that spells the name of an import the removal left unused no longer keeps that import (ESLint's `no-unused-vars` does not count a comment as a use). The comment stays. JSDoc types and `{@link}` references still keep it.
+- TypeScript and JavaScript: a very large file (a committed bundle of tens of
+  thousands of lines) no longer takes minutes in the post-rewrite semicolon
+  check or in choosing the style of the statement that replaces a discarded
+  value. Both now cost a multiple of the file's length instead of growing with
+  its square.
+- TypeScript and JavaScript: a flag whose key is spelled exactly like the enum member or constant that holds it (`PublicMaps = "PublicMaps"`, the usual PascalCase string-enum style) is no longer left alone in `.tsx` and `.jsx` readers. Before, every such reader (`useFeatureFlagEnabled(Feature.PublicMaps)`) was reported as `other-language` and nothing was rewritten. The reader is now treated as one that reads the key through the declaration, as it already was when the member and the key differ. A file that also reads a flag map by the key (`flags.PublicMaps`) is still reported and its reads kept.
+- JavaScript: a JSDoc `@return {boolean}` or `@returns {boolean}` (also `{?boolean}`, `{boolean|undefined}`, `{boolean|null}`) on the function now counts as the `boolean` annotation. A flag read that is one arm of a returned `&&`, `||`, `??` or ternary in such a function folds, where before the whole flag was refused as "neither async nor annotated boolean". A tag naming a Promise, an object or anything else is still not evidence, and a function's tag is never read for a function nested inside it.
+- TypeScript: a hook declared `boolean | undefined` (or `boolean | null`), the loading-state shape most flag hooks have, is now accepted as evidence that the read is synchronous, wherever a plain `boolean` return type already was, including a read returned from a `renderHook` callback. Before, one such test refused the flag, component readers included.
+- TypeScript: a hook declared `boolean | undefined` (or `boolean | null`) is folded only where its value is used as a condition (`if`, ternary, `!`, `&&`/`||`, `Boolean(x)`, a JSX child); comparing it with `undefined`/`null`, `typeof`, `??` or passing it keeps the flag refused. A test reading such a hook through `renderHook` is folded only when every use of its result is an `expect(result.current)` assertion the folded value satisfies; any other use, or an assertion about the loading state or the removed value, keeps the flag refused and names the test.
+- TypeScript and JavaScript: a file that holds a generic tagged template whose type argument is an object, array, function or `typeof` type (`sql<{ value: string }>\`…\``, `sql<string[]>\`…\``, the shape kysely and slonik use) is no longer refused as unparsable. Before, one such file next to a flag read stopped the whole flag with an engine error; now the file is rewritten like any other.
+
 ## 2.16.0
 
 ### Changed

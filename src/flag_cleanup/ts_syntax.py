@@ -524,23 +524,49 @@ def _asi_merged_statements(before: str, after: str, language: str) -> bool:
     baseline_statements = _statement_count(after, language)
     baseline_errors = count_syntax_errors(after, language)
 
-    matcher = difflib.SequenceMatcher(None, before_lines, after_lines, autojunk=False)
-    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+    from flag_cleanup.syntax import _line_opcodes, _SegmentTooLarge
+
+    try:
+        # Anchored on the lines unique to both sides: a bare `SequenceMatcher`
+        # is quadratic on a big file of repeated braces.
+        opcodes = _line_opcodes(before_lines, after_lines)
+    except _SegmentTooLarge:
+        opcodes = difflib.SequenceMatcher(
+            None, before_lines, after_lines, autojunk=False
+        ).get_opcodes()
+    junctions: set[int] = set()
+    for tag, _i1, _i2, j1, j2 in opcodes:
         if tag == "equal":
             continue
         # Both edges of a replaced range are junctions; a pure deletion collapses
         # to one. Line j-1 is the surviving line that precedes the junction.
-        for junction in {j1, j2}:
-            if junction <= 0 or junction > len(after_lines):
-                continue
-            probe = "".join(
-                after_lines[:junction] + [";\n"] + after_lines[junction:]
-            )
-            if count_syntax_errors(probe, language) > baseline_errors:
-                continue
-            if _statement_count(probe, language) > baseline_statements:
-                return True
-    return False
+        for junction in (j1, j2):
+            if 0 < junction <= len(after_lines):
+                junctions.add(junction)
+
+    # One probe per junction re-parsed the whole file each time: quadratic in
+    # the number of changed regions. Probe them TOGETHER and bisect only when
+    # the batch adds parse errors (a junction inside a multi-line construct,
+    # which on its own proves nothing and is skipped). A `;` on its own line
+    # is an `empty_statement`, never counted, so the statement count rises only
+    # where a `;` separated two fused statements.
+    def probe_finds_fusion(group: list[int]) -> bool:
+        pieces: list[str] = []
+        previous = 0
+        for junction in group:
+            pieces.extend(after_lines[previous:junction])
+            pieces.append(";\n")
+            previous = junction
+        pieces.extend(after_lines[previous:])
+        probe = "".join(pieces)
+        if count_syntax_errors(probe, language) > baseline_errors:
+            if len(group) == 1:
+                return False
+            middle = len(group) // 2
+            return probe_finds_fusion(group[:middle]) or probe_finds_fusion(group[middle:])
+        return _statement_count(probe, language) > baseline_statements
+
+    return bool(junctions) and probe_finds_fusion(sorted(junctions))
 
 
 #: The text an expression statement may not start with, because in statement

@@ -25,18 +25,20 @@ name, a JSX attribute's name, a comment, JSX text. A file that does not parse
 is returned unchanged, so it counts wherever the text spells the key.
 
 Only a spelling the run's ``key-aliases`` maps a flag to is read this way
-(:func:`declaring`, :func:`aliased`); any other key keeps the plain text
-search.
+(:func:`declaring`, :func:`aliased`), and a key that some member or constant is
+named like and valued at (``PublicMaps = "PublicMaps"``, :func:`named_like_holder`);
+any other key keeps the plain text search.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 
 from tree_sitter import Node
 
-from flag_cleanup import ts_syntax
+from flag_cleanup import source_index, ts_syntax
 
 #: Leaves that are always a name, wherever they sit.
 _NAMES = frozenset({"identifier", "type_identifier"})
@@ -65,6 +67,33 @@ def declaring(code_keys: Iterable[str]) -> Iterator[None]:
 def aliased(flag_key: str) -> bool:
     """Whether ``flag_key`` is a ``key-aliases`` spelling of this run."""
     return flag_key in _declared
+
+
+_IDENTIFIER = re.compile(r"[A-Za-z_$][\w$]*\Z")
+_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def named_like_holder(repo_dir: str, key: str) -> bool:
+    """Whether some enum member, constant or object property under ``repo_dir``
+    is named ``key`` and valued at it too (``PublicMaps = "PublicMaps"``).
+
+    The key is then spelled as a name by every reader of that holder, exactly
+    as a ``key-aliases`` spelling equal to its holder's name is, and is read
+    the same way. A superset test (a text match, not a parse): declaring a key
+    that nothing needs only blanks name positions, which the unproven-spelling
+    refusal then guards, as it does for an alias.
+    """
+    if not _IDENTIFIER.match(key):
+        return False
+    pattern = re.compile(rf"(?<![\w$]){re.escape(key)}\s*[:=]\s*(['\"`]){re.escape(key)}\1")
+    for source in source_index.files(repo_dir, _SUFFIXES):
+        try:
+            text = source.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if key in text and pattern.search(text):
+            return True
+    return False
 
 
 def _language(path: str) -> str:

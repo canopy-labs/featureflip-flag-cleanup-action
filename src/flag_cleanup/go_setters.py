@@ -227,6 +227,8 @@ def _test_data_source(receiver: Node, file: go_scope.File, packages: go_scope.Pa
     ``ldtestdata.DataSource()``: a local bound once, or a package-level
     ``var`` declared once in this package. ``Update`` and ``Flag`` of that
     type only write to an in-memory source."""
+    if receiver.type == "selector_expression":
+        return _test_data_field(receiver, file, packages)
     if receiver.type != "identifier" or file.clause is None:
         return False
     name = _text(receiver)
@@ -235,6 +237,35 @@ def _test_data_source(receiver: Node, file: go_scope.File, packages: go_scope.Pa
         return not binding.opaque and _is_data_source(binding.value, file)
     site = packages.package_var_binding(here.parent, file.clause, name)
     return site is not None and _is_data_source(site[1].value, site[0])
+
+
+def _test_data_field(receiver: Node, file: go_scope.File, packages: go_scope.Packages) -> bool:
+    """Whether ``receiver`` (``s.td``) is a field the repository DECLARES as
+    ``*ldtestdata.TestDataSource`` (or the value type) on the struct ``s`` is
+    proven to be (a method receiver, a parameter, a local built from a
+    literal). The declared type is the proof: a value of that type is a test
+    data source whatever was assigned to it, and ``Update`` and ``Flag`` of
+    one only write to memory. A promoted field, an embedded one or a generic
+    struct is not read."""
+    operand, field = receiver.child_by_field_name("operand"), receiver.child_by_field_name("field")
+    if operand is None or field is None or file.clause is None:
+        return False
+    owner = packages.static_type(operand, file)
+    written = packages.field_written(owner, _text(field)) if owner is not None else None
+    if written is None:
+        return False
+    struct_file, kind = written
+    if kind.type == "pointer_type" and len(kind.named_children) == 1:
+        kind = kind.named_children[0]
+    if kind.type != "qualified_type":
+        return False
+    package, name = kind.child_by_field_name("package"), kind.child_by_field_name("name")
+    return (
+        package is not None
+        and name is not None
+        and _text(name) == "TestDataSource"
+        and _imports_ldtestdata(struct_file, _text(package))
+    )
 
 
 def _test_data_site(

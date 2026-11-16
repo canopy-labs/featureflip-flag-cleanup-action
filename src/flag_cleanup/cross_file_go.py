@@ -327,23 +327,82 @@ def _setter_pin(path: str, source: str, root: Node, node: Node, spelling: str, r
     # In a test file either value clears (the one that goes deletes its test).
     # Anywhere else only the kept value does, so the run's own is asked.
     kept = go_setters.treatment()
-    for treatment in (True, False) if path.endswith("_test.go") or kept is None else (kept,):
+    for treatment in (True, False) if kept is None else (kept,):
         resolved, _ = mock_stubs.resolve(
             source, "go", "\x00no-such-key", treatment, key_texts=frozenset(spellings), checkout=(repo_dir, path)
         )
-        if go_setters.remaining(_parse(resolved), names, spellings):
+        if go_setters.remaining(_scope_of(root, node, _parse(resolved)), names, spellings):
             return False
     return True
+
+
+def _scope_of(root: Node, node: Node, resolved: Node) -> Node:
+    """What of ``resolved`` the pass must have cleared for ``node``'s setter to
+    be gone: the top-level function ``node`` sits in (a test, or a helper such
+    as ``enable(t, org)``), found again by its name and receiver, since a test
+    that sets the key from a variable elsewhere in the file leaves its own
+    setter without touching this one. A setter outside any function, or a
+    function that cannot be found once, is judged by the whole file."""
+    owner = node
+    while owner is not None and owner.type not in ("function_declaration", "method_declaration"):
+        owner = owner.parent
+    identity = _declaration_identity(owner) if owner is not None else None
+    if identity is None:
+        return resolved
+    same = [d for d in resolved.named_children if _declaration_identity(d) == identity]
+    declared = [d for d in root.named_children if _declaration_identity(d) == identity]
+    if len(declared) != 1 or len(same) > 1:
+        return resolved
+    if not same:
+        # The pass deleted the whole function: nothing of it remains.
+        return _parse("package p\n")
+    return same[0]
+
+
+def _declaration_identity(declaration: Node) -> tuple[str, str] | None:
+    if declaration.type not in ("function_declaration", "method_declaration"):
+        return None
+    name = declaration.child_by_field_name("name")
+    receiver = declaration.child_by_field_name("receiver")
+    if name is None:
+        return None
+    return _text(name), "".join(_text(receiver).split()) if receiver is not None else ""
 
 
 def references(path, source, declarations, accessors, repo_dir):
     return _references(path, source, declarations, accessors, repo_dir, False)
 
 
+def reads_beside_setters(path, source, declarations, accessors, repo_dir):
+    """:func:`references` with the mentions inside a call to a declared test
+    setter set aside: a setter the pass cannot decide (a test pinning the key
+    from a variable) stays with the declaration it keeps, and the reads and
+    the proven setters beside it are judged as usual."""
+    return _references(path, source, declarations, accessors, repo_dir, _SETTERS)
+
+
+def _in_setter_call(node: Node) -> bool:
+    names = go_setters.declared()
+    if not names:
+        return False
+    call = node.parent
+    while call is not None and call.type not in ("call_expression", "function_declaration", "method_declaration"):
+        call = call.parent
+    if call is None or call.type != "call_expression":
+        return False
+    function = call.child_by_field_name("function")
+    if function is not None and function.type == "selector_expression":
+        function = function.child_by_field_name("field")
+    return function is not None and _text(function) in names
+
+
 def reads_beside_mentions(path, source, declarations, accessors, repo_dir):
     """:func:`references` with every ``not-a-read`` mention set aside: what a
     reader whose mentions stay (the declaration is kept) still reads."""
     return _references(path, source, declarations, accessors, repo_dir, True)
+
+
+_SETTERS = "setters"
 
 
 def _references(path, source, declarations, accessors, repo_dir, lenient):
@@ -361,6 +420,10 @@ def _references(path, source, declarations, accessors, repo_dir, lenient):
     if root.has_error or go_module.package_clause(root) is None:
         return [], _whole_file(path, source, names)
     reader = _Reader(path, root, repo_dir)
+
+    def set_aside(node: Node) -> bool:
+        return lenient is True or (lenient is _SETTERS and _in_setter_call(node))
+
     accessor_set = frozenset(accessors)
     by_name: dict[str, list[xk.KeyDeclaration]] = {}
     for decl in declarations:
@@ -398,7 +461,7 @@ def _references(path, source, declarations, accessors, repo_dir, lenient):
                     ):
                         reads.append(xk.KeyReference(path, None, name))
                         bare_proven = True
-                    elif not lenient and any(reader.same_package(d) for d in by_name[name]):
+                    elif not set_aside(node) and any(reader.same_package(d) for d in by_name[name]):
                         reason = go_handles.FALLBACK_READ if _fallback_call(node) else xk.NOT_A_READ
                         refused.append(xk.refusal(path, node, reason, source))
                 continue
@@ -413,7 +476,7 @@ def _references(path, source, declarations, accessors, repo_dir, lenient):
                             reads.append(xk.KeyReference(path, None, name))
                             bare_proven = True
                             break
-                        if not lenient:
+                        if not set_aside(node):
                             refused.append(xk.refusal(path, node, xk.NOT_A_READ, source))
                         break
                     reason = _position_reason(call)
@@ -474,7 +537,7 @@ def _references(path, source, declarations, accessors, repo_dir, lenient):
                     reads.append(xk.KeyReference(path, qualifier, name))
                     owners.add(qualifier)
                     break
-                if not lenient:
+                if not set_aside(node):
                     reason = go_handles.FALLBACK_READ if _fallback_call(node) else xk.NOT_A_READ
                     refused.append(xk.refusal(path, node, reason, source))
                 break
@@ -562,6 +625,7 @@ xk.register(
         declarations=declarations,
         references=references,
         reads_beside_mentions=reads_beside_mentions,
+        reads_beside_setters=reads_beside_setters,
         entry_findings=entry_findings,
         declared_names=declared_names,
         declared_classifiers=declared_classifiers,

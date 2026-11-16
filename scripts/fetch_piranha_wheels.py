@@ -36,7 +36,7 @@ thing that fills it.
 
 Each release tag is derived from pyproject.toml's own pin, so bumping a pin IS
 bumping what gets fetched -- there is no second version literal to keep in
-sync. Each grammar's pin carries a PEP 440 LOCAL version (`0.23.2+canopy.3`,
+sync. Each grammar's pin carries a PEP 440 LOCAL version (`0.23.2+canopy.5`,
 `0.23.5+canopy.1`), which is what makes it unambiguous: PyPI forbids local
 versions, so such a pin can never be satisfied silently by upstream's
 identically-numbered release.

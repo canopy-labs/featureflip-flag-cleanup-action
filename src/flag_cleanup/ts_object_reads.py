@@ -26,7 +26,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import source_index, ts_syntax
+from flag_cleanup import source_index, ts_expectations, ts_syntax
 
 _SUFFIXES = (".ts", ".mts", ".cts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 _WRAPPERS = frozenset(
@@ -231,6 +231,218 @@ def _current_member_reads(root: Node) -> bool:
     return False
 
 
+def _name_is_nullable(name: str, index: _Index) -> bool:
+    """Whether every in-repo declaration of ``name`` returns ``boolean`` united
+    with ``undefined`` or ``null``: a hook with no value while it loads, whose
+    result a caller may compare with that no-value. A plain ``boolean`` is not."""
+    declarations = index.declarations(name)
+    return bool(declarations) and all(
+        _nullable_annotation(function.child_by_field_name("return_type")) for _, function in declarations
+    )
+
+
+def _nullable_annotation(annotation: Node | None) -> bool:
+    if annotation is None:
+        return False
+    parts = {p.strip() for p in _text(annotation).strip().lstrip(":").strip().lstrip("|").split("|")}
+    return "boolean" in parts and len(parts) > 1 and parts <= {"boolean", "undefined", "null"}
+
+
+def _hook_callback_read(call: Node) -> bool:
+    """Whether ``call`` is the value a ``renderHook`` callback returns (judged
+    by :func:`_renderhook_refusal`, not as an ordinary use)."""
+    node = call
+    while node.parent is not None and node.parent.type in _WRAPPERS:
+        node = node.parent
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "return_statement":
+        parent = parent.parent
+        while parent is not None and parent.type != "arrow_function" and parent.type not in ("function_expression", "function_declaration"):
+            parent = parent.parent
+    if parent is None or parent.type not in ("arrow_function", "function_expression"):
+        return False
+    outer = parent.parent
+    return outer is not None and outer.type == "arguments" and outer.parent is not None and _callee_name(outer.parent) == "renderHook"
+
+
+_JSX_PARENTS = frozenset({"jsx_element", "jsx_fragment"})
+
+
+def _truth_only(node: Node) -> bool:
+    """Whether the value of ``node`` is used only for its truthiness: a
+    condition, ``!``, ``Boolean(x)``, an operand of ``&&``/``||`` whose result
+    is itself used so, or a JSX child. A comparison, ``typeof``, ``??``, a
+    return, an argument, an assignment or a property value is not."""
+    while True:
+        parent = node.parent
+        if parent is None:
+            return False
+        kind = parent.type
+        if kind in _WRAPPERS:
+            node = parent
+        elif kind in ("if_statement", "while_statement", "do_statement"):
+            return parent.child_by_field_name("condition") == node
+        elif kind == "for_statement":
+            return parent.child_by_field_name("condition") == node
+        elif kind == "ternary_expression":
+            if parent.child_by_field_name("condition") == node:
+                return True
+            node = parent
+        elif kind == "unary_expression":
+            op = parent.child_by_field_name("operator")
+            return op is not None and _text(op) == "!"
+        elif kind == "binary_expression":
+            op = parent.child_by_field_name("operator")
+            if op is None or _text(op) not in ("&&", "||"):
+                return False
+            node = parent
+        elif kind == "arguments":
+            call = parent.parent
+            callee = call.child_by_field_name("function") if call is not None else None
+            return (
+                call is not None and callee is not None and callee.type == "identifier"
+                and _text(callee) == "Boolean" and len(parent.named_children) == 1
+            )
+        elif kind == "jsx_expression":
+            return parent.parent is not None and parent.parent.type in _JSX_PARENTS
+        else:
+            return False
+
+
+def _is_reference(identifier: Node) -> bool:
+    parent = identifier.parent
+    if parent is None:
+        return False
+    if parent.type in ("member_expression",) and parent.child_by_field_name("property") == identifier:
+        return False
+    if parent.type in ("pair", "property_signature", "public_field_definition") and parent.child_by_field_name("key") == identifier:
+        return False
+    return True
+
+
+def _untruthy_use(call: Node, root: Node) -> str | None:
+    """A reason when the value of ``call`` (an accessor returning ``boolean |
+    undefined``) is used other than for its truthiness, directly or through the
+    ``const`` it is bound to. Folding it to a literal there would make a
+    comparison with the no-value constant."""
+    reason = (
+        "the hook is declared `boolean | undefined`, and its value is used other than as a "
+        "condition (a comparison, `typeof`, `??` or an argument), which a folded literal would make constant"
+    )
+    if _truth_only(call):
+        return None
+    node = call
+    while node.parent is not None and node.parent.type in _WRAPPERS:
+        node = node.parent
+    parent = node.parent
+    if parent is not None and (
+        parent.type == "return_statement"
+        or (parent.type == "arrow_function" and parent.child_by_field_name("body") == node)
+    ):
+        # Handed straight to the caller, as a wrapper does: nothing here compares it.
+        return None
+    declarator = node.parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("value") != node:
+        return reason
+    name = declarator.child_by_field_name("name")
+    holder = declarator.parent
+    if name is None or name.type != "identifier" or holder is None or holder.type != "lexical_declaration" or _text(holder.children[0]) != "const":
+        return reason
+    for other in ts_syntax._walk(root):
+        if other.type in ("identifier", "shorthand_property_identifier") and _text(other) == _text(name) and other != name:
+            if other.type == "shorthand_property_identifier" or (_is_reference(other) and not _truth_only(other)):
+                return reason
+    return None
+
+
+def _renderhook_refusal(root: Node, flag_key: str, accessors: frozenset[str], treatment: bool) -> str | None:
+    """A reason when a ``renderHook`` callback returns the flag read and the test
+    does anything with its result but ``expect(result.current).<matcher>(<literal>)``
+    that the folded value satisfies. Whatever else it does (an alias, ``result.all``,
+    ``typeof``, a comparison inside ``expect``, a ``waitFor`` callback) the run
+    cannot evaluate, and a failing one is about the state being removed."""
+    if not _hook_callback_reads(root, flag_key, accessors):
+        return None
+    why = "the read is the return value of a renderHook callback and "
+    if _current_member_reads(root):
+        return why + "the test reads a member of `.current`, so the hook returns an object, not a boolean"
+    unknown = (
+        why + "the test uses its result other than as `expect(result.current).<matcher>(<literal>)` "
+        "with a matcher the folded value can be checked against"
+    )
+    for node in ts_syntax._walk(root):
+        if node.type != "call_expression" or _callee_name(node) != "renderHook":
+            continue
+        callbacks = [
+            a for a in (node.child_by_field_name("arguments").named_children if node.child_by_field_name("arguments") else [])
+            if _unwrap(a).type in ("arrow_function", "function_expression")
+        ]
+        if not callbacks:
+            continue
+        returned = [_unwrap(v) for v in (_returned(_unwrap(callbacks[0])) or [])]
+        if not any(v.type == "call_expression" and _callee_name(v) in accessors and _reads_key(v, flag_key) for v in returned):
+            continue
+        expression = node
+        while expression.parent is not None and expression.parent.type in ("await_expression", "parenthesized_expression"):
+            expression = expression.parent
+        parent = expression.parent
+        if parent is not None and parent.type == "expression_statement":
+            continue  # the result is dropped
+        if parent is None or parent.type != "variable_declarator" or parent.child_by_field_name("value") != expression:
+            return unknown
+        pattern = parent.child_by_field_name("name")
+        names: list[str] = []
+        if pattern is not None and pattern.type == "object_pattern":
+            for part in pattern.named_children:
+                if part.type == "shorthand_property_identifier_pattern":
+                    if _text(part) == "result":
+                        names.append("result")
+                    continue
+                if part.type == "pair_pattern":
+                    key, value = part.child_by_field_name("key"), part.child_by_field_name("value")
+                    if key is not None and _text(key) == "result":
+                        if value is None or value.type != "identifier":
+                            return unknown
+                        names.append(_text(value))
+                    continue
+                return unknown  # a rest element or a default
+        else:
+            return unknown
+        scope = parent.parent.parent if parent.parent is not None else root
+        for binding in names:
+            for ref in ts_syntax._walk(scope if scope is not None else root):
+                if ref.type != "identifier" or _text(ref) != binding or ref == pattern or not _is_reference(ref):
+                    continue
+                if ref.parent is not None and ref.parent.type in ("shorthand_property_identifier_pattern", "pair_pattern", "object_pattern"):
+                    continue
+                if not _evaluates(ref, treatment):
+                    return unknown if _evaluates(ref, treatment) is None else (
+                        why + "the test asserts something about `.current` that the folded value does not satisfy"
+                    )
+    return None
+
+
+def _evaluates(ref: Node, treatment: bool) -> bool | None:
+    """True when ``ref`` (a use of the renderHook result) is exactly an
+    ``expect(ref.current)[.not].<matcher>(<literal>?)`` statement that holds for
+    ``treatment``; False when it parses as one and fails; None for any other use."""
+    member = ref.parent
+    if member is None or member.type != "member_expression" or member.child_by_field_name("object") != ref:
+        return None
+    prop = member.child_by_field_name("property")
+    if prop is None or _text(prop) != "current":
+        return None
+    arguments = member.parent
+    if arguments is None or arguments.type != "arguments" or len(arguments.named_children) != 1:
+        return None
+    expect = arguments.parent
+    if expect is None or expect.type != "call_expression" or _callee_name(expect) != "expect":
+        return None
+    return ts_expectations.evaluate_expectation(expect, treatment)
+
+
 def _hook_callback_reads(root: Node, flag_key: str, accessors: frozenset[str]) -> bool:
     for node in ts_syntax._walk(root):
         if node.type != "call_expression" or _callee_name(node) != "renderHook":
@@ -248,7 +460,7 @@ def _hook_callback_reads(root: Node, flag_key: str, accessors: frozenset[str]) -
 
 
 def refusals(
-    paths: list[str], flag_key: str, accessors: tuple[str, ...], repo_dir: str
+    paths: list[str], flag_key: str, accessors: tuple[str, ...], repo_dir: str, treatment: bool = True
 ) -> dict[str, str]:
     """``{path: reason}`` for every file holding a read that is an object read."""
     names = frozenset(a.split("[", 1)[0] for a in accessors)
@@ -256,6 +468,7 @@ def refusals(
         return {}
     index = _Index(repo_dir)
     verdicts: dict[str, bool] = {}
+    nullable: dict[str, bool] = {}
     declared_in: dict[str, str] = {}
     found: dict[str, str] = {}
     for path in paths:
@@ -274,6 +487,10 @@ def refusals(
                 "member of `.current`, so the hook returns an object, not a boolean"
             )
             continue
+        hook_why = _renderhook_refusal(root, flag_key, names, treatment)
+        if hook_why is not None:
+            found[path] = hook_why
+            continue
         for node in ts_syntax._walk(root):
             if node.type != "call_expression":
                 continue
@@ -283,6 +500,13 @@ def refusals(
             if name not in verdicts:
                 verdicts[name] = _name_is_object(name, index)
                 declared_in[name] = ", ".join(sorted({p for p, _ in index.declarations(name)}))
+            if name not in nullable:
+                nullable[name] = _name_is_nullable(name, index)
+            if nullable[name] and not _hook_callback_read(node):
+                why = _untruthy_use(node, root)
+                if why is not None:
+                    found[path] = why
+                    break
             if verdicts[name]:
                 found[path] = (
                     f"`{name}` is declared in {declared_in[name]} as returning an object or "

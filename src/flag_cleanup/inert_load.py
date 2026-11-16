@@ -965,6 +965,41 @@ def _contains(node: Node, kind: str) -> bool:
     return node.type == kind or any(_contains(c, kind) for c in node.named_children)
 
 
+def _environment_object(node: Node | None, bound: set[str]) -> bool:
+    """The global ``process`` object's variable table (a ``process`` the module
+    binds is its own), or the bundler-replaced ``import.meta`` one."""
+    if node is None or node.type != "member_expression" or any(c.type in {"?.", "optional_chain"} for c in node.children):
+        return False
+    prop = node.child_by_field_name("property")
+    if prop is None or prop.type != "property_identifier" or prop.text != b"env":
+        return False
+    obj = node.child_by_field_name("object")
+    if obj is None:
+        return False
+    if obj.type == "identifier":
+        return obj.text == b"process" and "process" not in bound
+    return obj.type == "meta_property" and obj.text == b"import.meta"
+
+
+def _environment_read(node: Node, bound: set[str]) -> bool:
+    """A read of one named variable: ``<env>.NAME`` or ``<env>["NAME"]``. At
+    module scope that is a pure read. A write is a statement and a call
+    (``dotenv.config()``) is a call, so neither reaches here."""
+    if any(c.type in {"?.", "optional_chain"} for c in node.children):
+        return False
+    if node.type == "member_expression":
+        prop = node.child_by_field_name("property")
+        if prop is None or prop.type != "property_identifier":
+            return False
+    else:
+        index = node.child_by_field_name("index")
+        if index is None or index.type != "string" or any(
+            c.type == "template_substitution" for c in index.named_children
+        ):
+            return False
+    return _environment_object(node.child_by_field_name("object"), bound)
+
+
 def _kind(node: Node, bound: set[str], primitive: set[str]) -> str | None:
     """``"primitive"``, ``"value"`` or ``None`` (evaluating it may run code)."""
     kind = node.type
@@ -1009,6 +1044,18 @@ def _kind(node: Node, bound: set[str], primitive: set[str]) -> str | None:
         if operator in _PRIMITIVE_OPERATORS and left == right == _PRIMITIVE:
             return _PRIMITIVE
         return None
+    if kind == "ternary_expression":
+        parts = [
+            _kind(node.child_by_field_name(field), bound, primitive)
+            for field in ("condition", "consequence", "alternative")
+        ]
+        if None in parts:
+            return None
+        # Truthiness of any value calls nothing; the result is one of the arms.
+        return _PRIMITIVE if parts[1] == parts[2] == _PRIMITIVE else _VALUE
+    if kind in {"member_expression", "subscript_expression"}:
+        # A read of an environment variable is a string or `undefined`.
+        return _PRIMITIVE if _environment_read(node, bound) else None
     if kind in _CLOSURES:
         return _VALUE
     if kind == "array":

@@ -3611,6 +3611,9 @@ class Prepass:
     #: Go: the registry default when it is the removed branch
     #: (:mod:`flag_cleanup.go_defaults`).
     removed_default: ts_tests.FlagDefault | None = None
+    #: TypeScript and JavaScript: path -> where a test double answers the
+    #: accessor by key (:mod:`flag_cleanup.ts_key_stubs`); the run refuses.
+    unresolved: dict[str, list[str]] = field(default_factory=dict)
 
     def apply(self, paths: list[str]) -> None:
         forwards = self._forwards(paths)
@@ -3633,6 +3636,12 @@ class Prepass:
                     forwards=forwards,
                 )
                 knob_receivers = self.knob_receivers.get(path, frozenset())
+            if self.wrapper is None and self.language in _TS_LANGUAGES:
+                from flag_cleanup import ts_key_stubs  # circular at import time
+
+                left = ts_key_stubs.refusals(source, self.language, self.flag_key, self.accessors, path)
+                if left:
+                    self.unresolved[path] = left
             resolved, removed = resolve(
                 source, self.language, self.flag_key, self.treatment, self.accessors,
                 key_texts=self.key_texts.get(path, frozenset()),

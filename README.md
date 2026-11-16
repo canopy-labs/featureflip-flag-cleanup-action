@@ -1143,9 +1143,11 @@ one that names the key directly. Such a property, or a name destructured from
 anything (`const { IS_X } = flags`), is never rewritten, whatever the
 constants and enum members holding the key are called: the file's reads
 through them are left in place with it, every declaration of the key is
-kept, and the file is reported. All of this applies only to `key-aliases`
-spellings; any other key is found wherever the code spells it, and a
-property of that name elsewhere is left in place and reported, as before.
+kept, and the file is reported. All of this applies to `key-aliases`
+spellings, and to a key that an enum member, constant or object property is
+named like and valued at (`PublicMaps = "PublicMaps"`); any other key is found
+wherever the code spells it, and a property of that name elsewhere is left in
+place and reported, as before.
 
 What still uses the Featureflip key: the branch (`featureflip/remove-flag/experimental-agents`),
 the check for a pull request already opened for the flag, the pull request
@@ -1319,10 +1321,12 @@ first match wins. A read that is only tested (an `if`, `while`, `do` or `for` co
    flag's reads a boolean wrapper first, or remove the flag by hand.
 2. It is what an `async` function returns: the literal.
 3. It is what a function with an explicit return type returns:
-   `Promise<…>` gives `Promise.resolve(true)`, exactly `boolean` gives the
-   literal, anything else (a union, an alias, `MaybePromise`) refuses the flag. A read
-   that is only an arm of a ternary or an operand of `&&`, `||` or `??` is
-   folded only inside an `async` function or one annotated `boolean`.
+   `Promise<…>` gives `Promise.resolve(true)`, `boolean` (or `boolean | undefined`,
+   `boolean | null`) gives the literal, anything else (another union, an alias,
+   `MaybePromise`) refuses the flag. In a JavaScript file a JSDoc `@return {boolean}`
+   (or `@returns`) on the function is the same annotation, and `@return {Promise<…>}`
+   the Promise one. A read that is only an arm of a ternary or an operand of `&&`,
+   `||` or `??` is folded only inside an `async` function or one annotated `boolean`.
 4. Its receiver is a plain identifier that is a typed parameter of an
    enclosing function and is bound nowhere else inside that function (no
    variable, loop, `catch`, nested parameter, destructuring or assignment of the
@@ -1422,11 +1426,22 @@ be followed. The evidence is any one of these:
   `node_modules` copy committed with a version it doesn't hold. Server SDKs whose reads return a Promise
   (`@launchdarkly/node-server-sdk`, ConfigCat's `getValueAsync`) are deliberately
   not on the list;
-- the call reaches a declaration in your repository annotated `boolean`;
+- the call reaches a declaration in your repository annotated `boolean` (or `boolean | undefined`);
 - the wrapper declares its own return type as `boolean` or another primitive or
   literal type (`boolean | undefined`, `'on' | 'off'`), on the function or on the
-  `const` it is assigned to. `any`, `unknown`, an object or a Promise type are not
-  evidence.
+  `const` it is assigned to, or, in a JavaScript file, by a JSDoc `@return {boolean}`.
+  `any`, `unknown`, an object or a Promise type are not evidence.
+
+A hook declared `boolean | undefined` (or `| null`) is folded only where its value is
+used for its truthiness alone: an `if`/`while`/ternary condition, `!`, `Boolean(x)`, an
+operand of `&&`/`||` used the same way, or a JSX child, directly or through a `const`
+it is bound to. A comparison with `undefined` or `null`, `typeof`, `??`, or
+an argument keeps the flag refused, since the folded constant would make the
+comparison constant. Returning the value as it is (a wrapper) is not refused. A test that reads such a hook through `renderHook` is folded
+only when every use of its result is `expect(result.current).<matcher>(<literal>)`
+(`toBe`, `toEqual`, `toStrictEqual`, `toBeTruthy`, `toBeFalsy`, `toBeDefined`,
+`toBeUndefined`, `toBeNull`, optionally `.not`) and the folded value satisfies it;
+any other use, or an assertion about the loading state, keeps the flag refused.
 
 A declaration of the accessor in your repository that is, or could be, async still
 keeps the read, whatever the evidence. Without evidence, the read folds only when
@@ -2506,10 +2521,20 @@ the library and its imports, and only then in inherited members, so:
   through a name whose every declaration in the file is written with the
   class as its type, or initialised with `Flags(…)`, `const Flags(…)` or
   `new Flags(…)` and no type, where one of those declarations encloses the
-  call: a parameter, a local or a field of the enclosing class.
+  call: a parameter, a local or a field of the enclosing class. A lookup
+  that names the class as its one type argument counts as initialising with
+  it: `context.read<Flags>()`, `context.watch<Flags>()`,
+  `Provider.of<Flags>(context)` (with an optional `listen: true` or
+  `listen: false`), and `getIt<Flags>()`, `GetIt.I<Flags>()`,
+  `GetIt.instance<Flags>()`, `locator<Flags>()`, `sl<Flags>()` and
+  `serviceLocator<Flags>()`, each also through `.get`, with no arguments.
+  Once the caller folds, the declaration's lookup stays as a statement
+  (`context.read<Flags>();`), because a lookup can have effects the run
+  cannot see.
 
 Everything else is left alone: `widget.flags.newCheckout`,
-`context.read<Flags>().newCheckout`, `flags?.newCheckout`, `flags!.newCheckout`,
+`context.read<Flags>().newCheckout` (a lookup used inline, not held in a name),
+`flags?.newCheckout`, `flags!.newCheckout`,
 a cascade, a `late`, nullable or `dynamic` declaration, a prefixed type
 (`p.Flags`), a constructor parameter, a method torn off without a call, a
 call with type arguments, a mention inside a string, a symbol (`#newCheckout`)
@@ -4363,6 +4388,27 @@ too, and is reported. A registry whose value is not a boolean —
 discriminator is the value position the entry occupies, not the literal
 underneath it.
 
+In TypeScript and JavaScript, a Jest or Vitest `expect(<flag read>)` assertion that the
+removal turns into one that can only fail (`expect(useFlag("k")).toBeUndefined()`
+becomes `expect(true).toBeUndefined()`) keeps the flag refused, naming the file and the
+assertion: the test asserts the state this pull request deletes, and deleting a test of
+the removed value is your call. The matchers judged are `toBe`, `toEqual` and
+`toStrictEqual` with `true`, `false`, `undefined`, `null` or `void 0`, and `toBeTruthy`,
+`toBeFalsy`, `toBeDefined`, `toBeUndefined` and `toBeNull`, each optionally after `.not`;
+one that passes is deleted as before, and any other matcher is left alone. An assertion
+that already could only fail in your code is not counted.
+
+In every other language, an assertion the removal turns into one that can only fail
+(`Assert.True(false)`, `assertNull(true)`, `self.assertIsNone(True)`,
+`assert.Nil(t, true)`, `expect(true).to be_nil`, `$this->assertNull(true)`,
+`XCTAssertNil(true)`, `expect(true, isNull)`, and the `assertTrue(false)`-style forms
+the tool already listed) keeps the flag refused, naming the file and the assertion:
+the test asserts the state this pull request deletes, and deleting a test of the
+removed value is your call. Only a literal the run wrote counts; an assertion that
+already could only fail in your code is not counted, and one it cannot judge is left
+alone. A passing one (`Assert.NotNull(true)`, `assertTrue(true)`) is deleted or kept
+as before.
+
 What it does **not** do is rewrite a test whose *assertion* was the gate:
 `it('hides the link when the flag is off')` mentions no key, fails because the
 gate is gone, and is yours to delete. Nor does it touch statements that write a
@@ -4398,7 +4444,11 @@ if featureflags.Manager.BoolVariation("new-checkout", ldClient, false) {
 ```
 
 becomes `_ = featureflags.GetClient(platform)` in Go, and a bare
-`featureflags.getClient(platform);` in most other languages. The pull request
+`featureflags.getClient(platform);` in most other languages. In a TypeScript or
+JavaScript file written without semicolons (most of its statements end without
+one) the kept call is written without one too, unless the next statement starts
+with `(`, `[`, a backtick, `/`, `+` or `-`, where the `;` stays so the two lines
+do not run together. The pull request
 lists each one. Most are getters that fetched the flag client or built an
 evaluation context for the read that just went, and do nothing once it is gone.
 
@@ -4491,7 +4541,7 @@ What counts as a resolvable constant, per language:
 
 | Language | Shape |
 | --- | --- |
-| JavaScript / TypeScript / JSX / TSX | `const K = 'key'`, including `export const`, also written `'key' as const`, `'key' satisfies T` or `'key' as const satisfies T`, each optionally in one pair of parentheses; any other wrapper (`'key' as string`, `'key'!`) is refused as `unsupported-form`. A `let` or `var` is **not** — it may be reassigned. A top-level `const K = new Feature('key', false)` holds the key too, when its class is proven (see the cross-file table below) |
+| JavaScript / TypeScript / JSX / TSX | `const K = 'key'`, including `export const`, also written `'key' as const`, `'key' satisfies T` or `'key' as const satisfies T`, each optionally in one pair of parentheses, and with one comment after it, with or without a `;` (`const K = 'key' // owner`; the comment goes with the declaration); any other wrapper (`'key' as string`, `'key'!`) is refused as `unsupported-form`. A `let` or `var` is **not** — it may be reassigned. A top-level `const K = new Feature('key', false)` holds the key too, when its class is proven (see the cross-file table below) |
 | Java | `static final String K = "key"`, a `final` local, or an interface field (implicitly `final`). A non-`final` field is **not** |
 | Go | `const k = "key"`, alone or as one entry of a `const ( … )` block, where that entry's line is removed and the others stay. A `var` is **not**, except a typed flag handle (see below), and a block that uses `iota` or has an entry with no value (which repeats the one above it) is left alone, since removing one entry could change the others |
 | C# | `const string K = "key"`. `static readonly` is **not** a compile-time constant — it may be assigned in a static constructor |
@@ -4617,7 +4667,12 @@ through `paths` aliases, to the module that declares the constant. When
 the constant goes, the barrel's `export { NAME } from` line goes with it, or just that
 specifier if the statement lists others, and a file left with no import or
 export gets `export {};` so it stays a module (a declaring file that an
-`export *` still reaches too). A chain is followed only when
+`export *` still reaches too). In a TypeScript or JavaScript file, a plain comment that spells the name of an
+import the removal left unused (`// the old LinearSRGBColorSpace path`) does not
+keep that import, since ESLint's `no-unused-vars` and `noUnusedLocals` do not
+count a comment as a use; the comment stays. A JSDoc type (`@param {Type}`,
+`@returns {Type}`), a `{@link Type}`, a `@see` and a comment that is code to
+some checker (`/*: Type */`) still count, and keep the import. A chain is followed only when
 it can be read to the end: every `export *` target of a barrel must resolve to a
 file in the checkout, and exactly one of them may supply the name. The one
 exception is a package that cannot be a file of the checkout: an
@@ -5535,7 +5590,19 @@ stub beside any other `eq` is kept):
   `stub.withArgs('k').returns(…)`, `.resolves(…)` or `.callsFake(() => …)`, on
   `sinon.stub(obj, 'read')` or a name the file binds to one. A test is an `it(…)`
   or `test(…)` call (and their `.only`/`.skip`/`x`/`f` spellings), never a
-  `describe`.
+  `describe`. A Jest or Vitest mock of your own accessor that answers by key
+  (`jest.mock('./flags', () => ({ isEnabled: (name) => mock(name) }))` with
+  `mock.mockImplementation((n) => n === 'flag')` in the tests) is not resolved:
+  removing the flag would leave tests that run the removed branch. A test file
+  that spells the flag's key and mocks a module the accessor comes from (one it
+  imports the accessor from, or a relative module that mentions it) and holds
+  any stub call (`mockImplementation`, `mockReturnValue`, their `Once`,
+  `Resolved` and `Rejected` forms), or the key inside the mock's factory,
+  refuses the flag, naming the file and line. So does a file that spells the key
+  and stubs the accessor with `vi.mocked(f)` or `jest.spyOn(module, 'f')`.
+  Remove the flag from those tests first, then run the removal again. A file
+  that mocks the module but stubs nothing, or stubs without spelling the key,
+  is not affected.
 * **Go** — gomock `m.EXPECT().BoolVariation(…).Return(…)`, with or without
   `Times`/`AnyTimes`. A test is a `func TestX(t *testing.T)` or one `t.Run`
   subtest.
@@ -5823,6 +5890,14 @@ operands go too, at any depth of parentheses and `&&`/`||`:
 `if (a || b)`. As a value (`const v = x || <read>`, an argument, a `return`)
 the literal stays, since `0 || false` is `false`, not `0`.
 
+In a value position the same operands go when the other operand is provably a
+boolean, which a comparison, `in`, `instanceof` and `!` are: `{ isShow: n > 0 && <read> }`
+served **true** becomes `{ isShow: n > 0 }`, and served **false** becomes
+`{ isShow: false }`. A name or a call of unknown type keeps the literal
+(`ready && true`), since `x && true` is not `x` unless `x` is a boolean, and
+dropping a call or a property read (a getter) is declined as it is in a
+condition.
+
 Two leftovers are removed without a mention, since nothing of yours goes with
 them: a label whose last `break label` or `continue label` the fold removed
 (`no-unused-labels`, and TypeScript's TS7028), and a `static { … }` block the
@@ -5931,7 +6006,12 @@ file still loads. It is also deleted when the module is a file in the
 repository, named by a relative path or a `tsconfig.json` `paths` alias, and
 loading it provably does nothing: that file, and every module it loads in turn,
 only declares types, functions, classes and constants built from literals. A
-module of flag-key constants is the usual case. If anything in that graph calls
+module of flag-key constants is the usual case. A constant may also read one
+named environment variable (`process.env.NODE_ENV`, `process.env["MODE"]`,
+`import.meta.env.DEV`), alone or in a comparison, `!`, `&&`, `||`, `??` or a
+ternary, as a registry of dev-only flags does; a write to the environment, a
+call such as `dotenv.config()`, reading the whole table, an optional or computed
+read, or a module that declares its own `process` still keeps the bare import. If anything in that graph calls
 a function, builds an object with `new`, uses a decorator, loads a package or
 cannot be found, the bare import stays.
 
@@ -6503,6 +6583,13 @@ receivers the SDK documents — plus a bare `boolVariation(…)` where a project
 aliases the call. Both quote styles are matched, and the call may be split
 across lines the way `dart format` writes a long one.
 
+A key held in a `const` or `final` of the same file folds the same way. When
+anything else uses that name too (a log line, an entry of the Remote Config
+defaults map passed to `setDefaults`, another file), the declaration and those
+uses are kept and only the reads fold; the run says so in its log, and the file
+is still listed as referencing the flag, since the key's string remains. A name
+declared more than once in the file is still refused whole.
+
 They fold in `if`/`else if`/`else`, `!` negation, `&&`/`||` expressions, a
 conditional expression, and — the Flutter one — a **collection-`if` inside a
 widget tree's `children:` list**, including its `else` arm:
@@ -6802,6 +6889,13 @@ are identity and case-subsumption rather than value equality; and a comparison
 whose other operand is *not* a literal is left alone, because Ruby's only falsy
 values are `nil` and `false`, so `x == true` and a bare `x` disagree for every
 truthy non-`true` `x`.
+
+A read written directly against a keyword, such as `return(<read>) || a`,
+`x if(<read>) && a` or `if a &&(<read>)then b end`, folds completely: the literal
+is spaced from the word (`return true`, `x if a`), where it would otherwise have
+fused with it. A `?` or `!` written straight after the read, as in
+`(<read> && ok)?a: b`, is left in its parentheses, since a space there would
+make it another call.
 
 Indentation after a fold can be off by a level. Ruby blocks are `end`-delimited
 so this is cosmetic, and `rubocop -a` normalises it.
@@ -7565,6 +7659,13 @@ setter in a `defer` or a function literal's cleanup, a value held in a
 variable and an argument that calls something are not proven, so they stay and
 keep the constant, which the pull request lists as still referenced.
 
+A setter does not have to sit in a test function. A helper that pins the value
+that stays (`func enable(t *testing.T, org string) { featureflag.Set(org, Flag, true) }`)
+loses the line, even when another test of the file sets the same flag from a
+variable (`featureflag.Set("b", Flag, v)`). That test and its setter stay, and
+so does the constant they name; the reads still fold and the pull request
+lists the setter that was left. A helper that pins the value that goes stays.
+
 An `if` whose whole body is a setter that was deleted goes with it
 (`if tt.enable { featureflag.Set(org, Flag, true) }`), when its condition is a
 member read, optionally negated, and it is a statement of its own: no `else`,
@@ -7596,7 +7697,12 @@ statement under "overrides that no longer have an effect", since every read
 now returns the kept value). LaunchDarkly test data,
 `td.Update(td.Flag(pkg.X.Key()).VariationForAll(true))` (name `Update`), is
 recognised when `td` is a local or a package-level `var` of the same package
-initialised with `ldtestdata.DataSource()` from `github.com/launchdarkly/.../ldtestdata`;
+initialised with `ldtestdata.DataSource()` from `github.com/launchdarkly/.../ldtestdata`,
+or a field of a struct of your repository declared as `*ldtestdata.TestDataSource`
+(`s.td.Update(s.td.Flag(pkg.X.Key()).VariationForAll(true))`, with `s` a method
+receiver, a parameter or a local built from a struct literal). Only
+`VariationForAll(true|false)` is recognised: `.On(false)` and `.VariationForUser(...)`
+depend on what the same test data source was given earlier, so they stay;
 `td.Flag(Const)` with the key constant works the same way. A handle that is
 passed to any other function, or whose `.Key()` is used anywhere else (a log
 line), keeps its declaration.
@@ -8732,8 +8838,9 @@ means no PR.
   is narrower. In Dart, a declaration's initializer that `dart format` moved
   to the line after its `=` goes back beside it
   (`final enabled =\n    multiMediaEnabled ?? true;` becomes
-  `final enabled = multiMediaEnabled ?? true;`), under the `formatter:
-  page_width` of the nearest `analysis_options.yaml` (following a relative
+  `final enabled = multiMediaEnabled ?? true;`), as does a `=>` body
+  (`bool get x =>\n      true;`) and a `??`, `&&` or `||` chain it had broken
+  after its operators, under the `formatter: page_width` of the nearest `analysis_options.yaml` (following a relative
   `include:`), or 80. In TypeScript and JavaScript, under the width above, a
   value Prettier moved to the line after its `=` or `:` goes back beside it,
   and an `if`, `while` or `do … while` condition broken inside its
