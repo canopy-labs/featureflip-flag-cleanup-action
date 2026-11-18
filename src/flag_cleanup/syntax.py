@@ -4125,12 +4125,42 @@ def externally_visible_key_consts(
     return visible_key_consts(consts, language)
 
 
-def key_const_names(source: str, language: str, flag_key: str) -> tuple[str, ...]:
-    """The names of the hoisted key constants in ``source`` (for messages)."""
-    if language not in key_const.supported_languages() or language in _TS_LANGUAGES:
-        return ()
+def _key_const_tree(source: str, language: str):
+    """``(root, source bytes, profile language)`` as Gate 2's key-const question
+    reads ``source`` (the code view of a template), or ``None`` for a language
+    with no key-const profile."""
+    if language in _TS_LANGUAGES:
+        return ts_syntax._parse(source, language), source.encode("utf-8"), language
+    if language not in key_const.supported_languages():
+        return None
     profile = _PROFILES[language]
     if profile.code_view is not None:
         source, language = _code_view(source, language), profile.code_view
-    root = _parse(source, language)
-    return tuple(c.name for c in key_const.key_consts(root, source.encode("utf-8"), language, flag_key))
+    return _parse(source, language), source.encode("utf-8"), language
+
+
+def key_const_names(source: str, language: str, flag_key: str) -> tuple[str, ...]:
+    """The names of the hoisted key constants in ``source`` (for messages)."""
+    tree = _key_const_tree(source, language)
+    if tree is None:
+        return ()
+    root, data, language = tree
+    return tuple(dict.fromkeys(c.name for c in key_const.key_consts(root, data, language, flag_key)))
+
+
+def key_const_withheld(
+    source: str, language: str, flag_key: str, accessors: tuple[str, ...] = (), fold_only: bool = False
+) -> tuple[list[tuple[str, int, bool]], str | None]:
+    """What a file Gate 2 withheld leaves unfolded, and why: the
+    ``(constant, line, ambiguous)`` of each read of a hoisted key the const rules would
+    have folded, and :func:`key_const.withheld_reason` for the file (``None``
+    when the key-const question itself would let it through, so something
+    beyond the file kept it). No reads means nothing to say."""
+    tree = _key_const_tree(source, language)
+    if tree is None:
+        return [], None
+    root, data, language = tree
+    reads = key_const.removable_reads(root, data, language, flag_key, accessors)
+    if not reads:
+        return [], None
+    return reads, key_const.withheld_reason(root, data, language, flag_key, accessors, fold_only=fold_only)

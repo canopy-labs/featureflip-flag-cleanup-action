@@ -825,7 +825,7 @@ class _Options:
         return [str(origin / rest.replace("*", star)) for origin, rest in self.paths[pattern]]
 
 
-def _options(config: Path, stop: Path, strict: bool = True) -> _Options:
+def _options(config: Path, stop: Path, strict: bool = True, referencing: bool = False) -> _Options:
     """``config``'s ``paths`` and ``baseUrl``, as the compiler reads them.
 
     Each is the value of the nearest config in the ``extends`` chain that sets
@@ -843,9 +843,13 @@ def _options(config: Path, stop: Path, strict: bool = True) -> _Options:
     :func:`_enum_escapes`): ``references``, ``moduleSuffixes``, a repeated key
     and U+2028/U+2029 are read past rather than refused. A refusal there would
     hide an alias, and with it a use of the file, which fails open.
+
+    ``referencing``: ``config`` itself may have ``references``, because the
+    caller has shown it compiles the reader (:func:`_referencing_options`).
+    A config it extends still may not.
     """
     try:
-        chain = _inheriting(config, stop, (), strict)
+        chain = _inheriting(config, stop, (), strict, referencing)
     except (OSError, UnicodeDecodeError, ValueError, RuntimeError) as error:
         # RuntimeError: a symlink loop, from `Path.resolve`.
         raise _Unknown(str(config)) from error
@@ -892,7 +896,11 @@ def _option_path(value: str, origin: Path, config: Path, declared_in: Path | Non
 
 
 def _config(
-    reader_dir: Path, stop: Path, strict: bool = True, solution: Path | None = None
+    reader_dir: Path,
+    stop: Path,
+    strict: bool = True,
+    solution: Path | None = None,
+    reader: Path | None = None,
 ) -> _Options | None:
     """The options of the nearest config, or None when there is none.
 
@@ -900,7 +908,9 @@ def _config(
     :func:`_options`), or when two configs sit side by side. With
     ``solution`` (the reader's own path), a nearest config that delegates
     through ``references`` is read through the configs it names
-    (:func:`_solution_options`) instead of being refused.
+    (:func:`_solution_options`) instead of being refused. With ``reader``
+    alone, a nearest config with ``references`` is read only when it
+    compiles the reader itself (:func:`_referencing_options`).
     """
     current = reader_dir
     while True:
@@ -908,8 +918,9 @@ def _config(
         if len(present) > 1:
             raise _Unknown(str(current))
         if present:
-            if solution is not None and strict:
-                delegated = _solution_options(present[0], solution, stop)
+            asked = solution if solution is not None else reader
+            if asked is not None and strict:
+                delegated = _referencing_options(present[0], asked, stop, delegate=solution is not None)
                 if delegated is not None:
                     return delegated
             return _options(present[0], stop, strict)
@@ -933,24 +944,42 @@ def _strict_config(config: Path) -> dict:
 
 
 def _solution_options(config: Path, reader: Path, stop: Path) -> _Options | None:
-    """The options ``reader`` compiles with under a SOLUTION config, or None
-    when ``config`` has no ``references``.
+    """The options ``reader`` compiles with under a config with
+    ``references``, or None when ``config`` has none; see
+    :func:`_referencing_options`, which this asks with delegation allowed."""
+    return _referencing_options(config, reader, stop, delegate=True)
 
-    A solution config (`"files": []` plus ``references``, Vite's default
+
+def _referencing_options(config: Path, reader: Path, stop: Path, delegate: bool) -> _Options | None:
+    """The options ``reader`` compiles with under ``config``, a config with
+    ``references``; None when it has none.
+
+    A SOLUTION config (`"files": []` plus ``references``, Vite's default
     layout) compiles nothing itself: each file belongs to whichever referenced
-    config includes it. Every referenced config that MAY compile ``reader``
-    (:func:`_may_compile`, which over-matches) is read strictly, and the
-    answer stands only when they all read the same options. Raises
-    :class:`_Unknown` when none may, when they disagree, when the solution
-    config may compile ``reader`` itself, or when a reference cannot be read.
+    config includes it. With ``delegate``, every referenced config that MAY
+    compile ``reader`` (:func:`_may_compile`, which over-matches) is read
+    strictly, and the answer stands only when they all read the same options.
+
+    A config that also names files of its own (an ``include``, or a
+    ``files`` list that is not empty) and may compile ``reader`` answers with
+    its OWN options, read through its ``extends`` chain, ``delegate`` or not:
+    its ``paths`` are the ones its files compile with. Every referenced config
+    that may compile ``reader`` too must read the same options, since which of
+    them compiles it is not told here.
+
+    Raises :class:`_Unknown` when a reference cannot be read or lies outside
+    the checkout; when the config may compile ``reader`` but names no files of
+    its own (the compiler's default ``include`` would compile everything below
+    it); when the options that may apply disagree; and when the config does
+    not compile ``reader`` and either ``delegate`` is off or no reference may.
     """
     data = _strict_config(config)
     if "references" not in data:
         return None
     references = data["references"]
-    if not isinstance(references, list) or _may_compile(config, data, reader):
+    if not isinstance(references, list):
         raise _Unknown(str(config))
-    found: list[_Options] = []
+    targets: list[Path] = []
     for reference in references:
         written = reference.get("path") if isinstance(reference, dict) else None
         if not isinstance(written, str):
@@ -960,49 +989,104 @@ def _solution_options(config: Path, reader: Path, stop: Path) -> _Options | None
             target = target / "tsconfig.json"
         if not target.is_file() or not target.resolve().is_relative_to(stop):
             raise _Unknown(str(config))
-        if _may_compile(target, _strict_config(target), reader):
+        targets.append(target)
+    found: list[_Options] = []
+    if _may_compile(config, data, reader, stop):
+        if not _names_own_files(data):
+            raise _Unknown(str(config))
+        found.append(_options(config, stop, referencing=True))
+    elif not delegate:
+        raise _Unknown(str(config))
+    for target in targets:
+        if _may_compile(target, _strict_config(target), reader, stop):
             found.append(_options(target, stop))
     if not found or any(options != found[0] for options in found):
         raise _Unknown(str(config))
     return found[0]
 
 
-def _may_compile(config: Path, data: dict, reader: Path) -> bool:
+def _names_own_files(data: dict) -> bool:
+    """Whether a config lists files of its own to compile: an ``include`` of
+    strings, or a ``files`` list of strings that is not empty."""
+    files, include = data.get("files"), data.get("include")
+    if include is not None:
+        return isinstance(include, list) and all(isinstance(i, str) for i in include)
+    return isinstance(files, list) and bool(files) and all(isinstance(f, str) for f in files)
+
+
+def _may_compile(config: Path, data: dict, reader: Path, stop: Path) -> bool:
     """Whether ``config``'s ``files`` or ``include`` may hold ``reader``.
 
-    Over-matches on purpose, since every config that may hold it has to
-    agree: an ``include`` pattern counts as the directory before its first
-    wildcard, ``exclude`` is ignored, and a config that sets neither but
-    ``extends`` another counts, its inherited lists unread.
+    Each of the two is the compiler's: the config's own, or else inherited
+    through ``extends`` (:func:`_compile_lists`), each on its own and resolved
+    from the config that writes it. Over-matches on purpose, since every
+    config that may hold the reader has to agree: an ``include`` pattern
+    counts as the directory before its first wildcard, ``exclude`` is ignored,
+    and a config whose ``extends`` chain cannot be read counts.
     """
-    files, include = data.get("files"), data.get("include")
+    try:
+        lists = _compile_lists(config, data, stop, ())
+    except (_Unknown, OSError, UnicodeDecodeError, ValueError, RuntimeError):
+        return True
     target = reader.resolve()
-    if files is None and include is None:
-        return "extends" in data or target.is_relative_to(config.parent.resolve())
-    if files is not None:
+    if not lists:
+        # The compiler's default `include`: everything below the config.
+        return target.is_relative_to(config.parent.resolve())
+    if "files" in lists:
+        files, origin = lists["files"]
         if not isinstance(files, list):
             return True
         for entry in files:
-            if not isinstance(entry, str) or Path(os.path.normpath(config.parent / entry)).resolve() == target:
+            if not isinstance(entry, str) or Path(os.path.normpath(origin / entry)).resolve() == target:
                 return True
-    if include is not None:
+    if "include" in lists:
+        include, origin = lists["include"]
         if not isinstance(include, list):
             return True
         for pattern in include:
             if not isinstance(pattern, str):
                 return True
             pattern = pattern.replace("\\", "/")
+            directory = origin
             if pattern.startswith(_CONFIG_DIR):
-                pattern = "." + pattern[len(_CONFIG_DIR) :]
+                # The directory of the config in use, wherever it is written.
+                pattern, directory = "." + pattern[len(_CONFIG_DIR) :], config.parent
             literal = []
             for part in pattern.split("/"):
                 if any(ch in part for ch in "*?[{$"):
                     break
                 literal.append(part)
-            base = Path(os.path.normpath(config.parent.joinpath(*literal))).resolve()
+            base = Path(os.path.normpath(directory.joinpath(*literal))).resolve()
             if target == base or target.is_relative_to(base):
                 return True
     return False
+
+
+def _compile_lists(
+    config: Path, data: dict, stop: Path, below: tuple[Path, ...]
+) -> dict[str, tuple[object, Path]]:
+    """``files`` and ``include`` as the compiler reads them for ``config``,
+    each with the directory it resolves from: the config's own, or else the
+    nearest in its ``extends`` chain to set it (an array ``extends`` merges
+    left to right, so its last entry comes first). A key no config sets is
+    absent. Raises :class:`_Unknown` when a link of the chain cannot be read
+    (see :func:`_extended`), on a cycle, or deeper than :data:`_EXTENDS_DEPTH`."""
+    found = {key: (data[key], config.parent) for key in ("files", "include") if key in data}
+    if len(found) == 2:
+        return found
+    extends = data.get("extends", [])
+    if isinstance(extends, str):
+        extends = [extends]
+    if not isinstance(extends, list) or not all(isinstance(e, str) for e in extends):
+        raise _Unknown(str(config))
+    identity = config.resolve()
+    if identity in below or len(below) >= _EXTENDS_DEPTH:
+        raise _Unknown(str(config))
+    for name in reversed(extends):
+        base = _extended(config, name, stop)
+        for key, value in _compile_lists(base, _strict_config(base), stop, (*below, identity)).items():
+            found.setdefault(key, value)
+    return found
 
 
 def _fit(specifier: str, patterns: Iterable[str]) -> tuple[str, str] | None:
@@ -1052,7 +1136,7 @@ def _resolve(
             return hits[0] if hits else None
         if specifier.startswith("/") or not specifier:
             return None
-        options = _config(reader_dir, stop, strict, Path(reader_path) if solution else None)
+        options = _config(reader_dir, stop, strict, Path(reader_path) if solution else None, Path(reader_path))
         if options is None:
             return None
         targets = options.targets(specifier)
@@ -1393,7 +1477,7 @@ def jsx_automatic(reader_path: str, repo_dir: str) -> bool:
             data = json.loads(_strip_jsonc(config.read_text(encoding="utf-8")))
             if not isinstance(data, dict):
                 return False
-            if _may_compile(config, data, reader):
+            if _may_compile(config, data, reader, stop):
                 compiling.append(config)
     except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
         return False
@@ -1452,7 +1536,9 @@ _CONFIG_DIR = "${configDir}"
 _EXTENDS_DEPTH = 16
 
 
-def _inheriting(config: Path, stop: Path, below: tuple[Path, ...], strict: bool = True) -> list[tuple[Path, dict]]:
+def _inheriting(
+    config: Path, stop: Path, below: tuple[Path, ...], strict: bool = True, referencing: bool = False
+) -> list[tuple[Path, dict]]:
     """``config``'s ``compilerOptions`` and those of every config it
     ``extends``, nearest first: the first that sets an option sets it.
 
@@ -1463,7 +1549,8 @@ def _inheriting(config: Path, stop: Path, below: tuple[Path, ...], strict: bool 
     :data:`_EXTENDS_DEPTH`. ``below`` is the chain that led here, so a base
     two configs share is not taken for a cycle. Not ``strict``,
     ``references``, a repeated key and U+2028/U+2029 are read past (see
-    :func:`_options`).
+    :func:`_options`). ``referencing`` reads past ``references`` on
+    ``config`` alone, never on a config it extends.
     """
     identity = config.resolve()
     if identity in below or len(below) >= _EXTENDS_DEPTH:
@@ -1473,7 +1560,7 @@ def _inheriting(config: Path, stop: Path, below: tuple[Path, ...], strict: bool 
         # The compiler ends a line comment there; `_strip_jsonc` does not.
         raise _Unknown(str(config))
     data = json.loads(_strip_jsonc(text), object_pairs_hook=_no_repeats if strict else None)
-    if not isinstance(data, dict) or (strict and "references" in data):
+    if not isinstance(data, dict) or (strict and "references" in data and not referencing):
         raise _Unknown(str(config))
     options = data.get("compilerOptions", {})
     extends = data.get("extends", [])
@@ -3891,13 +3978,17 @@ def _enum_escapes(
     language: str,
     bound: dict[str, list[xk.KeyDeclaration]] | None = None,
     judged: list[tuple[int, int]] | None = None,
+    holders: bool = False,
 ) -> list[xk.Refusal]:
     """:func:`enum_escapes`, parsing ``source`` as ``language``. Given
     ``bound``, the code is a component's, which is never rewritten: a read of
     an entry there escapes too, and each name bound to the enum or its file
     is put in ``bound`` with the entries it can reach. Given ``judged``, the
     byte span of each import or ``require`` of the enum's file and of each
-    use followed from one is put in it."""
+    use followed from one is put in it. With ``holders``, which only a whole
+    module's judgment asks for (:func:`constant_module_escapes`), a
+    ``require`` stored in a slot written once and read only as
+    ``<slot>.<name>`` is followed too (``held`` below)."""
     if path.endswith((".d.ts", ".d.mts", ".d.cts")):
         return []
     by_module: dict[str, dict[str, list[xk.KeyDeclaration]]] = {}
@@ -4114,6 +4205,142 @@ def _enum_escapes(
         if n.type == "identifier" and _within(n, ("import_statement",)) is not None
     )
 
+    def binders_of(name: str) -> list[Node]:
+        """Every node binding ``name`` in the file, imports included."""
+        found = {n.id: n for n in ts_syntax.binding_nodes(root) if _text(n) == name}
+        for n in _walk(root):
+            if n.type == "identifier" and _text(n) == name and _within(n, ("import_statement",)) is not None:
+                found.setdefault(n.id, n)
+        return list(found.values())
+
+    def called(member: Node) -> bool:
+        """Whether ``member`` is called, which hands its object on as ``this``."""
+        outer = member
+        while outer.parent is not None and outer.parent.type in _TRANSPARENT:
+            outer = outer.parent
+        holder = outer.parent
+        return holder is not None and holder.type == "call_expression" and holder.child_by_field_name("function") == outer
+
+    def top_level(declarator: Node) -> bool:
+        """Whether ``declarator``'s declaration is a statement of the module
+        itself. Bound there and nowhere else in the file, a name means that
+        binding wherever it is spelled (no inner binding can shadow it), so
+        the write and every use are resolved to it by scope, not by name."""
+        lexical = declarator.parent
+        return lexical is not None and lexical.parent is not None and lexical.parent.type == "program"
+
+    def local_slot(target: Node) -> list[Node] | None:
+        """The other uses of ``target``, a local that a top-level ``let``
+        with no initialiser binds, alone in the file; None when it is not
+        one. A ``let`` anywhere else leaves ``target`` free where it is
+        written: a sloppy assignment to a global."""
+        local = _text(target)
+        # An assignment's target counts as a binding there; any other one
+        # is a second write.
+        binders = [n for n in binders_of(local) if n.id != target.id]
+        declarator = binders[0].parent if len(binders) == 1 else None
+        if (
+            declarator is None
+            or declarator.type != "variable_declarator"
+            or declarator.child_by_field_name("name") != binders[0]
+            or declarator.child_by_field_name("value") is not None
+            or not top_level(declarator)
+        ):
+            return None
+        lexical = declarator.parent
+        if (
+            lexical is None
+            or lexical.type != "lexical_declaration"
+            or not any(c.type == "let" for c in lexical.children)
+            or (lexical.parent is not None and lexical.parent.type == "export_statement")
+        ):
+            return None
+        return [n for n in uses(local, binders[0]) if n.id != target.id and not _in_type(n)]
+
+    def property_slot(left: Node) -> list[Node] | None:
+        """The other uses of ``h.p`` (``left``), where ``h`` is a top-level
+        ``const`` alone in the file, not exported, bound to an object literal of plain
+        properties none of which is ``p``, and only ever used as ``h.<name>``,
+        never called (a call hands ``h`` on as ``this``); None otherwise.
+        ``__proto__`` is refused wherever it is spelled: a prototype with a
+        setter for ``p`` would be handed the module by the write itself."""
+        obj = left.child_by_field_name("object")
+        prop = left.child_by_field_name("property")
+        if obj is None or obj.type != "identifier" or prop is None or prop.type != "property_identifier":
+            return None
+        holder, key = _text(obj), _text(prop)
+        if key == "__proto__":
+            return None
+        binders = binders_of(holder)
+        declarator = binders[0].parent if len(binders) == 1 else None
+        if (
+            declarator is None
+            or declarator.type != "variable_declarator"
+            or declarator.child_by_field_name("name") != binders[0]
+            or not _single_const(declarator)
+            or not top_level(declarator)
+        ):
+            return None
+        value = declarator.child_by_field_name("value")
+        if value is None or value.type != "object":
+            return None
+        for member in value.named_children:
+            if member.type == "comment":
+                continue
+            if member.type == "shorthand_property_identifier":
+                named = _text(member)
+            elif member.type == "pair":
+                name = member.child_by_field_name("key")
+                named = (
+                    _text(name)
+                    if name is not None and name.type == "property_identifier"
+                    else _string_value(name) if name is not None and name.type == "string" else None
+                )
+            else:
+                return None  # a spread, a method, a getter or setter
+            if named is None or named in (key, "__proto__"):
+                return None  # a computed key could be `p`
+        found: list[Node] = []
+        for use in uses(holder, binders[0]):
+            if _in_type(use):
+                continue
+            member = _member_of(use)
+            if member is None or called(member) or _text(member.child_by_field_name("property")) == "__proto__":
+                return None
+            if member.id == left.id or _text(member.child_by_field_name("property")) != key:
+                continue
+            found.append(member)
+        return found
+
+    def held(call: Node, module: str) -> bool:
+        """Whether ``call``, a ``require`` of ``module``, is stored by a
+        statement ``x = require(...)`` or ``h.p = require(...)`` in a slot
+        (:func:`local_slot`, :func:`property_slot`) that nothing else writes
+        and every other use reads only as ``<slot>.<name>``. Then the module
+        object goes nowhere but to those reads, as ``const m = require(...)``
+        followed as ``m.<name>`` does. Only a whole module is judged this way:
+        a slot holding an enum's file is not followed to the enum."""
+        assignment = call.parent
+        if (
+            not holders
+            or set(by_module[module]) != {_NO_ENUM}
+            or any(n.type == "with_statement" for n in _walk(root))
+            or assignment is None
+            or assignment.type != "assignment_expression"
+            or assignment.child_by_field_name("right") != call
+            or assignment.parent is None
+            or assignment.parent.type != "expression_statement"
+        ):
+            return False
+        left = assignment.child_by_field_name("left")
+        if left is not None and left.type == "identifier":
+            slot = local_slot(left)
+        elif left is not None and left.type == "member_expression":
+            slot = property_slot(left)
+        else:
+            slot = None
+        return slot is not None and all(_member_of(use) is not None for use in slot)
+
     def judge_import(statement: Node) -> None:
         clause = next((c for c in statement.named_children if c.type == "import_require_clause"), None)
         source_node = statement.child_by_field_name("source") or (
@@ -4205,6 +4432,8 @@ def _enum_escapes(
             ):
                 follow_enum(_text(target), target, by_module[module][_text(prop)])
                 return
+        if held(call, module):
+            return
         escape(call, every(module))
 
     def judge_specifier(node: Node) -> None:
@@ -4657,7 +4886,12 @@ def module_pattern(modules: Iterable[str], repo_dir: str) -> re.Pattern[str]:
 
 
 def module_escapes(
-    path: str, source: str, modules: Iterable[str], repo_dir: str, pattern: re.Pattern[str] | None = None
+    path: str,
+    source: str,
+    modules: Iterable[str],
+    repo_dir: str,
+    pattern: re.Pattern[str] | None = None,
+    holders: bool = False,
 ) -> list[xk.Refusal]:
     """Every use in ``path`` that hands one of ``modules`` on as an object,
     which can then reach any of its exports by a name computed at run time.
@@ -4667,9 +4901,14 @@ def module_escapes(
     re-export of it in any form, a dynamic ``import()``, ``import m =
     require(...)``, and every loader that can load it. A Vue, Svelte or
     Astro file is judged by :func:`component_escapes`, and its markup by
-    :func:`component_match` against ``pattern`` (built when not given)."""
+    :func:`component_match` against ``pattern`` (built when not given).
+    ``holders`` follows a ``require`` stored in a slot written once and read
+    only by member (see :func:`_enum_escapes`); a component's code is never
+    judged that way."""
     entries = _whole_modules(modules)
     if Path(path).suffix not in source_index.COMPONENT_SUFFIXES:
+        if holders:
+            return _enum_escapes(path, source, entries, repo_dir, _language(path), holders=True)
         return enum_escapes(path, source, entries, repo_dir)
     found = component_escapes(path, source, entries, repo_dir)
     hit = component_match(path, source, (pattern or module_pattern(modules, repo_dir),))
@@ -4686,12 +4925,17 @@ def constant_module_escapes(path: str, repo_dir: str) -> list[xk.Refusal]:
     a barrel's ``export * from`` (followed instead), a dynamic ``import()``,
     ``import m = require(...)``, and every loader that can load it, found
     through any specifier that can name it. Judged as a function wrapper's
-    module is (see :func:`flag_cleanup.wrapper_ts.handed_on`)."""
+    module is (see :func:`flag_cleanup.wrapper_ts.handed_on`), except that a
+    ``require`` stored in a slot written once and read only as
+    ``<slot>.<name>`` (``modules.constants = require(...)``, then
+    ``modules.constants.OTHER``) reaches no export by a computed name, so it
+    is followed rather than refused. A function wrapper's module is not
+    judged so: a call through the slot is one its proof never looks for."""
     from flag_cleanup import wrapper_ts
 
     return [
         xk.Refusal(where, line, xk.UNSUPPORTED_FORM, text)
-        for where, line, text in wrapper_ts.handed_on(repo_dir, path, named=True)
+        for where, line, text in wrapper_ts.handed_on(repo_dir, path, named=True, holders=True)
     ]
 
 

@@ -93,8 +93,14 @@ _TS = [
 
 _PY_UNEQUAL = (("True", "False"), ("False", "True"))
 _PY_MESSAGE = rf"(?:\s*,\s*(?:msg\s*=\s*)?{_STRING})?"
+#: Where an `assert` statement's test ends: its message, a comment, a `;`, a
+#: backslash continuation or the line (`\r` too: `$` matches before a `\n`
+#: only, and a CRLF file's line ends `\r\n`). A test that only STARTS with the
+#: literal (`assert False == x`, `assert False in xs`) is not decided by it, so
+#: it is not counted.
+_PY_TEST_END = r"(?=[ \t]*(?:[,#;\r\\]|$))"
 _PYTHON = [
-    r"^[ \t]*assert[ \t]+False\b",
+    r"^[ \t]*assert[ \t]+(?:False|\([ \t]*False[ \t]*\))" + rf"(?:\s*,\s*{_STRING})?" + _PY_TEST_END,
     _call(r"\bself\s*\.\s*assertTrue", "False" + _PY_MESSAGE),
     _call(r"\bself\s*\.\s*assertFalse", "True" + _PY_MESSAGE),
     *[
@@ -106,7 +112,7 @@ _PYTHON = [
         _call(r"\bself\s*\.\s*(?:assertEqual|assertIs)", pair + _PY_MESSAGE)
         for pair in _either((r"(?:True|False)", "None"), ("None", r"(?:True|False)"))
     ],
-    r"^[ \t]*assert[ \t]+(?:True|False)[ \t]+(?:is|==)[ \t]+None\b",
+    r"^[ \t]*assert[ \t]+(?:True|False)[ \t]+(?:is|==)[ \t]+None" + _PY_TEST_END,
 ]
 
 #: testify, on `assert` or `require`, test handle first; an optional single

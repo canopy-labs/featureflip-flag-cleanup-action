@@ -2083,6 +2083,8 @@ def _top_level_bindings_are_private(root: Node, language: str) -> bool:
     """
     if language not in _TS_MODULE_LANGUAGES:
         return False
+    if any(_assigns_commonjs_exports(statement) for statement in root.children):
+        return True
     for node in _walk(root):
         if node.type in _MODULE_EVIDENCE:
             return True
@@ -2091,6 +2093,29 @@ def _top_level_bindings_are_private(root: Node, language: str) -> bool:
             if callee is not None and callee.type == "identifier":
                 if callee.text == b"require":
                     return True
+    return False
+
+
+def _assigns_commonjs_exports(statement: Node) -> bool:
+    """``module.exports = …``, ``module.exports.x = …`` or ``exports.x = …`` as
+    a statement of the program itself: CommonJS, whose module wrapper makes the
+    top level private as ``require`` does. Only at the top level: a UMD
+    bundle assigns it under a ``typeof module`` guard and also runs as a
+    classic script."""
+    if statement.type != "expression_statement" or not statement.named_children:
+        return False
+    assignment = statement.named_children[0]
+    if assignment.type != "assignment_expression":
+        return False
+    target = assignment.child_by_field_name("left")
+    while target is not None and target.type == "member_expression":
+        obj = target.child_by_field_name("object")
+        prop = target.child_by_field_name("property")
+        if obj is not None and obj.type == "identifier":
+            if obj.text == b"exports":
+                return True
+            return obj.text == b"module" and prop is not None and prop.text == b"exports"
+        target = obj
     return False
 
 

@@ -326,6 +326,95 @@ contains = """(
 )"""
 at_least = 1
 
+# The same four with ONE comment between the member and its `;`
+# (`'k'?: boolean /* c */; 'b'?: boolean`). The `.` anchor does not skip a
+# comment, so without these the `;` stayed and the deletion left `{ ;` or a
+# doubled `;` behind. Rewritten, the comment goes with the member and its `,`,
+# as it does in a `,`-separated type.
+[[rules]]
+name = "rewrite_flag_keyed_boolean_type_member_separator_with_later_member_after_comment"
+query = """(
+  (object_type
+    (property_signature
+      [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
+      type: (type_annotation (predefined_type) @member_type)) @entry
+    . (comment) . (";") @separator
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @member_type "boolean")
+)"""
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
+holes = ["stale_flag_name"]
+
+[[rules]]
+name = "rewrite_flag_keyed_boolean_type_member_separator_with_earlier_member_after_comment"
+query = """(
+  (object_type
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
+    (property_signature
+      [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]
+      type: (type_annotation (predefined_type) @member_type)) @entry
+    . (comment) . (";") @separator)
+  (#eq? @flag_name "@stale_flag_name")
+  (#eq? @member_type "boolean")
+)"""
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
+holes = ["stale_flag_name"]
+
+[[rules]]
+name = "rewrite_flag_keyed_registry_type_member_separator_with_later_member_after_comment"
+query = """(
+  (object_type
+    (property_signature [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]) @entry
+    . (comment) . (";") @separator
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)])
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
+holes = ["stale_flag_name", "known_flag_keys"]
+
+[[rules.filters]]
+enclosing_node = "(object_type) @registry"
+contains = """(
+  (property_signature [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
+  (#any-of? @sibling @known_flag_keys)
+)"""
+at_least = 1
+
+[[rules]]
+name = "rewrite_flag_keyed_registry_type_member_separator_with_earlier_member_after_comment"
+query = """(
+  (object_type
+    [(property_signature) (method_signature) (index_signature) (call_signature) (construct_signature)]
+    (property_signature [(string . (string_fragment) @flag_name .) (property_identifier) @flag_name]) @entry
+    . (comment) . (";") @separator)
+  (#eq? @flag_name "@stale_flag_name")
+)"""
+replace_node = "separator"
+replace = ","
+groups = ["rewrite_flag_keyed_separator"]
+holes = ["stale_flag_name", "known_flag_keys"]
+
+[[rules.filters]]
+enclosing_node = "(object_type) @registry"
+contains = """(
+  (property_signature [(string . (string_fragment) @sibling .) (property_identifier) @sibling])
+  (#any-of? @sibling @known_flag_keys)
+)"""
+at_least = 1
+
+# --- Stage 2: delete the member --------------------------------------------
+# The `not_contains` filter is the belt to stage 1's braces: it declines a
+# member still followed by a `;`, so a mis-ordered file is a no-op instead of
+# an engine panic. Its capture names are prefixed because Piranha substitutes
+# a rule's OWN captures into its filter queries (see `rules/kt.toml`).
+
 # --- Stage 2: delete the member --------------------------------------------
 # The `not_contains` filter is the belt to stage 1's braces: it declines a
 # member still followed by a `;`, so a mis-ordered file is a no-op instead of
@@ -355,6 +444,10 @@ not_contains = ["""(
   (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
+)""", """(
+  (property_signature [(string . (string_fragment) @commented_name .) (property_identifier) @commented_name])
+  . (comment) . (";")
+  (#eq? @commented_name "@stale_flag_name")
 )"""]
 
 # STUB PRONG, an earlier surviving member.
@@ -380,6 +473,10 @@ not_contains = ["""(
   (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
+)""", """(
+  (property_signature [(string . (string_fragment) @commented_name .) (property_identifier) @commented_name])
+  . (comment) . (";")
+  (#eq? @commented_name "@stale_flag_name")
 )"""]
 
 # REGISTRY PRONG, a later surviving member.
@@ -410,6 +507,10 @@ not_contains = ["""(
   (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
+)""", """(
+  (property_signature [(string . (string_fragment) @commented_name .) (property_identifier) @commented_name])
+  . (comment) . (";")
+  (#eq? @commented_name "@stale_flag_name")
 )"""]
 
 # REGISTRY PRONG, an earlier surviving member.
@@ -440,6 +541,10 @@ not_contains = ["""(
   (property_signature [(string . (string_fragment) @unseparated_name .) (property_identifier) @unseparated_name])
   . (";")
   (#eq? @unseparated_name "@stale_flag_name")
+)""", """(
+  (property_signature [(string . (string_fragment) @commented_name .) (property_identifier) @commented_name])
+  . (comment) . (";")
+  (#eq? @commented_name "@stale_flag_name")
 )"""]
 
 

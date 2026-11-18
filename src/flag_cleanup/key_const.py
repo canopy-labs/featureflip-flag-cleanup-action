@@ -61,7 +61,7 @@ from tree_sitter import Node
 from flag_cleanup import dead_branches, kotlin_sentinel, rule_synthesis, ts_prototype, ts_syntax
 from flag_cleanup.tree_walk import preorder
 
-__all__ = ["KeyConst", "path_is_safe", "supported_languages", "key_consts"]
+__all__ = ["KeyConst", "path_is_safe", "removable_reads", "supported_languages", "key_consts", "withheld_reason"]
 
 
 @dataclass(frozen=True)
@@ -132,6 +132,21 @@ class _Profile:
     is_binding: Callable[[Node], bool] | None = None
     binding_ids: Callable[[Node], set[int]] | None = None
     withholds: Callable[[Node, bytes, list[KeyConst]], bool] | None = None
+    #: Asked only by a ``fold_only`` question, which lets every other use of
+    #: the name stand: the reason the file is still withheld (a spelling of
+    #: the name that is not a read of it, a scope the name could resolve to
+    #: something else in), or ``None``. An allow-list of read positions, so a
+    #: binder this module does not know is refused rather than folded under.
+    fold_only_withholds: Callable[[Node, bytes, list[KeyConst]], str | None] | None = None
+    #: The block a LOCAL key constant is scoped to, or ``None`` for one that is
+    #: not local. A local's name means the constant only after its declaration
+    #: and inside that block: before it, or outside, the same name resolves to
+    #: something else (a package constant, an inherited field), which the
+    #: binding count cannot see because it is declared in another file.
+    local_scope: Callable[[KeyConst], Node | None] | None = None
+    #: Optional: the reason ``withholds`` gave, worded for the log, when it
+    #: has one to give (``None`` falls back to a generic one).
+    withholds_reason: Callable[[Node, bytes, list[KeyConst]], str | None] | None = None
 
 
 # Populated at the bottom of this module, once every profile function exists.
@@ -202,17 +217,58 @@ def path_is_safe(
     exactly once. Its references may then be anything (a log line, a defaults
     map entry): the caller strips the delete rules, so the declaration stays
     and every other use of it keeps resolving. Only a language whose constant
-    cannot be reassigned may ask it.
+    cannot be reassigned may ask it, and the profile's ``fold_only_withholds``
+    must then also hold: every other spelling of the name is a read of it.
     """
+    return (
+        withheld_reason(
+            root, source_bytes, language, flag_key, accessors, treatment, kept_branches, fold_only
+        )
+        is None
+    )
+
+
+#: What :func:`withheld_reason` says of a name bound more than once.
+DECLARED_TWICE = "is declared more than once in the file"
+
+
+def withheld_reason(
+    root: Node,
+    source_bytes: bytes,
+    language: str,
+    flag_key: str,
+    accessors: tuple[str, ...] | frozenset[str] = (),
+    treatment: bool | None = None,
+    kept_branches: bool = False,
+    fold_only: bool = False,
+) -> str | None:
+    """Why :func:`path_is_safe` withholds this file, worded for the run's log
+    (it names the constant, and the line where one is known), or ``None`` when
+    it does not. The same question, answered with its reason: a file withheld
+    with a flag read left in it must say so, or the refusal reads exactly like
+    "nothing matched"."""
     accessor_names = frozenset(accessors)
     profile = _PROFILES.get(language)
     if profile is None:
-        return True
+        return None
     consts = profile.key_consts(root, source_bytes, flag_key)
     if not consts:
-        return True
+        return None
+    names = ", ".join(dict.fromkeys(c.name for c in consts))
     if profile.withholds is not None and profile.withholds(root, source_bytes, consts):
-        return False
+        specific = (
+            profile.withholds_reason(root, source_bytes, consts)
+            if profile.withholds_reason is not None
+            else None
+        )
+        return specific or (
+            f"key constant {names} is in a shape the run keeps whole in this language "
+            "(a reason is logged above where one is known)"
+        )
+    if fold_only and profile.fold_only_withholds is not None:
+        reason = profile.fold_only_withholds(root, source_bytes, consts)
+        if reason is not None:
+            return reason
     blocks = (
         _dead_blocks(root, source_bytes, language, consts, profile, accessor_names, treatment)
         if treatment is not None and dead_branches.supported(language)
@@ -246,15 +302,80 @@ def path_is_safe(
         # something other than the declaration the rules matched, and the
         # `enclosing_node` filter cannot tell the difference.
         if bindings != 1:
-            return False
+            return (
+                f"key constant {const.name} {DECLARED_TWICE} "
+                f"(line {const.name_nodes[0].start_point[0] + 1} and another), so a read "
+                "of it may mean the other declaration"
+            )
+        scope = profile.local_scope(const) if profile.local_scope is not None else None
+        if scope is not None:
+            outside = next(
+                (
+                    node
+                    for node in references
+                    if node.start_byte < const.declaration.end_byte or node.end_byte > scope.end_byte
+                ),
+                None,
+            )
+            if outside is not None:
+                return (
+                    f"key constant {const.name} is local (line "
+                    f"{const.name_nodes[0].start_point[0] + 1}), and the name is also spelled "
+                    f"at line {outside.start_point[0] + 1}, before its declaration or outside "
+                    "its block, where it means something else"
+                )
         if fold_only:
             continue
-        if not all(
-            profile.is_removable_read(node, accessor_names) or dead_branches.inside(node, blocks)
-            for node in references
-        ):
-            return False
-    return True
+        other = next(
+            (
+                node
+                for node in references
+                if not (
+                    profile.is_removable_read(node, accessor_names)
+                    or dead_branches.inside(node, blocks)
+                )
+            ),
+            None,
+        )
+        if other is not None:
+            return (
+                f"key constant {const.name} is also used at line {other.start_point[0] + 1}, "
+                "outside a flag read the run removes"
+            )
+    return None
+
+
+def removable_reads(
+    root: Node, source_bytes: bytes, language: str, flag_key: str, accessors: tuple[str, ...] = ()
+) -> list[tuple[str, int, bool]]:
+    """``(constant name, line, ambiguous)`` for every read of a hoisted key
+    that the const rules would fold, in source order: what a withheld file
+    leaves unfolded. ``ambiguous`` when the file binds that name more than
+    once (a parameter, a local, a pattern), so the read may mean the other."""
+    profile = _PROFILES.get(language)
+    if profile is None:
+        return []
+    consts = profile.key_consts(root, source_bytes, flag_key)
+    accessor_names = frozenset(accessors)
+    declared = {node.id for const in consts for node in const.name_nodes}
+    binding_ids = profile.binding_ids(root) if profile.binding_ids is not None else None
+
+    def _binds(node: Node) -> bool:
+        if binding_ids is not None:
+            return node.id in binding_ids
+        return profile.is_binding is not None and profile.is_binding(node)
+
+    bound: dict[str, int] = {}
+    reads: list[tuple[str, Node]] = []
+    for node in _walk(root):
+        const = next((c for c in consts if profile.is_reference(node, source_bytes, c.name)), None)
+        if const is None:
+            continue
+        if node.id in declared or _binds(node):
+            bound[const.name] = bound.get(const.name, 0) + 1
+        elif profile.is_removable_read(node, accessor_names):
+            reads.append((const.name, node))
+    return [(name, node.start_point[0] + 1, bound.get(name, 0) > 1) for name, node in reads]
 
 
 def dead_references(
@@ -790,7 +911,9 @@ _GO_NAME_FIELD_PARENTS = (
 #: declaration this gate matched is not the constant it appears to be. Counting
 #: it as a binding pushes the count past one and refuses, which is the safe
 #: direction.
-_GO_LEFT_FIELD_PARENTS = ("short_var_declaration", "range_clause", "assignment_statement")
+_GO_LEFT_FIELD_PARENTS = (
+    "short_var_declaration", "range_clause", "assignment_statement", "receive_statement",
+)
 
 
 def _go_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
@@ -953,6 +1076,24 @@ def go_file(path: str | None) -> Iterator[None]:
         _GO_FILE.reset(token)
 
 
+#: ``(start, end, text)`` of the property reads of the file being asked about
+#: that the run marks for its fold (``ts_async_reads.const_marks``).
+_TS_MARKED: ContextVar[frozenset[tuple[int, int, bytes]]] = ContextVar("ts_marked_reads", default=frozenset())
+
+
+@contextlib.contextmanager
+def marked_reads(spans: frozenset[tuple[int, int, bytes]]) -> Iterator[None]:
+    """The un-awaited property reads of the next gate question's file that the
+    run marks and folds whole: each counts as a removable read of its key
+    constant (:func:`_ts_is_removable_read`). A span is matched with its text,
+    so a file edited since it was planned matches none of them."""
+    token = _TS_MARKED.set(spans)
+    try:
+        yield
+    finally:
+        _TS_MARKED.reset(token)
+
+
 def _go_holder_call(const: KeyConst) -> Node | None:
     for spec in _walk(const.declaration):
         if spec.type != "var_spec":
@@ -1045,6 +1186,53 @@ def go_handle_findings(
     return found
 
 
+#: Go: the parents under which an identifier is a pure READ of a name. Asked
+#: only when every other use of a key constant may stand (``fold_only``): a
+#: spelling of the name anywhere else withholds the file, so a binder kind
+#: :func:`_go_is_binding` does not know is refused, not folded under.
+_GO_READ_PARENTS = frozenset({
+    "argument_list", "binary_expression", "literal_element", "parenthesized_expression",
+    "index_expression", "slice_expression", "send_statement", "return_statement",
+})
+#: An ``expression_list`` reads its names only as these fields of its parent
+#: (``x := k``, ``v = k``, ``const c = k``, ``for _, x := range k``), or
+#: under a ``return`` or a ``case``.
+_GO_READ_LIST_FIELDS = frozenset({"right", "value"})
+_GO_READ_LIST_PARENTS = frozenset({"return_statement", "expression_case"})
+
+
+def _go_fold_only_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> str | None:
+    """Why a Go key constant's reads may not fold while its other uses stand:
+    its name is spelled somewhere that is neither its declaration nor a read
+    of it. A Go ``const`` cannot be assigned or addressed, so once every
+    spelling is a read, each one holds the key."""
+    declared = {node.id for const in consts for node in const.name_nodes}
+    names = {const.name for const in consts if not go_is_var_holder(const)}
+    for node in _walk(root):
+        if node.type != "identifier" or node.id in declared or _text(node, source_bytes) not in names:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type in _GO_READ_PARENTS:
+            continue
+        if parent is not None and parent.type == "expression_list" and parent.parent is not None:
+            holder = parent.parent
+            index = next(i for i, c in enumerate(holder.children) if c.id == parent.id)
+            if holder.type in _GO_READ_LIST_PARENTS or holder.field_name_for_child(index) in _GO_READ_LIST_FIELDS:
+                continue
+        return (
+            f"key constant {_text(node, source_bytes)} is also spelled at line "
+            f"{node.start_point[0] + 1} as something other than a read of it"
+        )
+    return None
+
+
+def _go_local_scope(const: KeyConst) -> Node | None:
+    """The block a function-level ``const`` is declared in (see
+    :attr:`_Profile.local_scope`); ``None`` at package level."""
+    parent = const.declaration.parent
+    return None if parent is None or parent.type == "source_file" else parent
+
+
 def _go_is_binding(node: Node) -> bool:
     parent = node.parent
     if parent is None:
@@ -1135,7 +1323,15 @@ _JAVA_NAME_FIELD_PARENTS = (
     "interface_declaration",
     "record_declaration",
     "type_parameter",
+    # `o instanceof String NAME`, `try (var NAME = …)`, `enum E { NAME }`.
+    "instanceof_expression",
+    "resource",
+    "enum_constant",
 )
+
+#: Pattern nodes whose every ``identifier`` child is a binder: `case String
+#: NAME ->`, and a record pattern's `Point(String NAME, int y)`.
+_JAVA_PATTERN_BINDERS = ("type_pattern", "record_pattern_component")
 
 
 def _java_key_consts(root: Node, source_bytes: bytes, flag_key: str) -> list[KeyConst]:
@@ -1197,7 +1393,7 @@ def _java_is_binding(node: Node) -> bool:
         parameters = parent.child_by_field_name("parameters")
         if parameters is not None and parameters.id == node.id:
             return True
-    if parent.type == "inferred_parameters":
+    if parent.type == "inferred_parameters" or parent.type in _JAVA_PATTERN_BINDERS:
         return True
     # A `final` constant cannot be assigned to, so the name appearing on the
     # left of an assignment means the declaration matched is not the constant
@@ -1208,6 +1404,104 @@ def _java_is_binding(node: Node) -> bool:
         if left is not None and left.id == node.id:
             return True
     return False
+
+
+#: Java: the parents under which an identifier is a pure READ of a name (see
+#: :data:`_GO_READ_PARENTS`), and those where it is one only in a field.
+_JAVA_READ_PARENTS = frozenset({
+    "argument_list", "annotation_argument_list", "element_value_array_initializer",
+    "array_initializer", "switch_label", "binary_expression", "parenthesized_expression",
+    "return_statement", "yield_statement", "ternary_expression", "assert_statement",
+})
+_JAVA_READ_FIELDS = {
+    "element_value_pair": ("value",),
+    "assignment_expression": ("right",),
+    "variable_declarator": ("value",),
+    "cast_expression": ("value",),
+    "method_invocation": ("object",),
+    "field_access": ("object",),
+    "lambda_expression": ("body",),
+    "array_access": ("array", "index"),
+    "instanceof_expression": ("left",),
+}
+#: Bodies whose members a bare name is looked up in before an enclosing scope.
+_JAVA_BODIES = frozenset({"class_body", "interface_body", "enum_body"})
+
+
+def _java_inherits_here(node: Node, owner: Node) -> bool:
+    """Whether ``node``, a bare read of a constant declared directly in
+    ``owner`` (a class body, or the block of a local), could resolve to a
+    member of a supertype instead. Java looks a simple name up in the members
+    of each enclosing class, INHERITED ones included, before the scope
+    outside it, and a supertype can come from another file. So a read inside
+    an anonymous class, or a class, interface, enum or record that names a
+    supertype, between the read and ``owner`` may mean that member; a read
+    that is not inside ``owner`` at all (a subclass, a static import) is
+    reached through one."""
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.id == owner.id:
+            return False
+        if ancestor.type in _JAVA_BODIES:
+            declaration = ancestor.parent
+            if declaration is None or declaration.type == "object_creation_expression":
+                return True
+            if any(
+                c.type in ("superclass", "super_interfaces", "extends_interfaces")
+                for c in declaration.children
+            ):
+                return True
+        ancestor = ancestor.parent
+    return True
+
+
+def _java_fold_only_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> str | None:
+    """Why a Java key constant's reads may not fold while its other uses
+    stand: its name is spelled somewhere that is neither its declaration nor
+    a read of it, or a read could resolve to an inherited member. A ``final``
+    whose initialiser is a string literal is a constant variable: it cannot
+    be assigned, and ``javac`` inlines its value at every read."""
+    declared = {node.id for const in consts for node in const.name_nodes}
+    owners = {const.name: const.declaration.parent for const in consts}
+    for node in _walk(root):
+        if node.type != "identifier" or node.id in declared:
+            continue
+        name = _text(node, source_bytes)
+        if name not in owners:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        field = parent.child_by_field_name("field") if parent.type == "field_access" else None
+        if field is not None and field.id == node.id:
+            continue  # `x.NAME`, `this.NAME`: a member name, not the bare read folded
+        read = parent.type in _JAVA_READ_PARENTS
+        if not read:
+            fields = _JAVA_READ_FIELDS.get(parent.type)
+            if fields is not None:
+                index = next(i for i, c in enumerate(parent.children) if c.id == node.id)
+                read = parent.field_name_for_child(index) in fields
+        if not read:
+            return (
+                f"key constant {name} is also spelled at line {node.start_point[0] + 1} "
+                "as something other than a read of it"
+            )
+        owner = owners[name]
+        if owner is None or _java_inherits_here(node, owner):
+            return (
+                f"key constant {name} is read at line {node.start_point[0] + 1} inside a "
+                "class whose supertype could declare the same name, or outside the type "
+                "that declares it"
+            )
+    return None
+
+
+def _java_local_scope(const: KeyConst) -> Node | None:
+    """The block a ``final`` local is declared in (see
+    :attr:`_Profile.local_scope`); ``None`` for a field."""
+    if const.declaration.type != "local_variable_declaration":
+        return None
+    return const.declaration.parent
 
 
 def _java_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
@@ -1242,7 +1536,205 @@ _TS_AWAITED_ONLY_CALLEES = frozenset({"getBooleanValue"})
 #: real use of the value under a node type of its own. Counting it as a
 #: reference makes it a non-removable read, so such a file is withheld -- the
 #: safe direction, since the delete rule would otherwise strand it.
-_TS_REFERENCE_TYPES = ("identifier", "shorthand_property_identifier")
+#:
+#: A destructured ``const { OLD_CHECKOUT } = o`` rebinds the name under a node
+#: type of its own too, and an occurrence this walk never visits is never
+#: counted as the second binding that withholds the file.
+_TS_REFERENCE_TYPES = (
+    "identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern",
+)
+#: A class names its binding with a ``type_identifier``, and a class is a VALUE
+#: too: a nested ``class OLD_CHECKOUT {}`` shadows the constant. A type alias
+#: or an interface of the same name does not (`type K = typeof K` is common),
+#: so only a class's name is counted.
+_TS_CLASS_DECLARATIONS = frozenset({"class_declaration", "abstract_class_declaration", "class"})
+
+
+def _ts_enum_member(node: Node) -> bool:
+    """An enum member's name (`enum E { NAME }`, `enum E { NAME = … }`). In a
+    `namespace E` merged with that enum, a bare `NAME` means the member, so
+    the gate counts one as a second binding of the name."""
+    parent = node.parent
+    if node.type != "property_identifier" or parent is None:
+        return False
+    if parent.type == "enum_body":
+        return True
+    return parent.type == "enum_assignment" and parent.parent is not None and parent.parent.type == "enum_body"
+
+
+def _ts_is_reference(node: Node, source_bytes: bytes, name: str) -> bool:
+    if _ts_enum_member(node):
+        return _text(node, source_bytes) == name
+    if node.type == "type_identifier":
+        parent = node.parent
+        if parent is None or parent.type not in _TS_CLASS_DECLARATIONS:
+            return False
+        declared = parent.child_by_field_name("name")
+        return declared is not None and declared.id == node.id and _text(node, source_bytes) == name
+    return _is_named_identifier(node, source_bytes, name, _TS_REFERENCE_TYPES)
+
+
+#: TypeScript/JavaScript: the parents under which a name is a pure READ of it
+#: (see :data:`_GO_READ_PARENTS`), and those where it is one only in a field.
+#: Anything else -- a binder of any kind (`import K = Ns.Name` in a namespace,
+#: a parameter, a pattern), an update, a label -- withholds the file.
+_TS_READ_PARENTS = frozenset({
+    "arguments", "binary_expression", "array", "spread_element", "template_substitution",
+    "computed_property_name", "return_statement", "parenthesized_expression",
+    "ternary_expression", "as_expression", "satisfies_expression", "non_null_expression",
+    "type_assertion", "type_query", "await_expression", "throw_statement",
+    "sequence_expression", "jsx_expression", "expression_statement",
+})
+_TS_READ_FIELDS = {
+    "variable_declarator": ("value",),
+    "assignment_expression": ("right",),
+    "augmented_assignment_expression": ("right",),
+    "pair": ("value",),
+    "export_specifier": ("name",),
+    "export_statement": ("value",),
+    "required_parameter": ("value",),
+    "optional_parameter": ("value",),
+    "assignment_pattern": ("right",),
+    "object_assignment_pattern": ("right",),
+    "arrow_function": ("body",),
+    "member_expression": ("object",),
+    "subscript_expression": ("object", "index"),
+    "public_field_definition": ("value",),
+    "field_definition": ("value",),
+    "for_in_statement": ("right",),
+    "enum_assignment": ("value",),
+    "switch_case": ("value",),
+    "unary_expression": ("argument",),
+}
+
+
+#: Import forms that bind a name with no field ``binding_nodes`` reads it by:
+#: `import K = Ns.Name` and `import K = require("m")` (legal inside a
+#: `namespace`, where they shadow an outer `K`), a default import, `* as K`.
+#: Kept here rather than in ``binding_nodes``, whose other callers count
+#: bindings for their own questions.
+_TS_IMPORT_BINDERS = frozenset({"import_alias", "import_require_clause", "namespace_import", "import_clause"})
+
+
+def _ts_binding_ids(root: Node) -> set[int]:
+    ids = {n.id for n in ts_syntax.binding_nodes(root)}
+    for node in _walk(root):
+        if _ts_enum_member(node):
+            ids.add(node.id)
+        elif node.type in _TS_IMPORT_BINDERS:
+            ids.update(c.id for c in node.named_children if c.type == "identifier")
+        elif node.type == "import_specifier":
+            alias = node.child_by_field_name("alias")
+            if alias is not None:
+                ids.add(alias.id)
+    return ids
+
+
+def _ts_local_scope(const: KeyConst) -> Node | None:
+    """The block a ``const`` below the top level is declared in (see
+    :attr:`_Profile.local_scope`). A read before it is in its temporal dead
+    zone, and one outside it means another binding."""
+    parent = const.declaration.parent
+    if parent is None or parent.type in ("program", "export_statement"):
+        return None
+    return parent
+
+
+def _ts_direct_eval(root: Node) -> Node | None:
+    """A direct ``eval(…)`` call: in sloppy mode it can declare a ``var`` of any
+    name in the calling function, shadowing the constant there."""
+    for node in _walk(root):
+        if node.type == "call_expression":
+            callee = node.child_by_field_name("function")
+            if callee is not None and callee.type == "identifier" and callee.text == b"eval":
+                return node
+    return None
+
+
+#: Namespace bodies: `namespace N { … }`, `module N { … }`.
+_TS_NAMESPACES = frozenset({"internal_module", "module"})
+
+
+def _ts_merged_namespace_read(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> Node | None:
+    """A spelling of a key constant's name inside ANY ``namespace``/``module``
+    body or ``declare`` block, in a script or a module, exported or not.
+
+    A namespace is open to declaration merging from other files, and a member
+    merged in wins over the outer constant inside its body: in a script every
+    ``namespace N`` is one global namespace, another file's ``declare module
+    './a' { namespace N { const NAME } }`` augments a module's exported one,
+    and ``declare global`` reaches the global ones from a module. Which merge
+    can reach which namespace is not decided here: namespaces are rare in
+    current TypeScript, so refusing every one is cheap and sound."""
+    declared = {node.id for const in consts for node in const.name_nodes}
+    names = {const.name for const in consts}
+    for node in _walk(root):
+        if node.type != "identifier" or node.id in declared or _text(node, source_bytes) not in names:
+            continue
+        ancestor = node.parent
+        while ancestor is not None:
+            if ancestor.type == "ambient_declaration" or ancestor.type in _TS_NAMESPACES:
+                return node
+            ancestor = ancestor.parent
+    return None
+
+
+def _ts_withholds_reason(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> str | None:
+    call = _ts_direct_eval(root)
+    if call is not None:
+        return (
+            f"key constant {', '.join(dict.fromkeys(c.name for c in consts))} is in a file that "
+            f"calls `eval` directly (line {call.start_point[0] + 1}), which can declare a "
+            "variable of that name"
+        )
+    read = _ts_merged_namespace_read(root, source_bytes, consts)
+    if read is not None:
+        return (
+            f"key constant {_text(read, source_bytes)} is named at line {read.start_point[0] + 1} "
+            "inside a namespace, which another file can merge a member of that name into "
+            "that would win there"
+        )
+    return None
+
+
+def _ts_fold_only_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> str | None:
+    """Why a TypeScript or JavaScript key constant's reads may not fold while
+    its other uses stand. A ``const`` cannot be assigned, here or by an
+    importer; what is left is name resolution. Every spelling of the name must
+    be the declaration or a read in a position :data:`_TS_READ_PARENTS` /
+    :data:`_TS_READ_FIELDS` lists, so a binder this module does not know is
+    refused rather than folded under; and a ``with`` block (a bare name may be
+    a property of its object) withholds the file."""
+    declared = {node.id for const in consts for node in const.name_nodes}
+    names = {const.name for const in consts}
+    for node in _walk(root):
+        if node.type == "with_statement":
+            return (
+                f"key constant {', '.join(sorted(names))} is in a file with a `with` statement "
+                f"(line {node.start_point[0] + 1}), inside which a bare name may mean a property"
+            )
+        if node.type not in _TS_REFERENCE_TYPES or node.id in declared:
+            continue
+        name = _text(node, source_bytes)
+        if name not in names:
+            continue
+        parent = node.parent
+        if parent is None:
+            continue
+        if node.type == "shorthand_property_identifier" and parent.type == "object":
+            continue  # `{ NAME }`: a read of it
+        read = node.type == "identifier" and parent.type in _TS_READ_PARENTS
+        if not read and node.type == "identifier":
+            fields = _TS_READ_FIELDS.get(parent.type)
+            if fields is not None:
+                index = next(i for i, c in enumerate(parent.children) if c.id == node.id)
+                read = parent.field_name_for_child(index) in fields
+        if not read:
+            return (
+                f"key constant {name} is also spelled at line {node.start_point[0] + 1} "
+                "as something other than a read of it"
+            )
+    return None
 
 
 def _ts_ascription(node: Node, kind: str) -> Node | None:
@@ -1901,7 +2393,13 @@ def _ts_withholds(root: Node, source_bytes: bytes, consts: list[KeyConst]) -> bo
     """A holder is folded only where another file reads it, and only once its
     class is proven (:func:`_ts_holder_proven`): any mention of it in its own
     file but the declaration -- a read, a registry, ``export { NAME }``,
-    ``typeof NAME`` -- or a class that cannot be proven keeps the file."""
+    ``typeof NAME`` -- or a class that cannot be proven keeps the file.
+
+    A direct ``eval(…)`` keeps every key constant of the file: in sloppy mode
+    it can declare a ``var`` of the constant's name in the function that calls
+    it, and a read after it then means that ``var``."""
+    if _ts_direct_eval(root) is not None or _ts_merged_namespace_read(root, source_bytes, consts) is not None:
+        return True
     holders = [c for c in consts if ts_is_holder(c)]
     if not holders:
         return False
@@ -1951,6 +2449,10 @@ def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     if call.type != "call_expression":
         return False
     if isinstance(index, str):
+        if (call.start_byte, call.end_byte, call.text) in _TS_MARKED.get():
+            # Un-awaited, decided by `ts_async_reads` and marked whole: the
+            # sentinel fold removes it, whatever the accessor list now holds.
+            return not ts_syntax.declined_by_object_key_rules(call, index, awaited=False)
         if ts_syntax.declined_by_object_key_rules(call, index):
             return False
     elif ts_syntax.declined_by_const_rules(call, positioned=bool(index)):
@@ -3274,18 +3776,21 @@ _PROFILES.update(
             is_binding=_go_is_binding,
             is_removable_read=_go_is_removable_read,
             withholds=_go_withholds,
+            fold_only_withholds=_go_fold_only_withholds,
+            local_scope=_go_local_scope,
         ),
         **{
             language: _Profile(
                 key_consts=_ts_key_consts,
-                is_reference=lambda n, b, name: _is_named_identifier(
-                    n, b, name, _TS_REFERENCE_TYPES
-                ),
+                is_reference=_ts_is_reference,
                 # Reuses `ts_syntax`'s own binding traversal rather than a
                 # second copy of its field rules — see `binding_nodes` there.
-                binding_ids=lambda root: {n.id for n in ts_syntax.binding_nodes(root)},
+                binding_ids=_ts_binding_ids,
                 is_removable_read=_ts_is_removable_read,
                 withholds=_ts_withholds,
+                fold_only_withholds=_ts_fold_only_withholds,
+                local_scope=_ts_local_scope,
+                withholds_reason=_ts_withholds_reason,
             )
             for language in ("ts", "tsx", "js")
         },
@@ -3340,6 +3845,8 @@ _PROFILES.update(
             is_reference=lambda n, b, name: _is_named_identifier(n, b, name, ("identifier",)),
             is_binding=_java_is_binding,
             is_removable_read=_java_is_removable_read,
+            fold_only_withholds=_java_fold_only_withholds,
+            local_scope=_java_local_scope,
         ),
     }
 )

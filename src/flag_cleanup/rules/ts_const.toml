@@ -45,9 +45,10 @@
 #
 # The `. … .` anchors restrict the declaration to a single declarator.
 # `const on = <read>, retries = 3;` therefore produces no const-path diff at
-# all: the generic rule below still replaces the read, and both bindings
-# survive. Without the anchors the delete rule took the whole statement and
-# silently dropped `retries`.
+# here: the generic rule below replaces the read, and `ts_fold`'s pass after
+# the engine cuts the `on = true` declarator alone and inlines its uses.
+# Without the anchors the delete rule took the whole statement and silently
+# dropped `retries`.
 #
 # The `not_contains` re-binding guard is what stops silently-wrong output for
 # nested shadowing (`const on = <read>; for (…) { const on = item.enabled; … }`).

@@ -3068,7 +3068,13 @@ def _typeof_type(node: Node | None) -> str | None:
     declaration's type parameter can be."""
     if node is None or node.type != "typeof_expression":
         return None
-    type_node = node.child_by_field_name("type")
+    return _plain_type(node, node.child_by_field_name("type"))
+
+
+def _plain_type(node: Node, type_node: Node | None) -> str | None:
+    """``type_node`` as written, when it is a plain (possibly qualified or
+    generic) type name that no generic declaration around ``node`` has a
+    type parameter of."""
     if type_node is None or type_node.type not in _TYPE_NAMES:
         return None
     spelled = set(_WORD.findall(xcs._text(type_node)))
@@ -3125,13 +3131,301 @@ def _receiver_types(access: Node | None, repo_dir: str | None) -> frozenset[str]
     return _typeof_elements(collection, len(names), names.index(site), repo_dir)
 
 
+def _plain_arguments(call: Node | None) -> list[Node] | None:
+    """The argument expressions of ``call``, when none is named or passed
+    with ``ref``, ``out`` or ``in``."""
+    arguments = call.child_by_field_name("arguments") if call is not None else None
+    if arguments is None:
+        return None
+    values = []
+    for argument in arguments.named_children:
+        if argument.type != "argument":
+            continue
+        if argument.child_by_field_name("name") is not None or any(
+            not c.is_named and xcs._text(c) in ("ref", "out", "in") for c in argument.children
+        ):
+            return None
+        if not argument.named_children:
+            return None
+        values.append(argument.named_children[-1])
+    return values
+
+
+#: Members whose body is code, from a local function out to a method.
+_FUNCTION_MEMBERS = frozenset(
+    {
+        "method_declaration",
+        "local_function_statement",
+        "constructor_declaration",
+        "destructor_declaration",
+        "operator_declaration",
+        "conversion_operator_declaration",
+        "accessor_declaration",
+    }
+)
+_TYPE_DECLARATIONS_AROUND = frozenset(
+    {"class_declaration", "struct_declaration", "record_declaration", "interface_declaration"}
+)
+#: With :data:`_USING_STATIC` (below, comments between the words allowed),
+#: a file that may hold a ``global using static``.
+_GLOBAL_WORD = re.compile(r"\bglobal\b")
+#: repo_dir -> whether some C# file or project item may be a global ``using
+#: static``, and the checkout's library-based type names.
+_GLOBAL_STATICS: dict[str, bool] = {}
+_LIBRARY_BASED: dict[str, frozenset[str]] = {}
+
+
+def _global_static_usings(repo_dir: str) -> bool:
+    """Whether a project ``<Using Static>`` item or a C# file's ``global using
+    static`` may import static members into every file of a project; an
+    item or file that cannot be read may. Cached per ``repo_dir``."""
+    if repo_dir not in _GLOBAL_STATICS:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        items, readable = xcs.msbuild_usings(repo_dir)
+        found = not readable or any(i.kind == "static" for i in items)
+        if not found:
+            for f in source_index.files(repo_dir, {".cs"}, with_ignored=True):
+                if not f.path.name.endswith(".cs"):
+                    continue
+                text = wc._read(f.resolved)
+                if text is None:
+                    found = True
+                    break
+                decoded = _decoded(text)
+                if not (_GLOBAL_WORD.search(decoded) and _USING_STATIC.search(decoded)):
+                    continue
+                root = wc.parse(text)
+                # Recovery may split `global` from the directive it starts.
+                if root.has_error or _directive_hides(text, root) or any(
+                    (node.type == "using_directive" and (using := xcs._using(node)).kind == "static" and using.is_global)
+                    or (
+                        (node.type == "ERROR" or node.is_missing)
+                        and _GLOBAL_WORD.search(xcs._text(node))
+                        and _USING_STATIC.search(xcs._text(node))
+                    )
+                    for node in cross_file_keys.walk(root)
+                ):
+                    found = True
+                    break
+        _GLOBAL_STATICS[repo_dir] = found
+    return _GLOBAL_STATICS[repo_dir]
+
+
+_COCLASS = re.compile(r"\bCoClass")
+#: repo_dir -> whether a C# or .NET guest file may spell ``CoClass``.
+_COCLASSES: dict[str, bool] = {}
+
+
+def _spells_coclass(repo_dir: str) -> bool:
+    """Whether a C# or .NET guest file of the checkout, ignored ones
+    included, spells ``CoClass`` (``CoClassAttribute`` too), escapes
+    decoded, or cannot be read: ``[CoClass(typeof(C))]`` on an interface
+    ``I`` makes ``new I()`` create a ``C``. Cached per ``repo_dir``."""
+    if repo_dir not in _COCLASSES:
+        from flag_cleanup import source_index
+        from flag_cleanup import wrapper_csharp as wc
+
+        found = False
+        for f in source_index.files(repo_dir, None, with_ignored=True):
+            if not f.path.name.lower().endswith((".cs", *wc._GUESTS)):
+                continue
+            text = wc._read(f.resolved)
+            if text is None or _COCLASS.search(_decoded(text)):
+                found = True
+                break
+        _COCLASSES[repo_dir] = found
+    return _COCLASSES[repo_dir]
+
+
+def _framework_expression(name: Node, member: Node, repo_dir: str) -> bool:
+    """Whether the bare identifier ``Expression`` at ``name`` binds no
+    checkout declaration: nothing in ``member`` (the outermost function
+    member around it) binds the name, no generic declaration around it has
+    a type parameter of it, no type or extension block around it has a
+    parameter of it, no type around it (checkout types whose every part
+    and base is known) has or inherits a member of it, no ``using static``
+    can import one, and no alias or checkout type takes it.
+
+    A type of a referenced assembly in an enclosing namespace can still
+    take the name before a file's ``using``. :func:`_constant_object_type`
+    does not rest on this alone: it asks it of two bare spellings in one
+    scope, which then bind one type, so a lookup that is not the
+    framework's ``Property`` holds a value that is not the framework's
+    ``Constant`` either. The residual is a library type that has both
+    static methods and misuses them."""
+    if xcs._text(name) != "Expression" or _plain_type(name, name) is None:
+        return False
+    if not _only_binding(member, "Expression", name):
+        return False
+    checkout = xcs.csharp_index(repo_dir)
+    if checkout.may_declare_type("Expression"):
+        return False
+    aliases = _alias_names(repo_dir)
+    if aliases is None or "Expression" in aliases:
+        return False
+    if repo_dir not in _LIBRARY_BASED:
+        _LIBRARY_BASED[repo_dir] = library_based(checkout)
+    based = _LIBRARY_BASED[repo_dir]
+    node = name.parent
+    while node is not None:
+        # A primary-constructor parameter, or an extension block's receiver,
+        # is in scope in every member below it.
+        if node.type in _TYPE_DECLARATIONS_AROUND or node.type == "extension_declaration":
+            parameters = [c for c in node.named_children if c.type == "receiver_parameter"] + [
+                p for c in node.named_children if c.type == "parameter_list" for p in c.named_children
+            ]
+            for parameter in parameters:
+                declared = parameter.child_by_field_name("name")
+                if declared is not None and _ident(declared) == "Expression":
+                    return False
+        if node.type in _TYPE_DECLARATIONS_AROUND:
+            declared = node.child_by_field_name("name")
+            owner = xcs._text(declared) if declared is not None else ""
+            infos = checkout.by_last.get(owner, ())
+            if not infos or owner in based:
+                return False
+            for info in infos:
+                if info.partial or "Expression" in info.members | checkout.inherited_members(info.supertypes):
+                    return False
+        if node.type == "compilation_unit" and _USING_STATIC.search(_decoded(xcs._text(node))):
+            return False
+        node = node.parent
+    return not _global_static_usings(repo_dir)
+
+
+def _constant_object_type(call: Node | None, repo_dir: str | None) -> str | None:
+    """The type ``T`` an ``Expression.Property(target, name)`` or
+    ``PropertyOrField`` call reaches the members of, when ``target`` is a
+    ``var`` local declared by a statement whose scope holds the call, bound
+    once in the outermost function member around it, written by no
+    assignment and taken by no ``ref``, ``out`` or ``in``, whose initializer
+    is ``Expression.Constant(new T(...))``.
+
+    A ``ConstantExpression`` cannot change, ``Constant`` with one argument
+    takes its ``Type`` from the value, and ``new T(...)`` creates a ``T``
+    exactly, so the lookup sees ``T``'s members and its bases', as a
+    ``typeof(T)`` receiver's does (:func:`_receiver_types`). Both
+    ``Expression``s are written bare and must be the framework's
+    (:func:`_framework_expression`); ``var`` must be no checkout type. ``T``
+    must be a checkout type, not an alias, and no file may spell
+    ``CoClass``, which lets ``new I()`` create another type. None
+    otherwise."""
+    values = _plain_arguments(call)
+    if repo_dir is None or values is None or len(values) != 2 or values[0].type != "identifier":
+        return None
+    function = call.child_by_field_name("function")
+    receiver = values[0]
+    member = _outermost_member(call)
+    if member is None or function is None or function.type != "member_access_expression":
+        return None
+    if not _framework_expression(function.child_by_field_name("expression"), member, repo_dir):
+        return None
+    local = _ident(receiver)
+    declarator = None
+    for node in cross_file_keys.walk(member):
+        if node.type != "identifier" or _ident(node) != local:
+            continue
+        parent = node.parent
+        if parent is not None and parent.type == "variable_declarator" and xcs._field(parent, node) == "name":
+            if declarator is not None:
+                return None
+            declarator = parent
+            continue
+        if parent is not None and parent.type in ("ref_expression", "argument") and any(
+            not c.is_named and xcs._text(c) in ("ref", "out", "in") for c in parent.children
+        ):
+            return None
+        child, outer = node, parent
+        while outer is not None and outer.id != member.id:
+            if outer.type == "assignment_expression" and xcs._field(outer, child) == "left":
+                return None
+            child, outer = outer, outer.parent
+    if declarator is None or not _only_binding(member, local, declarator.child_by_field_name("name")):
+        return None
+    declaration = declarator.parent
+    declared = declaration.child_by_field_name("type") if declaration is not None else None
+    if (
+        not _declared_around(declarator, receiver)
+        or declared is None
+        or declared.type != "implicit_type"
+        or declares_var(repo_dir)
+    ):
+        return None
+    values = [c for c in declarator.named_children if c.id != declarator.child_by_field_name("name").id]
+    if len(values) != 1 or values[0].type != "invocation_expression":
+        return None
+    constant = values[0]
+    function = constant.child_by_field_name("function")
+    if (
+        function is None
+        or function.type != "member_access_expression"
+        or xcs._text(function.child_by_field_name("name")) != "Constant"
+        or not _framework_expression(function.child_by_field_name("expression"), member, repo_dir)
+    ):
+        return None
+    created = _plain_arguments(constant)
+    if created is None or len(created) != 1 or created[0].type != "object_creation_expression":
+        return None
+    type_node = created[0].child_by_field_name("type")
+    plain = _plain_type(created[0], type_node)
+    simple = xcs._simple_name(type_node) if plain is not None else None
+    aliases = _alias_names(repo_dir) or frozenset()
+    if (
+        simple is None
+        or not xcs.csharp_index(repo_dir).by_last.get(simple)
+        or simple in aliases
+        or _spells_coclass(repo_dir)
+    ):
+        return None
+    return plain
+
+
+def _outermost_member(node: Node) -> Node | None:
+    """The outermost function member around ``node`` inside its type (a
+    method around a local function), or None outside one. A name a local
+    function or a lambda reads may be bound anywhere in it."""
+    member = None
+    node = node.parent
+    while node is not None and node.type not in _TYPE_DECLARATIONS_AROUND:
+        if node.type in _FUNCTION_MEMBERS:
+            member = node
+        node = node.parent
+    return member
+
+
+def _declared_around(declarator: Node, use: Node) -> bool:
+    """Whether the ``variable_declarator`` of a local is declared by a
+    statement whose scope holds ``use``: a ``local_declaration_statement``
+    directly in a block or a switch section that ``use`` is inside.
+
+    A local in a sibling block may share the name of a field the use reads,
+    which the compiler allows. A statement the grammar placed in an ``#if``
+    branch is no declaration of the code around it: the compiler reads one
+    branch, the grammar every one, so a use in another branch, or after the
+    ``#endif``, may read something else of the name."""
+    declaration = declarator.parent
+    statement = declaration.parent if declaration is not None and declaration.type == "variable_declaration" else None
+    return (
+        statement is not None
+        and statement.type == "local_declaration_statement"
+        and statement.parent is not None
+        and statement.parent.type in ("block", "switch_section")
+        and any(a.id == statement.parent.id for a in xcs._ancestors(use))
+    )
+
+
 def _read_only_local(name: Node, method: Node, members: frozenset[str] = _READ_ONLY_MEMBERS) -> Node | None:
     """The initializer of the local ``name`` reads, when it is a local of
-    ``method`` that nothing else binds, and every other mention of it only
-    reads one of ``members`` (:data:`_READ_ONLY_MEMBERS`, the ``Count`` of a
-    framework collection included; an array's caller passes
-    :data:`_ARRAY_READS`) or is iterated by a ``foreach``. Names are
-    compared as the compiler reads them (:func:`_ident`)."""
+    ``method`` declared by a statement whose scope holds ``name``
+    (:func:`_declared_around`), that nothing else in the outermost function
+    member around it binds (a lambda's local may shadow an outer one), and
+    every other mention of it only reads one of ``members``
+    (:data:`_READ_ONLY_MEMBERS`, the ``Count`` of a framework collection
+    included; an array's caller passes :data:`_ARRAY_READS`) or is iterated
+    by a ``foreach``. Names are compared as the compiler reads them
+    (:func:`_ident`)."""
     local = _ident(name)
     declarator = None
     for node in cross_file_keys.walk(method):
@@ -3158,7 +3452,13 @@ def _read_only_local(name: Node, method: Node, members: frozenset[str] = _READ_O
         ):
             continue
         return None  # written, passed, returned or used some other way
-    if declarator is None or not _only_binding(method, local, declarator.child_by_field_name("name")):
+    outermost = _outermost_member(name)
+    if (
+        declarator is None
+        or outermost is None
+        or not _declared_around(declarator, name)
+        or not _only_binding(outermost, local, declarator.child_by_field_name("name"))
+    ):
         return None
     values = [c for c in declarator.named_children if c.id != declarator.child_by_field_name("name").id]
     return values[0] if len(values) == 1 else None
@@ -3329,7 +3629,8 @@ def _computed_route(
     With ``bounds``, a name-taking call whose receiver can only be the
     ``Type`` of some types (:func:`_receiver_types`) is not one: each of
     those types is added to ``bounds`` instead, for the caller to judge
-    against a family. ``repo_dir`` lets a parameter name be proven
+    against a family. So is an ``Expression.Property`` on a local holding a
+    constant of a new object (:func:`_constant_object_type`). ``repo_dir`` lets a parameter name be proven
     (:func:`name_sources`) and a collection's type be checked.
 
     With ``attribute_only``, a property lookup whose result is only tested
@@ -3387,7 +3688,10 @@ def _computed_route(
             if (spelled == "Expression" or spelled.endswith(".Expression")) and not _literal_name(
                 call, name, nameof, repo_dir
             ):
-                return True
+                created = _constant_object_type(call, repo_dir) if bounds is not None else None
+                if created is None:
+                    return True
+                bounds.add(created)
         elif name == "DataBinder":
             # `DataBinder.M(...)` or `System.Web.UI.DataBinder.M(...)`.
             holder = access if access is not None else node
@@ -3527,8 +3831,9 @@ def declares_nameof(repo_dir: str) -> bool:
     then calls it wherever it is in scope, and is no constant. Every
     identifier ``nameof`` must be the callee of an invocation, written
     without ``@``; a file that cannot be read, or that spells the word where
-    it does not parse, may declare one. Cached per ``repo_dir``, like the
-    scan."""
+    it does not parse, may declare one, unless the parser still placed that
+    spelling as an identifier inside an error-free body (:func:`_placed`).
+    Cached per ``repo_dir``, like the scan."""
     if repo_dir not in _NAMEOF:
         from flag_cleanup import source_index
         from flag_cleanup import wrapper_csharp as wc
@@ -3545,7 +3850,7 @@ def declares_nameof(repo_dir: str) -> bool:
                 continue
             for node in cross_file_keys.walk(wc.parse(text)):
                 if node.type == "ERROR" or node.is_missing:
-                    if _NAMEOF_WORD.search(wc._text(node)):
+                    if any(not _placed(node, match) for match in _NAMEOF_WORD.finditer(wc._text(node))):
                         declared = True
                 elif node.type == "identifier" and wc._text(node) in ("nameof", "@nameof"):
                     parent = node.parent
@@ -3561,6 +3866,35 @@ def declares_nameof(repo_dir: str) -> bool:
                 break
         _NAMEOF[repo_dir] = declared
     return _NAMEOF[repo_dir]
+
+
+#: Nodes whose content is statements or expressions. Parsed without an error,
+#: such a node is a valid parse of its bytes, so an identifier in it is what
+#: that parse says: a declaration of ``nameof`` there reads as one.
+_PLACING = frozenset({"block", "arrow_expression_clause", "variable_declarator", "argument_list"})
+
+
+def _placed(error: Node, match: re.Match[str]) -> bool:
+    """Whether a ``nameof`` spelled in the text of ``error`` is an identifier
+    the parser placed inside an error-free body, initializer or argument list
+    below the error. :func:`declares_nameof` then judges it like any other
+    identifier, so it declares nothing unless it is written as a declaration.
+    A spelling no identifier covers, or one the parser left loose in the
+    error, may be a declaration it could not read."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    text = wc._text(error)
+    start = error.start_byte + len(text[: match.start()].encode("utf-8"))
+    end = start + len(match.group(0).encode("utf-8"))
+    leaf = error.descendant_for_byte_range(start, end)
+    if leaf is None or leaf.type != "identifier" or (leaf.start_byte, leaf.end_byte) != (start, end):
+        return False
+    node = leaf.parent
+    while node is not None and node.type != "ERROR" and node != error:
+        if node.type in _PLACING and not node.has_error:
+            return True
+        node = node.parent
+    return False
 
 
 def computed_name_route(repo_dir: str, family: Family) -> bool:
@@ -3617,6 +3951,9 @@ def reset_cache() -> None:
     _ALIASES.clear()
     _LOOSE.clear()
     _PATTERNS.clear()
+    _GLOBAL_STATICS.clear()
+    _LIBRARY_BASED.clear()
+    _COCLASSES.clear()
 
 
 def _enclosing(path: str, projects: frozenset[Path], repo_dir: str | None = None) -> list[Path]:

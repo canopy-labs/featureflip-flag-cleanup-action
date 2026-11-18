@@ -1145,14 +1145,17 @@ def module_escapes(repo_dir: str, wrapper: wi.Wrapper) -> list[tuple[str, int, s
     return handed_on(repo_dir, wrapper.path)
 
 
-def handed_on(repo_dir: str, module_path: str, named: bool = False) -> list[tuple[str, int, str]]:
+def handed_on(
+    repo_dir: str, module_path: str, named: bool = False, holders: bool = False
+) -> list[tuple[str, int, str]]:
     """``(path, line, text)`` of each use that hands the module at
     ``module_path`` on as an object (:func:`cross_file_ts.module_escapes`),
     which can then reach any of its exports by a name computed at run time.
 
     A barrel's ``export * from`` the module is followed rather than refused:
     the barrel joins the modules judged, so a namespace of it handed on
-    escapes in turn. A file that cannot be read escapes at its first line."""
+    escapes in turn. A file that cannot be read escapes at its first line.
+    ``holders``: see :func:`cross_file_ts.module_escapes`."""
     from flag_cleanup import source_index
 
     module = str(Path(module_path).resolve())
@@ -1191,7 +1194,7 @@ def handed_on(repo_dir: str, module_path: str, named: bool = False) -> list[tupl
             continue
         lines = text.split("\n")
         judged = _blanked(text, followed.get(path, []))
-        for refusal in cross_file_ts.module_escapes(path, judged, modules, repo_dir, pattern):
+        for refusal in cross_file_ts.module_escapes(path, judged, modules, repo_dir, pattern, holders):
             escapes.append((path, refusal.line, lines[refusal.line - 1].strip()))
     return sorted(set(escapes))
 

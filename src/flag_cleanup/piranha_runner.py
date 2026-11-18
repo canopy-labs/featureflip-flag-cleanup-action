@@ -128,6 +128,7 @@ from flag_cleanup import (
     jvm_class_eligibility,
     jvm_unread_members,
     key_const,
+    key_const_kept,
     line_width,
     kotlin_sentinel,
     forwarder_csharp,
@@ -180,7 +181,6 @@ from flag_cleanup.syntax import (
     collapse_introduced_carriage_returns,
     collapse_introduced_double_spaces,
     const_path_is_safe,
-    key_const_names,
     externally_visible_key_consts,
     remove_dead_loops,
     remove_unreachable_statements,
@@ -1744,6 +1744,8 @@ _ENGINE_STRANDED_LOCAL_RULES = {
     "delete_stranded_kotlin_local": "decl",
     "delete_stranded_csharp_local": "decl",
     "delete_stranded_ts_local": "decl",
+    "delete_stranded_ts_declarator": "declarator",
+    "delete_stranded_ts_declarator_last": "declarator",
     "delete_stranded_ts_var": "decl",
     "delete_stranded_ts_pattern_name": "n",
     "delete_stranded_ts_pattern_name_last": "n",
@@ -2230,6 +2232,8 @@ def _transform_flag(
     # readers) is told. See :mod:`flag_cleanup.ts_async_reads`.
     planned_accessors = accessors
     first_sites = ts_async_reads.plan(repo_dir, paths + sibling_readers, flag_key, accessors, language)
+    # Spans and texts read now, off the customer's bytes: Gate 2 counts them as removable reads.
+    const_marked = ts_async_reads.const_marks(first_sites)
     # A read that cannot be folded safely cannot stay while the others go: the
     # flag is refused, before anything is written.
     refused_reads = ts_async_reads.refusal(first_sites)
@@ -2406,7 +2410,7 @@ def _transform_flag(
     # withhold anything. Every other language has no pre-pass, so the file bytes
     # here are identical either way and moving this changes nothing for them.
     with_const, without_const = _partition_by_const_safety(
-        paths, language, flag_key, accessors, repo_dir=repo_dir, treatment=treatment
+        paths, language, flag_key, accessors, repo_dir=repo_dir, treatment=treatment, marked=const_marked
     )
 
     # CROSS-FILE KEY CONSTANTS -- also before the pre-pass, which has to see
@@ -2457,6 +2461,18 @@ def _transform_flag(
     # A declaration a mention elsewhere keeps says nothing about the reads
     # beside it, which are reads of the flag like any other, unless the
     # constant may hold something else by then.
+    # Only for a file no other file's mention keeps: one that does keeps its
+    # reads too, and the run reports that mention as the reason.
+    any_kept = (
+        {
+            p: key_const_kept.KEPT_ELSEWHERE
+            if (resolution is not None and _is_blocked(resolution, p)) or _refused_at(resolution, p)
+            else key_const_kept.fold_refusal(p, language, flag_key, accessors, repo_dir)
+            for p in without_const
+        }
+        if language in _FOLDS_ANY_KEPT_CONSTANT
+        else {}
+    )
     kept_declarations = [
         p for p in without_const
         if (
@@ -2472,37 +2488,31 @@ def _transform_flag(
                 treatment, kept_branches=True,
             )
         )
-        or (
-            language in _FOLDS_ANY_KEPT_CONSTANT
-            # A file that imports `dart:mirrors` keeps its key constants and
-            # their reads whole (`cross_file_dart.constant_escapes`).
-            and "dart:mirrors" not in Path(p).read_text(encoding="utf-8")
-            and _const_safe_at(
-                p, Path(p).read_text(encoding="utf-8"), language, flag_key, accessors,
-                fold_only=True,
-            )
-        )
+        or (p in any_kept and any_kept[p] is None)
     ]
     if kept_declarations and language == "python":
         # Only a declaration the resolution kept for mentions that spell its
         # name, of a constant no file writes (`Profile.constant_writes`).
         folding = resolution.kept_reads_fold if resolution is not None else frozenset()
-        kept_declarations = [p for p in kept_declarations if str(Path(p).resolve()) in folding]
+        kept_declarations = [
+            p for p in kept_declarations
+            if str(Path(p).resolve()) in folding or (p in any_kept and any_kept[p] is None)
+        ]
     elif kept_declarations and language != "go" and _rewrites_constants(repo_dir, language):
         # A Go constant cannot be assigned: `go build` rejects it.
         kept_declarations = []
     without_const = [p for p in without_const if p not in kept_declarations]
-    if language in _FOLDS_ANY_KEPT_CONSTANT:
-        for p in kept_declarations:
-            names = key_const_names(Path(p).read_text(encoding="utf-8"), language, flag_key)
-            if names:
-                logger.warning(
-                    "%s: key constant %s is also used outside a flag read or "
-                    "another file reads it, so its declaration is kept; the reads "
-                    "of it are folded",
-                    p,
-                    ", ".join(names),
-                )
+    # Said once the rewrite stands: what folded, and what a later pass removed.
+    kept_before = (
+        {p: Path(p).read_text(encoding="utf-8") for p in kept_declarations}
+        if language in _FOLDS_ANY_KEPT_CONSTANT
+        else {}
+    )
+    for p in without_const:
+        # Withheld whole with a flag read left in it: say so, by name.
+        message = key_const_kept.withheld_message(p, language, flag_key, accessors, any_kept.get(p))
+        if message is not None:
+            logger.warning("%s", message)
 
     # An attribute gate is decided here, after the resolution, because a
     # constant may name its key. Its refusal comes before the engine writes
@@ -2620,6 +2630,7 @@ def _transform_flag(
                 refused=culprits,
                 discarded=[],
             )
+        read_sites = _gated_const_reads(read_sites, const_marked, with_const, flag_key, spec.display_name)
         for site_path in dict.fromkeys(site.path for site in read_sites):
             found = ts_async_reads.marks(read_sites, async_names, site_path)
             if found:
@@ -3719,6 +3730,10 @@ def _transform_flag(
             reasons=reasons,
         )
 
+    for p, before in kept_before.items():
+        message = key_const_kept.kept_message(p, before, language, flag_key)
+        if message is not None:
+            logger.warning("%s", message)
     return TransformOutcome(
         _summaries_to_diff(summaries, repo_dir),
         tuple(unprocessable),
@@ -5887,6 +5902,15 @@ def _is_blocked(resolution: cross_file_keys.Resolution, path: str) -> bool:
     return str(Path(path).resolve()) in resolution.blocked
 
 
+def _refused_at(resolution: cross_file_keys.Resolution | None, path: str) -> bool:
+    """Whether the cross-file resolution reports a refusal in ``path`` itself
+    (an owner reflecting over itself, a module handed on whole)."""
+    if resolution is None:
+        return False
+    resolved = str(Path(path).resolve())
+    return any(r.path == resolved for r in resolution.refusals)
+
+
 def _key_paths(paths: list[str], flag_key: str) -> list[str]:
     return [
         p
@@ -5991,10 +6015,10 @@ def _reader_rules(
 _FOLDS_KEPT_CONSTANTS = frozenset({"ruby", "go", "python"})
 
 #: Languages whose key constant folds its reads whatever else uses the name
-#: (a log line, a Remote Config defaults map entry), because the constant cannot
-#: be reassigned and a second binding of the name is refused: the declaration
-#: stays, so the other uses keep resolving. Dart `const`/`final` only.
-_FOLDS_ANY_KEPT_CONSTANT = frozenset({"dart"})
+#: (a log line, a Remote Config defaults map entry), when it provably holds the
+#: key at every read: the declaration stays, so the other uses keep resolving.
+#: See :mod:`flag_cleanup.key_const_kept`.
+_FOLDS_ANY_KEPT_CONSTANT = key_const_kept.FOLDS_ANY_KEPT_CONSTANT
 
 #: What replaces a Ruby constant at run time without spelling its name. Spelled
 #: anywhere in a checkout, a kept constant may not hold the key when it is read.
@@ -7785,11 +7809,48 @@ def _referenced_elsewhere(
     return hits
 
 
-def _const_safe_at(path: str, *args, **kwargs) -> bool:
+def _const_safe_at(path: str, *args, marked: dict | None = None, **kwargs) -> bool:
     """:func:`const_path_is_safe` for the file at ``path``: a Go handle's
-    constructor is proven from the repository around it."""
-    with key_const.go_file(path):
+    constructor is proven from the repository around it, and ``marked``
+    (:func:`ts_async_reads.const_marks`) names the property reads of a key
+    constant the run marks and folds."""
+    spans = (marked or {}).get(str(Path(path).resolve()), frozenset())
+    with key_const.go_file(path), key_const.marked_reads(spans):
         return const_path_is_safe(*args, **kwargs)
+
+
+def _gated_const_reads(
+    sites: list[ts_async_reads.Site],
+    gated: dict[str, frozenset[tuple[int, int, bytes]]],
+    with_const: list[str],
+    flag_key: str,
+    display_name: str,
+) -> list[ts_async_reads.Site]:
+    """``sites`` without the constant-keyed reads Gate 2 did not count as
+    removable: such a read stays, and so does its constant. Where Gate 2 did
+    (the file is in ``with_const``), every read it counted must still be marked
+    on the bytes the engine gets, or the declaration would go with a read left;
+    the flag is refused instead."""
+    allowed = {str(Path(p).resolve()) for p in with_const}
+    kept: list[ts_async_reads.Site] = []
+    marked: dict[str, set] = {}
+    for site in sites:
+        path = str(Path(site.path).resolve())
+        if site.const_key:
+            span = (*site.call, Path(site.path).read_bytes()[site.call[0] : site.call[1]])
+            if path not in allowed or span not in gated.get(path, ()):
+                continue
+            marked.setdefault(path, set()).add(span)
+        kept.append(site)
+    lost = sorted(p for p in allowed if not gated.get(p, frozenset()) <= marked.get(p, set()))
+    if lost:
+        raise UnsafeRewriteError(
+            f"the {display_name} transform refused flag {flag_key!r}: a read of its key "
+            "constant changed between the checks and the rewrite",
+            refused=lost,
+            discarded=[],
+        )
+    return kept
 
 
 def _partition_by_const_safety(
@@ -7800,6 +7861,7 @@ def _partition_by_const_safety(
     *,
     repo_dir: str | None = None,
     treatment: bool | None = None,
+    marked: dict | None = None,
 ) -> tuple[list[str], list[str]]:
     """Split candidate files into (const rules allowed, const rules withheld).
 
@@ -7829,7 +7891,7 @@ def _partition_by_const_safety(
         except (OSError, UnicodeDecodeError):  # pragma: no cover - filtered earlier
             withheld.append(path)
             continue
-        allowed_here = _const_safe_at(path, source, language, flag_key, accessors, treatment)
+        allowed_here = _const_safe_at(path, source, language, flag_key, accessors, treatment, marked=marked)
         if not allowed_here and language == "go":
             grouped = key_const.go_positional_key_consts(source, flag_key)
             if grouped:

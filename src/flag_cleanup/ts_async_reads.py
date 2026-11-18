@@ -45,7 +45,8 @@ Order, first match wins, after parentheses, ``!`` (non-null), ``as`` and
    documented as returning a Promise, or could be (an explicit return type that
    is not a primitive or a union of primitives, no return type on a signature,
    a body that returns a call other than one of an audited package export
-   (``SYNC_PACKAGE_EXPORTS``), a const initialised from a call, a ``.then``
+   (``SYNC_PACKAGE_EXPORTS``) or a built-in whose result is never a Promise
+   (:func:`_builtin_result`), a const initialised from a call, a ``.then``
    chain) leaves the read; none folds it. Test files are not read, and in test
    support directories (``tests/``, ``__mocks__/``, ...) a fake whose returns
    call nothing does not count. A read that is not returned folds.
@@ -344,13 +345,778 @@ def _returned_expressions(subject: Node) -> list[Node | None]:
     return returns
 
 
-def _returns_only_booleans(subject: Node, sync_call: Callable[[Node], bool] | None = None) -> bool:
+def _returns_only_booleans(
+    subject: Node,
+    sync_call: Callable[[Node], bool] | None = None,
+    boolean_leaf: Callable[[Node], str | None] | None = None,
+) -> bool:
     """Every returned expression is certainly a primitive, or, given
-    ``sync_call``, a call it proves returns no Promise."""
+    ``sync_call``, a call it proves returns no Promise, or, given
+    ``boolean_leaf``, certainly a boolean (:func:`_boolean_result`)."""
     returns = _returned_expressions(subject)
     return bool(returns) and all(
-        _certainly_boolean(r) or (sync_call is not None and r is not None and sync_call(r)) for r in returns
+        _certainly_boolean(r)
+        or (sync_call is not None and r is not None and sync_call(r))
+        or (boolean_leaf is not None and _boolean_result(r, boolean_leaf))
+        for r in returns
     )
+
+
+#: Operators whose result is always a boolean.
+_BOOLEAN_OPERATORS = frozenset({"===", "!==", "==", "!=", "<", ">", "<=", ">=", "in", "instanceof"})
+
+
+def _boolean_result(expr: Node | None, leaf: Callable[[Node], str | None], depth: int = 0) -> bool:
+    """Whether ``expr`` always evaluates to ``true`` or ``false``: a boolean
+    literal, a comparison or type test, ``!x``, what ``leaf`` calls
+    ``"boolean"``, a ternary whose arms both are, ``a && b`` when both are
+    (a falsy ``a`` is the result: ``0``, ``""``), and ``a || b`` / ``a ?? b``
+    when ``b`` is and ``a`` is too or is what ``leaf`` calls ``"nullable"``
+    (a boolean or nothing). ``typeof``, arithmetic and ``String(x)`` are not
+    booleans and are not accepted HERE; :func:`_returns_only_booleans` still
+    accepts a return that is wholly a primitive (``_certainly_boolean``), as
+    it always has. Parentheses, ``as``, ``satisfies``, ``!`` and ``<T>`` are
+    looked through."""
+    while expr is not None and expr.type in _SEE_THROUGH:
+        expr = _unwrap_once(expr)
+    if expr is None or depth > 16:
+        return False
+    if expr.type in ("true", "false"):
+        return True
+    if expr.type == "unary_expression":
+        operator = expr.child_by_field_name("operator")
+        return operator is not None and _text(operator) == "!"
+    if leaf(expr) == "boolean":
+        return True
+    if expr.type == "binary_expression":
+        operator = expr.child_by_field_name("operator")
+        op = _text(operator) if operator is not None else ""
+        if op in _BOOLEAN_OPERATORS:
+            return True
+        left, right = expr.child_by_field_name("left"), expr.child_by_field_name("right")
+        if op == "&&":
+            return _boolean_result(left, leaf, depth + 1) and _boolean_result(right, leaf, depth + 1)
+        if op in ("||", "??"):
+            return _boolean_result(right, leaf, depth + 1) and (
+                _boolean_result(left, leaf, depth + 1) or _nullable_leaf(left, leaf)
+            )
+        return False
+    if expr.type == "ternary_expression":
+        return _boolean_result(expr.child_by_field_name("consequence"), leaf, depth + 1) and _boolean_result(
+            expr.child_by_field_name("alternative"), leaf, depth + 1
+        )
+    return False
+
+
+def _nullable_leaf(expr: Node | None, leaf: Callable[[Node], str | None]) -> bool:
+    while expr is not None and expr.type in _SEE_THROUGH:
+        expr = _unwrap_once(expr)
+    return expr is not None and leaf(expr) == "nullable"
+
+
+# --- built-ins whose result is never a Promise ------------------------------------------
+
+#: Global functions that always return a boolean. Not ``String``/``Number``:
+#: a primitive is not a boolean, and the fold writes one.
+_PRIMITIVE_CALLS = frozenset({"Boolean"})
+#: Static methods of a global that always return a boolean.
+_STATIC_PREDICATES = frozenset({("Object", "hasOwn"), ("Array", "isArray")})
+#: Constructors of a built-in collection.
+_COLLECTIONS = frozenset({"Set", "Map"})
+#: Methods of a built-in array, Set or Map that always return a boolean.
+_COLLECTION_PREDICATES = frozenset({"includes", "has", "some", "every"})
+#: Members of a private collection that use it without handing it out: each
+#: returns a primitive (``push`` the new length, ``delete`` a boolean,
+#: ``clear`` undefined) and takes no callback that is given the collection.
+_COLLECTION_USES = frozenset({"includes", "has", "indexOf", "lastIndexOf", "push", "delete", "clear", "length", "size"})
+#: Members that return the collection itself, so use it safely only when the result is discarded.
+_COLLECTION_CHAINS = frozenset({"add", "set"})
+#: Members whose callback is called with the collection as its third argument.
+_COLLECTION_CALLBACKS = frozenset({"some", "every"})
+#: Members of a private table whose read yields an object someone may write to.
+_TABLE_ESCAPES = frozenset({"__proto__", "constructor", "prototype"})
+#: Calls a table may be an argument of without being handed out.
+_TABLE_READERS = frozenset({("Object", "hasOwn"), ("Object", "keys"), ("Object", "values"), ("Object", "entries")})
+#: Every global the proofs above rely on.
+_RELIED_GLOBALS = _PRIMITIVE_CALLS | _COLLECTIONS | {"Object", "Array"}
+#: Names whose write in any file may be a relied-on global's: the global object.
+_GLOBAL_OBJECTS = frozenset({"globalThis", "window", "self", "global"})
+_PROTOTYPE_REACH = re.compile(r"\b(?:prototype|__proto__|getPrototypeOf|constructor)\b")
+_PROTOTYPE_WRITERS = frozenset(
+    {"Object.assign", "Object.defineProperty", "Object.defineProperties", "Object.setPrototypeOf",
+     "Reflect.defineProperty", "Reflect.setPrototypeOf", "Reflect.set"}
+)
+
+
+def _root_identifier(node: Node) -> Node | None:
+    """The identifier a plain ``a.b.c`` chain starts from, or None."""
+    while node.type in ("member_expression", "subscript_expression") or node.type in _SEE_THROUGH:
+        inner = node.child_by_field_name("object") if node.type in ("member_expression", "subscript_expression") else _unwrap_once(node)
+        if inner is None:
+            return None
+        node = inner
+    return node if node.type == "identifier" else None
+
+
+#: Property names whose presence in a written member chain means it may reach
+#: a relied-on global, whatever name the chain starts from (`root.Object.x`,
+#: `t.Array.isArray`, `({}).constructor.x`).
+_RELIED_PROPERTIES = _RELIED_GLOBALS | {"Reflect", "constructor", "__proto__"}
+#: Writers that name the key they write as their second argument.
+_KEYED_WRITERS = frozenset({"Object.defineProperty", "Reflect.defineProperty", "Reflect.set"})
+
+
+def _member_chain_patches(target: Node) -> bool:
+    """Whether a written member chain (an assignment target, or the object a
+    writer is handed) may reach a relied-on global or its prototype: a link
+    of the chain is named like a relied-on global, ``Reflect``,
+    ``constructor`` or ``__proto__`` (by a property or a string key), the
+    chain starts at a relied-on global, it reads a computed key of the global
+    object, or it reaches a built-in's prototype
+    (:func:`_reaches_builtin_prototype`). Everything else is an object of the
+    program's own (``Foo.prototype.x``, ``this.state.x``)."""
+    if _reaches_builtin_prototype(target):
+        return True
+    node = target
+    while True:
+        while node.type in _SEE_THROUGH:
+            inner = _unwrap_once(node)
+            if inner is None:
+                return False
+            node = inner
+        if node.type == "member_expression":
+            prop = node.child_by_field_name("property")
+            if prop is not None and _text(prop) in _RELIED_PROPERTIES:
+                return True
+        elif node.type == "subscript_expression":
+            index = node.child_by_field_name("index")
+            name = _string_value(index) if index is not None and index.type == "string" else None
+            if name in _RELIED_PROPERTIES:
+                return True
+            owner = node.child_by_field_name("object")
+            root = _root_identifier(owner) if owner is not None else None
+            if name is None and root is not None and (_text(root) in _GLOBAL_OBJECTS or _global_alias(root)):
+                return True  # `globalThis[name] = …`, `const g = globalThis; g[k] = …`: any global
+        elif node.type == "identifier":
+            return _text(node) in _RELIED_GLOBALS
+        else:
+            return False  # `this.x`, `f().x`: an object of the program's own
+        owner = node.child_by_field_name("object")
+        if owner is None:
+            return False
+        node = owner
+
+
+def _mentions_global_object(node: Node | None, this: bool = False) -> bool:
+    return node is not None and any(
+        (this and n.type == "this") or (n.type == "identifier" and _text(n) in _GLOBAL_OBJECTS) for n in ts_syntax._walk(node)
+    )
+
+
+def _global_alias(name: Node) -> bool:
+    """Whether ``name`` may hold the global object: a binding of it in the
+    file is a declarator or an assignment whose value mentions ``globalThis``,
+    ``window``, ``self`` or ``global``, or a parameter of a function called on
+    the spot with one of those or ``this`` in its place
+    (``(function (root) { … })(this)``)."""
+    from flag_cleanup import ts_scope
+
+    program = name
+    while program.parent is not None:
+        program = program.parent
+    for binder in ts_scope.bindings(program, _text(name)):
+        holder = binder.parent
+        if holder is None:
+            continue
+        if holder.type == "variable_declarator" and _mentions_global_object(holder.child_by_field_name("value")):
+            return True
+        if holder.type in _ASSIGNMENTS and _mentions_global_object(holder.child_by_field_name("right")):
+            return True
+        function = holder
+        while function is not None and function.type not in _FUNCTION_NODES:
+            function = function.parent if function.type in ("formal_parameters", "required_parameter", "optional_parameter", "assignment_pattern") else None
+        if function is None:
+            continue
+        params = _params(function)
+        index = next((i for i, p in enumerate(params) if p.start_byte <= binder.start_byte < p.end_byte), None)
+        call = function.parent
+        while call is not None and call.type == "parenthesized_expression":
+            call = call.parent
+        if index is None or call is None or call.type != "call_expression":
+            continue
+        args = call.child_by_field_name("arguments")
+        items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+        if index < len(items) and _mentions_global_object(items[index], this=True):
+            return True
+    return False
+
+
+def _pattern_writes_member(pattern: Node) -> bool:
+    """Whether a destructuring ASSIGNMENT pattern writes a member
+    (``({ hasOwn: Object.hasOwn } = …)``, ``[Array.isArray] = […]``)."""
+    return any(n.type in ("member_expression", "subscript_expression") for n in ts_syntax._walk(pattern))
+
+
+def _patches_builtins(node: Node) -> bool:
+    """Whether ``node`` may replace a global the built-in proofs rely on, one
+    of its statics or its prototype. Written as what a write must NOT look
+    like to be let through:
+
+    - an assignment (``=``, ``||=``, …) or ``for (… in/of …)`` target that is
+      a relied-on name, a member chain :func:`_member_chain_patches` cannot
+      clear, or a destructuring pattern holding any member target;
+    - ``Object.defineProperty``/``Reflect.defineProperty``/``Reflect.set``
+      whose key is not a plain string literal, or names a relied-on global;
+    - ``Object.defineProperties`` on anything;
+    - any of those and ``Object.assign``/``setPrototypeOf`` handed a chain
+      :func:`_member_chain_patches` cannot clear, or the global object;
+    - a ``with`` statement."""
+    if node.type == "with_statement":
+        return True
+    if node.type in _ASSIGNMENTS or node.type == "for_in_statement":
+        left = node.child_by_field_name("left")
+        while left is not None and left.type in _SEE_THROUGH:
+            left = _unwrap_once(left)
+        if left is None:
+            return False
+        if left.type == "identifier":
+            return _text(left) in _RELIED_GLOBALS
+        if left.type in ("object_pattern", "array_pattern"):
+            return _pattern_writes_member(left)
+        if left.type in ("member_expression", "subscript_expression"):
+            return _member_chain_patches(left)
+        return False
+    if node.type == "call_expression" and _callee_text(node) in _PROTOTYPE_WRITERS:
+        callee = _callee_text(node)
+        if callee == "Object.defineProperties":
+            return True
+        args = node.child_by_field_name("arguments")
+        items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+        if not items:
+            return False
+        first = items[0]
+        if callee in _KEYED_WRITERS:
+            key = items[1] if len(items) > 1 else None
+            if key is None or key.type != "string" or _string_value(key) in _RELIED_PROPERTIES:
+                return True
+        elif first.type == "identifier" and _text(first) in _GLOBAL_RECEIVERS:
+            return True  # `Object.assign(window, …)` writes keys this does not read
+        return _member_chain_patches(first)
+    return False
+
+
+def _reaches_builtin_prototype(owner: Node) -> bool:
+    """Whether a written-to object may be a built-in's prototype: its text
+    names a prototype and it is not a plain chain from a name of the
+    program's own (``Foo.prototype`` is a class of the repository's)."""
+    text = _text(owner)
+    if not _PROTOTYPE_REACH.search(text):
+        return False
+    root = _root_identifier(owner)
+    if root is None or _text(root) in _RELIED_GLOBALS:
+        return True
+    return bool(re.search(r"\b(?:__proto__|getPrototypeOf|constructor)\b", text))
+
+
+def _declares_global_builtin(tree: Node) -> bool:
+    """Whether a file with no ``import`` or ``export`` (so possibly a classic
+    script, whose top-level declarations are globals every script shares)
+    declares a relied-on global at its top level (``function Boolean() {}``)."""
+    if any(child.type in ("import_statement", "export_statement") for child in tree.children):
+        return False
+    for child in tree.named_children:
+        names: list[Node | None] = []
+        if child.type in ("function_declaration", "class_declaration", "generator_function_declaration"):
+            names.append(child.child_by_field_name("name"))
+        elif child.type in ("variable_declaration", "lexical_declaration"):
+            names += [d.child_by_field_name("name") for d in child.named_children if d.type == "variable_declarator"]
+        if any(n is not None and _text(n) in _RELIED_GLOBALS for n in names):
+            return True
+    return False
+
+
+def _tree_patches(tree: Node) -> bool:
+    """Whether a parsed file or block may patch a built-in: its parse has an
+    error (what it says cannot be read), it holds a NUL (a UTF-16 file the
+    UTF-8 parse misread), or a node of it does (:func:`_patches_builtins`)."""
+    return tree.has_error or b"\0" in tree.text or any(
+        _patches_builtins(node)
+        for node in ts_syntax._walk(tree)
+        if node.type in _ASSIGNMENTS or node.type in ("call_expression", "with_statement", "for_in_statement")
+    )
+
+
+#: Files whose ``<script>`` blocks run as code no parse of the checkout's
+#: TypeScript and JavaScript sees; an HTML page's inline script is a classic one.
+_EMBEDDING_SUFFIXES = (".vue", ".svelte", ".astro", ".html", ".htm")
+_SCRIPT_BLOCK = re.compile(r"<script\b((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>(.*?)</script\s*>", re.IGNORECASE | re.DOTALL)
+_SCRIPT_LANG = re.compile(r"""\blang\s*=\s*["']?(ts|typescript|tsx)\b""", re.IGNORECASE)
+
+
+def _embedded_scripts_patch(repo: _Repo) -> bool:
+    """Whether a ``<script>`` block of a single-file component or HTML page
+    patches a built-in (:func:`_patches_builtins`) or, in an HTML page,
+    declares one at its top level. A block is parsed with the grammar its
+    ``lang`` names (TypeScript, TSX, else JavaScript), and one whose parse
+    has an error answers yes, as does an unreadable such file: a block this
+    cannot read is not proven clean. :func:`_text_patches` reads every file
+    besides."""
+    root = getattr(repo, "root", None)
+    if root is None or not Path(root).is_dir():
+        return False
+    for path in _walk_files(Path(root)):
+        file = path.name
+        if not file.lower().endswith(_EMBEDDING_SUFFIXES):
+            continue
+        text = _checked_text(path)
+        if text is True:
+            return True
+        if not isinstance(text, str) or "<script" not in text.lower():
+            continue
+        page = file.lower().endswith((".html", ".htm"))
+        for attributes, block in _SCRIPT_BLOCK.findall(text):
+            lang = _SCRIPT_LANG.search(attributes)
+            grammar = "js" if lang is None else ("tsx" if lang.group(1).lower() == "tsx" else "ts")
+            tree = ts_syntax._parse(block, grammar)
+            if _tree_patches(tree) or (page and _declares_global_builtin(tree)):
+                return True
+    return False
+
+
+_RELIED = r"(?:Array|Object|Set|Map|Boolean)"
+#: Relied-on globals whose statics or prototype the proofs read: an alias of
+#: `Boolean` can only be called, never patch the global, so it is left out.
+_RELIED_WITH_MEMBERS = r"(?:Array|Object|Set|Map)"
+_CHAIN_NAMES = r"(?:Array|Object|Set|Map|Boolean|Reflect|constructor)"
+_GLOBAL_OBJECT = r"(?:globalThis|window|self|global)"
+_CHAIN = r"""(?:\s*\??\.\s*[\w$]+|\s*\[[^\]\n]*\])*"""
+_ASSIGN = r"\s*(?:(?<![=!<>])=(?![=>])|\?\?=|\|\|=|&&=)"
+_NAMED_LITERAL = r"""\s*\[\s*['"`](?!""" + _RELIED + r"""['"`])[\w$]+['"`]\s*\]"""
+_PLAIN_KEY = r"""['"](?!""" + _CHAIN_NAMES + r"""['"])[\w$-]+['"]\s*[,)]"""
+#: A conservative TEXT reading of a write that may replace a built-in the
+#: proofs rely on, in any file: it over-refuses (a comment, a string, an
+#: unrelated ``x.Map = …``), never under-refuses a spelled-out patch.
+_TEXT_PATCH = re.compile(
+    "|".join(
+        [
+            # a chain through a relied-on name, in any position, assigned:
+            # `Object.hasOwn = …`, `root.Object.hasOwn = …`, `t.Array.isArray=…`, `Boolean = …`,
+            # `({}).constructor.hasOwn = …`
+            r"\b" + _CHAIN_NAMES + r"\b" + _CHAIN + _ASSIGN,
+            r"""\[\s*['"`]""" + _CHAIN_NAMES + r"""['"`]\s*\]""" + _CHAIN + _ASSIGN,
+            # `window.Array.isArray = …`, `globalThis[name] = …` (not `window["matchMedia"] = …`)
+            r"\b" + _GLOBAL_OBJECT + r"(?:\s*\??\.\s*" + _RELIED + r"\b|(?=\s*(?!" + _NAMED_LITERAL + r")\[))" + _CHAIN + _ASSIGN,
+            # a destructuring assignment with a member target
+            r"\(\s*\{[^{}]*:\s*[\w$]+(?:\s*\??\.\s*[\w$]+|\s*\[[^\]\n]*\])+\s*(?:=[^,{}]*)?(?:,[^{}]*)?\}\s*=(?![=>])",
+            r"(?:^|[;{}(,]|=>)\s*\[[^\[\]\n]*[\w$\])]\s*\??\.\s*[\w$]+[^\[\]\n]*\]\s*=(?![=>])",
+            # any mention of a built-in's prototype but a borrowed method call (`Array.prototype.slice.call(…)`)
+            r"\b" + _RELIED + r"\s*\.\s*prototype\b(?!\s*\.\s*[\w$]+\s*\.\s*(?:call|apply|bind)\s*\()",
+            # a prototype reached without its name
+            r"__proto__|\bgetPrototypeOf\b|\bsetPrototypeOf\b|\.\s*constructor\s*\.\s*prototype\b|__define(?:Getter|Setter)__",
+            # `Object.defineProperties` on anything
+            r"\bObject\s*\.\s*defineProperties\s*\(",
+            # a writer whose first argument names a relied-on global, a prototype or the global object
+            r"\b(?:Object\s*\.\s*(?:assign|defineProperty|setPrototypeOf)|Reflect\s*\.\s*(?:defineProperty|set|setPrototypeOf))\s*\(\s*"
+            r"[^,)]*\b(?:" + _CHAIN_NAMES + r"|prototype|__proto__)\b",
+            r"\b(?:Object\s*\.\s*(?:assign|setPrototypeOf)|Reflect\s*\.\s*setPrototypeOf)\s*\(\s*(?:" + _GLOBAL_OBJECT + r"|this)\b",
+            # a keyed writer whose key is not a plain string literal of another name, on anything
+            r"\b(?:Object\s*\.\s*defineProperty|Reflect\s*\.\s*(?:defineProperty|set))\s*\(\s*[^,]*,(?!\s*" + _PLAIN_KEY + r")",
+            # a test double or stub of one
+            r"\b(?:spyOn|stubGlobal|replaceProperty)\s*\(\s*(?:" + _RELIED + r"\b|['\"`]" + _RELIED + r"['\"`]|" + _GLOBAL_OBJECT
+            + r"\s*,\s*['\"`]" + _RELIED + r"['\"`])",
+            # an alias of one (`const O = Object`), or one handed to a function
+            r"(?<![=!<>])=(?!=)\s*" + _RELIED_WITH_MEMBERS + r"\s*(?:[;,)\]}\r]|$)",
+            r"[(,]\s*" + _RELIED_WITH_MEMBERS + r"\s*[),]",
+            # `with (Object) hasOwn = …`
+            r"\bwith\s*\(\s*[\w$.]*\b(?:" + _RELIED + r"|" + _GLOBAL_OBJECT + r"|this)\b",
+        ]
+    ),
+    re.MULTILINE,
+)
+#: Extensions whose files are code: a NUL there is not a binary file but a
+#: text the scans cannot read (UTF-16), so it counts as a patch.
+_CODE_SUFFIXES = tuple(_EXTENSIONS) + _EMBEDDING_SUFFIXES
+
+
+def _checked_text(path: Path) -> str | None | bool:
+    """The text of ``path`` for the patch scans: ``True`` when the file cannot
+    be read or is a code file holding a NUL (a patch, unproven), ``None``
+    when it is to be skipped (not a regular file; a binary one, judged from
+    its first 8 KiB before the rest is read), else the text. A UTF-16 file
+    with no byte-order mark is decoded as such."""
+    import stat
+
+    try:
+        info = os.stat(path)  # follows a symlink; a dangling one raises
+    except OSError:
+        return True
+    if not stat.S_ISREG(info.st_mode):
+        return None  # a FIFO, socket or device is never opened
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(8192)
+            if b"\0" in head:
+                even, odd = head[0::2], head[1::2]
+                utf16 = None
+                if odd and odd.count(0) > 0.9 * len(odd) and even.count(0) < 0.1 * len(even):
+                    utf16 = "utf-16-le"
+                elif even and even.count(0) > 0.9 * len(even) and odd.count(0) < 0.1 * len(odd):
+                    utf16 = "utf-16-be"
+                if utf16 is None:
+                    return True if path.name.lower().endswith(_CODE_SUFFIXES) else None
+                return (head + handle.read()).decode(utf16, "replace")
+            return (head + handle.read()).decode("utf-8", "replace")
+    except OSError:
+        return True
+
+
+def _walk_files(root: Path):
+    for current, directories, names in os.walk(root):
+        directories[:] = [d for d in directories if d not in {"node_modules", ".git"}]
+        for name in names:
+            yield Path(current) / name
+
+
+def _text_patches(repo: _Repo) -> bool:
+    """Whether any file of the checkout, whatever its extension (templates,
+    component files, docs, scripts), outside ``node_modules`` and ``.git``,
+    matches :data:`_TEXT_PATCH`, or cannot be read (:func:`_checked_text`).
+    The backstop under the parsed scans: a patch in a file kind they do not
+    read still withholds the proofs."""
+    root = getattr(repo, "root", None)
+    if root is None:
+        return False
+    root = Path(root)
+    for file in [root] if root.is_file() else _walk_files(root):
+        text = _checked_text(file)
+        if text is True:
+            return True
+        if isinstance(text, str) and (
+            _TEXT_PATCH.search(text)
+            or (file.name.lower().endswith(_CODE_SUFFIXES) and "\0" in text)
+            or _text_alias_write(text)
+        ):
+            return True
+    return False
+
+
+_GLOBAL_WORD = re.compile(r"\b(?:globalThis|window|self|global|this)\b")
+_ALIAS_BINDING = re.compile(
+    r"(?<![\w$.])(?:(?:const|let|var)\s+)?([\w$]+)\s*(?<![=!<>])=(?![=>])[^;\n]*\b(?:globalThis|window|self|global)\b"
+)
+_CALLED_ON_GLOBAL = re.compile(r"[})]\s*\)?\s*\(\s*(?:this|globalThis|window|self|global)\s*[,)]")
+
+
+def _text_alias_write(text: str) -> bool:
+    """A computed write (``x[<not a quoted name>] = …``) through a name the
+    file binds to something mentioning the global object, or any computed
+    write in a file with a function called on the global object (an IIFE
+    handed ``this``). Narrower than "any computed write in a file that names
+    ``window``", which is every React component with a lookup table."""
+    if not _GLOBAL_WORD.search(text):
+        return False
+    computed = r"\s*\[(?!\s*['\"`][\w$-]+['\"`]\s*\])[^\]\n]*\]" + _CHAIN + _ASSIGN
+    if _CALLED_ON_GLOBAL.search(text) and re.search(r"[\w$)\]]" + computed, text):
+        return True
+    names = {m.group(1) for m in _ALIAS_BINDING.finditer(text)} - {"const", "let", "var"}
+    return any(re.search(r"(?<![\w$.])" + re.escape(n) + computed, text) for n in names)
+
+
+def _builtins_patched(repo: _Repo) -> bool:
+    """Whether any parsed file of the checkout, test files included, patches
+    a built-in the proofs rely on (:func:`_patches_builtins`), declares one at
+    the top of a file that may be a classic script
+    (:func:`_declares_global_builtin`), or could not be read. Computed once
+    per run."""
+    cached = getattr(repo, "_patched", None)
+    if cached is not None:
+        return cached
+    patched = (
+        any(tree is None or _declares_global_builtin(tree) or _tree_patches(tree) for tree in repo.trees.values())
+        or _embedded_scripts_patch(repo)
+        or _text_patches(repo)
+    )
+    repo._patched = patched  # type: ignore[attr-defined]
+    return patched
+
+
+def _global(repo: _Repo, tree: Node, name: str) -> bool:
+    """Whether ``name`` in this file is the built-in global: nothing in the
+    file binds it (an import, a declaration, a parameter, an assignment) and
+    nothing in the checkout patches it."""
+    return name in _RELIED_GLOBALS and not _bound_anywhere(tree, name) and not _builtins_patched(repo)
+
+
+def _private_const(repo: _Repo, path: str, tree: Node, name: Node) -> Node | None:
+    """The value of the module-private ``const`` that ``name`` means, or None.
+
+    The one binding of the name in the file is a top-level ``const``
+    declarator (not exported), the file is a module (not a classic script,
+    whose top-level names other scripts share), nothing in it reaches a
+    binding by a computed name (``eval``, ``with``, ...) and nothing in the
+    checkout uses rewire."""
+    from flag_cleanup import ts_scope
+
+    if name.type != "identifier":
+        return None
+    binders = ts_scope.bindings(tree, _text(name))
+    if len(binders) != 1:
+        return None
+    declarator = binders[0].parent
+    if declarator is None or declarator.type != "variable_declarator" or declarator.child_by_field_name("name") != binders[0]:
+        return None
+    lexical = declarator.parent
+    if not _const_declarator(declarator) or lexical is None or lexical.parent is None or lexical.parent.type != "program":
+        return None
+    if _classic_script(repo, path, lexical) is not None or _file_reflects(tree) is not None or _module_scope_reflection(repo):
+        return None
+    value = declarator.child_by_field_name("value")
+    while value is not None and value.type in _SEE_THROUGH:
+        value = _unwrap_once(value)
+    return value
+
+
+def _references(tree: Node, name: str, binder: Node) -> list[Node] | None:
+    """Every reference to ``name`` in the file other than its binding, or None
+    when one is a form no use check reads (a shorthand ``{ name }``)."""
+    found = []
+    for node in ts_syntax._walk(tree):
+        if node.type == "shorthand_property_identifier" and _text(node) == name:
+            return None
+        if node.type == "identifier" and _text(node) == name and node != binder:
+            found.append(node)
+    return found
+
+
+def _member_of(ref: Node) -> tuple[Node, str] | None:
+    """``(member, key)`` when ``ref`` is the object of a ``ref.key`` or
+    ``ref["key"]`` (``?.`` too); key is None for a computed index."""
+    parent = ref.parent
+    if parent is None or parent.child_by_field_name("object") != ref:
+        return None
+    if parent.type == "member_expression":
+        prop = parent.child_by_field_name("property")
+        return (parent, _text(prop)) if prop is not None else None
+    if parent.type == "subscript_expression":
+        return parent, _string_value(parent.child_by_field_name("index")) or ""
+    return None
+
+
+def _member_written(member: Node) -> bool:
+    """Whether a member expression is written, deleted or updated rather than read."""
+    parent = member.parent
+    while parent is not None and parent.type in _SEE_THROUGH:
+        member, parent = parent, parent.parent
+    if parent is None:
+        return False
+    if parent.type in _ASSIGNMENTS and parent.child_by_field_name("left") == member:
+        return True
+    if parent.type == "update_expression":
+        return True
+    return parent.type == "unary_expression" and _text(parent.child_by_field_name("operator")) == "delete"
+
+
+def _arrow_without_collection(callback: Node | None) -> bool:
+    """A callback that cannot be handed the collection: an arrow (no
+    ``arguments`` of its own) of at most two plain parameters."""
+    if callback is None or callback.type != "arrow_function":
+        return False
+    return len(_params(callback)) <= 2 and not any(p.type == "rest_pattern" for p in _params(callback))
+
+
+def _collection_use(ref: Node) -> bool:
+    """A use of a private collection that cannot hand it out or replace a method."""
+    member = _member_of(ref)
+    if member is None or member[0].type != "member_expression":
+        return False
+    node, key = member
+    if _member_written(node):
+        return False
+    if key in ("length", "size"):
+        return True
+    call = node.parent
+    if call is None or call.type != "call_expression" or call.child_by_field_name("function") != node:
+        return False
+    if key in _COLLECTION_CHAINS:
+        return call.parent is not None and call.parent.type == "expression_statement"
+    if key in _COLLECTION_CALLBACKS:
+        args = call.child_by_field_name("arguments")
+        items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
+        return len(items) == 1 and _arrow_without_collection(items[0])
+    return key in _COLLECTION_USES
+
+
+def _table_use(repo: _Repo, tree: Node, ref: Node) -> bool:
+    """A use of a private table that reads a value and hands out nothing:
+    ``t.k``, ``t[k]`` read as a value (not written, called, or read further
+    as an object), ``k in t``, or an argument of ``Object.keys`` and friends."""
+    parent = ref.parent
+    if parent is not None and parent.type == "binary_expression" and parent.child_by_field_name("right") == ref:
+        return _text(parent.child_by_field_name("operator")) == "in"
+    if parent is not None and parent.type == "arguments":
+        call = parent.parent
+        callee = call.child_by_field_name("function") if call is not None else None
+        if callee is None or callee.type != "member_expression":
+            return False
+        owner, prop = callee.child_by_field_name("object"), callee.child_by_field_name("property")
+        return (
+            owner is not None and prop is not None and owner.type == "identifier"
+            and (_text(owner), _text(prop)) in _TABLE_READERS and _global(repo, tree, _text(owner))
+        )
+    member = _member_of(ref)
+    if member is None:
+        return False
+    node, key = member
+    if key in _TABLE_ESCAPES or _member_written(node):
+        return False
+    outer = node.parent
+    while outer is not None and outer.type in _SEE_THROUGH:
+        node, outer = outer, outer.parent
+    if outer is None:
+        return True
+    if outer.type == "call_expression" and outer.child_by_field_name("function") == node:
+        return False
+    return not (outer.type in ("member_expression", "subscript_expression") and outer.child_by_field_name("object") == node)
+
+
+def _uses_only(repo: _Repo, tree: Node, name: Node, use: Callable[[Node], bool]) -> bool:
+    from flag_cleanup import ts_scope
+
+    binders = ts_scope.bindings(tree, _text(name))
+    refs = _references(tree, _text(name), binders[0]) if len(binders) == 1 else None
+    return refs is not None and all(use(ref) for ref in refs)
+
+
+def _private_collection(repo: _Repo, path: str, tree: Node, name: Node) -> bool:
+    """``name`` is a module-private ``const`` initialised by an array literal or
+    a ``new Set``/``new Map`` of the globals, and every use of it in the file
+    neither hands it out nor replaces a member (:func:`_collection_use`)."""
+    value = _private_const(repo, path, tree, name)
+    if value is None:
+        return False
+    if value.type == "new_expression":
+        constructor = value.child_by_field_name("constructor")
+        if constructor is None or constructor.type != "identifier" or _text(constructor) not in _COLLECTIONS:
+            return False
+        if not _global(repo, tree, _text(constructor)):
+            return False
+    elif value.type != "array" or _builtins_patched(repo):
+        return False
+    return _uses_only(repo, tree, name, _collection_use)
+
+
+def _private_table(repo: _Repo, path: str, tree: Node, name: Node) -> bool:
+    """``name`` is a module-private ``const`` initialised by an object literal
+    of plain keys (not ``__proto__``) valued with ``true``/``false``, and every use of it only reads a value
+    (:func:`_table_use`). A missing key reads ``Object.prototype``, which
+    nothing in the checkout patches (:func:`_builtins_patched`)."""
+    value = _private_const(repo, path, tree, name)
+    if value is None or _builtins_patched(repo):
+        return False
+    entries = [c for c in value.named_children if c.type != "comment"]
+    if value.type == "object":
+        for entry in entries:
+            if entry.type != "pair":
+                return False
+            key = entry.child_by_field_name("key")
+            if key is None or key.type not in ("property_identifier", "string", "number"):
+                return False
+            if (_string_value(key) if key.type == "string" else _text(key)) == "__proto__":
+                return False
+            if entry.child_by_field_name("value") is None or entry.child_by_field_name("value").type not in ("true", "false"):
+                return False
+    else:
+        return False  # an array's `length`, `map`, … are read by key too
+    return _uses_only(repo, tree, name, lambda ref: _table_use(repo, tree, ref))
+
+
+def _builtin_result(repo: _Repo, path: str, tree: Node, expr: Node) -> str | None:
+    """``"boolean"`` when ``expr`` is a built-in's result that is always a
+    boolean: ``Boolean(x)``, ``Object.hasOwn(..)``, ``Array.isArray(..)``,
+    ``c.includes/has/some/every(..)`` on a private built-in collection
+    (:func:`_private_collection`); ``"nullable"`` for ``t[k]``/``t.k`` of a
+    private table of boolean literals (:func:`_private_table`), which is a
+    boolean or ``undefined``; else None. Each global must be the built-in one
+    (:func:`_global`).
+
+    A key that names an inherited member (``t["constructor"]``) reads that
+    member, which is neither: not modelled.
+
+    Not modelled: a built-in replaced by a dependency or by a write this
+    scan cannot name (a computed key, an alias of a prototype), which
+    TypeScript's own checking does not model either."""
+    return "boolean" if _always_boolean(repo, path, tree, expr) else (
+        "nullable" if _table_read(repo, path, tree, expr) else None
+    )
+
+
+def _always_boolean(repo: _Repo, path: str, tree: Node, expr: Node) -> bool:
+    if expr.type != "call_expression" or any(c.type == "?." for c in expr.children):
+        return False
+    callee = expr.child_by_field_name("function")
+    if callee is None:
+        return False
+    if callee.type == "identifier":
+        return _text(callee) in _PRIMITIVE_CALLS and _global(repo, tree, _text(callee))
+    if callee.type != "member_expression":
+        return False
+    owner, prop = callee.child_by_field_name("object"), callee.child_by_field_name("property")
+    if owner is None or prop is None or owner.type != "identifier":
+        return False
+    if (_text(owner), _text(prop)) in _STATIC_PREDICATES:
+        return _global(repo, tree, _text(owner))
+    return _text(prop) in _COLLECTION_PREDICATES and _private_collection(repo, path, tree, owner)
+
+
+#: ``Object.getOwnPropertyNames(Object.prototype)``: what a table read by a
+#: key of these names returns instead of an entry (a function, an object).
+_OBJECT_PROTOTYPE_MEMBERS = frozenset(
+    {"constructor", "__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__",
+     "__lookupSetter__", "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf", "__proto__",
+     "toLocaleString"}
+)
+
+
+def _table_read(repo: _Repo, path: str, tree: Node, expr: Node) -> bool:
+    """``t.k``/``t["k"]`` with ``k`` an own key of a private table, or
+    ``t[name]`` with ``name`` a plain identifier, when the flag being removed
+    is not named like an ``Object.prototype`` member (which the read would
+    return instead of an entry). A computed key (``t[a + b]``) is not read."""
+    if expr.type not in ("member_expression", "subscript_expression"):
+        return False
+    owner = expr.child_by_field_name("object")
+    if owner is None or owner.type != "identifier" or not _private_table(repo, path, tree, owner):
+        return False
+    if expr.type == "member_expression":
+        key = expr.child_by_field_name("property")
+        literal = _text(key) if key is not None else None
+    else:
+        index = expr.child_by_field_name("index")
+        literal = _string_value(index) if index is not None and index.type == "string" else None
+        if literal is None:
+            flag_key = getattr(repo, "flag_key", None)
+            return (
+                index is not None and index.type == "identifier"
+                and flag_key is not None and flag_key not in _OBJECT_PROTOTYPE_MEMBERS
+            )
+    return literal is not None and literal in _table_keys(owner, tree)
+
+
+def _table_keys(owner: Node, tree: Node) -> set[str]:
+    """The own keys of the object literal ``owner``'s one binding holds."""
+    from flag_cleanup import ts_scope
+
+    binders = ts_scope.bindings(tree, _text(owner))
+    declarator = binders[0].parent if len(binders) == 1 else None
+    value = declarator.child_by_field_name("value") if declarator is not None else None
+    while value is not None and value.type in _SEE_THROUGH:
+        value = _unwrap_once(value)
+    keys = set()
+    for entry in value.named_children if value is not None and value.type == "object" else ():
+        key = entry.child_by_field_name("key") if entry.type == "pair" else None
+        if key is not None:
+            keys.add(_string_value(key) if key.type == "string" else _text(key))
+    return keys
 
 
 #: Exports of published packages whose result IS the flag's value, never a
@@ -373,7 +1139,16 @@ def _returns_only_booleans(subject: Node, sync_call: Callable[[Node], bool] | No
 #: (``useFeatureFlag<T>(key, defaultValue: T): T``).
 SYNC_PACKAGE_EXPORTS: dict[str, dict[str, int | None]] = {
     "@growthbook/growthbook-react": {"useFeatureIsOn": None, "useFeatureValue": 1},
+    # Featureflip's React SDK, every release (1.0.0 to 2.19.2):
+    # `useFeatureFlag<T>(key: string, defaultValue: T): T`, read through
+    # `useSyncExternalStore`, so the flag's value or `defaultValue`.
+    "@featureflip/react": {"useFeatureFlag": 1},
 }
+#: Entries whose handed-back argument no type bounds: `useFeatureFlag<T>(key,
+#: defaultValue: T): T` takes a Promise as gladly as `false`, so the argument
+#: must be shown primitive in TypeScript too (:func:`_primitive_fallback`).
+#: GrowthBook's `useFeatureValue<T extends JSONValue>` is bounded there.
+_UNBOUNDED_FALLBACKS = frozenset({("@featureflip/react", "useFeatureFlag")})
 
 
 def _audited_sync_call(expr: Node, tree: Node, path: str, repo_dir: str) -> bool:
@@ -386,8 +1161,11 @@ def _audited_sync_call(expr: Node, tree: Node, path: str, repo_dir: str) -> bool
     the export may hand back must be a primitive literal."""
     from flag_cleanup import cross_file_ts, inert_calls, ts_scope
 
-    while expr.type == "parenthesized_expression" and expr.named_children:
-        expr = expr.named_children[0]
+    while expr.type in _SEE_THROUGH:
+        inner = _unwrap_once(expr)  # `useFeatureFlag(k, d) as FlagValue<K>` is the call's value
+        if inner is None:
+            return False
+        expr = inner
     if expr.type != "call_expression" or any(c.type == "?." for c in expr.children):
         return False
     callee = expr.child_by_field_name("function")
@@ -404,12 +1182,242 @@ def _audited_sync_call(expr: Node, tree: Node, path: str, repo_dir: str) -> bool
     if exports is None or name not in exports:
         return False
     handed_back = exports[name]
-    if handed_back is not None and _EXTENSIONS.get(Path(path).suffix) == "js":
+    if handed_back is not None:
         args = expr.child_by_field_name("arguments")
         items = [c for c in args.named_children if c.type != "comment"] if args is not None else []
-        if len(items) <= handed_back or items[handed_back].type not in _PRIMITIVE_NODES - {"template_string"}:
+        if len(items) <= handed_back:
+            return False
+        if _EXTENSIONS.get(Path(path).suffix) == "js":
+            if items[handed_back].type not in _PRIMITIVE_NODES - {"template_string"}:
+                return False
+        elif (specifier, name) in _UNBOUNDED_FALLBACKS and not _primitive_fallback(items[handed_back], tree, path, repo_dir):
             return False
     return cross_file_ts.names_package(path, specifier, repo_dir)
+
+
+def _primitive_fallback(arg: Node, tree: Node, path: str, repo_dir: str, depth: int = 0) -> bool:
+    """Whether a handed-back argument is certainly a primitive: a literal, a
+    name bound once in the file by a ``const`` holding one, or a read into an
+    ``as const`` registry (:func:`_registry_object`) whose every value the
+    read can reach is a literal (``FLAGS[key].default`` over
+    ``{ look: { default: false } } as const``)."""
+    from flag_cleanup import ts_scope
+
+    while arg.type in _SEE_THROUGH:
+        inner = _unwrap_once(arg)
+        if inner is None:
+            return False
+        arg = inner
+    if arg.type in _PRIMITIVE_NODES - {"template_string"}:
+        return True
+    if depth > 4:
+        return False
+    if arg.type == "identifier":
+        binders = ts_scope.bindings(tree, _text(arg))
+        declarator = binders[0].parent if len(binders) == 1 else None
+        if declarator is None or declarator.type != "variable_declarator" or not _const_declarator(declarator):
+            return False
+        value = declarator.child_by_field_name("value")
+        return value is not None and _primitive_fallback(value, tree, path, repo_dir, depth + 1)
+    keys: list[str | None] = []
+    node = arg
+    while node.type in ("member_expression", "subscript_expression") or node.type in _SEE_THROUGH:
+        if node.type in _SEE_THROUGH:
+            inner = _unwrap_once(node)
+            if inner is None:
+                return False
+            node = inner
+            continue
+        if node.type == "member_expression":
+            prop = node.child_by_field_name("property")
+            keys.append(_text(prop) if prop is not None else None)
+        else:
+            index = node.child_by_field_name("index")
+            keys.append(_string_value(index) if index is not None and index.type == "string" else None)
+        node = node.child_by_field_name("object")
+    if not keys or node.type != "identifier":
+        return False
+    found = _registry_object(tree, path, node)
+    if found is None or _registry_escapes(repo_dir, *found):
+        return False
+    values: list[Node | None] = [found[0]]
+    for key in reversed(keys):
+        reached = []
+        for value in values:
+            while value is not None and value.type in _SEE_THROUGH:
+                value = _unwrap_once(value)
+            if value is None or value.type != "object":
+                return False
+            for entry in value.named_children:
+                if entry.type == "comment":
+                    continue
+                name = entry.child_by_field_name("key") if entry.type == "pair" else None
+                if name is None or name.type not in ("property_identifier", "string", "number"):
+                    return False
+                spelled = _string_value(name) if name.type == "string" else _text(name)
+                if key is None or spelled == key:
+                    reached.append(entry.child_by_field_name("value"))
+        if not reached:
+            return False  # a key the registry does not hold reads `undefined`, or an inherited member
+        values = reached
+    return all(v is not None and v.type in _PRIMITIVE_NODES - {"template_string"} for v in values)
+
+
+def _reached(registry: Node, depth: int) -> list[Node] | None:
+    """The values ``depth`` keys into ``registry``, every key taken; None when
+    a level is not an object literal of plain pairs."""
+    values = [registry]
+    for _ in range(depth):
+        reached = []
+        for value in values:
+            while value is not None and value.type in _SEE_THROUGH:
+                value = _unwrap_once(value)
+            if value is None or value.type != "object":
+                return None
+            for entry in value.named_children:
+                if entry.type == "comment":
+                    continue
+                if entry.type != "pair" or entry.child_by_field_name("value") is None:
+                    return None
+                reached.append(entry.child_by_field_name("value"))
+        values = reached
+    return values
+
+
+_REGISTRY_ESCAPES: dict[tuple[str, str, str], bool] = {}
+
+
+def _registry_escapes(repo_dir: str, registry: Node, name: str, declared_in: str) -> bool:
+    """Whether the registry may be written to without a cast: in the file that
+    declares it and every TypeScript or JavaScript file that names it in an
+    import or export or reads it as a member (``ns.FLAGS``), an occurrence of
+    the name (or its import alias) heading a member chain is
+    an assignment target (``FLAGS.look.default = …``, ``++``, a destructuring
+    target), or ends at an object of the registry rather than a literal
+    (``Object.assign(FLAGS.look, …)``, ``const l = FLAGS.look``), other than
+    in its declaration, an import or export, a type (``typeof FLAGS``), a
+    property key or a spread (``...FLAGS``, which copies). Read as text with
+    the comments blanked out, so a string can refuse."""
+    key = (str(Path(repo_dir).resolve()), name, str(Path(declared_in).resolve()))
+    if key in _REGISTRY_ESCAPES:
+        return _REGISTRY_ESCAPES[key]
+    root = Path(repo_dir)
+    files = [root] if root.is_file() else [p for p in _walk_files(root) if p.suffix in _EXTENSIONS]
+    escapes = False
+    for file in files:
+        text = _checked_text(file)
+        if text is True:
+            escapes = True
+            break
+        if not isinstance(text, str) or name not in text:
+            continue
+        text = _without_comments(text, _EXTENSIONS[file.suffix])
+        names = {name} | set(re.findall(r"\b" + re.escape(name) + r"\s+as\s+([\w$]+)", text))
+        declares = file.resolve() == Path(declared_in).resolve()
+        imports = re.search(r"\b(?:import|export)\b[^;]*\b" + re.escape(name) + r"\b", text) or re.search(
+            r"\.\s*" + re.escape(name) + r"\b", text
+        )
+        if not (declares or imports):
+            continue  # another binding of the same name
+        if any(_name_escapes(text, alias, registry) for alias in names):
+            escapes = True
+            break
+    _REGISTRY_ESCAPES[key] = escapes
+    return escapes
+
+
+def _without_comments(text: str, grammar: str) -> str:
+    """``text`` with every comment the parse finds blanked out (lengths kept)."""
+    data = bytearray(text.encode("utf-8"))
+    for node in ts_syntax._walk(ts_syntax._parse(text, grammar)):
+        if node.type == "comment":
+            data[node.start_byte : node.end_byte] = b" " * (node.end_byte - node.start_byte)
+    return data.decode("utf-8", "replace")
+
+
+_CHAIN_LINK = re.compile(r"\s*\??\.\s*[\w$]+|\s*\[[^\]\n]*\]")
+
+
+def _name_escapes(text: str, name: str, registry: Node) -> bool:
+    for match in re.finditer(r"(?<![\w$])" + re.escape(name) + r"\b", text):
+        before = text[: match.start()]
+        line = before[before.rfind("\n") + 1 :]
+        end = match.end()
+        depth = 0
+        while (link := _CHAIN_LINK.match(text, end)) is not None:
+            end, depth = link.end(), depth + 1
+        after = text[end : end + 3]
+        if depth == 0 and re.search(r"\b(?:const|let|var)\s+$", line):
+            continue  # the declaration
+        if re.match(r"\s*(?:(?<![=!<>])=(?![=>])|\?\?=|\|\|=|&&=|\+=|-=|\+\+|--)", text[end:]):
+            return True
+        if re.match(r"\s*[,}\]]", after) and re.search(r"[}\]]\s*=(?![=>])", text[end : text.find("\n", end) if "\n" in text[end:] else len(text)]) and re.search(r"[{\[,:]\s*(?:[\w$]+\s*\??\.\s*)*$", line):
+            return True  # a destructuring target
+        if re.search(r"^\s*(?:import|export)\b", line) or re.search(r"\b(?:const|let|var)\s+$", line):
+            continue
+        if re.search(r"\b(?:typeof|keyof)\s+(?:[\w$]+\s*\??\.\s*)*$", line) or re.search(r"\.\.\.\s*(?:[\w$]+\s*\??\.\s*)*$", line):
+            continue
+        if depth == 0 and re.match(r"\s*:(?!:)", text[end:]) and re.search(r"[{,]\s*$", line):
+            continue  # a property key
+        if re.match(r"\s*[.\[(]", text[end:]):
+            continue  # read further, or called
+        reached = _reached(registry, depth)
+        if reached is None or not reached or any(v.type not in _PRIMITIVE_NODES - {"template_string"} for v in reached):
+            return True  # an object of the registry handed on
+    return False
+
+
+def _registry_object(tree: Node, path: str, name: Node) -> tuple[Node, str, str] | None:
+    """The object literal ``name`` means when it is an ``as const`` registry:
+    a top-level ``const`` of this file bound once, or one exported as
+    ``export const`` by the relative module a named import of it reads. Its
+    entries are readonly to the compiler; a write through a cast is not
+    modelled."""
+    from flag_cleanup import inert_calls, ts_scope
+
+    binders = ts_scope.bindings(tree, _text(name))
+    if len(binders) != 1:
+        return None
+    declarator = binders[0].parent
+    if declarator is not None and declarator.type == "variable_declarator":
+        found = _as_const_object(declarator)
+        return None if found is None else (found, _text(name), path)
+    imported = inert_calls._imported(binders[0])
+    if imported is None or not imported[0].startswith("."):
+        return None
+    for candidate in _module_candidates(path, imported[0]):
+        if candidate.suffix in (".ts", ".tsx", ".mts", ".cts") and candidate.is_file():
+            try:
+                other = ts_syntax._parse(candidate.read_text(encoding="utf-8"), _EXTENSIONS[candidate.suffix])
+            except (OSError, UnicodeDecodeError):
+                return None
+            found = [b for b in ts_scope.bindings(other, imported[1])]
+            if len(found) != 1 or found[0].parent is None or found[0].parent.type != "variable_declarator":
+                return None
+            lexical = found[0].parent.parent
+            if lexical is None or lexical.parent is None or lexical.parent.type != "export_statement":
+                return None
+            registry = _as_const_object(found[0].parent)
+            return None if registry is None else (registry, imported[1], str(candidate))
+    return None
+
+
+def _as_const_object(declarator: Node) -> Node | None:
+    """The object literal of a top-level ``const X = { … } as const``."""
+    lexical = declarator.parent
+    if not _const_declarator(declarator) or lexical is None:
+        holder = None
+    else:
+        holder = lexical.parent.parent if lexical.parent is not None and lexical.parent.type == "export_statement" else lexical.parent
+    if holder is None or holder.type != "program":
+        return None
+    value = declarator.child_by_field_name("value")
+    if value is None or value.type != "as_expression" or not any(c.type == "const" for c in value.children):
+        return None
+    inner = value.named_children[0] if value.named_children else None
+    while inner is not None and inner.type == "parenthesized_expression":
+        inner = _unwrap_once(inner)
+    return inner if inner is not None and inner.type == "object" else None
 
 
 def _only_reads(expr: Node | None) -> bool:
@@ -591,6 +1599,7 @@ def _written_value_possibly_async(
     sync_call: Callable[[Node], bool] | None,
     imported_double: Callable[[Node], bool] | None,
     not_callable: Callable[[Node], bool] | None,
+    boolean_leaf: Callable[[Node], str | None] | None = None,
 ) -> bool | None:
     """What a write gives the name (``o.enabled = <value>``), judged as a
     declarator's value is: a function by its ``async`` token, return type or
@@ -604,7 +1613,7 @@ def _written_value_possibly_async(
         rtype = value.child_by_field_name("return_type")
         if rtype is not None:
             return not _primitive_return(rtype)
-        return not _returns_only_booleans(value, sync_call)
+        return not _returns_only_booleans(value, sync_call, boolean_leaf)
     if _is_test_double(value, imported_double):
         return None
     if not_callable is not None and not_callable(value):
@@ -622,8 +1631,8 @@ def _write_of(node: Node, name: str) -> tuple[str, Node | None] | None:
     (:func:`_const_declarator`)."""
     if node.type in _ASSIGNMENTS:
         left = node.child_by_field_name("left")
-        while left is not None and left.type in ("parenthesized_expression", "non_null_expression") and left.named_children:
-            left = left.named_children[0]
+        while left is not None and left.type in _SEE_THROUGH:
+            left = _unwrap_once(left)  # `(isOn as any) = …` writes `isOn`
         value = node.child_by_field_name("right")
         if left is None:
             return None
@@ -683,6 +1692,7 @@ def _possibly_async(
     sync_call: Callable[[Node], bool] | None = None,
     imported_double: Callable[[Node], bool] | None = None,
     not_callable: Callable[[Node], bool] | None = None,
+    boolean_leaf: Callable[[Node], str | None] | None = None,
 ) -> bool | None:
     """Whether a declaration of the name is, or could be, async. None: says nothing.
 
@@ -709,8 +1719,15 @@ def _possibly_async(
         if value is not None and value.type in _FUNCTION_VALUES:
             subject = value
             if ftype is not None and not (_has_async_token(value) or _jsdoc_promise(node)):
-                # `const isEnabled: (k: string) => R = (k) => …`: the declared type decides.
-                return not _primitive_return(ftype.child_by_field_name("return_type"))
+                # `const isEnabled: (k: string) => R = (k) => …`: a primitive R
+                # decides; else the body does when the binding is a `const`
+                # and R names no Promise (:func:`_body_decides`).
+                declared = ftype.child_by_field_name("return_type")
+                if _primitive_return(declared):
+                    return False
+                if _body_decides(node, declared):
+                    return not _returns_only_booleans(value, sync_call, boolean_leaf)
+                return True
         else:
             if ftype is not None:
                 return _jsdoc_promise(node) or not _primitive_return(ftype.child_by_field_name("return_type"))
@@ -727,11 +1744,35 @@ def _possibly_async(
     if _has_async_token(subject) or _jsdoc_promise(node):
         return True
     rtype = subject.child_by_field_name("return_type")
-    if rtype is not None:
+    if rtype is not None and (_primitive_return(rtype) or not _body_decides(node, rtype)):
         return not _primitive_return(rtype)
     if node.type in _SIGNATURE_KINDS:
         return True
-    return not _returns_only_booleans(subject, sync_call)
+    return not _returns_only_booleans(subject, sync_call, boolean_leaf)
+
+
+#: An annotation naming a Promise or a thenable, whatever alias wraps it
+#: (`MaybePromise<T>`, `PromiseLike<T>`, `Awaitable<T>`).
+_PROMISE_NAMED = re.compile(r"Promise|Thenable|Awaitable", re.IGNORECASE)
+
+
+def _body_decides(node: Node, annotation: Node | None) -> bool:
+    """Whether a non-primitive return ``annotation`` gives way to the body:
+    ``node`` is a BINDING nothing can replace (a function declaration, or a
+    ``const`` holding an arrow or function expression) and the annotation's
+    text names no Promise (:data:`_PROMISE_NAMED`). A function that is not
+    ``async`` returns what its ``return``s give, whatever its type says
+    (``useFlag<K>(key: K): FlagValue<K>``). A class or interface member, or a
+    property, keeps "the annotation decides": another implementation of the
+    same member may return what the type allows."""
+    if annotation is None or _PROMISE_NAMED.search(_text(annotation)):
+        return False
+    if node.type == "function_declaration":
+        return True
+    if node.type == "variable_declarator" and _const_declarator(node):
+        value = node.child_by_field_name("value")
+        return value is not None and value.type in ("arrow_function", "function_expression", "function")
+    return False
 
 
 #: Text that can make or name a Promise, a thenable or a getter (whose read runs code).
@@ -1038,15 +2079,22 @@ class Site:
     #: awaited reads have rules of their own, so these sites are un-awaited ones
     #: and a LITERAL decision is marked too: no bare-call rule exists to fold it.
     prop: bool = False
+    #: A property read whose key is a constant of its own file bound once to the
+    #: flag's key (``useFlag({ key: KEY })``), decided LITERAL. It is keyed, and
+    #: marked only where Gate 2 counted it among the constant's removable reads
+    #: (:func:`const_marks`), so the declaration goes with the last read.
+    const_key: bool = False
 
 
 class _Repo:
     """Repo-wide facts, built once per plan: declarations by name, parsed files."""
 
-    def __init__(self, repo_dir: str, accessors: frozenset[str]) -> None:
+    def __init__(self, repo_dir: str, accessors: frozenset[str], flag_key: str | None = None) -> None:
         from flag_cleanup.piranha_runner import _SKIP_DIRS, source_files
 
         self.accessors = accessors
+        #: The flag being removed: a table read by its key is judged against it (:func:`_table_read`).
+        self.flag_key = flag_key
         #: Every declaration of the name that may be async, whatever it is,
         #: and where the first one is: what a member read may call.
         self.possibly_async: dict[str, bool] = defaultdict(bool)
@@ -1091,6 +2139,7 @@ class _Repo:
                             lambda call, tree=tree, path=path: _audited_sync_call(call, tree, str(path), repo_dir),
                             lambda callee, tree=tree, path=path: _imported_test_double(callee, tree, str(path), repo_dir),
                             lambda value, tree=tree: _not_callable(value, tree),
+                            lambda expr, tree=tree, path=path: _builtin_result(self, str(path), tree, expr),
                         )
                         if verdict and support and _a_fake(node, tree):
                             verdict = None  # a fake in test support code that only reads
@@ -1118,6 +2167,7 @@ class _Repo:
                                 lambda call, tree=tree, path=path: _audited_sync_call(call, tree, str(path), repo_dir),
                                 lambda callee, tree=tree, path=path: _imported_test_double(callee, tree, str(path), repo_dir),
                                 lambda v, tree=tree: _not_callable(v, tree),
+                                lambda expr, tree=tree, path=path: _builtin_result(self, str(path), tree, expr),
                             )
                         if verdict:
                             note(name, node, kind == "binding")
@@ -2664,7 +3714,7 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
         return []
     props = {n: p for n, p in rule_synthesis.positions_of(accessors).items() if isinstance(p, str)}
     names = frozenset(a for a in accessors if rule_synthesis.plain_name(a) == a)
-    repo = _Repo(repo_dir, names | frozenset(props))
+    repo = _Repo(repo_dir, names | frozenset(props), flag_key)
     sites: list[Site] = []
     for path in dict.fromkeys(paths):
         if _EXTENSIONS.get(Path(path).suffix) is None:
@@ -2711,11 +3761,52 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
                 # returned or passed on may be awaited or `.then`-ed by a
                 # caller. Left as it always was, and listed by the residual scan.
                 continue
+            const_key = (
+                prop is not None and decision == LITERAL and literal != flag_key
+                and _key_constant(tree, node, prop, flag_key)
+            )
             sites.append(
                 Site(path, name, (callee.start_byte, callee.end_byte), (node.start_byte, node.end_byte),
-                     decision, literal == flag_key, why, prop is not None)
+                     decision, literal == flag_key or const_key, why, prop is not None, const_key)
             )
     return sites
+
+
+def _key_constant(tree: Node, call: Node, prop: str, flag_key: str) -> bool:
+    """Whether the ``prop`` value of ``call``'s object argument is a name bound
+    exactly once in the file, by a ``const`` whose value is the flag's key: the
+    declaration the key-constant rules recognise (``key_const._ts_key_consts``)."""
+    from flag_cleanup import key_const, ts_scope
+
+    args = call.child_by_field_name("arguments")
+    obj = args.named_children[0] if args is not None and args.named_children else None
+    if obj is None or obj.type != "object":
+        return False
+    values = [
+        pair.child_by_field_name("value")
+        for pair in obj.named_children
+        if pair.type == "pair" and pair.child_by_field_name("key") is not None and _text(pair.child_by_field_name("key")) == prop
+    ]
+    if len(values) != 1 or values[0] is None or values[0].type != "identifier":
+        return False
+    name = _text(values[0])
+    binders = ts_scope.bindings(tree, name)
+    if len(binders) != 1:
+        return False
+    consts = key_const._ts_key_consts(tree, tree.text, flag_key)
+    return any(const.name == name and any(n.id == binders[0].id for n in const.name_nodes) for const in consts)
+
+
+def const_marks(sites: list[Site]) -> dict[str, frozenset[tuple[int, int, bytes]]]:
+    """Per resolved path, ``(start, end, text)`` of each constant-keyed property
+    read the run may mark (:attr:`Site.const_key`): what Gate 2 counts as a
+    removable read of the constant (``key_const.marked_reads``)."""
+    found: dict[str, set[tuple[int, int, bytes]]] = defaultdict(set)
+    for site in sites:
+        if site.const_key:
+            data = Path(site.path).read_bytes()
+            found[str(Path(site.path).resolve())].add((*site.call, data[site.call[0] : site.call[1]]))
+    return {path: frozenset(spans) for path, spans in found.items()}
 
 
 def managed_accessors(sites: list[Site]) -> frozenset[str]:

@@ -8,6 +8,205 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.18.0
+
+### Changed
+
+- In a Dart package whose `pubspec.lock` resolves the Featureflip SDK to
+  2.8.2, a plain `import 'package:featureflip/featureflip.dart';` that the
+  removal leaves unused is now deleted, as it already was for 2.8.1 and
+  earlier. Before, the import stayed in place on 2.8.2.
+- The transform engine is now 0.58.0, and the C# parser 0.23.5+canopy.4. They
+  carry the TypeScript/JavaScript, Python, Ruby/ERB and C# changes noted
+  alongside this release.
+- TypeScript and JavaScript: a flag read to the right of a call that decides
+  its condition (`if (!types.has(type) || <read>)` served true, or
+  `const store = isBlob(b) && !<read> && … ? x : null`) no longer refuses the
+  flag. The call is kept as a statement of its own on the line above
+  (`types.has(type);`) and the condition folds. This applies when the call is
+  the first thing an `if`, `return` or single-name `const`/`let` directly in a
+  block evaluates, and no comment sits on the line above it or on its own
+  lines; other shapes
+  are still refused, as before. The kept call always ends with `;`.
+- JavaScript: in a CommonJS file (one that assigns `module.exports` or
+  `exports.name` at its top level), a top-level constant the removal leaves
+  unread is now deleted, as it already was in an ES module or a file that
+  calls `require`.
+- TypeScript and JavaScript: an in-repository flag wrapper with no return type
+  whose returns are certainly booleans from built-ins now counts as
+  synchronous, so its reads fold instead of refusing the flag. That covers
+  `Boolean(…)`, `Object.hasOwn(…)`, `Array.isArray(…)`,
+  `includes`/`has`/`some`/`every` on a module-private array, `Set` or `Map`,
+  and a read of a module-private table of `true`/`false` values with a boolean
+  fallback (`flags[name] ?? false`, `flags[name] || false`). The built-ins are
+  not trusted where the file rebinds their names or the repository (including
+  component and HTML `<script>` blocks) patches them.
+- TypeScript and JavaScript: an un-awaited read of a property-keyed accessor
+  whose key is a constant of the same file (`useFlag({ key: KEY })`) now folds
+  under the same synchronous-evidence rules as a string-literal key, and the
+  constant is deleted with its last read.
+
+### Fixed
+
+- C#: one file that does not parse no longer stops every keyless wrapper
+  from being inlined. A `nameof(x)` inside a parse error used to count as a
+  possible declaration of something named `nameof`, so every
+  `GetProperty(nameof(…))` in the repository counted as a lookup by a
+  computed name, and every string spelling the wrapper's member name (an
+  `"IsEnabled"` in a validation message or an EF model snapshot) kept the
+  wrapper. A `nameof` the parser still read as a call inside an error-free
+  body, initializer or argument list now counts as a call.
+- C#: `Expression.Property(target, name)` with a computed `name` no longer
+  counts as a lookup on any type when `target` is a `var` local, in scope
+  and never rebound, that holds `Expression.Constant(new T(…))` for a type
+  `T` of the repository. It is bound to `T`, as a
+  `typeof(T).GetProperty(name)` already was. Anything that could make
+  `Expression` mean another type (an alias, a member, a `using static`) or
+  make `new T()` create another one keeps the old reading.
+- C#: a by-name lookup in a loop over a local array (of strings, or of
+  `typeof(…)`) is bound to that array's values only when the local is
+  declared in a block that holds the loop. A local of the same name in a
+  sibling block, in another `#if` branch, or in a lambda inside a local
+  function used to be taken for the loop's collection, though the compiler
+  binds the loop to a field or an outer local of that name; the lookup now
+  takes any name, and strings that may be that name count again. The same
+  holds for an `Expression.Property` target declared in another `#if`
+  branch.
+  If a removal already merged inlined a keyless wrapper in a repository
+  that looks members up by name in such a loop, check that nothing still
+  looks the wrapper's member up.
+- Python: a read compared with `None` (`<read> is not None`, `<read> is None`,
+  `!= None`, `== None`) now folds to `True` or `False`, since a boolean is never
+  `None`. Before, the comparison was left as `False is not None`, and an
+  `assert <read> is not None` served `false` refused the whole flag as an
+  assertion that "can only fail", although it always passed.
+- Python: a chained comparison holding the read (`<read> == True == other`,
+  `<read> is x is False`, `<read> in x == True`) is no longer folded to a
+  single literal. `a == b == c` compares `a` with `b` and
+  `b` with `c`, so served `true` it is `True == other`, not `True`; the run now
+  leaves the chain as the fold wrote it. If a removal already merged rewrote
+  such a chain, check that the condition it left still says what you meant.
+- Python: `if x and <read>:` served `false` (and `x or <read>` served `true`)
+  no longer deletes the condition when `x` holds an operator that can call your
+  code: arithmetic (`a + b`), a comparison other than `is`/`is not` (`a < b`,
+  `a in b`), a unary `-`/`~` on anything but a number, or a dict or set
+  display (`{a: b}`, `{a}`). Before, whatever that
+  method did was dropped with the `if`. The condition is now left as
+  `if a < b and False:` for you to remove. Names, `is`, `is not` and `not`
+  still fold as before. If a removal already merged deleted such a condition
+  and the operator is one your own class defines, check that nothing relied on
+  what it did.
+- Python: an `assert` whose test only starts with the folded literal
+  (`assert False == expected`, `assert False in states`) no longer refuses the
+  flag as an assertion that can only fail; only a test that is the literal
+  itself (`assert False`, with or without a message) is counted.
+- Go, Java, TypeScript, JavaScript and Python: a flag key held in a constant
+  that something else in the file also uses (a log line, a key of a defaults
+  map) no longer leaves the flag untouched with only a generic "still
+  references" line. When the constant cannot hold anything else at a read (a
+  Go, TypeScript or JavaScript `const`, a Java `final`, or a Python module
+  constant nothing rebinds or patches), its reads now fold, the constant and
+  its other uses are kept, and the log names the constant.
+- Every language: a file left untouched because its key constant could not be
+  resolved now says so in the log, naming the file, the constant, the lines
+  of its reads and the reason (a second use in C#, Kotlin, Swift, PHP and Ruby,
+  a name declared twice, a `monkeypatch.setattr` of a Python constant, and so
+  on). Before, nothing distinguished it from a file where nothing matched.
+- TypeScript and JavaScript: a read of a key constant inside a scope that
+  rebinds its name by destructuring (`const { KEY } = options`), by a nested
+  `class KEY {}`, or (TypeScript) by an enum member of that name read inside
+  a `namespace` merged with the enum, was folded as the constant, which
+  removed the wrong branch.
+  It is now left alone. If you merged a removal where a key constant's name
+  was reused that way, check it.
+- Go, Java and TypeScript: a flag read that comes before a key constant
+  declared inside a function, or outside the block that declares it, was
+  folded as that constant, though the name there means something else (a
+  package-level constant, an inherited field). Such a file is now left
+  untouched and the log says why. If you merged a removal where a read sat
+  above a local key constant, check it.
+- TypeScript: a read of a key constant inside a `namespace` (or `module`)
+  body was folded as the constant, though another file can merge a member of
+  that name into the namespace that wins there: a script's `namespace` of the
+  same name, a `.d.ts` `declare namespace`, or a `declare module "./a"`
+  augmentation of an exported one. A key constant read inside any namespace,
+  or under any `declare` block, now leaves its file untouched, and the log
+  says why.
+- JavaScript and TypeScript: a file that calls `eval` directly no longer has
+  its key constant's reads folded, since `eval` can declare a variable of the
+  same name. The log names the constant and the `eval` line.
+- A doc comment (`/** … */`, `///`) directly above the flag's own read, a
+  variable holding it, or its registry entry is now removed with that line.
+  Before, it was left behind and read as the documentation of the next
+  statement.
+- TypeScript and JavaScript: a flag read bound in a `const` that declares
+  several names (`const on = <read>, retries = 3;`) is now inlined and its
+  name removed, keeping the others. Before, `const on = true, retries = 3;`
+  stayed, with every use of `on` still testing it. A literal-valued name of
+  such a declaration that only the removed branch read is removed too, so
+  ESLint's `no-unused-vars` no longer reports it.
+- TypeScript and JavaScript: a read beside an `in` test inside a `for`
+  loop's first clause (`for (let v = (<read> || 'k' in o) && z; …)`) now
+  folds to `('k' in o) && z`. Before, the fold stopped at `(false || 'k' in
+  o) && z`, which ESLint's `no-constant-binary-expression` reports, and a
+  `for (let v = (<read> ? 'k' in o : z); …)` refused the whole flag.
+- TypeScript: removing a flag's member from a `;`-separated object type
+  with a comment before its `;` (`{ a?: boolean; 'k'?: boolean /* c */; b?:
+  boolean }`) no longer fails the whole flag when the member sits in the
+  middle, and no longer leaves the comment jammed against the next member
+  when it is first. The comment goes with the member.
+- TypeScript and JavaScript: a conditional spread in a call's arguments
+  (`f(a, ...(<read> ? [x] : []))`) now becomes `f(a, x)` or `f(a)`, as it
+  already did in an array or object literal, instead of `f(a, ...([x]))` or
+  `f(a, ...([]))`. A spread the fold leaves around a name, property or call
+  (`...(rows)`) loses its parentheses in any of the three. A spread literal
+  that starts or ends with a comment (`f(a, ...(<read> ? [/* none */] : []))`)
+  keeps its brackets instead of being spliced, which used to leave a stray
+  comma and refuse the flag.
+- Ruby and ERB: a fold next to code written without spaces now keeps that
+  code meaning what it did. When a flag read in parentheses sits directly
+  after a keyword, as in `x = b if(<read>) || :z`, the fold writes a space:
+  `x = b if :z`. Before, it wrote `x = b if:z`, which Ruby reads as a call
+  of `b` with an `if:` argument, so the line ran unconditionally. The same
+  applies after `unless`, `and`, `or`, `while` and `rescue`. After a `:`
+  or an `=`, the result keeps its parentheses: `a ? b :(:legacy)`,
+  `mode:(:legacy)`, `v =(~a)`. Before, these came out as `b ::legacy` (a
+  constant lookup), `level::"warn"` (which stopped the whole flag's run) and
+  `v =~a` (a regex match). A literal written straight before a `?` keeps a
+  pair too (`(true)?a : b`), so the ternary still folds instead of becoming
+  a call of `true?`. A fold that no rule can prove safe is left in place and
+  reported.
+  If a removal already merged folded a Ruby read written against a keyword,
+  a `:` or an `=` without a space, check the line it left.
+- C#: a member under two or more attribute lists inside one `#if` block
+  (`#if NET5_0_OR_GREATER`, then `[UnconditionalSuppressMessage(…)]` twice,
+  then `#endif`) is now parsed and cleaned. Before, the parser could not
+  read the file, so a flag read in it was left in place and reported.
+- TypeScript and JavaScript: a flag wrapper that is a function declaration or
+  a `const` arrow declaring a return type the run cannot read (such as
+  `useFlag<K>(key: K): FlagValue<K>`) and returning Featureflip's
+  `useFeatureFlag(key, fallback)` from `@featureflip/react` no longer refuses
+  every flag it reads. Such a wrapper is now judged by what it returns unless
+  its declared type names a Promise, and `useFeatureFlag` joins the hooks
+  known to return the flag's value when its fallback is a literal, a `const`
+  holding one, or a read of an `as const` registry of literals.
+- TypeScript/JavaScript: a `tsconfig.json` with `references` that also lists
+  files of its own (an `include`, or a `files` list that is not empty) is no
+  longer treated as unreadable. Its own `paths` and `baseUrl` are read,
+  through `extends`, for the files it compiles, so a `vi.mock("@/lib/...")`
+  or an import through such an alias resolves instead of hiding a wrapper or
+  keeping a key constant. A solution config (`"files": []` with only
+  `references`) is read as before.
+- TypeScript/JavaScript: a config named in `references` now counts as
+  compiling a file through the `files` or `include` it inherits with
+  `extends`, as the compiler reads it. An alias two such configs read
+  differently is no longer resolved through only one of them.
+- JavaScript/TypeScript: a key constant's module stored once in a test
+  (`modules.constants = require("../src/constants")`, or a `let` assigned
+  once) and then read only as `modules.constants.OTHER` no longer keeps the
+  constant's declaration. Any other use of the stored module, or of the
+  object holding it, still keeps it.
+
 ## 2.17.0
 
 ### Added

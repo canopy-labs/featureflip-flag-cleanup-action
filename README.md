@@ -1343,24 +1343,52 @@ first match wins. A read that is only tested (an `if`, `while`, `do` or `for` co
    async unless it has a primitive return type (`boolean`, `string`, `number`,
    `undefined`, `null`, a literal type, or a union of these such as
    `boolean | undefined`; not `void`, which an async function satisfies) or is a
-   function that is not `async` and whose every returned expression is a
+   function that is not `async`, declares no other return type (but see
+   below), and whose every returned expression, looking through `as`,
+   `satisfies` and `!`, is a
    literal, a comparison, a `!`, `typeof` or arithmetic expression, or a
-   ternary, `&&`, `||` or `??` of those, or a direct call of one of these
+   ternary, `&&`, `||` or `??` of those; or is certainly a boolean: `true`,
+   `false`, a comparison, `!x`, a call of the built-in `Boolean`,
+   `Object.hasOwn` or `Array.isArray`, a built-in predicate of a private
+   collection (below), a ternary or `&&` whose every operand is one of those,
+   or an `||`/`??` whose right side is one and whose left side is one or a read
+   of a private table (below), such as `flags[name] ?? false`. A built-in that
+   returns a string or number (`String(x)`, `Number(x)`) is not evidence: the
+   fold writes `true` or `false`, and a value read as text would change; or a
+   direct call of one of these
    hooks, imported by name (renamed or not) from its published package:
    GrowthBook's `useFeatureIsOn` and `useFeatureValue` from
-   `@growthbook/growthbook-react`. Their published types return the flag's
+   `@growthbook/growthbook-react`, and Featureflip's `useFeatureFlag` from
+   `@featureflip/react`. Their published types return the flag's
    boolean or JSON value, never a Promise, so a wrapper such as
    `export const useFeature: GetFeatureValue = (f) => useFeatureValue(f.id, f.defaultValue)`
-   folds. GrowthBook's `useFeature` is not one of them: it returns a result
-   object, which is not the flag's value. In a `.js` file `useFeatureValue`'s
-   fallback must be a literal, since the hook returns it unchanged when the flag
-   is unknown and nothing checks its type there. The hook is not trusted when a
+   or `return useFeatureFlag(key, fallback) as FlagValue<K>` folds.
+   GrowthBook's `useFeature` is not one of them: it returns a result
+   object, which is not the flag's value. In a `.js` file the fallback of
+   `useFeatureValue` and `useFeatureFlag` must be a literal, since the hook returns it unchanged when the flag
+   is unknown and nothing checks its type there. `useFeatureFlag` declares no
+   bound on that type, so in TypeScript too its fallback must be a literal, a
+   `const` holding one, or a read of an `as const` registry of literals
+   (`FLAGS[key].default` over `export const FLAGS = { look: { default: false } } as const`,
+   in the same file or a relative import) that reaches only keys the registry
+   holds, and that no file writes to or hands on (`Object.assign(FLAGS.look, …)`,
+   `const look = FLAGS.look`); a parameter, `unknown` or a Promise passed
+   through refuses. The hook is not trusted when a
    `paths` or `baseUrl` entry of a `tsconfig*.json` or `jsconfig*.json` from the
    wrapper's directory up to the repository root could resolve the package's
    name to a file, or when a file or directory named like the package sits in
    the wrapper's directory or one above it. A function value assigned to a name
    with a declared function type (`const isEnabled: (k: string) => boolean = …`)
-   is judged by that type's return type. A value that is a reference, any other
+   is judged by that type's return type when it is primitive. A declared
+   return type that is not primitive gives way to the body (the returned
+   expressions above) for a function declaration or a `const` holding an arrow
+   or function expression, which nothing can replace, when the type names no
+   Promise (no `Promise`, `PromiseLike`, `Thenable` or `Awaitable` anywhere in
+   its text, whatever alias wraps it): `useFlag<K>(key: K): FlagValue<K>`
+   returning `useFeatureFlag(key, fallback) as FlagValue<K>` folds. A class,
+   interface or object member keeps being judged by its declared type, since
+   another implementation of it may return what the type allows, and so does
+   a `let`. A value that is a reference, any other
    call, an alias, a destructured binding or a returned local, or a ternary or
    `&&` with one as an arm, all count. So does every write of the name, judged
    on what it writes as a declaration's value is: `enabled = …`,
@@ -1382,6 +1410,84 @@ first match wins. A read that is only tested (an `if`, `while`, `do` or `for` co
    be a member of an exported object, as with `module.exports = { enabled }`)
    and for `obj.enabled(…)` they all do. A refusal names the first declaration
    that counts.
+
+   The built-ins are trusted only when the file binds none of their names (no
+   import, declaration, parameter or assignment of `Boolean`, `Object`, `Set`
+   and so on) and nothing in the repository may replace one, one of its
+   statics or its prototype. The check lists what a write must look like to
+   be let through, not the writes it knows, and either half of it withholds
+   every built-in proof for the run:
+
+   - the TypeScript and JavaScript files, and the `<script>` blocks of `.vue`,
+     `.svelte`, `.astro` and HTML files (read as TypeScript when their `lang`
+     says so), are parsed. A file or block that does not parse cleanly, or
+     holds a NUL byte, counts as a write. So does an assignment (or a
+     `for … in/of` target) to `Array`, `Object`, `Set`, `Map` or `Boolean`, or
+     to a member chain with a link named like one of those, `Reflect`,
+     `constructor` or `__proto__`, whatever name it starts from
+     (`root.Object.hasOwn`, `t.Array.isArray`, `({}).constructor.x`), or a
+     computed member of the global object, or a built-in's prototype; a
+     destructuring assignment with any member target
+     (`({ hasOwn: Object.hasOwn } = …)`); `Object.defineProperty`,
+     `Reflect.defineProperty` or `Reflect.set` on anything with a key that is
+     not a plain string literal, or names one of them; `Object.defineProperties`
+     on anything; any writer handed one of them or the global object; a `with`
+     statement; and a top-level `function Boolean` in a file with no `import`
+     or `export`. Writes to your own objects (`this.state = …`,
+     `Foo.prototype.x = …`, `Object.defineProperty(window, "matchMedia", …)`)
+     pass;
+   - the text of every other file in the checkout, whatever its extension
+     (server templates such as `.erb`, `.ejs`, `.hbs` or `.php`, `.mdx`,
+     `.astro` frontmatter, scripts, docs), outside `node_modules`, is searched
+     for anything that may be such a write: the same chains, destructuring
+     assignments and writers spelled out, any mention of a built-in's
+     `prototype` other than a borrowed method call
+     (`Array.prototype.slice.call(…)`), `__proto__`, `getPrototypeOf`, a
+     `spyOn` or `stubGlobal` of one, an alias of `Array`, `Object`, `Set` or
+     `Map` (`const O = Object`), and `with (Object)`. A UTF-16 file is read as
+     such; a binary file is skipped, judged from its first 8 KiB, but a code
+     file holding a NUL counts. A file that cannot be read, including a
+     symbolic link to nothing, counts; a pipe, socket or device is never
+     opened. This is a text search, so a comment or string that reads like
+     such a write, or a compiled helper that sets `__proto__`, also withholds
+     the proofs.
+
+   A computed write through another name for the global object is a write
+   too: `const g = globalThis; g[name] = …`, a polyfill loop
+   `for (const k of Object.keys(shims)) root[k] = shims[k]`, or the parameter
+   of a function called on the spot with `this`, `window` or `globalThis`,
+   but not the global object obtained by evaluating a string
+   (`Function('return this')()`, an indirect `eval`).
+
+   Not detected: a built-in replaced by a dependency (`node_modules` is not
+   read) or by a script loaded from another site; a writer reached through an
+   alias (`const dp = Object.defineProperty; dp(globalThis, …)`); a test
+   double installed by a library call such as `sinon.stub(globalThis,
+   "Boolean")`; a `for … of` loop whose target is a built-in's member, in a
+   file this does not parse (a template or other non-script file); and a
+   build tool that rebinds a global name at bundle time (webpack's
+   `ProvidePlugin`, an esbuild or Vite `define`).
+
+   A **private collection** is a `const` declared at the top level of a module
+   (not exported, not a classic script, no `eval`, `with` or rewire in reach)
+   whose value is an array literal, `new Set(…)` or `new Map(…)`; its
+   `includes`, `has`, `some` and `every` return a boolean. Every other use of it
+   in the file must be `includes`, `has`, `indexOf`, `lastIndexOf`, `push`,
+   `delete`, `clear`, `length` or `size`, an `add` or `set` whose result is
+   discarded, or a `some`/`every` whose callback is an arrow of at most two
+   parameters, so the collection is never handed out or given a method of its
+   own. A **private table** is such a `const` holding an object literal (not
+   an array) of plain keys valued with `true` or `false`
+   (`{ look: true, other: false }`), and every use of it in the file only
+   reads a value (`flags[name]`, `flags.look`, `name in flags`,
+   `Object.keys(flags)`), never writes, calls, or reads further into one.
+   `flags[name] ?? false` then folds, as long as the key is a plain name and
+   the flag's own key is not the name of an `Object.prototype` member
+   (`constructor`, `toString`, `valueOf`, `hasOwnProperty`, `__proto__` and
+   the rest), whose read returns that member; `flags.look` folds when `look`
+   is one of the table's own keys. Anything else returned, such as
+   `flag ? flag.isActive : false` or `flags[name] ?? false` on a parameter,
+   still counts.
 
 A refusal names the file and the reason ("an un-awaited read whose result may
 be a Promise: …"), including for a read through a key constant, so a key
@@ -1590,10 +1696,15 @@ first-argument one for that reason:
   not awaited, such as a hook (`useFlag({ key: "old-checkout" })`), is decided
   like a first-argument accessor's: it folds where its result is used as a
   boolean, becomes `Promise.resolve(<value>)` where a Promise is expected, and
-  the flag is refused where the result is used as a Promise or an object. Only a
-  string-literal key folds when it is not awaited. An un-awaited read through a
-  constant or enum member is left, the run lists it as a reference that still
-  names the flag, and the constant is kept;
+  the flag is refused where the result is used as a Promise or an object. A
+  key that is a string literal folds when it is not awaited, and so does a
+  `const` of the same file bound once to the key (`useFlag({ key: KEY })`)
+  where it folds to the literal: the constant is deleted with its last read,
+  under the rules of an awaited read through a constant. Where the constant has
+  another use, or another read of it is left, the read and the constant are both
+  kept. An un-awaited read through a constant of another file or an enum member,
+  or one that would become `Promise.resolve(<value>)`, is left, the run lists it
+  as a reference that still names the flag, and the constant is kept;
 - every other value in the object must be a literal (a string without spaces or
   escapes, an integer, `true`, `false`, `null`, `undefined`), a plain name, or an
   object or array literal made only of those (`organization: { _id: orgId }`
@@ -3177,7 +3288,11 @@ every call to which (in its file, with no method group, qualified call,
 overload or string naming the method) passes a constant, or of an xunit
 `[Theory]` fed only `[InlineData]` constants and called from nowhere; or a
 `foreach` variable over an array of constants, written in place or held by a
-local nothing writes, passes or returns. The array may also be held by a
+local nothing writes, passes or returns. The local must be declared in a block
+that holds the loop, outside any `#if` branch, and nothing else in its method
+(a lambda or local function included) may bind its name: one declared in a
+sibling block or another `#if` branch leaves the loop reading whatever else has
+that name. The array may also be held by a
 `private` field of the class that declares the loop (not a `partial` one),
 with no attribute, when every other mention of the field in that class only
 iterates it or reads its `Length`, no file in your repository other than its
@@ -3934,6 +4049,8 @@ pair is left in place and listed with the other references to the flag.
 
 Every member position in a `;`-separated object type is covered — first,
 middle and last, with or without a trailing `;` — with one exception, below.
+A comment between the member and its `;` (`'old-checkout'?: boolean /* c */;`)
+goes with the member.
 
 **A type's last surviving member is never deleted.** `{}` does not mean "an
 empty object" in a type position; it means *any non-nullish value*, so
@@ -4562,11 +4679,22 @@ all" rather than to a partial rewrite:
   (`$"…"`, `"…${x}"`, an f-string), not concatenated, not computed by a call;
 * the name must be bound **exactly once** in the file. A narrower scope that
   rebinds it to a different key would otherwise have *that* flag's read folded
-  to *this* flag's value, which compiles and is wrong;
+  to *this* flag's value, which compiles and is wrong. In Go, Java and
+  TypeScript, a constant declared inside a function must not be named before
+  its declaration or outside its block either, since the name there means
+  something else (a package-level constant, an inherited field). A JavaScript
+  or TypeScript file that calls `eval` directly is left untouched, since
+  `eval` can declare a variable of the same name, and so is a TypeScript
+  file that reads the constant inside any `namespace` or `module` body or
+  `declare` block, since another file can merge a member of that name into
+  the namespace (a script's namespace of the same name, a `declare
+  namespace`, a `declare module "./a"` augmentation);
 * every other reference to the name must itself be a flag read this tool
   removes. If anything else reads it — a log line, a map entry, a wrapper you
-  have **not** named in `accessors` — nothing in the file is touched, because
-  removing the declaration would leave code that does not resolve. A wrapper you
+  have **not** named in `accessors` — the declaration is kept, because removing
+  it would leave code that does not resolve, and in C#, Kotlin, Swift, PHP and
+  Ruby nothing in the file is touched (the other languages still fold the
+  reads, under the conditions below). A wrapper you
   *have* named counts as a read and does not withhold the file. In C#, Java,
   Go, TypeScript, JavaScript and Python, a reference inside the block the fold deletes does not count either,
   because it is deleted with the block: under `treatment: true`,
@@ -4581,9 +4709,29 @@ all" rather than to a partial rewrite:
   the reference sits in the block the fold keeps (`if !flags.IsEnabled(org, K) {
   return errors.New("turn on " + K) }` with `treatment: false`), the read folds
   and the declaration stays, because the kept branch still names it. A
-  reference anywhere else in the file still leaves the file untouched. Python
-  gets the deleted-block case only, and only within one file: a Python constant
-  can be rebound, so a declaration kept for a mention leaves its reads alone.
+  reference anywhere else in the file is covered by the next paragraph.
+
+  In Dart, Go, Java, TypeScript, JavaScript and Python, any other use of the
+  name (a log line, a key of a defaults map) keeps the declaration and that use,
+  and the reads still fold, when the constant cannot hold anything else at a
+  read. Dart, Go, TypeScript and JavaScript `const` and Java `final` cannot be
+  assigned, so that holds once every other spelling of the name in the file is
+  a read of it (not a variable, parameter or pattern of that name). Java also
+  needs the read not to sit inside an anonymous class, or a class that names a
+  supertype, between it and the constant's declaration, since an inherited
+  member of that name would win; JavaScript and TypeScript need the file to
+  have no `with` statement. Python needs the module to bind the name once, with no star
+  import, `globals()` or `exec` that could rebind it unnamed, and no file of
+  the repository to write it (`module.NAME = …`, `setattr`, `mock.patch`,
+  `monkeypatch.setattr`). The log names the kept constant, and the file is still
+  listed as referencing the flag, since the key's string remains. This is about
+  uses in the constant's own file: one that another file reads or reaches
+  whole follows [Declared in another file](#declared-in-another-file).
+
+  Whenever a file is left untouched for any of these conditions while it still
+  reads the flag through a key constant, the log says so by name: the file, the
+  constant, the lines of its reads and the reason. In C#, Kotlin, Swift, PHP and
+  Ruby, a key constant with any other use is left whole this way.
 
 **Python and Ruby rest on a weaker guarantee than the rest**, and it is worth
 knowing which: neither language has a real constant, so the third condition is
@@ -4659,6 +4807,25 @@ of it included, keeps the declaration the same way. The constant's proven
 reads are still folded; only the declaration stays. An `export * from` the
 module (a barrel) is followed rather than refused, so a namespace of the
 barrel handed on keeps the declaration too.
+
+One stored `require` of the module is followed rather than refused: a
+statement `holder.slot = require(...)`, where `holder` is a `const` declared
+at the top level of the file, and nowhere else in it, bound to an object
+literal of plain properties, or `slot = require(...)`, where `slot` is a `let`
+declared the same way with no value, when nothing else in the file writes the
+slot and every other use of it is `slot.<name>` (as in a test that reloads
+constants in `beforeEach` and reads `holder.slot.OTHER`). Any other use keeps
+the declaration as before: the slot or its holder read with a computed key,
+passed, spread, destructured, enumerated, written again or exported, a method
+called on the holder, a holder object that spreads, computes a key, defines a
+method or already sets the slot, a holder or `let` declared inside a function
+or block (the write may then reach a global of that name), a `var`, a `with`
+anywhere in the file, or `__proto__` spelled on the holder. Reading the
+constant itself through the slot (`holder.slot.NAME`) is not a read the run
+folds, so it keeps the declaration too. Not looked for, as for any module
+object the file holds: code the file runs through `eval`, and a setter for the
+slot's name installed on `Object.prototype`, which the write itself would
+call.
 
 A TypeScript or JavaScript key constant imported through a barrel is folded
 like one imported from its own file. The chain is followed through
@@ -5539,8 +5706,14 @@ still treated as proven:
   at all, and the mention is refused, when two files could be meant, or when
   the nearest config, or one it extends, cannot be read for certain: it
   extends a package (such as a `@tsconfig/*` preset) or a file outside the
-  repository, uses `references`, sets `paths` or `baseUrl` to `null`, sets
-  `moduleSuffixes`, repeats a key, or does not parse.
+  repository, uses `references` (unless it also lists files of its own that
+  may hold the reading file, see below), sets `paths` or `baseUrl` to `null`,
+  sets `moduleSuffixes`, repeats a key, or does not parse. A config with
+  `references` and its own `include` (or a `files` list that is not empty)
+  compiles those files with its own `paths` and `baseUrl`, so they are read
+  from it, through `extends`, when every referenced config that may also hold
+  the reading file reads them the same way. A config it extends may not use
+  `references`.
 
 ## Tests that mock the flag read
 
@@ -5825,8 +5998,11 @@ the read itself.** `const show = on || user.enrolled` becomes
 `const show = true` once `on` is folded, and the run then inlines `show` into
 its uses and folds those in turn, so `{show && <Panel />}` becomes
 `<Panel />`. It does this only for a `const` declared inside a function or
-block, holding a single binding on its own line, with its name bound nowhere
-else in the file and every use an ordinary expression after it. Anything else
+block, on its own line, with its name bound nowhere else in the file and every
+use an ordinary expression after it. In a `const` that declares several names
+(`const show = true, retries = 3;`) only `show` and its comma go, unless a
+comment sits between it and its neighbour; a name the removed branch alone
+read, holding a literal, then goes the same way. Anything else
 — `{ show }` shorthand, `typeof show`, a top-level `const`, a second binding
 of the name — keeps `const show = true;` for you to inline by hand. A `const`
 you had already set to a literal yourself (`const DEBUG = false`) is never
@@ -5873,9 +6049,26 @@ The same goes for a condition the read leaves decided by a literal, such as
 `if (path !== "/health" && <read>)` served **false**, or `|| <read>` served
 **true**. `no-constant-condition` reports `x && false` and `x || true` in a
 condition, and when `x` could run code (a call, `new`, `await`, an assignment,
-a property read) it cannot be dropped, so a removal that would leave
-`if (req.path() !== "/health" && false)` standing is **refused** rather than
-shipped. Your own conditions of that shape are left alone. The same goes
+a property read) it cannot be dropped. When `x` is a call, `new` or `await`
+(also under `!` or parentheses), the condition is the first thing its
+statement evaluates, and that statement is an `if` (not an `else if`), a
+`return` or a `const`/`let` of one name directly inside a block, the call is
+kept as a statement of its own on the line above and the condition folds:
+`if (!types.has(type) || <read>) { return false }` served **true** becomes
+`types.has(type);` followed by `return false`. The new line always ends with
+`;`, even in a file that leaves them off: the line below it is whatever the
+condition kept, and one starting with `[`, `(` or a template would otherwise
+run on from the call. A comment on the last non-blank line above the
+statement (`// @ts-expect-error`, `// eslint-disable-next-line`, a JSDoc type)
+keeps it from being lifted, since the comment would then apply to the call,
+and so does any comment on the statement's own lines (a trailing
+`// eslint-disable-line`, one inside the condition or the body).
+Anywhere else, for example
+`if (req.path() !== "/health" && false)` (the comparison is not a call),
+`a() || b() || <read>`, an `else if`, a labelled statement, a `case`, an
+unbraced body, a loop condition, or a call starting with `(`, `[` or a
+template, which could join the line above, a removal that would leave the
+constant condition standing is **refused** rather than shipped. Your own conditions of that shape are left alone. The same goes
 for a conditional expression left testing a literal (`false ? 'a' : 'b';`), a
 statement such as `false || 'fallback';` (`no-constant-binary-expression`),
 and a flag read left as a bare `true;` or `false;` statement. These are left
@@ -6040,9 +6233,16 @@ load-time work done first without importing it.
 
 A `paths` alias is read through a solution `tsconfig.json` (one with
 `references`, as in Vite's template) when every referenced config whose `files`
-or `include` may hold the importing file reads it the same way. If they
-disagree, if none of them may hold the file, or if the solution config could
-compile the file itself, the alias counts as not found.
+or `include` may hold the importing file reads it the same way. Each of
+`files` and `include` is the config's own or, when it sets none, the one it
+inherits through `extends`; a config whose `extends` chain cannot be read
+counts as holding the file. If they
+disagree, or if none of them may hold the file, the alias counts as not found.
+A config with `references` that also lists files of its own (an `include`, or
+a `files` list that is not empty) and may hold the importing file is read for
+its own `paths` instead, as long as every referenced config that may hold the
+file agrees; one that lists no files of its own but may still hold the file
+(no `files` or `include` at all) counts as not found.
 
 The Featureflip JavaScript SDKs are the one exception to "loads a package".
 Some loads no proof here can reach: a module that imports a package, or one
@@ -6233,6 +6433,24 @@ work — because naming it is itself the statement that it reads a boolean.
 
 `elif <read>:` is handled in both directions: serving `false` deletes the dead
 clause, serving `true` promotes it to `else:` and drops every clause after it.
+
+A read compared with `None` (`<read> is not None`, `<read> is None`, `!= None`,
+`== None`, either way round) folds to `True` or `False` whichever value is
+served, since a boolean is never `None`; `assert <read> is not None` is then
+deleted like any other assertion the removal made trivially true. A chained
+comparison holding the read (`<read> == True == other`, `<read> is x is False`)
+compares each operand with the next, so it keeps the literal the fold wrote and
+is left for you.
+
+In an `if`, `elif` or `while` condition, a ternary's test or a `not`,
+`x and <read>` served `false` folds to `False` (and `x or <read>` served `true`
+to `True`) only when evaluating `x` cannot run code of yours: a name, a literal,
+`is`, `is not`, `not`, `and` and `or` over them. A call, an attribute read, a
+subscript, an arithmetic operator (`a + b`), a comparison other than `is`/`is not`
+(`a < b`, `path != "/healthcheck"`, `a in b`), a unary `-`/`~` on anything
+but a number, and a dict or set display (`{a: b}`, `{a}`, which hash their keys)
+can each call a method you defined, so `if a < b and <read>:`
+served `false` becomes `if a < b and False:` and stays for you to remove.
 
 An awaited read — `if await client.variation(…)`, the shape an async wrapper
 produces — is folded together with its `await`, since `await True` would raise
@@ -8437,7 +8655,9 @@ means no PR.
   the flag is off"). A read counts only as the whole statement or the whole
   value of one plain variable: a statement that uses it inside something
   else (an assertion, an argument, an object or array, a property of an
-  object) is "any other statement". Doc comments, tool directives
+  object) is "any other statement". A doc comment (`/** … */`, `///`) goes
+  only with the flag's own read, variable or entry, which is what it
+  documented; above any other statement it is kept. Tool directives
   (`eslint-disable`, `noqa`, `NOSONAR`, …) and comments naming the flag are
   never removed this way, and nothing is removed while the flag is still read
   in that language and directory. In Python and Ruby, a comment above the read

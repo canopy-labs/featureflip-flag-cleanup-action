@@ -131,8 +131,10 @@ def _write_pattern(name: str) -> re.Pattern[str]:
     an attribute assignment or augmented assignment (``m.NAME = …``,
     ``m.NAME += …``), a ``del m.NAME``, the name as a string in a call that
     writes an attribute by name (``setattr``, ``delattr``, ``mock.patch``,
-    ``patch.object``, ``monkeypatch.setattr``), or a namespace written by key
-    (``vars(m)["NAME"] = …``). Textual on purpose, like Ruby's ``const_set``
+    ``patch.object``, ``monkeypatch.setattr``), a namespace written by key
+    (``vars(m)["NAME"] = …``), or by keyword or literal through a mapping
+    update (``vars(m).update(NAME=…)``, ``mock.patch.dict(m.__dict__,
+    NAME=…)``, ``mock.patch.dict(m.__dict__, {"NAME": …})``). Textual on purpose, like Ruby's ``const_set``
     scan: it may count a harmless spelling, which only keeps the reads as
     before. A plain string holding the name is not a write: a key constant is
     often named after its own key (``NAME = "NAME"``)."""
@@ -143,6 +145,13 @@ def _write_pattern(name: str) -> re.Pattern[str]:
         rf"|\bdel\b[^\n]*\.\s*{word}\b"
         rf"|\b(?:setattr|delattr|patch|object)\s*\([^)]*{quoted}"
         rf"|{quoted}\s*\]\s*=(?!=)"
+        # A mapping update by keyword or by literal key, anywhere in a file that
+        # calls `update(` or `dict(` (`vars(m).update(NAME=…)`,
+        # `mock.patch.dict(…, NAME=…)`, `{"NAME": …}`): the arguments are not
+        # parsed, since they nest and span lines, so any `NAME=` after a `(` or
+        # `,`, or `"NAME":` after a `{` or `,`, in such a file counts.
+        rf"|(?s:\A(?=.*?\b(?:update|dict)\s*\().*[(,]\s*\b{word}\s*=(?!=))"
+        rf"|(?s:\A(?=.*?\b(?:update|dict)\s*\().*[{{,]\s*{quoted}\s*:)"
     )
 
 

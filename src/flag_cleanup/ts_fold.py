@@ -22,10 +22,11 @@ drives the same loop for Python.
 
 Which bindings qualify, and why each condition is there:
 
-* **The transform made it a literal.** Per NAME, the declaration must be a
-  single-declarator ``const`` whose value is ``true``/``false`` in the output
-  and was not in the input. ``const DEBUG = false`` at the top of a file is the
-  customer's, and stays.
+* **The transform made it a literal.** Per NAME, the declarator must be a
+  ``const``'s whose value is ``true``/``false`` in the output and was not in
+  the input. ``const DEBUG = false`` at the top of a file is the customer's,
+  and stays. In a declaration of several (``const on = true, retries = 3;``)
+  only that declarator and its comma go, never the statement.
 * **It is bound exactly once in the whole file**, counted with the same
   :func:`~flag_cleanup.ts_syntax.binding_nodes` census Gate 2 uses. A second
   binder anywhere — a parameter, a ``catch`` variable, a destructured
@@ -40,7 +41,8 @@ Which bindings qualify, and why each condition is there:
   than rewritten, and so is a mention of the name outside the block, which
   can only be some other binding.
 * **The declaration has its line(s) to itself**, so deleting it is deleting
-  whole lines.
+  whole lines. A declarator among others is cut with the comma that joins it
+  to its neighbour, and only when no comment lies in that cut.
 
 A refusal leaves the declaration standing as ``const show = true;`` — exactly
 what the run produced before this pass existed. Nothing here can make a
@@ -143,7 +145,7 @@ def inline_literal_bindings(before: str, after: str, language: str, marker: str)
         name = _text(name_node, data)
         if produced[name] <= preexisting[name] or bindings[name] != 1:
             continue
-        span = _own_lines(declaration, data)
+        span = _own_lines(declaration, data) if declaration.type == "lexical_declaration" else _cut(declaration)
         if span is None:
             continue
         references = _references(root, data, name, name_node, declaration)
@@ -165,11 +167,13 @@ def _text(node: Node, data: bytes) -> str:
 
 
 def _literal_consts(root: Node, data: bytes) -> list[tuple[Node, Node, Node]]:
-    """``(declaration, name, value)`` for each block-scoped ``const x = <literal>``.
+    """``(what goes, name, value)`` for each block-scoped ``const x = <literal>``.
 
-    Single-declarator only, for the reason `ts_const.toml` gives: deleting
+    What goes is the whole declaration when it declares one name, and the
+    ``variable_declarator`` alone when it declares several: deleting
     ``const show = true, retries = 3;`` would take ``retries`` with it.
     """
+    del data
     found = []
     for node in _walk(root):
         if node.type != "lexical_declaration" or node.parent is None:
@@ -179,15 +183,34 @@ def _literal_consts(root: Node, data: bytes) -> list[tuple[Node, Node, Node]]:
         if not any(child.type == "const" for child in node.children):
             continue
         declarators = [c for c in node.named_children if c.type == "variable_declarator"]
-        if len(declarators) != 1:
-            continue
-        name = declarators[0].child_by_field_name("name")
-        value = declarators[0].child_by_field_name("value")
-        if name is None or name.type != "identifier" or value is None:
-            continue
-        if value.type in _LITERALS:
-            found.append((node, name, value))
+        for declarator in declarators:
+            name = declarator.child_by_field_name("name")
+            value = declarator.child_by_field_name("value")
+            if name is None or name.type != "identifier" or value is None:
+                continue
+            if value.type in _LITERALS:
+                found.append((node if len(declarators) == 1 else declarator, name, value))
     return found
+
+
+def _cut(declarator: Node) -> tuple[int, int] | None:
+    """The span of one declarator among several, with the comma joining it to
+    the next one (or, when it is the last, to the one before), or ``None``
+    when a comment lies in that span."""
+    following = declarator.next_named_sibling
+    if following is not None and following.type == "variable_declarator":
+        start, end = declarator.start_byte, following.start_byte
+    else:
+        previous = declarator.prev_named_sibling
+        if previous is None or previous.type != "variable_declarator":
+            return None
+        start, end = previous.end_byte, declarator.end_byte
+    parent = declarator.parent
+    if parent is None or any(
+        child.type == "comment" and start < child.end_byte and child.start_byte < end for child in parent.children
+    ):
+        return None
+    return start, end
 
 
 def _own_lines(declaration: Node, data: bytes) -> tuple[int, int] | None:
@@ -207,6 +230,10 @@ def _references(
 ) -> list[Node] | None:
     """Every reference to the binding, or ``None`` if one cannot be rewritten."""
     scope = declaration.parent
+    if declaration.type == "variable_declarator" and scope is not None:
+        scope = scope.parent
+    if scope is None:
+        return None
     references = []
     for node in _walk(root):
         if node.type in _OTHER_NAME_NODES:

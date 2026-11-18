@@ -1026,9 +1026,9 @@ def leading_comments(
     Directly above is no blank line between. Whole is a run of complete
     statements of ``before`` (a declaration the run inlined, a guard of the
     removed branch), never part of one: a deleted ``if`` header whose body
-    stayed is not a deleted statement. A doc comment documents something
-    that survives, and a comment naming the key is :func:`rewrite`'s; both
-    are left out.
+    stayed is not a deleted statement. A doc comment is left out unless what
+    it documented was the flag's own (below), and a comment naming the key is
+    :func:`rewrite`'s.
 
     A statement's comment is found only when nothing else claims it: the
     deleted statements were followed by a blank line, the end of their block
@@ -1109,8 +1109,10 @@ def leading_comments(
             continue
         texts, joined, _offsets = _group_texts(old, old_starts, old_ends, group, first, i1 - 1)
         raw = old[old_starts[first] : old_ends[i1 - 1]]
+        # A doc comment documents the declaration below it, so it is kept
+        # unless that declaration was the flag's own and is gone.
         if (
-            any(t.encode("utf-8").startswith(_DOC_MARKERS) for t in texts)
+            (not own and any(t.encode("utf-8").startswith(_DOC_MARKERS) for t in texts))
             or names.search(raw)
             or _DIRECTIVE.match(joined)
             or first <= (1 if grammar in ("python", "ruby") else 0)
