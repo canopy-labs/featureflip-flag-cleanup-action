@@ -80,6 +80,7 @@ from flag_cleanup.mock_stubs import (
     TEST,
     TEST_PHASE,
     THEORY_FACT,
+    COUNT_WORD,
 )
 
 logger = logging.getLogger(__name__)
@@ -473,6 +474,87 @@ def _rule(name: str, pattern: str, sentinel: str, node: str, replace: str, group
     return "\n".join(lines) + "\n"
 
 
+#: Words of a test name that count the gates it ran over.
+_COUNT_WORDS = frozenset({"either", "both", "neither", "each", "two", "gates", "flags"})
+
+
+def _camel_words(name: str) -> list[str]:
+    return [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", name)]
+
+
+#: A doc comment's count of gates: ``both gates``, ``either flag``, ``each
+#: gate``, ``two gates``, ``both of the toggles``.
+_COUNT_DOC = re.compile(
+    r"\b(?:(?:both|either|neither)\s+(?:of\s+(?:the\s+)?)?(?:gates?|flags?|toggles?|switches)"
+    r"|each\s+gate"
+    r"|(?:two|2)\s+(?:gates|flags|toggles|switches))\b",
+    re.IGNORECASE,
+)
+_MEMBERS = ("method_declaration", "constructor_declaration", "property_declaration", "operator_declaration")
+
+
+def _doc_lines(member: Node) -> list[str]:
+    """The text of the ``///`` lines right above ``member``, markup stripped."""
+    lines: list[str] = []
+    row = member.start_point[0]
+    previous = member.prev_sibling
+    while previous is not None and previous.type == "comment" and previous.end_point[0] >= row - 1:
+        text = _text(previous).strip()
+        if not text.startswith("///"):
+            break
+        lines.append(re.sub(r"<[^>]*>", "", text[3:]).strip())
+        row = previous.start_point[0]
+        previous = previous.prev_sibling
+    return list(reversed(lines))
+
+
+def _member_keys(root: Node) -> dict[tuple, Node]:
+    seen: dict[tuple, int] = {}
+    found: dict[tuple, Node] = {}
+    for node in _walk(root):
+        if node.type not in _MEMBERS:
+            continue
+        name = node.child_by_field_name("name")
+        base = (_type_chain(node), node.type, _text(name) if name is not None else "")
+        seen[base] = seen.get(base, 0) + 1
+        found[(*base, seen[base])] = node
+    return found
+
+
+def _body(member: Node) -> str:
+    return _text(member)
+
+
+def count_words(summaries: list, repo_dir: str) -> list[tuple[str, str, str]]:
+    """``(path, COUNT_WORD, text)`` for each doc comment, on a member this run
+    edited, that counts gates (:data:`_COUNT_DOC`): one gate fewer may have
+    made it wrong. Reported, never edited: no rule can tell which count it
+    states."""
+    rows: list[tuple[str, str, str]] = []
+    for summary in summaries:
+        if file_deletion.deleted(summary) or not str(summary.path).endswith(".cs"):
+            continue
+        if summary.original_content == summary.content:
+            continue
+        try:
+            before = _member_keys(_parse(summary.original_content))
+            after = _member_keys(_parse(summary.content))
+        except Exception as exc:  # noqa: BLE001 - never refuses the flag
+            logger.info("doc comments of %s not read: %s: %s", summary.path, type(exc).__name__, exc)
+            continue
+        for key, node in after.items():
+            old = before.get(key)
+            if old is None or _body(old) == _body(node):
+                continue
+            for line in _doc_lines(node):
+                found = _COUNT_DOC.search(line)
+                if found is not None:
+                    label = ".".join((*key[0], key[2]))
+                    rows.append((os.path.relpath(summary.path, repo_dir), COUNT_WORD, f'{label}: "{line[:140]}"'))
+                    break
+    return rows
+
+
 def collapse(
     summaries: list,
     repo_dir: str,
@@ -539,6 +621,11 @@ def collapse(
             edits += [(n.start_byte, n.end_byte, f"{sentinel}_v{first + i}()".encode()) for n, i in plan.reads]
             described.setdefault(path, []).append(
                 f"{plan.name}: " + ", ".join(f"`{p}` = `{v}`" for _, p, v in plan.parameters)
+                + (
+                    " (the name counts gates: reword it)"
+                    if any(w in _COUNT_WORDS for w in _camel_words(plan.name))
+                    else ""
+                )
             )
         out = data
         for start, end, replacement in sorted(edits, reverse=True):
@@ -1832,6 +1919,10 @@ def review(
         summaries, rows = collapse(summaries, repo_dir, rewrite, engine)
     except Exception as exc:  # noqa: BLE001
         logger.warning("theories left as they were: %s: %s", type(exc).__name__, exc)
+    try:
+        rows += count_words(summaries, repo_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("doc comments not read for gate counts: %s: %s", type(exc).__name__, exc)
     complete = {f.wrapper for f in statuses if f.reason == wi.COMPLETE}
     families = [
         f

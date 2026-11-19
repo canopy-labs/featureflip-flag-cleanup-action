@@ -138,7 +138,7 @@ inputs:
       `remove`'s inputs — the complete list is in the README's "Re-run a
       removal from a comment" section, and the short version is: `api-token`,
       `org`, `project`, `api-url`, `directories`, `languages`, `accessors`,
-      `key-aliases` and `ignore` all apply and must match the workflow that opened the pull
+      `key-aliases`, `flag-maps` and `ignore` all apply and must match the workflow that opened the pull
       request, or a re-run regenerates a different diff than the one already
       proposed. `staleness` is NOT on that list: this command looks the flag
       up by the key its branch already encodes and checks both tiers
@@ -320,6 +320,32 @@ inputs:
       `import-unresolved`. Any other value fails the run immediately (exit 2).
     required: false
     default: 'off'
+  flag-maps:
+    description: >-
+      TypeScript and JavaScript only: comma-separated names of objects whose
+      keys are flag keys (`featureToggles, unleashToggles`). Then
+      `<expression ending in that name>[KEY]`, with KEY the flag's key as a
+      string literal or as a constant of the same file, is a read of the flag.
+      EVERY object with a listed name, in every file and scope, is treated as
+      the flag map, so list a distinctive name and not `flags`. The read is
+      folded only as the condition of an `if`, `while` or ternary, the operand
+      of `!`, or an operand of `&&`/`||` in such a position; any other position
+      is left as written. A run with a folded read checks the whole checkout once,
+      after every language pass: any file that still holds the key, however it is
+      spelled (raw, or with `\x`/`\u`/octal/HTML-entity/`%` escapes), other
+      than `.md` and `.rst` documents, extension-less `CHANGELOG`/`LICENSE`
+      files, gitignored files and the key as an item of this Action's `flags`
+      input in a GitHub Actions workflow file (not GitLab CI or CircleCI config,
+      which refuse) (`.txt`, `.mdx` and every other file type
+      count), refuses the flag (`unsafe-rewrite`, naming
+      the file and line) and rolls everything back, as does a write to the map
+      with a key the run cannot read, such as a reducer's
+      `state.featureToggles[action.key] = value`. A key built from pieces at runtime and
+      never spelled whole is not seen. A constant declared in another file, a
+      `?? DEFAULTS[KEY]` default and a defaults object's entry are not handled
+      yet. Empty (the default) changes nothing.
+    required: false
+    default: ''
   languages:
     description: >-
       Comma-separated Piranha languages to run. Leave unset to run every
@@ -461,6 +487,7 @@ runs:
     FEATUREFLIP_SIDE_EFFECT_FREE_CALLS: ${{ inputs.side-effect-free-calls }}
     FEATUREFLIP_TEST_SETTERS: ${{ inputs.test-setters }}
     FEATUREFLIP_KEY_ALIASES: ${{ inputs.key-aliases }}
+    FEATUREFLIP_FLAG_MAPS: ${{ inputs.flag-maps }}
     FEATUREFLIP_WORKSPACE_PACKAGES: ${{ inputs.workspace-packages }}
     FEATUREFLIP_DIRECTORIES: ${{ inputs.directories }}
     FEATUREFLIP_IGNORE: ${{ inputs.ignore }}

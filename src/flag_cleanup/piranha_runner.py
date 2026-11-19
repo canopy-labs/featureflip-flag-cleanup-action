@@ -148,6 +148,7 @@ from flag_cleanup import (
     comment_sentences,
     stale_comments,
     ts_barrels,
+    ts_flag_maps,
     ts_key_names,
     ts_bound_overrides,
     ts_constant_params,
@@ -162,6 +163,7 @@ from flag_cleanup import (
     ts_saga_yield,
     ts_gates,
     ts_object_reads,
+    ts_table_reads,
     ts_expectations,
     ts_key_survivors,
     ts_param_pins,
@@ -234,6 +236,13 @@ class PiranhaTransformError(RuntimeError):
 #: listing the others, so an abort nobody has seen yet stops the flag instead
 #: of shipping a partial removal.
 _UNREADABLE_INPUT = "will not rewrite a file it cannot read"
+
+#: The reason a quarantined file is listed with. The pull request body keys on
+#: the leading word to give these files a block of their own.
+UNPARSEABLE_REASON = (
+    "unparseable: the engine could not parse this file, so it was left exactly "
+    "as it was and still reads this flag"
+)
 
 
 class UnsafeRewriteError(RuntimeError):
@@ -735,6 +744,9 @@ _SKIP_DIRS = frozenset({".git", "node_modules"})
 
 #: The languages whose rules can read a key that is not the first argument.
 KEY_POSITION_LANGUAGES = frozenset({"python", "ts", "tsx", "js"})
+
+#: The languages whose rules read a flag map (`flags[KEY]`, the `flag-maps` input).
+_FLAG_MAP_LANGUAGES = frozenset({"ts", "tsx", "js"})
 
 
 def supported_languages() -> tuple[str, ...]:
@@ -1950,6 +1962,7 @@ def run_piranha(
     flag_default: ts_tests.FlagDefault | None = None,
     key_positions: tuple[tuple[str, int | str], ...] = (),
     code_keys: frozenset[str] = frozenset(),
+    flag_maps: tuple[str, ...] = (),
 ) -> str:
     """:func:`transform_flag`, keeping only the diff.
 
@@ -1973,6 +1986,7 @@ def run_piranha(
         repo_dir, language, flag_key, treatment, paths, accessors,
         known_flag_keys=known_flag_keys, gates=gates, inline_wrappers=inline_wrappers,
         flag_default=flag_default, key_positions=key_positions, code_keys=code_keys,
+        flag_maps=flag_maps,
     ).diff
 
 
@@ -1992,6 +2006,7 @@ def transform_flag(
     entries: bool = True,
     key_positions: tuple[tuple[str, int | str], ...] = (),
     code_keys: frozenset[str] = frozenset(),
+    flag_maps: tuple[str, ...] = (),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -2054,7 +2069,9 @@ def transform_flag(
     # the run's listing.
     with source_index.run_scope(), source_index.forgetting(), unused.prose_blind_scope(), ts_key_names.declaring(
         code_keys
-    ), go_setters.treating(treatment), _holder_named_like_key(repo_dir, language, flag_key):
+    ), go_setters.treating(treatment), _holder_named_like_key(repo_dir, language, flag_key), ts_flag_maps.declaring(
+        flag_maps if language in _FLAG_MAP_LANGUAGES else ()
+    ):
         try:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
@@ -2225,6 +2242,28 @@ def _transform_flag(
     # afterwards would be reading a file the engine had already corrupted.
     paths, skipped = _partition_by_readability(paths, language)
 
+    # `flag-maps`: folding a read of a map is sound only if nothing else writes
+    # the flag into it. A run with such a read accounts for the key over the
+    # WHOLE checkout. This pass only gives the better messages (a spelling that
+    # writes it); the check that decides is made once, after every pass, by
+    # `orchestrate`. See :mod:`flag_cleanup.ts_flag_maps`.
+    map_accounting = bool(
+        ts_flag_maps.names()
+        and language in _FLAG_MAP_LANGUAGES
+        and ts_flag_maps.has_read(paths, flag_key)
+    )
+    if map_accounting:
+        map_refusals = ts_flag_maps.refusals(checkout_root(repo_dir), flag_key)
+        if map_refusals:
+            raise UnsafeRewriteError(
+                f"the {spec.display_name} transform refused flag {flag_key!r}: the key is also written "
+                "or spelled where a `flag-maps` fold cannot account for it ("
+                + "; ".join(f"{path}: {why}" for path, why in sorted(map_refusals.items())) + ")",
+                refused=sorted(map_refusals),
+                discarded=[],
+                reasons=map_refusals,
+            )
+
     # An accessor with an un-awaited read that must not become a bare literal
     # (it returns a Promise, or could) is "managed": its un-awaited reads are
     # decided and marked one by one below, and it leaves `accessors`, which is
@@ -2331,6 +2370,11 @@ def _transform_flag(
             refused=culprits,
             discarded=[],
         )
+    # A table whose readers this run cannot all see keeps its entries: the pass
+    # runs without the entry rules, and the files are reported as kept.
+    table_holds = _table_holds(language, flag_key, repo_dir, entries)
+    if table_holds:
+        entries = False
 
     if not paths:
         # Every candidate was unreadable, so there is nothing to transform —
@@ -2358,12 +2402,13 @@ def _transform_flag(
     # its rules match a sentinel, not a name, so its accessor support is in the
     # pre-pass below, which is the only part of this that can read a key.
     generated_rules: tempfile.TemporaryDirectory | None = None
-    if all_accessors and language != "kt":
+    flag_maps = tuple(sorted(ts_flag_maps.names()))
+    if (all_accessors or flag_maps) and language != "kt":
         generated_rules = tempfile.TemporaryDirectory(prefix="flag-cleanup-rules-")
         rules_file, const_rules_file = _write_generated_rules(
             Path(generated_rules.name), rules_file, const_rules_file,
             tuple(a for a in all_accessors if a not in async_names),
-            key_positions=key_positions, async_accessors=async_names,
+            key_positions=key_positions, async_accessors=async_names, flag_maps=flag_maps,
         )
 
     # `untreated` is `treated`'s complement — the literal spelling of the branch
@@ -2630,7 +2675,9 @@ def _transform_flag(
                 refused=culprits,
                 discarded=[],
             )
-        read_sites = _gated_const_reads(read_sites, const_marked, with_const, flag_key, spec.display_name)
+        read_sites = _gated_const_reads(
+            read_sites, const_marked, with_const, flag_key, spec.display_name, kept_declarations
+        )
         for site_path in dict.fromkeys(site.path for site in read_sites):
             found = ts_async_reads.marks(read_sites, async_names, site_path)
             if found:
@@ -2718,6 +2765,9 @@ def _transform_flag(
     )
 
     unprocessable: list[str] = list(skipped)
+    #: The files the engine could not parse, left untouched; reported with the
+    #: reason ``unparseable`` (see ``_UNPARSEABLE_REASON``).
+    unparseable: list[str] = []
     summaries: list = []
     # What the engine is actually handed. `paths` can be wider: the snapshot
     # also covers files that only mention a key constant, and a file that is
@@ -2754,16 +2804,18 @@ def _transform_flag(
                     proven=proven,
                     blocked=resolution.blocked,
                     treatment=treatment,
+                    kept_declarations=kept_declarations,
                 )
                 # Extend, never rebind: the pre-flight skips above are already in
                 # here, and `_quarantine_and_retry` only ever knows about the files
                 # it was given.
                 unprocessable.extend(quarantined)
+                unparseable.extend(quarantined)
             except BaseException:
                 if prepass is not None:
                     prepass.restore_all()
                 raise
-            if len(quarantined) == len(engine_paths):
+            if len(quarantined) == len(engine_paths) - len(kept_declarations):
                 # Nothing survived, so there is no partial removal to offer and no
                 # reason to soften the failure: report it exactly as before.
                 if prepass is not None:
@@ -3372,6 +3424,7 @@ def _transform_flag(
         treatment=treatment,
         cut_rows=cut_rows,
         constant_names=deleted_constants,
+        known_flag_keys=known_flag_keys,
     )
     bindings = bindings + comment_rows
 
@@ -3743,7 +3796,12 @@ def _transform_flag(
         declined,
         test_doubles,
         deleted_tests,
-        kept,
+        tuple(kept)
+        + tuple(
+            (os.path.relpath(path, repo_dir), f"flag-keyed table entry kept: {reason}")
+            for path, reason in sorted(table_holds.items())
+        )
+        + tuple((path, UNPARSEABLE_REASON) for path in unparseable),
         tuple(
             (os.path.relpath(r.path, repo_dir), r.line, r.reason, r.text)
             for r in resolution.refusals
@@ -4191,6 +4249,17 @@ def _check_object_reads(
     )
 
 
+def _table_holds(language: str, flag_key: str, repo_dir: str, entries: bool) -> dict[str, str]:
+    """The files whose flag-keyed table entry must stay, and why.
+
+    See :mod:`flag_cleanup.ts_table_reads`: keeping an entry is always safe,
+    so the pass runs without the entry rules instead of refusing the flag.
+    """
+    if language not in ("ts", "tsx", "js") or not entries:
+        return {}
+    return ts_table_reads.holds(repo_dir, flag_key)
+
+
 def _check_gates(
     paths: list[str],
     language: str,
@@ -4590,6 +4659,7 @@ def _remove_stale_comments(
     treatment: bool = True,
     cut_rows: dict[str, set[str]] | None = None,
     constant_names: Mapping[str, frozenset[str]] | None = None,
+    known_flag_keys: frozenset[str] = frozenset(),
 ) -> tuple[list, tuple[tuple[str, str, str], ...], list]:
     """Delete each comment that only described the flag, a deleted family
     type or a deleted key constant, with a ``(path, "removed comment", text)``
@@ -4659,8 +4729,16 @@ def _remove_stale_comments(
         after, rewords = comment_sentences.reword(after, grammar, names)
         # A comment that names the key inside a sentence that stays true:
         # the flag's half of a conjunction, or its item of a list.
-        if ts_tests.covers(language):
-            after, cut = comment_conjuncts.cut(after, grammar, flag_key, treatment=treatment)
+        if language == "csharp":
+            # Only a count of two flags is cut outside the TS family.
+            after, cut = comment_conjuncts.cut(
+                after, grammar, flag_key, treatment=treatment, counts_only=True, known_flag_keys=known_flag_keys
+            )
+            rewords = [*rewords, *cut]
+            if cut and cut_rows is not None:
+                cut_rows.setdefault(path, set()).update(r.after for r in cut)
+        elif ts_tests.covers(language):
+            after, cut = comment_conjuncts.cut(after, grammar, flag_key, treatment=treatment, known_flag_keys=known_flag_keys)
             rewords = [*rewords, *cut]
             if cut and cut_rows is not None:
                 cut_rows.setdefault(path, set()).update(r.after for r in cut)
@@ -6209,6 +6287,7 @@ def _quarantine_and_retry(
     proven: Iterable[str] = (),
     blocked: frozenset[str] = frozenset(),
     treatment: bool | None = None,
+    kept_declarations: Iterable[str] = (),
 ) -> tuple[list, list[str]]:
     """Find the file(s) the engine cannot process, then transform the rest.
 
@@ -6244,8 +6323,34 @@ def _quarantine_and_retry(
     the engine: it read the file, rewrote it, and rejected what it wrote. A
     probe that ends that way stops the whole flag, exactly as a Gate 1 refusal
     does.
+
+    A file that DECLARES a key constant the run keeps (``kept_declarations``)
+    is not quarantinable: readers in other files were judged against that
+    declaration, so withholding it would fold their reads against a constant
+    nobody could read. It is probed first and ALONE, and one the engine cannot
+    parse refuses the flag by name. Probed alone because the declarations ride
+    every engine invocation, so one that cannot be read used to fail every
+    other file's probe too and take the whole batch down as "unprocessable".
     """
     readers = frozenset(reader_paths)
+    declarations = [str(p) for p in kept_declarations]
+    for declaration in declarations:
+        probe: list = []
+        try:
+            run_groups(
+                collected=probe, with_const=[], without_const=[], kept_declarations=[declaration]
+            )
+        except PiranhaTransformError as abort:
+            if _UNREADABLE_INPUT not in str(abort):
+                raise
+            raise PiranhaTransformError(
+                f"{declaration} declares a key constant for {flag_key!r} and cannot "
+                "be parsed, so the reads of it in other files cannot be removed "
+                "soundly. Nothing was written for this flag; fix the file's syntax "
+                f"or exclude it. Engine message: {abort}"
+            ) from (abort.__cause__ or abort)
+        finally:
+            _restore(probe)
     regained_set = frozenset(regained)
 
     def unblocked(group: list[str]) -> tuple[list[str], list[str]]:
@@ -6266,6 +6371,8 @@ def _quarantine_and_retry(
     survivors: list[str] = []
     unprocessable: list[str] = []
     for path in paths:
+        if path in declarations:
+            continue
         # Probed under the SAME Gate 2 decision the real run would make — which
         # is why `accessors` has to reach this far. Forcing the const rules on
         # here would abort for a file they were withheld from and quarantine it
@@ -6279,7 +6386,7 @@ def _quarantine_and_retry(
             one = {"with_const": [], "without_const": [path]}
         probe: list = []
         try:
-            run_groups(collected=probe, **one)
+            run_groups(collected=probe, kept_declarations=[], **one)
         except PiranhaTransformError as abort:
             if _UNREADABLE_INPUT not in str(abort):
                 # The engine READ this file — it refuses one it cannot, with
@@ -6346,6 +6453,7 @@ def _write_generated_rules(
     *,
     key_positions: dict[str, int | str] | None = None,
     async_accessors: frozenset[str] = frozenset(),
+    flag_maps: tuple[str, ...] = (),
 ) -> tuple[Path, Path]:
     """Write accessor-extended copies of the rule files and return their paths.
 
@@ -6377,13 +6485,17 @@ def _write_generated_rules(
     """
     generated = destination / rules_file.name
     generated.write_text(
-        rule_synthesis.with_accessors(
-            rules_file.read_text(encoding="utf-8"),
-            (*accessors, *sorted(async_accessors)),
-            templates_text=_accessor_templates_for(rules_file),
-            key_positions=key_positions,
-            positional_text=_key_position_templates_for(rules_file),
-            async_accessors=async_accessors,
+        rule_synthesis.with_flag_maps(
+            rule_synthesis.with_accessors(
+                rules_file.read_text(encoding="utf-8"),
+                (*accessors, *sorted(async_accessors)),
+                templates_text=_accessor_templates_for(rules_file),
+                key_positions=key_positions,
+                positional_text=_key_position_templates_for(rules_file),
+                async_accessors=async_accessors,
+            ),
+            flag_maps,
+            _key_position_templates_for(rules_file),
         ),
         encoding="utf-8",
     )
@@ -6392,8 +6504,13 @@ def _write_generated_rules(
     generated_const = destination / const_rules_file.name
     generated_const.write_text(
         rule_synthesis.with_accessor_const_rules(
-            rule_synthesis.with_accessor_guards(
-                const_rules_file.read_text(encoding="utf-8"), accessors
+            rule_synthesis.with_flag_maps(
+                rule_synthesis.with_accessor_guards(
+                    const_rules_file.read_text(encoding="utf-8"), accessors
+                ),
+                flag_maps,
+                _key_position_templates_for(const_rules_file),
+                before_trailing_rules=True,
             ),
             accessors,
             templates_text=_accessor_templates_for(const_rules_file),
@@ -7825,22 +7942,27 @@ def _gated_const_reads(
     with_const: list[str],
     flag_key: str,
     display_name: str,
+    kept: Iterable[str] = (),
 ) -> list[ts_async_reads.Site]:
     """``sites`` without the constant-keyed reads Gate 2 did not count as
     removable: such a read stays, and so does its constant. Where Gate 2 did
     (the file is in ``with_const``), every read it counted must still be marked
     on the bytes the engine gets, or the declaration would go with a read left;
-    the flag is refused instead."""
+    the flag is refused instead. A file whose declaration the run keeps
+    (``kept``) is not counted by Gate 2: its marked reads fold, as its awaited
+    ones do, and the declaration stays."""
     allowed = {str(Path(p).resolve()) for p in with_const}
+    stays = {str(Path(p).resolve()) for p in kept}
     kept: list[ts_async_reads.Site] = []
     marked: dict[str, set] = {}
     for site in sites:
         path = str(Path(site.path).resolve())
         if site.const_key:
             span = (*site.call, Path(site.path).read_bytes()[site.call[0] : site.call[1]])
-            if path not in allowed or span not in gated.get(path, ()):
+            if (path not in allowed and path not in stays) or span not in gated.get(path, ()):
                 continue
-            marked.setdefault(path, set()).add(span)
+            if path in allowed:
+                marked.setdefault(path, set()).add(span)
         kept.append(site)
     lost = sorted(p for p in allowed if not gated.get(p, frozenset()) <= marked.get(p, set()))
     if lost:

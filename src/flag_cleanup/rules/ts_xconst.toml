@@ -33,10 +33,11 @@ name = "xconst_qualified_boolvariation_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "boolVariation")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
@@ -55,10 +56,11 @@ name = "xconst_qualified_usefeatureflag_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useFeatureFlag")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
@@ -79,10 +81,11 @@ name = "xconst_qualified_usebooleanflagvalue_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useBooleanFlagValue")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
@@ -102,10 +105,11 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments
         . (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member)))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
@@ -124,9 +128,10 @@ name = "xconst_bare_boolvariation_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments . (identifier) @key_member)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "boolVariation")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -144,9 +149,10 @@ name = "xconst_bare_usefeatureflag_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments . (identifier) @key_member)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useFeatureFlag")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -166,9 +172,10 @@ name = "xconst_bare_usebooleanflagvalue_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments . (identifier) @key_member)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useBooleanFlagValue")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -187,9 +194,10 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments . (identifier) @key_member))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -207,12 +215,13 @@ name = "xconst_nested_boolvariation_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (member_expression !optional_chain
           object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
           property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "boolVariation")
   (#eq? @key_namespace "__XCONST_NAMESPACE__")
   (#eq? @key_owner "__XCONST_OWNER__")
@@ -232,12 +241,13 @@ name = "xconst_nested_usefeatureflag_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (member_expression !optional_chain
           object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
           property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useFeatureFlag")
   (#eq? @key_namespace "__XCONST_NAMESPACE__")
   (#eq? @key_owner "__XCONST_OWNER__")
@@ -259,12 +269,13 @@ name = "xconst_nested_usebooleanflagvalue_read"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (member_expression !optional_chain
           object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
           property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useBooleanFlagValue")
   (#eq? @key_namespace "__XCONST_NAMESPACE__")
   (#eq? @key_owner "__XCONST_OWNER__")
@@ -285,12 +296,13 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments
         . (member_expression !optional_chain
           object: (member_expression !optional_chain object: (identifier) @key_namespace property: (property_identifier) @key_owner)
           property: (property_identifier) @key_member)))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @key_namespace "__XCONST_NAMESPACE__")
   (#eq? @key_owner "__XCONST_OWNER__")

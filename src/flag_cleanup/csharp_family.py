@@ -3971,8 +3971,9 @@ def _enclosing(path: str, projects: frozenset[Path], repo_dir: str | None = None
 #: A file-based app's directive (``#:project ../App/App.csproj``,
 #: ``#:package Lib@1.0``): ``dotnet run app.cs`` builds the file as a project
 #: of its own, which no project file names. Matched on any line, which only
-#: errs toward a file-based app.
-_APP_DIRECTIVE = re.compile(r"^[ \t]*#:", re.MULTILINE)
+#: errs toward a file-based app, and after a byte-order mark, which the file
+#: is read with.
+_APP_DIRECTIVE = re.compile(r"^\ufeff?[ \t]*#:", re.MULTILINE)
 
 
 def _file_based_app(path: str) -> bool:

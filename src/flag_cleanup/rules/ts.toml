@@ -171,10 +171,11 @@ name = "replace_boolvariation_read_with_boolean_literal"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (string . (string_fragment) @flag_name .))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "boolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -206,10 +207,11 @@ name = "replace_usefeatureflag_read_with_boolean_literal"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (string . (string_fragment) @flag_name .))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useFeatureFlag")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -240,10 +242,11 @@ name = "replace_usebooleanflagvalue_read_with_boolean_literal"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . (string . (string_fragment) @flag_name .))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useBooleanFlagValue")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -301,10 +304,11 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments
         . (string . (string_fragment) @flag_name .)))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "getBooleanValue")
   (#eq? @flag_name "@stale_flag_name")
 )"""

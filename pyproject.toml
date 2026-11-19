@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.18.0"
+version = "2.19.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,30 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.60.0. Python: deleting an entry no longer turns a one-element set
+    # `{k}` into the dict `{}` or a subscript `x[a, k]` into the scalar index
+    # `x[a]`; Swift: nor a tuple `(a, k)` into the scalar `(a)` (each is
+    # withheld, or keeps its comma where that keeps the meaning). Ruby: an edit
+    # after a bare name, a space and an operator written against its operand
+    # (`b &(<read>) || c`, `b +(x) && <read>`) is withheld, since Ruby reads
+    # that name as a call or a local by what precedes it and tree-sitter
+    # cannot tell. TypeScript/JavaScript: `v = (await <read>) || v` served
+    # false folds to `v = v`, and the statement is deleted when `v` is a
+    # parameter or body-level declaration of the nearest function (ESLint
+    # `no-self-assign`). No grammar rev moved.
+    #
+    # 0.59.0. Grammars only, no rule changed. C#: the grammar moves to
+    # canopy-labs/tree-sitter-c-sharp 64d0b68, upstream 0.24.0 plus only the
+    # patches upstream has not merged (it took most of ours), so the
+    # tree-sitter-c-sharp pin below moves to `0.24.0+canopy.1`. New with it:
+    # C# 14 `#:` file-based-app directives and slice-only list patterns before
+    # `&&`/`and` parse. Swift: the grammar moves to upstream main fef1236 with
+    # no patch of ours (upstream merged the operator-precedence one), so the
+    # tree-sitter-swift pin moves to `+canopy.2`; one catch clause may hold
+    # several patterns. Measured on 44,065 C# and 6,218 Swift files: no file
+    # that parsed starts to error, 3 C# and 1 Swift erroring files parse, and
+    # one clean C# tree changes (the slice pattern).
+    #
     # 0.58.0. TypeScript/JavaScript: a pair the code already has (a call's
     # arguments, an array, a template substitution, an outer parenthesis) makes
     # an `in` legal in a `for` initializer, so a fold there is no longer
@@ -697,7 +721,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.58.0",
+    "polyglot-piranha==0.60.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -770,14 +794,17 @@ dependencies = [
     "tree-sitter-go==0.25.0+canopy.1",
     # Swift. NOT a PyPI release, pinned EXACTLY for the same reason as the
     # grammars above: Gate 1 must parse what the engine rewrites.
-    # polyglot-piranha bundles upstream main (after 0.7.4: the empty tuple `()` as
-    # an expression and `x as? T ?? d`, which PyPI's 0.7.4 reports as a MISSING
-    # node and an ERROR) plus ONE grammar patch (canopy-labs/tree-sitter-swift):
-    # binary operators, calls and casts take Swift's precedence, so `a == b || c`
-    # is `(a == b) || c` and `!f()` is `!(f())`. `node-types.json` is unchanged.
-    # Resolves only from wheels/ (PEP 440 local segment), filled by
-    # scripts/fetch_piranha_wheels.py. Bump the segment when the engine's pin moves.
-    "tree-sitter-swift==0.7.4+canopy.1",
+    # polyglot-piranha bundles upstream main (after 0.7.4, unreleased: the empty
+    # tuple `()` as an expression and `x as? T ?? d`, which PyPI's 0.7.4 reports
+    # as a MISSING node and an ERROR; binary operators, calls and casts take
+    # Swift's precedence, so `a == b || c` is `(a == b) || c` and `!f()` is
+    # `!(f())`; several patterns in one catch clause). Since `+canopy.2` the fork
+    # (canopy-labs/tree-sitter-swift) carries no grammar patch, only the
+    # generated parser upstream does not commit, so this wheel is the only way
+    # to get that grammar until upstream releases. Resolves only from wheels/
+    # (PEP 440 local segment), filled by scripts/fetch_piranha_wheels.py. Bump
+    # the segment when the engine's pin moves.
+    "tree-sitter-swift==0.7.4+canopy.2",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the
@@ -829,29 +856,31 @@ dependencies = [
     # C#. NOT a PyPI release, and pinned EXACTLY for the same reason as
     # tree-sitter-typescript above: Gate 1 must see the SAME node shapes the
     # engine rewrites against, or its checks silently stop matching.
-    # Since `+canopy.4` polyglot-piranha bundles canopy-labs/tree-sitter-c-sharp
-    # daf8b7b (`+canopy.3` was 87435a0, without the attribute-list fix noted at
-    # 0.58.0 above; `+canopy.2` was f7e8943, without the two scanner fixes noted
-    # at 0.49.0): upstream's C# 14 grammar (past the 0.23.5 release, which is now
-    # only a name) plus our patches, and this wheel is cut from that same
-    # commit. The patches: `partial`, `async` and `required` parse as
-    # identifiers at the start of a statement, several real-world shapes
-    # upstream rejected parse, and the escaped-brace fix that was the whole of
-    # `+canopy.1`:
+    # Since `0.24.0+canopy.1` polyglot-piranha bundles
+    # canopy-labs/tree-sitter-c-sharp 64d0b68: upstream 0.24.0 plus only the
+    # patches upstream has not merged, and this wheel is cut from that same
+    # commit. (`0.23.5+canopy.1`..`.4` were 0.23.5, then upstream's C# 14
+    # commit, plus every patch; upstream has since merged most of them,
+    # including the escaped-brace fix that was the whole of `+canopy.1`.) What
+    # is still ours: `partial`, `async` and `required` parse as identifiers at
+    # the start of a statement; `partial` after `ref` is a `modifier` node, as
+    # the partial-type checks here expect (upstream reads it as a bare token);
+    # directive text and skipped-branch boundaries judged by `#if` depth; and
+    # several attribute lists in one `#if` block. The escaped-brace fix the
+    # test below pins:
     #
-    #   bc21c68  an escaped `{{` left the scanner's brace count at its limit,
-    #            so the `{` straight after it could not open a hole:
-    #            `$"{{{x}}}"` read `{x}` as string content. With a
-    #            string literal in the hole stock 0.23.5 ERRORS; without one it
-    #            is no error at all, just a hole whose expression nothing can
-    #            see -- a flag read or a key const inside it included.
+    #   an escaped `{{` left the scanner's brace count at its limit, so the `{`
+    #   straight after it could not open a hole: `$"{{{x}}}"` read `{x}` as
+    #   string content. With a string literal in the hole stock 0.23.5 ERRORS;
+    #   without one it is no error at all, just a hole whose expression nothing
+    #   can see -- a flag read or a key const inside it included.
     #
     # Same local-segment discipline as the TypeScript pin: PyPI forbids local
     # versions, so this resolves only from wheels/, and the segment must move
     # whenever the engine's pinned commit does. The test
     # `test_the_csharp_grammar_matches_the_engines_view_of_escaped_braces`
     # fails if the stock grammar is ever installed instead.
-    "tree-sitter-c-sharp==0.23.5+canopy.4",
+    "tree-sitter-c-sharp==0.24.0+canopy.1",
     # Dart. The ONE grammar here that is NOT the version the engine bundles,
     # and the gap is a whole restructuring rather than a skew: the engine pins
     # `tree-sitter-dart 0.3.0` (0.2.0 until engine 0.38.0: a conventional

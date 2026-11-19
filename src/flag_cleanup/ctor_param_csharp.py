@@ -302,6 +302,9 @@ _FRAMEWORK_TYPES: dict[str, tuple[str, int]] = {
     "IDataProtector": ("Microsoft.AspNetCore.DataProtection", 0),
     "IHostEnvironment": ("Microsoft.Extensions.Hosting", 0),
     "IWebHostEnvironment": ("Microsoft.AspNetCore.Hosting", 0),
+    "ISender": ("Mediator", 0),
+    "IPublisher": ("Mediator", 0),
+    "IMediator": ("Mediator", 0),
 }
 _FRAMEWORK_GENERICS: dict[str, tuple[str, int]] = {
     "ILogger": ("Microsoft.Extensions.Logging", 1),
@@ -848,6 +851,38 @@ def _names(parameter_list: Node) -> tuple[str, ...]:
     )
 
 
+def _constructor_parameter_names(declaration: Node, primary: Node | None) -> frozenset[str]:
+    """The parameter names of every constructor the type declares: its
+    primary one and each ``constructor_declaration`` of its own body."""
+    lists = [primary] if primary is not None else []
+    body = declaration.child_by_field_name("body")
+    for member in body.named_children if body is not None else ():
+        if member.type == "constructor_declaration":
+            found = member.child_by_field_name("parameters") or next(
+                (c for c in member.children if c.type == "parameter_list"), None
+            )
+            if found is not None:
+                lists.append(found)
+    return frozenset(_decoded(name) for parameter_list in lists for name in _names(parameter_list))
+
+
+def _names_no_parameter(arguments: Node, constructor_names: frozenset[str] | None) -> bool:
+    """Whether some named argument spells a name that is no parameter of
+    any constructor (``constructor_names``; ``None`` when unknown)."""
+    if constructor_names is None:
+        return False
+    for item in _items(arguments):
+        label = item.child_by_field_name("name")
+        if label is None:
+            continue
+        spelled = _decoded(_text(label))
+        if "\ufffd" in spelled:
+            return False  # an escape this cannot read: not ruled out
+        if spelled not in constructor_names:
+            return True
+    return False
+
+
 def _arity(parameter_list: Node) -> tuple[int, float]:
     """The fewest and most arguments a call can pass. A ``params`` array is
     not a ``parameter`` node in this grammar; it makes the most unbounded."""
@@ -919,6 +954,7 @@ def plan(path: str, source: str, label: str, repo_dir: str) -> Removal | Refusal
         sees=lambda caller: csharp_family.sees(repo_dir, caller, path),
         interfaces=_interface_positions(parameters, root, path, repo_dir),
         inert_in=lambda node, caller: _plain_construction(node, repo_dir, caller),
+        constructor_names=_constructor_parameter_names(declaration, parameters),
     )
     if reason is not None:
         return Refusal(label, reason)
@@ -1010,6 +1046,7 @@ def _references(
     sees: Callable[[str], bool] | None = None,
     interfaces: dict[int, str] | None = None,
     inert_in: Callable[[Node, str], bool] | None = None,
+    constructor_names: frozenset[str] | None = None,
 ) -> tuple[list[Site], str | None]:
     """Every site that spells the type ``name``, or a reason it cannot be
     proven: see the module docstring."""
@@ -1027,8 +1064,11 @@ def _references(
     everywhere = _global_usings(repo_dir) if namespace else set()
     #: Target-typed ``new(…)``s whose context names another type, or that a
     #: literal for a framework type rules out: the type name, and where.
-    targeted: list[tuple[str, str]] = []
+    targeted: list[tuple[str, str, str]] = []
+    #: Names a ``global using`` aliases (every file sees them), and the names
+    #: a file aliases for itself.
     aliases: set[str] = set()
+    local_aliases: dict[str, set[str]] = {}
     base_inert = inert
     # Other checkout types of the same simple name: each spelling is then
     # settled by lookup, or the plan refuses.
@@ -1052,8 +1092,12 @@ def _references(
         if is_cs and b"using" in data:
             # Every word between a `using` and its `=`: `unsafe`, a comment
             # or an escape between them only adds names.
-            for alias in _ALIAS.finditer(_decoded(data.decode("utf-8", "replace"))):
-                aliases.update(_WORD.findall(alias.group(1)))
+            decoded_text = _decoded(data.decode("utf-8", "replace"))
+            for alias in _ALIAS.finditer(decoded_text):
+                if _GLOBAL_BEFORE.search(decoded_text[: alias.start()]):
+                    aliases.update(_WORD.findall(alias.group(1)))
+                else:
+                    local_aliases.setdefault(file.resolved, set()).update(_WORD.findall(alias.group(1)))
         if not is_cs:
             if mentions:
                 return sites, f"{file.path} mentions it (razor, cshtml or another .NET guest file)"
@@ -1101,13 +1145,18 @@ def _references(
                 args = _argument_list(node)
                 count = len(_items(args)) if args is not None else 0
                 candidate = arity[0] <= count <= arity[1] and (sees is None or sees(file.resolved))
+                if candidate and args is not None and _names_no_parameter(args, constructor_names):
+                    # CS1739: a named argument no constructor has a
+                    # parameter of cannot be calling any of them.
+                    continue
                 ruled_out = (
                     _literal_for_an_interface(args, interfaces or {}) if candidate and args is not None else None
                 )
                 where = f"{file.path}:{node.start_point[0] + 1}"
                 if ruled_out:
                     # Ruled out only if the framework name is the framework's.
-                    targeted.append((ruled_out, where))
+                    # Spelled in the declaring file's parameters: any file's alias refuses.
+                    targeted.append((ruled_out, where, ""))
                 elif candidate and ruled_out is None:
                     spelling = _target_spelling(node, repo_dir, file.resolved) if sees is not None else None
                     target = spelling[0] if spelling is not None else None
@@ -1137,7 +1186,7 @@ def _references(
                         reason = _site(spelled, args, index, names, local, inert)
                         if reason is not None:
                             return sites, f"{where}: {reason}"
-                    targeted.append((target, where))
+                    targeted.append((target, where, file.resolved))
                 continue
             if node.type != "identifier" or _text(node) != name:
                 continue
@@ -1188,8 +1237,12 @@ def _references(
     if targeted:
         items, readable = _xcs().msbuild_usings(repo_dir)
         aliases |= {_decoded(i.alias) for i in items if i.alias}
-        for target, where in targeted:
-            if not readable or target in aliases:
+        for target, where, home in targeted:
+            if (
+                not readable
+                or target in aliases
+                or (target in local_aliases.get(home, ()) if home else any(target in a for a in local_aliases.values()))
+            ):
                 return sites, f"{where}: a target-typed new(…) could construct it (its type may be an alias)"
     return sites, None
 
@@ -1527,6 +1580,8 @@ def _type_parameter(node: Node, simple: str) -> bool:
 #: over-match only refuses.
 _ALIAS = re.compile(r"\busing\b([^;{}()=]*)=")
 _WORD = re.compile(r"\w+")
+#: What may stand right before a ``using`` that makes the alias global.
+_GLOBAL_BEFORE = re.compile(r"\bglobal\s+$")
 _ESCAPE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
 
 
@@ -1747,6 +1802,10 @@ def _target_spelling(node: Node, repo_dir: str, from_path: str | None = None) ->
         declared = _added_element(parent, node, repo_dir, from_path)
         if declared is None:
             return None
+    elif parent.type == "expression_element":
+        declared = _passed_element(parent, repo_dir, from_path)
+        if declared is None:
+            return None
     elif parent.type == "property_declaration" and (value := parent.child_by_field_name("value")) is not None and value.id == node.id:
         # `public HashSet<string> Names { get; } = new(comparer);`: an
         # auto-property's initializer creates the property's type.
@@ -1828,6 +1887,15 @@ def _added_element(argument: Node, node: Node, repo_dir: str, from_path: str | N
         return None
     method = function.child_by_field_name("name")
     receiver = function.child_by_field_name("expression")
+    while (
+        receiver is not None
+        and receiver.type == "parenthesized_expression"
+        and len(receiver.named_children) == 1
+        and receiver.named_children[0].type == "assignment_expression"
+        and any(not c.is_named and _text(c) == "??=" for c in receiver.named_children[0].children)
+    ):
+        # `(xs ??= []).Add(…)` adds to `xs`, whichever branch ran.
+        receiver = receiver.named_children[0].child_by_field_name("left")
     if method is None or _text(method) != "Add" or receiver is None or receiver.type != "identifier":
         return None
     collection = (
@@ -1847,6 +1915,123 @@ def _added_element(argument: Node, node: Node, repo_dir: str, from_path: str | N
         or simple not in _ADDING
         or _may_declare_type(repo_dir, simple, from_path)
         or wrapper_csharp._checkout_extension(repo_dir, "Add")
+    ):
+        return None
+    return type_arguments.named_children[0]
+
+
+#: Declarations that may carry a base list.
+_BASE_LIST_DECLARATIONS = frozenset(
+    {"class_declaration", "struct_declaration", "record_declaration", "record_struct_declaration", "interface_declaration"}
+)
+
+#: Library collection types a collection expression can build, of one type argument.
+_BUILDABLE = frozenset(
+    {"IEnumerable", "IReadOnlyList", "IReadOnlyCollection", "IList", "ICollection", "List", "HashSet", "ISet",
+     "IReadOnlySet", "ImmutableArray", "ImmutableList", "Span", "ReadOnlySpan"}
+)
+
+
+def _passed_element(element: Node, repo_dir: str, from_path: str | None) -> Node | None:
+    """The element type of the collection parameter ``f([new(…)])`` or
+    ``f(p: [new(…)])`` fills: ``element`` the ``expression_element`` holding
+    the ``new(…)`` directly, the collection expression the whole of an
+    argument of a simple-name call. The class holding the call declares
+    exactly one member ``f`` (so C#'s lookup stops there), a non-generic
+    method, in a class that is not ``partial`` and whose bases are library
+    types; the parameter is found by name, or by position when no argument
+    before it is named, and is declared an array or a library collection of
+    one type argument, no checkout type bearing that name."""
+    collection = element.parent.parent if element.parent is not None else None
+    if element.parent is None or element.parent.type != "collection_element" or collection is None:
+        return None
+    if collection.type != "collection_expression":
+        return None
+    argument = collection.parent
+    arguments = argument.parent if argument is not None else None
+    call = arguments.parent if arguments is not None else None
+    if (
+        argument is None
+        or argument.type != "argument"
+        or arguments is None
+        or arguments.type != "argument_list"
+        or call is None
+        or call.type != "invocation_expression"
+        or _expression(argument) is None
+        or _expression(argument).id != collection.id
+    ):
+        return None
+    function = call.child_by_field_name("function")
+    if function is None or function.type != "identifier":
+        return None
+    called = _text(function)
+    member, owner = _member_and_owner(call)
+    if member is None or owner is None or "partial" in _modifiers(owner) or _binds(member, called):
+        return None
+    # No type around the call may have a base list: a base (class or
+    # interface) can bring an `F`, or a nested type, that C#'s lookup finds
+    # before anything this reads. Names are not resolved here.
+    enclosing: Node | None = owner
+    while enclosing is not None:
+        if enclosing.type in _BASE_LIST_DECLARATIONS and any(c.type == "base_list" for c in enclosing.children):
+            return None
+        # A C# 14 `extension` block holds static members that C#'s lookup
+        # may pick instead of the class's own `F`; they are not modelled.
+        if enclosing.type == "extension_declaration" or (
+            enclosing.type in _BASE_LIST_DECLARATIONS and any(n.type == "extension_declaration" for n in _walk(enclosing))
+        ):
+            return None
+        enclosing = enclosing.parent
+    body = owner.child_by_field_name("body")
+    same = [
+        m for m in (body.named_children if body is not None else ())
+        if (n := m.child_by_field_name("name")) is not None and _text(n) == called
+    ]
+    if len(same) != 1 or same[0].type != "method_declaration":
+        return None
+    method = same[0]
+    if any(c.type == "type_parameter_list" for c in method.children):
+        return None
+    declared = method.child_by_field_name("parameters")
+    if declared is None or any(c.type != "parameter" for c in declared.named_children if c.type != "comment"):
+        return None
+    parameters = _parameters(declared)
+    items = _items(arguments)
+    if len(items) != len(parameters) or any(_optional(p) for p in parameters):
+        return None  # the method must fit the call exactly, or a base's `F` may be chosen
+    label = argument.child_by_field_name("name")
+    if label is not None:
+        wanted = _text(label).removeprefix("@")
+        parameter = next(
+            (p for p in parameters if (n := p.child_by_field_name("name")) is not None and _text(n).removeprefix("@") == wanted),
+            None,
+        )
+    else:
+        at = items.index(argument) if argument in items else -1
+        if at < 0 or at >= len(parameters) or any(i.child_by_field_name("name") is not None for i in items[:at]):
+            return None
+        parameter = parameters[at]
+    if parameter is None or any(c.type in ("attribute_list", "modifier") for c in parameter.children):
+        return None
+    kind = parameter.child_by_field_name("type")
+    if kind is not None and kind.type == "nullable_type" and kind.named_children:
+        kind = kind.named_children[0]
+    if kind is None:
+        return None
+    if kind.type == "array_type":
+        rank = next((c for c in kind.named_children if c.type == "array_rank_specifier"), None)
+        if rank is None or _text(rank).replace(" ", "") != "[]":
+            return None  # a multi-dimensional or nested array
+        return kind.child_by_field_name("type")
+    if kind.type != "generic_name":
+        return None
+    type_arguments = next((c for c in kind.named_children if c.type == "type_argument_list"), None)
+    simple = _simple(kind) or ""
+    if (
+        type_arguments is None
+        or len(type_arguments.named_children) != 1
+        or simple not in _BUILDABLE
+        or _may_declare_type(repo_dir, simple, from_path)
     ):
         return None
     return type_arguments.named_children[0]
@@ -2660,6 +2845,7 @@ def plan_classic(
         sees=lambda caller: csharp_family.sees(repo_dir, caller, path),
         interfaces=_interface_positions(parameters, root, path, repo_dir),
         inert_in=lambda node, caller: _plain_construction(node, repo_dir, caller),
+        constructor_names=_constructor_parameter_names(declaration, parameters),
     )
     if reason is not None:
         return Refusal(label, reason)

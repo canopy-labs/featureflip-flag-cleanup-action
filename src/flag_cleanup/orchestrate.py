@@ -79,7 +79,7 @@ from typing import Protocol
 
 import httpx
 
-from flag_cleanup import git_ops, github_ops, go_setters, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, removed_refusals, ruby_owner_reach, source_index, ts_key_names, ts_workspace, wildcard_stubs
+from flag_cleanup import git_ops, github_ops, go_setters, inert_calls, inert_load, nesting, prerequisite_hold, report_paths, removed_refusals, ruby_owner_reach, source_index, ts_flag_maps, ts_key_names, ts_workspace, wildcard_stubs
 from flag_cleanup.constant_wrappers import (
     ConstantWrapper,
     find_constant_wrappers,
@@ -1691,6 +1691,13 @@ def piranha_transform(
     try:
         try:
             _refuse_ambiguous_code_key(candidate, config, known_flag_keys)
+            # `flag-maps`: asked before any pass writes, whether this flag has a
+            # read of a listed map the rules will fold.
+            map_read = bool(config.flag_maps) and ts_flag_maps.has_read(
+                [f for _directory, lang, files in plan if lang in ("ts", "tsx", "js") for f in files],
+                config.code_key(candidate.key),
+                config.flag_maps,
+            )
             with git_ops.guarding_writes(snapshot, ledger):
                 outcomes = _run_plan(plan, candidate, config, known_flag_keys)
             kept_entries: list[tuple[str, str]] = []
@@ -1759,6 +1766,24 @@ def piranha_transform(
                                 for path, _text in first
                             },
                         )
+            # ...and then, ONCE, after every pass has run: the fold of a map read is
+            # sound only if the key is spelled nowhere else in the checkout.
+            # Anything but an inert document that still holds it refuses the
+            # whole flag, which the handler below rolls back.
+            if map_read:
+                left = ts_flag_maps.survivors(
+                    [checkout_root(d) for d in config.directories], config.code_key(candidate.key)
+                )
+                if left:
+                    raise UnsafeRewriteError(
+                        f"the removal of {candidate.key!r} was refused: after the fold the key is still "
+                        "spelled where a `flag-maps` fold cannot account for it ("
+                        + "; ".join(f"{path}: {why}" for path, why in sorted(left.items())[:10])
+                        + (f"; and {len(left) - 10} more" if len(left) > 10 else "")
+                        + ")",
+                        refused=sorted(left),
+                        reasons=left,
+                    )
             for outcome in outcomes:
                 if outcome.diff:
                     diff_parts.append(outcome.diff)
@@ -2023,6 +2048,7 @@ def _run_plan(
             entries=entries,
             key_positions=config.key_positions,
             code_keys=config.code_keys(),
+            flag_maps=config.flag_maps,
         )
         outcomes.append(
             replace(

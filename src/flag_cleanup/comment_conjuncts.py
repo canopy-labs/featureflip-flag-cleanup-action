@@ -24,6 +24,9 @@ these hold:
   [release|feature] (flag|gate|toggle)`` with the key optionally backticked, and
   names no key but the removed one; the other side is plain words with no
   ``or``, ``not``, ``unless``, a second operator or any symbol;
+* a two-flag count, ``BOTH <a> and <b> are on`` or ``<a> and <b> are both on``
+  (one of the two the removed key, the other one word), is cut to ``<a> is
+  on``, wherever it sits in a sentence and across the line breaks of a comment;
 * the flag was served ``true``: removing a ``true`` conjunct leaves the other
   half, while a ``false`` one would leave the whole thing false, so nothing is
   cut then;
@@ -127,6 +130,37 @@ def conjunct(content: str, key: str, *, linked: bool) -> str | None:
     return None
 
 
+_TOKEN = r"`?[A-Za-z][\w.-]*`?"
+_ON = r"(?:on|enabled|true|live|active)(?![\w-])"
+_BOTH = (
+    re.compile(rf"\bBOTH\s+(?P<a>{_TOKEN})\s+and\s+(?P<b>{_TOKEN})\s+are\b(?=\s+{_ON})", re.IGNORECASE),
+    re.compile(rf"(?<![\w`.-])(?P<a>{_TOKEN})\s+and\s+(?P<b>{_TOKEN})\s+are\s+both\b(?=\s+{_ON})", re.IGNORECASE),
+)
+
+
+def both_count(text: str, key: str, known: frozenset[str]) -> tuple[int, int, str] | None:
+    """``(start, end, replacement)`` for the first ``BOTH <a> and <b> are``
+    (or ``<a> and <b> are both``) of ``text`` where exactly one of the two
+    words is ``key``: the span becomes ``<other> is``. ``None`` when there is
+    none, or the other word is not EXACTLY one of ``known``, the project's
+    flag keys (without that set the prose is left alone)."""
+    for pattern in _BOTH:
+        for found in pattern.finditer(text):
+            a, b = found.group("a"), found.group("b")
+            named = [w.strip("`") == key for w in (a, b)]
+            if named.count(True) != 1:
+                continue
+            other = b if named[0] else a
+            bare = other.strip("`")
+            if bare == key or bare not in known:
+                continue
+            # Exactly two conjuncts: nothing listed in front of the first.
+            if re.search(r"[,;]\s*$", text[: found.start("a")]) or re.search(r"\b(?:and|or)\s+$", text[: found.start("a")], re.IGNORECASE):
+                continue
+            return found.start(), found.end(), f"{other} is"
+    return None
+
+
 _ITEM = r"[\w.-]+[=:][\w.-]+"
 
 
@@ -201,13 +235,17 @@ def cut(
     *,
     treatment: bool,
     linked: dict[int, str] | None = None,
+    counts_only: bool = False,
+    known_flag_keys: frozenset[str] = frozenset(),
 ) -> tuple[str, list[Reword]]:
     """``source`` with the conjunct or list item cut out of each qualifying
     comment, and what changed. Without ``linked`` the comments tried are the
     ones naming ``key``. With it (``{1-based line: comment text}`` from the
     call-site report) they are the single comments starting on those lines
     whose whole text is the reported one, and only a conjunct is cut. ``source``
-    itself when nothing qualifies or a code token would change."""
+    itself when nothing qualifies or a code token would change. With
+    ``counts_only`` only the two-flag count is cut (:func:`both_count`), the
+    one shape the languages without call-site proofs share."""
     bom = source.startswith("﻿")
     data = source[1:].encode("utf-8") if bom else source.encode("utf-8")
     if linked is None and key.encode() not in data:
@@ -223,7 +261,7 @@ def cut(
         return 0 <= row < len(source_lines) and source_lines[row].lstrip().startswith((b"//", b"/*", b"*", b"#"))
 
     edits: list[tuple[int, int, bytes, Reword]] = []
-    for node in _comments(root):
+    for node in () if counts_only else _comments(root):
         row = node.start_point[0]
         if linked is not None:
             if linked.get(row + 1) != _comment_text(node):
@@ -257,6 +295,8 @@ def cut(
                 for r in range(row, row + len(lines))
             )
             edits.append((start, end, new.encode(), Reword(row + index + 1, content.strip(), new.strip(), raw)))
+    if treatment and linked is None and known_flag_keys:
+        _both_edits(root, data, key, source_lines, edits, known_flag_keys)
     if not edits:
         return source, []
     out, at = bytearray(), 0
@@ -272,6 +312,73 @@ def cut(
         return source, []
     text = after.decode("utf-8")
     return ("﻿" + text if bom else text), [e[3] for e in sorted(edits, key=lambda e: e[0])]
+
+
+def _both_edits(root: Node, data: bytes, key: str, source_lines: list[bytes], edits: list, known: frozenset[str]) -> None:
+    """Add the cuts of a two-flag count (:func:`both_count`) to ``edits``.
+    A count wraps over lines, so each run of consecutive own-line comment
+    lines is read as one text, and the edit lands on the lines it touches:
+    the first holds the cut-down words, a later one only what follows them.
+    A run with a tool directive in it, a line the cut would empty, or an edit
+    that overlaps another is left alone."""
+    runs: list[list[tuple[int, int, int, str, str]]] = []
+    previous = -2
+    for node in _comments(root):
+        row = node.start_point[0]
+        trailing = bool(source_lines[row][: node.start_point[1]].strip())
+        for index, (a, _b, opening, content, closing) in enumerate(_lines_of(node)):
+            at = row + index
+            line_bytes = source_lines[at] if at < len(source_lines) else b""
+            entry = (at, node.start_byte + a + len(opening.encode()), len(content.encode()), content, closing)
+            if is_directive_line(line_bytes, content):
+                previous = -2
+                runs.append([])
+                continue
+            if at == previous + 1 and not (trailing and index == 0) and runs and runs[-1]:
+                runs[-1].append(entry)
+            else:
+                runs.append([entry])
+            previous = at
+    for run in runs:
+        joined = ""
+        spans: list[tuple[int, int]] = []
+        for _row, _start, _size, content, _closing in run:
+            if joined:
+                joined += " "
+            spans.append((len(joined), len(joined) + len(content.strip())))
+            joined += content.strip()
+        if key not in joined:
+            continue
+        found = both_count(joined, key, known)
+        if found is None:
+            continue
+        lo, hi, replacement = found
+        pieces: list[tuple[int, str, str]] = []
+        usable = True
+        for (row, start, size, content, _closing), (a, b) in zip(run, spans, strict=True):
+            if b <= lo or a >= hi:
+                continue
+            kept_before = joined[a:lo] if a < lo else ""
+            kept_after = joined[hi:b] if b > hi else ""
+            if not a <= lo < b:
+                kept_after = kept_after.lstrip()
+            first = a <= lo < b
+            new = kept_before + (replacement if first else "") + kept_after
+            if not new.strip():
+                usable = False
+                break
+            lead = content[: len(content) - len(content.lstrip())]
+            trail = content[len(content.rstrip()) :]
+            pieces.append((row, start, lead + new + trail, content))
+        if not usable or not pieces:
+            continue
+        spans_new = [(start, start + len(content.encode())) for _row, start, _new, content in pieces]
+        clash = any(s < end and start < e for s, e in spans_new for start, end, *_ in edits)
+        if clash:
+            continue
+        raw = tuple(bytes(source_lines[r]).decode("utf-8", "replace").strip() for r, *_ in [(x[0],) for x in run])
+        for row, start, new, content in pieces:
+            edits.append((start, start + len(content.encode()), new.encode(), Reword(row + 1, content.strip(), new.strip(), raw)))
 
 
 def _continues(next_line: str) -> bool:

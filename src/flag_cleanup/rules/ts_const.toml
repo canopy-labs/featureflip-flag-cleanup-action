@@ -115,15 +115,16 @@ enclosing_node = """(
        name: (identifier) @decl_name
        value: (call_expression
          function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                    (identifier) @sdk_fn]
+                    (identifier) @sdk_fn] @sdk_callee
          arguments: (arguments . (string . (string_fragment) @flag_name .)))) .))
    (program
      (lexical_declaration kind: "const" . (variable_declarator
        name: (identifier) @decl_name
        value: (call_expression
          function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                    (identifier) @sdk_fn]
+                    (identifier) @sdk_fn] @sdk_callee
          arguments: (arguments . (string . (string_fragment) @flag_name .)))) .))] @scope
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @decl_name "@identifier")
 )"""
@@ -201,15 +202,16 @@ query = """(
       name: (identifier) @variable_name
       value: (call_expression
         function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                   (identifier) @sdk_fn]
+                   (identifier) @sdk_fn] @sdk_callee
         arguments: (arguments . (string . (string_fragment) @flag_name .)))) .) @declaration)
    (program
     (lexical_declaration kind: "const" . (variable_declarator
       name: (identifier) @variable_name
       value: (call_expression
         function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                   (identifier) @sdk_fn]
+                   (identifier) @sdk_fn] @sdk_callee
         arguments: (arguments . (string . (string_fragment) @flag_name .)))) .) @declaration)] @scope
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @flag_name "@stale_flag_name")
 )"""
 replace_node = "declaration"
@@ -321,9 +323,10 @@ name = "replace_boolvariation_const_key_read_with_boolean_literal"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments . (identifier) @key_const)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "boolVariation")
 )"""
 replace_node = "call"
@@ -422,9 +425,10 @@ name = "replace_usefeatureflag_const_key_read_with_boolean_literal"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments . (identifier) @key_const)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useFeatureFlag")
 )"""
 replace_node = "call"
@@ -517,9 +521,10 @@ name = "replace_usebooleanflagvalue_const_key_read_with_boolean_literal"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments . (identifier) @key_const)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "useBooleanFlagValue")
 )"""
 replace_node = "call"
@@ -615,9 +620,10 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments . (identifier) @key_const))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "getBooleanValue")
 )"""
 replace_node = "await"

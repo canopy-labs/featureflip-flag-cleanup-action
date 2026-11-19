@@ -3480,7 +3480,16 @@ def refusal_reason(
             before, language
         ):
             return "a flag read was left as a bare true or false statement"
-        return ts_syntax.refusal_reason(before, after, language)
+        # The sharper reasons above and in `ts_syntax` win when both apply.
+        reason = ts_syntax.refusal_reason(before, after, language)
+        if reason is not None:
+            return reason
+        # Sound by construction, not by shape: a boolean literal the fold put
+        # inside ANY condition (through `!`, a comma, an assignment, whatever
+        # wraps it) is a condition its lint may call constant.
+        if ts_dead_code.condition_literals_grew(before, after, language):
+            return "a boolean literal the fold introduced was left inside a condition"
+        return None
     if language not in _PROFILES:
         raise ValueError(f"unsupported language {language!r}")
     if count_syntax_errors(after, language) > count_syntax_errors(before, language):

@@ -8,6 +8,125 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.19.0
+
+### Added
+
+- A TypeScript or JavaScript wrapper whose own tests are written once for every
+  member of its factory, `describe.each(['isA', 'isB'])('%s', (method) => { ...
+  buildFlags(fake)[method]() ... })`, no longer keeps the removed member. The
+  row naming it is cut (the whole block when it was the only row), and the
+  pull request lists it. A table that is not a literal array of strings, a
+  modifier such as `.only`, or any other use of the row's name keeps the member
+  as before.
+- `flag-maps` input (TypeScript and JavaScript): names objects whose keys are flag keys, so that `state.featureToggles[KEY]` is a read of the flag. It folds where the read is a boolean condition (`if`, `while`, a ternary, `!`, `&&`, `||`) for a key written as a string literal or as a constant of the same file; every other position is left as written. Every object with a listed name is treated as the flag map, so list a distinctive name. A run with a folded read checks the whole checkout once, after every language pass: any file that still holds the key, however it is spelled (raw, or with `\x`, `\u`, octal, HTML-entity or `%` escapes), refuses the flag unless it is a `.md`/`.rst` document, an extension-less `CHANGELOG`/`LICENSE` file, gitignored, or the key as an item of this Action's `flags` input in a GitHub Actions workflow file (not GitLab CI or CircleCI config); submodules are searched too, and a map written through a dynamic key (`state.featureToggles[action.key] = v`) is never eligible; it refuses the flag, names the file and line and rolls everything back, as does a write to the map with a key the run cannot read. A key built from pieces at runtime and never spelled whole is not seen. A constant declared in another file, a `?? DEFAULTS[KEY]` default and a defaults object's entries are not handled yet.
+
+### Changed
+
+- A C# run that removes a gate and its injection point now deletes the empty
+  interface, its implementations and the constructor parameters that took it
+  in more cases. An implicit `new(…)` is now ruled out as a call to the
+  constructor when it passes a named argument no constructor has (the
+  compiler would reject it), when it is added to a list that `(list ??= [])`
+  creates, or when it is an element of a collection expression passed to a
+  method of its own class whose parameter is an array or a list of another
+  type (only when neither that class nor any type around it has a base list or a
+  C# 14 `extension` block).
+- The C# options setting a removed gate read is no longer kept just because
+  the repository has a method called `Bind`, `GetSection` or `Configure`
+  somewhere. A method only holds it when a binding call could resolve to it
+  (an extension method of a fitting size, or a method its own type or a
+  derived one could call). The pull request now says "The options setting the
+  family read was kept, because:" for such a case, instead of listing it
+  among what the deleted family left behind.
+- A comment that says `BOTH <flag> and <other> are on` (or `<flag> and
+  <other> are both on`) is cut down to `<other> is on` when `<other>` is one of
+  the project's flag keys, wherever it sits in a sentence and over the line
+  breaks of a comment, in every language whose comments are cut.
+- The pull request now lists doc comments on C# members the run edited that
+  count gates ("both gates", "either flag", "two gates"), and notes when a
+  `[Theory]` turned into a `[Fact]` still has a name that counts gates.
+- The transform engine is now 0.59.0, the C# parser 0.24.0+canopy.1 and the
+  Swift parser 0.7.4+canopy.2. C# files that use C# 14 file-based-app
+  directives (`#:package`, `#:property` and the rest) now parse instead of
+  being skipped, and so do Swift files with several patterns in one `catch`
+  clause. A list pattern such as `x is [.., '\\', c] && y` is now read
+  correctly.
+- A file the transform engine cannot parse is now listed in its own block of the
+  pull request, with the reason `unparseable`, in addition to the "still
+  reference this flag" list. The rest of the flag is removed as before.
+
+### Fixed
+
+- The transform engine is now 0.60.0. These shapes used to be rewritten wrongly
+  and are now either withheld or rewritten correctly. If you merged a removal
+  that touched one of them, check it.
+  - Python: removing the last flagged entry of a set `{k}` no longer leaves
+    `{}`, which is a dict. Removing one index of a subscript `x[a, k]` no
+    longer turns a tuple index into the scalar `x[a]`.
+  - Swift: removing an element of a tuple `(a, k)` no longer leaves the scalar
+    `(a)`.
+  - Ruby: a read inside `b &(<read>) || c`, or after a bare name followed by a
+    space and an operator written against its operand (`b +(x) && <read>`), is
+    left as it was. Ruby decides whether that name is a call or a variable, and
+    a rewrite could change which one it reads.
+- TypeScript/JavaScript: `v = (await <read>) || v` with the false treatment
+  used to leave `v = v`, which ESLint rejects (`no-self-assign`). The statement
+  is now deleted when `v` is a parameter or top-level declaration of the
+  enclosing function.
+- MDX documents are read more cautiously when deciding whether they still use
+  a module. A `/` in an `export`/`import` block that could open a regular
+  expression now makes the rest of the document count as code, so a later
+  `import` is no longer mistaken for a code sample and a wrapper is no longer
+  deleted while the document still imports its module. An `import` or
+  `export` line between a first-line `---` pair counts as code too. A
+  document with thousands of unclosed code fences is scanned in linear time
+  instead of seconds. If you merged a removal that deleted a wrapper an MDX
+  document still imported, check it.
+- TypeScript and JavaScript: an un-awaited property read of a key constant
+  (`useFlag({ key: KEY })`) now folds when the constant has another use and its
+  declaration stays, the same as the awaited read beside it. It folds only where
+  the read is proven synchronous, as before; otherwise it is left whole.
+- A file that declares a key constant for the flag and cannot be parsed now
+  refuses the flag with a message naming that file. Before, it made the engine
+  reject every other file in the run too, and the flag failed with an
+  unattributed engine error.
+- TypeScript and JavaScript removals could be rewritten wrongly in the shapes
+  below. If you merged a removal from an earlier version that touched one of
+  them, check it.
+- A TypeScript or JavaScript read whose call chain is optional on any link
+  (`svc?.a.useFlag({ key: 'k' })`, `svc?.client.boolVariation('k', false)`) is
+  now left as written, like `useFlag?.()` already was. Folding it to `true` or
+  `false` changed the value when `svc` was nullish.
+- A key constant is now kept when its whole module is handed on through a
+  member every object has (`m.valueOf()[key]`, `m.hasOwnProperty(...)`,
+  `m.constructor`); the computed read used to return `undefined` after the
+  constant was deleted.
+- A boolean literal the fold leaves in an `if`, `while`, `do`, `for` or
+  ternary condition, however it is wrapped (`!(ready() || true)`,
+  `(track(), true)`, `(on = true)`), is now refused like the plain form,
+  instead of shipping code that fails `no-constant-condition`.
+- A flag-keyed table entry (`const flags = { look: true, other: false }`) is
+  now deleted only when every use of the table in its own file is a literal
+  read: the declaration, `flags.name` or `flags['name']`. A table holding a
+  method, getter, spread or computed key, a key in a variable or
+  parameter, an alias, spread, `Object.entries`, `in`, a default export, a
+  script file or a file using `eval` keeps the entry. It is listed as left in
+  place, and the rest of the removal ships.
+- An exported flag table's entry is now also kept unless every module that can
+  load it is resolved and reads the table by literal keys (relative imports,
+  tsconfig paths, workspace packages, barrels and `export *`, script blocks of
+  Vue, Svelte, Astro and MDX files). An unresolvable import that could be an
+  alias, a dynamic `import()` or `require()`, a glob load, or a page or template
+  naming the module keeps it. An unresolved relative import or a bare import
+  no `package.json` declares, anywhere in the checkout, now keeps every exported
+  table's entry.
+- A key spelled with an escape sequence (`flags['\x6cook']`) is no longer read as
+  a literal key when deciding whether a table entry can be removed.
+- An import, export or `require` whose module specifier is spelled with an escape
+  (`'.\x2fflags'`), a literal `module`/`node:module` specifier, and a component's
+  markup that loads modules now keep an exported table's entries.
+
 ## 2.18.0
 
 ### Changed

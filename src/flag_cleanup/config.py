@@ -205,6 +205,9 @@ class Config:
     #: already-handled lookup, the API calls, ``flags``/``ignore``, the
     #: archive modes) keeps the Featureflip key. See :meth:`code_key`.
     key_aliases: tuple[tuple[str, str], ...] = ()
+    #: ``flag-maps``: names of objects whose keys are flag keys (``flags[KEY]``),
+    #: read by TypeScript and JavaScript. See :mod:`flag_cleanup.ts_flag_maps`.
+    flag_maps: tuple[str, ...] = ()
     #: ``workspace-packages``: whether a TS/JS import of a workspace package
     #: by name is followed to its source (``follow``) or left
     #: ``import-unresolved`` (``off``, the default); see
@@ -273,6 +276,13 @@ class Config:
                 f"expected one or more of {', '.join(supported_languages())}"
             )
 
+        flag_maps = _parse_flag_maps(_get(env, "FEATUREFLIP_FLAG_MAPS", ""))
+        if flag_maps and not {"ts", "tsx", "js"} & set(languages):
+            # Every other language ignores the input, which would then match nothing.
+            raise ConfigError(
+                "FEATUREFLIP_FLAG_MAPS names a map of flags, which only a TypeScript or "
+                "JavaScript run reads, but FEATUREFLIP_LANGUAGES includes neither"
+            )
         accessors, gates, key_positions = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
         properties = [name for name, at in key_positions if isinstance(at, str)]
         if properties and not {"ts", "tsx", "js"} & set(languages):
@@ -375,6 +385,7 @@ class Config:
                 _get(env, "FEATUREFLIP_MAX_PRS", str(DEFAULT_MAX_PRS)),
             ),
             key_aliases=_parse_key_aliases(_get(env, "FEATUREFLIP_KEY_ALIASES", "")),
+            flag_maps=flag_maps,
             workspace_packages=_parse_workspace_packages(_get(env, "FEATUREFLIP_WORKSPACE_PACKAGES", "off")),
         )
 
@@ -545,6 +556,22 @@ def _parse_workspace_packages(value: str) -> str:
             f"expected one of {', '.join(WORKSPACE_PACKAGES_VALUES)}"
         )
     return mode
+
+
+_FLAG_MAP_NAME = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*\Z")
+
+
+def _parse_flag_maps(value: str) -> tuple[str, ...]:
+    """Split and validate ``FEATUREFLIP_FLAG_MAPS``: comma- or newline-separated
+    plain names. A name that is not an identifier, or is listed twice, refuses the
+    run: the name decides which subscripts are folded to a literal."""
+    names = [item.strip() for item in re.split(r"[,\n]", value) if item.strip()]
+    for name in names:
+        if _FLAG_MAP_NAME.match(name) is None:
+            raise ConfigError(f"FEATUREFLIP_FLAG_MAPS entry {name!r} is not a plain identifier")
+    if len(set(names)) != len(names):
+        raise ConfigError("FEATUREFLIP_FLAG_MAPS lists a name more than once")
+    return tuple(names)
 
 
 def _parse_key_aliases(value: str) -> tuple[tuple[str, str], ...]:

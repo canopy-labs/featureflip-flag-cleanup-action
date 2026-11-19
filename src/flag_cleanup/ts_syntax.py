@@ -321,6 +321,18 @@ def _walk(node: Node):
         stack.extend(current.children)
 
 
+def chain_is_optional(callee: Node | None) -> bool:
+    """Whether ANY link of ``callee`` is optional (``svc?.a.useFlag``,
+    ``svc.a?.b.read``, ``svc?.["a"].read``).
+
+    A nullish link makes the whole call ``undefined`` without running it, so
+    folding it to a boolean changes the value. The rules' ``!optional_chain``
+    sees only the last link; this looks at every one (and over-refuses a ``?.``
+    nested inside the callee's own sub-expressions, the safe direction).
+    """
+    return callee is not None and any(n.type in ("optional_chain", "?.") for n in _walk(callee))
+
+
 def _parse(source: str, language: str) -> Node:
     return _parser(language).parse(source.encode("utf-8")).root_node
 

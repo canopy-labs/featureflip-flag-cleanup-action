@@ -2625,7 +2625,7 @@ def _property_argument(call: Node, prop: str) -> tuple[str | None, bool]:
 
 
 def _is_optional(call: Node, callee: Node) -> bool:
-    if any(c.type == "optional_chain" for c in callee.children):
+    if ts_syntax.chain_is_optional(callee):
         return True
     return any(c.type == "?." for c in call.children)
 

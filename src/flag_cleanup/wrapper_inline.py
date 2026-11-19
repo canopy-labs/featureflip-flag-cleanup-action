@@ -170,6 +170,8 @@ DOC_REFERENCE = "doc-reference"
 RESIDUE = "residue"
 #: The family's residue was kept, and the first reason why.
 RESIDUE_KEPT = "residue-kept"
+#: The family was deleted; only the options setting it read stays.
+RESIDUE_KEPT_OPTIONS = "residue-kept-options"
 #: A comment or document that still names a type the residue pass deleted.
 RESIDUE_PROSE = "residue-prose"
 

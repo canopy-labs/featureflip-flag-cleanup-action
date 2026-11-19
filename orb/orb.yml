@@ -133,6 +133,14 @@ commands:
           source. Set it only if no bundler, test runner, Babel plugin or
           loader in your build maps a workspace package to a different
           implementation than its source (see README, "Workspace packages").
+      flag-maps:
+        type: string
+        default: ""
+        description: >-
+          Comma-separated names of objects whose keys are flag keys
+          (`featureToggles, unleashToggles`), TypeScript and JavaScript only.
+          `<expression ending in that name>[KEY]` is then a read of the flag in a boolean
+          condition. Every object with a listed name is treated as the flag map.
       languages:
         type: string
         default: ""
@@ -317,6 +325,7 @@ commands:
             export FEATUREFLIP_SIDE_EFFECT_FREE_CALLS="<< parameters.side-effect-free-calls >>"
             export FEATUREFLIP_TEST_SETTERS="<< parameters.test-setters >>"
             export FEATUREFLIP_KEY_ALIASES="<< parameters.key-aliases >>"
+            export FEATUREFLIP_FLAG_MAPS="<< parameters.flag-maps >>"
             export FEATUREFLIP_WORKSPACE_PACKAGES="<< parameters.workspace-packages >>"
             export FEATUREFLIP_DIRECTORIES="<< parameters.directories >>"
             export FEATUREFLIP_IGNORE="<< parameters.ignore >>"
@@ -352,6 +361,7 @@ commands:
               -e FEATUREFLIP_SIDE_EFFECT_FREE_CALLS \
               -e FEATUREFLIP_TEST_SETTERS \
               -e FEATUREFLIP_KEY_ALIASES \
+              -e FEATUREFLIP_FLAG_MAPS \
               -e FEATUREFLIP_WORKSPACE_PACKAGES \
               -e FEATUREFLIP_DIRECTORIES \
               -e FEATUREFLIP_IGNORE \

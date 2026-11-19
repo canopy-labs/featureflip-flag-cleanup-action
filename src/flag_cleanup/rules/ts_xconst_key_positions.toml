@@ -12,10 +12,11 @@ name = "xconst_qualified_key_at_position"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . __KEY_POSITION__(member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
   (#eq? @key_owner "__XCONST_OWNER__")
   (#eq? @key_member "__XCONST_MEMBER__")
@@ -41,10 +42,11 @@ name = "xconst_bare_key_at_position"
 query = """(
   (call_expression
     function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-               (identifier) @sdk_fn]
+               (identifier) @sdk_fn] @sdk_callee
     arguments: (arguments
       . __KEY_POSITION__(identifier) @key_member)
   ) @call
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
   (#eq? @key_member "__XCONST_MEMBER__")
 )"""
@@ -89,12 +91,13 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments
         . (object
             (pair key: (property_identifier) @key_prop
                   value: (member_expression !optional_chain object: (identifier) @key_owner property: (property_identifier) @key_member))) @key_object .))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
   (#eq? @key_prop "__KEY_PROPERTY__")
   (#eq? @key_owner "__XCONST_OWNER__")
@@ -130,12 +133,13 @@ query = """(
   (await_expression
     (call_expression
       function: [(member_expression !optional_chain property: (property_identifier) @sdk_fn)
-                 (identifier) @sdk_fn]
+                 (identifier) @sdk_fn] @sdk_callee
       arguments: (arguments
         . (object
             (pair key: (property_identifier) @key_prop
                   value: (identifier) @key_member)) @key_object .))
   ) @await
+  (#not-match? @sdk_callee "[?][.]")
   (#eq? @sdk_fn "__ACCESSOR_TEMPLATE__")
   (#eq? @key_prop "__KEY_PROPERTY__")
   (#eq? @key_member "__XCONST_MEMBER__")

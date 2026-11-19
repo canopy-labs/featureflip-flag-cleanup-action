@@ -539,7 +539,7 @@ default.
 
 **This mode reads a narrower set of inputs than `remove` does, and getting the
 list right matters.** `api-token`, `org`, `project`, `api-url`, `directories`,
-`languages`, `accessors`, `key-aliases` and `ignore` all feed the same
+`languages`, `accessors`, `key-aliases`, `flag-maps` and `ignore` all feed the same
 transform a scheduled run uses, so a re-run configured differently regenerates a *different* pull
 request under the same title — keep this workflow's values in step with the
 one that opened the pull request. `staleness` does NOT belong on that list:
@@ -820,6 +820,7 @@ entries dropped.
 | `side-effect-free-calls` | `FEATUREFLIP_SIDE_EFFECT_FREE_CALLS` | *(none)* | Every language: comma-separated function or method names whose call does nothing you need, such as a getter that only returns your flag client (`GetClient, getClient`). When a removal leaves a call running only as a discard (`_ = getClient(p)` in Go, a bare `getClient(p);` elsewhere), a call to a listed name is deleted instead of kept, when every argument is a name, a literal or a member read. Plain names only, as for `accessors`, matched by the name the call ends in. The pull request names each call deleted this way. See [Discarded calls](#discarded-calls). In Go, a listed call is also allowed as an argument of a typed flag handle's constructor call (`NewBoolFlag("key", env.IsDevelopment())`), which deleting the handle stops running. |
 | `test-setters` | `FEATUREFLIP_TEST_SETTERS` | *(none)* | Go only: comma-separated names of the functions your tests set a flag with, such as `Set` for `featureflag.Set(orgID, Flag, true)`. A test that pins the flag being removed to the value that stays loses that line, and a test that pins it to the value that goes is deleted, the same way a mocked read is resolved. A call is touched only when it is proven: the callee is a package-level function of your repository (`Set(...)` in its own package or `pkg.Set(...)` through an import of a package of the repository, never a method; see [Go workspaces](#go-workspaces-and-modules-that-import-each-other) for an import of another module) declared with a `bool` parameter, the call is a statement of its own with exactly one argument spelling the flag's key and one `true` or `false` literal, and every other argument is a name, a member read or a literal. A test that sets the flag both ways, a setter in a `defer`, a method call and any call that is not proven are left in place, and the constant they name stays. Plain names only, as for `accessors`. |
 | `key-aliases` | `FEATUREFLIP_KEY_ALIASES` | *(none)* | `featureflip-key=code-key` entries, one per line or comma-separated, for code that spells a flag's key differently from Featureflip (`experimental-agents=experimental.agents`). The removal searches the code for the right-hand spelling; everything else about the flag keeps its Featureflip key. See "Keys spelled differently in your code" below. |
+| `flag-maps` | `FEATUREFLIP_FLAG_MAPS` | *(none)* | TypeScript and JavaScript: comma-separated names of objects whose keys are flag keys (`featureToggles, unleashToggles`), so that `state.featureToggles[KEY]` is a read of the flag where it is a boolean condition (`if`, `while`, ternary, `!`, `&&`, `||`). Every object with a listed name is treated as the flag map, so use a distinctive name; a write to it refuses the flag. |
 | `workspace-packages` | `FEATUREFLIP_WORKSPACE_PACKAGES` | `off` | TypeScript and JavaScript monorepos: `follow` follows an import of another package of your repository by name (`import { FLAG } from "@acme/flags"`) to that package's source; `off` leaves it `import-unresolved`. Set `follow` only if no bundler, test runner, Babel plugin or loader in your build maps a workspace package to a different implementation than its source. See "Workspace packages" below. Any other value fails the run (exit 2). |
 | `ignore` | `FEATUREFLIP_IGNORE` | *(none)* | Comma-separated flag keys to always skip. |
 | `flags` | `FEATUREFLIP_FLAGS` | *(none)* | Comma-separated flag keys this run may propose, as an ALLOWlist — leave unset to consider every candidate. Does not re-propose a flag that already has a pull request — to re-run against one whose pull request is already open or closed, comment `@featureflip-cleanup rerun` on it instead, see [Re-run a removal from a comment](#re-run-a-removal-from-a-comment). `ignore` wins when a key is in both. |
@@ -1725,10 +1726,81 @@ read, as for the positioned accessors above. An enum member or `as const`
 property is kept and reported, never deleted. `getFlag{key}` and a plain
 `getFlag` cannot both be listed for the same function.
 
-**A subscript read is not supported.** `state.featureToggles[OLD]` or
-`toggles["old-checkout"]` is not a call, so no accessor name reaches it, and any
-object can be subscripted. The constant stays, the subscript is listed as a
-reference that still names the flag, and the rest of the run is unaffected.
+**A subscript read is a read only for a map you name.** Any object can be
+subscripted, so nothing is guessed: `flag-maps: featureToggles, unleashToggles`
+makes `<expression ending in that name>[KEY]` a read of the flag
+(`state.featureToggles[KEY]`, `props.featureToggles[KEY]`, `unleashToggles[KEY]`),
+when `KEY` is the key as a string literal or a constant of the same file.
+
+**Every object with a listed name, in every file and scope, is treated as the
+flag map.** Nothing can tell your flag map from another object that happens to
+share its name (a CLI's parsed `flags`, a form's `toggles`), so list a
+distinctive name, not `flags`.
+
+The read is folded only where it is a boolean condition: the condition of an
+`if`, a `while` or a ternary (`cond ? a : b`), the operand of `!`, and an
+operand of `&&` or `||` that is itself in one of those positions (nested up to
+three `&&`/`||` deep, one pair of parentheses around the whole allowed). Every
+other position is left as written: `const on = toggles[KEY]`, `toggles[KEY] ===
+'on'`, an object property, an argument, a `return`, and a read through `?.`, a
+call (`getToggles().featureToggles[KEY]`) or a name that merely contains the
+listed one. A constant whose every reference is a folded read is deleted with
+them; one still read in a left-over position is kept.
+
+**The flag is refused, naming the file and line, when the key is spelled
+anywhere else.** A fold is only sound if nothing else writes the flag into the
+map, and a write has to spell the key somewhere. So a run with at least one
+folded read checks the WHOLE checkout (the git root of every entry in
+`directories`, whatever `directories` and `languages` say), once, after every
+language pass has run:
+
+* any file that still holds the key refuses the flag (`[unsafe-rewrite]`), and
+  every pass's changes are rolled back. The key counts however it is spelled:
+  raw, or with `\xHH`, `\uHHHH`, `\u{H}`, octal, HTML numeric entities,
+  `&hyphen;`/`&dash;` or `%HH` escapes written out. The files looked at are the
+  ones git lists in the checkout, submodules included (tracked and untracked,
+  not gitignored: build output that cannot ship does not count; a tracked
+  `node_modules` does); outside a git checkout, every file but `.git` and
+  `node_modules`. Symlinks, FIFOs and devices are never followed,
+  and a file that cannot be read refuses the flag by name. The only files
+  allowed to mention the key are `.md` and `.rst` documents, extension-less
+  `CHANGELOG`, `LICENSE`, `LICENCE` and `COPYING` files (unless they start
+  with `#!`), and the key as an item of the `flags` input of a step that uses
+  this Action (`canopy-labs/featureflip-flag-cleanup-action`, matched exactly)
+  in a `.github/workflows` file with no YAML anchor or alias. That exemption is
+  for GitHub Actions workflows only: a key named in GitLab CI or CircleCI
+  config refuses the flag, which is safe, and support for those is a follow-up. `.txt` and `.mdx` are not exempt
+  (override lists load at runtime), and neither is every other file type,
+  known or not (`.yml`, `.py`, `.gts`, `.erb`, `.json`, `.vue`, `.svelte`);
+* a read in a position that is not folded (`const on = toggles[KEY]`) leaves the
+  key behind, so it refuses the flag too.
+
+Before anything is rewritten the same checkout is also searched for the
+spellings that explain a refusal best: the key as the target of an assignment,
+`++`, `delete` or a destructuring target, as an object property, a `Map` entry
+or an argument of `.set`, `Reflect.*`, `Object.defineProperty` or
+`Object.assign`, and a write to a listed map (or an alias of it,
+`const t = toggles`) whose index is not a string literal or a constant of a
+known value (`toggles['a' + 'b'] = …`, `toggles[parts.join('-')] = …`,
+`toggles[k] = …`).
+
+**A map written through a dynamic key anywhere is never eligible.** A Redux
+reducer such as `state.featureToggles[action.key] = action.value` may write the
+flag whatever its key is, so the run refuses the flag when it finds one.
+
+**What this cannot see:** a key built from pieces at runtime and never spelled
+whole anywhere (a template, a concatenation or a join that reaches the map by a
+route other than a direct write to it, such as a computed key in an object that
+is later copied into the map), and the by-name matching above (another object
+with a listed name is treated as the flag map). Use a distinctive name. The
+check reads only the files in the checkout, so it also cannot see a map filled
+at runtime from outside the repository (an environment variable, a URL, browser
+storage or a server-rendered bootstrap), or a file left out of a sparse
+checkout.
+
+**Not handled yet:** a constant declared in another file, a
+`?? DEFAULTS[KEY]` default after an optional read, and a defaults object's
+entry (`{ [KEY]: false }`). Those are left exactly as before.
 
 **A wrapper that takes the key indirectly cannot be reached this way.** If your
 wrapper is called as `useFlag(FLAGS.oldCheckout)` or `flags.oldCheckout()`, the
@@ -2096,7 +2168,15 @@ are plain names, so the rows can feed the fake and the expected value. Its
 title must be the file's only one of that name, and neither it nor a suite
 around it may be focused (`it.only`, `fit`, `fdescribe`, `describe.only`):
 deleting a focused test changes which tests run. A skipped one (`it.skip`,
-`xit`, `describe.skip`, `xdescribe`) never runs, and is deleted like any other. In plain JavaScript a function
+`xit`, `describe.skip`, `xdescribe`) never runs, and is deleted like any other.
+A factory's members tested generically, `describe.each(['isA', 'isB'])('%s',
+(method) => { ... buildFlags(fake)[method](...) ... })` (also `it.each` and
+`test.each`), lose the row naming the removed member, and the whole block goes
+when it was the only row. That needs a top-level call with no modifier, a
+literal array of plain strings as the table, one plain parameter that is used
+only as `<factory call or const holding one>[method](...)`, and no call in the
+body other than the factory, those subscript calls, `expect(...)` and
+`vi.fn()`/`jest.fn()` stubs. Any other shape keeps the member. In plain JavaScript a function
 wrapper's own test does not reach this rule yet: its call is refused first,
 while the run decides whether the read may return a Promise (see "A
 TypeScript or JavaScript accessor that may return a Promise keeps its type"
@@ -3997,6 +4077,48 @@ other titles and comments is listed on its own, under "name this flag only in
 test titles", so you can reword the rest. Any other
 string keeps the entry, even in a test, because fixture data that borrows the
 key can still reach a lookup by key.
+
+**In JavaScript and TypeScript a table's entry is deleted only when every use of
+the table is a literal read.** It starts with its own file: `const flags = { look: true, other: false }`
+loses its `look` entry only when every mention of `flags` in that file is the
+declaration, `flags.name`, or `flags['name']` / `flags[NAME]` with a top-level
+`const` string that nothing else in the file rebinds (and no such key is a member
+every object has, such as `valueOf`). The table itself may hold only plain
+`key: literal` pairs: a method, getter, spread, computed key or a value that is
+not a literal could read the table through `this`, so it keeps every entry. A key held in a variable or a parameter, the table passed on,
+aliased, spread, enumerated (`Object.entries`), tested with `in`, read through
+`Reflect`, nested in another object, held in a class field, a parameter default,
+a ternary or a call, a default export, a table in a script file (no `import` or
+`export`) or a file that uses `eval`, `Function` or `with` keeps its entry. An
+exported table is also checked in the files that load it. Every module that can
+load the declaring file (a relative import, a tsconfig path alias, a workspace
+package, a re-export or `export *` through a barrel, `require('./x')`, a Vue,
+Svelte, Astro or MDX script block) is found with the same resolver the other
+cross-file passes use, and it must read the table only as `name.literal`,
+`name['literal']` or `name[NAME]` with a `const` string (through a namespace
+import, only `ns.name.literal`; a default import counts only when the module
+hands the table on as its default). This has a cost anywhere in the repository,
+not only near the table: a relative import the resolver cannot map (a
+React Native `.ios` file, a directory `main`) or a bare import that no
+`package.json` above the reader declares with a version holds every exported
+table, because either could be an alias or a build step that reaches the table.
+So does any use of `require` other than `require('literal')`, any `import()`
+that is not a single string, `import.meta` members other than `env`, `url`,
+`hot`, `dirname` and `filename`, `module.require`, `System.import`,
+`__non_webpack_require__`, `createRequire`, the name `System` and any use of the
+identifier `module` other than `module.exports` (a string subscript such as
+`module['require']` counts), an import of `module` or `node:module`, a relative
+import of a component file (`.vue`, `.svelte`, `.astro`, `.mdx`), a
+`package.json` with an object-valued `browser` or `react-native` field, an
+`imports` field, or an `exports` value naming the module's file, and any text
+file in the repository (other than prose such as `.md`, and lockfiles) that
+names the module's file or package, or that contains `import(`, `require(` or
+`import.meta`. A key written with an escape sequence (`'\x6cook'`) is never
+treated as a literal. The only objects whose entry goes without a binding are the literals a
+test file hands straight to a call, a JSX attribute or an array. A test file is
+decided by its path (`*.test.*`, `*.spec.*`, `__tests__/`), and never one with
+`import.meta.vitest`. The rest of the removal still ships, and the pull request
+lists the table under "deliberately left in place".
 
 That covers the registry line, a test's override property, and a type alias or
 inline object type beside it (`type Overrides = { 'old-checkout'?: boolean }`)
@@ -6044,6 +6166,13 @@ block (an unbraced `if` body, a labelled loop, a `switch` arm) are not
 rewritten, and the flag is **refused** instead of opening a pull request your
 lint fails. As with unreachable statements, a file that already had a dead
 loop is left alone. See [Known gaps](#known-gaps).
+
+A boolean literal the fold leaves anywhere in an `if`, `while`, `do`, `for` or
+ternary condition (template literals included), however it is wrapped (`!(ready() || <read>)`,
+`(track(), <read>)`, `(on = <read>)`), is refused rather than shipped with
+failing `no-constant-condition` lint. Conditions are paired by their text, so
+the code's own `if (x.debug === true)` cannot hide one the fold changed;
+`while (true)` is allowed.
 
 The same goes for a condition the read leaves decided by a literal, such as
 `if (path !== "/health" && <read>)` served **false**, or `|| <read>` served
@@ -8433,6 +8562,23 @@ means no PR.
 
 ### Known gaps
 
+* **A loader spelled through a computed subscript is not seen.** The check for
+  other modules that load an exported TypeScript or JavaScript flag table holds
+  on the names `require`, `createRequire` and the like, and on a string
+  subscript that spells them, but not on one assembled at run time
+  (`globalThis['req' + 'uire']`).
+* **A string-valued `browser` or `module` field in `package.json` is not
+  followed.** Such a field points a bundler at a different entry file for the
+  package, and the exported-table check does not read where it points; an object
+  `browser` or `react-native` field, an `imports` field and an `exports` value
+  naming the table's file do hold.
+* **An exported TypeScript or JavaScript flag table can lose an entry that a
+  bundler alias still reads.** The check for other modules that load the table
+  follows imports the resolver can map and holds on anything it cannot. It does
+  not see a bundler or test-runner alias that redirects a package name your
+  `package.json` declares to local code, when that alias is written in a file
+  whose name does not contain `config` or `workspace`. Such a redirected import
+  reads the table through a module this run takes for an external package.
 * **A TypeScript or JavaScript file whose code holds the same string both as
   a directive and as an ordinary statement is refused whenever the removal
   rewrites it.** For example, a legacy `var x; 'use strict';` (an ordinary
@@ -8752,10 +8898,28 @@ means no PR.
   run kept (`k=true` for `true`, `k=false` for `false`), next to another such
   item, not the last one left. Each cut is listed among the reworded comments.
 
+  **A count of two flags is cut down to the other flag.** In C# and in the
+  TypeScript family, a comment that says `BOTH <flag> and <other> are on` (or
+  `<flag> and <other> are both on`, also `enabled`, `true`, `live` or `active`)
+  becomes `<other> is on`, wherever it sits in a sentence and even when the
+  sentence wraps onto the next comment line. The count must name exactly two
+  things (a list such as `a, b and k` is left alone), one of them the removed
+  key and the other exactly one of the project's flag keys; `on` must not
+  continue as `on-call`, and the flag must have been served `true`. Otherwise
+  the comment is left as it is.
+
   On cause 1 specifically: Ruby views (`.erb`), the TypeScript module suffixes
   (`.mts`, `.cts`), Kotlin scripts (`.kts`), Rake tasks (`.rake`) and Swift
   (`.swift`) were each an uncovered extension once and are now processed
   normally.
+
+  **C# doc comments that count gates are listed.** When a run edits a C# member
+  (removes a parameter, an argument or a test row) and the doc comment above it
+  says `both gates`, `either flag`, `each gate`, `neither toggle` or `two
+  gates`, the pull request lists the member and the sentence. One gate fewer
+  decides the behaviour now, so the count may be wrong, and the comment is never
+  edited. A `[Theory]` the run turned into a `[Fact]` is listed with a note when
+  its name holds a counting word (`Either`, `Both`, `Each`, `Two`, `Gates`).
 
   **One set of directories is exempt from the naming entirely:** `dist/`,
   `build/`, `out/`, `coverage/`, `.next/`, `.nuxt/`, `.output/`, `.svelte-kit/`
@@ -9103,9 +9267,13 @@ means no PR.
   Piranha bundles its own parser, and a file it cannot parse makes it abort
   before any rule runs. Such files are **quarantined**: they are left untouched,
   the rest of the flag's files are still cleaned, and the pull request lists them
-  under "still reference this flag" so nobody merges it
+  under "still reference this flag", and again in a block of their own naming the
+  reason `unparseable`, so nobody merges it
   believing the flag is gone. Only when *every* candidate file is unparseable
-  does the flag report `[engine-error]` and exit `1`. Confirmed cases: a
+  does the flag report `[engine-error]` and exit `1`. A file that **declares** a
+  key constant for the flag cannot be withheld, because reads of that constant in
+  other files depend on it: the flag is refused (`[engine-error]`, naming the
+  file) and nothing is written. Confirmed cases: a
   type-level `import()` inside type arguments
   (`importOriginal<typeof import('./x')>()`), and JSX in a `.ts` file — the
   latter correctly, since `tsc` rejects it too. TC39 auto-accessors

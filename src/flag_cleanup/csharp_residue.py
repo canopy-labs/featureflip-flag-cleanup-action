@@ -119,6 +119,8 @@ class Kept(Exception):
         #: The other proofs that failed beside this one, so the report lists
         #: every leftover a reviewer would have to remove, not the first.
         self.also: tuple[Kept, ...] = ()
+        #: Raised by the options tier, after the family itself was deleted.
+        self.options = False
 
 
 @dataclass(frozen=True)
@@ -2178,6 +2180,7 @@ def prove(
         options = _options_tier(wrapper, residue, targets, repo_dir)
     except Kept as kept:
         options = None
+        kept.options = True
         residue.kept.append(kept)
     usings: list[tuple[str, int, int, int]] | None = None
     if options is not None:
@@ -2186,6 +2189,7 @@ def prove(
         except Kept as kept:
             # Only the options class can be what empties it now: the
             # family is checked alone below.
+            kept.options = True
             residue.kept.append(kept)
             options = None
     if usings is None:
@@ -2535,7 +2539,10 @@ def remove(
             for path, line, text in residue.rows
         ]
         rows += [
-            wi.Finding(kept.path or wrapper.path, kept.line, wi.RESIDUE_KEPT, kept.reason, wrapper.label)
+            wi.Finding(
+                kept.path or wrapper.path, kept.line,
+                wi.RESIDUE_KEPT_OPTIONS if kept.options else wi.RESIDUE_KEPT, kept.reason, wrapper.label,
+            )
             for kept in residue.kept
         ]
         rows += [
@@ -3999,7 +4006,11 @@ def _config_keys(
     read by something this run does not delete."""
     from flag_cleanup import csharp_family
 
-    declared = _repository_methods(repo_dir, _BINDING_MEMBERS, _GENERIC_BINDERS)
+    binding_files = {str(Path(b).resolve()) for b in bindings}
+    declared = _repository_methods(
+        repo_dir, _BINDING_MEMBERS, _GENERIC_BINDERS,
+        could_bind=lambda node, at: _could_be_the_binding(node, at, binding_files, repo_dir),
+    )
     if declared is not None:
         raise Kept(
             declared[0], declared[1],
@@ -4114,12 +4125,50 @@ def _extension(method: Node) -> bool:
     return bool(listed) and any(c.type == "modifier" and _text(c) == "this" for c in listed[0].children)
 
 
+def _could_be_the_binding(method: Node, path: str, binding_files: set[str], repo_dir: str = "") -> bool:
+    """Whether the declaration ``method`` of ``path`` could be what a binding
+    call (``services.Configure<O>(…)``, ``.Bind(section)``) resolves to
+    instead of the framework's. Everything may be, except a method that is
+    private: declared ``private``, or with no access modifier inside a class,
+    struct or record (never an interface, whose members are public), that is no
+    extension method and sits in a file with no binding call. A local function
+    is private to its own method and counts the same way. A ``partial`` type
+    is one type: a binding call in ANY of its parts reaches the method, and a
+    part this cannot find or read counts as one."""
+    if method.type == "method_declaration":
+        if _extension(method):
+            return True
+        owner = method.parent.parent if method.parent is not None else None
+        modifiers = ctor_param_csharp._modifiers(method)
+        access = modifiers & {"public", "protected", "internal", "private"}
+        if "private" in access and access != {"private"}:
+            return True  # `private protected`
+        if access != {"private"} and not (
+            not access and owner is not None and owner.type in ("class_declaration", "struct_declaration", "record_declaration")
+        ):
+            return True
+    elif method.type != "local_function_statement":
+        return True
+    if path in binding_files:
+        return True
+    owner = method.parent.parent if method.parent is not None else None
+    if owner is not None and "partial" in ctor_param_csharp._modifiers(owner):
+        name = owner.child_by_field_name("name")
+        index = xcs.csharp_index(repo_dir)
+        spelled = _text(name) if name is not None else ""
+        if not spelled or index.unreadable or index.spelled_where_unparsed(spelled):
+            return True
+        return any(info.path in binding_files for info in index.by_last.get(spelled, ()))
+    return False
+
+
 def _repository_methods(
     repo_dir: str,
     names: frozenset[str],
     generic_only: frozenset[str] = frozenset(),
     vendored: tuple[str, ...] = (),
     extensions_only: bool = False,
+    could_bind: Callable[[Node, str], bool] | None = None,
 ) -> tuple[str, int, str] | None:
     """``(path, line, name)`` of a method the repository declares under one
     of ``names``: an extension method of that name could be what a call
@@ -4150,6 +4199,8 @@ def _repository_methods(
                 if namespace in _FRAMEWORK_NAMESPACES or namespace.startswith(("Microsoft.Extensions.", *vendored)):
                     continue  # the framework's own, vendored or stubbed
                 if extensions_only and not _extension(node):
+                    continue
+                if could_bind is not None and not could_bind(node, source.resolved):
                     continue
                 if _text(name) in generic_only and not any(c.type == "type_parameter_list" for c in node.children):
                     continue  # `x.Name<T>(…)` binds only to a generic method

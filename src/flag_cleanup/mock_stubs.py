@@ -142,6 +142,10 @@ FALSE_TITLE = "false title"
 #: ``[Fact]`` with each parameter's value written where it was read; carries
 #: the test's name and the values.
 THEORY_FACT = "theory made a fact"
+#: A doc comment on a member the run edited that counts gates (``both``,
+#: ``either``, ``each gate``, ``two gates``), which one fewer may have made
+#: wrong; reported, never edited. Carries ``member: "the sentence"``.
+COUNT_WORD = "counts gates"
 #: A kept C# test whose name held the removed gate's kept state as a part of
 #: its own (``…_GateOn_…``), renamed without it; carries ``old\nnew``.
 RENAMED_METHOD = "renamed test method"
@@ -2254,6 +2258,16 @@ def resolve(
     if profile is None:
         return source, []
     if wrapper is not None and language in _TS_LANGUAGES:
+        from flag_cleanup import ts_member_rows
+
+        scopes = frozenset(s for s, r in wrapper.siblings if r == ts_member_rows.EACH)
+        if scopes:
+            # `describe.each([...names])`: the rows of the removed members.
+            source, cut = ts_member_rows.cut(source, language, frozenset(wrapper.names), scopes)
+            rest = replace(wrapper, siblings=frozenset(p for p in wrapper.siblings if p[1] != ts_member_rows.EACH))
+            resolved, removed = _resolve_ts_wrappers(source, language, treatment, rest, targets or {})
+            rows = [Removal(OWN_TEST, f"{t} (row {n})" if n else t) for t, n in cut if n or not any(x == t and y for x, y in cut)]
+            return resolved, rows + removed
         return _resolve_ts_wrappers(source, language, treatment, wrapper, targets or {})
     if wrapper is not None and language == "ruby":
         return _resolve_ruby_wrappers(source, language, treatment, wrapper, targets or {})

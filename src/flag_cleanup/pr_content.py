@@ -54,6 +54,7 @@ from flag_cleanup.mock_stubs import (
     TEST_PHASE,
     TEST_ROWS,
     THEORY_FACT,
+    COUNT_WORD,
 )
 from flag_cleanup.residue import Residue
 from flag_cleanup.inert_load import DECLARED_LOAD
@@ -2286,6 +2287,7 @@ def pr_body(
     rebuilt = [(path, text) for path, kind, text in test_doubles if kind == REBUILT]
     false_titles = [(path, text) for path, kind, text in test_doubles if kind == FALSE_TITLE]
     facts = [(path, text) for path, kind, text in test_doubles if kind == THEORY_FACT]
+    counts = [(path, text) for path, kind, text in test_doubles if kind == COUNT_WORD]
     renamed_methods = [
         (path, *[*text.split("\n", 2), ""][:3]) for path, kind, text in test_doubles if kind == RENAMED_METHOD and "\n" in text
     ]
@@ -2415,6 +2417,18 @@ def pr_body(
             "was read:",
             ">",
             *[f"> - {_md_code(path)} — {_one_line(text)}" for path, text in facts[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
+    if counts:
+        count = len(counts)
+        lines += [
+            f"> **{count} doc comment{'' if count == 1 else 's'} on edited members "
+            f"count{'s' if count == 1 else ''} gates: reword {'it' if count == 1 else 'them'}.** "
+            "One gate fewer decides the behaviour now, so \"both\", \"either\" and \"two\" may no "
+            "longer be true:",
+            ">",
+            *[f"> - {_md_code(path)} — {_one_line(text)}" for path, text in counts[:20]],
             *([f"> - ...and {count - 20} more"] if count > 20 else []),
             "",
         ]
@@ -2681,6 +2695,24 @@ def pr_body(
     wrappers = without_inlined(wrappers, wrapper_findings)
     if wrappers:
         lines += _constant_wrapper_lines(wrappers)
+    # Quarantined files first: they have their own reason and their own block.
+    unparseable = tuple(row for row in left_in_place if row[1].startswith("unparseable:"))
+    left_in_place = tuple(row for row in left_in_place if not row[1].startswith("unparseable:"))
+    if unparseable:
+        count = len(unparseable)
+        lines += [
+            f"> **⚠️ {count} file{'' if count == 1 else 's'} could not be parsed "
+            "(`unparseable`).** The transform engine does not read "
+            f"{'it' if count == 1 else 'them'}, so "
+            f"{'it was' if count == 1 else 'they were'} left exactly as "
+            f"{'it was' if count == 1 else 'they were'}, and any read of this "
+            "flag in them is still there. The rest of the flag was removed. "
+            "Fix the syntax the engine rejects, or change them by hand:",
+            ">",
+            *[f"> - {_md_code(path)}" for path, _reason in unparseable[:20]],
+            *([f"> - ...and {count - 20} more"] if count > 20 else []),
+            "",
+        ]
     if left_in_place:
         count = len(left_in_place)
         lines += [
@@ -2709,7 +2741,7 @@ _WRAPPER_STATUSES = ("complete", "partial")
 #: wrapper, a doc comment's reference to it rewritten to plain text, and what
 #: the C# residue pass did with what the family left behind. Grouped with
 #: the refusals, and told apart from them on rendering.
-_WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-prose")
+_WRAPPER_NOTES = ("sibling", "shared", "doc-reference", "residue", "residue-kept", "residue-kept-options", "residue-prose")
 #: The ``test_doubles`` kind of an assertion the fold made trivially true and
 #: the engine deleted (``piranha_runner.TRIVIAL_ASSERTION``): listed apart
 #: from the mock lines, since it neither stubbed nor verified anything.
@@ -2717,7 +2749,7 @@ _TRIVIAL_ASSERTION = "assertion"
 #: Test-double removal kinds that are not a mock line.
 _NOT_MOCK_LINES = (
     TEST, SETTER_TEST, SIBLING_TEST, OWN_TEST, EMPTIED_SUITE, PINNED_PARAMETER, TEST_PHASE, TEST_ROWS, REBUILT, FLAG_VALUE_ASSERTION,
-    FALSE_TITLE, THEORY_FACT, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST, FOLDED_TEST,
+    FALSE_TITLE, THEORY_FACT, COUNT_WORD, RENAMED_METHOD, GATE_NAMED, DUPLICATE_TEST, FOLDED_TEST,
 )
 
 
@@ -2874,6 +2906,13 @@ def _residue_lines(notes: list[tuple[str, int, str, str, str]]) -> list[str]:
             "parameters taking the interface build as they are), because:"
         )
         lines += [f">   - {_md_code(f'{p}:{n}')} — {_one_line(t)}" for p, n, _, t, _ in kept]
+    kept_options = [r for r in notes if r[2] == "residue-kept-options"]
+    if kept_options:
+        lines.append(
+            ">   The options setting the family read was kept (its class property and "
+            "configuration keys), because:"
+        )
+        lines += [f">   - {_md_code(f'{p}:{n}')} — {_one_line(t)}" for p, n, _, t, _ in kept_options]
     prose = [r for r in notes if r[2] == "residue-prose"]
     if prose:
         lines.append(">   Comments and documents still naming a type this deleted (the prose may be stale):")
@@ -2917,7 +2956,7 @@ def note_wrapper_findings(findings: tuple[tuple[str, int, str, str, str], ...]) 
                     "%s: residue removed: %s", label,
                     "; ".join(f"{p}:{n} {_one_line(t)}" for p, n, _, t, _ in removed),
                 )
-            for p, n, _, t, _ in (r for r in notes if r[2] == "residue-kept"):
+            for p, n, _, t, _ in (r for r in notes if r[2] in ("residue-kept", "residue-kept-options")):
                 logger.warning("%s: residue kept at %s:%d: %s", label, p, n, _one_line(t))
         else:
             logger.warning(
@@ -3143,6 +3182,7 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
     rebuilt = [(p, t) for p, kind, t in test_doubles if kind == REBUILT]
     false_titles = [(p, t) for p, kind, t in test_doubles if kind == FALSE_TITLE]
     facts = [(p, t) for p, kind, t in test_doubles if kind == THEORY_FACT]
+    counts = [(p, t) for p, kind, t in test_doubles if kind == COUNT_WORD]
     renamed = [(p, t) for p, kind, t in test_doubles if kind == RENAMED_METHOD]
     gate_named = [(p, t) for p, kind, t in test_doubles if kind == GATE_NAMED]
     duplicates = [(p, t) for p, kind, t in test_doubles if kind == DUPLICATE_TEST]
@@ -3174,6 +3214,13 @@ def note_family_doubles(test_doubles: tuple[tuple[str, str, str], ...]) -> None:
             len(facts),
             "" if len(facts) == 1 else "s",
             "; ".join(f"{p}: {_one_line(t)}" for p, t in facts),
+        )
+    if counts:
+        logger.warning(
+            "%d doc comment%s on edited members count gates: %s",
+            len(counts),
+            "" if len(counts) == 1 else "s",
+            "; ".join(f"{p}: {_one_line(t)}" for p, t in counts),
         )
     if renamed:
         logger.warning(

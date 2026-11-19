@@ -148,6 +148,101 @@ def constant_condition_logicals(source: str, language: str) -> int:
     return count
 
 
+_FUNCTION_NODES = ("function_expression", "arrow_function", "function_declaration", "generator_function")
+
+_CONDITION_PARENTS = {
+    "if_statement": "condition",
+    "while_statement": "condition",
+    "do_statement": "condition",
+    "for_statement": "condition",
+    "ternary_expression": "condition",
+}
+
+
+def _conditions(source: str, language: str) -> list[tuple[str, int]]:
+    """``(whitespace-normalised text, bare boolean literals)`` of every condition.
+
+    Conditions are if, while, do, for and ternary tests. A bare ``while (true)``
+    is left out: ``no-constant-condition`` allows it, and it is what the true
+    treatment leaves of ``while (<read>)``.
+    """
+    found: list[tuple[str, int]] = []
+    for node in _walk(_parse(source, language)):
+        field = _CONDITION_PARENTS.get(node.type)
+        if field is None:
+            continue
+        condition = node.child_by_field_name(field)
+        if condition is None:
+            continue
+        if node.type == "while_statement" and _condition_literal(node) == "true":
+            continue
+        text = " ".join(condition.text.decode("utf-8", "replace").split())
+        found.append((text, _bare_literals(condition)))
+    return found
+
+
+#: Where a literal is data, not part of the condition's own logic: a call's
+#: arguments (the `false` default of a read the fold replaced whole), an
+#: object or array, a function body, a ``yield``.
+_OPAQUE = frozenset(
+    {"arguments", "object", "array", "class_body", "statement_block", "yield_expression", *_FUNCTION_NODES}
+)
+
+
+def _compared_with_a_value(literal: Node) -> bool:
+    """``true === other``: a literal compared with a value that is unknown at
+    lint time (a name other than ``undefined``, a member, a call, ``new``,
+    ``await`` or ``this``), which is not constant. Anything the linter can decide
+    (``true !== void 0``, ``true === (() => 1)``) still counts."""
+    parent = literal.parent
+    if parent is None or parent.type != "binary_expression":
+        return False
+    operator = parent.child_by_field_name("operator")
+    if operator is None or operator.type not in ("===", "!==", "==", "!="):
+        return False
+    other = parent.child_by_field_name("right") if parent.child_by_field_name("left") == literal else parent.child_by_field_name("left")
+    while other is not None and other.type == "parenthesized_expression" and len(other.named_children) == 1:
+        other = other.named_children[0]
+    if other is None:
+        return False
+    if other.type == "identifier":
+        return other.text.decode("utf-8", "replace") != "undefined"
+    return other.type in ("member_expression", "subscript_expression", "call_expression", "new_expression", "await_expression", "this")
+
+
+def _bare_literals(condition: Node) -> int:
+    count = 0
+    stack = [condition]
+    while stack:
+        node = stack.pop()
+        if node.type in ("true", "false") and not _compared_with_a_value(node):
+            count += 1
+        if node.type in _OPAQUE and node is not condition:
+            continue
+        stack.extend(node.children)
+    return count
+
+
+def condition_literals_grew(before: str, after: str, language: str) -> bool:
+    """Whether ``after`` has a condition holding a bare boolean literal whose
+    text no condition of ``before`` has (each partner used once).
+
+    Paired by TEXT, so the customer's own ``if (x.debug === true)`` matches
+    itself and cannot mask a literal the fold left in another condition.
+    """
+    partners: dict[str, int] = {}
+    for text, _count in _conditions(before, language):
+        partners[text] = partners.get(text, 0) + 1
+    for text, count in _conditions(after, language):
+        if count == 0:
+            continue
+        if partners.get(text, 0) > 0:
+            partners[text] -= 1
+            continue
+        return True
+    return False
+
+
 def literal_statements(source: str, language: str) -> int:
     """Expression statements that are only a boolean literal (``false;``),
     parentheses looked through: a discarded flag read the engine folded but
@@ -172,8 +267,7 @@ def _constant_truth(condition: Node | None) -> bool | None:
     Mirrors what ``no-constant-condition`` reports in a condition: a literal,
     and a ``&&``/``||`` one of whose operands is the literal that decides it
     (``x && false`` is falsy, ``x || true`` truthy, whatever ``x`` is, and
-    ``true && x`` is ``x``). Parentheses are looked through. ``!false`` is not
-    counted: the engine always folds it, so it never reaches here.
+    ``true && x`` is ``x``). Parentheses are looked through. ``!`` is looked through: ``!(x || true)`` is constant too.
     """
     node = condition
     while node is not None and node.type == "parenthesized_expression":
@@ -183,6 +277,21 @@ def _constant_truth(condition: Node | None) -> bool | None:
         return None
     if node.type in ("true", "false"):
         return node.type == "true"
+    if node.type == "unary_expression":
+        # ``!`` negates whatever its operand decides, however deep the
+        # parentheses and nested ``!`` go (``!(x || true)`` is always false);
+        # ``void`` is always falsy and ``typeof`` always truthy (a string).
+        unary = node.child_by_field_name("operator")
+        if unary is None:
+            return None
+        if unary.type == "void":
+            return False
+        if unary.type == "typeof":
+            return True
+        if unary.type != "!":
+            return None
+        decided = _constant_truth(node.child_by_field_name("argument"))
+        return None if decided is None else not decided
     if node.type != "binary_expression":
         return None
     operator = node.child_by_field_name("operator")

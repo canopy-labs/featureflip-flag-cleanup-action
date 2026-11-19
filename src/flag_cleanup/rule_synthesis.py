@@ -460,6 +460,55 @@ def with_accessors(
     return block.rstrip("\n") + "\n" + rule + "# END GENERATED\n" + rule + "\n" + tail
 
 
+#: A ``[[rules]]`` block carrying this is the template for a read of a flag MAP
+#: (``flags[KEY]``), cloned once per name in the ``flag-maps`` input with
+#: ``__FLAG_MAP__`` replaced by the name.
+_FLAG_MAP_MARKER = re.compile(r"^#\s*accessor-template:\s*flag-map\b", re.MULTILINE)
+_FLAG_MAP = "__FLAG_MAP__"
+
+
+def with_flag_maps(
+    rules_text: str,
+    flag_maps: tuple[str, ...],
+    templates_text: str | None,
+    *,
+    before_trailing_rules: bool = False,
+) -> str:
+    """``rules_text`` plus one clone of each ``flag-map`` template per name.
+
+    Only a source with such blocks clones anything (the TypeScript family's
+    ``*_key_positions.toml``); every other returns ``rules_text`` unchanged, as
+    does an empty ``flag_maps``. ``before_trailing_rules`` lands the clones
+    before a const file's callee-agnostic declaration delete, for the reason
+    :func:`with_accessors` gives.
+    """
+    if not flag_maps or not templates_text:
+        return rules_text
+    templates = [b for b in _split_blocks(templates_text)[1:] if _FLAG_MAP_MARKER.search(b)]
+    if not templates:
+        return rules_text
+    generated = []
+    for index, name in enumerate(flag_maps):
+        for template in templates:
+            clone = template.replace(_FLAG_MAP, name)
+            clone = re.sub(
+                r'^name = "(.*)"$', rf'name = "generated__flag_map_{index}__\1"', clone, count=1, flags=re.MULTILINE
+            )
+            generated.append(_trim_trailing_commentary(clone))
+    rule = "# " + "=" * 73 + "\n"
+    banner = (
+        "\n" + rule
+        + "# GENERATED at run time from the flag-map templates, one per name in the\n"
+          "# `flag-maps` input. Not checked in, and not editable: change the input.\n"
+        + rule
+    )
+    head, tail = _split_at_last_seed(rules_text) if before_trailing_rules else (rules_text, "")
+    block = head.rstrip("\n") + "\n" + banner + "\n" + "\n".join(generated)
+    if not tail:
+        return block
+    return block.rstrip("\n") + "\n" + rule + "# END GENERATED\n" + rule + "\n" + tail
+
+
 def _split_at_last_seed(rules_text: str) -> tuple[str, str]:
     """``rules_text`` cut just after its last callee-pinned rule.
 

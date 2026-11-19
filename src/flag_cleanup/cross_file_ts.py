@@ -1858,9 +1858,7 @@ def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = Tr
     if function is None:
         return False
     if function.type == "member_expression":
-        if function.child_by_field_name("optional_chain") is not None:
-            return False
-        if any(c.type == "?." for c in function.children):
+        if ts_syntax.chain_is_optional(function):
             return False
         function = function.child_by_field_name("property")
     if function is None or function.type not in ("identifier", "property_identifier"):
@@ -1963,6 +1961,29 @@ def _member_of(node: Node) -> Node | None:
     return parent
 
 
+#: Members every plain object answers, whatever the module exports. A CommonJS
+#: module object is one, so ``m.valueOf()`` hands it straight back, and
+#: ``m.hasOwnProperty``, ``m.constructor`` and ``m.__proto__`` reach it or its
+#: prototype too. A whole module followed as ``m.<export>`` must treat any of
+#: these as handing the module on, not as "another export".
+_OBJECT_MEMBERS = frozenset(
+    {
+        "valueOf",
+        "toString",
+        "toLocaleString",
+        "hasOwnProperty",
+        "isPrototypeOf",
+        "propertyIsEnumerable",
+        "constructor",
+        "__proto__",
+        "__defineGetter__",
+        "__defineSetter__",
+        "__lookupGetter__",
+        "__lookupSetter__",
+    }
+)
+
+
 def _hands_on_member(member: Node) -> bool:
     """Whether the access ``member`` hands on only the member's value.
 
@@ -2034,7 +2055,7 @@ def _is_plain_member(node: Node) -> bool:
     )
 
 
-def package_outside(reader_path: str, specifier: str, repo_dir: str) -> bool:
+def package_outside(reader_path: str, specifier: str, repo_dir: str, *, declared_only: bool = False) -> bool:
     """Whether bare ``specifier``, which resolves to no file, names a package
     that cannot be a file of the checkout, so an ``export *`` from it supplies
     none of this run's constants.
@@ -2050,7 +2071,9 @@ def package_outside(reader_path: str, specifier: str, repo_dir: str) -> bool:
     * it is a Node built-in, or declared in a ``package.json`` above the reader
       by a version (not ``file:``/``link:``/``portal:``/``workspace:``) or
       installed in a ``node_modules`` above it as a real directory (a symlink
-      into the checkout is a workspace link).
+      into the checkout is a workspace link). ``declared_only=True`` keeps
+      only the declaration: an install alone proves nothing, since a bundler
+      config nobody here reads can alias an installed name.
     """
     import json
 
@@ -2087,6 +2110,7 @@ def package_outside(reader_path: str, specifier: str, repo_dir: str) -> bool:
         return False
     directory = Path(reader_path).resolve().parent
     installed = False
+    declared = False
     while True:
         linked = directory / "node_modules" / package
         if linked.exists():
@@ -2109,8 +2133,9 @@ def package_outside(reader_path: str, specifier: str, repo_dir: str) -> bool:
                         ):
                             return False
                         installed = True
+                        declared = True
         if directory == root or directory.parent == directory or not directory.is_relative_to(root):
-            return installed
+            return declared if declared_only else installed
         directory = directory.parent
 
 
@@ -3315,10 +3340,49 @@ _LANG = re.compile(r"""\blang\s*=\s*["']?([\w-]+)""", re.IGNORECASE)
 _MD_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 #: An MDX ESM line: ``import``/``export`` at the start of a line.
 _MDX_ESM = re.compile(r"(?:import|export)\b")
+#: An ESM line between first-line ``---`` fences, which a plain MDX reads as
+#: a thematic break and so runs: ``import: x`` is a YAML key, not one.
+_YAML_ESM = re.compile(
+    r"""import\s+(?:[{*"'$A-Za-z_])|export\s+(?:[{*]|default\b|const\b|let\b|var\b|function\b|class\b|async\b|type\b|interface\b|enum\b)"""
+)
 #: An inline code span: a run of backticks closed by a run of the same
 #: length, inside one paragraph.
 _MD_CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n)[\s\S])*?(?<!`)\1(?!`)")
 _OPENERS = {"(": ")", "[": "]", "{": "}"}
+#: The words after which a ``/`` opens a regular expression rather than divides.
+_REGEX_KEYWORDS = frozenset(
+    "return typeof instanceof in of new delete void throw case do else yield await default extends".split()
+)
+
+
+def _divides(source: str, index: int) -> bool:
+    """Whether the ``/`` at ``index`` is provably a division, by a rule that
+    needs no comment or string parsing. Both must hold: nothing before it on
+    its line is a ``/``, quote or backtick (so no comment, string, template or
+    earlier regular expression can sit there), and, past spaces and tabs
+    alone, it follows an identifier or number that is no keyword, or a ``]``.
+    Everything else may open a regular expression, whose brackets and quotes
+    the ESM lexer cannot read: the caller then calls the rest of the document
+    code. The first such ``/`` ends the scan, so this is linear."""
+    start = source.rfind("\n", 0, index) + 1
+    before = source[start:index]
+    if any(char in before for char in "/'\"`"):
+        return False
+    before = before.rstrip(" \t")
+    if not before:
+        return False
+    if before[-1] == "]":
+        return True
+    end = len(before)
+    begin = end
+    while begin > 0 and (before[begin - 1].isalnum() or before[begin - 1] in "_$."):
+        begin -= 1
+    word = before[begin:end]
+    if not word or word.endswith("."):
+        return False
+    if word[0].isdigit():
+        return True
+    return word.rsplit(".", 1)[-1] not in _REGEX_KEYWORDS
 
 
 def _lines(source: str) -> list[tuple[int, int, str]]:
@@ -3337,7 +3401,10 @@ def _esm_end(source: str, start: int) -> int:
     line reached with every bracket, string, template literal (``${}`` holes
     included) and block comment of the JavaScript so far closed; else at the
     end of the document. A blank line inside an exported template literal is
-    still ESM, so a ``~~~`` or a fence line below it is no fence."""
+    still ESM, so a ``~~~`` or a fence line below it is no fence. A ``/``
+    that is no comment and no provable division may open a regular expression
+    (``/}/``), which this lexer does not read: the rest of the document is
+    then code, never a fence."""
     stack: list[str] = []
     index = start
     length = len(source)
@@ -3377,6 +3444,8 @@ def _esm_end(source: str, start: int) -> int:
             stack.append("/*")
             index += 2
             continue
+        if char == "/" and not _divides(source, index):
+            return length  # maybe a regex literal: in doubt, the rest is code
         if char == "`":
             stack.append("`")
         elif char in _OPENERS:
@@ -3411,18 +3480,27 @@ def _mdx_layout(source: str) -> list[tuple[int, int, str]]:
     lines = _lines(source)
     regions: list[tuple[int, int, str]] = []
     index = 0
+    #: Per fence character, the shortest marker that found no closer: no
+    #: later opener of that length or more can find one either, so an
+    #: unclosed opener costs one scan, not one per opener.
+    unclosed: dict[str, int] = {}
     if lines and lines[0][2].rstrip() == "---":
         closing = next((n for n in range(1, len(lines)) if lines[n][2].rstrip() == "---"), None)
         if closing is not None:
-            regions.append((0, lines[closing][1], "text"))
+            holds_esm = any(_YAML_ESM.match(lines[n][2]) for n in range(1, closing))
+            regions.append((0, lines[closing][1], "code" if holds_esm else "text"))
             index = closing + 1
     while index < len(lines):
         start, end, text = lines[index]
         fence = _MD_FENCE.fullmatch(text)
         if fence is not None and not (fence.group(1)[0] == "`" and "`" in fence.group(2)):
             marker = fence.group(1)
-            closer = re.compile(rf" {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*")
-            closing = next((n for n in range(index + 1, len(lines)) if closer.fullmatch(lines[n][2])), None)
+            closing = None
+            if len(marker) < unclosed.get(marker[0], len(marker) + 1):
+                closer = re.compile(rf" {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*")
+                closing = next((n for n in range(index + 1, len(lines)) if closer.fullmatch(lines[n][2])), None)
+                if closing is None:
+                    unclosed[marker[0]] = len(marker)
             if closing is not None:
                 regions.append((start, lines[closing][1], "text"))
                 index = closing + 1
@@ -4149,6 +4227,9 @@ def _enum_escapes(
                 escape(node, every(module))
                 continue
             owner = _text(member.child_by_field_name("property"))
+            if owner not in owners and owner in _OBJECT_MEMBERS:
+                escape(member, every(module))  # `m.valueOf()` hands the module itself on
+                continue
             if owner not in owners:
                 continue  # another export: never the enum, which only escapes in its file
             judge(member)
@@ -4339,7 +4420,11 @@ def _enum_escapes(
             slot = property_slot(left)
         else:
             slot = None
-        return slot is not None and all(_member_of(use) is not None for use in slot)
+        return slot is not None and all(
+            (taken := _member_of(use)) is not None
+            and _text(taken.child_by_field_name("property")) not in _OBJECT_MEMBERS
+            for use in slot
+        )
 
     def judge_import(statement: Node) -> None:
         clause = next((c for c in statement.named_children if c.type == "import_require_clause"), None)

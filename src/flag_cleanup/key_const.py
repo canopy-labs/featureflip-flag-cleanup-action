@@ -58,7 +58,7 @@ from typing import Callable
 
 from tree_sitter import Node
 
-from flag_cleanup import dead_branches, kotlin_sentinel, rule_synthesis, ts_prototype, ts_syntax
+from flag_cleanup import dead_branches, kotlin_sentinel, rule_synthesis, ts_flag_maps, ts_prototype, ts_syntax
 from flag_cleanup.tree_walk import preorder
 
 __all__ = ["KeyConst", "path_is_safe", "removable_reads", "supported_languages", "key_consts", "withheld_reason"]
@@ -2442,6 +2442,8 @@ def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     so counting such a read as removable here would let the delete rule strand
     a reference the engine deliberately left standing.
     """
+    if ts_flag_maps.is_flag_map_read(identifier):
+        return True
     slot = ts_syntax.read_slot(identifier)
     if slot is None:
         return False
@@ -2461,9 +2463,7 @@ def _ts_is_removable_read(identifier: Node, accessors: frozenset[str]) -> bool:
     if function is None:
         return False
     if function.type == "member_expression":
-        if function.child_by_field_name("optional_chain") is not None:
-            return False
-        if any(c.type == "?." for c in function.children):
+        if ts_syntax.chain_is_optional(function):
             return False
         function = function.child_by_field_name("property")
     if function is None or function.type not in ("identifier", "property_identifier"):

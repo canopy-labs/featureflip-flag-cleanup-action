@@ -3400,6 +3400,19 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         for n in reader.occurrences("@" + wrapper.name)
         if n.type == "identifier" and not names_only(n) and judged(n)
     ]
+    if csharp_family._file_based_app(path):
+        # `dotnet run app.cs` builds a file-based app (`#:project …`,
+        # `#:package …`) as a project of its own, from what its directives
+        # name. No project file says what its `using`s import, so no read in
+        # it is proven and the wrapper stays. (Grammars before C# 14's `#:`
+        # support read the directive as an ERROR, which left the `using`s
+        # unresolved to the same effect.) Such a file is never family-free,
+        # so the cref, knob and verbatim mentions above are all of its own.
+        return found + [
+            wi.Occurrence(path, wi.line_of(n), wi.text_of(n.parent or n), None, wi.IMPORT_UNRESOLVED)
+            for n in reader.occurrences(wrapper.name)
+            if n.type == "identifier" and not names_only(n) and not xcs._in_directive(n)
+        ]
     for node in reader.occurrences(wrapper.name):
         if node.type != "identifier" or names_only(node) or xcs._in_directive(node) or not judged(node):
             continue

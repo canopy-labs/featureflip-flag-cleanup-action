@@ -45,7 +45,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_emptied_tests, ts_mock_config, ts_scope, ts_tests, ts_workspace
+from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_syntax, ts_emptied_tests, ts_mock_config, ts_member_rows, ts_scope, ts_tests, ts_workspace
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.ts_scope import text as _text
 
@@ -90,7 +90,7 @@ def _callee_name(call: Node) -> str | None:
     if function is None:
         return None
     if function.type == "member_expression":
-        if function.child_by_field_name("optional_chain") is not None:
+        if ts_syntax.chain_is_optional(function):
             return None
         function = function.child_by_field_name("property")
     if function is None or function.type not in ("identifier", "property_identifier"):
@@ -1359,12 +1359,14 @@ class Index:
         for node in cross_file_keys.walk(file.root):
             if described and describes(node, wrapper):
                 continue
-            kind = None if test and _test_title(node) else _declares(node, name, file, wrapper)
+            kind = None if test and (_test_title(node) or _row_string(node, file, wrapper)) else _declares(node, name, file, wrapper)
             if kind == "interface":
                 self.interface_members.append((path, node.start_byte))
             elif kind == "member":
                 self.declarations.append((path, node.start_byte))
             if test and (_stub_mention(node, name, word, wrapper.kind, file) or _mockito_call(node, name)):
+                if node.type in _STRINGS and _each_row(node, file, wrapper) is not None:
+                    continue  # a row of a `describe.each([...names])` the run cuts
                 self.test_doubles.append((path, wi.line_of(node), wi.text_of(node.parent or node)))
 
 
@@ -2072,6 +2074,8 @@ def factory_escapes(repo_dir: str, wrapper: wi.Wrapper, files: ts_scope.Files) -
                 if role == _INSTANCE:
                     if _receiver_only(reference):
                         continue
+                    if _stubs(path, text) and ts_member_rows.row_subscript(reference, text, ts_scope.grammar(path)):
+                        continue  # `flags[method]` of a `describe.each` row: cut with the member
                     getter = _getter_returning(reference) if home else None
                     if getter is not None:
                         pending.append((file.path, _text(getter), _GETTER))
@@ -2130,8 +2134,10 @@ def _test_local_instance(call: Node, file: ts_scope.File) -> bool:
     if not _stubs(file.path, file.source):
         return False
     held = _const_holding(call)
+    grammar = ts_scope.grammar(file.path)
     if held is None:
-        return False
+        # `F(<fake>)[method](...)` of a `describe.each([...names])` row.
+        return _owned_arguments(call) and ts_member_rows.row_subscript(call, file.source, grammar)
     data = file.source.encode("utf-8")
     found = _test_body(call, data)
     if found is None or held.parent.parent.parent != found[1]:
@@ -2143,7 +2149,9 @@ def _test_local_instance(call: Node, file: ts_scope.File) -> bool:
         return False
     for node in cross_file_keys.walk(found[1]):
         if node.type in ("identifier", "shorthand_property_identifier") and _text(node) == name and node != held:
-            if node.type != "identifier" or not _receiver_only(node):
+            if node.type != "identifier" or not (
+                _receiver_only(node) or ts_member_rows.row_subscript(node, file.source, grammar)
+            ):
                 return False
     return True
 
@@ -5107,6 +5115,34 @@ def _plain_matcher_argument(node: Node, params: Set[str] = frozenset()) -> bool:
     return False
 
 
+def _row_string(node: Node, file: ts_scope.File, wrapper: wi.Wrapper) -> bool:
+    """Whether a ``string`` node is a row :func:`_each_row` accepts."""
+    if node.type != "string" or len(node.named_children) != 1:
+        return False
+    return _each_row(node.named_children[0], file, wrapper) is not None
+
+
+def _each_row(node: Node, file: ts_scope.File, wrapper: wi.Wrapper) -> ts_member_rows.Each | None:
+    """The :mod:`ts_member_rows` statement ``node`` is a row of, when it names
+    this factory member and every factory the statement calls is the wrapper's
+    own, imported from its module."""
+    factory = ts_scope.factory_name(wrapper.owner)
+    if wrapper.kind != "method" or factory is None or file.path == wrapper.path or _text(node) != wrapper.name:
+        return None
+    found = ts_member_rows.row_of(node, file.source, ts_scope.grammar(file.path))
+    if found is None or found[1] != wrapper.name:
+        return None
+    each = found[0]
+    for name in each.factories:
+        imported = file.import_of(name)
+        if (
+            file.binding(name) is None or imported is None or imported.module != wrapper.path
+            or imported.imported != factory or imported.type_only
+        ):
+            return None
+    return each
+
+
 def _is_import_binding(node: Node, file: ts_scope.File) -> bool:
     """Whether ``node`` is the identifier of the name that an import or a
     ``require`` binds (``import { f }``, ``import f``, ``const { f } = require(...)``),
@@ -5138,6 +5174,17 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         }
     found: list[wi.Occurrence] = []
     for node in cross_file_keys.walk(file.root):
+        if node.type == "string_fragment" and _text(node) == wrapper.name and _stubs(path, source):
+            row = _each_row(node, file, wrapper)
+            if row is not None:
+                # A row of `describe.each([...names])`: the test-double pass cuts it.
+                found.append(
+                    wi.Occurrence(
+                        path, wi.line_of(node), wi.text_of(node.parent or node), None, wi.SIBLING_RECEIVER,
+                        ts_member_rows.EACH, True, scope=row.scope,
+                    )
+                )
+            continue
         if node.type not in MENTION_TYPES or _text(node) not in names:
             continue
         if node.type != "identifier" and _text(node) != wrapper.name:
