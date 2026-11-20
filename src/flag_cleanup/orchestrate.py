@@ -117,6 +117,8 @@ from flag_cleanup.piranha_runner import (
     checkout_root,
     ensure_supported_code_key,
     ensure_supported_key,
+    accessor_mentions,
+    key_constant_names,
     plan_reads,
     plan_registry_default,
     transform_flag,
@@ -1691,6 +1693,16 @@ def piranha_transform(
     try:
         try:
             _refuse_ambiguous_code_key(candidate, config, known_flag_keys)
+            _refuse_ambiguous_accessors(candidate, config)
+            # Read before any pass writes: a removal may delete a declaration
+            # whose name a negated read it could not fold still spells.
+            negated_constants = (
+                key_constant_names(
+                    sorted({checkout_root(d) for d in config.directories}), config.code_key(candidate.key)
+                )
+                if config.negated_accessors
+                else frozenset()
+            )
             # `flag-maps`: asked before any pass writes, whether this flag has a
             # read of a listed map the rules will fold.
             map_read = bool(config.flag_maps) and ts_flag_maps.has_read(
@@ -1766,11 +1778,44 @@ def piranha_transform(
                                 for path, _text in first
                             },
                         )
+            # A negated accessor (`!isDisabled`) is folded only by the rule that
+            # matches its read, complemented there. Every other pass (test
+            # doubles, wrappers, key constants) is blind to it, so anything left
+            # that could still be such a read or a double of one -- any file of
+            # the checkout holding both the accessor's name and the key, or a
+            # constant bound to it -- would describe the removed branch as live
+            # beside the folded reads. Asked only of a run that changed
+            # something, and refused whole, rolled back by the handler below.
+            if config.negated_accessors and any(o.diff for o in outcomes):
+                left = accessor_mentions(
+                    sorted({checkout_root(d) for d in config.directories}),
+                    config.code_key(candidate.key),
+                    config.negated_accessors,
+                    negated_constants,
+                )
+                if left:
+                    reasons = {
+                        path: (
+                            f"still names `{name}` and the flag's key (or a constant holding it) after "
+                            f"the removal. `{name}` is a negated accessor (`!{name}`): only a read the "
+                            "rules match is folded, to the opposite of the served value, and a test "
+                            "double of it, a read through a key constant or a read in another shape "
+                            "is not, so the flag is refused rather than left half-removed. Rewrite "
+                            "what is left by hand, then run again"
+                        )
+                        for path, name in left.items()
+                    }
+                    raise UnsafeRewriteError(
+                        f"the removal of {candidate.key!r} was refused: "
+                        + "; ".join(f"{os.path.relpath(path)}: {why}" for path, why in sorted(reasons.items())),
+                        refused=sorted(reasons),
+                        reasons=reasons,
+                    )
             # ...and then, ONCE, after every pass has run: the fold of a map read is
             # sound only if the key is spelled nowhere else in the checkout.
             # Anything but an inert document that still holds it refuses the
             # whole flag, which the handler below rolls back.
-            if map_read:
+            if map_read or any(o.map_read for o in outcomes):
                 left = ts_flag_maps.survivors(
                     [checkout_root(d) for d in config.directories], config.code_key(candidate.key)
                 )
@@ -1874,6 +1919,45 @@ def piranha_transform(
         raise
     else:
         _undo_transform(config, snapshot, pending=None)
+
+
+def _refuse_ambiguous_accessors(candidate: Candidate, config: Config) -> None:
+    """Refuse a flag read through an accessor whose name reads as the flag's
+    opposite (``isDisabled``) and was declared without saying which way it
+    reads (``!name`` or ``+name``).
+
+    Such a name is no accessor at all for the run (it is in neither
+    ``accessors`` nor ``negated_accessors``), so nothing folds its reads; a
+    flag none of whose files names it goes ahead untouched by it. One whose
+    checkout holds the name beside the key is refused before anything is
+    written, naming the accessor and both spellings that resolve it: folding
+    it either way would be a guess, and the wrong guess keeps the branch the
+    removal deletes.
+    """
+    if not config.ambiguous_accessors:
+        return
+    found = accessor_mentions(
+        sorted({checkout_root(d) for d in config.directories}),
+        config.code_key(candidate.key),
+        config.ambiguous_accessors,
+    )
+    if not found:
+        return
+    reasons = {
+        path: (
+            f"names `{name}` beside the flag's key, and `accessors` declares `{name}` without "
+            f"saying which way it reads: its name reads as the flag's opposite. Write `!{name}` "
+            f"if it returns true while the flag is off, or `+{name}` if it returns the served "
+            "value despite its name"
+        )
+        for path, name in found.items()
+    }
+    raise UnsafeRewriteError(
+        f"the removal of {candidate.key!r} was refused: "
+        + "; ".join(f"{os.path.relpath(path)}: {why}" for path, why in sorted(reasons.items())),
+        refused=sorted(reasons),
+        reasons=reasons,
+    )
 
 
 def _refuse_ambiguous_code_key(
@@ -2049,6 +2133,7 @@ def _run_plan(
             key_positions=config.key_positions,
             code_keys=config.code_keys(),
             flag_maps=config.flag_maps,
+            negated_accessors=config.negated_accessors,
         )
         outcomes.append(
             replace(
@@ -2451,7 +2536,11 @@ def wildcard_stub_lines(config: Config, diff: str) -> tuple[tuple[str, str], ...
     """:func:`flag_cleanup.wildcard_stubs.find` over the swept directories,
     for the read callees ``diff`` removed a call of. Deduplicated by resolved
     path, like the residual scan, for overlapping directories."""
-    names = wildcard_stubs.removed_reads(diff, config.accessors) if diff else frozenset()
+    names = (
+        wildcard_stubs.removed_reads(diff, (*config.accessors, *config.negated_accessors))
+        if diff
+        else frozenset()
+    )
     if not names:
         return ()
     seen: dict[str, Path] = {}

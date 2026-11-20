@@ -499,7 +499,7 @@ def _binding_filler(tree: ast.AST, node: ast.AST, data: bytes, start: int) -> by
             block = getattr(owner, field, None)
             if not isinstance(block, list):
                 continue
-            if not any(statement is node for statement in block):
+            if not any(statement == node for statement in block):
                 continue
             # A module may legitimately end up empty; a suite may not.
             if isinstance(owner, ast.Module) or len(block) > 1:

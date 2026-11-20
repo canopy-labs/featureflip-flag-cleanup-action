@@ -64,9 +64,9 @@ def _bindings(root: Node, name: str) -> int:
         and node.text.decode("utf-8") == name
         and node.parent is not None
         and node.parent.type in _BINDING_PARENTS
-        and not (node.parent.type == "variable_declarator" and node.parent.child_by_field_name("value") is node)
-        and not (node.parent.type == "arrow_function" and node.parent.child_by_field_name("body") is node)
-        and not (node.parent.type == "assignment_pattern" and node.parent.child_by_field_name("right") is node)
+        and not (node.parent.type == "variable_declarator" and node.parent.child_by_field_name("value") == node)
+        and not (node.parent.type == "arrow_function" and node.parent.child_by_field_name("body") == node)
+        and not (node.parent.type == "assignment_pattern" and node.parent.child_by_field_name("right") == node)
     )
 
 

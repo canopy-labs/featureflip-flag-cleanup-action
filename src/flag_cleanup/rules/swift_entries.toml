@@ -78,6 +78,14 @@
 # No `?` quantifier anywhere in this file: in tree-sitter it lets an optional
 # child match NOTHING, and in a deletion rule that widens what is deleted.
 
+#
+# Cost note: the `first` variants name the pair that follows as an unfielded
+# `(_) @next`, with the comment refused by a predicate, and never as
+# `key: (_) @next`. A wildcard behind a field and an anchor makes tree-sitter's
+# query analysis slow over the Swift grammar (seconds for the plain variants,
+# minutes for the `_after_comment` registry one), and the engine pays it once
+# per process before it handles its first Swift file.
+
 [[rules]]
 name = "delete_flag_keyed_boolean_pair_after"
 query = '''(
@@ -117,7 +125,8 @@ query = '''(
   (dictionary_literal
     . key: (line_string_literal . (line_str_text) @flag_name .) @flag_key
     . value: (boolean_literal) @value
-    . key: (_) @next)
+    . (_) @next)
+  (#not-match? @next "^/[/*]")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @value "@treated")
 )'''
@@ -134,7 +143,8 @@ query = '''(
     . [(comment) (multiline_comment)] @leading_comment
     . key: (line_string_literal . (line_str_text) @flag_name .)
     . value: (boolean_literal) @value
-    . key: (_) @next)
+    . (_) @next)
+  (#not-match? @next "^/[/*]")
   (#eq? @flag_name "@stale_flag_name")
   (#eq? @value "@treated")
 )'''
@@ -244,7 +254,8 @@ query = '''(
   (dictionary_literal
     . key: (line_string_literal . (line_str_text) @flag_name .) @flag_key
     . value: (_) @value
-    . key: (_) @next)
+    . (_) @next)
+  (#not-match? @next "^/[/*]")
   (#eq? @flag_name "@stale_flag_name")
   (#not-eq? @value "@untreated")
 )'''
@@ -269,9 +280,10 @@ query = '''(
     . [(comment) (multiline_comment)] @leading_comment
     . key: (line_string_literal . (line_str_text) @flag_name .)
     . value: (_) @value
-    . key: (_) @next)
+    . (_) @next)
   (#eq? @flag_name "@stale_flag_name")
   (#not-eq? @value "@untreated")
+  (#not-match? @next "^/[/*]")
 )'''
 replace_node = "leading_comment"
 replace_node_end = "next"

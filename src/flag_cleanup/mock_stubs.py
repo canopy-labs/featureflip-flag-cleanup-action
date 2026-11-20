@@ -82,7 +82,7 @@ from typing import Callable, Iterable, Mapping
 
 from tree_sitter import Node
 
-from flag_cleanup import cs_param_pins, go_defaults, go_setters, jvm_matchers, key_const, kotlin_sentinel, syntax, ts_syntax, ts_tests, unused
+from flag_cleanup import cs_param_pins, go_defaults, go_setters, go_table_fields, jvm_matchers, key_const, kotlin_sentinel, syntax, ts_syntax, ts_tests, unused
 from flag_cleanup.key_const import (
     _CSHARP_FLAG_READ_CALLEES,
     _DART_FLAG_READ_CALLEES,
@@ -535,7 +535,7 @@ def ts_each_rows(node: Node) -> Node | None:
     root = member.child_by_field_name("object")
     while root is not None and root.type == "member_expression":
         root = root.child_by_field_name("object")
-    if root is None or root.type != "identifier" or root.text.decode("utf-8", "replace") not in _TS_TEST_CALLEES:
+    if root is None or root.type != "identifier" or root.text.decode("utf-8", "replace") not in _TS_TEST_CALLEES:  # root-text-ok: an identifier node, not a tree root
         return None
     named = [c for c in rows.named_children if c.type != "comment"]
     return named[0] if len(named) == 1 else None
@@ -2761,6 +2761,7 @@ def _apply(
         tests = _kotlin_emptied_containers(tests, data)
     rows: list[tuple[Node, str]] = []
     relied: list[str] = []
+    table_fields: tuple[tuple[str, str], ...] = ()
     if language == "go" and decided:
         # The `if` a deleted setter empties goes with it, and so do the table
         # rows that relied on a default that is the removed branch.
@@ -2772,6 +2773,7 @@ def _apply(
         settled = go_defaults.settle(root, live_lines, dict(decided), treatment, flag_key, removed_default)
         lines = [entry for entry in lines if entry not in live_lines] + settled.lines
         rows, relied = settled.rows, settled.relied
+        table_fields = settled.fields
     extra = list(extra)
     # A pin whose every call keeps its test still edits: the parameter, the
     # arguments and a construction's literal.
@@ -2819,6 +2821,8 @@ def _apply(
         result = unused._delete_method(
             result, unused.Candidate(removal.text, start, end, removal.kind, removal.text)
         )
+    if table_fields:
+        result = go_table_fields.drop(result, table_fields)
     # This pass's own guard. Gate 1 judges the engine's rewrite of these files
     # from THIS output, not from the customer's text — its differential checks
     # read a deliberately deleted test as a fold that lost something (Go's `if`

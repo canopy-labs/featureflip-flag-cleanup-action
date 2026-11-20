@@ -78,7 +78,7 @@ query = """(
      (prefix_expression (simple_identifier) @sdk_fn)]
     (call_suffix
       (value_arguments
-        . (value_argument (line_string_literal . (_) @flag_name .))))
+        . (value_argument (line_string_literal . (line_str_text) @flag_name .))))
   ) @call
   (#eq? @sdk_fn "boolVariation")
   (#not-match? @receiver_chain "[?]")
@@ -97,16 +97,13 @@ holes = ["treated", "stale_flag_name"]
 # argument (`default:`), so only the first argument is anchored — the label on
 # the second is irrelevant to the match and is left unconstrained.
 #
-# The key is matched through a WILDCARD child of the string literal rather than
-# by naming the content node. Capturing the literal whole is useless either way
-# — its text includes the quotes, which `#eq?` cannot accept — see go.toml for
-# the full account.
-#
-# The wildcard was originally forced: the bundled Swift grammar had no
-# `line_str_text` node to name. That is no longer true as of fork 0.10.0
-# (probed, not assumed — a rule naming `line_str_text` matches). The wildcard
-# stays anyway, because it is correct under both grammars and this file already
-# has one grammar-version dependency too many; see the bang note above.
+# The key is matched through the string literal's `line_str_text` child rather
+# than by capturing the literal whole: its text includes the quotes, which `#eq?`
+# cannot accept — see go.toml for the full account. Never spell that child as a
+# wildcard, `(line_string_literal . (_) @flag_name .)`: it is equivalent for a
+# key (an escape or an interpolation never equals one), but tree-sitter's query
+# analysis over the Swift grammar then takes seconds per process, paid before the
+# first Swift file is handled.
 [[rules]]
 name = "replace_boolvariation_read_with_boolean_literal"
 query = """(
@@ -116,7 +113,7 @@ query = """(
      (simple_identifier) @sdk_fn]
     (call_suffix
       (value_arguments
-        . (value_argument (line_string_literal . (_) @flag_name .))))
+        . (value_argument (line_string_literal . (line_str_text) @flag_name .))))
   ) @call
   (#eq? @sdk_fn "boolVariation")
   (#not-match? @receiver_chain "[?]")
@@ -231,7 +228,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal . (_) @flag_name .)) .)
+          (line_string_literal . (line_str_text) @flag_name .)) .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)
     . value: (_)
@@ -287,7 +284,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal . (_) @flag_name .)) .)
+          (line_string_literal . (line_str_text) @flag_name .)) .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)
     . (type_annotation) @annotation
@@ -321,7 +318,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal . (_) @flag_name .))
+          (line_string_literal . (line_str_text) @flag_name .))
       . (visibility_modifier) @vis .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)
@@ -351,7 +348,7 @@ query = """(
     (modifiers
       . (attribute
           (user_type (type_identifier) @attr_name)
-          (line_string_literal . (_) @flag_name .))
+          (line_string_literal . (line_str_text) @flag_name .))
       . (visibility_modifier) @vis .)
     (value_binding_pattern) @binding
     name: (pattern (simple_identifier) @prop_name)

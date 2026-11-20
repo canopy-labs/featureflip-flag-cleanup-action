@@ -1078,7 +1078,7 @@ def _is_library_matcher(call: Node) -> bool:
     root = call
     while root.parent is not None:
         root = root.parent
-    source = root.text.decode("utf-8", "replace")
+    source = root.text.decode("utf-8", "replace")  # root-text-ok: matched as text, no offsets
     if receiver is not None:
         return jvm_matchers.qualifier_is_library(_text(receiver), source)
     return jvm_matchers.bare_eq_is_library(source, "java")

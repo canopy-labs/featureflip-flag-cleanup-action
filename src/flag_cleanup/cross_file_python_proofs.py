@@ -11,6 +11,7 @@ from pathlib import Path
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
+from flag_cleanup import source_bytes
 from flag_cleanup import key_const
 from flag_cleanup import unused
 from flag_cleanup.cross_file_python_syntax import (
@@ -724,7 +725,7 @@ def _rewrite_refusal(
         return None
     if module.level and not module.parts:
         return xk.UNSUPPORTED_FORM  # `from . import NAME`: the module is the package itself
-    data = root.text
+    data = source_bytes.of(root)
     line_end = _line_end(data, binding.statement.end_byte)
     if not unused._python_line_can_end_in_a_comment(root, line_end):
         # The rewrite has to mark its line `# noqa: F401`, and a comment

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.19.0"
+version = "2.20.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -571,6 +571,20 @@ dependencies = [
     # while `#if` blocks in a tail after a folded `return` are still deleted.
     # No grammar rev moved, so `+canopy.3` and `+canopy.2` stay.
     #
+    # 0.61.0. C#: a constructor's `X = <read>;` is deleted only when the
+    # enclosing type declares X with the same literal; a field with no
+    # initialiser, a property, a parameter named X or a nested type's member
+    # keeps the assignment (before, the member lost its only write and every
+    # reader flipped). Swift: a stored property assigned the flag in `init` is
+    # deleted only when every mention of it is a read the run rewrites;
+    # otherwise it stays, with the assignment folded (an internal property
+    # read from another file, through another value or a key path was
+    # deleted, and some of those shapes panicked). Ruby/ERB/Python: the
+    # cascade rewrites only the literal conditions the run's own edit
+    # reaches, so a customer's `if false`/`while False:` beside the flag's
+    # read is left as written and no longer stalls the flag's own fold.
+    # No grammar rev moved.
+    #
     # 0.60.0. Python: deleting an entry no longer turns a one-element set
     # `{k}` into the dict `{}` or a subscript `x[a, k]` into the scalar index
     # `x[a]`; Swift: nor a tuple `(a, k)` into the scalar `(a)` (each is
@@ -721,7 +735,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.60.0",
+    "polyglot-piranha==0.61.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.

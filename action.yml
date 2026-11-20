@@ -224,7 +224,12 @@ inputs:
       `ConditionallyRender[condition?show:elseShow]`: once its condition folds
       to a literal, the element is replaced by the branch it renders. A C#
       attribute gate is named like a function, `FeatureGate`: a `true` removal
-      deletes it and a `false` removal is refused.
+      deletes it and a `false` removal is refused. A read that returns the
+      flag's opposite is named with a leading `!`, `!isDisabled` (quote the
+      value in YAML), and folds to the opposite of the served value; a name
+      that reads as the opposite (`isDisabled`, `inactive`, `featureOff`) is
+      not used until written `!name`, or `+name` if it returns the served value
+      anyway; each flag read through it is refused.
     required: false
     default: ''
   inline-wrappers:

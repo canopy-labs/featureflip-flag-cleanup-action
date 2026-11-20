@@ -296,6 +296,31 @@ def has_read(paths: Iterable[str], flag_key: str, flag_maps: Iterable[str] | Non
     return False
 
 
+def has_cross_file_read(readers: Mapping[str, Iterable[object]], flag_maps: Iterable[str] | None = None) -> bool:
+    """Whether a reader holds ``<map>[REF]`` the reader rules fold, for REF one
+    of the references proven in it (``(path, refs)``, each ref with ``owner``
+    and ``member``): the cross-file half of :func:`has_read`. The rules match a
+    reference by its text, so the text is what is asked for here too."""
+    from flag_cleanup import ts_syntax
+
+    listed = _declared if flag_maps is None else frozenset(flag_maps)
+    if not listed:
+        return False
+    for path, refs in readers.items():
+        texts = {f"{r.owner}.{r.member}" if r.owner is not None else r.member for r in refs if not getattr(r, "accessor", "")}
+        source = _read(path) if path.endswith(CODE_SUFFIXES) else None
+        if not texts or source is None:
+            continue
+        root = ts_syntax._parse(source, _language(path))
+        for node in [root, *_descendants(root)]:
+            if node.type != "subscript_expression":
+                continue
+            index = node.child_by_field_name("index")
+            if index is not None and _text(index) in texts and is_flag_map_read(index, listed):
+                return True
+    return False
+
+
 #: The only files whose mention of the key does not refuse the flag: prose a
 #: build never reads. `.mdx` is not among them (it is code), nor is `.txt`
 #: (runtime-loaded override lists use it), nor any other suffix, known or not.
@@ -427,35 +452,258 @@ def _is_own_action(uses: object) -> bool:
     return base in _OWN_ACTIONS
 
 
-def _workflow_items(path: str, data_text: str, flag_key: str) -> int | None:
-    """How many occurrences of the key in a customer's workflow file are items of the
-    ``flags`` input of a step that uses this Action; ``None`` when the file cannot
-    be parsed, 0 when it holds a YAML anchor or alias (which can route a value to
-    anywhere)."""
+#: The published GitLab CI template, as the README tells customers to include
+#: it: a ``remote`` of this exact URL, at any ref that is not a ``.``/``..`` segment.
+_OWN_TEMPLATE = re.compile(
+    r"https://raw\.githubusercontent\.com/canopy-labs/featureflip-flag-cleanup-action/"
+    r"(?!\.\.?/)[A-Za-z0-9._-]+/gitlab/templates/flag-cleanup\.yml"
+)
+#: The job the template defines.
+_TEMPLATE_JOB = "featureflip-flag-cleanup"
+#: The keys a GitLab job extending (or overriding) the template's job, and every
+#: job it extends in turn, may set and still have its ``FEATUREFLIP_FLAGS``
+#: exempt: none of them runs a command.
+_TEMPLATE_JOB_KEYS = frozenset(
+    {"extends", "variables", "stage", "rules", "tags", "timeout", "needs", "interruptible",
+     "retry", "when", "allow_failure", "resource_group"}
+)
+#: The only keys a top-level ``default:`` may set: everything else it sets (a
+#: ``before_script``, ``hooks``, ``services``) runs in the template's job.
+_DEFAULT_KEYS = frozenset({"image", "tags", "retry", "interruptible", "timeout", "cache", "artifacts"})
+#: The only top-level keys whose value is not a mapping. Any other (the
+#: deprecated global ``before_script``/``after_script``/``image``/``services``, a
+#: ``script``) applies to, or runs in, every job, the template's included.
+_TOP_LEVEL_LISTS = frozenset({"include", "stages"})
+#: Top-level names GitLab reserves that are not jobs, other than ``include``,
+#: ``stages``, ``variables``, ``workflow`` and ``default``: each refuses the
+#: exemption whatever its value (a global ``image`` mapping carries an
+#: ``entrypoint``; ``pages`` is a deploy job of its own).
+_RESERVED_TOP_LEVEL = frozenset(
+    {"image", "services", "before_script", "after_script", "script", "cache", "hooks", "pages",
+     "types", "spec", "true", "false", "nil"}
+)
+#: The YAML core tags; any other (``!reference``, ``!!python/...``) is unreadable here.
+_CORE_TAGS = frozenset(
+    f"tag:yaml.org,2002:{name}" for name in ("str", "int", "float", "bool", "null", "seq", "map", "timestamp")
+)
+#: The published CircleCI orb, matched exactly up to the ``@version``.
+_OWN_ORB = "featureflip/flag-cleanup"
+#: The orb's job and command that take a ``flags`` parameter.
+_ORB_ENTRY = "cleanup"
+
+
+class _Scalar(str):
+    """A YAML scalar's text, with the ``(start, end)`` of its source in the file."""
+
+    span: tuple[int, int] = (0, 0)
+
+
+class _NotExempt(Exception):
+    """The file is YAML, but nothing in it may be exempt (a duplicated key, a merge key)."""
+
+
+class _Unreadable(Exception):
+    """The file is not YAML this check can read (a custom tag such as ``!reference``)."""
+
+
+def _plain(node: object) -> object:
+    """``node`` (composed, never constructed: no date or number is resolved, so
+    nothing raises on a value) as dicts, lists and :class:`_Scalar`."""
     import yaml
 
-    try:
-        events = list(yaml.parse(data_text))
-        document = yaml.safe_load(data_text)
-    except yaml.YAMLError:
-        return None
-    if any(isinstance(e, yaml.AliasEvent) or getattr(e, "anchor", None) for e in events):
-        return 0
-    count = 0
+    tag = getattr(node, "tag", None)
+    if tag and tag not in _CORE_TAGS:
+        raise _Unreadable(tag)
+    if isinstance(node, yaml.ScalarNode):
+        scalar = _Scalar(node.value)
+        scalar.span = (node.start_mark.index, node.end_mark.index)
+        return scalar
+    if isinstance(node, yaml.SequenceNode):
+        return [_plain(child) for child in node.value]
+    if isinstance(node, yaml.MappingNode):
+        mapping: dict[str, object] = {}
+        for key, value in node.value:
+            if not isinstance(key, yaml.ScalarNode) or key.value == "<<" or key.value in mapping:
+                raise _NotExempt(getattr(key, "value", key))
+            mapping[key.value] = _plain(value)
+        return mapping
+    return None
+
+
+def _items(value: object, flag_key: str, text: str) -> list[tuple[int, int]]:
+    """``[span]`` of ``value`` when it is a comma- or newline-separated list holding
+    the key as an item, and every spelling of the key in its source is such an
+    item: no escape, no line continuation, no item that merely contains it."""
+    if not isinstance(value, _Scalar):
+        return []
+    found = sum(item.strip() == flag_key for item in re.split(r"[,\n]", value))
+    start, end = value.span
+    raw = text[start:end]
+    if not found or "\\" in raw or decoded(raw) != raw or raw.count(flag_key) != found:
+        return []
+    return [value.span]
+
+
+def _github_items(document: object, flag_key: str, text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
     jobs = document.get("jobs") if isinstance(document, dict) else None
     for job in (jobs or {}).values() if isinstance(jobs, dict) else ():
         for step in (job.get("steps") or []) if isinstance(job, dict) else ():
             if not isinstance(step, dict) or not _is_own_action(step.get("uses")):
                 continue
-            flags = (step.get("with") or {}).get("flags") if isinstance(step.get("with"), dict) else None
-            if isinstance(flags, str):
-                count += sum(item.strip() == flag_key for item in re.split(r"[,\n]", flags))
-    return count
+            if isinstance(step.get("with"), dict):
+                spans += _items(step["with"].get("flags"), flag_key, text)
+    return spans
 
 
-def _is_workflow(path: str) -> bool:
+def _gitlab_items(document: object, flag_key: str, text: str) -> list[tuple[int, int]]:
+    """The template's ``flags`` input where the file includes it, and
+    ``FEATUREFLIP_FLAGS`` in the template's job or a job that extends it, when
+    that job, every job it extends (transitively, each defined in this file) and
+    the file's ``default:`` and top level set nothing that runs a command, and no
+    job extends it."""
+    if not isinstance(document, dict):
+        return []
+    includes = document.get("include")
+    includes = includes if isinstance(includes, list) else [includes]
+    spans: list[tuple[int, int]] = []
+    included = False
+    for entry in includes:
+        remote = entry.get("remote") if isinstance(entry, dict) else entry
+        if not (isinstance(remote, str) and _OWN_TEMPLATE.fullmatch(remote.strip())):
+            continue
+        included = True
+        inputs = entry.get("inputs") if isinstance(entry, dict) else None
+        if isinstance(inputs, dict):
+            spans += _items(inputs.get("flags"), flag_key, text)
+    if not included:
+        return spans
+    default = document.get("default")
+    if default is not None and not (
+        isinstance(default, dict)
+        and set(default) <= _DEFAULT_KEYS
+        and isinstance(default.get("image", ""), str)  # a mapping can set an `entrypoint`
+    ):
+        return []
+    if any(
+        key in _RESERVED_TOP_LEVEL or (not isinstance(value, dict) and key not in _TOP_LEVEL_LISTS)
+        for key, value in document.items()
+    ):
+        return []
+
+    def parents(job: object) -> list[object] | None:
+        """The jobs ``job`` extends; ``None`` when ``extends`` is not a name or a list of names."""
+        extends = job.get("extends") if isinstance(job, dict) else None
+        if extends is None:
+            return []
+        listed = [extends] if isinstance(extends, str) else extends if isinstance(extends, list) else None
+        return listed if listed is not None and all(isinstance(p, str) for p in listed) else None
+
+    def inert(name: str, seen: frozenset[str]) -> bool:
+        """Whether job ``name`` and everything it extends set only inert keys.
+        The template's own job is inert as published; a parent not in this file is not known."""
+        if name in seen:
+            return False
+        job = document.get(name)
+        if name == _TEMPLATE_JOB and job is None:
+            return True
+        above = parents(job)
+        if not isinstance(job, dict) or not set(job) <= _TEMPLATE_JOB_KEYS or above is None:
+            return False
+        return all(inert(parent, seen | {name}) for parent in above)
+
+    # A job another job extends hands its variables on to that job's own script.
+    extended = {parent for job in document.values() for parent in (parents(job) or [])}
+    for name, job in document.items():
+        above = parents(job)
+        if not isinstance(job, dict) or above is None:
+            continue
+        if name != _TEMPLATE_JOB and (name.startswith(".") or _TEMPLATE_JOB not in above):
+            continue
+        if name in extended or not inert(name, frozenset()):
+            continue
+        if isinstance(job.get("variables"), dict):
+            spans += _items(job["variables"].get("FEATUREFLIP_FLAGS"), flag_key, text)
+    return spans
+
+
+def _circleci_items(document: object, flag_key: str, text: str) -> list[tuple[int, int]]:
+    """The ``flags`` parameter of the orb's ``cleanup`` job in a workflow, or of
+    its ``cleanup`` command in a job's steps, under an alias whose ``orbs:``
+    entry names the published orb."""
+    if not isinstance(document, dict) or not isinstance(document.get("orbs"), dict):
+        return []
+    names = {
+        f"{alias}/{_ORB_ENTRY}"
+        for alias, orb in document["orbs"].items()
+        if isinstance(orb, str) and orb.strip().split("@", 1)[0] == _OWN_ORB
+    }
+
+    def entries(listing: object) -> list[tuple[int, int]]:
+        found: list[tuple[int, int]] = []
+        for entry in listing if isinstance(listing, list) else ():
+            if isinstance(entry, dict) and len(entry) == 1:
+                ((name, params),) = entry.items()
+                if name in names and isinstance(params, dict):
+                    found += _items(params.get("flags"), flag_key, text)
+        return found
+
+    spans: list[tuple[int, int]] = []
+    workflows = document.get("workflows")
+    for workflow in workflows.values() if isinstance(workflows, dict) else ():
+        if isinstance(workflow, dict):
+            spans += entries(workflow.get("jobs"))
+    jobs = document.get("jobs")
+    for job in jobs.values() if isinstance(jobs, dict) else ():
+        if isinstance(job, dict):
+            spans += entries(job.get("steps"))
+    return spans
+
+
+_CI_ITEMS = {"github": _github_items, "gitlab": _gitlab_items, "circleci": _circleci_items}
+
+
+def _ci_exempt(kind: str, text: str, flag_key: str) -> bool | None:
+    """Whether every spelling of the key in a customer's CI file of ``kind`` (raw
+    or :func:`decoded`) lies inside an item of this Action's flag list: the
+    ``flags`` input of a step that uses the Action, the GitLab template's
+    ``flags`` input or ``FEATUREFLIP_FLAGS``, the orb's ``flags`` parameter.
+    Asked per occurrence: the items' source is blanked and what is left must not
+    spell the key. ``None`` when the file cannot be read as YAML (a custom tag
+    such as GitLab's ``!reference``, nesting too deep to parse, more than one
+    document), False when it holds an anchor, an alias, a merge key or a
+    duplicated key, which can each put a value somewhere it does not appear."""
+    import yaml
+
+    if text.startswith("﻿"):
+        return None
+    try:
+        events = list(yaml.parse(text))
+        node = yaml.compose(text)
+        if any(isinstance(e, yaml.AliasEvent) or getattr(e, "anchor", None) for e in events):
+            return False
+        spans = _CI_ITEMS[kind](_plain(node), flag_key, text)
+    except _NotExempt:
+        return False
+    except Exception:  # noqa: BLE001 -- yaml errors, recursion: unreadable, refused by name
+        return None
+    blanked = list(text)
+    for start, end in spans:
+        blanked[start:end] = " " * (end - start)
+    return flag_key not in decoded("".join(blanked))
+
+
+def _ci_kind(path: str) -> str | None:
+    """Which CI system reads ``path``: a ``.github/workflows`` file, a
+    ``.gitlab-ci.yml``, or a ``.circleci/config.yml``."""
     norm = path.replace("\\", "/")
-    return "/.github/workflows/" in norm and norm.endswith((".yml", ".yaml"))
+    if "/.github/workflows/" in norm and norm.endswith((".yml", ".yaml")):
+        return "github"
+    if norm.rsplit("/", 1)[-1] in (".gitlab-ci.yml", ".gitlab-ci.yaml"):
+        return "gitlab"
+    if norm.endswith("/.circleci/config.yml"):
+        return "circleci"
+    return None
 
 
 def _occurrences(path: str, flag_key: str) -> tuple[int, int] | None:
@@ -499,7 +747,8 @@ def survivors(checkout_roots: str | Iterable[str], flag_key: str) -> Mapping[str
     key counts however it is spelled: raw, or through :func:`decoded`. Files that
     may keep it: ``.md`` and ``.rst``, the extension-less ``CHANGELOG``/``LICENSE``/
     ``LICENCE``/``COPYING`` (unless they start ``#!``), and the key as an item of
-    the ``flags`` input of this Action in a workflow file. A file that cannot be
+    this Action's flag list in a GitHub Actions workflow, a ``.gitlab-ci.yml`` or
+    a ``.circleci/config.yml`` (:func:`_ci_exempt`). A file that cannot be
     read is refused by name, never skipped.
     """
     import os
@@ -517,13 +766,14 @@ def survivors(checkout_roots: str | Iterable[str], flag_key: str) -> Mapping[str
                 hit = _occurrences(path, flag_key)
                 if hit is None:
                     continue
-                line, count = hit
-                if _is_workflow(path):
-                    allowed = _workflow_items(path, open(path, encoding="utf-8").read(), flag_key)
-                    if allowed is not None and allowed >= count:
+                line, _count = hit
+                kind = _ci_kind(path)
+                if kind is not None:
+                    exempt = _ci_exempt(kind, open(path, encoding="utf-8").read(), flag_key)
+                    if exempt:
                         continue
-                    if allowed is None:
-                        found[path] = f"line {line}: a workflow file that cannot be read as YAML holds the key"
+                    if exempt is None:
+                        found[path] = f"line {line}: a CI file that cannot be read as YAML holds the key"
                         continue
             except FileNotFoundError:
                 continue

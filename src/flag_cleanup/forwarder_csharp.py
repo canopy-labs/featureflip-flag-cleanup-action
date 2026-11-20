@@ -354,7 +354,7 @@ def _cref_names(repo_dir: str, owner: str, name: str) -> bool:
 
 def _spells_dynamic(root: Node) -> bool:
     """Whether a parsed C# file spells ``dynamic`` as a name or a type."""
-    return b"dynamic" in root.text and any(
+    return b"dynamic" in root.text and any(  # root-text-ok: a substring test
         n.type in ("identifier", "predefined_type") and _text(n) == "dynamic" for n in _walk(root)
     )
 
@@ -381,7 +381,7 @@ def _aligned(data: bytes, root: Node) -> bool:
     """Whether ``root`` was parsed from ``data`` as it is on disk, so that its
     offsets index ``data`` directly. Those offsets count a byte order mark,
     which ``root.text`` leaves out."""
-    return data[root.start_byte : root.end_byte] == root.text and root.end_byte <= len(data)
+    return data[root.start_byte : root.end_byte] == root.text and root.end_byte <= len(data)  # root-text-ok: the same slice
 
 
 def _same(root: Node, node: Node) -> Node | None:
@@ -545,7 +545,7 @@ def plan(path: str, content: str, owner_name: str, method_name: str, repo_dir: s
             return f"{call_path}: its text changed while it was read"
         if call_reader.root.has_error or _spells_dynamic(call_reader.root):
             return f"{call_path}: does not parse, or uses dynamic (a call bound at run time)"
-        if _NULLABLE.search(call_reader.root.text):
+        if _NULLABLE.search(call_reader.root.text):  # root-text-ok: a regex search
             return f"{call_path}: a #nullable directive may give the call another nullable context"
         for found in nodes:
             where = f"{call_path}:{found.start_point[0] + 1}"

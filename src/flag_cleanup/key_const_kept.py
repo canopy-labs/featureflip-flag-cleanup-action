@@ -127,7 +127,9 @@ def kept_message(path: str, before: str, language: str, flag_key: str) -> str | 
     if after == before:
         return (
             f"{path}: key constant {listed} is kept, and no read of the flag through it "
-            "here could be folded"
+            "here could be folded (the file is unchanged: check that the read's accessor "
+            "and key position are among the run's accessors, and that the read is one "
+            "the tool can prove synchronous)"
         )
     return (
         f"{path}: key constant {listed} is also used outside a flag read or another "

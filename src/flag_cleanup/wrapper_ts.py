@@ -39,13 +39,13 @@ from __future__ import annotations
 import functools
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping, Set
+from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, ts_async_reads, ts_syntax, ts_emptied_tests, ts_mock_config, ts_member_rows, ts_scope, ts_tests, ts_workspace
+from flag_cleanup import cross_file_keys, cross_file_ts, key_const, mock_stubs, source_bytes, ts_async_reads, ts_syntax, ts_emptied_tests, ts_mock_config, ts_member_rows, ts_scope, ts_tests, ts_workspace
 from flag_cleanup import wrapper_inline as wi
 from flag_cleanup.ts_scope import text as _text
 
@@ -2913,7 +2913,7 @@ def _settles(
         or _text(declaration.children[0]) != "const"
         or block is None
         or block.type != "statement_block"
-        or not _unit_body(block, file.root.text)
+        or not _unit_body(block, source_bytes.of(file.root))
         or _mock_of(bound, file, files) != ts_scope.TypeRef(wrapper.path, wrapper.owner)
     ):
         return False
@@ -4127,6 +4127,12 @@ def _builds_owner(file: ts_scope.File, wrapper: wi.Wrapper) -> bool:
 
 
 def _constructs_owner(file: ts_scope.File, wrapper: wi.Wrapper) -> bool:
+    return next(_owner_constructions(file, wrapper), None) is not None
+
+
+def _owner_constructions(file: ts_scope.File, wrapper: wi.Wrapper) -> Iterator[Node]:
+    """Each ``new Owner(...)`` of the wrapper's class, or call of its factory,
+    in ``file`` (see :func:`_builds_owner`)."""
     owner = ts_scope.factory_name(wrapper.owner) or wrapper.owner
     kind = "call_expression" if ts_scope.factory_name(wrapper.owner) is not None else "new_expression"
     for node in cross_file_keys.walk(file.root):
@@ -4139,7 +4145,7 @@ def _constructs_owner(file: ts_scope.File, wrapper: wi.Wrapper) -> bool:
                 continue
             imported = file.import_of(_text(obj))
             if imported is None or imported.imported is None and imported.module in (None, wrapper.path):
-                return True
+                yield node
             continue
         if callee is None or callee.type != "identifier":
             continue
@@ -4147,9 +4153,113 @@ def _constructs_owner(file: ts_scope.File, wrapper: wi.Wrapper) -> bool:
         imported = file.import_of(local)
         if imported is not None:
             if imported.imported == owner and imported.module in (None, wrapper.path):
-                return True
+                yield node
         elif local == owner and _same_file(file.path, wrapper.path):
+            yield node
+
+
+#: What an object a test builds may pass through and still be that object.
+_SAME_OBJECT = frozenset(
+    {"as_expression", "satisfies_expression", "non_null_expression", "parenthesized_expression", "await_expression"}
+)
+_IMPORT_PARENTS = frozenset({"import_specifier", "namespace_import", "import_clause"})
+
+
+def _instance_escapes(file: ts_scope.File, wrapper: wi.Wrapper) -> list[Node]:
+    """In a test file, each use of an object the file builds of the wrapper's
+    owner (``buildFlags(fake)``, ``new Flags(fake)``) through which the
+    wrapper may be called without its name being spelled: ``flags[method]``,
+    ``Object.values(flags)``, a helper it is handed to, a spread, a return.
+
+    Such an object reads the flag through whatever the test gave it. The
+    member's read is folded whether the member goes or stays, so a test left
+    calling it this way asserts what the read used to return. Followed: the
+    object itself, and every name bound to it (``const``, ``let`` or an
+    assignment, and names bound to those), by spelling, so a same-named
+    binding elsewhere in the file counts too. Accounted for: ``x.<name>``
+    (a call of the wrapper by name is :func:`occurrences`' to judge), a
+    destructuring of named members that are not the wrapper, a type, and
+    the subscript of a ``describe.each`` whose rows do not name it
+    (:mod:`ts_member_rows`). Anything else is an escape."""
+    if wrapper.kind != "method" or wrapper.static:
+        return []
+    grammar = ts_scope.grammar(file.path)
+    held: set[str] = set()
+
+    def judge(value: Node) -> Node | None:
+        """The escape ``value`` is, else ``None``; a name it is bound to joins ``held``."""
+        node = value
+        while node.parent is not None and node.parent.type in _SAME_OBJECT:
+            node = node.parent
+        parent = node.parent
+        if parent is not None and parent.type == "variable_declarator" and parent.child_by_field_name("value") == node:
+            name = parent.child_by_field_name("name")
+            if name is not None and name.type == "identifier":
+                held.add(_text(name))
+                return None
+            if name is not None and name.type == "object_pattern" and _names_other_members(name, wrapper.name):
+                return None
+        elif parent is not None and parent.type == "assignment_expression" and parent.child_by_field_name("right") == node:
+            left = parent.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                held.add(_text(left))
+                return None
+        elif _receiver_only(node):
+            return None
+        else:
+            rows = ts_member_rows.subscript_rows(node, file.source, grammar)
+            if rows is not None and wrapper.name not in rows:
+                return None
+        return node
+
+    def uses() -> Iterator[Node]:
+        yield from _owner_constructions(file, wrapper)
+        for node in cross_file_keys.walk(file.root):
+            if node.type == "shorthand_property_identifier" and _text(node) in held:
+                yield node  # `{ flags }`: handed on whole
+                continue
+            if node.type != "identifier" or _text(node) not in held:
+                continue
+            parent = node.parent
+            if parent is None or parent.type in _IMPORT_PARENTS:
+                continue
+            if parent.type == "variable_declarator" and parent.child_by_field_name("name") == node:
+                continue
+            if parent.type == "assignment_expression" and parent.child_by_field_name("left") == node:
+                continue
+            if not _in_type(node):
+                yield node
+
+    # The walk is not in source order, so the names are bound to a fixpoint first.
+    while True:
+        before = len(held)
+        escapes = [n for n in uses() if n.type == "shorthand_property_identifier" or judge(n) is not None]
+        if len(held) == before:
+            return escapes
+
+
+def _names_other_members(pattern: Node, name: str) -> bool:
+    """``{ a, b: c }``: only named members, none of them ``name``, no rest."""
+    for part in pattern.named_children:
+        if part.type == "comment":
+            continue
+        if part.type == "shorthand_property_identifier_pattern":
+            key = part
+        elif part.type == "pair_pattern":
+            key = part.child_by_field_name("key")
+        else:
+            return False  # a rest, a default, or something not modelled
+        if key is None or key.type not in ("shorthand_property_identifier_pattern", "property_identifier") or _text(key) == name:
+            return False
+    return True
+
+
+def _in_type(node: Node) -> bool:
+    ancestor = node.parent
+    while ancestor is not None and ancestor.type not in ("statement_block", "program", "expression_statement"):
+        if ancestor.type in _TYPE_CONTEXTS:
             return True
+        ancestor = ancestor.parent
     return False
 
 
@@ -4201,6 +4311,17 @@ def driven(wrapper: wi.Wrapper, index: Index) -> list[tuple[str, int, str, str]]
             ]
         if injected and file is not None:
             found += [(path, wi.line_of(n), wi.text_of(n), HANDED_ON) for n in _renamed_exports(file, wrapper, files)]
+    if wrapper.kind == "method" and not wrapper.static:
+        owner = ts_scope.factory_name(wrapper.owner) or wrapper.owner
+        for path in cross_file_keys.mention_files(index.repo_dir, [owner], exclude=()):
+            source = wi._read(path) if path.endswith(ts_scope.FAMILY_EXTENSIONS) else None
+            if source is None or not _stubs(path, source):
+                continue
+            file = files.file(path, source)
+            if file is not None:
+                found += [
+                    (path, wi.line_of(n), wi.text_of(n.parent or n), DRIVEN_TEST) for n in _instance_escapes(file, wrapper)
+                ]
     return sorted(set(found))
 
 

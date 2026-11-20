@@ -30,8 +30,10 @@ one flag's guard from another's. Accessor support for Kotlin lives in
 
 from __future__ import annotations
 
+import contextlib
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 __all__ = [
@@ -40,6 +42,7 @@ __all__ = [
     "accessors_for",
     "cross_file_key_rules",
     "generated_rule_names",
+    "negating",
     "with_accessors",
     "with_accessor_const_rules",
     "with_accessor_guards",
@@ -154,9 +157,71 @@ def _for_accessor(block: str, accessor: str) -> str:
     """``block`` with its callee predicate naming ``accessor`` and every
     accessor-only arm switched on. The ONE place a callee is swapped, so a
     seed clone and a cross-file reader clone cannot disagree about the shapes
-    an accessor reaches."""
+    an accessor reaches -- and so the one place a NEGATED accessor's clone is
+    complemented (:func:`negating`)."""
     swapped = _SDK_FN_PREDICATE.sub(f'(#eq? @sdk_fn "{accessor}")', block, count=1)
-    return _ACCESSOR_ARM.sub(r"\1", swapped)
+    swapped = _ACCESSOR_ARM.sub(r"\1", swapped)
+    if plain_name(accessor) in _NEGATED.get():
+        return _complemented(swapped, accessor)
+    return swapped
+
+
+_NEGATED: ContextVar[frozenset[str]] = ContextVar("negated_accessors", default=frozenset())
+
+
+@contextlib.contextmanager
+def negating(names) -> Iterator[None]:
+    """Clone every rule generated for one of ``names`` as a read of the flag's
+    OPPOSITE: ``isDisabled('k')`` written ``!isDisabled`` in the ``accessors``
+    input.
+
+    The complement is made where the treatment meets the read, in the clone's
+    own holes, rather than downstream: a clone whose ``replace`` writes the
+    UNTREATED literal hands the engine's cascade exactly the literal the
+    customer's code would have computed, so every fold built on a read (``if``,
+    ``!``, ``&&``/``||``, a ternary, a bound local, a dead loop) applies to it
+    unchanged, in every language whose read is a cloned rule.
+    """
+    token = _NEGATED.set(frozenset(names))
+    try:
+        yield
+    finally:
+        _NEGATED.reset(token)
+
+
+#: The holes whose value depends on the treatment, each paired with the one
+#: that holds the opposite treatment's value. A complemented clone swaps every
+#: pair, in its query and its ``replace`` alike.
+_TREATMENT_HOLES = {
+    "treated": "untreated",
+    "untreated": "treated",
+    "safe_nav_false_flag_name": "safe_nav_true_flag_name",
+    "safe_nav_true_flag_name": "safe_nav_false_flag_name",
+}
+_TREATMENT_HOLE_RE = re.compile(
+    r'(?P<lead>@|")(?P<hole>' + "|".join(sorted(_TREATMENT_HOLES, key=len, reverse=True)) + r')\b'
+)
+_REPLACE_LINE = re.compile(r'^replace = "(?P<value>.*)"$', re.MULTILINE)
+
+
+def _complemented(block: str, accessor: str) -> str:
+    """``block`` reading the opposite of the served value: every treatment hole
+    swapped for its pair (see :data:`_TREATMENT_HOLES`).
+
+    Refuses a block whose ``replace`` writes a value no treatment hole decides
+    (anything but a deletion, a treatment hole, or a receiver chosen by a
+    treatment-keyed query): swapping nothing there would fold the negated read
+    to the served value, which is the defect this exists to prevent.
+    """
+    decided_by_query = re.search(r"@safe_nav_(?:true|false)_flag_name\b", block) is not None
+    for match in _REPLACE_LINE.finditer(block):
+        value = match["value"]
+        if value and re.search(r"@(?:un)?treated\b", value) is None and not decided_by_query:
+            raise SynthesisError(
+                f"the rule cloned for the negated accessor {accessor!r} writes "
+                f"{value!r}, which no treatment hole decides; it cannot be complemented"
+            )
+    return _TREATMENT_HOLE_RE.sub(lambda m: m["lead"] + _TREATMENT_HOLES[m["hole"]], block)
 
 
 @dataclass(frozen=True)
@@ -387,6 +452,15 @@ def with_accessors(
         raise SynthesisError(
             "no seed rule with a literal (#eq? @sdk_fn \"...\") predicate; "
             "custom accessors cannot be expressed for this language"
+        )
+
+    # A seed fires before its clones, so a negated accessor sharing a seed's
+    # callee would be folded by the seed, to the served value: refused loudly.
+    shadowed = sorted({a for a in accessors if a in _NEGATED.get()} & {seed.callee for seed in seeds})
+    if shadowed:
+        raise SynthesisError(
+            f"the negated accessor(s) {', '.join(repr(a) for a in shadowed)} share the SDK "
+            "read's own name, which already folds to the served value"
         )
 
     templates: list[_Block] = []
@@ -630,7 +704,14 @@ def with_accessor_guards(const_rules_text: str, accessors: tuple[str, ...]) -> s
     and is returned untouched. That line says nothing about whether the file's
     own rules get cloned -- :func:`with_accessor_const_rules` answers that, and
     conflating the two is #2730.
+
+    A NEGATED accessor (:func:`negating`) is never added. The guard is what
+    keeps the const rules from inlining a name bound to the read, and those
+    rules write the TREATED literal for each use of it: lifting the guard for
+    a read of the opposite value inverts every use. Left out, such a binding
+    keeps the guard, and the read itself is folded, complemented, by its clone.
     """
+    accessors = tuple(name for name in accessors if plain_name(name) not in _NEGATED.get())
     if not accessors or not const_rules_text:
         return const_rules_text
 
@@ -723,6 +804,7 @@ def cross_file_key_rules(
     strip_key_hole: bool = True,
     marked: bool = False,
     positional_text: str | None = None,
+    flag_maps: tuple[str, ...] = (),
 ) -> str:
     """Rules for the reader invocation: one clone per proven reference.
 
@@ -752,6 +834,10 @@ def cross_file_key_rules(
     does not, the ``sentinel`` hole is stripped too, for the same reason as the
     key: a seed whose query names a value the file lacks makes the engine skip
     the file. Measured: Java's sentinel rules alone made every reader skip.
+
+    ``flag_maps`` (the ``flag-maps`` input) clones the ``# xconst: flag-map-*``
+    blocks of ``positional_text`` once per plain reference and per name: the
+    ``flags[KEY]`` read with KEY the reference.
     """
     blocks = [
         b for b in _split_blocks(_strip_comments_keep_markers(template_text))[1:]
@@ -781,6 +867,12 @@ def cross_file_key_rules(
         kind: [b for b in _split_blocks(_strip_comments_keep_markers(positional_text))[1:] if f"# xconst: {kind}" in b]
         for kind in ("qualified", "bare", "property-qualified", "property-bare")
     } if positional_text is not None and positioned else {}
+    map_blocks = {
+        kind: [b for b in _split_blocks(_strip_comments_keep_markers(positional_text))[1:] if f"# xconst: flag-map-{kind}\n" in b]
+        for kind in ("qualified", "bare")
+    } if positional_text is not None and flag_maps else {}
+    if flag_maps and positional_text is not None and not all(map_blocks.values()):
+        raise SynthesisError("a flag-map reader template needs `# xconst: flag-map-qualified` and `-bare` blocks")
     # A positioned accessor is not a first-argument one: the loops below see plain names only.
     accessors = tuple(a for a in accessors if a not in {_spelled(n, i) for n, i in positioned.items()})
 
@@ -821,6 +913,18 @@ def cross_file_key_rules(
                         r'^name = "(.*)"$',
                         lambda m: f'name = "{m.group(1)}__{index}__accessor_{name}"',
                         _for_accessor(block, name),
+                        count=1,
+                        flags=re.MULTILINE,
+                    )
+                    clones.append(_RULE_HEADER + "\n" + clone.removeprefix(_RULE_HEADER).strip() + "\n")
+            for map_index, map_name in enumerate(flag_maps):
+                for template in map_blocks.get("qualified" if owner is not None else "bare", []):
+                    block = template.replace("__XCONST_OWNER__", _query_text(owner_text))
+                    block = block.replace("__XCONST_MEMBER__", _query_text(member)).replace(_FLAG_MAP, map_name)
+                    clone = re.sub(
+                        r'^name = "(.*)"$',
+                        lambda m: f'name = "{m.group(1)}__{index}__flag_map_{map_index}"',
+                        block,
                         count=1,
                         flags=re.MULTILINE,
                     )

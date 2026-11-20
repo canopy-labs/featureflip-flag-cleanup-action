@@ -572,7 +572,7 @@ def _equality_matcher(value: Node) -> Node | None:
     root = call
     while root.parent is not None:
         root = root.parent
-    source = root.text.decode("utf-8", "replace")
+    source = root.text.decode("utf-8", "replace")  # root-text-ok: matched as text, no offsets
     if callee.type == "navigation_expression":
         qualifier = callee.text.decode("utf-8", "replace").rsplit(".", 1)[0]
         return call if jvm_matchers.qualifier_is_library(qualifier, source) else None

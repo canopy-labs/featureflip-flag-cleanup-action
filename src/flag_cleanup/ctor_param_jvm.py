@@ -306,7 +306,7 @@ def _lombok_status(root: Node, written: str | None) -> str:
     single, stars, unreadable = _imports(root)
     if written is None:
         # A usage whose name cannot be read: Lombok's if the file names Lombok at all.
-        return "yes" if b"lombok" in root.text else "no"
+        return "yes" if b"lombok" in root.text else "no"  # root-text-ok: a substring test
     first, _, rest = written.partition(".")
     bound = single.get(first)
     if bound is not None:

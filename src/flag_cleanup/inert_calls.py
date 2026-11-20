@@ -268,7 +268,7 @@ def _own_call_count(statement: Node, language: str) -> int:
     count = 0
     for node in _walk(statement):
         if node.type in _CALL_TYPES:
-            if node is not statement and language == "ruby" and node.type == "call" and _inert(node, language):
+            if node != statement and language == "ruby" and node.type == "call" and _inert(node, language):
                 continue  # Ruby's member read
             count += 1
     return count

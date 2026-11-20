@@ -671,7 +671,7 @@ def _bound_in_member(argument: Node, name: str) -> bool:
             if n.parent is not None and (
                 n.parent.type in _BINDERS or any(a.type.endswith("_pattern") for a in _ancestors(n))
             ):
-                if n.parent is member:
+                if n.parent == member:
                     continue  # the enclosing function's own name
                 if n.parent.type in _DECLARATORS and n != next(
                     (c for c in n.parent.named_children if c.type == "identifier"), None

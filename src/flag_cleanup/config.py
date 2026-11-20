@@ -156,6 +156,18 @@ class Config:
     #: ``("getFlag", "key")``: the key is the property of that name in the
     #: object-literal argument (TypeScript and JavaScript only).
     key_positions: tuple[tuple[str, int | str], ...] = ()
+    #: Accessors that return the flag's OPPOSITE (``isDisabled('k')``),
+    #: written ``!isDisabled`` in the ``accessors`` input. Held apart from
+    #: ``accessors`` on purpose: every pass that reads ``accessors`` takes a
+    #: read to return the served value, so a name here reaches only the
+    #: generated rules, which fold it to the complement. See
+    #: :func:`flag_cleanup.rule_synthesis.negating`.
+    negated_accessors: tuple[str, ...] = ()
+    #: Names in the ``accessors`` input that read as the flag's opposite
+    #: (``isDisabled``) and say neither ``!name`` nor ``+name``. In neither list
+    #: above, so nothing folds their reads; a flag the checkout reads through
+    #: one is refused, naming it. See :func:`reads_as_negative`.
+    ambiguous_accessors: tuple[str, ...] = ()
     ignore: frozenset[str] = frozenset()
     #: Flag keys this run may propose, as an ALLOWlist. Empty — the default —
     #: means no filtering, so an existing workflow is unaffected.
@@ -283,7 +295,9 @@ class Config:
                 "FEATUREFLIP_FLAG_MAPS names a map of flags, which only a TypeScript or "
                 "JavaScript run reads, but FEATUREFLIP_LANGUAGES includes neither"
             )
-        accessors, gates, key_positions = _parse_accessors(_get(env, "FEATUREFLIP_ACCESSORS", ""))
+        accessors, gates, key_positions, negated_accessors, ambiguous_accessors = _parse_accessors(
+            _get(env, "FEATUREFLIP_ACCESSORS", "")
+        )
         properties = [name for name, at in key_positions if isinstance(at, str)]
         if properties and not {"ts", "tsx", "js"} & set(languages):
             raise ConfigError(
@@ -301,7 +315,9 @@ class Config:
                 "name the position of the key, which only a Python, TypeScript or "
                 "JavaScript run reads, but FEATUREFLIP_LANGUAGES includes none of them"
             )
-        suffixed = [name for name in accessors if name.endswith(("?", "!"))]
+        suffixed = [
+            name for name in (*accessors, *negated_accessors, *ambiguous_accessors) if name.endswith(("?", "!"))
+        ]
         if suffixed and not SUFFIXED_ACCESSOR_LANGUAGES & set(languages):
             # Every configured run would drop these (`accessors_for`), so the
             # input would be read and then silently match nothing.
@@ -359,6 +375,8 @@ class Config:
             languages=languages,
             accessors=accessors,
             key_positions=key_positions,
+            negated_accessors=negated_accessors,
+            ambiguous_accessors=ambiguous_accessors,
             side_effect_free_modules=_split_csv(
                 _get(env, "FEATUREFLIP_SIDE_EFFECT_FREE_MODULES", ""), default=()
             ),
@@ -418,9 +436,57 @@ _KEY_POSITION_RE = re.compile(
 )
 
 
+#: The words that make an accessor's name read as the flag's OPPOSITE:
+#: ``isDisabled``, ``is_not_enabled``, ``featureOff``, ``isHidden``, Pennant's
+#: ``inactive``. Compared against the name's words (split at ``_`` and at each
+#: lower-to-upper case change), never as substrings, so ``isOffered`` and
+#: ``noticeEnabled`` are not caught; ``on`` followed or preceded by ``off``
+#: (``isOnOff``, ``on_off_flag``) names a toggle, not its off state. A name
+#: holding one must say which way it reads: ``!name`` when it returns the
+#: opposite of the served value, ``+name`` when it returns the served value
+#: regardless of its name. Folding it either way by guess is the failure this
+#: exists to stop: a read folded as the served value when it returns the
+#: opposite keeps the branch the removal was meant to delete.
+NEGATIVE_WORDS = frozenset(
+    {
+        "not", "no", "non", "isnt", "disable", "disabled", "deactivated", "inactive",
+        "off", "hidden", "blocked", "unavailable", "optout",
+    }
+)
+
+_WORD_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def reads_as_negative(name: str) -> bool:
+    """Whether ``name``, a function name, holds a word of :data:`NEGATIVE_WORDS`."""
+    words = [
+        word.lower()
+        for part in name.rstrip("?!").split("_")
+        for word in _WORD_RE.findall(part)
+    ]
+    # `opt_out`/`optOut` is one word here.
+    words = [
+        "optout" if (word, nxt) == ("opt", "out") else word
+        for word, nxt in zip(words, [*words[1:], ""])
+    ]
+    for index, word in enumerate(words):
+        if word not in NEGATIVE_WORDS:
+            continue
+        if word == "off" and "on" in words[max(index - 1, 0) : index + 2]:
+            continue
+        return True
+    return False
+
+
 def _parse_accessors(
     value: str,
-) -> tuple[tuple[str, ...], tuple[Gate, ...], tuple[tuple[str, int | str], ...]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[Gate, ...],
+    tuple[tuple[str, int | str], ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
     """Split, validate and de-duplicate ``FEATUREFLIP_ACCESSORS``.
 
     Returns the function names and, separately, the gate components
@@ -433,11 +499,46 @@ def _parse_accessors(
     (``flag_is_active[1]``): the name joins the function names, and the index
     is returned beside it. ``[0]`` is the plain name.
 
+    Fourth, the NEGATED accessors, written ``!name``: a read that returns the
+    opposite of the served value. A negated accessor takes no key position,
+    and neither marker applies to a gate component.
+
+    Fifth, the AMBIGUOUS names: ones that read as negative
+    (:func:`reads_as_negative`) with no marker. They leave the function names
+    (and their key positions); a flag read through one is refused. ``+name``
+    declares such a name an ordinary accessor.
+
     De-duplication is not tidiness. Each name becomes one generated rule, and
     two rules sharing a name is a hard engine error — so a repeated value would
     turn a harmless typo into a run that cannot start.
     """
     names = _split_csv(value, default=())
+    negated: dict[str, None] = {}
+    confirmed: set[str] = set()
+    for item in names:
+        if item.startswith("!"):
+            negated[item[1:]] = None
+        elif item.startswith("+"):
+            # `+flag_off[1]` confirms `flag_off`: the position is parsed below.
+            confirmed.add(re.split(r"[\[{]", item[1:], maxsplit=1)[0])
+    names = tuple(item[1:] if item.startswith("+") else item for item in names if not item.startswith("!"))
+    bad_negated = [name for name in negated if not _ACCESSOR_RE.match(name)]
+    if bad_negated:
+        raise ConfigError(
+            f"unsupported FEATUREFLIP_ACCESSORS value(s): "
+            f"{', '.join(repr('!' + name) for name in bad_negated)}; a negated accessor "
+            "is a plain function name after the `!`, matching [A-Za-z_][A-Za-z0-9_]* "
+            "with at most one trailing ? or ! (Ruby only). It cannot carry a key "
+            "position, a key property or a gate component"
+        )
+    plain = {re.split(r"[\[{]", name, maxsplit=1)[0] for name in names}
+    both = sorted(name for name in negated if name in plain)
+    if both:
+        raise ConfigError(
+            f"FEATUREFLIP_ACCESSORS names {', '.join(repr(n) for n in both)} both "
+            "negated (`!name`) and not; a read returns the served value or its "
+            "opposite, never both"
+        )
     gates = {gate: None for name in names if (gate := parse_gate(name)) is not None}
     names = tuple(name for name in names if parse_gate(name) is None)
     positions: dict[str, int | str] = {}
@@ -478,7 +579,15 @@ def _parse_accessors(
     seen: dict[str, None] = {}
     for name in names:
         seen[name] = None
-    return tuple(seen), tuple(gates), tuple(positions.items())
+    # A name that reads as the flag's opposite and says neither `!` nor `+`
+    # is no accessor for the run: a flag read through it is refused, naming
+    # it (`orchestrate._refuse_ambiguous_accessors`), every other flag goes
+    # ahead.
+    ambiguous = tuple(name for name in seen if name not in confirmed and reads_as_negative(name))
+    for name in ambiguous:
+        del seen[name]
+        positions.pop(name, None)
+    return tuple(seen), tuple(gates), tuple(positions.items()), tuple(negated), ambiguous
 
 
 def _parse_call_names(value: str, variable: str = "FEATUREFLIP_SIDE_EFFECT_FREE_CALLS") -> tuple[str, ...]:

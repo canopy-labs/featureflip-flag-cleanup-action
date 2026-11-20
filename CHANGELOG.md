@@ -8,6 +8,90 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.20.0
+
+### Added
+
+- `flag-maps`: a read of a listed map whose key is a constant declared in another file (`featureToggles[SWAP]` after `import { SWAP } from './keys'`, or `featureToggles[keys.SWAP]` through a namespace import) now folds in the same boolean positions as a same-file constant, and the constant goes once nothing else uses it. The whole-checkout key check applies to these runs too, so a write of the key anywhere still refuses the flag.
+- `accessors` takes a negated read: `!isDisabled` declares a helper that
+  returns `true` while the flag is off, and each of its reads is folded to the
+  opposite of the served value, in every supported language but Kotlin. Quote
+  the value in YAML (`accessors: 'isEnabled, !isDisabled'`). Laravel Pennant's
+  `Feature::inactive('KEY')` folds with `!inactive`. A Kotlin run refuses a
+  flag that a negated accessor reads, and once a removal has changed anything,
+  any source file that still names a negated accessor together with the flag's
+  key (or a constant holding it), such as a test double of the read, refuses
+  the flag.
+- A TypeScript or JavaScript key constant read through a destructured `require` of a barrel (`const { FLAG } = require("./flags")` where `./flags` re-exports it with `export *` or `export { FLAG } from`) is now folded and removed, along with the barrel's re-export line, exactly as an `import { FLAG }` through the barrel already was. This includes a renamed re-export, chained barrels, an enum behind a barrel (its reads fold, its entry stays) and, with `workspace-packages: follow`, a workspace package's barrel. A rest element, a default value, a renaming `{ FLAG: X }`, a `let`, a CommonJS barrel and the barrel object taken whole keep being reported and left alone.
+
+### Changed
+
+- The transform engine is now 0.61.0. It carries the C# constructor-assignment,
+  Swift stored-property and Python/Ruby/ERB literal-condition fixes listed
+  under Fixed.
+- A `flag-maps` removal run from the GitLab CI template or the CircleCI orb is no longer refused because the flag's key is named in the run's own flag list. As on GitHub Actions, the key may appear in `.gitlab-ci.yml` only as an item of the template's `flags` input or of `FEATUREFLIP_FLAGS` on the template's job, and in `.circleci/config.yml` only as an item of the orb's `flags` parameter; any other mention, or a YAML anchor or alias, still refuses the flag.
+- An accessor whose name reads as the flag's opposite (a word such as `not`,
+  `disabled`, `inactive`, `off`, `hidden` or `blocked`: `isDisabled`,
+  `is_not_enabled`, `featureOff`, Pennant's `inactive`) is no longer folded to
+  the served value, which kept the branch the removal should have deleted. It
+  is not used until you say which way it reads: write `!name` if it returns
+  `true` while the flag is off, or `+name` if it returns the served value
+  despite its name. Until then, each flag whose key sits in a file beside the
+  name is refused, naming the accessor; other flags are unaffected. If you merged a
+  removal that folded such an accessor, check which branch it kept.
+- Go: when a removal deletes the setter and the `if tt.enable { ... }` that guarded it, the table field that only that `if` read is now removed too, from the struct and from every row, and the remaining columns are realigned the way `gofmt` writes them. The field stays when anything else reads it, a row is passed on whole, a comment sits beside another field, or the file was not `gofmt`-formatted to begin with.
+- Go: a table held in a local (`tests := []struct{...}{...}` followed by `for _, tt := range tests`) is now recognised wherever the Action reads a table, so its default rows and unused field are handled like an inline table. Several other passes compared syntax nodes by identity, which never matched; they now compare by value.
+
+### Fixed
+
+- A Blade view with an inline `@section('title', $title)`, `@push('stack', $html)` or `@prepend` outside the flag's conditional is rewritten normally. Before, its computed content made the Action refuse the whole flag, rolling back every other file. The same directive inside a conditional the Action folds still leaves that view as it is and lists it.
+- A C# field or property that a constructor assigns the flag no longer loses
+  that assignment. Before, `ShowPlans = flags.IsEnabled("k");` was deleted
+  while the member stayed, so every reader of it silently got `false` under
+  the true treatment. The assignment is now folded to the literal
+  (`ShowPlans = true;`) and deleted only where the member's own declaration
+  already holds that same value. If you merged a C# removal where a
+  constructor assigned the flag to a field or property, check it.
+- A Python, Ruby or ERB removal no longer rewrites a condition you wrote as a
+  literal (`if False:`, `if false`, `unless false`, `while False:`, a bare
+  `true` statement) just because it stands in the same block as the flag's
+  read. Before, that dead code was deleted from the pull request too, which put
+  an unrelated edit in the diff, and it could stop the flag's own read from
+  folding: a Ruby modifier `if` was left as `... if false` and a Python `if`
+  as a stray `pass`. The same holds at the top level of an ERB template. A
+  literal condition the fold itself produces is still folded; one you wrote is
+  yours to judge. If you merged a Python, Ruby or ERB removal whose diff also
+  deleted a literal condition you wrote, check it.
+- In a GitHub Actions workflow, a `flags` input that spells the flag's key through an escape or a line continuation no longer exempts a plain mention of the key elsewhere in the workflow from the `flag-maps` check: every spelling of the key must lie inside a plainly written item of the Action's flag list, or the flag is refused. If you merged a `flag-maps` removal whose workflow
+  spelled the key that way, check that nothing else still names it.
+- A TypeScript or JavaScript class method or factory member that a test
+  reaches without naming it, through an object the test builds with a fake
+  (`flags[method]()` in a `describe.each` whose rows could not be cut,
+  `Object.values(flags)`, a helper the object is handed to), now refuses the
+  flag. Before, the member was kept but its read was still folded, so the pull
+  request shipped a test that could only fail under the other value. If you
+  merged such a removal, check its tests.
+- An exported flag table is now kept whenever a module specifier written with
+  an escape or a substitution appears anywhere, whichever check sees it first,
+  and when component markup or another text file loads modules through
+  `createRequire`, `require.context` or `__non_webpack_require__`.
+- A Go test file that opens with a byte-order mark or blank lines now has its table rows for the removed flag state deleted, as it does without them. Before, the rows stayed. A Python reader file opening that way is judged by its real line ends.
+- The first Swift removal in a run no longer sits for about four minutes before it does anything. One Swift rule, which deletes a dictionary entry that follows a comment, cost minutes of query analysis every time a process first touched Swift. It is now written in a form that costs milliseconds, and it matches exactly what it did before.
+- Swift: a stored property assigned from the flag in an `init` (`let showPlans:
+  Bool`, `showPlans = isEnabled("key")`) is no longer deleted when anything
+  could still name it. The declaration was removed with the assignment, and a
+  read through another value (`layout.showPlans` in a view or a test), a key
+  path (`\.showPlans`), a projected `$showPlans` or a capture `[showPlans]`
+  was left behind, so the result did not compile. The property is now deleted
+  only when it is `private`, declared alone with no other modifier or
+  attribute, and every use of its name in the type is one the rewrite replaces;
+  otherwise it is kept with the assignment folded to the literal. A run that
+  would still leave a deleted property named, or write a literal where a name
+  is assigned, is refused instead of opened. If you merged a Swift removal
+  that deleted a stored property assigned in an `init`, check that it builds.
+- A TypeScript, TSX or JavaScript file that opens with a byte-order mark or blank lines and declares a key constant now has its reads of the flag folded. Before, the file was left unchanged and only a log line said so. That log line now says what to check.
+- A TypeScript, TSX or JavaScript file with CRLF line endings that declares a key constant no longer refuses the whole flag as "cannot be parsed". Its reads of the flag now fold exactly as they do in the LF copy of the file, and the file stays CRLF.
+
 ## 2.19.0
 
 ### Added

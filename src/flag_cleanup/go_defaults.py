@@ -19,8 +19,8 @@ TypeScript family does in :mod:`flag_cleanup.ts_tests`:
 
 Nothing here is a proof that a row's ``want`` describes the removed branch: the
 title is what decides, exactly as for TypeScript, and the pull request says so.
-The now-unused table field is left, because removing it means rewriting every
-row and the struct's alignment.
+The now-unused table field is removed by :mod:`flag_cleanup.go_table_fields`
+when it can prove nothing reads it.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from tree_sitter import Node
 
-from flag_cleanup import ts_tests
+from flag_cleanup import source_bytes, ts_tests
 from flag_cleanup.syntax import _parse, _walk
 
 #: The row fields whose string says what the row is about.
@@ -160,6 +160,9 @@ class Settled:
     rows: list[tuple[Node, str]]
     #: ``"Test/title"`` of each unset row that stays.
     relied: list[str]
+    #: ``(function name, field)`` of each ``if x.field {`` this emptied: the
+    #: table field it read may now be unread (:mod:`flag_cleanup.go_table_fields`).
+    fields: tuple[tuple[str, str], ...] = ()
 
 
 def settle(
@@ -210,7 +213,15 @@ def settle(
     relied: list[str] = []
     if removed_default is not None:
         rows, relied = _rows(root, list(emptied.values()), setters, treatment, flag_key, removed_default)
-    return Settled(kept, rows, relied)
+    fields: set[tuple[str, str]] = set()
+    for candidate in emptied.values():
+        condition = _simple_condition(candidate.child_by_field_name("condition"))
+        function = _enclosing_function(candidate)
+        member = condition.child_by_field_name("field") if condition is not None else None
+        name = function.child_by_field_name("name") if function is not None else None
+        if member is not None and name is not None:
+            fields.add((_text(name), _text(member)))
+    return Settled(kept, rows, relied, tuple(sorted(fields)))
 
 
 def _table(loop: Node, variable: str) -> Node | None:
@@ -242,7 +253,7 @@ def _table(loop: Node, variable: str) -> Node | None:
             if (
                 declaration is not None
                 and declaration.type == "short_var_declaration"
-                and declaration.child_by_field_name("left") is parent
+                and declaration.child_by_field_name("left") == parent
                 and len(parent.named_children) == 1
                 and found is None
             ):
@@ -301,10 +312,7 @@ def _own_lines(row: Node) -> bool:
 
 
 def _source_of(node: Node) -> bytes:
-    root = node
-    while root.parent is not None:
-        root = root.parent
-    return root.text
+    return source_bytes.of(node)
 
 
 def _rows(

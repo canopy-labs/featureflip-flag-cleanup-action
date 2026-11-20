@@ -384,15 +384,22 @@ def row_subscript(node: Node, source: str, language: str) -> bool:
     """Whether ``node`` is the object of one of a whitelisted statement's
     ``<object>[param]`` subscripts: the factory call itself, or the ``const``
     that holds it."""
+    return subscript_rows(node, source, language) is not None
+
+
+def subscript_rows(node: Node, source: str, language: str) -> frozenset[str] | None:
+    """The names of the rows of the whitelisted statement whose
+    ``<object>[param]`` subscript ``node`` is the object of, else ``None``:
+    the only members that subscript can reach."""
     sub = node.parent
     if sub is None or sub.type != "subscript_expression" or sub.child_by_field_name("object") != node:
-        return False
+        return None
     top = sub
     while top.parent is not None and top.parent.type != "program":
         top = top.parent
     if top.parent is None:
-        return False
-    return any(
-        e.statement.start_byte == top.start_byte and (sub.start_byte, sub.end_byte) in e.subscripts
-        for e in statements(source, language)
-    )
+        return None
+    for each in statements(source, language):
+        if each.statement.start_byte == top.start_byte and (sub.start_byte, sub.end_byte) in each.subscripts:
+            return frozenset(name for name, _ in each.rows)
+    return None

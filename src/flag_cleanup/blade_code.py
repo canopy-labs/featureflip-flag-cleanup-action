@@ -283,6 +283,8 @@ def code_view(source: str) -> str:
                 lines.append(f"elseif ({lower[4:]}({a})):")
             elif lower == "php" and args is not None:
                 lines.append(f"({args});")
+        elif undecided(name, args):
+            pass  # decided at run time, inline as written: nothing to close
         elif lower.startswith("else") and len(lower) > 4:
             # `@elsecan`, `@elseauth`, a `Blade::if` conditional's `@elsename`.
             lines.append(f"elseif ({lower[4:]}({a})):")
@@ -488,6 +490,25 @@ def builtin(name: str, args: str | None) -> tuple[str, str | None] | None:
     return None
 
 
+def undecided(name: str, args: str | None) -> bool:
+    """Whether ``@name(args)`` is a function-block directive written with a
+    content argument that is not a literal: ``@section('t', $title)``,
+    ``@push('s', $html)``, ``@slot('x', $c, [])``.
+
+    Laravel decides at RUN time (``startSection`` buffers when the content is
+    ``null``), so the table cannot call it a block or inline. It is not a
+    built-in (inside a span a rewrite reached, it still refuses), but it is no
+    custom opener either: it never pairs a closer by name, so it adds nothing to
+    the block count. Written inline, as every such use is, it holds no body.
+    """
+    lower = name.lower()
+    return (
+        lower in _BLOCK_WITH_ONE
+        and builtin(name, args) is None
+        and len(_arguments(args)) > 1
+    )
+
+
 def _directives(source: str) -> list[tuple[str, str | None]]:
     return [(name, args) for kind, name, args in _tokens(source) if kind == "directive"]
 
@@ -538,6 +559,8 @@ def balance(source: str, names: frozenset[str] = frozenset()) -> int:
         if kind != "directive":
             continue
         known = builtin(name, args)
+        if known is None and undecided(name, args):
+            continue
         if known is not None:
             score += {IF_OPEN: 1, BLOCK_OPEN: 1, IF_CLOSE: -1, BLOCK_CLOSE: -1}.get(known[0], 0)
             continue

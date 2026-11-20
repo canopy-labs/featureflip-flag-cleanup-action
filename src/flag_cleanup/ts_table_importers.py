@@ -76,6 +76,23 @@ def _string_value(node: Node | None) -> str | None:
     return None
 
 
+class _Unreadable:
+    """A module specifier spelled with an escape or a substitution
+    (``'.\\x2fflags'``): not the text it shows, so where it loads from cannot
+    be read. :func:`_specs` and :func:`_export_form` hand it on in place of the
+    specifier, and every caller holds on it, so no check depends on another
+    having run first."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNREADABLE"
+
+
+UNREADABLE = _Unreadable()
+_UNREADABLE_REASON = "a module specifier spelled with an escape or a substitution"
+
+
 def _real(path: str) -> str:
     return os.path.realpath(path)
 
@@ -110,7 +127,7 @@ def _units(repo_dir: str, files: dict[str, tuple[str, Node]]) -> tuple[list[_Uni
             pieces.append(text[at:])
             outside = "".join(pieces)
         if _LOAD_CALL.search(outside):
-            return units, f"the markup of {location} loads modules (`import(`, `require(` or `import.meta`)"
+            return units, f"the markup of {location} loads modules (`import(`, `require(`, `import.meta` or another loader)"
         if regions is None:
             if re.search(r"\bimport\b|\brequire\b", text):
                 return units, f"the code of {location} cannot be told from its markup"
@@ -160,6 +177,8 @@ def hold_reason(
                 if kind is None:
                     continue
                 spec, items = kind
+                if spec is UNREADABLE:
+                    return f"{_UNREADABLE_REASON} in {unit.path}"
                 source_module = resolve(unit.path, spec) if spec is not None else None
                 if spec is not None:
                     if source_module not in carrying:
@@ -199,14 +218,16 @@ def _stems(path: str) -> set[str]:
     return {p.stem}
 
 
-def _export_form(node: Node) -> tuple[str | None, list[tuple[str, str]]] | None:
-    """``(source or None, [(imported, exported)])`` for an ``export`` statement of names."""
+def _export_form(node: Node) -> tuple[str | _Unreadable | None, list[tuple[str, str]]] | None:
+    """``(source or None, [(imported, exported)])`` for an ``export`` statement
+    of names, and ``(UNREADABLE, [])`` for any ``export … from`` whose source
+    cannot be read."""
     if node.type != "export_statement":
         return None
     source = node.child_by_field_name("source")
     spec = _string_value(source) if source is not None else None
     if source is not None and spec is None:
-        return None
+        return UNREADABLE, []
     items: list[tuple[str, str]] = []
     star = any(c.type in ("*", "namespace_export") for c in node.children)
     if star:
@@ -229,9 +250,12 @@ def _imported_from(unit: _Unit, local: str, resolve, carrying: dict[str, set[str
     for node in ts_syntax._walk(unit.root):
         if node.type != "import_statement":
             continue
-        spec = _string_value(node.child_by_field_name("source"))
+        source = node.child_by_field_name("source")
+        if source is None:
+            continue  # `import x = require(...)`: read by `_specs`
+        spec = _string_value(source)
         if spec is None:
-            continue
+            return True  # unreadable: it may be a carrying module
         module = resolve(unit.path, spec)
         if module not in carrying:
             continue
@@ -304,6 +328,8 @@ def _dynamic_hazard(unit: _Unit) -> str | None:
                 if len(args) != 1 or _string_value(args[0]) is None:
                     return "an `import()` that is not a single string"
     for _node, spec in _specs(unit):
+        if spec is UNREADABLE:
+            return _UNREADABLE_REASON
         if spec in ("module", "node:module"):
             return "a load of `module` (`import`, `export`, `require` or `import()`)"
     return None
@@ -353,29 +379,32 @@ def _provably_elsewhere(path: str, spec: str, repo_dir: str) -> bool:
     return cross_file_ts.package_outside(path, spec, repo_dir, declared_only=True)
 
 
-def _specs(unit: _Unit) -> Iterator[tuple[Node, str]]:
-    """Every static or literal module specifier of the unit, with its node."""
+def _specs(unit: _Unit) -> Iterator[tuple[Node, str | _Unreadable]]:
+    """Every module specifier of the unit, with its node: the static ones
+    (``import``, ``export … from``, ``import x = require``) and the first
+    argument of each ``require(…)`` / ``import(…)``. One that is not a plain
+    string is :data:`UNREADABLE`, never skipped."""
     for node in ts_syntax._walk(unit.root):
         if node.type in ("import_statement", "export_statement"):
             source = node.child_by_field_name("source")
-            spec = _string_value(source)
-            if spec is not None:
-                yield node, spec
+            if source is not None:
+                spec = _string_value(source)
+                yield node, UNREADABLE if spec is None else spec
             for child in node.named_children:
                 if child.type == "import_require_clause":
                     for part in child.named_children:
                         if part.type == "string":
                             value = _string_value(part)
-                            if value is not None:
-                                yield node, value
+                            yield node, UNREADABLE if value is None else value
         elif node.type == "call_expression":
             function = node.child_by_field_name("function")
             arguments = node.child_by_field_name("arguments")
             if function is not None and (_text(function) == "require" or function.type == "import") and arguments is not None:
-                first = arguments.named_children[0] if arguments.named_children else None
+                first = next((c for c in arguments.named_children if c.type != "comment"), None)
+                if first is None:
+                    continue  # `require()` loads nothing
                 value = _string_value(first)
-                if value is not None:
-                    yield node, value
+                yield node, UNREADABLE if value is None else value
 
 
 def _unit_reason(unit: _Unit, repo_dir: str, resolve, carrying: dict[str, set[str]], stems: set[str], declaring: str) -> str | None:
@@ -384,6 +413,8 @@ def _unit_reason(unit: _Unit, repo_dir: str, resolve, carrying: dict[str, set[st
     namespaces: dict[str, set[str]] = {}
     binders: set[int] = set()
     for node, spec in _specs(unit):
+        if spec is UNREADABLE:
+            return f"{_UNREADABLE_REASON} in {unit.path}"
         module = resolve(unit.path, spec)
         if module is None:
             if not _provably_elsewhere(unit.path, spec, repo_dir):
@@ -544,7 +575,14 @@ def _specifier_ranges(unit: _Unit) -> list[tuple[int, int]]:
     return ranges
 
 
-_LOAD_CALL = re.compile(r"import\s*\(|require\s*\(|import\.meta")
+#: A module load in text this does not parse: component markup outside its
+#: script blocks, and other text files. Inside a script these are tokens
+#: (:func:`_dynamic_hazard`); here they are spellings.
+_LOAD_CALL = re.compile(
+    r"import\s*\(|require\s*\(|import\.meta"
+    r"|\bcreateRequire\b|\b__non_webpack_require__\b"
+    r"|\brequire\s*\.\s*context\b|\bmodule\s*\.\s*require\b|\bSystem\s*\.\s*import\b"
+)
 
 
 def _manifest_remaps(text: str, stems: set[str]) -> str | None:
@@ -619,7 +657,7 @@ def _other_files(repo_dir: str, declaring: str, stems: set[str]) -> str | None:
         if location.name in _MANIFESTS:
             continue  # lockfiles and workspace lists
         if _LOAD_CALL.search(text):
-            return f"{location}, a file the parser does not read, loads modules (`import(`, `require(` or `import.meta`)"
+            return f"{location}, a file the parser does not read, loads modules (`import(`, `require(`, `import.meta` or another loader)"
         if any(n.search(text) for n in needles):
             return f"{location}, a file the parser does not read, names the module"
         if named is not None and named.search(text):

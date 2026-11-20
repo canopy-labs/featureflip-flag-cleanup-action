@@ -789,7 +789,7 @@ class Index:
         ):
             logger.info("cannot parse the declarations of %s, so no keyless wrapper qualifies", path)
             self.unreadable = True
-        key_literal = wi.key_literal(wrapper, path, root.text.decode("utf-8", "replace"))
+        key_literal = wi.key_literal(wrapper, path, root.text.decode("utf-8", "replace"))  # root-text-ok: matched as text
         for node in _walk(root):
             kind = node.type
             if kind in _DEFS and _text(node.child_by_field_name("name")) == name:

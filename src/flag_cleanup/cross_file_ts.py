@@ -94,7 +94,7 @@ from pathlib import Path
 from tree_sitter import Node
 
 from flag_cleanup import cross_file_keys as xk
-from flag_cleanup import key_const, key_const_visibility, rule_synthesis, source_index, ts_barrels, ts_enum_spread, ts_key_names, ts_syntax
+from flag_cleanup import key_const, key_const_visibility, rule_synthesis, source_index, ts_barrels, ts_enum_spread, ts_flag_maps, ts_key_names, ts_syntax
 
 #: Callees whose FIRST argument the reader rules rewrite. `getBooleanValue`
 #: only when awaited: the bare call is a `Promise<boolean>`, exactly as in
@@ -1743,6 +1743,8 @@ def _require_bindings(
     modules: frozenset[str],
     require_is_global: bool,
     enums: dict[tuple[str, str], dict[str, xk.KeyDeclaration]],
+    through=None,
+    through_enum=None,
 ) -> list[_Binding]:
     value = declarator.child_by_field_name("value")
     if value is None or value.type != "call_expression":
@@ -1755,8 +1757,15 @@ def _require_bindings(
         return []
     spec = _string_value(args.named_children[0])
     module = resolve(spec) if spec is not None else None
-    if module not in modules:  # `modules` holds the enums' files as well
+    # `modules` holds the enums' files as well. Any other module is a barrel
+    # when it re-exports one of our names: only a destructuring of it is read
+    # (`const { X } = require("./barrel")`); the module object itself is not.
+    barrel = module is not None and module not in modules
+    target = declarator.child_by_field_name("name")
+    if module is None or (barrel and (through is None or target is None or target.type != "object_pattern")):
         return []
+    if barrel and any(c.type in ("rest_pattern", "object_assignment_pattern") for c in target.named_children):
+        return []  # a rest takes the names the run deletes; a default is a second read
     lexical = declarator.parent
     provable = (
         require_is_global
@@ -1766,18 +1775,30 @@ def _require_bindings(
         and lexical.parent is not None
         and lexical.parent.type == "program"
     )
-    target = declarator.child_by_field_name("name")
     found: list[_Binding] = []
     if target is None:
         return found
     rebound = not require_is_global
+
+    def declaration(name: str) -> xk.KeyDeclaration | None:
+        found_decl = declared.get((module, name))
+        if found_decl is None and barrel:
+            found_decl = through(module, name)
+        return found_decl
+
+    def enum_named(name: str) -> tuple[str, str] | None:
+        if (module, name) in enums:
+            return (module, name)
+        return through_enum(module, name) if barrel and through_enum is not None else None
     if target.type == "identifier":
         found.append(_Binding(target, _text(target), None, module, provable, require_rebound=rebound))
     elif target.type == "object_pattern":
         for prop in target.named_children:
             if prop.type == "shorthand_property_identifier_pattern":
-                decl = declared.get((module, _text(prop)))
-                enum_of = (module, _text(prop)) if decl is None and (module, _text(prop)) in enums else None
+                decl = declaration(_text(prop))
+                enum_of = enum_named(_text(prop)) if decl is None else None
+                if barrel and decl is None and enum_of is None:
+                    continue
                 found.append(
                     _Binding(
                         prop,
@@ -1794,20 +1815,14 @@ def _require_bindings(
                 local = prop.child_by_field_name("value")
                 if key is None or local is None or local.type != "identifier":
                     continue
-                decl = (
-                    declared.get((module, _text(key)))
-                    if key.type == "property_identifier"
-                    else None
-                )
+                decl = declaration(_text(key)) if key.type == "property_identifier" else None
                 # `{ NAME: X }`: the fold removes the read of `X`, and nothing
                 # removes `NAME:` from the pattern, so the file would go on
                 # naming an export the same run deletes. An enum is never
                 # deleted, so `{ Flags: F }` names nothing that goes away.
-                enum_of = (
-                    (module, _text(key))
-                    if decl is None and key.type == "property_identifier" and (module, _text(key)) in enums
-                    else None
-                )
+                enum_of = enum_named(_text(key)) if decl is None and key.type == "property_identifier" else None
+                if barrel and decl is None and enum_of is None:
+                    continue
                 found.append(
                     _Binding(
                         local,
@@ -1843,6 +1858,9 @@ def _is_read(argument: Node, accessors: frozenset[str], *, positioned: bool = Tr
     constructed object holding the key) is read by a configured accessor
     only: an SDK call takes the key itself.
     """
+    if ts_flag_maps.is_flag_map_read(argument):
+        # `flags[KEY]` for a `flag-maps` name, in a position the reader rules fold.
+        return not holder
     slot = ts_syntax.read_slot(argument)
     if slot is None:
         return False
@@ -2489,7 +2507,7 @@ def references(
     for node in _walk(root):
         if node.type == "variable_declarator":
             requires.extend(
-                _require_bindings(node, resolve, declared, modules, require_is_global, enums)
+                _require_bindings(node, resolve, declared, modules, require_is_global, enums, through, through_enum)
             )
     for binding in requires:
         bind(binding.node, binding.local)

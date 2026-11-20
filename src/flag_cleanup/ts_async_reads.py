@@ -76,7 +76,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import kotlin_sentinel, rule_synthesis, ts_syntax
+from flag_cleanup import kotlin_sentinel, mock_stubs, rule_synthesis, source_bytes, ts_syntax
 
 _EXTENSIONS = {".ts": "ts", ".tsx": "tsx", ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js", ".mts": "ts", ".cts": "ts"}
 
@@ -639,7 +639,7 @@ def _tree_patches(tree: Node) -> bool:
     """Whether a parsed file or block may patch a built-in: its parse has an
     error (what it says cannot be read), it holds a NUL (a UTF-16 file the
     UTF-8 parse misread), or a node of it does (:func:`_patches_builtins`)."""
-    return tree.has_error or b"\0" in tree.text or any(
+    return tree.has_error or b"\0" in tree.text or any(  # root-text-ok: a membership test
         _patches_builtins(node)
         for node in ts_syntax._walk(tree)
         if node.type in _ASSIGNMENTS or node.type in ("call_expression", "with_statement", "for_in_statement")
@@ -1388,7 +1388,7 @@ def _registry_object(tree: Node, path: str, name: Node) -> tuple[Node, str, str]
     for candidate in _module_candidates(path, imported[0]):
         if candidate.suffix in (".ts", ".tsx", ".mts", ".cts") and candidate.is_file():
             try:
-                other = ts_syntax._parse(candidate.read_text(encoding="utf-8"), _EXTENSIONS[candidate.suffix])
+                other = ts_syntax._parse(mock_stubs._read_exact(candidate), _EXTENSIONS[candidate.suffix])
             except (OSError, UnicodeDecodeError):
                 return None
             found = [b for b in ts_scope.bindings(other, imported[1])]
@@ -2217,7 +2217,7 @@ class _Repo:
         tree = None
         if grammar is not None:
             try:
-                tree = ts_syntax._parse(Path(path).read_text(encoding="utf-8"), grammar)
+                tree = ts_syntax._parse(mock_stubs._read_exact(path), grammar)
             except (OSError, UnicodeDecodeError):
                 tree = None
         self.trees[key] = tree
@@ -2865,7 +2865,7 @@ def _classic_script(repo: _Repo, path: str, function: Node) -> str | None:
         return None
     if Path(path).suffix in {".cjs", ".mjs", ".cts", ".mts"}:
         return None  # a module by its extension alone
-    text = tree.text.decode("utf-8", "replace")
+    text = tree.text.decode("utf-8", "replace")  # root-text-ok: a regex search
     if not re.search(r"\btypeof\s+(?:module|exports|define|require)\b", text) and any(
         _commonjs_statement(child) for child in tree.children
     ):
@@ -3720,7 +3720,7 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
         if _EXTENSIONS.get(Path(path).suffix) is None:
             continue
         try:
-            source = Path(path).read_text(encoding="utf-8")
+            source = mock_stubs._read_exact(path)
         except (OSError, UnicodeDecodeError):
             continue
         if not any(n in source for n in (*names, *props)):
@@ -3793,7 +3793,7 @@ def _key_constant(tree: Node, call: Node, prop: str, flag_key: str) -> bool:
     binders = ts_scope.bindings(tree, name)
     if len(binders) != 1:
         return False
-    consts = key_const._ts_key_consts(tree, tree.text, flag_key)
+    consts = key_const._ts_key_consts(tree, source_bytes.of(tree), flag_key)
     return any(const.name == name and any(n.id == binders[0].id for n in const.name_nodes) for const in consts)
 
 

@@ -86,6 +86,7 @@ from polyglot_piranha import PiranhaArguments, execute_piranha
 
 from flag_cleanup import (
     py_key_survivors,
+    swift_removed_members,
     contradicting,
     cs_kept_tests,
     cs_orphan_usings,
@@ -1947,6 +1948,10 @@ class TransformOutcome:
     #: row of its own). A wrapper that did not qualify has one row at its
     #: declaration giving the reason. See :mod:`flag_cleanup.wrapper_inline`.
     wrapper_findings: tuple[tuple[str, int, str, str, str], ...] = ()
+    #: Whether this pass folds a read of a `flag-maps` map, the key in the
+    #: read's own file or in a constant of another: the run then accounts for
+    #: the key over the whole checkout. See :mod:`flag_cleanup.ts_flag_maps`.
+    map_read: bool = False
 
 
 def run_piranha(
@@ -2007,8 +2012,16 @@ def transform_flag(
     key_positions: tuple[tuple[str, int | str], ...] = (),
     code_keys: frozenset[str] = frozenset(),
     flag_maps: tuple[str, ...] = (),
+    negated_accessors: tuple[str, ...] = (),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
+
+    ``negated_accessors`` names the reads that return the flag's OPPOSITE
+    (``!isDisabled`` in the ``accessors`` input). They reach the generated
+    rules alone, complemented (:func:`rule_synthesis.negating`); every other
+    pass is told ``accessors`` only, so none of them can take such a read for
+    the served value. A Kotlin run, whose reads are not cloned rules, refuses a
+    flag one of them reads.
 
     ``flag_key`` is the key as the CODE spells it. ``code_keys`` holds every
     spelling the ``key-aliases`` input maps a flag to; one of them, as
@@ -2054,6 +2067,7 @@ def transform_flag(
     # The one place a run's accessors are narrowed to its language: everything
     # below, rules and passes alike, sees only names its language can spell.
     accessors = rule_synthesis.accessors_for(language, accessors)
+    negated_accessors = rule_synthesis.accessors_for(language, negated_accessors)
     positions = dict(key_positions)
     if language not in KEY_POSITION_LANGUAGES:
         accessors = tuple(name for name in accessors if name not in positions)
@@ -2077,12 +2091,14 @@ def transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
                 known_flag_keys, doubles, gates, inline_wrappers, flag_default, read_elsewhere,
                 entries=entries, key_positions=positions, code_keys=code_keys,
+                negated_accessors=negated_accessors,
             )
         except _NoReadFolded:
             return _transform_flag(
                 repo_dir, language, flag_key, treatment, paths, accessors,
                 known_flag_keys, None, gates, inline_wrappers, flag_default,
                 entries=entries, key_positions=positions, code_keys=code_keys,
+                negated_accessors=negated_accessors,
             )
         except BaseException:
             # Newest first: a later pass's "original" is an earlier pass's
@@ -2090,6 +2106,118 @@ def transform_flag(
             for prepass in reversed(doubles):
                 prepass.restore_all()
             raise
+
+
+def _refuse_negated_kotlin_reads(
+    paths: list[str], repo_dir: str, flag_key: str, names: tuple[str, ...]
+) -> None:
+    """Refuse the flag when a Kotlin file of it calls a negated accessor.
+
+    Kotlin's reads are folded by the sentinel pre-pass, not by cloned rules, so
+    the complement :func:`rule_synthesis.negating` makes has nowhere to happen
+    there. Left to the pre-pass the call would be no read at all, and the rest
+    of the removal would go ahead around a read of the flag it never folded.
+    Any call of the name in a file that holds the key refuses: which key the
+    call reads is the pre-pass's question, and it is not asked here.
+    """
+    call = re.compile(r"(?<![\w$])(?:" + "|".join(map(re.escape, names)) + r")\s*[({]")
+    reasons: dict[str, str] = {}
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        found = call.search(text)
+        if found is not None:
+            name = found.group(0).rstrip("({ \t\n")
+            reasons[path] = (
+                f"calls `{name}`, which `accessors` declares negated (`!{name}`); a "
+                "negated accessor is not folded in Kotlin yet, so the flag is left "
+                "for that read to be rewritten by hand"
+            )
+    if reasons:
+        raise UnsafeRewriteError(
+            f"the Kotlin transform refused flag {flag_key!r}: "
+            + "; ".join(f"{os.path.relpath(path, repo_dir)} {why}" for path, why in sorted(reasons.items())),
+            refused=sorted(reasons),
+            discarded=[],
+            reasons=reasons,
+        )
+
+
+def _folded_name(name: str) -> str:
+    """``name`` as :func:`accessor_mentions` compares it: lower case, without
+    ``_`` and a Ruby ``?``/``!``, so ``isDisabled``, ``is_disabled``,
+    ``IsDisabled`` and ``:is_disabled?`` all fold to ``isdisabled``."""
+    return name.rstrip("?!").replace("_", "").lower()
+
+
+def _checkout_sources(roots: Iterable[str]) -> list[tuple[str, str]]:
+    """``(path, text)`` of every source file under ``roots``, once each."""
+    files: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path in source_files(Path(root), KNOWN_EXTENSIONS, _SKIP_DIRS):
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                files.append((str(path), path.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                continue
+    return files
+
+
+def key_constant_names(roots: Iterable[str], flag_key: str) -> frozenset[str]:
+    """The names any source file under ``roots`` binds to ``flag_key`` as a
+    string literal (``KEY = 'k'``, ``const KEY = "k"``, ``case key = "k"``,
+    ``static final String KEY = "k"``). Read BEFORE a removal: the run may
+    delete a declaration whose name a read it did not fold still spells."""
+    key = re.escape(flag_key)
+    binding = re.compile(
+        r"(?<![\w$])([A-Za-z_$][\w$]*)\s*(?::[^=\n]*)?=\s*[@rbuf]?[\"'`]" + key + r"[\"'`]"
+    )
+    return frozenset(m.group(1) for _path, text in _checkout_sources(roots) for m in binding.finditer(text))
+
+
+def accessor_mentions(
+    roots: Iterable[str],
+    flag_key: str,
+    names: Iterable[str],
+    constants: Iterable[str] = (),
+) -> dict[str, str]:
+    """``{path: name}`` for every source file under ``roots`` that holds both
+    one of ``names`` and the key.
+
+    Sound by construction, not by shape: a "mention" of a name is its folded
+    spelling (:func:`_folded_name`) anywhere in the file's folded text, so a
+    call, a stub's string (`spyOn(f, 'isDisabled')`, `receive(:disabled?)`,
+    `On("IsDisabled", …)`), a `.return_value` attribute and a comment all
+    count; a mention of the key is the key itself, or one of ``constants``
+    (:func:`key_constant_names`, read before the removal) or a name the
+    checkout binds to the key now. It over-reports by design: a file holding
+    both is one where a read through the name may stand, and the callers
+    refuse a flag rather than guess.
+    """
+    folded = {_folded_name(name): name for name in names if _folded_name(name)}
+    if not folded:
+        return {}
+    files = _checkout_sources(roots)
+    key_text = re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(flag_key) + r"(?![A-Za-z0-9_\-])")
+    every = sorted(set(constants) | key_constant_names(roots, flag_key))
+    constant = (
+        re.compile(r"(?<![\w$])(?:" + "|".join(map(re.escape, every)) + r")(?![\w$])") if every else None
+    )
+    found: dict[str, str] = {}
+    for path, text in files:
+        squashed = text.replace("_", "").lower()
+        hit = next((name for spelling, name in folded.items() if spelling in squashed), None)
+        if hit is None:
+            continue
+        if key_text.search(text) or (constant is not None and constant.search(text)):
+            found[path] = hit
+    return found
 
 
 @contextlib.contextmanager
@@ -2125,6 +2253,7 @@ def _transform_flag(
     entries: bool = True,
     key_positions: dict[str, int | str] | None = None,
     code_keys: frozenset[str] = frozenset(),
+    negated_accessors: tuple[str, ...] = (),
 ) -> TransformOutcome:
     """Remove ``flag_key`` from the code under ``repo_dir`` and return a diff.
 
@@ -2234,6 +2363,9 @@ def _transform_flag(
     sibling_readers = [p for p in paths if _grammar_of(p, language) != language]
     paths = [p for p in paths if p not in sibling_readers]
 
+    if language == "kt" and negated_accessors:
+        _refuse_negated_kotlin_reads(paths, repo_dir, flag_key, negated_accessors)
+
     # PRE-FLIGHT — drop any file the GATE cannot fully parse, before the engine
     # is handed it. Dart only; see `syntax.source_is_unreadable` for the defect
     # this closes and the corpus measurement that makes an absolute parse check
@@ -2253,16 +2385,7 @@ def _transform_flag(
         and ts_flag_maps.has_read(paths, flag_key)
     )
     if map_accounting:
-        map_refusals = ts_flag_maps.refusals(checkout_root(repo_dir), flag_key)
-        if map_refusals:
-            raise UnsafeRewriteError(
-                f"the {spec.display_name} transform refused flag {flag_key!r}: the key is also written "
-                "or spelled where a `flag-maps` fold cannot account for it ("
-                + "; ".join(f"{path}: {why}" for path, why in sorted(map_refusals.items())) + ")",
-                refused=sorted(map_refusals),
-                discarded=[],
-                reasons=map_refusals,
-            )
+        _refuse_map_writes(spec, repo_dir, flag_key)
 
     # An accessor with an un-awaited read that must not become a bare literal
     # (it returns a Promise, or could) is "managed": its un-awaited reads are
@@ -2403,13 +2526,16 @@ def _transform_flag(
     # pre-pass below, which is the only part of this that can read a key.
     generated_rules: tempfile.TemporaryDirectory | None = None
     flag_maps = tuple(sorted(ts_flag_maps.names()))
-    if (all_accessors or flag_maps) and language != "kt":
+    if (all_accessors or flag_maps or negated_accessors) and language != "kt":
         generated_rules = tempfile.TemporaryDirectory(prefix="flag-cleanup-rules-")
-        rules_file, const_rules_file = _write_generated_rules(
-            Path(generated_rules.name), rules_file, const_rules_file,
-            tuple(a for a in all_accessors if a not in async_names),
-            key_positions=key_positions, async_accessors=async_names, flag_maps=flag_maps,
-        )
+        # A negated accessor reaches the rules here and nowhere else: its
+        # clones write the untreated literal (`rule_synthesis.negating`).
+        with rule_synthesis.negating(negated_accessors):
+            rules_file, const_rules_file = _write_generated_rules(
+                Path(generated_rules.name), rules_file, const_rules_file,
+                (*(a for a in all_accessors if a not in async_names), *negated_accessors),
+                key_positions=key_positions, async_accessors=async_names, flag_maps=flag_maps,
+            )
 
     # `untreated` is `treated`'s complement — the literal spelling of the branch
     # this run is DELETING — and it exists for the `*_entries.toml` rules alone.
@@ -2742,6 +2868,17 @@ def _transform_flag(
                 refused=[prepass.failed_path] if prepass.failed_path else [],
                 discarded=sorted(set(prepass.originals) - {prepass.failed_path}),
             ) from exc
+
+    # `flag-maps` through a constant of another file: the same accounting as
+    # above, which the key's text alone could not show (a reader never holds it).
+    if (
+        not map_accounting
+        and ts_flag_maps.names()
+        and language in _FLAG_MAP_LANGUAGES
+        and ts_flag_maps.has_cross_file_read(resolution.readers)
+    ):
+        map_accounting = True
+        _refuse_map_writes(spec, repo_dir, flag_key)
 
     reader_rules = _reader_rules(
         spec, flag_key, rules_file, accessors, resolution, reader_paths, reader_const
@@ -3712,6 +3849,14 @@ def _transform_flag(
                     "the state this removal deletes, so delete or rewrite it first"
                     + (f" ({len(found)} such assertions)" if len(found) > 1 else "")
                 )
+    # A stored property the engine deleted that something still names: a read
+    # through another value, a key path, a projected value, a capture. Asked of
+    # the bytes the run produced, not of the engine's own guard.
+    if language == "swift" and changed:
+        for path, reason in swift_removed_members.refusals(
+            changed, repo_dir, file_deletion.deleted
+        ).items():
+            reasons.setdefault(path, reason)
     if language == "python" and changed:
         for path, reason in py_key_survivors.refusals(
             changed, repo_dir, flag_key, file_deletion.deleted
@@ -3815,6 +3960,7 @@ def _transform_flag(
             (os.path.relpath(f.path, repo_dir), f.line, f.reason, f.text, f.wrapper)
             for f in wrapper_rows
         ),
+        map_read=map_accounting,
     )
 
 
@@ -5989,6 +6135,21 @@ def _refused_at(resolution: cross_file_keys.Resolution | None, path: str) -> boo
     return any(r.path == resolved for r in resolution.refusals)
 
 
+def _refuse_map_writes(spec: _Language, repo_dir: str, flag_key: str) -> None:
+    """Refuse the flag when :func:`ts_flag_maps.refusals` finds the key written or
+    spelled where a `flag-maps` fold cannot account for it. Asked before the engine."""
+    map_refusals = ts_flag_maps.refusals(checkout_root(repo_dir), flag_key)
+    if map_refusals:
+        raise UnsafeRewriteError(
+            f"the {spec.display_name} transform refused flag {flag_key!r}: the key is also written "
+            "or spelled where a `flag-maps` fold cannot account for it ("
+            + "; ".join(f"{path}: {why}" for path, why in sorted(map_refusals.items())) + ")",
+            refused=sorted(map_refusals),
+            discarded=[],
+            reasons=map_refusals,
+        )
+
+
 def _key_paths(paths: list[str], flag_key: str) -> list[str]:
     return [
         p
@@ -6043,6 +6204,8 @@ def _reader_rules(
         return None
     template = (RULES_DIR / f"{spec.rule_base}_xconst.toml").read_text(encoding="utf-8")
     positional = _key_position_templates_for(RULES_DIR / f"{spec.rule_base}_xconst.toml")
+    # `flags[KEY]` with KEY a proven reference: the `flag-maps` clones.
+    flag_maps = tuple(sorted(ts_flag_maps.names())) if spec.rule_base == "ts" else ()
     base = rules_file.read_text(encoding="utf-8")
     keyed = frozenset(_key_paths(reader_paths, flag_key))
     # The wrapper pass's sentinel, when a reader also calls a keyless wrapper
@@ -6070,11 +6233,11 @@ def _reader_rules(
                 paths=frozenset(paths),
                 keyless=rule_synthesis.cross_file_key_rules(
                     base, template, refs, accessors=accessors, marked=marked,
-                    positional_text=positional,
+                    positional_text=positional, flag_maps=flag_maps,
                 ),
                 keyed=rule_synthesis.cross_file_key_rules(
                     base, template, refs, accessors=accessors, strip_key_hole=False,
-                    marked=marked, positional_text=positional,
+                    marked=marked, positional_text=positional, flag_maps=flag_maps,
                 ),
             )
         )

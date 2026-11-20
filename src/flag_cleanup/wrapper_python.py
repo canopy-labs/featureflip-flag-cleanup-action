@@ -51,7 +51,7 @@ from pathlib import Path
 
 from tree_sitter import Node
 
-from flag_cleanup import cross_file_keys, key_const, mock_stubs, syntax
+from flag_cleanup import cross_file_keys, key_const, mock_stubs, source_bytes, syntax
 from flag_cleanup import wrapper_inline as wi
 
 logger = logging.getLogger(__name__)
@@ -682,11 +682,8 @@ def member_end(member: Node) -> int:
     separation the member had (two blank lines at the top level, one in a
     class). Before a dedent (the last method of a class) the member's own
     end, which leaves the larger gap the dedented statement had."""
-    root = member
-    while root.parent is not None:
-        root = root.parent
-    data, base = root.text, root.start_byte
-    end = data.find(b"\n", member.end_byte - base)
+    data = source_bytes.of(member)
+    end = data.find(b"\n", member.end_byte)
     if end == -1:
         return member.end_byte
     column = member.start_point[1]
@@ -696,7 +693,7 @@ def member_end(member: Node) -> int:
         line = data[position : len(data) if line_end == -1 else line_end]
         if line.strip():
             indent = len(line) - len(line.lstrip(b" \t"))
-            return base + position - 1 if indent == column else member.end_byte
+            return position - 1 if indent == column else member.end_byte
         if line_end == -1:
             break
         position = line_end + 1
