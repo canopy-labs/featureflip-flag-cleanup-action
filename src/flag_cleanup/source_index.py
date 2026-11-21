@@ -183,7 +183,7 @@ def _present(listing: tuple[SourceFile, ...]) -> tuple[SourceFile, ...]:
         return listing
     forgotten = frozenset(_forgotten)
     cached = _filtered.get(id(listing))
-    if cached is not None and cached[0] is listing and cached[1] == forgotten:
+    if cached is not None and cached[0] is listing and cached[1] == forgotten:  # identity: cache keyed by the listing object
         return cached[2]
     kept = tuple(f for f in listing if f.resolved not in forgotten)
     _filtered.clear()

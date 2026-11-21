@@ -1315,7 +1315,7 @@ def plan_callers(
         for node in _walk(tree):
             if node.type == "uri" and "dart:mirrors" in _text(node):
                 return f"{file} imports dart:mirrors"
-            if node.type in _TYPE_DECLARATIONS and node is not cls:
+            if node.type in _TYPE_DECLARATIONS and node != cls:
                 label = next((c for c in node.named_children if c.type in ("identifier", "type_identifier")), None)
                 if label is not None and _text(label) == class_name:
                     return f"{_where(file, node)}: another declaration of {class_name}"

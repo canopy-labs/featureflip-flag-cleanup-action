@@ -8,6 +8,67 @@ has no section here is refused before anything is built. Changes that have not
 been released yet are kept as separate notes and gathered into the version's
 section when it is released.
 
+## 2.21.0
+
+### Added
+
+- Ruby: tests that set the flag with Flipper (`Flipper.enable(:k)`, `Flipper.disable(:k)`) or stub its read for the key (`allow(Flipper).to receive(:enabled?).with(:k, user).and_return(true)`, or the Mocha form) are now cleaned up with the flag. A test of the removed value is deleted, a pin or stub of the kept value is deleted from its test, and a write that only resets the flag after a test or in a `teardown`/`after` hook goes. A `before`/`setup` pin of the removed value deletes the tests it governs.
+- Ruby: a flag read stored in an instance variable (`@preview = Flipper.enabled?(:k)`) now has its later reads in the same method folded too (`@preview ? a : []`, `x if @preview`), when every write of that variable in the repository stores the same value. The assignment itself stays, because a view or another method may read it, and the pull request names it.
+
+### Changed
+
+- Blade: a directive your own code registers with `Blade::directive`, such as `@money($amount, 'GBP')`, no longer leaves a view untouched when it sits inside a flag's `@if` or `@feature`. The Action reads the registration and, when the closure only returns text built from string literals and its argument, checks each use: one that compiles to whole PHP statements or markup is kept with the code around it. A registration it cannot read keeps the old behaviour, and the view is listed in the pull request. The `@money` and `@currency` directives of `akaunting/laravel-money` are known the same way when `composer.lock` installs a release from 1.0.0 to 6.1.0.
+- ERB: in an HTML template (`.html.erb`), the markup a removed `<% if %>` wrapped now moves back by the indentation the tag added, and a block removed between two blank lines leaves one blank line instead of two. Partials, ViewComponent templates, templates that use a `<pre>`, `<textarea>`, `<script>` or `<style>` element or a `white-space` style anywhere, attribute values, multi-line Ruby strings and block helpers it cannot vouch for keep their layout exactly. Other templates, such as `.text.erb` mailers, keep their indentation and blank lines exactly.
+
+### Fixed
+
+- Blade: raw PHP or an `@php` block inside a flag's `@if` that spells `else:` or `default:` (which the PHP grammar reads as a label) no longer lets the flag's removal drop one of its branches. The view is left as it is and listed, like any other PHP there that is not whole statements. If a removal this Action opened has already been merged, check the Blade views it changed for a flag's `@if` that lost a branch where its PHP spelled `else:` or `default:`.
+- Blade: a `//` or `#` comment inside raw PHP ends at `?>`, as PHP reads it, so a directive after such a comment (`<?php // it's fine ?>`) is no longer missed when the Action checks a rewritten view.
+- Blade: an Alpine or Vue event attribute with a hyphenated event name (`@modal-ok.window="…"`, `@date-picked="…"`) inside a flag's `@if` or `@feature` no longer leaves the view untouched. Like `@click="…"`, it is markup, and the flag is removed around it.
+- A negated accessor (`!isDisabled`) read through a key held in an enum entry (`VOTING("k")`), a typed Go constant, an object or hash property, a constructed holder, a Ruby symbol or `%q(k)`, or a name bound to one of these, now refuses the flag instead of being left unfolded beside the flag's folded reads. If a removal this Action opened has already been merged, search it for a negated read of the flag's accessor (`!isDisabled`) that is still there: it no longer agrees with the value the rest of the removal kept.
+- C#: a local declared without an initializer (`int x;`) that the removal leaves unread is now deleted with the rest of the flag's code, instead of staying behind as an unused-variable warning that fails a build treating warnings as errors.
+- Ruby: a method the removal folds down to a bare `return` now comes back empty, whatever its parameters, and a bare `return` left as the last line after a `return if …` or `return unless …` is dropped. Both return `nil` exactly as before. A method left empty is named in the pull request, so a reviewer can delete it together with its callers.
+- Swift: the code a removed flag leaves after an unconditional `return` is now
+  deleted inside closures of a computed property (a SwiftUI `body`'s
+  `.task { }`, `.onReceive { }`, `.refreshable { }`), in an initializer, a
+  deinitializer, an accessor, a property observer, a subscript and a
+  file-scope closure, as it already was in a function. Before, a
+  `guard <flag> else { return }` there became a bare `return` with the rest
+  of the closure still below it, and Swift reads `return` followed by a call
+  on the next line as `return <call>`, so that call still ran. If a removal
+  this Action opened has already been merged, check its closures and
+  initializers for a bare `return` with code on the lines below it. A `return` left
+  last in an initializer, deinitializer, setter or observer goes too, and one
+  left last in a closure goes when nothing or two or more statements are left
+  before it (with one statement left, removing it could change the closure's
+  result type). A one-line body (`{ guard <flag> else { return }; work() }`)
+  now comes out as valid code instead of failing the run.
+- Swift: dead code after a `return` that declares a local function, type or
+  typealias is now kept, with the bindings beside it, rather than deleted.
+  Swift lets those be used above their declaration, so deleting one broke the
+  code before the `return`. In a closure, a dead statement that returns a
+  value is kept too, since it can decide the closure's result type.
+- Swift: a removal that would leave a statement after a bare `return`, where
+  Swift would run it as the returned value, is now refused instead of shipped.
+  So is one that would keep a `lazy`, computed, observed, wrapped or
+  `async let` binding there, which fails to link. A changed file that already
+  had code after a bare `return` (Swift warns on it) is refused too.
+- Swift: a `private` wrapper member of a struct or enum with an inheritance
+  clause is now inlined at its callers and deleted, as one of a type with none. This is
+  the usual SwiftUI shape, `private var xEnabled: Bool { flags.isEnabled("x") }`
+  on a `struct … : View`, which used to be kept as `overridable` with every
+  `if xEnabled` left for the reviewer. Swift does not let a `private` member
+  satisfy a protocol requirement, so the conformance cannot reach it. A
+  `fileprivate` member is treated the same unless its type is itself `private`
+  or `fileprivate`, or its file declares a file-private protocol the type
+  conforms to.
+- Swift: a wrapper read as a whole `if` or `guard` condition (`if xEnabled {`)
+  no longer counts as a second declaration of its name, which kept the
+  wrapper and every caller unchanged.
+- Swift: a file using `try` or `await` on a plain name or property right before the `{` of an `if`, `while` or `switch` (the `async let` idiom `if let detail = try? await detailTask {`, or `while let item = await queue {`) is now rewritten. Before, the Swift grammar read the `{` as a closure passed to the name, the file did not parse, and the pull request listed it as unprocessed with every flag read in it left in place.
+- TypeScript and JavaScript: a flag read through a key reached by a module's default export (`import F from "./keys"` where the module does `export default 'key'`, `export default K`, `export { default as F } from`, or `module.exports = …`) is now listed as `unsupported-form` at the import or export that takes it, instead of being skipped without a word.
+- Removing a flag block that was the last statement of a file no longer leaves a blank line at the end of the file, which Laravel Pint, PHP-CS-Fixer, RuboCop and Prettier reject. The blank line that separated the block from the code above it now goes with the block.
+
 ## 2.20.0
 
 ### Added

@@ -198,7 +198,7 @@ def _scoped_statements(
     stack: list[tuple[ast.AST, tuple[str, ...], ast.AST]] = [(tree, (), tree)]
     while stack:
         node, path, owner = stack.pop()
-        if node is not tree:
+        if node is not tree:  # identity: Python ast nodes
             found.append((node, path, owner))
         if isinstance(node, _SCOPES):
             path, owner = path + (node.name,), node

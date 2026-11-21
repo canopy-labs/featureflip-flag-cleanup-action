@@ -679,6 +679,14 @@ def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
     lines = source.splitlines()
     for line, _name in key_const.ts_unaccepted_key_forms(root, source.encode("utf-8"), flag_key):
         refused.append(xk.Refusal(path, line, xk.UNSUPPORTED_FORM, lines[line - 1].strip()))
+    # A module's default export holding the key is imported under any local
+    # name, which no reader rule spells: say why its reads stay. A file that
+    # declares a key constant is judged by :func:`constant_module_escapes`
+    # instead, which names each importer and keeps the constant's own reads.
+    data = source.encode("utf-8")
+    if not key_const.key_consts(root, data, _language(path), flag_key):
+        for node in _default_exports_of_key(root, set(), flag_key):
+            refused.append(xk.refusal(path, node, xk.UNSUPPORTED_FORM, source))
     for decl in found:
         spellings = _member_spellings(root, decl.name) + [
             node
@@ -691,6 +699,91 @@ def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
             first = min(spellings, key=lambda n: n.start_byte)
             refused.append(xk.refusal(path, first, xk.UNSUPPORTED_FORM, source, decl.entry))
     return refused
+
+
+#: Default-exported values that never are the key an importer reads.
+_NOT_KEY_VALUES = frozenset({"class", "function_expression", "arrow_function", "generator_function"})
+
+#: The CommonJS spellings of a module's default export.
+_COMMONJS_DEFAULTS = frozenset({"module.exports", "exports.default", "module.exports.default"})
+
+
+def _string_consts(root: Node) -> set[str]:
+    """The names of the file's top-level ``const`` declarators bound to a plain
+    string, whatever it holds (a key constant among them)."""
+    found: set[str] = set()
+    for statement in root.named_children:
+        declaration = statement
+        if statement.type == "export_statement":
+            declaration = statement.child_by_field_name("declaration")
+        if declaration is None or declaration.type != "lexical_declaration" or _text(declaration).split()[0] != "const":
+            continue
+        for declarator in declaration.named_children:
+            if declarator.type != "variable_declarator":
+                continue
+            name = declarator.child_by_field_name("name")
+            value = _unwrap(declarator.child_by_field_name("value"))
+            if (
+                name is not None
+                and name.type == "identifier"
+                and value is not None
+                and value.type in ("string", "template_string")
+            ):
+                found.add(_text(name))
+    return found
+
+
+def _default_exports_of_key(root: Node, names: set[str], flag_key: str | None) -> list[Node]:
+    """Each top-level statement making the module's default export hold the
+    key: ``export default "<key>"``, ``export default K`` or ``export { K as
+    default }`` for one of the constants ``names``, ``export default { x:
+    "<key>" }``, and ``module.exports = ...`` or ``exports.default = ...``
+    holding either. ``flag_key`` None: only through ``names``.
+
+    An importer binds a default export under a name of its own choosing
+    (``import F from "./keys"``), so a read through it spells neither the key
+    nor the constant, and the reads are never judged at all. Over-reports by
+    design: a default export that merely contains the key is listed too.
+    """
+
+    def holds(node: Node | None) -> bool:
+        if node is None:
+            return False
+        for n in _walk(node):
+            if flag_key is not None and n.type == "string" and _string_value(n) == flag_key:
+                return True
+            if flag_key is not None and n.type == "template_string" and _text(n)[1:-1] == flag_key:
+                return True
+            if n.type in ("identifier", "shorthand_property_identifier") and _text(n) in names:
+                return True
+        return False
+
+    found: list[Node] = []
+    for statement in root.named_children:
+        if statement.type == "export_statement":
+            if any(c.type == "default" for c in statement.children):
+                # A default class is judged as a holder of static fields, and
+                # a function's key is no value an importer reads as the key.
+                value = _unwrap(statement.child_by_field_name("value"))
+                if value is not None and value.type not in _NOT_KEY_VALUES and holds(value):
+                    found.append(statement)
+                continue
+            clause = next((c for c in statement.named_children if c.type == "export_clause"), None)
+            if clause is not None and statement.child_by_field_name("source") is None and any(
+                spec.type == "export_specifier"
+                and _text(spec.child_by_field_name("alias") or spec.child_by_field_name("name")) == "default"
+                and holds(spec.child_by_field_name("name"))
+                for spec in clause.named_children
+            ):
+                found.append(statement)
+        elif statement.type == "expression_statement":
+            assignment = next((c for c in statement.named_children if c.type == "assignment_expression"), None)
+            left = assignment.child_by_field_name("left") if assignment is not None else None
+            if left is not None and "".join(_text(left).split()) in _COMMONJS_DEFAULTS:
+                right = _unwrap(assignment.child_by_field_name("right"))
+                if right is not None and right.type not in _NOT_KEY_VALUES and holds(right):
+                    found.append(statement)
+    return found
 
 
 # --- specifier resolution ---------------------------------------------------------
@@ -5039,7 +5132,107 @@ def constant_module_escapes(path: str, repo_dir: str) -> list[xk.Refusal]:
     return [
         xk.Refusal(where, line, xk.UNSUPPORTED_FORM, text)
         for where, line, text in wrapper_ts.handed_on(repo_dir, path, named=True, holders=True)
-    ]
+    ] + _default_takers(path, repo_dir)
+
+
+def _default_takers(path: str, repo_dir: str) -> list[xk.Refusal]:
+    """When the module at ``path`` makes its default export hold a key
+    constant (``export default K``, ``export { K as default }``,
+    ``module.exports = K``), each place that takes that default,
+    ``unsupported-form``: ``import F from``, ``import { default as F } from``,
+    a re-export ``export { default } from`` or ``export { default as F }
+    from``, a ``require()`` not destructured into named members, and a
+    dynamic ``import()``. The importer binds the value under a name of its
+    own, which no reader rule spells, so its reads are never judged.
+
+    A specifier that resolves to another file is not one; one that resolves
+    to nothing in a file whose text can name the module (a package or path
+    alias the resolver cannot read) is, since it may be."""
+    try:
+        source = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    root = ts_syntax._parse(source, _language(path))
+    if not _default_exports_of_key(root, _string_consts(root), None):
+        return []
+    from flag_cleanup import ts_scope
+
+    module = str(Path(path).resolve())
+    found: list[xk.Refusal] = []
+    for importer in xk.mention_files(repo_dir, (), exclude=(path,), also=module_pattern({module}, repo_dir)):
+        if not importer.endswith(ts_scope.FAMILY_EXTENSIONS):  # a component is judged by `handed_on`
+            continue
+        try:
+            text = Path(importer).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            found.append(xk.Refusal(importer, 1, xk.UNSUPPORTED_FORM, ""))
+            continue
+        tree = ts_syntax._parse(text, _language(importer))
+        for site, specifier in _takes_default(tree, text):
+            spec = _string_value(specifier)
+            target = resolve_specifier(importer, spec, repo_dir) if spec is not None else None
+            if target is not None and str(Path(target).resolve()) != module:
+                continue
+            found.append(xk.refusal(importer, site, xk.UNSUPPORTED_FORM, text))
+    return found
+
+
+def _takes_default(root: Node, text: str) -> list[tuple[Node, Node | None]]:
+    """``(site, specifier)`` for each place in a file that can take a
+    module's default export: a default import or ``{ default as F }``, a
+    re-export of ``default``, a namespace import or ``export * as`` in a file
+    that spells ``.default`` or ``["default"]``, a ``require()`` that is not a
+    destructuring into named members, and a dynamic ``import()``."""
+    reads_default = bool(re.search(r"\.\s*default\b|\[\s*[\"'`]default[\"'`]\s*\]", text))
+    found: list[tuple[Node, Node | None]] = []
+    for node in _walk(root):
+        if node.type in ("import_statement", "export_statement"):
+            source = node.child_by_field_name("source")
+            if source is None:
+                continue
+            for part in node.named_children:
+                if part.type == "import_clause":
+                    for clause in part.named_children:
+                        if clause.type == "identifier" or (clause.type == "namespace_import" and reads_default):
+                            found.append((node, source))
+                        elif clause.type == "named_imports" and any(
+                            _text(spec.child_by_field_name("name")) == "default"
+                            for spec in clause.named_children
+                            if spec.type == "import_specifier"
+                        ):
+                            found.append((node, source))
+                elif part.type == "export_clause" and any(
+                    _text(spec.child_by_field_name("name")) == "default"
+                    for spec in part.named_children
+                    if spec.type == "export_specifier"
+                ):
+                    found.append((node, source))
+                elif part.type == "namespace_export" and reads_default:
+                    found.append((node, source))
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            arguments = node.child_by_field_name("arguments")
+            first = next((a for a in arguments.named_children if a.type != "comment"), None) if arguments else None
+            if function is None or first is None:
+                continue
+            if function.type == "import":
+                found.append((node, first))
+            elif function.type == "identifier" and _text(function) == "require":
+                holder = node.parent
+                declarator = holder is not None and holder.type == "variable_declarator"
+                pattern = holder.child_by_field_name("name") if declarator else None
+                if (
+                    pattern is not None
+                    and pattern.type == "object_pattern"
+                    and holder.child_by_field_name("value") == node
+                    and not any(c.type == "rest_pattern" for c in pattern.named_children)
+                    and "default" not in {
+                        _text(c.child_by_field_name("key") or c) for c in pattern.named_children
+                    }
+                ):
+                    continue  # `const { K } = require(...)`: named members only
+                found.append((node, first))
+    return found
 
 
 def declared_classifiers(path: str, source: str) -> set[tuple[str, str]]:

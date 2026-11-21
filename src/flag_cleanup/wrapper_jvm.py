@@ -375,7 +375,7 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     member = wrapper
     for supertype in owner.supertypes:
         # A type is never its own supertype: the name is another type's.
-        candidates = [c for c in index.types.get(supertype, []) if c is not owner]
+        candidates = [c for c in index.types.get(supertype, []) if c is not owner]  # identity: declarations of one index
         declared_in = (lambda c: c.properties) if wrapper.kind == "property" else (lambda c: c.members)
         if not any(wrapper.name in declared_in(c) for c in candidates):
             continue
@@ -433,7 +433,7 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
         owner.open
         or index.wrapper_words & {"open", "abstract"}
         or wrapper.owner in index.loose_subclassed
-        or any(d is not owner for d in index.extenders.get(wrapper.owner, ()))
+        or any(d is not owner for d in index.extenders.get(wrapper.owner, ()))  # identity: declarations of one index
     ):
         return None, wi.OVERRIDABLE
     return member, None

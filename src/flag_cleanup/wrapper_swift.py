@@ -28,7 +28,9 @@ module level; a member through the static type of its receiver. So:
   every binding in the file is one.
 
 A type with an inheritance clause (a protocol requirement may be called
-through the protocol, and the member is that conformance), an ``open``
+through the protocol, and the member is that conformance) is refused, unless
+the member cannot witness a requirement (:func:`_unwitnessable`: ``private``,
+or ``fileprivate`` with nothing file-private to conform to); an ``open``
 class, a class anything in the repository subclasses, and a member that is
 ``open``, ``class``, ``override``, ``dynamic`` or carries any attribute
 (``@objc``, ``@available``, ...) are refused; a subclass or a sibling
@@ -403,6 +405,16 @@ def _binds(node: Node) -> bool:
         return False
     if parent.type == "parameter" and _field_of(node) == "external_name":
         return False  # an argument label binds nothing in the body
+    if (
+        parent.type in ("if_statement", "guard_statement")
+        and _field_of(node) == "condition"
+        and (node.prev_sibling is None or node.prev_sibling.type != ".")
+    ):
+        # `if name {`, `guard name else`, the `y` of `if let x = y`: a read,
+        # never a binding (an optional binding's name is the
+        # `bound_identifier`). The case of `if case .a = v` is a direct child
+        # too, after a `.`, and stays counted: it is not a read either.
+        return False
     return key_const._swift_is_binding(node) or parent.type in _BINDERS or _field_of(node) == "bound_identifier"
 
 
@@ -589,7 +601,7 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     if not top_level(wrapper):
         for path, line, text in index.subtypes:
             return None, wi.Refused(wi.TEST_DOUBLE if _is_test(path) else wi.OVERRIDABLE, path, line, text)
-        if index.conformances:
+        if index.conformances and not _unwitnessable(wrapper, index):
             sibling = next((t for t in index.test_types if set(t[3]) & index.conformances), None)
             if sibling is not None:
                 return None, wi.Refused(wi.TEST_DOUBLE, *sibling[:3])
@@ -601,6 +613,48 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     if len(index.declarations) != 1:
         return None, wi.NAME_NOT_UNIQUE
     return wrapper, None
+
+
+def _unwitnessable(wrapper: wi.Wrapper, index: Index) -> bool:
+    """Whether no conformance can make the member a protocol requirement's
+    witness, so the owner's inheritance clause cannot route a call to it.
+
+    Measured with swiftc 6.0: a ``private`` member never witnesses a
+    requirement (``must be declared internal because it matches a requirement
+    in internal protocol``, or ``fileprivate`` for a file-private protocol),
+    even where a protocol extension supplies a default the conformance could
+    otherwise use. A ``fileprivate`` member witnesses only for a type that is
+    itself ``private`` or ``fileprivate``, or a protocol that is, and such a
+    protocol can only be conformed to in its own file: so it qualifies when
+    the owner is neither and its file declares no such protocol of a name the
+    owner conforms to. Only a member of a struct or an enum: a class may be
+    an ``NSObject`` (or ``@objcMembers``) one, whose members Objective-C can
+    reach by selector or key-value coding with no attribute on the member
+    itself, so a class keeps the old refusal. An attributed or ``dynamic``
+    member is refused before this (``annotated``, ``overridable``).
+    """
+    if wrapper.kind not in ("method", "property") or not wrapper.private:
+        return False
+    if index.owner_kind not in ("struct", "enum"):
+        return False
+    cached = index.file(wrapper.path)
+    if cached is None:
+        return False
+    root = cached[1]
+    declaration = next((n for n in _walk(root) if n.start_byte == wrapper.start and n.end_byte == wrapper.end), None)
+    if declaration is None:
+        return False
+    access = xs._written_access(declaration)
+    if access == "private":
+        return True
+    if access != "fileprivate" or index.owner_access in ("private", "fileprivate"):
+        return False
+    return not any(
+        n.type == "protocol_declaration"
+        and xs._written_access(n) in ("private", "fileprivate")
+        and xs._type_name(n) in index.conformances
+        for n in _walk(root)
+    )
 
 
 def _public(access: str | None) -> bool:

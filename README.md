@@ -1334,7 +1334,12 @@ test double of one is not resolved. So once a removal has changed anything,
 every source file of the checkout is checked: any file that still names a
 negated accessor (in any spelling: `isDisabled`, `is_disabled`, `:disabled?`,
 or as a string such as `spyOn(flags, 'isDisabled')`) together with the flag's
-key, or a constant holding the key, refuses the flag, naming the file. This
+key, or a name holding the key, refuses the flag, naming the file. A name
+holds the key when it is bound to it in any shape: a constant (typed or not),
+an enum entry (`VOTING("k")` included), a constructed holder
+(`new Feature("k")`), a Ruby symbol or `%q(k)`, a name bound to or imported as
+one of these, or an object or hash property, which counts only where it is
+read as a member (`Flags.voting`, `FLAGS[:voting]`) or destructured. This
 over-refuses on purpose: a comment or a registry that holds both stops the
 flag too. A double that names neither the key nor such a constant (a
 `mockReturnValue(true)` that answers every key) is not caught by this check;
@@ -3137,7 +3142,15 @@ read, which is why an `@objc` member is never a wrapper.
 
 A type with an inheritance clause, its own or an extension's, keeps its
 wrappers (`overridable`): a protocol it conforms to may call the member
-through an existential, and deleting it would break the conformance. So does
+through an existential, and deleting it would break the conformance. A
+`private` member of a `struct` or `enum` is the exception, and so is a
+`fileprivate` one of a type that is not itself `private` or `fileprivate`,
+unless its file declares a `private` or `fileprivate` protocol the type
+conforms to. Swift does not let such a member satisfy a protocol requirement,
+so the usual SwiftUI wrapper, `private var xEnabled: Bool { … }` on a
+`struct … : View`, is inlined and deleted like any other. A class keeps the
+refusal: as an `NSObject` (or `@objcMembers`) class, Objective-C can reach its
+members by selector or key-value coding. So does
 an `open` class, a class anything in the repository subclasses, and a member
 that is `open`, `class`, `override` or `dynamic`; a subclass, or another type
 conforming to the same protocol, in a test target (`Tests`, `Mocks`, `Fakes`)
@@ -5042,7 +5055,17 @@ A TypeScript or JavaScript key constant imported through a barrel, by
 `import { NAME }` or by a destructuring `const { NAME } = require("./barrel")`
 (`const` only, no rest element, no default value, no renaming `{ NAME: X }`), is folded
 like one imported from its own file. A default import through a barrel is not
-followed, nor is the barrel object itself (`const k = require("./barrel")`). The chain is followed through
+followed, nor is the barrel object itself (`const k = require("./barrel")`).
+A key reached through a module's default export (`export default 'key'`,
+`export default K` or `export { K as default }` for a key constant `K`,
+`export default { … }` holding the key, `module.exports = …`) is not folded
+either: the importer binds it under a name of its own (`import F from
+"./keys"`). Each place that takes such a default (a default import,
+`{ default as F }`, `export { default } from`, `export { default as F } from`,
+a `require()` that is not destructured into named members, `import()`) is
+listed as `unsupported-form`, and the file is left as it is; where the
+default export is the key itself, its own line is listed. A default export
+nothing takes changes nothing: the constant's reads elsewhere still fold. The chain is followed through
 `export { NAME } from "./m"` and `export * from "./m"`, any number of hops and
 through `paths` aliases, to the module that declares the constant. When
 the constant goes, the barrel's `export { NAME } from` line goes with it, or just that
@@ -6009,6 +6032,24 @@ stub beside any other `eq` is kept):
   not ones that pin the kept value), of the kept value only the pin. Declare `active` in `accessors` so the read is
   folded. `Feature::for($user)->activate(…)`, an array of keys and any value but
   `true` are left.
+* **Ruby** — Flipper's `Flipper.enable(:k)` and `Flipper.disable(:k)` (also
+  with an actor, as `Flipper.enable :k`, or `Flipper[:k].enable`), the key a
+  symbol, a string or a key constant; and an RSpec or Mocha stub of a read
+  callee answering for the key, `allow(Flipper).to
+  receive(:enabled?).with(:k, user).and_return(true)` (or `{ true }`, or
+  `Flipper.stubs(:enabled?).with(:k).returns(true)`), with
+  `expect(…).to have_received(:enabled?).with(:k, …)` as its verification.
+  Declare the read callee (`enabled?`) in `accessors`. A test is an RSpec
+  example, a group nested in another, a Minitest `test_*` method or an
+  ActiveSupport `test "…" do`. A write after the test's own code
+  (`Flipper.disable(:k)` as its last line) or in an `after`/`teardown` hook
+  puts the flag back and goes either way. A pin in a `before`/`setup` hook no
+  test encloses governs every test beside it: of the removed value it deletes
+  those tests (but not ones that pin the kept value), of the kept value only the
+  pin. A hook left empty goes with it. Left alone: a percentage or group
+  rollout (`enable_percentage_of_actors`, `enable_group`), a write inside some
+  other block (`expect { Flipper.enable(:k) }.to change { … }`), and a test
+  that writes both values before its last line.
 * **Python** — django-waffle's pins from `waffle.testutils`:
   `@override_flag("k", active=True)` on a test, `with override_flag("k", False):`
   inside one, and the same for `override_switch` and `override_sample`, with
@@ -7294,7 +7335,16 @@ via a local `use_new = client.bool_variation(…)`, which is inlined and its
 binding removed. A local that is written more than once (`x = true if admin`,
 `x ||= y`), whose reads reach past the branch or block that writes it, or that
 is an instance variable (`@x`, visible to the object's other methods) is left
-standing as `x = true`. A write used as a **value** (`if (x = <read>)`,
+standing as `x = true`. An instance variable's assignment always stays, and
+the pull request names it, since a view, another method or a serializer may
+read it. Its reads later in the same method body are folded when every write
+of that variable in the repository's Ruby, ERB, HAML and Slim stores the same
+literal and nothing calls `instance_variable_set`, `remove_instance_variable`
+or defines a writer for it. A read inside a block, a lambda, a nested `def`, a
+string, a `rescue` clause or `defined?` is left, and so is one in parentheses
+holding an `if`/`unless` modifier, `and`, `or` or `not` in a file that also
+has such code without parentheses. A gem writing the same instance variable on
+the same object is not seen. A write used as a **value** (`if (x = <read>)`,
 `x = <read> or log(…)`, a method's last statement) is replaced by its value, so
 the expression keeps what it evaluated to. `string_variation` / `number_variation` / `json_variation` are never matched —
 Ruby is untyped, so the method name is the only type signal a call site
@@ -7391,10 +7441,17 @@ left alone:
 * any other write (`+=`, `||= compute`, `a, b = …`);
 * a statement sharing its line with another (`limit = 3; go`).
 
-A Rails callback **guard** the fold empties is cleaned up. A method whose only
-statement is left as a bare `return` becomes an empty method (both return
-`nil`; a bare `return` after other statements stays, since dropping it would
-change the value the method returns). An empty method named by a
+A bare `return` the fold leaves with nothing to do is dropped, in any method
+the run changed (a `def` or `def self.`, with parameters or not): when it is
+the method's only statement (both return `nil`), and when it is the last
+statement right after a `return if …` or `return unless …` (that line is `nil`
+when it does not return, so the method still returns `nil`). A bare `return`
+after any other statement stays, since dropping it would change the value the
+method returns, and so does one in a method with a comment inside it or one
+the run did not change. A method the run left empty and that stays is listed
+in the pull request by name, so a reviewer can delete it with its callers.
+
+A Rails callback **guard** the fold empties is cleaned up. An empty method named by a
 `before_action` (or `before_filter`, `prepend_before_action`,
 `append_before_action`, with or without `only:`/`except:`/`if:`) is deleted
 together with every such callback, the pull request lists it as a callback guard
@@ -7443,8 +7500,26 @@ it is, across separate tags:
 Removing the flag keeps the surviving arm's markup exactly as it was, and
 removes each line that held only a deleted tag. Rails renders such a line as
 nothing, so its output doesn't change. Plain `ERB.new` with no trim mode renders
-one as a blank line, so a template rendered that way loses that blank line. The
-surviving arm stays at its old indentation. A tag written with trim markers
+one as a blank line, so a template rendered that way loses that blank line. In
+an HTML template (named `.html.erb`, or `.html+<variant>.erb`) the surviving
+arm is also moved back by the indentation its tag added, and a block removed
+between two blank lines leaves one of them, both of which HTML renders as
+nothing. The tidy assumes ordinary HTML whitespace rules for a full template,
+so neither is done in a partial (`_name.html.erb`) or a ViewComponent template
+(`*_component.html.erb`, or anything under a `components/` directory), which
+render wherever they are placed, or in a template that mentions anywhere, in any
+spelling, a `pre`, `textarea`, `script`, `style`, `xmp`, `listing` or
+`plaintext` element, `white-space`, a Tailwind `whitespace-` class or
+`xml:space`. Elsewhere, both stay as they were where a line starts inside an
+attribute value, and inside a lambda or a block helper other than an iterator,
+a Rails form or link helper, `content_tag` or `tag.<element>`; the indentation
+also stays where a line starts inside a multi-line Ruby string. Not seen: output
+that code outside the template puts into a whitespace-preserving context, such
+as a layout that wraps `yield` in a `<pre>`, a `render template:` inside a
+`<pre>`, a helper without a block that opens one (`<%= open_pre %>`), or a class
+that a stylesheet gives `white-space: pre`. Any other template
+(`.text.erb`, `.json.erb`, a bare `.erb`) keeps its indentation and blank
+lines. A tag written with trim markers
 takes what they trimmed with it (the newline after `-%>`, the indentation
 before `<%-`), so a `.text.erb` template renders exactly as before.
 
@@ -8431,18 +8506,39 @@ under "still reference this flag" in the pull request.
 Only Laravel's own directives, Pennant's and Livewire 3's may sit inside a
 conditional the Action folds, because only their meaning is known: any other
 directive registered with `Blade::if` or `Blade::directive` could open, close or
-split the block. A few of Laravel's depend on their arguments: `@push('s', $html)`
+split the block. The one exception is a directive your own code registers in a
+way the Action can read, in your project's non-test PHP files (anything under a
+`tests/`, `test/` or `spec/` directory, or in a `*Test.php` file, is not read):
+`Blade::directive('money', …)` (or `->directive(…)` on the Blade compiler) with
+a literal name and a closure or arrow function that only returns text built from
+string literals and its argument, such as `fn ($e) => "<?php echo money({$e});
+?>"`. Each use is then checked with its own argument, and one that compiles to
+whole PHP statements (an `echo`, an expression, a braced block) or markup is
+kept with the code around it. A directive registered twice differently, with a
+handler the Action cannot read, through a class it cannot tell is the Blade
+facade, or also by `Blade::if`, stays unknown, and so does every custom
+directive when your code registers a directive or a `Blade::if` under a name
+that is not a literal, or in any way other than a direct call (a callable such
+as `[Blade::class, 'directive']`, a method name held in a variable,
+`call_user_func`). A name your code registers is never read as an Alpine
+attribute. Registrations in ignored files, such as a package's
+under `vendor/`, are not read; `akaunting/laravel-money`'s `@money` and
+`@currency` are known when your `composer.lock` installs a release from 1.0.0
+to 6.1.0. A few of Laravel's depend on their arguments: `@push('s', $html)`
 or `@section('t', $title)`, whose content is not a literal, counts as unknown **inside** a
 conditional the Action folds; outside one it is read as the inline form it is written as, so
 a layout's `@section('title', $title)` no longer holds up a view's other flags. A view
 with any other directive between an `@if`/`@unless`/`@feature` and its closer is
 **left as it is** and listed in the pull request with the files the transform
 engine could not process, even when that conditional is not the flag's. So is a
-view where raw PHP or an `@php` block inside such a conditional opens or closes
-a block (`<?php if ($x): ?>`, `<?php endif; ?>`), or where `<?= … ?>` there has
-no closing `;`. Move the custom directive or the PHP block out of the
+view where raw PHP or an `@php` block inside such a conditional is anything but
+whole statements (an `echo`, an expression, an `unset`, a braced block, `if` or
+loop): one that opens or closes a block (`<?php if ($x): ?>`, `<?php endif; ?>`,
+`<?php else: ?>`), a label, a function declaration, a `return`, or a `<?= … ?>`
+with no closing `;`. Move the custom directive or the PHP block out of the
 conditional and the next run removes the flag. Alpine and Vue event attributes
-(`@click="…"`, `@submit.prevent="…"`) are markup and are fine anywhere. A
+(`@click="…"`, `@submit.prevent="…"`, `@modal-ok.window="…"`) are markup and are
+fine anywhere. A
 rewrite that would reach a custom directive, or leave a Blade block without its
 opener or its closer, is **refused**, and the run exits 1 naming the file.
 
@@ -8458,6 +8554,35 @@ Folded away entirely in `if` / `else` (including an `else if` chain, where the
 surviving branch keeps its own braces and a dead last branch takes its `else`
 with it), under `!` negation, in a `&&` or `||` operand, in a `guard … else`
 and in a ternary.
+
+When the fold leaves an unconditional `return` (served false,
+`guard <read> else { return }` becomes its `else` body), the statements after
+it are deleted: in a function, an initializer, a deinitializer, an accessor, a
+property observer, a subscript and any closure, including a closure passed to
+a SwiftUI modifier in a computed `body` (`.task { }`, `.onReceive { }`). This
+is more than tidying. Swift reads `return` followed by an expression on the
+next line as returning that expression, so code left below the `return` would
+still run. A `return` that is then the last statement of a function,
+initializer, deinitializer, setter or observer goes too. In a closure it goes
+when nothing, or two or more statements, are left before it. With one
+statement left it stays (`.task { await refresh(); return }`): without it the
+closure would return that statement's value, which can change the closure's
+type. Some things are kept after the `return`, each starting with a keyword
+that no expression can start with:
+
+- a local function, type or typealias, which Swift lets the code above the
+  `return` use;
+- beside one of those, the `let`, `var` and `guard` bindings it may capture;
+- in a closure, a statement holding a `return` with a value, which may decide
+  the closure's result type.
+
+Swift warns that the kept code will never be executed. If anything else would
+be left after a bare `return` (a `#if` elsewhere in the body keeps the tail from
+being removed), or a binding kept there is `lazy`, computed, observed, wrapped or
+`async let` (Swift fails to link one beside a local function that captures it),
+the file is refused rather than rewritten. The check reads the rewritten file as
+it is, so a file the removal changes is refused as well when it already had a
+statement after a bare `return` that Swift warns will never be executed.
 
 A read bound to a `let` is inlined, and the `if useLegacy` reading it is folded
 the same way.

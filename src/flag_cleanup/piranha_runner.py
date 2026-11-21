@@ -85,6 +85,7 @@ else:  # pragma: no cover - project requires >=3.11
 from polyglot_piranha import PiranhaArguments, execute_piranha
 
 from flag_cleanup import (
+    blade_directives,
     py_key_survivors,
     swift_removed_members,
     contradicting,
@@ -141,6 +142,7 @@ from flag_cleanup import (
     report_paths,
     residue,
     ruby_guard_methods,
+    ruby_ivar_fold,
     ruby_owner_reach,
     source_index,
     call_site_comments,
@@ -2173,12 +2175,76 @@ def key_constant_names(roots: Iterable[str], flag_key: str) -> frozenset[str]:
     """The names any source file under ``roots`` binds to ``flag_key`` as a
     string literal (``KEY = 'k'``, ``const KEY = "k"``, ``case key = "k"``,
     ``static final String KEY = "k"``). Read BEFORE a removal: the run may
-    delete a declaration whose name a read it did not fold still spells."""
+    delete a declaration whose name a read it did not fold still spells.
+
+    Every holder shape a reader can name the key through counts, provable or
+    not: a typed constant (Go's ``const Voting Flag = "k"``), an object or
+    hash property (``voting: 'k'``, ``'voting' => 'k'``), an enum constant's
+    constructor argument (``VOTING("k")``), a constructed holder
+    (``x = new Feature("k")``), and a Ruby symbol or ``%q(k)``; plus whatever
+    each language's own key-constant recogniser declares in a file holding
+    the key. Over-reporting is safe: a name here only makes a file that also
+    names a negated accessor refuse the flag.
+
+    A property's name is returned with a leading ``.`` (``.voting``): a plain
+    name such as ``key`` or ``flag`` is the property of countless objects
+    that hold no key, so :func:`accessor_mentions` counts it only where it is
+    spelled as a member (``Flags.voting``, ``Keys::VOTING``,
+    ``flags['voting']``) or destructured (``const { voting } = Flags``)."""
     key = re.escape(flag_key)
-    binding = re.compile(
-        r"(?<![\w$])([A-Za-z_$][\w$]*)\s*(?::[^=\n]*)?=\s*[@rbuf]?[\"'`]" + key + r"[\"'`]"
+    value = (
+        r"(?:(?:[@rbuf]|:)?[\"'`]" + key + r"[\"'`]|%[qQ]?(?:\(" + key + r"\)|\[" + key + r"\]|\{" + key
+        + r"\}|<" + key + r">|([|!/])" + key + r"\1)|:" + key + r"(?![\w?!]))"
     )
-    return frozenset(m.group(1) for _path, text in _checkout_sources(roots) for m in binding.finditer(text))
+    name = r"(?<![\w$])([A-Za-z_$][\w$]*)"
+    bindings = [
+        # `KEY = 'k'`, `KEY: string = 'k'`, `KEY = new Feature('k')`, `KEY = Flag('k')`
+        name + r"\s*(?::[^=\n]*)?=\s*(?:(?:new\s+)?[A-Z][\w$.]*\s*(?:<[^>\n]*>)?\s*\(\s*)?" + value,
+        # Go's typed constant: `Voting Flag = 'k'`
+        name + r"\s+[\w$.*\[\]]+\s*=\s*" + value,
+        # an enum constant's constructor argument: `VOTING("k")`
+        r"(?<![\w$.])([A-Z][A-Z0-9_]*)\s*\(\s*" + value,
+    ]
+    # an object, struct or hash property: `voting: 'k'`, `:voting => 'k'`, `'voting' => 'k'`
+    member = r"(?<![\w$:])[\"':]?([A-Za-z_$][\w$]*)[\"']?\s*(?::|=>)\s*" + value
+    found: set[str] = set()
+    sources = _checkout_sources(roots)
+    for path, text in sources:
+        if flag_key not in text:
+            continue
+        for binding in bindings:
+            found.update(m.group(1) for m in re.finditer(binding, text))
+        found.update("." + m.group(1) for m in re.finditer(member, text))
+        found |= _declared_key_holders(path, text, flag_key)
+    # A name bound to one of these, or importing one under another name
+    # (`const V = Keys.VOTING`, `import { VOTING as V }`), holds the key too.
+    for _round in range(3):
+        known = sorted({n.lstrip(".") for n in found})
+        if not known:
+            break
+        either = "(?:" + "|".join(map(re.escape, known)) + ")"
+        aliases = (
+            name + r"\s*(?::[^=\n]*)?=\s*(?:[\w$]+(?:\.|::|\?\.))*" + either + r"\s*(?:[;,\n)]|$)",
+            r"(?<![\w$])" + either + r"\s+as\s+([A-Za-z_$][\w$]*)",
+        )
+        more = {m.group(1) for _path, text in sources for alias in aliases for m in re.finditer(alias, text, re.M)}
+        if more <= found:
+            break
+        found |= more
+    return frozenset(found)
+
+
+def _declared_key_holders(path: str, text: str, flag_key: str) -> set[str]:
+    """The names the key-constant recogniser of ``path``'s language declares
+    holding ``flag_key`` there: enum entries, static fields, ``as const``
+    members and the like, in shapes no binding pattern above spells."""
+    profile = cross_file_keys._profile_for(path)
+    if profile is None:
+        return set()
+    try:
+        return {d.name for d in profile.declarations(str(Path(path).resolve()), text, flag_key)}
+    except cross_file_keys.DeclarationsUnreadable:
+        return set()
 
 
 def accessor_mentions(
@@ -2205,10 +2271,17 @@ def accessor_mentions(
         return {}
     files = _checkout_sources(roots)
     key_text = re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(flag_key) + r"(?![A-Za-z0-9_\-])")
-    every = sorted(set(constants) | key_constant_names(roots, flag_key))
-    constant = (
-        re.compile(r"(?<![\w$])(?:" + "|".join(map(re.escape, every)) + r")(?![\w$])") if every else None
-    )
+    every = set(constants) | key_constant_names(roots, flag_key)
+    plain = sorted(n for n in every if not n.startswith("."))
+    members = sorted({n[1:] for n in every if n.startswith(".")} - set(plain))
+    alternatives = []
+    if plain:
+        alternatives.append(r"(?<![\w$])(?:" + "|".join(map(re.escape, plain)) + r")(?![\w$])")
+    if members:
+        either = "|".join(map(re.escape, members))
+        alternatives.append(r"(?:\.|::|\[\s*:?[\"'`]?)(?:" + either + r")(?![\w$])")
+        alternatives.append(r"\{[^{}=;]*(?<![\w$])(?:" + either + r")(?![\w$])[^{}=;]*\}\s*=")
+    constant = re.compile("|".join(alternatives)) if alternatives else None
     found: dict[str, str] = {}
     for path, text in files:
         squashed = text.replace("_", "").lower()
@@ -2733,6 +2806,16 @@ def _transform_flag(
         if language in ("ts", "tsx", "js")
         else _formatter_width_facts(sorted({*paths, *reader_paths}), language, repo_dir)
     )
+    # A Blade view: what the project's own `Blade::directive`s compile to, read
+    # from their registrations (:mod:`flag_cleanup.blade_directives`), so the
+    # engine and the gate can each decide a use of one inside a folded
+    # conditional instead of leaving the view untouched.
+    blade_registrations = blade_directives.registrations(repo_dir) if language == "blade" else {}
+    if blade_registrations:
+        ts_facts = {
+            **ts_facts,
+            **blade_directives.facts(sorted({*paths, *reader_paths}), blade_registrations),
+        }
 
     # THE KOTLIN PRE-PASS — besides the test-double pass, the only thing in
     # this tool that edits the customer's files before the engine does. It
@@ -3605,6 +3688,14 @@ def _transform_flag(
     if language == "ruby":
         summaries, guard_rows = ruby_guard_methods.remove(summaries, repo_dir, Rewrite)
         bindings = bindings + guard_rows
+        # An instance variable the fold made a literal is kept (a view or
+        # another method may read it): named, so a reviewer can follow it.
+        bindings = bindings + tuple(
+            (os.path.relpath(s.path, repo_dir), ruby_ivar_fold.KEPT_KIND, text)
+            for s in summaries
+            if s.path.endswith(".rb") and s.original_content != s.content
+            for text in ruby_ivar_fold.kept_assignments(s.original_content, s.content)
+        )
 
     # Comments beside the changes that describe a flag's state without naming
     # it ("while the flag is off"): reported, never edited. After every edit,
@@ -3715,6 +3806,7 @@ def _transform_flag(
             _grammar_of(s.path, language),
             excused_initializers=engine_dead_inits.get(s.path, 0),
             read_markers=read_markers,
+            blade_directives=blade_registrations,
         )
         # A surviving sentinel means the engine did not consume a read the
         # pre-pass marked. It parses, so Gate 1's checks are blind to it, and
@@ -4286,7 +4378,7 @@ def _resolve_wrapper_doubles(
         return any(is_double_of(f, wrapper) for f in refusals)
 
     def forget(gone: list[mock_stubs.Prepass]) -> None:
-        doubles[:] = [d for d in doubles if not any(d is g for g in gone)]
+        doubles[:] = [d for d in doubles if not any(d is g for g in gone)]  # identity: prepasses of one list
 
     pending = [
         w for w in found
@@ -5743,7 +5835,7 @@ def _rename_kept_titles(
                 snapshots = ts_tests.stored_snapshot_names(repo_dir)
             return name in snapshots
 
-        extra = {"before": summary.original_content} if rename is ts_tests.rename_kept_titles else {}
+        extra = {"before": summary.original_content} if rename is ts_tests.rename_kept_titles else {}  # identity: a function
         content, renamed = rename(
             summary.content, _grammar_of(summary.path, language), flag_key, kept, stored, **extra
         )
@@ -6971,8 +7063,21 @@ def _no_single_file_inline(
     return after
 
 
+def _inline_ruby_bindings(
+    before: str, after: str, marker: str, *, language: str, path: str | None = None, repo_dir: str | None = None
+) -> str:
+    """The reads of an instance variable the fold bound to a literal, where
+    every write of it in the checkout stores that literal
+    (:mod:`flag_cleanup.ruby_ivar_fold`). Ruby files only: an ERB template's
+    instance variables are the controller's, and are never folded there."""
+    if language != "ruby" or path is None or repo_dir is None or _grammar_of(path, language) != "ruby":
+        return after
+    return ruby_ivar_fold.inline_ivar_reads(before, after, marker, path=path, repo_dir=repo_dir)
+
+
 _BOUND_LITERAL_INLINERS = {
     "python": _inline_python_bindings,
+    "ruby": _inline_ruby_bindings,
     "ts": _inline_ts_bindings,
     "tsx": _inline_ts_bindings,
     "js": _inline_ts_bindings,

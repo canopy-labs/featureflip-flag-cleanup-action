@@ -186,7 +186,7 @@ def find_gates(
     outermost = [
         f
         for f in found
-        if not any(o is not f and _contains(o.node, f.node) for o in found)
+        if not any(o is not f and _contains(o.node, f.node) for o in found)  # identity: _Found objects of one list
     ]
     return sorted(outermost, key=lambda f: f.node.start_byte)
 

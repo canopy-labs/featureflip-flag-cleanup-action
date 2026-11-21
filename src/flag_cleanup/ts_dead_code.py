@@ -217,7 +217,7 @@ def _bare_literals(condition: Node) -> int:
         node = stack.pop()
         if node.type in ("true", "false") and not _compared_with_a_value(node):
             count += 1
-        if node.type in _OPAQUE and node is not condition:
+        if node.type in _OPAQUE and node != condition:
             continue
         stack.extend(node.children)
     return count

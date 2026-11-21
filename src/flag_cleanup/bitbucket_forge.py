@@ -537,7 +537,7 @@ class BitbucketForge:
             if response.status_code != 200:
                 _raise(response, f"could not set the draft state of pull request #{pull.number}")
             pr = _json_object(response, "pull request")
-            honoured = pr.get("draft") is draft
+            honoured = pr.get("draft") is draft  # identity: a JSON bool
             if draft and honoured:
                 return True
             description = str(pr.get("description", current.get("description")) or "")

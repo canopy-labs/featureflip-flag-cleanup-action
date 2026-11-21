@@ -196,7 +196,7 @@ def _sys_modules(root: Node) -> list[Node]:
             continue
         # `x.sys` names the module through another one; `sys` names it itself.
         value = parent if parent is not None and parent.type == "attribute" and _not_a_mention(node) else node
-        if value is not node and _text(node) != "sys":
+        if value != node and _text(node) != "sys":
             continue  # `obj.s`: an attribute that only shares an alias's spelling
         outer = value.parent
         if outer is not None and outer.type == "attribute" and outer.child_by_field_name("object").id == value.id:

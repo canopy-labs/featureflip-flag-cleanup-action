@@ -205,7 +205,7 @@ def _shrunk_lists(source: str, spans: list[tuple[int, int]], language: str) -> l
         join
         for container, join in found
         if not any(
-            other is not container
+            other != container
             and container.start_byte <= other.start_byte
             and other.end_byte <= container.end_byte
             for other, _ in found

@@ -332,7 +332,7 @@ def _elements(root: Node, data: bytes, local: str) -> list[Node] | None:
             return None
     if names != 2 * len(elements):
         return None
-    if any(o is not e and ts_gates._contains(o, e) for o in elements for e in elements):
+    if any(o != e and ts_gates._contains(o, e) for o in elements for e in elements):
         return None
     return sorted(elements, key=lambda n: n.start_byte)
 

@@ -1153,14 +1153,223 @@ def _resolve_ruby_wrappers(
     return _apply(source, language, profile, root, data, _statements(root, data, profile, describes), patterns, treatment)
 
 
+#: The hooks that run once a test is over: RSpec's `after` and Minitest's
+#: (or ActiveSupport's) `teardown`.
+_RUBY_AFTER_HOOKS = frozenset({"after", "teardown"})
+
+
 def _in_ruby_after_hook(statement: Node, data: bytes) -> bool:
     body = statement.parent
     hook = body.parent.parent if body is not None and body.parent is not None else None
-    return hook is not None and _ruby_callee(hook, data) == "after"
+    if hook is not None and _ruby_callee(hook, data) in _RUBY_AFTER_HOOKS:
+        return True
+    method = body.parent if body is not None else None
+    return (
+        method is not None
+        and method.type == "method"
+        and _text(method.child_by_field_name("name"), data) == "teardown"
+    )
 
 
-#: What a Laravel Pennant statement sets the flag to.
-_PENNANT_VALUES = {"activate": "true", "deactivate": "false"}
+#: What a Laravel Pennant or Flipper statement sets the flag to.
+_PENNANT_VALUES = {"activate": "true", "deactivate": "false", "enable": "true", "disable": "false"}
+
+#: A Flipper write of the key: ``Flipper.enable(:k)``, ``Flipper[:k].disable``.
+_FLIPPER = r"(?:::)?Flipper"
+_FLIPPER_WRITE = re.compile(rf"{_FLIPPER}\s*(?:\.\s*(?:enable|disable)\w*\b|\[)")
+
+
+def _ruby_key(flag_key: str, consts: Iterable[str]) -> str:
+    """The key as a Ruby test spells it: a string, a symbol, or a constant."""
+    spellings = [re.escape(f'{q}{flag_key}{q}') for q in ('"', "'")]
+    spellings += [re.escape(f":{q}{flag_key}{q}") for q in ('"', "'")]
+    if re.fullmatch(r"[A-Za-z_]\w*[?!]?", flag_key):
+        spellings.append(re.escape(f":{flag_key}") + r"(?![\w?!=])")
+    spellings += [rf"(?<![\w:@$]){re.escape(name)}(?![\w?!])" for name in consts]
+    return "(?:" + "|".join(spellings) + ")"
+
+
+def _flipper_patterns(key: str, reads: str) -> list[tuple[str, str]]:
+    """Flipper's writes of the key, and RSpec and Mocha stubs of a read
+    callee constrained to the key with ``with(<key>, …)``."""
+    write = rf"{_FLIPPER}\s*\.\s*(?P<value>enable|disable)"
+    symbol = rf"(?::(?:{reads})|(?P<quote>['\"])(?:{reads})(?P=quote))"
+    receiver = r"(?:::)?[A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)*"
+    with_key = rf"\s*\.\s*with\(\s*{key}(?:\s*,\s*{_BALANCED})?\s*\)"
+    chain = _RUBY_CONSTRAINTS
+    receive = rf"(?:allow|expect)\(\s*{receiver}\s*\)\s*\.\s*to\s+receive\(\s*{symbol}\s*\){with_key}{chain}"
+    mocha = rf"{receiver}\s*\.\s*(?:stubs|expects)\(\s*{symbol}\s*\){with_key}{chain}"
+    return [
+        (STUB, rf"{write}\(\s*{key}(?:\s*,\s*{_BALANCED})?\s*\)"),
+        (STUB, rf"{write}\s+{key}(?:\s*,\s*[\w.:@]+)?"),
+        (STUB, rf"{_FLIPPER}\s*\[\s*{key}\s*\]\s*\.\s*(?P<value>enable|disable)(?:\(\s*\))?"),
+        (STUB, rf"{receive}\s*\.\s*and_return\(\s*{_RUBY_BOOL}\s*\){chain}"),
+        (STUB, rf"{receive}\s*\{{\s*{_RUBY_BOOL}\s*\}}"),
+        (
+            VERIFICATION,
+            rf"expect\(\s*{receiver}\s*\)\s*\.\s*(?:to|not_to|to_not)\s+have_received\(\s*{symbol}\s*\)"
+            rf"{with_key}{chain}",
+        ),
+        (STUB, rf"{mocha}\s*\.\s*returns\(\s*{_RUBY_BOOL}\s*\){chain}"),
+    ]
+
+
+def _ruby_trailing_reset(statement: Node, data: bytes) -> bool:
+    """Whether ``statement`` is a Flipper write that puts the flag back once
+    its test is done: something other than a Flipper write comes before it in
+    its body, and only Flipper writes follow it. It says nothing of the branch
+    the test ran."""
+    if not _FLIPPER_WRITE.match(" ".join(_text(statement, data).split())):
+        return False
+    siblings = [c for c in statement.parent.named_children if c.type != "comment"] if statement.parent else []
+    index = next((i for i, c in enumerate(siblings) if c.id == statement.id), None)
+    if index is None:
+        return False
+    writes = [_FLIPPER_WRITE.match(" ".join(_text(c, data).split())) is not None for c in siblings]
+    return not all(writes[:index]) and all(writes[index + 1 :])
+
+
+#: The hooks that run before each test: a pin there states the branch of
+#: every test it governs.
+_RUBY_BEFORE_HOOKS = frozenset({"before", "setup"})
+
+
+def _ruby_hook_of(statement: Node, data: bytes) -> Node | None:
+    """The before-hook ``statement`` is written directly in (``before do``,
+    ``setup do``, ``def setup``), when no test encloses it: a hook inside a
+    nested group is that group's, and the group is a test of its own."""
+    body = statement.parent
+    if body is None or body.parent is None:
+        return None
+    holder = body.parent
+    hook = holder.parent if holder.type in ("do_block", "block") else holder
+    if hook.type == "call" and _ruby_callee(hook, data) in _RUBY_BEFORE_HOOKS:
+        pass
+    elif not (hook.type == "method" and _text(hook.child_by_field_name("name"), data) == "setup"):
+        return None
+    if _enclosing_test(hook, _PROFILES["ruby"], data)[0] is not None:
+        return None
+    return hook
+
+
+def _ruby_governed_tests(hook: Node, data: bytes) -> list[Node]:
+    """The outermost tests in the body ``hook`` is written in."""
+    scope = hook.parent
+    found: list[Node] = []
+    stack = list(scope.children) if scope is not None else []
+    while stack:
+        node = stack.pop(0)
+        if node.id != hook.id and _ruby_test(node, data) is not None:
+            found.append(node)
+            continue
+        stack = list(node.children) + stack
+    return found
+
+
+def _ruby_pinned_hooks(
+    statements: list[Node], data: bytes, patterns: list[tuple[str, re.Pattern[str]]], treatment: bool
+) -> tuple[list[Node], list[tuple[int, int, Removal]]]:
+    """``(statements decided here, spans)`` for the pins of the REMOVED value
+    in a before-hook no test encloses: every test it governs runs the removed
+    branch and goes, except one that pins the kept value itself, and the pin
+    goes with them (the hook too, once nothing else is in it). A hook pinning
+    the kept value is the ordinary path's; one pinning both, or anything it
+    cannot read, is left."""
+    hooks: dict[int, tuple[Node, list[tuple[Node, str | None, str | None]]]] = {}
+    for statement in statements:
+        hook = _ruby_hook_of(statement, data)
+        if hook is None:
+            continue
+        kind, value, _ = _recognise(_text(statement, data), patterns)
+        hooks.setdefault(hook.id, (hook, []))[1].append((statement, kind, value))
+    kept = "true" if treatment else "false"
+    decided: list[Node] = []
+    spans: list[tuple[int, int, Removal]] = []
+    for hook, pins in hooks.values():
+        if any(kind != STUB for _, kind, _ in pins) or {v == "true" for _, _, v in pins} != {not treatment}:
+            continue
+        decided += [s for s, _, _ in pins]
+        for test in _ruby_governed_tests(hook, data):
+            own = [
+                s for s in statements
+                if test.start_byte <= s.start_byte and s.end_byte <= test.end_byte
+            ]
+            if any(_recognise(_text(s, data), patterns)[1] == kept for s in own):
+                continue
+            decided += own
+            spans.append((_with_leading_comments(test, data), test.end_byte, Removal(TEST, _ruby_test(test, data) or "")))
+        body = [c for c in (hook.child_by_field_name("body") or _ruby_block_body(hook)).named_children if c.type != "comment"] if (hook.child_by_field_name("body") or _ruby_block_body(hook)) is not None else []
+        if len(body) == len(pins):
+            spans.append((_with_leading_comments(hook, data), hook.end_byte, Removal(STUB, " ".join(_text(pins[0][0], data).split()))))
+        else:
+            spans += [(*_line_span(s, data), Removal(STUB, " ".join(_text(s, data).split()))) for s, _, _ in pins]
+    return decided, spans
+
+
+def _ruby_block_body(call: Node) -> Node | None:
+    block = call.child_by_field_name("block")
+    if block is None:
+        return None
+    return next((c for c in block.named_children if c.type in ("body_statement", "block_body")), None)
+
+
+#: Blocks a Flipper write may sit in and still say which branch its test runs.
+_RUBY_WRITE_HOLDERS = frozenset({"before", "after", "around", "setup", "teardown"})
+
+
+def _ruby_write_elsewhere(statement: Node, data: bytes) -> bool:
+    """Whether ``statement`` is a Flipper write inside a block that is not a
+    test, a group or a hook: ``expect { Flipper.enable(:k) }.to change { … }``
+    is a test OF the write, and deleting the write would empty it."""
+    if not _FLIPPER_WRITE.match(" ".join(_text(statement, data).split())):
+        return False
+    body = statement.parent
+    holder = body.parent if body is not None else None
+    if holder is None:
+        return False
+    if holder.type in ("block", "do_block"):
+        call = holder.parent
+        return not (
+            call is not None
+            and (
+                _ruby_test(call, data) is not None
+                or _ruby_callee(call, data) in _RUBY_WRITE_HOLDERS | _RUBY_GROUP_CALLEES
+            )
+        )
+    if holder.type == "method":
+        name = _text(holder.child_by_field_name("name"), data)
+        return not (name.startswith("test_") or name in ("setup", "teardown"))
+    return holder.type not in ("program", "class", "module", "body_statement")
+
+
+def _resolve_flipper(
+    source: str, flag_key: str, treatment: bool, accessors: tuple[str, ...], key_texts: frozenset[str]
+) -> tuple[str, list[Removal]]:
+    """:func:`resolve` for a Ruby test of a direct read: Flipper's
+    ``enable``/``disable`` of the key, and a stub of a read callee answering
+    for the key (``allow(Flipper).to receive(:enabled?).with(:k, u).and_return(true)``).
+    A Flipper write after the test's code is its reset, and goes either way."""
+    reads = "|".join(re.escape(n) for n in sorted(_RUBY_FLAG_READ_CALLEES | set(accessors), key=len, reverse=True))
+    if "Flipper" not in source and not re.search(rf"\b(?:receive|stubs|expects|have_received)\(\s*:", source):
+        return source, []
+    profile = _PROFILES["ruby"]
+    data = source.encode("utf-8")
+    root = profile.parse(source, "ruby")
+    consts = [k.name for k in key_const.key_consts(root, data, "ruby", flag_key)]
+    key = _ruby_key(flag_key, [*consts, *key_texts])
+    symbol = rf"(?::(?:{reads})|['\"](?:{reads})['\"])"
+    mention = re.compile(
+        rf"{_FLIPPER}\s*(?:\.\s*\w+\s*\(?\s*{key}|\[\s*{key})"
+        rf"|\b(?:receive|have_received|stubs|expects)\(\s*{symbol}\s*\)[\s\S]*?{key}"
+    )
+    if not mention.search(source):
+        return source, []
+    statements = _statements(root, data, profile, lambda text: mention.search(text) is not None)
+    patterns = [(kind, re.compile(p)) for kind, p in _flipper_patterns(key, reads)]
+    decided, extra = _ruby_pinned_hooks(statements, data, patterns, treatment)
+    held = {s.id for s in decided}
+    statements = [s for s in statements if s.id not in held]
+    return _apply(source, "ruby", profile, root, data, statements, patterns, treatment, extra)
 
 
 #: The PHPUnit and Pest hooks that run around a test: test code, though no test.
@@ -1346,7 +1555,7 @@ def _ruby_emptied_hooks(lines: list[tuple[Node, str]], data: bytes) -> list[tupl
         if (
             hook is not None
             and hook.type == "call"
-            and _ruby_callee(hook, data) in ("before", "after")
+            and _ruby_callee(hook, data) in ("before", "after", "setup", "teardown")
             and len(statements) == len(gone)
         ):
             found.append((hook, gone[0][1]))
@@ -2273,6 +2482,8 @@ def resolve(
         return _resolve_ruby_wrappers(source, language, treatment, wrapper, targets or {})
     if wrapper is None and language == "php":
         return _resolve_pennant(source, flag_key, treatment)
+    if wrapper is None and language == "ruby":
+        return _resolve_flipper(source, flag_key, treatment, accessors, key_texts)
     if wrapper is None and language == "python":
         # A Django test pins the flag with waffle's `override_flag`; the SDK
         # read itself is not stubbed in a form this module reads.
@@ -2516,7 +2727,11 @@ def _apply(
         if decided and (statement.start_byte, statement.end_byte) in decided:
             # A Go test setter proven by :mod:`flag_cleanup.go_setters`.
             kind, value, groups = STUB, "true" if decided[(statement.start_byte, statement.end_byte)] else "false", {}
-        if kind == STUB and language == "ruby" and _in_ruby_after_hook(statement, data):
+        if kind == STUB and language == "ruby" and _ruby_write_elsewhere(statement, data):
+            kind = None
+        if kind == STUB and language == "ruby" and (
+            _in_ruby_after_hook(statement, data) or _ruby_trailing_reset(statement, data)
+        ):
             # It runs once the test is over, so it says nothing of the branch
             # the test ran, and goes whatever that was.
             kind = VERIFICATION
@@ -2614,7 +2829,7 @@ def _apply(
             continue
         for other in units.values():
             if (
-                other is not unit
+                other is not unit  # identity: units of one dict
                 and other.test is not None
                 and unit.test.start_byte <= other.test.start_byte
                 and other.test.end_byte <= unit.test.end_byte
@@ -2835,7 +3050,7 @@ def _apply(
     # equal rows, and stay two.
     removals: list[Removal] = []
     for _, _, removal in spans:
-        if isinstance(removal, Removal) and not any(removal is listed for listed in removals):
+        if isinstance(removal, Removal) and not any(removal is listed for listed in removals):  # identity: removals of one list
             removals.append(removal)
     removals += [Removal(RELIED_ON_DEFAULT, label) for label in relied]
     return result, removals + [_pin_removal(root, data, pin, deleted) for pin in _with_chained(root, data, live)] + [
@@ -2956,7 +3171,7 @@ def _phase_independent(test: Node, phase: list[Node], data: bytes) -> bool:
             and n.end_byte <= start
         ):
             name = _text(n, data)
-            uses = [w for w in words if w is not n and _text(w, data) == name]
+            uses = [w for w in words if w != n and _text(w, data) == name]
             if uses and all(not outside(w) for w in uses):
                 return False
     awaits = [n for n in _walk(test) if n.type == "await_expression"]

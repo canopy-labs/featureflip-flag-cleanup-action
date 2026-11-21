@@ -85,7 +85,7 @@ parses as intended, and a wrong rewrite can pass that. It is a net, not a proof
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import difflib
@@ -1953,6 +1953,80 @@ def _swift_false_after_a_clause(source: str) -> int:
     return count
 
 
+#: What may follow a bare Swift ``return`` in its statement list: a local
+#: function, type or typealias and a ``guard`` start with a keyword no
+#: expression can start with, and a compiler directive ends what the ``return``
+#: reads (swiftc 6.0: ``return`` NEWLINE ``#if DEBUG`` NEWLINE ``log()`` runs
+#: nothing). A binding qualifies only when it is plain (:func:`_swift_plain_binding`).
+_SWIFT_INERT_AFTER_RETURN = frozenset({
+    "function_declaration",
+    "class_declaration",
+    "protocol_declaration",
+    "typealias_declaration",
+    "guard_statement",
+    "directive",
+})
+
+
+def _swift_plain_binding(node) -> bool:
+    """A ``let``/``var`` that only stores.
+
+    No ``lazy``, attribute or property wrapper, accessor or observer block, and
+    not ``async let``: swiftc 6.0 links a plain local kept after a ``return``
+    beside a local function that captures it, but not one of those.
+    """
+    value = node.child_by_field_name("value")
+    for child in node.children:
+        if child.is_named:
+            if (value is None or child.id != value.id) and child.type not in (
+                "value_binding_pattern", "pattern", "type_annotation", "ownership_modifier",
+                "comment", "multiline_comment",
+            ):
+                return False
+        elif child.type not in ("=", ",", ":"):
+            return False
+    return True
+
+
+def _swift_live_after_bare_return(source: str) -> str | None:
+    """A statement after a bare Swift ``return`` that is not inert there, or None.
+
+    Swift reads ``return`` NEWLINE ``work()`` as ``return work()`` (swiftc 6.0
+    only warns), so a statement left there is not dead code: it runs, as the
+    value returned. Read off the parse tree alone: per ``statements`` list,
+    every statement after a ``return`` with no ``result``, comments skipped and
+    up to a directive, must be one of :data:`_SWIFT_INERT_AFTER_RETURN` or a
+    plain binding. NOT differential, unlike the checks around it: a ``;`` in a
+    comment once hid such a pair from a text test, and a pair the author wrote
+    in a branch the removal deletes once masked an identical new one. A file
+    that already had one is refused when the run changes it; swiftc warns on
+    that code anyway.
+    """
+    for node in _walk(_parse(source, "swift")):
+        if node.type != "statements":
+            continue
+        statements = [
+            c for c in node.named_children if c.type not in ("comment", "multiline_comment")
+        ]
+        for i, jump in enumerate(statements):
+            if (
+                jump.type != "control_transfer_statement"
+                or jump.child(0) is None
+                or jump.child(0).type != "return"
+                or jump.child_by_field_name("result") is not None
+            ):
+                continue
+            for following in statements[i + 1 :]:
+                if following.type == "directive":
+                    break
+                if following.type in _SWIFT_INERT_AFTER_RETURN or (
+                    following.type == "property_declaration" and _swift_plain_binding(following)
+                ):
+                    continue
+                return following.text.decode("utf-8", "replace")
+    return None
+
+
 def _go_literal_decided_conditions(source: str) -> int:
     """How many Go ``if`` and ``for`` conditions a literal OPERAND decides:
     ``x && false``, ``x || true``, through parentheses and nested chains of
@@ -3385,7 +3459,7 @@ ENGINE_MARKERS: tuple[str, ...] = ("fc-jsx-spread",)
 
 def refusal_reason(
     before: str, after: str, language: str, *, excused_initializers: int = 0,
-    read_markers: tuple[str, ...] = (),
+    read_markers: tuple[str, ...] = (), blade_directives: Mapping[str, str | None] | None = None,
 ) -> str | None:
     """Which of :func:`transform_broke_syntax`'s checks refused; ``None`` if none.
 
@@ -3398,6 +3472,11 @@ def refusal_reason(
     ``excused_initializers`` is how many Go ``if`` initializers the engine
     removed along with code that could not run; the lost-initializer count
     allows for exactly that many.
+
+    ``blade_directives`` are the project's own Blade directives and the text
+    each compiles to, ``None`` for one registered unreadably
+    (:mod:`flag_cleanup.blade_directives`); the Blade checks decide each use of
+    one themselves (:func:`blade_code.custom_kind`).
     """
     # Ahead of the ts delegation, which returns wholesale: these checks cover
     # the TS family too, and putting either after the branch would silently
@@ -3416,13 +3495,15 @@ def refusal_reason(
         # deleted or a conditional it folded, may own the `@else` or the closer
         # the fold attributed to the flag's conditional. The table is this
         # module's own (`blade_code.builtin`), not the engine's.
-        outside = blade_code.whitelist_violation(before, after)
+        outside = blade_code.whitelist_violation(before, after, blade_directives)
         if outside is not None:
+            if not outside.startswith("@"):
+                return f"the rewrite reached {outside}"
             return f"the rewrite reached {outside}, which is not a Laravel built-in directive"
         names = blade_code.closers(before) | blade_code.closers(after)
-        if blade_code.balance(before, names) != 0:
+        if blade_code.balance(before, names, blade_directives) != 0:
             return "the Blade view has a block whose opener and closer cannot be paired"
-        if blade_code.balance(after, names) != 0:
+        if blade_code.balance(after, names, blade_directives) != 0:
             return "the rewrite left a Blade block without its opener or its closer"
     for marker in ENGINE_MARKERS:
         # Differential, so a repository that already contains the string is not refused.
@@ -3532,6 +3613,15 @@ def refusal_reason(
         return (
             "the flag read is used as a decorator or called, so it is not a boolean read: "
             "the result would fail when it runs"
+        )
+    if (
+        language == "swift"
+        and before != after
+        and _swift_live_after_bare_return(after) is not None
+    ):
+        return (
+            "the removal left a statement right after a bare `return`, which Swift "
+            "reads as the value returned, so that statement would run"
         )
     if language == "swift" and _swift_false_after_a_clause(after) > _swift_false_after_a_clause(
         before

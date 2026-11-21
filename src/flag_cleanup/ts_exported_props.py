@@ -228,13 +228,13 @@ def _plan_prop(component, decl, function, proven, elements, marker):
             )
         if passed <= earlier:
             continue
-        own = [e for f, e in elements if f is decl]
+        own = [e for f, e in elements if f is decl]  # identity: _File objects
         declared = _plan(decl.root, decl.data, component, prop, literal, own, marker, function)
         if declared is None:
             continue
         plan: dict[_File, list[Edit]] = {decl: list(declared)}
         for file, element in elements:
-            if file is decl:
+            if file is decl:  # identity: _File objects
                 continue
             span = _item_span(_attributes(element, prop, file.data)[0], file.data, separator=None)
             if span is None:
@@ -442,14 +442,14 @@ def _users(
             if root.has_error:
                 return None
             file = _File(spelled, original, current, root, current.encode("utf-8"))
-        if file is not decl and exempt is not None and exempt(file):
+        if file is not decl and exempt is not None and exempt(file):  # identity: _File objects
             users.append(file)
             continue
         if not _accounted(
-            component, file, file is decl, allowed, decl_resolved, repo_dir, use, solution, use_in
+            component, file, file is decl, allowed, decl_resolved, repo_dir, use, solution, use_in  # identity: _File objects
         ):
             return None
-        if file is not decl:
+        if file is not decl:  # identity: _File objects
             users.append(file)
     if not seen_decl:
         # The declaring file's own spellings went unchecked: outside the listing.

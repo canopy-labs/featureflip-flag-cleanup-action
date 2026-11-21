@@ -39,9 +39,15 @@ at it (see ``syntax._code_view``).
 from __future__ import annotations
 
 import difflib
+import functools
 import re
+from collections.abc import Mapping
 
-__all__ = ["balance", "builtin", "closers", "code_view", "whitelist_violation"]
+__all__ = ["balance", "builtin", "closers", "code_view", "custom_kind", "whitelist_violation"]
+
+#: Where a project's own directive's argument goes in the text it compiles to
+#: (`blade_directives.ARGUMENT`).
+_ARGUMENT = "\0"
 
 #: Built-in conditionals, by lower-cased name, and the PHP condition the view
 #: gives each. The arguments are kept where Blade keeps them, so a rewrite of
@@ -105,8 +111,9 @@ def _closing_paren(text: str, start: int) -> int | None:
 def _php_close(text: str, start: int) -> int:
     """The index of the ``?>`` ending the PHP opened at ``start``, or -1.
 
-    A ``?>`` inside a quoted string does not end it (an Atom feed's
-    ``<?= '<?xml …?>' ?>``).
+    As PHP's lexer reads it: a ``?>`` inside a quoted string or a ``/* */``
+    comment does not end it (an Atom feed's ``<?= '<?xml …?>' ?>``), and one in
+    a ``//`` or ``#`` line comment does, quotes or not (``<?php // it's ?>``).
     """
     i = start + 2
     while i < len(text) - 1:
@@ -117,6 +124,17 @@ def _php_close(text: str, start: int) -> int:
                 if text[i] == "\\":
                     i += 1
                 i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                return -1
+            i = end + 1
+        elif text.startswith("//", i) or (char == "#" and not text.startswith("#[", i)):
+            while i < len(text) and text[i] != "\n":
+                if text.startswith("?>", i):
+                    return i
+                i += 1
+            continue
         elif text.startswith("?>", i):
             return i
         i += 1
@@ -131,7 +149,40 @@ def _block(text: str, i: int, open_: str, close: str) -> int | None:
     return None if at < 0 else at + len(close)
 
 
-def _tokens(text: str) -> list[tuple[str, str, str | None]]:
+def _modifier(text: str, at: int) -> bool:
+    """Whether a ``.mod`` event modifier starts at ``at``."""
+    first = text[at + 1 : at + 2]
+    return text[at : at + 1] == "." and first.isascii() and first.isalpha()
+
+
+def _attribute_end(text: str, name: str, j: int) -> int | None:
+    """Where an Alpine or Vue event attribute ends when ``@name`` (its name
+    ending at ``j``) is one, or ``None`` for a directive. Blade leaves a name it
+    does not know as text:
+
+    * ``@click="…"``: the name is followed by ``=``;
+    * ``@submit.prevent="…"``: by a ``.`` modifier, for a name that is not a
+      built-in;
+    * ``@modal-ok.window="…"``, ``@clock-changed="…"``: by ``-word`` segments and
+      then ``=`` or a modifier, for the same names. Blade's name is ``\\w+``, so
+      it reads ``@modal`` and leaves it as text, as for ``@click``.
+    """
+    if text[j : j + 1] == "=":
+        return j
+    known = builtin(name, None) is not None
+    if _modifier(text, j) and not known:
+        return j
+    end = j
+    while text[end : end + 1] == "-" and end + 1 < len(text) and _is_word(text[end + 1]):
+        end += 1
+        while end < len(text) and _is_word(text[end]):
+            end += 1
+    if end > j and not known and (text[end : end + 1] == "=" or _modifier(text, end)):
+        return end
+    return None
+
+
+def _tokens(text: str, registered: frozenset[str] = frozenset()) -> list[tuple[str, str, str | None]]:
     """``(kind, name or code, args)`` in order: ``("code", php, None)``,
     ``("echo", expr, None)`` or ``("directive", name, args)``."""
     out: list[tuple[str, str, str | None]] = []
@@ -194,13 +245,10 @@ def _tokens(text: str) -> list[tuple[str, str, str | None]]:
                 i += 1
                 continue
             name = text[i + 1 : j]
-            # `@click="…"`, `@submit.prevent="…"`: an Alpine or Vue event
-            # attribute, which Blade leaves as text.
-            following = text[j : j + 2]
-            if following[:1] == "=" or (
-                following[:1] == "." and following[1:].isalpha() and builtin(name, None) is None
-            ):
-                i = j
+            # A name the project registers is its directive, whatever follows.
+            end = None if name in registered else _attribute_end(text, name, j)
+            if end is not None:
+                i = end
                 continue
             k = j
             while k < n and text[k] in " \t":
@@ -490,6 +538,88 @@ def builtin(name: str, args: str | None) -> tuple[str, str | None] | None:
     return None
 
 
+#: Directive names the views model; a project's own directive may not replace one.
+_MODELLED = frozenset({
+    "if", "elseif", "else", "endif", "unless", "endunless", "feature", "unlessfeature",
+    "elsefeature", "endfeature",
+})
+
+
+@functools.cache
+def _php_parser():
+    import tree_sitter_php
+    from tree_sitter import Language, Parser
+
+    return Parser(Language(tree_sitter_php.language_php()))
+
+
+#: What may stand at the top level of PHP a folded conditional holds (raw PHP,
+#: or what a project's directive compiles to): whole statements that cannot
+#: open or close a block across the fragment's edges.
+_WHOLE_TOP_LEVEL = frozenset({
+    "php_tag", "text_interpolation", "text", "comment", "echo_statement",
+    "expression_statement", "unset_statement", "compound_statement", "if_statement",
+    "foreach_statement", "for_statement", "while_statement",
+})
+#: Never anywhere in it. tree-sitter-php reads a lone `else:`, `ELSE :` or
+#: `default:` as a goto label, without an error.
+_NEVER_IN_WHOLE = frozenset({"named_label_statement", "goto_statement", "colon_block"})
+#: A name spelling one of these is the alternative syntax read as a constant
+#: (`endif;` parses alone).
+_ALT_KEYWORDS = frozenset({
+    "else", "elseif", "endif", "endforeach", "endfor", "endwhile", "endswitch", "enddeclare",
+})
+
+
+def whole_statements(php: str) -> bool:
+    """Whether ``php``, a whole PHP file (opening with its own ``<?php``), is
+    only whole statements: no ERROR or MISSING node, every top-level statement
+    a kind in :data:`_WHOLE_TOP_LEVEL`, and no label, ``goto``, alternative-
+    syntax body or alternative-syntax keyword spelled as a name anywhere. A
+    WHITELIST: anything it does not name is refused."""
+    tree = _php_parser().parse(php.encode("utf-8"))
+    root = tree.root_node
+    if root.has_error or any(child.type not in _WHOLE_TOP_LEVEL for child in root.children):
+        return False
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in _NEVER_IN_WHOLE:
+            return False
+        if node.type == "name" and (node.text or b"").decode("utf-8").lower() in _ALT_KEYWORDS:
+            return False
+        stack.extend(node.children)
+    return True
+
+
+#: The name a raw PHP block (`<?php … ?>`, `@php … @endphp`) takes among the
+#: directives :func:`whitelist_violation` aligns; no directive can spell it.
+_RAW_PHP = "\0php"
+
+
+def custom_kind(
+    name: str, args: str | None, custom: Mapping[str, str | None] | None
+) -> tuple[str, str | None] | None:
+    """:func:`builtin`, knowing what the project's own directives compile to.
+
+    Blade looks a project's directive up first, by exact name, so it wins over
+    a built-in of the same name. One whose text, with this use's argument, is
+    :func:`whole_statements` is inline; one registered in a way that could not
+    be read (``None``), one replacing a directive the views model, and any
+    other use, are unknown. A raw PHP block (:data:`_RAW_PHP`) is inline when
+    it is whole statements.
+    """
+    if name == _RAW_PHP:
+        return (INLINE, None) if whole_statements(f"<?php\n{args or ''}\n") else None
+    if custom and name in custom:
+        compiled = custom[name]
+        if compiled is None or name.lower() in _MODELLED:
+            return None
+        compiled = compiled.replace(_ARGUMENT, (args or "").strip())
+        return (INLINE, None) if whole_statements(f"<?php\n?>{compiled}<?php\n") else None
+    return builtin(name, args)
+
+
 def undecided(name: str, args: str | None) -> bool:
     """Whether ``@name(args)`` is a function-block directive written with a
     content argument that is not a literal: ``@section('t', $title)``,
@@ -513,6 +643,16 @@ def _directives(source: str) -> list[tuple[str, str | None]]:
     return [(name, args) for kind, name, args in _tokens(source) if kind == "directive"]
 
 
+def _items(source: str, registered: frozenset[str]) -> list[tuple[str, str | None]]:
+    """The directives, and each raw PHP block as ``(_RAW_PHP, code)``, in order.
+    A name the project registers is never read as an Alpine attribute."""
+    return [
+        (name, args) if kind == "directive" else (_RAW_PHP, name)
+        for kind, name, args in _tokens(source, registered)
+        if kind in ("directive", "code")
+    ]
+
+
 def closers(source: str) -> frozenset[str]:
     """The names ``x`` whose ``@endx`` the Blade ``source`` spells, lower-cased."""
     return frozenset(
@@ -533,7 +673,11 @@ def _alt_balance(code: str) -> int:
     return opened - len(_ALT_CLOSER.findall(code))
 
 
-def balance(source: str, names: frozenset[str] = frozenset()) -> int:
+def balance(
+    source: str,
+    names: frozenset[str] = frozenset(),
+    directives: Mapping[str, str | None] | None = None,
+) -> int:
     """Block openers minus block closers in a Blade view, by counting directives.
 
     The grammar cannot be asked: tree-sitter-php reads a bare ``endif;`` without
@@ -543,9 +687,10 @@ def balance(source: str, names: frozenset[str] = frozenset()) -> int:
     opener when ``@endname`` is in the file or in ``names`` (with its
     ``@unlessname``), and its ``@endname`` as a closer. Raw PHP counts its
     alternative-syntax blocks. A view Blade can compile scores zero; a correct
-    fold removes an opener and its closer together.
+    fold removes an opener and its closer together. ``directives`` are the
+    project's own (:func:`custom_kind`): one proven inline counts nothing.
     """
-    tokens = _tokens(source)
+    tokens = _tokens(source, frozenset(directives or ()))
     custom = names | frozenset(
         name.lower()[3:]
         for kind, name, _ in tokens
@@ -558,7 +703,7 @@ def balance(source: str, names: frozenset[str] = frozenset()) -> int:
             continue
         if kind != "directive":
             continue
-        known = builtin(name, args)
+        known = custom_kind(name, args, directives)
         if known is None and undecided(name, args):
             continue
         if known is not None:
@@ -572,7 +717,9 @@ def balance(source: str, names: frozenset[str] = frozenset()) -> int:
     return score
 
 
-def _spans(directives: list[tuple[str, str | None]]) -> tuple[dict[int, int], dict[int, int]]:
+def _spans(
+    directives: list[tuple[str, str | None]], custom: Mapping[str, str | None] | None = None
+) -> tuple[dict[int, int], dict[int, int]]:
     """``(pairs, parents)``: each built-in opener's closer index, and each
     directive's innermost enclosing ``if`` opener, paired by built-ins alone.
     A name that is not a built-in is ignored here; what matters is that it is
@@ -584,7 +731,7 @@ def _spans(directives: list[tuple[str, str | None]]) -> tuple[dict[int, int], di
         ifs = [at for at, cls in stack if cls is None]
         if ifs:
             parents[index] = ifs[-1]
-        known = builtin(name, args)
+        known = custom_kind(name, args, custom)
         if known is None:
             continue
         kind, cls = known
@@ -599,7 +746,9 @@ def _spans(directives: list[tuple[str, str | None]]) -> tuple[dict[int, int], di
     return pairs, parents
 
 
-def whitelist_violation(before: str, after: str) -> str | None:
+def whitelist_violation(
+    before: str, after: str, custom: Mapping[str, str | None] | None = None
+) -> str | None:
     """The first directive outside the built-in table the rewrite reached, or None.
 
     A rewrite reaches a directive it DELETED, and every directive between a
@@ -607,9 +756,11 @@ def whitelist_violation(before: str, after: str) -> str | None:
     conditional (its opener, a rung, its closer, or a directive inside it). A
     non-built-in there may own an ``@else`` or a closer the fold attributed to
     the flag's conditional, so the rewrite cannot be trusted, whatever the
-    engine decided.
+    engine decided. A project's own directive in ``custom`` counts as a
+    built-in only where :func:`custom_kind` proves that use inline.
     """
-    old, new = _directives(before), _directives(after)
+    registered = frozenset(custom or ())
+    old, new = _items(before, registered), _items(after, registered)
     matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
     deleted = [
         index
@@ -619,13 +770,13 @@ def whitelist_violation(before: str, after: str) -> str | None:
     ]
     if not deleted:
         return None
-    pairs, parents = _spans(old)
+    pairs, parents = _spans(old, custom)
     closers_of = {closer: opener for opener, closer in pairs.items()}
     for index in deleted:
         name, args = old[index]
-        known = builtin(name, args)
+        known = custom_kind(name, args, custom)
         if known is None:
-            return f"@{name}"
+            return _spelled(name)
         if known[0] == IF_OPEN:
             opener = index
         elif known[0] == IF_CLOSE and index in closers_of:
@@ -636,6 +787,10 @@ def whitelist_violation(before: str, after: str) -> str | None:
             continue
         end = pairs.get(opener, len(old) - 1)
         for inner in range(opener, end + 1):
-            if builtin(*old[inner]) is None:
-                return f"@{old[inner][0]}"
+            if custom_kind(*old[inner], custom) is None:
+                return _spelled(old[inner][0])
     return None
+
+
+def _spelled(name: str) -> str:
+    return "raw PHP that is not whole statements" if name == _RAW_PHP else f"@{name}"

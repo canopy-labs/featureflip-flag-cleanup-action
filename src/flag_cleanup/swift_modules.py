@@ -327,7 +327,7 @@ def _projects(root: Path) -> list[Path]:
     as that object is current. Outside a run every call asks again."""
     listing = source_index.run_listing(str(root))
     cached = _PROJECTS.get(str(root))
-    if listing is not None and cached is not None and cached[0] is listing:
+    if listing is not None and cached is not None and cached[0] is listing:  # identity: cache keyed by the listing object
         return cached[1]
     found = _list_projects(root)
     if listing is not None:

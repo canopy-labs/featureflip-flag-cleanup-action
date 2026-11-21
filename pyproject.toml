@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.20.0"
+version = "2.21.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -585,6 +585,28 @@ dependencies = [
     # read is left as written and no longer stalls the flag's own fold.
     # No grammar rev moved.
     #
+    # 0.62.0. Swift: the dead code after a jump is deleted in every body
+    # that holds a return (closures, `init`, computed properties, accessors),
+    # not only a `func`; swiftc reads `return` NEWLINE `work()` as
+    # `return work()`, so a kept tail ran. Every language: deleting a file's
+    # last statement no longer leaves a blank line ending the file. Blade:
+    # hyphenated Alpine attributes stay attributes, and project directives
+    # are read from the registration facts. ERB: an HTML template's unwrapped
+    # `<% if %>` body is dedented and a doubled blank line collapsed. No
+    # grammar rev moved.
+    #
+    # 0.64.0 (0.63.0 is skipped). Swift: the grammar moves to
+    # canopy-labs/tree-sitter-swift 03cf487, and the Swift wheel below with it
+    # to `+canopy.4`. `try`/`await` on a bare name or member before a
+    # condition's `{` (`if let d = try? await detailTask {`, `while let x =
+    # await queue {`, `switch await s {`) parses as the condition; before, the
+    # file was an ERROR tree and no read in it was rewritten. Every other parse
+    # tree is unchanged. 0.63.0 carried a first version of the same patch that
+    # made tree-sitter's query analysis take ~30 s on two of the Swift entry
+    # rules (tests/test_swift_query_cost.py), so the first Swift file of a run
+    # stalled; 0.64.0's grammar builds the same trees with that cost back at
+    # upstream's.
+    #
     # 0.60.0. Python: deleting an entry no longer turns a one-element set
     # `{k}` into the dict `{}` or a subscript `x[a, k]` into the scalar index
     # `x[a]`; Swift: nor a tuple `(a, k)` into the scalar `(a)` (each is
@@ -735,7 +757,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.61.0",
+    "polyglot-piranha==0.64.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -812,13 +834,17 @@ dependencies = [
     # tuple `()` as an expression and `x as? T ?? d`, which PyPI's 0.7.4 reports
     # as a MISSING node and an ERROR; binary operators, calls and casts take
     # Swift's precedence, so `a == b || c` is `(a == b) || c` and `!f()` is
-    # `!(f())`; several patterns in one catch clause). Since `+canopy.2` the fork
-    # (canopy-labs/tree-sitter-swift) carries no grammar patch, only the
-    # generated parser upstream does not commit, so this wheel is the only way
-    # to get that grammar until upstream releases. Resolves only from wheels/
-    # (PEP 440 local segment), filled by scripts/fetch_piranha_wheels.py. Bump
-    # the segment when the engine's pin moves.
-    "tree-sitter-swift==0.7.4+canopy.2",
+    # `!(f())`; several patterns in one catch clause). `+canopy.4` adds one
+    # grammar patch of ours (canopy-labs/tree-sitter-swift
+    # `canopy/swift-try-await-bare-name-2`, sent upstream): `try`/`await` on a
+    # bare name or member before the `{` of an `if`, `while` or `switch` is
+    # the condition, not a call with a trailing closure, so a file using
+    # `if let d = try? await detailTask {` is no longer one ERROR. The wheel
+    # also carries the generated parser upstream does not commit, so it is the
+    # only way to get that grammar until upstream releases. Resolves only from
+    # wheels/ (PEP 440 local segment), filled by scripts/fetch_piranha_wheels.py.
+    # Bump the segment when the engine's pin moves.
+    "tree-sitter-swift==0.7.4+canopy.4",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the

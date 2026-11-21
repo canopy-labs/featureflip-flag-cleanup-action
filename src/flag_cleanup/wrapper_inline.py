@@ -717,7 +717,7 @@ def _occurrences_in(
         same,
     )
     source = _read(path)
-    ours = lang is same or lang.language in same.siblings
+    ours = lang is same or lang.language in same.siblings  # identity: language profiles
     if source is None:
         return ours, [Occurrence(path, 1, "", None, RECEIVER_UNPROVEN)]
     return ours, lang.occurrences(path, source, wrapper, index)

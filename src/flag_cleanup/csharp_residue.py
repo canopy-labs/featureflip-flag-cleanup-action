@@ -3872,7 +3872,7 @@ def _options_class(name: str, knob: str, repo_dir: str) -> tuple[str, Node, _Fil
     )
     for member in members:
         attributed = any(c.type == "attribute_list" for c in member.children)
-        if attributed and member is knob_member:
+        if attributed and member == knob_member:
             raise Kept(where, member.start_point[0] + 1, f"an attribute on {name}.{knob} ([Required], [ConfigurationKeyName], ...)")
         if attributed and member.type != "property_declaration":
             raise Kept(where, member.start_point[0] + 1, f"an attribute on a member of {name}")

@@ -1432,7 +1432,7 @@ def _heirs(index: _Index, owner_last: str) -> list[_TypeInfo]:
     an heir of every owner.
     """
     cached = _HEIRS.get(id(index))
-    if cached is None or cached[0] is not index:
+    if cached is None or cached[0] is not index:  # identity: cache keyed by the index object
         children: dict[str, list[_TypeInfo]] = {}
         for infos in index.by_last.values():
             for info in infos:

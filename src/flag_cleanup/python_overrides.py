@@ -175,7 +175,7 @@ def resolve(
     for test in tests.values():
         if not test.pins or any(pin.value is None for pin in test.pins):
             continue
-        if any(pin.value is not treatment for pin in test.pins):
+        if any(pin.value is not treatment for pin in test.pins):  # identity: bools
             deleted.append(test)
             continue
         kept = [_kept_edit(pin, data) for pin in test.pins]
@@ -186,12 +186,12 @@ def resolve(
     # there: overlapping spans would cut the text twice.
     deleted = [
         t for t in deleted
-        if not any(o is not t and o.outer.start_byte <= t.outer.start_byte < o.outer.end_byte for o in deleted)
+        if not any(o is not t and o.outer.start_byte <= t.outer.start_byte < o.outer.end_byte for o in deleted)  # identity: tests of one list
     ]
     gone = [(t.outer.start_byte, t.outer.end_byte) for t in deleted]
     stubs = [(e, r) for e, r in stubs if not any(a <= e[0] < b for a, b in gone)]
     for pin in loose:
-        if pin.value is not treatment or any(a <= pin.node.start_byte < b for a, b in gone):
+        if pin.value is not treatment or any(a <= pin.node.start_byte < b for a, b in gone):  # identity: bools
             continue
         edit = _kept_edit(pin, data)
         if edit is None or python_patches._overlap([*(e for e, _ in stubs), edit]):
@@ -300,7 +300,7 @@ def refusal_reason(
         return None
     for call in _calls(syntax._parse(source, "python"), flag_key, frozenset(key_texts)):
         value = _value(call)
-        if value is treatment:
+        if value is treatment:  # identity: bools
             continue
         where = " ".join(_text(call).split())
         what = "the removed value" if value is not None else "a value this run cannot read"

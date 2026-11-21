@@ -10,14 +10,19 @@ whole body is a bare ``return``, or to nothing:
       render_response(false, message: "You do not have access.")
     end
 
-Two things are done, each only for a method that had a body before the run:
+Three things are done, each only for a method that had a body before the run:
 
-* A body that is only a bare ``return`` becomes an empty body. Both return
-  ``nil``, so nothing can tell them apart. (A trailing bare ``return`` after
-  other statements is never touched: dropping it would change which value the
-  method returns.)
+* A bare ``return`` with no work left is dropped, in any ``def`` or
+  ``def self.`` (parameters or not): when it is the body's only statement
+  (both return ``nil``, so nothing can tell them apart), and when it is the
+  last statement right after a modifier ``return if c`` / ``return unless c``
+  (that statement is ``nil`` when its ``return`` does not run). A trailing
+  bare ``return`` after any other statement is never touched: dropping it
+  would change which value the method returns.
 * An empty method named by a ``before_action`` is deleted together with every
   such callback, when the name is spelled nowhere else in the checkout.
+* An emptied method that stays is reported by name: a caller, a callback
+  registered from another file, a route or a view may still reach it.
 
 The second one is deliberately narrow, because a Rails method is reached by
 name from places no parse of one file sees:
@@ -61,6 +66,10 @@ from flag_cleanup.unused import _parse, _walk
 
 #: The binding kind of each row: a deleted method, reported with the others.
 KIND = "guard method"
+#: The kind of a method the run emptied and this pass kept: reported, never
+#: edited further (a caller, a callback in another file, a route or a view may
+#: still name it).
+EMPTIED_KIND = "emptied method"
 
 _CALLBACKS = frozenset(
     {
@@ -80,7 +89,8 @@ def remove(
 ) -> tuple[list, tuple[tuple[str, str, str], ...]]:
     """Empty and delete the guard methods the run's fold left behind in the
     Ruby files it changed. Returns the summaries and a
-    ``(path, "guard method", name)`` row for each deleted method."""
+    ``(path, "guard method", name)`` row for each deleted method, and a
+    ``(path, "emptied method", label)`` row for each emptied one kept."""
     candidates = [
         s
         for s in summaries
@@ -101,13 +111,14 @@ def remove(
             out.append(summary)
             continue
         text, names = _rewrite(summary.original_content, summary.content, summary.path, spelled)
+        relative = os.path.relpath(summary.path, repo_dir)
+        rows.extend((relative, EMPTIED_KIND, label) for label in emptied(summary.original_content, text))
         if text == summary.content:
             out.append(summary)
             continue
         git_ops.before_writing([summary.path])
         Path(summary.path).write_bytes(text.encode("utf-8"))
         out.append(rewrite(summary.path, summary.original_content, text))
-        relative = os.path.relpath(summary.path, repo_dir)
         rows.extend((relative, KIND, name) for name in names)
     return out, tuple(rows)
 
@@ -150,8 +161,8 @@ def _rewrite(before: str, after: str, path: str, checkout: _Checkout) -> tuple[s
     had_body = _bodied_methods(_parse(before, "ruby"))
     data = after.encode("utf-8")
     edits: list[tuple[int, int, bytes]] = []
-    drops: list[tuple[int, int, bytes]] = []
     names: list[str] = []
+    deleted: set[int] = set()
     for container in _walk(root):
         if container.type not in ("class", "module"):
             continue
@@ -179,12 +190,10 @@ def _rewrite(before: str, after: str, path: str, checkout: _Checkout) -> tuple[s
                 edits.extend(plan)
                 names.append(name)
                 deleted_here.add(method.id)
-            elif kind == "return":
-                edit = _drop_return(data, method)
-                if edit is not None:
-                    drops.append(edit)
         if deleted_here:
             edits.extend(_dangling_modifiers(data, body, deleted_here))
+            deleted.update(deleted_here)
+    drops = _returns(_parse(before, "ruby"), root, data, deleted)
     if not edits and not drops:
         return after, ()
     edits = sorted([*_tidy(data, edits), *drops])
@@ -398,8 +407,105 @@ def _tidy(data: bytes, edits: list[tuple[int, int, bytes]]) -> list[tuple[int, i
     return out
 
 
-def _drop_return(data: bytes, method: Node) -> tuple[int, int, bytes] | None:
-    """The edit that empties a method whose only statement is a bare ``return``."""
-    statement = method.child_by_field_name("body").named_children[0]
-    span = _line_span(data, statement)
-    return (span[0], span[1], b"") if span is not None else None
+def _bare_return(node: Node) -> bool:
+    return node.type == "return" and not node.named_children
+
+
+def _key(method: Node) -> tuple[tuple[str, ...], str]:
+    """A method's class/module scope and its name, ``self.`` (or another
+    receiver) included for a singleton method."""
+    receiver = method.child_by_field_name("object")
+    prefix = _text(receiver) + "." if receiver is not None else ""
+    return _scope(method), prefix + _text(method.child_by_field_name("name"))
+
+
+def _methods(root: Node) -> dict[tuple[tuple[str, ...], str], list[Node]]:
+    """Every ``def`` and ``def self.`` of the file, at any depth, by key."""
+    found: dict[tuple[tuple[str, ...], str], list[Node]] = {}
+    for node in _walk(root):
+        if node.type in ("method", "singleton_method"):
+            found.setdefault(_key(node), []).append(node)
+    return found
+
+
+def _statements(method: Node) -> list[Node] | None:
+    """The statements of a method's ``def … end`` body (an empty list for an
+    empty one), or None for an endless ``def m = …``. A ``rescue`` /
+    ``ensure`` clause is not a statement, so a body holding one is None too."""
+    body = method.child_by_field_name("body")
+    if body is None:
+        return [] if method.text.rstrip().endswith(b"end") else None
+    if body.type != "body_statement":
+        return None
+    statements = body.named_children
+    if any(s.type in ("rescue", "else", "ensure") for s in statements):
+        return None
+    return statements
+
+
+def _returns(before: Node, after: Node, data: bytes, deleted: set[int]) -> list[tuple[int, int, bytes]]:
+    """The edits that drop a bare ``return`` the run left with no work to do,
+    in a method (at any depth, with parameters or not) the run changed.
+
+    Two places, both value-neutral, because a method's value is its last
+    statement's:
+
+    * the method's ONLY statement: ``def m(x); return; end`` and
+      ``def m(x); end`` both return ``nil``;
+    * the LAST statement, after a modifier ``return if c`` / ``return unless c``:
+      that statement is ``nil`` when its ``return`` does not run, so the method
+      returns ``nil`` either way.
+
+    Differential, per method: the same key names exactly one method on each
+    side, and before the run that method had a body that did not end in a bare
+    ``return`` (one that did is the customer's own). A comment anywhere in the
+    method withholds it."""
+    old = _methods(before)
+    drops: list[tuple[int, int, bytes]] = []
+    for key, nodes in _methods(after).items():
+        if len(nodes) != 1 or len(old.get(key, ())) != 1:
+            continue
+        method, previous = nodes[0], old[key][0]
+        if method.id in deleted or any(n.type == "comment" for n in _walk(method)):
+            continue
+        was = _statements(previous)
+        if not was or _bare_return(was[-1]) or previous.text == method.text:
+            continue
+        now = _statements(method)
+        if not now or not _bare_return(now[-1]):
+            continue
+        if len(now) > 1:
+            tail = now[-2]
+            if tail.type not in ("if_modifier", "unless_modifier"):
+                continue
+            guarded = tail.child_by_field_name("body")
+            if guarded is None or not _bare_return(guarded):
+                continue
+        span = _line_span(data, now[-1])
+        if span is not None:
+            drops.append((span[0], span[1], b""))
+    return drops
+
+
+def emptied(before: str, after: str) -> tuple[str, ...]:
+    """The methods ``after`` leaves with an empty body that had one before the
+    run, each as ``Scope#name`` (``Scope.name`` for a singleton method). They
+    are kept: something may still call them by name."""
+    root = _parse(after, "ruby")
+    if root.has_error:
+        return ()
+    old = _methods(_parse(before, "ruby"))
+    labels: list[tuple[int, str]] = []
+    for key, nodes in _methods(root).items():
+        if len(nodes) != 1 or len(old.get(key, ())) != 1:
+            continue
+        if _statements(nodes[0]) != [] or not _statements(old[key][0]):
+            continue
+        scope, name = key
+        owner = "::".join(scope)
+        if "." in name:
+            label = f"{owner}.{name.split('.', 1)[1]}" if owner else name
+        else:
+            label = f"{owner}#{name}" if owner else name
+        labels.append((nodes[0].start_byte, label))
+    return tuple(label for _, label in sorted(labels))

@@ -860,7 +860,7 @@ def _world(root: str) -> _World | None:
     if shares is None:
         return None
     cached = _WORLDS.get(root)
-    if cached is not None and cached[0] is layout and cached[1] is shares:
+    if cached is not None and cached[0] is layout and cached[1] is shares:  # identity: cache keyed by the objects
         return cached[2]
     world = _World(layout, shares)
     _WORLDS[root] = (layout, shares, world)

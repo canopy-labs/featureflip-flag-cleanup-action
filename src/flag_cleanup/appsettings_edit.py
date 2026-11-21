@@ -289,7 +289,7 @@ def remove_keys(text: str, section: list[str], keys: list[str]) -> tuple[str, li
         # member can need the comma before it.
         survivors = [m for m in target.members if m not in doomed]
         for member in doomed:
-            trimmed = _Object(target.start, target.end, [m for m in target.members if m in survivors or m is member])
+            trimmed = _Object(target.start, target.end, [m for m in target.members if m in survivors or m is member])  # identity: members of one parsed object
             cuts.append(_cut(text, trimmed, member))
         expected = _without(_plain(root), [k.lower() for k in section], wanted)
     edits: list[tuple[int, int]] = []

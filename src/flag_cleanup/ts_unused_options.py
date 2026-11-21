@@ -203,14 +203,14 @@ def _plan(option, state, by_resolved, run_files, taken, repo_dir, proofs):
     replacements = _reads(function, found_option, data, resolver)
     if replacements is None:
         return None
-    edits = {file: (spans, replacements if file is decl else []) for file, spans in deletions.items()}
+    edits = {file: (spans, replacements if file is decl else []) for file, spans in deletions.items()}  # identity: _File objects
     run = {str(Path(p).resolve()) for p in run_files}
     for file in edits:
         if str(Path(file.path).resolve()) not in run and taken(file.current):
             # Another run of this removal takes the file too: editing it here
             # as well would propose its hunks twice.
             return None
-    if any(_overlap(spans, replacements if file is decl else []) for file, (spans, replacements) in edits.items()):
+    if any(_overlap(spans, replacements if file is decl else []) for file, (spans, replacements) in edits.items()):  # identity: _File objects
         return None
     node = found_option.parameter if found_option.sole else found_option.member
     return edits, spelled, _one_line(node.text.decode("utf-8"))

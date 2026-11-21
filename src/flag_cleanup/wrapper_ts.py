@@ -1541,7 +1541,7 @@ def without_descriptions(wrapper: wi.Wrapper) -> tuple[str, str] | None:
         text = source
         for span in reversed(spans):
             start, end, _ = span
-            if span is marker:
+            if span is marker:  # identity: spans of one list
                 raw = text.encode("utf-8")
                 text = (raw[:start] + unused.MODULE_MARKER.encode("utf-8") + raw[end:]).decode("utf-8")
                 continue

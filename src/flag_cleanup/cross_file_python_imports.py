@@ -52,7 +52,7 @@ def _run_memo(repo_dir: str) -> _RunMemo | None:
     listing = source_index.run_listing(repo_dir)
     if listing is None:
         return None
-    if _memo is None or _memo.listing is not listing:
+    if _memo is None or _memo.listing is not listing:  # identity: cache keyed by the listing object
         _memo = _RunMemo(listing)
     return _memo
 

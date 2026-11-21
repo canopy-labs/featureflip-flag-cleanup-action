@@ -71,7 +71,7 @@ def holds(matcher: str, argument: Node | None, value: bool) -> bool | None:
         return True
     if matcher in _VALUE_MATCHERS:
         known, expected = literal(argument)
-        return (expected is value) if known else None
+        return (expected is value) if known else None  # identity: bools
     return None
 
 

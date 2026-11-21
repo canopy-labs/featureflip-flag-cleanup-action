@@ -151,7 +151,7 @@ def functions_that_lost_the_read(before: str, after: str, grammar: str, names: r
     lost: set[str] = set()
     for name, node in holding:
         inner = any(
-            other is not node
+            other != node
             and other.start_byte >= node.start_byte
             and other.end_byte <= node.end_byte
             for _, other in holding
@@ -281,7 +281,7 @@ def _loads_no_flag_client(path: str, source: str, repo_dir: str) -> bool:
 
 def _in_type(leaf: Node, stop: Node) -> bool:
     node = leaf.parent
-    while node is not None and node is not stop:
+    while node is not None and node != stop:
         if node.type in ("type_annotation", "type_alias_declaration", "interface_declaration"):
             return True
         node = node.parent

@@ -241,7 +241,7 @@ def find_pinned_tests(
     outermost = [
         node
         for node in chosen.values()
-        if not any(_contains(other, node) for other in chosen.values() if other is not node)
+        if not any(_contains(other, node) for other in chosen.values() if other != node)
     ]
     return [_identity(node, titled) for node in sorted(outermost, key=lambda n: n.start_byte)]
 
@@ -899,7 +899,7 @@ def _pinned_titles(before: str, language: str, flag_key: str, kept: str) -> froz
         if counts[title] != 1 or match is None or "describe" in callee_text.split(".")[0]:
             continue
         # A nested test is its own test: only an innermost one has a body.
-        if any(o is not node and _contains(node, o) for o, _c, _t in titled):
+        if any(o != node and _contains(node, o) for o, _c, _t in titled):
             continue
         arguments = node.child_by_field_name("arguments")
         callback = _plain(arguments)[1:] if arguments is not None else []

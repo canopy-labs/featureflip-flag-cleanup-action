@@ -320,7 +320,7 @@ def _setter_pin(path: str, source: str, root: Node, node: Node, spelling: str, r
     kept = go_setters.treatment()
     if kept is not None and not path.endswith("_test.go"):
         for site in found:
-            if site.value is not kept:
+            if site.value is not kept:  # identity: bools
                 go_setters.note_inert(path, site.statement)
     from flag_cleanup import mock_stubs
 

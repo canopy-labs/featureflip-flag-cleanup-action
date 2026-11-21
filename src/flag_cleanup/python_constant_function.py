@@ -295,8 +295,8 @@ class _Module:
                 return False
             if isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.BitOr):
                 continue
-            if isinstance(parent, ast.Compare) and any(node is c for c in parent.comparators):
-                index = next(i for i, c in enumerate(parent.comparators) if c is node)
+            if isinstance(parent, ast.Compare) and any(node is c for c in parent.comparators):  # identity: Python ast nodes
+                index = next(i for i, c in enumerate(parent.comparators) if c is node)  # identity: Python ast nodes
                 if isinstance(parent.ops[index], (ast.In, ast.NotIn)):
                     continue
             return False
@@ -617,7 +617,7 @@ def _plan(
     tail = lines[last.end_lineno - 1].encode("utf-8")[last.end_col_offset :].decode("utf-8")  # type: ignore[index]
     if tail.strip():
         return None
-    if fn.body[0] is not body[0]:
+    if fn.body[0] is not body[0]:  # identity: Python ast nodes
         start = fn.body[0].end_lineno + 1  # type: ignore[operator]
     else:
         ends = [fn.lineno, *(a.end_lineno or 0 for a in ast.walk(fn.args) if hasattr(a, "end_lineno"))]

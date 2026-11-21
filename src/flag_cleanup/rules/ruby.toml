@@ -302,6 +302,32 @@ replace = ""
 # comment is not syntax. (PHP closes the same gap locally only because its chain
 # is FLAT, so its clause's siblings are untouched.)
 
+# --- inlined@marker(<literal>) — an instance variable's read, inlined after the engine
+#
+# Not an SDK shape: it matches only something THIS TOOL wrote.
+# `ruby_ivar_fold` proves that a read of `@x` comes after a `@x = <literal>` the
+# fold produced, in the same method body, with every write of `@x` in the
+# checkout storing that literal, and writes a call to this marker at the read.
+# The engine then runs again and this rule creates the literal INSIDE the
+# cascade, so `(a if @x) || []` folds as a read written inline would. The
+# marker carries its value as its argument. A marker the engine leaves behind
+# unwinds the file. The callee is the marker with an `inlined` prefix, never
+# the bare marker: the bare one is the wrapper SENTINEL below, whose rule
+# replaces any call of it with `@treated` (see `go.toml`'s rule of this name).
+[[rules]]
+name = "replace_inlined_binding_marker_with_boolean_literal"
+query = """(
+  (call
+    . method: (identifier) @inlined_callee
+    arguments: (argument_list . [(true) (false)] @value .)
+  ) @call
+  (#eq? @inlined_callee "inlined@marker")
+)"""
+replace_node = "call"
+replace = "@value"
+groups = ["replace_expression_with_boolean_literal"]
+holes = ["marker"]
+
 # --- @sentinel() — a call to a keyless wrapper, proven and marked before the engine
 #
 # Reached ONLY through the wrapper pass (`wrapper_inline`), as the rules of

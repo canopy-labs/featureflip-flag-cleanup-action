@@ -855,7 +855,7 @@ def _ts_import_candidates(
                             specifier if emptied is None else emptied,
                             source_bytes,
                             "import",
-                            load if emptied is node else None,
+                            load if emptied == node else None,
                             loads,
                         )
                     )
@@ -2273,7 +2273,7 @@ def _go_var_candidates(declaration: Node, data: bytes) -> list[Candidate]:
             if value is not None and len(values) != 1:
                 continue
             node = declaration if len(specs) == 1 else spec
-            if node is spec and not _alone_on_its_lines(data, spec):
+            if node == spec and not _alone_on_its_lines(data, spec):
                 # `var (a = 1; b = 2)`: deleting `a = 1` leaves `(; b = 2)`.
                 continue
             found.append(
@@ -2954,7 +2954,7 @@ def _declared_name_and_value(
         # whichever named child is not the name — present only when an
         # initializer actually exists (a bare `int x;` declarator has just
         # the one named child, the name itself).
-        rest = [child for child in declarator.named_children if child is not name_node]
+        rest = [child for child in declarator.named_children if child != name_node]
         if rest:
             value_node = rest[-1]
     return bound_name, value_node

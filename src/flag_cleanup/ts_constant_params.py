@@ -559,7 +559,7 @@ def _plan_empty(function, name, allowed, scope, old_root, data, old_data) -> tup
         return None
     index = len(positional) - 1
     parameter = positional[index]
-    if parameter is not params[-1]:
+    if parameter != params[-1]:
         return None
     pattern = parameter.child_by_field_name("pattern")
     if parameter.type != "required_parameter" or pattern is None or pattern.type != "identifier":

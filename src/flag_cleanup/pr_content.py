@@ -59,6 +59,8 @@ from flag_cleanup.mock_stubs import (
 from flag_cleanup.residue import Residue
 from flag_cleanup.inert_load import DECLARED_LOAD
 from flag_cleanup.python_constant_function import COLLAPSED_FUNCTION
+from flag_cleanup.ruby_guard_methods import EMPTIED_KIND as EMPTIED_METHOD
+from flag_cleanup.ruby_ivar_fold import KEPT_KIND as KEPT_IVAR
 from flag_cleanup.cross_file_php_features import REMOVED_FEATURE_CLASS
 from flag_cleanup.ts_readiness_gates import EDITED_COMMENT, KEPT_GUARD, NAMED_IN_COMMENT, REMOVED_GATE, REMOVED_GUARD
 from flag_cleanup.ts_tests import REMOVED_DEFAULT, RENAMED_TEST
@@ -211,6 +213,8 @@ REPORTED_BINDING_KINDS = frozenset(
         "failing assertion",
         "constant guard",
         COLLAPSED_FUNCTION,
+        EMPTIED_METHOD,
+        KEPT_IVAR,
         "unread binding",
         "emptied override",
         "dropped default argument",
@@ -868,6 +872,48 @@ def _collapsed_function_lines(rows: list[tuple[str, str]]) -> list[str]:
         "`return` of each one the same literal. The statements before them only fed "
         "that result (assignments, environment reads, string tests and comparisons), "
         "and none of them could do anything else, so they were removed:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _emptied_method_lines(rows: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Ruby method the fold left with an empty body, or
+    nothing. Each is kept, because something outside the file may still call it
+    by name, and a reviewer may want to delete it with its callers."""
+    if not rows:
+        return []
+    count = len(rows)
+    noun = "method was" if count == 1 else "methods were"
+    return [
+        f"> **{count} {noun} left empty.** Folding the flag out removed every "
+        "statement of each one, so it now does nothing and returns `nil`. Each is "
+        "kept because its callers, a callback registered elsewhere, a route or a "
+        "view may still name it; a reviewer may want to delete it together with them:",
+        ">",
+        *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
+        *([f"> - ...and {count - 20} more"] if count > 20 else []),
+        "",
+    ]
+
+
+def _kept_ivar_lines(rows: list[tuple[str, str]]) -> list[str]:
+    """The callout naming each Ruby instance variable the fold left assigned a
+    literal, or nothing. Its reads later in the same method were folded where
+    that was proven; the assignment stays, because a view or another method
+    may read it."""
+    if not rows:
+        return []
+    count = len(rows)
+    noun = "instance variable now holds" if count == 1 else "instance variables now hold"
+    return [
+        f"> **{count} {noun} a constant.** The flag read it stored was replaced by "
+        "the literal. Its reads later in the same method were folded where nothing "
+        "else in the repository can change it; the assignment is kept because a "
+        "view, another method or a serializer may still read it, and a reviewer may "
+        "want to fold those too:",
         ">",
         *[f"> - {_md_code(path)}: {_md_code(text)}" for path, text in rows[:20]],
         *([f"> - ...and {count - 20} more"] if count > 20 else []),
@@ -2106,6 +2152,10 @@ def pr_body(
     lines += _collapsed_function_lines(
         [(path, text) for path, kind, text in bindings if kind == COLLAPSED_FUNCTION]
     )
+    lines += _emptied_method_lines(
+        [(path, text) for path, kind, text in bindings if kind == EMPTIED_METHOD]
+    )
+    lines += _kept_ivar_lines([(path, text) for path, kind, text in bindings if kind == KEPT_IVAR])
     lines += _kept_argument_local_lines(kept_argument_locals)
     lines += _unread_local_lines(unread_locals)
     lines += _declared_call_lines(declared_calls)

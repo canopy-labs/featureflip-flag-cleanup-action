@@ -327,7 +327,7 @@ def _registration_of(node: Node, param: str, body: Node) -> Node | None:
     name = function.child_by_field_name("name")
     if receiver is None or receiver.type != "identifier" or name is None or name.type != "identifier":
         return None
-    if _text(name) not in _INFERRING or (value is node and _text(name) not in ("AddSingleton", "TryAddSingleton")):
+    if _text(name) not in _INFERRING or (value == node and _text(name) not in ("AddSingleton", "TryAddSingleton")):
         return None
     statement = call.parent
     if statement is None or statement.type != "expression_statement" or statement.parent != body:

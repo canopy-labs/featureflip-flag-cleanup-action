@@ -336,7 +336,7 @@ def _rows(
         if condition is None or condition.type != "selector_expression":
             continue
         body = _statements(candidate.child_by_field_name("consequence")) or []
-        if not all(setters.get((s.start_byte, s.end_byte)) is treatment for s in body):
+        if not all(setters.get((s.start_byte, s.end_byte)) is treatment for s in body):  # identity: bools
             continue
         operand = condition.child_by_field_name("operand")
         field = condition.child_by_field_name("field")

@@ -3085,7 +3085,7 @@ def _inherited_reach(
         return inside
     # Where the head's next member is read: past the value itself when the
     # value is nothing but its head.
-    at = goes_on if goes_on is not None and head is whole else head
+    at = goes_on if goes_on is not None and head == whole else head
     if head.type in ("object_creation_expression", "cast_expression"):
         return _off_library(at, _type_word(head.child_by_field_name("type")), based, members_of)
     if head.type in _TYPED_HEADS:
