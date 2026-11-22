@@ -244,6 +244,17 @@ def _exports_of(root: Node, name: str) -> _Exports:
                 exported = _spelled(alias if alias is not None else spec_name)
                 if exported != name:
                     continue
+                if (
+                    name == "default"
+                    and source is None
+                    and not type_only
+                    and not any(c.type == "type" for c in specifier.children)
+                ):
+                    # `export { K as default }`: the module declares its default.
+                    if named is not None or declares or renamed is not None:
+                        raise _Unknown
+                    declares = True
+                    continue
                 if source is None or type_only or any(c.type == "type" for c in specifier.children):
                     raise _Unknown  # a local re-exported (and perhaps renamed), or a type
                 if named is not None or declares or renamed is not None:
@@ -259,6 +270,13 @@ def _exports_of(root: Node, name: str) -> _Exports:
         if any(c.type == "=" for c in statement.children):
             raise _Unknown  # ``export = x``
         declaration = statement.child_by_field_name("declaration")
+        if name == "default" and any(c.type == "default" for c in statement.children):
+            # Any `export default ...` (a declaration, an anonymous class or
+            # function, an expression) claims `default` for this module.
+            if named is not None or declares or renamed is not None:
+                raise _Unknown
+            declares = True
+            continue
         if declaration is None:
             # ``export default ...`` and the rest export no ``name``, unless
             # the text says otherwise.
@@ -271,6 +289,8 @@ def _exports_of(root: Node, name: str) -> _Exports:
             if named is not None or declares or renamed is not None:
                 raise _Unknown
             declares = True
+    if name == "default":
+        stars = []  # `export *` never re-exports `default`
     return _Exports(declares, named, tuple(stars), renamed)
 
 

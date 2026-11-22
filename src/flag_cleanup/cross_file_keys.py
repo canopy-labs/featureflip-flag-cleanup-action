@@ -65,6 +65,12 @@ ENUM_ENTRY = "enum-entry"
 #: once every mention in the repository is a proven read, but the profile's
 #: runner deletes its whole file rather than an engine rule deleting a line.
 FEATURE_CLASS = "feature-class"
+#: A module's DEFAULT export holding the key (TypeScript/JavaScript). An
+#: importer binds it under a name of its own, so the declaration's ``name`` is
+#: never spelled by a reader: each reader's local name is the member of its
+#: read. Never removable, and found through :attr:`Profile.default_importers`
+#: rather than by spelling its name.
+DEFAULT_EXPORT = "default-export"
 #: The kinds a declaring file can lose once every mention is a proven read.
 REMOVABLE = frozenset({CONSTANT, FEATURE_CLASS})
 
@@ -122,6 +128,10 @@ class KeyDeclaration:
     #: name may read the key off a flag map, which no rule rewrites. Not part
     #: of a declaration's identity: every declaration of a run holds one key.
     key: str = field(default="", compare=False)
+    #: The owner is a class or an object a file can rewrite at run time
+    #: (`static readonly` is TypeScript only): an escape that is not provably
+    #: read-only voids every read of the entry.
+    mutable_owner: bool = field(default=False, compare=False)
 
     @property
     def entry(self) -> str:
@@ -153,6 +163,11 @@ class Refusal:
     #: from constant refusals, whose wording ("the declaration is kept") is
     #: false for an entry, which is always kept.
     entry: str = ""
+    #: An escape of an entry's owner that provably only reads it (an
+    #: enumeration, a spread into a new object, ``typeof``): it names the use
+    #: and voids nothing. Every other escape of a mutable owner may rewrite
+    #: the entry, and voids its reads (:attr:`KeyDeclaration.mutable_owner`).
+    harmless: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -283,6 +298,13 @@ class Profile:
     #: the file declaring one of ``constants`` as a whole, however it spells
     #: the import. Set with :attr:`constant_escapes`.
     constant_module_pattern: (
+        Callable[[tuple[KeyDeclaration, ...], str], re.Pattern[str]] | None
+    ) = None
+    #: ``(default exports, repo_dir)``: what a file's text holds when it can
+    #: import one of the :data:`DEFAULT_EXPORT` declarations, directly or
+    #: through a barrel, without spelling any name of ours. Those files are
+    #: read as readers.
+    default_importers: (
         Callable[[tuple[KeyDeclaration, ...], str], re.Pattern[str]] | None
     ) = None
     #: Suffixes of files that can use an enum's file or a constant but that
@@ -678,6 +700,33 @@ def mention_pattern(names: Iterable[str]) -> re.Pattern[str]:
     )
 
 
+def default_importer_files(
+    repo_dir: str, language: str, key_paths: Iterable[str], flag_key: str
+) -> list[str]:
+    """The files that can import the default export of one of ``key_paths``
+    holding the key (:data:`DEFAULT_EXPORT`), which spell no name of ours."""
+    _load_profiles()
+    profile = _PROFILES.get(language)
+    if profile is None or profile.default_importers is None:
+        return []
+    defaults: list[KeyDeclaration] = []
+    for path in key_paths:
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        defaults.extend(
+            d
+            for d in profile.declarations(str(Path(path).resolve()), source, flag_key)
+            if d.kind == DEFAULT_EXPORT
+        )
+    if not defaults:
+        return []
+    return mention_files(
+        repo_dir, [], exclude=key_paths, also=profile.default_importers(tuple(defaults), repo_dir)
+    )
+
+
 def key_token(flag_key: str) -> re.Pattern[str]:
     """``flag_key`` as a whole token in source text, as the residue scan reads it.
 
@@ -915,7 +964,7 @@ def resolve(
     kept_setters: set[str] = set()
     # declaring files some mention stops from being deleted
     blocked: set[str] = set(kept_at_home)
-    names = {decl.name for decl in unique}
+    names = {decl.name for decl in unique if decl.kind != DEFAULT_EXPORT}
     # Every segment of a nested owner (`Outer.Inner`): a file declaring only
     # `Outer` can still supply it, and has to be read to be seen competing.
     owners = {
@@ -936,6 +985,16 @@ def resolve(
     if constants_of and profile.constant_module_pattern is not None:
         whole = profile.constant_module_pattern(constants_of, repo_dir)
         also = whole if also is None else re.compile(f"(?:{also.pattern})|(?:{whole.pattern})")
+    # A module's default export is imported under any local name: its
+    # importers are found by the module they name, and read as readers.
+    defaults_of = tuple(d for d in unique if d.kind == DEFAULT_EXPORT)
+    default_pattern = (
+        profile.default_importers(defaults_of, repo_dir)
+        if defaults_of and profile.default_importers is not None
+        else None
+    )
+    if default_pattern is not None:
+        also = default_pattern if also is None else re.compile(f"(?:{also.pattern})|(?:{default_pattern.pattern})")
     unparsed = profile.enum_unparsed_suffixes
     # Ignored build output included: a competing declaration there still
     # decides which constant a tracked reader gets. Its own mentions are
@@ -1005,6 +1064,8 @@ def resolve(
         else set()
     )
     spells_a_name = mention_pattern(names | judged_owners | aliases)
+    if default_pattern is not None:
+        spells_a_name = re.compile(f"(?:{spells_a_name.pattern})|(?:{default_pattern.pattern})")
     spells_a_name_folded = re.compile(spells_a_name.pattern, re.IGNORECASE)
     live_constants = [d for d in live if d.kind in REMOVABLE]
     spells_a_constant = mention_pattern({d.name for d in live_constants} | aliases)
@@ -1031,6 +1092,15 @@ def resolve(
                     refusals.append(Refusal(path, line, UNSUPPORTED_FORM, source.split("\n")[line - 1].strip()))
                     blocked |= spelled_in(source, path)
                     kept_whole |= spelled_in(source, path)
+            if defaults_of and path not in ignored:
+                # A component importing a module's default export under its own
+                # name: never read, so the take is named and the file is left.
+                found_at = default_pattern.search(source) if source is not None and default_pattern else None
+                if source is None or found_at is not None:
+                    line = 1 if found_at is None else source.count("\n", 0, found_at.start()) + 1
+                    text = "" if source is None else source.split("\n")[line - 1].strip()
+                    if not any(r.path == path and r.line == line for r in refusals):
+                        refusals.append(Refusal(path, line, UNSUPPORTED_FORM, text))
             continue
         spells = spells_a_name_folded if _case_insensitive(path) else spells_a_name
         if source is not None and not spells.search(source):
@@ -1137,10 +1207,10 @@ def resolve(
                 kept_whole.add(holder)
                 if escape not in refusals:
                     refusals.append(escape)
-    if constants and profile.module_escapes is not None:
+    if (constants or defaults_of) and profile.module_escapes is not None:
         # A refusal a reader already gave on the same line is this escape.
         refused_at = {(r.path, r.line) for r in refusals if not r.entry}
-        for path in sorted({d.path for d in constants}):
+        for path in sorted({d.path for d in constants} | {d.path for d in defaults_of if d in live}):
             for escape in profile.module_escapes(path, repo_dir):
                 blocked.add(path)
                 kept_whole.add(path)
@@ -1149,6 +1219,7 @@ def resolve(
                     refusals.append(escape)
     notes: list[Refusal] = []
     entries = tuple(d for d in live if d.kind == ENUM_ENTRY)
+    mutated: set[str] = set()
     if entries and profile.enum_escapes is not None:
         # An escape on a line a reader's refusal already names for the same
         # entry is that refusal: its reason is the constant's for the spelling.
@@ -1168,6 +1239,8 @@ def resolve(
                 escapes = profile.enum_escapes(path, source, entries, repo_dir)
             for escape in escapes:
                 escaped.add(escape.entry)
+                if not escape.harmless:
+                    mutated.add(escape.entry)
                 if (escape.path, escape.line, escape.entry) not in refused_at:
                     refused_at.add((escape.path, escape.line, escape.entry))
                     refusals.append(escape)
@@ -1185,6 +1258,30 @@ def resolve(
                 line, text = _line_of(path, hit[0].member)
                 for entry in sorted({ref.declaration.entry for ref in hit}):
                     refusals.append(Refusal(path, line, DECLARATION_KEPT, text, entry))
+    held_entries = {d.entry for d in entries if d.holder}
+    mutable_entries = {d.entry for d in entries if d.mutable_owner and not d.holder}
+    if held_entries or mutable_entries:
+        # A constructed holder is an object: a mention of it that is not a
+        # proven read of its key (`Flags.X.key = "other"`, `const h = Flags.X`,
+        # `Object.values(Flags)`) can change what EVERY read of it gets, so
+        # whatever refuses one voids all of them.
+        touched = {r.entry for r in refusals if r.entry in held_entries}
+        # A string entry's class or object is rewritable too (`(Flags as any).X
+        # = "y"`, `Object.defineProperty(Flags, ...)`, `Object.assign`, `delete`):
+        # an escape that is not provably read-only voids its reads.
+        touched |= mutable_entries & mutated
+        for path in sorted(readers):
+            hit = [
+                ref for ref in readers[path]
+                if ref.declaration is not None and ref.declaration.entry in touched
+            ]
+            if not hit:
+                continue
+            del readers[path]
+            blocked |= spelled_in(sources.get(path) or "", path)
+            line, text = _line_of(path, hit[0].member)
+            for entry in sorted({ref.declaration.entry for ref in hit}):
+                refusals.append(Refusal(path, line, DECLARATION_KEPT, text, entry))
     if entries and profile.enum_dynamic_uses is not None:
         for path, source in sorted(sources.items()):
             if source is None or path in ignored or not path.endswith(family_extensions):

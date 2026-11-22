@@ -160,20 +160,30 @@ def _attribute_end(text: str, name: str, j: int) -> int | None:
     ending at ``j``) is one, or ``None`` for a directive. Blade leaves a name it
     does not know as text:
 
-    * ``@click="…"``: the name is followed by ``=``;
+    * ``@click="…"``: the name is followed by ``=``, and is not a built-in
+      (``@else="1"`` compiles to ``<?php else: ?>``);
     * ``@submit.prevent="…"``: by a ``.`` modifier, for a name that is not a
       built-in;
     * ``@modal-ok.window="…"``, ``@clock-changed="…"``: by ``-word`` segments and
       then ``=`` or a modifier, for the same names. Blade's name is ``\\w+``, so
-      it reads ``@modal`` and leaves it as text, as for ``@click``.
+      it reads ``@modal`` and leaves it as text, as for ``@click``;
+    * ``@update:model-value="…"``: ``:word`` segments join the same way, but
+      never a ``::``.
     """
-    if text[j : j + 1] == "=":
-        return j
     known = builtin(name, None) is not None
+    if text[j : j + 1] == "=" and not known:
+        return j
     if _modifier(text, j) and not known:
         return j
     end = j
-    while text[end : end + 1] == "-" and end + 1 < len(text) and _is_word(text[end + 1]):
+    # `-word` and `:word` segments (`@update:model-value`); a `:` joins only
+    # when a word follows and it is not the first half of `::`, Blade's
+    # namespace separator.
+    while (
+        (text[end : end + 1] == "-" or (text[end : end + 1] == ":" and text[end + 1 : end + 2] != ":"))
+        and end + 1 < len(text)
+        and _is_word(text[end + 1])
+    ):
         end += 1
         while end < len(text) and _is_word(text[end]):
             end += 1
@@ -244,6 +254,10 @@ def _tokens(text: str, registered: frozenset[str] = frozenset()) -> list[tuple[s
             if j == i + 1:
                 i += 1
                 continue
+            if text.startswith("::", j) and j + 2 < n and _is_word(text[j + 2]):
+                j += 2  # `@pkg::name`: Blade's namespaced directive name
+                while j < n and _is_word(text[j]):
+                    j += 1
             name = text[i + 1 : j]
             # A name the project registers is its directive, whatever follows.
             end = None if name in registered else _attribute_end(text, name, j)

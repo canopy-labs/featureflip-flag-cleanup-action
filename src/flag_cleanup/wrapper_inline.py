@@ -100,6 +100,17 @@ UNREMOVABLE_LOCAL = "unremovable-local"
 #: receiver, so it panics there, and folding it would remove the panic. Only
 #: Go produces it.
 NIL_RECEIVER = "nil-receiver"
+#: The read sits inside an ``await`` that covers more than the read, is
+#: bound by an ``async let``, or is awaited in a body not written ``async``
+#: (whose async-ness may come from that ``await`` alone), so inlining could
+#: leave an ``await`` with nothing to wait for. Only Swift produces it; an
+#: ``await`` of the read alone in an ``async`` function, initializer, getter
+#: or typed closure goes with it.
+AWAITED = "awaited"
+#: The read initializes one of several names a single declaration binds
+#: (``let a = flags.x, b = other()``), which the inliner would delete whole.
+#: Only Swift produces it.
+MULTI_BINDING = "multi-binding"
 #: A mention in a file of another language, which this run does not rewrite.
 OTHER_LANGUAGE = "other-language"
 #: A test double of the wrapper that could not be resolved.

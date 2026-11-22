@@ -1328,7 +1328,10 @@ language but Kotlin, whose run refuses a flag (`unsafe-rewrite`, naming the
 file) when a file holding its key calls a negated accessor. Nothing else in
 the run knows the name: a keyless wrapper around one is not inlined (its read
 is still folded, and the wrapper returns the literal), a local bound to the
-read is not inlined by name (the read is folded where it is bound), a read
+read is not inlined by name (the read is folded where it is bound; in TypeScript,
+TSX, JavaScript and JSX a program-level or function-level `const` bound to the
+read is inlined whole, as the opposite literal, like the same `const` bound to
+an ordinary accessor), a read
 whose key is held in a constant the run cannot prove removable is left, and a
 test double of one is not resolved. So once a removal has changed anything,
 every source file of the checkout is checked: any file that still names a
@@ -3154,8 +3157,21 @@ members by selector or key-value coding. So does
 an `open` class, a class anything in the repository subclasses, and a member
 that is `open`, `class`, `override` or `dynamic`; a subclass, or another type
 conforming to the same protocol, in a test target (`Tests`, `Mocks`, `Fakes`)
-keeps them as `test-double`. A wrapper with any attribute (`@objc`,
-`@available`, `@MainActor`) is not inlined at all (`annotated`). Members of an
+keeps them as `test-double`. A wrapper with any other attribute (`@objc`,
+`@available`) is not inlined at all (`annotated`). `@MainActor` alone is
+allowed while the repository declares no macro or type named `MainActor`: it
+decides who may read the member synchronously, not what it returns. A reader
+off the main actor writes `await Flags.newCheckout`, and that `await` goes with
+the read, since `await true` waits for nothing (swiftc warns, and fails under
+warnings-as-errors). That happens only where the code around it is written
+`async`: an `async` function or initializer, a `get async` accessor, or a
+closure whose type says `async`. Elsewhere, and for a read inside an `await`
+that covers more than the read (`await (Flags.newCheckout && ready())`) or
+bound by an `async let`, the read is left as it is (`awaited`): an untyped
+closure is asynchronous only because of its `await`s, so removing the last
+one would leave its own caller's `await` with nothing to wait for. A read that
+initializes one of several names in one declaration (`let a = flags.newCheckout,
+b = other()`) is left as it is too (`multi-binding`). Members of an
 extension, a protocol or an actor, and declarations between `#if` and
 `#endif`, are not treated as wrappers. A `public` wrapper (of a `public` type,
 for a member) is never deleted (`published`), unless the nearest
@@ -3690,8 +3706,10 @@ is reported as **partial** rather than **complete**:
 | `published` | Dart, PHP, Ruby and Swift only: a public wrapper in a package's `lib/` whose `pubspec.yaml` does not say `publish_to: none`, a public or protected PHP wrapper of a Composer package whose `composer.json` does not say `"type": "project"`, a public Ruby class method of a gem (a `.gemspec` beside or above it), or a `public` Swift wrapper not under a `Package.swift` that declares no `.library` product, which another package may call. Its callers are inlined and it is kept. |
 | `receiver-unproven` | Nothing in the file ties the receiver to the method's class. In TypeScript and JavaScript, also a use that hands a function wrapper's module on as an object (see above). |
 | `outside-run` | The call, or the interface the method implements, is in a file outside the directories this run rewrites. In TypeScript and JavaScript, also a caller of another file type of the family that is not configured, or that another run of the family also rewrites. |
-| `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module whose builds may not all read this repository's copy (see [Go workspaces](#go-workspaces-and-modules-that-import-each-other)), or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). |
+| `import-unresolved` | The receiver's type names the class, but the file's imports do not reach it. In Go, the call is in another package with no import of the function's, in another module whose builds may not all read this repository's copy (see [Go workspaces](#go-workspaces-and-modules-that-import-each-other)), or through an unaliased import whose path does not end in the package's name, or the call's receiver or an argument is read through such an import or a dot import. In TypeScript and JavaScript, a default import, a re-export or barrel, a package name, or a wrapper whose module does not export it directly (an `export *`, an `export { name } from` or a `module.exports` there). In C#, a call in a file-based app (`#:` directives) this tool cannot model exactly: the finding names the directive (a `#:sdk` other than `Microsoft.NET.Sdk`, a `#:property` that may change compilation or name lookup, an unknown directive, a `#:project` that is not exactly one project of the repository, a `Directory.Build` file above the app, or an app inside a project's directory). An app whose `#:project` directives reach the wrapper's project is read like any project's file, but only when the checkout has a project file, the wrapper's file belongs to a project, and no symbolic link in the checkout leads to C# source; otherwise every app keeps the wrapper. |
 | `argument-has-call` | An argument holds a call, a lambda or an assignment. In Go, a receive (`<-ch`) or a dereference (`*p`) counts too. In TypeScript and JavaScript, `new`, `await`, `yield`, `delete`, a spread or `++`/`--` counts too, and an arrow or function argument counts only when its body holds one of these or a call. So does a parameter default of the wrapper that may run code, whether or not the call passes that argument. |
+| `awaited` | Swift only: the call sits inside an `await` that covers more than the call (`await (flags.newCheckout && ready())`), is bound by an `async let`, or is awaited in code not written `async` (an untyped closure, a closure passed to a parameter), so inlining could leave an `await` with nothing to wait for. An `await` of the call alone, in an `async` function, initializer, getter or typed closure, goes with it. |
+| `multi-binding` | Swift only: the call initializes one of several names one `let` or `var` declares (`let a = flags.newCheckout, b = other()`); inlining it would delete the others with it. |
 | `unremovable-local` | Go only: folding the call would leave a local unused that the cleanup does not remove (see above), and Go does not build with an unused local. |
 | `nil-receiver` | Go only: the call reaches a value-receiver method through a pointer that may be nil, so it panics there, and folding it would remove the panic. |
 | `other-language` | The call is in a Groovy or Scala file, in a Java file calling a Kotlin method (or the reverse), in Java, Groovy or Scala naming a Kotlin getter (`getEnableX`), or in Kotlin reading a Java getter as a property (`flags.enabled`), or a VB or F# file naming a C# wrapper. |
@@ -5056,16 +5074,21 @@ A TypeScript or JavaScript key constant imported through a barrel, by
 (`const` only, no rest element, no default value, no renaming `{ NAME: X }`), is folded
 like one imported from its own file. A default import through a barrel is not
 followed, nor is the barrel object itself (`const k = require("./barrel")`).
-A key reached through a module's default export (`export default 'key'`,
-`export default K` or `export { K as default }` for a key constant `K`,
-`export default { … }` holding the key, `module.exports = …`) is not folded
-either: the importer binds it under a name of its own (`import F from
-"./keys"`). Each place that takes such a default (a default import,
-`{ default as F }`, `export { default } from`, `export { default as F } from`,
-a `require()` that is not destructured into named members, `import()`) is
-listed as `unsupported-form`, and the file is left as it is; where the
-default export is the key itself, its own line is listed. A default export
-nothing takes changes nothing: the constant's reads elsewhere still fold. The chain is followed through
+A key reached through a module's default export is folded when the export is
+provably the key itself: `export default 'key'`, or `export default K` or
+`export { K as default }` for a top-level `const K` holding it. A read of the
+importer's own name for it (`import F from "./keys"`, `import { default as F }
+from "./keys"`, or `import { F } from "./barrel"` for a barrel's `export {
+default as F } from "./keys"`) is folded like a named import, and the import
+the fold strands goes with it. The default export itself, and any barrel line
+that hands it on, are kept in this version and listed as `unsupported-form`.
+It is not followed, and the file is left as it is, when the default export is
+anything else (`export default { … }` holding the key, a call, a `let` or
+`var`), when the module is a declaration file or has one beside it, for
+`import * as m` (`m.default`), `import()`, a type-only import, and for
+`module.exports = …` with a `require()`. Each of those places is listed as
+`unsupported-form`. A default export nothing takes changes nothing: the
+constant's reads elsewhere still fold. The chain is followed through
 `export { NAME } from "./m"` and `export * from "./m"`, any number of hops and
 through `paths` aliases, to the module that declares the constant. When
 the constant goes, the barrel's `export { NAME } from` line goes with it, or just that
@@ -5730,11 +5753,37 @@ when the class is defined, so a static block, a method, an accessor, an
 instance member, a decorator or an initialiser that calls anything could set
 the field unseen, and any of them makes the class's field `enum-unproven`. A
 field holding a constructed object (`static readonly NEW_CHECKOUT = new
-FeatureFlag("new-checkout")`, read as `FeatureFlags.NEW_CHECKOUT.key`) is not
-resolved and is reported as `unsupported-form`. Every use of the class other
+FeatureFlag("new-checkout")`) is resolved when its class is proven the way a
+constructed constant's is: no `extends`, no decorator, a single constructor
+that only stores its arguments, with the key stored unmodified in a field
+nothing else writes, and no file of the repository reaching the class's
+prototype. Every other member of the class must be a literal or such a
+construction. The read is then `FeatureFlags.NEW_CHECKOUT.<field>`, where
+`<field>` is whatever field the class stores the key in (`key`, `id`, `name`):
+it is taken from the constructor, never assumed. A holder is an object, so
+any other mention of it (`FeatureFlags.NEW_CHECKOUT` itself, a write of its
+field, `Object.assign`, an alias, `Object.values(FeatureFlags)`) keeps every
+read of it, each named as the reason. A holder that cannot be proven is
+reported as `unsupported-form`. A class written as an expression,
+`export const FeatureFlags = class { static readonly NEW_CHECKOUT = "..." }`,
+is treated like the declaration when the `const` binds that class expression
+itself: not a `let` or `var`, with no type annotation, no `extends` and no
+wrapping call, assertion or parentheses (`mixin(class { ... })`), which are
+reported as `unsupported-form` or `enum-unproven`. Every use of the class other
 than `FeatureFlags.<field>` or a type (`new FeatureFlags()`, `extends
 FeatureFlags`, `Object.values(FeatureFlags)`, passing it on) is a use of the
-whole enum, as above.
+whole enum, as above. For a class or an `as const` object a use that is not
+provably read-only (`(FeatureFlags as any).X = "y"`, `Object.defineProperty`,
+`Object.assign`, `delete`, an alias, passing it to a function) may rewrite the
+key at run time, so it keeps every read of that registry. Only these uses do
+not: `Object.values`, `Object.keys`, `Object.entries`,
+`Object.getOwnPropertyNames`, `Object.freeze` or `Object.isFrozen` with the
+registry as their only argument, and `JSON.stringify` with it as its only
+argument (on the global `Object` or `JSON`, which the file must not declare,
+import or receive as a parameter); a spread into an object literal; `typeof`;
+and `"key" in` with a string literal. `new FeatureFlags()`, `extends`,
+`instanceof` and every other use keep the reads, because an instance or a
+subclass can reach the class without naming it.
 
 The reads are folded and **the entry is left in place**. Removing an enum
 entry can change stored values (a Java ordinal, a PHP backing value read back
@@ -6277,6 +6326,10 @@ never run. A stranded destructuring `var` refuses the flag, and so does a dead
 `if` branch that declares a `var`: the name is hoisted to the function and may
 be read after the `if`, so the branch is not deleted, and the `if` left
 testing a literal is refused rather than shipped.
+
+Only code the fold made unreachable is deleted, in every language that does this. Code you
+wrote after a `return`, `throw`, `raise`, `break` or `continue` of your own stays where it is,
+even when the same function also holds a flag read the removal folds.
 
 A loop condition the fold makes constant is finished the way your lint
 expects, because `no-constant-condition` rejects every constant loop except
@@ -6911,6 +6964,14 @@ also means a method stays when deleting it would leave a field of the file
 that the compiler warns about, an error under `TreatWarningsAsErrors`: one only
 the method assigned (CS0649), or one only the method read (CS0169, CS0414).
 
+A C# local function the fold leaves with no caller is deleted the same way (the
+compiler's CS8321, an error under `TreatWarningsAsErrors`), top-level statements
+included, and so is a local or another local function only it used. The
+conditions are the method's, adapted: no attribute and not `extern`, no method or
+other local function of the same name in the file, nothing in the file naming it
+(a delegate, `nameof`, a string or a comment all count; its own recursion does
+not), and no preprocessor directive beside its declaration.
+
 A primary-constructor parameter is the one place that costs a build. When
 every read of `client` in `class Svc(IClient client)` was a flag read the fold
 removed, the parameter is left unread and the compiler warns CS9113, which is
@@ -7479,6 +7540,16 @@ seen, and is deleted if nothing spells its name.
 
 A `require` is never removed: it runs the file it names.
 
+**A removal that would change what a later read means is refused.** Ruby declares a
+local where its assignment appears, even one that never runs: `y = 1 if <flag>`
+followed by `puts y.inspect` prints `nil`. If the removal deletes that
+assignment, the later `y` becomes a method call (a `NameError`, or the wrong
+value where a method `y` exists). The tool resolves every bare identifier in
+the file the way Ruby does, before and after, and leaves the file alone, with
+the reason, when a read changes between local and method. Move the read or
+assign the local before the flag check, then run it again. `.erb` templates are
+checked the same way. A local read only through `binding` or `eval` is not seen.
+
 ## Supported ERB flag-read shapes
 
 `.erb` templates run the **Ruby** rules above, unchanged. Every call form,
@@ -7522,6 +7593,9 @@ that a stylesheet gives `white-space: pre`. Any other template
 lines. A tag written with trim markers
 takes what they trimmed with it (the newline after `-%>`, the indentation
 before `<%-`), so a `.text.erb` template renders exactly as before.
+Rails and the Action trim a deleted tag by different rules, so a file is
+refused unless every statement tag the removal deletes or changes is safe to
+delete (see below).
 
 Three things are specific to templates:
 
@@ -7533,8 +7607,30 @@ Three things are specific to templates:
 * **ERB comments (`<%# … %>`) and literal tags (`<%% … %>`) are not code.** A
   flag read written inside either is text, and nothing rewrites it.
 
-One shape is **refused** rather than rewritten, and the run exits 1 naming the
-file: a **subject-less `case`** whose `when` is the flag read — `<% case %>` /
+Two shapes are **refused** rather than rewritten, and the run exits 1 naming the
+file and the reason. An ERB view the transform engine rewrote but could not turn back into a
+template that renders the same is refused the same way, with the engine's reason,
+never reported as nothing to remove. A view it could not read at all (a
+byte-order mark, a template that does not parse) is left untouched, the rest of
+the flag is removed, and the pull request lists the file with the engine's reason. The first is a rule, not a list: a removal that deletes or changes a
+statement tag (`<% … %>` or `<%- … -%>`) is made only if every such tag
+
+* starts its line after spaces or tabs only (no text, no other whitespace such
+  as a no-break space or form feed), and is followed at once by the line's
+  newline (or the end of the file, where the tag must then start its line with
+  no indent): no blank, text or second tag after it;
+* is the only `<%` on its line (a second tag, an output tag, a comment tag or a
+  `<%%` escape on the line refuses it);
+* does not empty a block that an output tag opens (`<%= form_with … do %>`): the
+  block's other lines must keep literal text (an output tag or a comment does
+  not count);
+* spells the same marker form as every other such tag the removal deletes or
+  changes in the file: all `<% … %>`, or all `<%- … -%>`. Two guards in one
+  file, one written each way, are refused even when they are separate blocks.
+  A tag with only one marker (`<%- … %>`, `<% … -%>`) is never removed.
+
+A tag on a line the removal leaves alone, such as your own inline `<% unless x %>…<% end %>`, is not checked. Rails would otherwise render the page differently, with extra blank
+lines or lines joined or indented differently. The second shape is a **subject-less `case`** whose `when` is the flag read — `<% case %>` /
 `<% when <read> %>`. In a `.rb` file that shape is folded; in a template it is
 not, so the Action declines rather than shipping a template with the dead arm
 still standing and the flag key already gone. Fix it by hand, or add the key to
@@ -8537,7 +8633,7 @@ loop): one that opens or closes a block (`<?php if ($x): ?>`, `<?php endif; ?>`,
 `<?php else: ?>`), a label, a function declaration, a `return`, or a `<?= … ?>`
 with no closing `;`. Move the custom directive or the PHP block out of the
 conditional and the next run removes the flag. Alpine and Vue event attributes
-(`@click="…"`, `@submit.prevent="…"`, `@modal-ok.window="…"`) are markup and are
+(`@click="…"`, `@submit.prevent="…"`, `@modal-ok.window="…"`, `@update:model-value="…"`) are markup and are
 fine anywhere. A
 rewrite that would reach a custom directive, or leave a Blade block without its
 opener or its closer, is **refused**, and the run exits 1 naming the file.
@@ -8583,6 +8679,21 @@ being removed), or a binding kept there is `lazy`, computed, observed, wrapped o
 the file is refused rather than rewritten. The check reads the rewritten file as
 it is, so a file the removal changes is refused as well when it already had a
 statement after a bare `return` that Swift warns will never be executed.
+
+A line that starts with `(` or `[` begins a new statement in Swift. After the
+block of an `if` or `while` condition (`if legacy { return }` followed by
+`["cart", "payment"].forEach { … }`) the grammar reads it that way too, and the
+check is removed like any other. After a `let` bound to a dotted name
+(`let p = settings.path` followed by `(a ?? b).run()`) the grammar still reads
+it as the arguments of the line above, so a file the removal would change is
+refused when the grammar reads such a line that way, before or after the
+rewrite, since the rewrite would be planned on the wrong statements.
+
+Two more Swift shapes are refused rather than rewritten: a flag read bound by
+a `let` or `var` that declares several names (`let legacy = <read>, count =
+other()`), where the read's name cannot be inlined without deleting the others
+with it, and a read bound by an `async let` (`async let legacy = <read>`),
+where the removal used to leave `await true`.
 
 A read bound to a `let` is inlined, and the `if useLegacy` reading it is folded
 the same way.

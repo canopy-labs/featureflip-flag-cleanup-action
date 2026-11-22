@@ -2090,8 +2090,14 @@ def _ts_parameter_property(param: Node) -> bool:
 
 
 def _ts_class_keeps_first_argument(cls: Node) -> bool:
-    """Whether constructing ``cls`` does nothing but store its arguments, the
-    first one unmodified in a field nothing else in the class writes.
+    """:func:`_ts_class_key_fields` found fields."""
+    return _ts_class_key_fields(cls) is not None
+
+
+def _ts_class_key_fields(cls: Node) -> frozenset[str] | None:
+    """The field(s) the first constructor argument lands in, when constructing
+    ``cls`` does nothing but store its arguments, the first one unmodified in
+    a field nothing else in the class writes; None when that is not proven.
 
     No superclass and no decorator (either can replace the constructor); one
     ``constructor``, whose parameters are plain names with literal defaults at
@@ -2105,62 +2111,62 @@ def _ts_class_keeps_first_argument(cls: Node) -> bool:
     ``this`` in the class is the object of a plain ``this.F``, and the key's
     field is written only by the constructor's own assignment."""
     if any(c.type == "decorator" for c in cls.children):
-        return False
+        return None
     heritage = next((c for c in cls.named_children if c.type == "class_heritage"), None)
     if heritage is not None and any(c.type != "implements_clause" for c in heritage.named_children):
-        return False
+        return None
     body = cls.child_by_field_name("body")
     if body is None:
-        return False
+        return None
     constructors: list[Node] = []
     members: list[Node] = []
     for member in body.named_children:
         if member.type == "comment" or member.type == "method_signature":
             continue
         if any(c.type == "decorator" for c in member.children):
-            return False
+            return None
         name = member.child_by_field_name("name")
         if member.type == "method_definition" and name is not None and name.text == b"constructor":
             constructors.append(member)
             continue
         if member.type == "class_static_block":
-            return False
+            return None
         if member.type == "public_field_definition":
             static = any(c.type == "static" for c in member.children)
             value = member.child_by_field_name("value")
             if not static and value is not None and not _ts_inert(value):
-                return False
+                return None
         members.append(member)
     if len(constructors) != 1:
-        return False
+        return None
     constructor = constructors[0]
     stored: set[int] = set()
     parameters = constructor.child_by_field_name("parameters")
     block = constructor.child_by_field_name("body")
     if parameters is None or block is None:
-        return False
+        return None
     params = [p for p in parameters.named_children if p.type != "comment"]
     names: list[str] = []
     for index, param in enumerate(params):
         if param.type not in ("required_parameter", "optional_parameter"):
-            return False
+            return None
         if any(c.type == "decorator" for c in param.children):
-            return False
+            return None
         pattern = param.child_by_field_name("pattern")
         if pattern is None or pattern.type != "identifier":
-            return False
+            return None
         default = param.child_by_field_name("value")
         if default is not None and not _ts_inert(default):
-            return False
+            return None
         if index == 0:
             if param.type != "required_parameter" or default is not None:
-                return False
+                return None
             annotation = param.child_by_field_name("type")
             if annotation is not None and annotation.text.decode("utf-8").lstrip(":").strip() != "string":
-                return False
+                return None
         names.append(pattern.text.decode("utf-8"))
     if not names:
-        return False
+        return None
     fields: set[str] = {names[0]} if _ts_parameter_property(params[0]) else set()
     assigned: list[str] = []
     others: set[str] = {n for p, n in zip(params[1:], names[1:]) if _ts_parameter_property(p)}
@@ -2169,25 +2175,25 @@ def _ts_class_keeps_first_argument(cls: Node) -> bool:
             continue
         expression = statement.named_children[0] if statement.type == "expression_statement" else None
         if expression is None or expression.type != "assignment_expression":
-            return False
+            return None
         left = expression.child_by_field_name("left")
         field = _ts_this_field(left)
         right = expression.child_by_field_name("right")
         if field is None or right is None or right.type != "identifier":
-            return False
+            return None
         stored.add(left.id)
         if right.text.decode("utf-8") not in names:
-            return False
+            return None
         assigned.append(field)
         (fields if right.text.decode("utf-8") == names[0] else others).add(field)
     # Each field written once, and the key's never from another parameter.
     if not fields or len(assigned) != len(set(assigned)) or fields & others:
-        return False
+        return None
     # No accessor or method of the key field's name stands in for it.
     for member in members:
         name = member.child_by_field_name("name")
         if member.type != "public_field_definition" and name is not None and name.text.decode("utf-8") in fields:
-            return False
+            return None
     # Every `this` in the class is the object of a plain `this.F`, and the
     # key's field is written by the constructor's own assignment alone:
     # `this["id"]`, `(this as any).id`, `const self = this`,
@@ -2198,13 +2204,13 @@ def _ts_class_keeps_first_argument(cls: Node) -> bool:
         member = node.parent
         obj = member.child_by_field_name("object") if member is not None else None
         if member is None or member.type != "member_expression" or obj is None or obj.id != node.id:
-            return False
+            return None
         prop = member.child_by_field_name("property")
         if prop is None or prop.type != "property_identifier":
-            return False
+            return None
         if member.id not in stored and _ts_written(member) and prop.text.decode("utf-8") in fields:
-            return False
-    return True
+            return None
+    return frozenset(fields)
 
 
 #: Where a member expression is assigned to as part of a pattern.
@@ -2263,14 +2269,62 @@ def _ts_holder_class(root: Node, value: Node, path: str | None) -> str | None:
     elif not rest or not _ts_boolean(rest[0], root, path, 0):
         # No default and no type argument says nothing about the value's type.
         return None
+    found = _ts_constructed_class(root, constructor, path)
+    return found[0] if found is not None else None
+
+
+def _ts_constructed_class(root: Node, constructor: Node, path: str) -> tuple[str, frozenset[str]] | None:
+    """The class ``constructor`` (the name after ``new``) is, and the field(s)
+    its first argument lands in, when it is bound exactly once in the file by
+    a top-level class or an unaliased named import of one and keeps its first
+    argument (:func:`_ts_class_key_fields`)."""
     binders = _ts_class_name_binders(root, constructor.text.decode("utf-8"))
     if len(binders) != 1:
         return None
     cls = _ts_top_level_class(binders[0]) or _ts_imported_class(binders[0], path)
-    if cls is None or not _ts_class_keeps_first_argument(cls):
+    fields = _ts_class_key_fields(cls) if cls is not None else None
+    name = cls.child_by_field_name("name") if cls is not None else None
+    if fields is None or name is None:
         return None
-    name = cls.child_by_field_name("name")
-    return name.text.decode("utf-8") if name is not None else None
+    return name.text.decode("utf-8"), fields
+
+
+def ts_inert_construction(root: Node, value: Node, path: str | None) -> bool:
+    """Whether ``value``, a ``new C(…)`` in a class's static field, does
+    nothing but store its (inert) arguments: ``C`` is proven
+    (:func:`_ts_constructed_class`) and no argument runs code."""
+    if path is None or value.type != "new_expression":
+        return False
+    constructor = value.child_by_field_name("constructor")
+    arguments = value.child_by_field_name("arguments")
+    if constructor is None or constructor.type != "identifier" or arguments is None:
+        return False
+    if not all(_ts_inert(a) for a in arguments.named_children):
+        return False
+    return _ts_constructed_class(root, constructor, path) is not None
+
+
+def ts_static_holder_fields(root: Node, value: Node, path: str | None) -> frozenset[str] | None:
+    """The member(s) a static field's ``new C("key", …)`` exposes the key
+    through (``key`` of ``constructor(readonly key: string)``), or None.
+
+    Proven like a constructed constant (:func:`_ts_holder_class`) except the
+    boolean evidence: the field is read as ``Flags.X.key`` in the key
+    position of an SDK call, which fixes what the key is read as. The first
+    argument is the plain string, and no file of the checkout may reach the
+    class's prototype (:func:`_ts_prototype_site`)."""
+    if not ts_inert_construction(root, value, path) or path is None:
+        return None
+    arguments = value.child_by_field_name("arguments")
+    constructor = value.child_by_field_name("constructor")
+    listed = [c for c in arguments.named_children if c.type != "comment"]
+    first = listed[0] if listed else None
+    if first is None or first.type != "string" or len(first.named_children) != 1:
+        return None
+    found = _ts_constructed_class(root, constructor, path)
+    if found is None or _ts_prototype_site(found[0], path) is not None:
+        return None
+    return found[1]
 
 
 #: Operators whose result is a boolean whatever their operands are.

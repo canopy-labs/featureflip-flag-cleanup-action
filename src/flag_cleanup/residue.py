@@ -870,17 +870,32 @@ def _enum_member(node: Node, language: str) -> Node | None:
 def _static_field(field: Node, mention: Node) -> bool:
     """Whether ``mention`` is the plain string value (also ``as const``) of
     ``field``, a ``static readonly`` field of a class declared at the top of
-    its file: a key registry read as ``Owner.FIELD``, like an ``as const``
-    object's property."""
+    its file (or the initialiser of a top-level ``const``): a key registry
+    read as ``Owner.FIELD``, like an ``as const`` object's property. Also the
+    first argument of a constructed holder there
+    (``static readonly X = new FeatureFlag("<key>")``), read as
+    ``Owner.FIELD.key``."""
     value = field.child_by_field_name("value")
     if value is not None and value.type == "as_expression" and any(c.type == "const" for c in value.children):
         value = next((c for c in value.named_children if c.type != "comment"), None)
+    if value is not None and value.type == "new_expression":
+        arguments = value.child_by_field_name("arguments")
+        listed = [c for c in arguments.named_children if c.type != "comment"] if arguments is not None else []
+        value = listed[0] if listed else None
     if value is None or value.type != "string" or not (value.start_byte <= mention.start_byte < value.end_byte):
         return False
     if not {"static", "readonly"} <= {c.type for c in field.children}:
         return False
     body = field.parent
     declaration = body.parent if body is not None else None
+    if declaration is not None and declaration.type == "class" and declaration.parent is not None:
+        # `export const Flags = class { ... }`: the class is the initialiser.
+        declarator = declaration.parent
+        declaration = declarator.parent if declarator.type == "variable_declarator" else None
+        top = declaration.parent if declaration is not None else None
+        if top is not None and top.type == "export_statement":
+            top = top.parent
+        return body is not None and body.type == "class_body" and top is not None and top.type == "program"
     top = declaration.parent if declaration is not None else None
     if top is not None and top.type == "export_statement":
         top = top.parent

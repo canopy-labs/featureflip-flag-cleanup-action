@@ -88,6 +88,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
+import bisect
 import difflib
 import re
 import sys
@@ -1770,6 +1771,36 @@ def _ruby_hazard(
     return ("exposed", unmatched) if unmatched is not None else None
 
 
+def _ruby_local_flip(before: str, after: str, language: str) -> str | None:
+    """The refusal for a rewrite that changed what a surviving Ruby read means: a bare
+    identifier Ruby read as a local (an assignment to it came earlier in its scope,
+    dead or not) that it now reads as a method call, or the reverse
+    (:mod:`flag_cleanup.ruby_locals`)."""
+    profile = _PROFILES[language]
+    if profile.code_view is not None:
+        return _ruby_local_flip(
+            _code_view(before, language), _code_view(after, language), profile.code_view
+        )
+    if language != "ruby" or before == after:
+        return None
+    from flag_cleanup import ruby_locals
+
+    try:
+        found = ruby_locals.flipped_read(before, after, lambda source: _parse(source, "ruby"))
+    except RecursionError:
+        return "the file is nested too deeply to check that every local is still declared"
+    if found is None:
+        return None
+    name, line, was_local = found
+    if was_local:
+        return (
+            f"`{name}` (line {line}) was a local variable and would now be read as a method "
+            "call: Ruby declares a local where its assignment appears, even one that never "
+            "runs, and the removal deleted the assignment that declared it"
+        )
+    return f"`{name}` (line {line}) was a method call and would now be read as a local variable"
+
+
 def _ruby_kind_name(kind: str) -> str:
     """How a refusal names a loose node's kind."""
     if kind.endswith("_modifier"):
@@ -2025,6 +2056,134 @@ def _swift_live_after_bare_return(source: str) -> str | None:
                     continue
                 return following.text.decode("utf-8", "replace")
     return None
+
+
+def _swift_line_start_arguments(source: str) -> str | None:
+    """A Swift call's or constructor's ``(``/``[`` arguments that start a line, or None.
+
+    Swift never continues an expression into a ``(`` or ``[`` at the start of a
+    line: there it begins a new statement. A parse tree that hangs such a
+    bracket on the line above as its arguments is therefore not the program
+    swiftc reads. It happens after a condition's block, read as a trailing
+    closure (``if ready() { return }`` NEWLINE ``[1].forEach { … }`` becomes one
+    ``if`` subscripting the closure), and after a dotted name bound by a
+    declaration (``let p = a.b`` NEWLINE ``(c ?? d).run()``). A rewrite of that
+    tree folds the wrong statement, so the check is NOT differential: a file
+    holding one on either side of the rewrite is refused when the run changes
+    it. Returns the bracketed line's text.
+    """
+    data = source.encode("utf-8")
+    for node in _walk(_parse(source, "swift")):
+        if node.type not in ("call_suffix", "constructor_suffix") or not node.named_children:
+            continue
+        arguments = node.named_children[0]
+        if arguments.type != "value_arguments":
+            continue
+        line_start = data.rfind(b"\n", 0, arguments.start_byte) + 1
+        if not data[line_start : arguments.start_byte].strip():
+            end = data.find(b"\n", arguments.start_byte)
+            return data[line_start : end if end != -1 else len(data)].decode(
+                "utf-8", "replace"
+            ).strip()
+    return None
+
+
+def _swift_awaited_literals(source: str) -> list[int]:
+    """1-based lines of each ``await`` whose operand is a boolean literal.
+
+    ``await true`` waits for nothing: swiftc warns, and fails under
+    warnings-as-errors. The inliner writes it when it inlines an ``async let``
+    bound to a read into the ``await`` that read the binding.
+    """
+    lines = []
+    for node in _walk(_parse(source, "swift")):
+        if node.type != "await_expression":
+            continue
+        operand = next((c for c in node.named_children if c.type not in ("comment", "multiline_comment")), None)
+        while operand is not None and operand.type == "tuple_expression" and operand.named_child_count == 1:
+            operand = operand.named_children[0]
+        if operand is not None and operand.type == "boolean_literal":
+            lines.append(node.start_point[0] + 1)
+    return lines
+
+
+def _swift_shared_bindings(source: str) -> dict[str, int]:
+    """For each name a ``let``/``var`` binding several names declares, how many
+    declarations bind it."""
+    counts: Counter = Counter()
+    root = _parse(source, "swift")
+    shared: dict[str, None] = {}
+    for node in _walk(root):
+        if node.type == "property_declaration":
+            patterns = [c for c in node.named_children if c.type == "pattern"]
+            names = [_text_of(p) for p in patterns]
+            for name in names:
+                counts[name] += 1
+            if len(patterns) > 1:
+                shared.update(dict.fromkeys(names))
+    return {name: counts[name] for name in shared}
+
+
+def _text_of(node: Node) -> str:
+    return node.text.decode("utf-8", "replace").strip()
+
+
+def _swift_lost_shared_binding(before: str, after: str) -> str | None:
+    """A name a multi-name ``let``/``var`` bound in ``before`` that ``after``
+    binds fewer times yet still reads.
+
+    The inliner deletes a declaration whose binding it inlined, the other
+    names of ``let a = <read>, b = other()`` with it, leaving ``b`` unbound.
+    """
+    lost = [
+        name
+        for name, count in _swift_shared_bindings(before).items()
+        if _swift_bindings_of(after, name) < count
+    ]
+    if not lost:
+        return None
+    reads = {
+        _text_of(n)
+        for n in _walk(_parse(after, "swift"))
+        if n.type == "simple_identifier"
+    }
+    return next((name for name in lost if name in reads), None)
+
+
+def _swift_shared_literal_bindings(source: str) -> list[tuple[str, int]]:
+    """Each name a multi-name ``let``/``var`` binds to a boolean literal, with
+    its line.
+
+    The inliner leaves ``let legacy = <read>, count = other()`` standing as
+    ``let legacy = true, count = other()``: deleting the declaration would
+    unbind ``count``, so the literal stays bound and every read of ``legacy``
+    with it. The flag key is gone from the file, so no later run could revisit
+    the leftover.
+    """
+    found = []
+    for node in _walk(_parse(source, "swift")):
+        if node.type != "property_declaration":
+            continue
+        names = node.children_by_field_name("name")
+        if len(names) < 2:
+            continue
+        values = node.children_by_field_name("value")
+        if len(values) != len(names):
+            continue
+        for name, value in zip(names, values):
+            if value.type == "boolean_literal":
+                found.append((_text_of(name), name.start_point[0] + 1))
+    return found
+
+
+def _swift_bindings_of(source: str, name: str) -> int:
+    return sum(
+        1
+        for node in _walk(_parse(source, "swift"))
+        if node.type == "property_declaration"
+        for c in node.named_children
+        if c.type == "pattern" and _text_of(c) == name
+    )
 
 
 def _go_literal_decided_conditions(source: str) -> int:
@@ -3457,6 +3616,181 @@ def transform_broke_syntax(before: str, after: str, language: str) -> bool:
 ENGINE_MARKERS: tuple[str, ...] = ("fc-jsx-spread",)
 
 
+_ERB_TAG_RE = re.compile(r"<%(?!%)(?!-?[=#])(-?)(.*?)(-?)%>", re.DOTALL)
+#: Every tag holding Ruby, output tags included (`<%= form_for x do |f| %>` opens a block).
+_ERB_CODE_RE = re.compile(r"<%(?!%)(?!-?\#)(-?)(=?)(.*?)(-?)%>", re.DOTALL)
+_ERB_OPENER_RE = re.compile(r"(?:if|unless|case|while|until|for|begin|def|class|module)\b|.*\bdo\s*(?:\|[^|]*\|)?$", re.DOTALL)
+
+
+def _erb_trees(source: str) -> tuple[dict[int, int], list[tuple[int, int]]] | None:
+    """The outermost block each code tag of ``source`` belongs to, by tag offset.
+
+    ``<% if %>`` … ``<% else %>`` … ``<% end %>`` (and the other openers, or a
+    tag ending ``do |x|``) form one tree with everything nested in it; every
+    other top-level tag is a tree of its own. The second result holds the body
+    span (from after the opening tag to the start of its ``end``) of every
+    block an output tag opens (`<%= helper do %>`). ``None`` when the tags do
+    not nest the way this reads them (an ``end`` with nothing open, a block
+    left open, a tag that holds ``end`` beside other code): the caller then
+    treats the whole file as one tree.
+    """
+    trees: dict[int, int] = {}
+    spans: list[tuple[int, int]] = []
+    open_blocks: list[int | None] = []
+    root = None
+    for match in _ERB_CODE_RE.finditer(source):
+        code = match.group(3).strip()
+        if code != "end" and re.search(r"\bend\b", code):
+            return None
+        if not open_blocks:
+            root = match.start()
+        trees[match.start()] = root if root is not None else match.start()
+        if code == "end":
+            if not open_blocks:
+                return None
+            body = open_blocks.pop()
+            if body is not None:
+                spans.append((body, match.start()))
+        elif _ERB_OPENER_RE.match(code):
+            open_blocks.append(match.end() if match.group(2) else None)
+    return (trees, spans) if not open_blocks else None
+
+
+def _erb_block_emptied(before: str, edited_text: Callable[[int, int], str], span: tuple[int, int]) -> bool:
+    """Whether the lines of an output block's body that the rewrite kept hold no literal text.
+
+    Every tag counts as empty, output tags and comments included: ActionView's
+    ``capture`` falls back to the block's RETURN VALUE when the buffer is blank,
+    so a body that renders only whitespace (a comment, ``<%= '' %>``, ``<%= nil %>``)
+    reads differently from one the rewrite leaves bare.
+    """
+    return not re.sub(r"<%.*?%>", "", edited_text(*span), flags=re.DOTALL).strip()
+
+
+def _erb_trim_hazard(before: str, after: str) -> str | None:
+    """Why deleting a statement tag could change the page Rails renders.
+
+    Rails renders with Erubi (``trim: true``), which takes the indent and the
+    newline of a statement tag by its own rules (whitespace before it on its
+    line, a newline right after it), while the rewrite deletes tags by another
+    (what its trim markers say). The two agree only on a narrow shape, so this
+    is a whitelist: the rewrite is refused unless EVERY statement tag it
+    removed or changed
+
+    * sits on a line of the form ``[ \\t]*<tag>`` followed at once by a
+      newline (``\\n`` or ``\\r\\n``), or the end of the file with nothing before it
+      on the line: no other
+      whitespace (``\\f``, ``\\v``, no-break spaces) before it, no blanks
+      or text after it;
+    * is the only ``<%`` on its lines (a second tag, an output tag, a comment
+      tag or a ``<%%`` escape on the line all refuse); and
+    * does not empty a block an output tag opens (`<%= helper do %>`): the
+      block's lines that the rewrite keeps must hold literal text (no tag of any
+      kind counts, nor a comment); and
+    * spells the same marker form as every other such tag of its outermost block
+      (the whole file when the tags do not nest): all
+      unmarked ``<% … %>``, or all ``<%- … -%>``. A tag with one marker never
+      qualifies.
+
+    "Removed or changed" is read from a line diff of the original against the
+    rewrite: a tag on a line the diff keeps is untouched, so a customer's own
+    inline `<% unless x %>…<% end %>` beside the guard does not refuse it. When
+    identical lines make the diff ambiguous about which copy went, the copies
+    have the same text and so the same verdict. Measured against ActionView
+    over a corpus of guard shapes (``tests/test_erb_trim_markers.py``), each
+    shape the whitelist admits rendered identically; the shapes it refuses
+    included every one that did not.
+    """
+    if before == after:
+        return None
+    lines = re.findall(r"[^\n]*\n|[^\n]+", before)
+    starts = [0]
+    for text in lines:
+        starts.append(starts[-1] + len(text))
+    edited: set[int] = set()
+    for op, i1, i2, _j1, _j2 in difflib.SequenceMatcher(
+        None, lines, re.findall(r"[^\n]*\n|[^\n]+", after), autojunk=False
+    ).get_opcodes():
+        if op != "equal":
+            edited.update(range(i1, i2))
+
+    def touched(match: re.Match[str]) -> bool:
+        first = bisect.bisect_right(starts, match.start()) - 1
+        last = bisect.bisect_right(starts, max(match.end() - 1, match.start())) - 1
+        return any(n in edited for n in range(first, last + 1))
+
+    changed = [m for m in _ERB_TAG_RE.finditer(before) if touched(m)]
+    parsed = _erb_trees(before)
+    if parsed is not None:
+        trees, spans = parsed
+    else:
+        trees = None
+        spans = (
+            [(0, len(before))]
+            if any(
+                m.group(2) and _ERB_OPENER_RE.match(m.group(3).strip())
+                for m in _ERB_CODE_RE.finditer(before)
+            )
+            else []
+        )
+
+    def kept_text(low: int, high: int) -> str:
+        """What the rewrite left of ``before[low:high]``: its whole lines the diff kept."""
+        first = bisect.bisect_right(starts, low) - 1
+        return "".join(
+            before[max(low, starts[n]) : min(high, starts[n + 1])]
+            for n in range(first, len(lines))
+            if starts[n] < high and n not in edited
+        )
+
+    forms: dict[int, set[bool]] = {}
+    for match in changed:
+        line = before.count("\n", 0, match.start()) + 1
+        tag = match.group(0)
+        reason = None
+        start = before.rfind("\n", 0, match.start()) + 1
+        newline = before.find("\n", match.end())
+        end = len(before) if newline < 0 else newline + 1
+        if before[start : match.start()].strip(" \t"):
+            reason = "it follows text, or a blank other than a space or tab, on its line"
+        elif match.end() == len(before) and match.start() != start:
+            reason = "it ends the file with no newline after it and is indented"
+        elif not (
+            match.end() == len(before)
+            or before.startswith("\n", match.end())
+            or before.startswith("\r\n", match.end())
+        ):
+            reason = "something follows it on its line"
+        elif before.count("<%", start, end) != 1:
+            reason = "another tag, comment or `<%%` escape shares its line"
+        elif bool(match.group(1)) != bool(match.group(3)):
+            reason = "it spells one trim marker, not both or neither"
+        if reason is not None:
+            return (
+                f"a statement tag was removed or changed (line {line}, `{tag[:60]}`) and "
+                f"{reason}: Rails trims such a tag differently from how the rewrite deletes it, "
+                "so the page would render differently"
+            )
+        tree = -1 if trees is None else trees[match.start()]
+        if any(
+            low <= match.start() < high and _erb_block_emptied(before, kept_text, (low, high))
+            for low, high in spans
+        ):
+            return (
+                f"a statement tag was removed or changed (line {line}, `{tag[:60]}`) inside a block "
+                "helper (`<%= … do %>`) left with nothing in it but whitespace and statement tags: "
+                "Rails would render the emptied block differently"
+            )
+        forms.setdefault(tree, set()).add(bool(match.group(1)))
+    if any(len(form) > 1 for form in forms.values()):
+        return (
+            "the statement tags removed or changed mix `<%- … -%>` and unmarked `<% … %>` "
+            "spellings: Rails trims them differently from how the rewrite deletes them, "
+            "so the page would render differently"
+        )
+    return None
+
+
 def refusal_reason(
     before: str, after: str, language: str, *, excused_initializers: int = 0,
     read_markers: tuple[str, ...] = (), blade_directives: Mapping[str, str | None] | None = None,
@@ -3577,6 +3911,9 @@ def refusal_reason(
         return "the result has a syntax error the original did not"
     if _stranded_keywords(after, language) > _stranded_keywords(before, language):
         return "a keyword was left stranded where an expression is read"
+    flipped = _ruby_local_flip(before, after, language)
+    if flipped is not None:
+        return flipped
     hazard = _ruby_hazard(before, after, language, read_markers)
     if hazard is not None and hazard[0] == "changed":
         return (
@@ -3602,6 +3939,10 @@ def refusal_reason(
             "or an `and`, `or` or `not`, outside the parentheses that held it "
             f"(`{hazard[1][:60]}`): Ruby rejects the result, or reads it as a different statement"
         )
+    if language == "erb":
+        trim = _erb_trim_hazard(before, after)
+        if trim is not None:
+            return trim
     if _native_parse_fails(after, language) and not _native_parse_fails(before, language):
         return "the language's own compiler rejects the result"
     if _attribute_residues(after, language) > _attribute_residues(before, language):
@@ -3614,6 +3955,34 @@ def refusal_reason(
             "the flag read is used as a decorator or called, so it is not a boolean read: "
             "the result would fail when it runs"
         )
+    if language == "swift" and before != after:
+        misread = _swift_line_start_arguments(before) or _swift_line_start_arguments(after)
+        if misread is not None:
+            return (
+                f"the parser reads the line `{misread[:60]}` as arguments to the line above "
+                "it, but Swift starts a new statement there, so the rewrite would change "
+                "the wrong code"
+            )
+        introduced = _swift_awaited_literals(after)
+        if len(introduced) > len(_swift_awaited_literals(before)):
+            return (
+                f"the removal left `await` in front of a literal (line {introduced[0]}), which "
+                "waits for nothing: Swift warns, and a build that treats warnings as errors fails"
+            )
+        lost = _swift_lost_shared_binding(before, after)
+        if lost is not None:
+            return (
+                f"the removal deleted the declaration of `{lost}`, which shared a `let` or `var` "
+                f"with the flag's binding, and `{lost}` is still read"
+            )
+        shared = _swift_shared_literal_bindings(after)
+        if len(shared) > len(_swift_shared_literal_bindings(before)):
+            name, line = shared[0]
+            return (
+                f"the removal stopped part-way: the flag read became a literal bound to "
+                f"`{name}` (line {line}) in a `let` or `var` that declares other names too, "
+                "so the binding could not be inlined and deleted"
+            )
     if (
         language == "swift"
         and before != after

@@ -240,6 +240,25 @@ class PiranhaTransformError(RuntimeError):
 #: of shipping a partial removal.
 _UNREADABLE_INPUT = "will not rewrite a file it cannot read"
 
+#: Template grammars whose views the engine may WITHHOLD (a file it read, would
+#: not rewrite, and returns unchanged with a ``skipped_reason``).
+_TEMPLATE_VIEW_GRAMMARS = frozenset({"erb"})
+
+#: How a withheld view's reason starts when the engine withheld it at the END of
+#: the run: its rewritten view could not be aligned with the template, or the
+#: rewrite would delete or change a statement tag Rails trims differently. The
+#: rewrite of a flag this view reads would have been wrong, so the flag is
+#: refused. Every other reason is a READ-TIME withhold (a byte-order mark, the
+#: reserved `_erb_r` prefix, a template that does not parse, a region gap, a
+#: synthesized view that did not parse): the file is left alone and named in the
+#: pull request's caveat with the engine's reason, as an unparseable file of any
+#: other language is. The engine exposes no structured field for the difference,
+#: so these prefixes are pinned by ``test_erb_trim_markers``.
+_END_OF_RUN_WITHHOLD_PREFIXES = (
+    "rewritten view could not be aligned",
+    "the fold would delete or change",
+)
+
 #: The reason a quarantined file is listed with. The pull request body keys on
 #: the leading word to give these files a block of their own.
 UNPARSEABLE_REASON = (
@@ -1001,7 +1020,15 @@ def _candidate_files_without_wrappers(
     )
     resolved_root = root.resolve()
     extra: list[str] = []
-    for mention in cross_file_keys.mention_files(repo_dir, names, exclude=found):
+    mentions = cross_file_keys.mention_files(repo_dir, names, exclude=found)
+    # A default import binds the module's export under a name of its own, so
+    # its importers spell none of `names`.
+    mentions += [
+        m
+        for m in cross_file_keys.default_importer_files(repo_dir, language, found, flag_key)
+        if m not in mentions
+    ]
+    for mention in mentions:
         sibling = mention.endswith(sibling_extensions)
         if not (sibling or spec.owns(mention)):
             continue
@@ -2985,6 +3012,8 @@ def _transform_flag(
     )
 
     unprocessable: list[str] = list(skipped)
+    withheld_views: dict[str, str] = {}
+    withheld_reasons: dict[str, str] = {}
     #: The files the engine could not parse, left untouched; reported with the
     #: reason ``unparseable`` (see ``_UNPARSEABLE_REASON``).
     unparseable: list[str] = []
@@ -3057,14 +3086,18 @@ def _transform_flag(
         # files the engine could not process rather than passing as a no-match.
         # Only a file that names the key as a whole word: the candidate scan is a
         # substring match, and a view that only says `signupEnabled` is not one
-        # the flag's removal left behind.
+        # the flag's removal left behind. A view that reads the flag through a
+        # keyless wrapper holds the pre-pass's marker instead of the key.
         whole_key = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(flag_key)}(?![A-Za-z0-9_-])")
         for summary in summaries:
             reason = getattr(summary, "skipped_reason", None)
             if (
                 reason
                 and summary.path not in unprocessable
-                and whole_key.search(summary.original_content or "")
+                and (
+                    whole_key.search(summary.original_content or "")
+                    or (prepass is not None and prepass.survived(summary.path, summary.original_content or ""))
+                )
             ):
                 logger.warning(
                     "the transform engine left %s untouched while removing %r: %s",
@@ -3072,6 +3105,18 @@ def _transform_flag(
                     flag_key,
                     reason,
                 )
+                if _grammar_of(summary.path, language) in _TEMPLATE_VIEW_GRAMMARS:
+                    if reason.startswith(_END_OF_RUN_WITHHOLD_PREFIXES):
+                        # The engine read this view, rewrote it, and could not
+                        # give back a template that renders the same: a refusal
+                        # with its reason, never `no-changes`.
+                        withheld_views[summary.path] = (
+                            f"the transform engine withheld this template: {reason}"
+                        )
+                        continue
+                    # Withheld at read time: the caveat path, with the reason.
+                    withheld_reasons[summary.path] = reason
+                    unparseable.append(summary.path)
                 unprocessable.append(summary.path)
 
         # Read BEFORE any text pass or the pre-pass rebase: both replace a
@@ -3781,7 +3826,7 @@ def _transform_flag(
     # Last of all, off the bytes that stay on disk: every pass above has run, so a
     # local one of them removed is not named.
     bindings = bindings + _unread_locals(summaries, language, repo_dir)
-    reasons: dict[str, str] = dict(barrel_reasons)
+    reasons: dict[str, str] = {**withheld_views, **barrel_reasons}
     run_tokens = _RunTokens(summaries, language)
     # What a read of the flag spells: its key, as the code spells it and as
     # each alias does, the key constants that hold it, its keyless wrappers,
@@ -3888,7 +3933,10 @@ def _transform_flag(
                 "a delegating `yield*` read would become `yield* <boolean>`, which throws "
                 "because a boolean is not iterable"
             )
-        if reason is not None:
+        # A view the engine withheld keeps the engine's reason: the marker a
+        # keyless wrapper's pre-pass wrote is still in it only because the
+        # engine handed the file back as it was.
+        if reason is not None and s.path not in withheld_views:
             reasons[s.path] = reason
     # A proven cross-file reader must come out naming none of the constants it
     # was proven against: anything left would point at a declaration this run
@@ -4038,7 +4086,15 @@ def _transform_flag(
             (os.path.relpath(path, repo_dir), f"flag-keyed table entry kept: {reason}")
             for path, reason in sorted(table_holds.items())
         )
-        + tuple((path, UNPARSEABLE_REASON) for path in unparseable),
+        + tuple(
+            (
+                path,
+                f"unparseable: the engine withheld this template: {withheld_reasons[path]}"
+                if path in withheld_reasons
+                else UNPARSEABLE_REASON,
+            )
+            for path in unparseable
+        ),
         tuple(
             (os.path.relpath(r.path, repo_dir), r.line, r.reason, r.text)
             for r in resolution.refusals
@@ -6758,19 +6814,22 @@ def _write_generated_rules(
         return generated, const_rules_file
     generated_const = destination / const_rules_file.name
     generated_const.write_text(
-        rule_synthesis.with_accessor_const_rules(
-            rule_synthesis.with_flag_maps(
-                rule_synthesis.with_accessor_guards(
-                    const_rules_file.read_text(encoding="utf-8"), accessors
+        rule_synthesis.with_negated_const_rules(
+            rule_synthesis.with_accessor_const_rules(
+                rule_synthesis.with_flag_maps(
+                    rule_synthesis.with_accessor_guards(
+                        const_rules_file.read_text(encoding="utf-8"), accessors
+                    ),
+                    flag_maps,
+                    _key_position_templates_for(const_rules_file),
+                    before_trailing_rules=True,
                 ),
-                flag_maps,
-                _key_position_templates_for(const_rules_file),
-                before_trailing_rules=True,
+                accessors,
+                templates_text=_accessor_templates_for(const_rules_file),
+                key_positions=key_positions,
+                positional_text=_key_position_templates_for(const_rules_file),
             ),
-            accessors,
-            templates_text=_accessor_templates_for(const_rules_file),
-            key_positions=key_positions,
-            positional_text=_key_position_templates_for(const_rules_file),
+            tuple(a for a in accessors if rule_synthesis.is_negated(a)),
         ),
         encoding="utf-8",
     )

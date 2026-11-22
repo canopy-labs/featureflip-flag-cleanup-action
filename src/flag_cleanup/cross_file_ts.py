@@ -227,7 +227,60 @@ def declarations(path: str, source: str, flag_key: str) -> list[xk.KeyDeclaratio
             )
         )
     entries, _refused = _enum_entries(path, root, source, flag_key)
-    return found + entries
+    default = _default_declaration(path, root, {c.name for c in consts}, flag_key)
+    return found + entries + ([default] if default is not None else [])
+
+
+#: The name a module's default export is declared under. Never spelled by a
+#: reader: each importer binds it as it likes.
+DEFAULT_NAME = "default"
+
+
+def _default_declaration(path: str, root: Node, key_names: set[str], flag_key: str) -> xk.KeyDeclaration | None:
+    """The module's default export, when it provably IS the key: ``export
+    default "<key>"``, or ``export default K`` / ``export { K as default }``
+    for a top-level ``const K`` holding it.
+
+    Nothing else: an expression, a call, an object, a ``let`` or ``var`` (a
+    later write can change it), a re-export of another module's default, a
+    declaration file (its types say nothing of the value) and a JavaScript
+    file with one beside it. The declaration is never deleted: only the reads
+    through it fold."""
+    if path.endswith((".d.ts", ".d.mts", ".d.cts")):
+        return None
+    beside = declaration_file(path)
+    if beside is not None and Path(beside).exists():
+        return None
+    found = _default_exports_of_key(root, key_names, flag_key)
+    if len(found) != 1:
+        return None
+    statement = found[0]
+    if statement.type != "export_statement":
+        return None
+    value = _unwrap(statement.child_by_field_name("value"))
+    if value is not None:
+        held = (
+            _literal(value) == flag_key
+            if value.type in ("string", "template_string")
+            else value.type == "identifier" and _text(value) in key_names
+        )
+    else:
+        clause = next((c for c in statement.named_children if c.type == "export_clause"), None)
+        specifiers = [
+            spec
+            for spec in (clause.named_children if clause is not None else ())
+            if spec.type == "export_specifier"
+            and _text(spec.child_by_field_name("alias") or spec.child_by_field_name("name")) == DEFAULT_NAME
+        ]
+        held = (
+            statement.child_by_field_name("source") is None
+            and len(specifiers) == 1
+            and _text(specifiers[0].child_by_field_name("name")) in key_names
+            and specifiers[0].child_by_field_name("alias") is not None
+        )
+    if not held:
+        return None
+    return xk.KeyDeclaration(path, DEFAULT_NAME, None, path, kind=xk.DEFAULT_EXPORT, key=flag_key)
 
 
 def _enum_entries(
@@ -392,7 +445,7 @@ def _enum_entries(
                 found.append(
                     xk.KeyDeclaration(
                         path, _text(key), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""}),
-                        key=flag_key,
+                        key=flag_key, mutable_owner=True,
                     )
                 )
     _static_entries(path, root, source, flag_key, names, found, refused)
@@ -434,7 +487,10 @@ def _static_entries(
     """
     held = xk.key_token(flag_key)
     classes: dict[str, int] = {}
-    tops: list[tuple[Node, Node | None, bool]] = []
+    #: (the class, its export statement, ambient, the name it is read under,
+    #: whether it is bound as a class expression should be: None for a
+    #: declaration, else whether its binding is a lone, unannotated ``const``)
+    tops: list[tuple[Node, Node | None, bool, Node | None, bool | None]] = []
     for statement in root.named_children:
         export = statement if statement.type == "export_statement" else None
         declaration = (
@@ -447,13 +503,33 @@ def _static_entries(
         ambient = declaration is not None and declaration.type == "ambient_declaration"
         if ambient:
             declaration = next((c for c in declaration.named_children if c.type in _CLASS_DECLARATIONS), None)
+        if declaration is not None and declaration.type in ("lexical_declaration", "variable_declaration"):
+            # `const F = class { ... }`: the class expression is the
+            # initialiser itself, of a `const` (never reassigned), with no
+            # type annotation (others would see that type) and no wrapping
+            # call, assertion or mixin. A `let`/`var` can be reassigned.
+            declarators = [c for c in declaration.named_children if c.type == "variable_declarator"]
+            single_const = len(declarators) == 1 and any(c.type == "const" for c in declaration.children)
+            for declarator in declarators:
+                name_node = declarator.child_by_field_name("name")
+                expression = declarator.child_by_field_name("value")
+                if name_node is None or name_node.type != "identifier":
+                    continue
+                classes[_text(name_node)] = classes.get(_text(name_node), 0) + 1
+                if expression is not None and expression.type == "class":
+                    plain = single_const and declarator.child_by_field_name("type") is None
+                    tops.append((expression, export, False, name_node, plain))
+            continue
         if declaration is None or declaration.type not in _CLASS_DECLARATIONS:
             continue
         named = declaration.child_by_field_name("name")
         if named is not None:
             classes[_text(named)] = classes.get(_text(named), 0) + 1
-        tops.append((declaration, export, ambient))
-    for declaration, export, ambient in tops:
+        tops.append((declaration, export, ambient, named, None))
+    def built(value: Node) -> bool:
+        return key_const.ts_inert_construction(root, value, path)
+
+    for declaration, export, ambient, named, bound_ok in tops:
         body = declaration.child_by_field_name("body")
         members = [m for m in body.named_children if m.type != "comment"] if body is not None else []
         holding = [
@@ -465,7 +541,6 @@ def _static_entries(
         ]
         if not holding:
             continue
-        named = declaration.child_by_field_name("name")
         owner = _text(named) if named is not None else "?"
         spelled = [_key_name(m.child_by_field_name("name")) for m in members if m.type == "public_field_definition"]
         heritage = any(
@@ -481,6 +556,7 @@ def _static_entries(
             # escape scan does not follow.
             and not any(c.type == "default" for c in export.children)
             and not ambient
+            and bound_ok is not False
             and named is not None
             and not heritage
             and not decorated
@@ -488,24 +564,87 @@ def _static_entries(
             and names.get(owner, 0) == 0
             and not root.has_error
             and None not in spelled
-            and all(_inert_member(m) for m in members)
+            and all(_inert_member(m, built) for m in members)
         )
         for member in holding:
             name = member.child_by_field_name("name")
             value = member.child_by_field_name("value")
             label = _key_name(name) if name is not None else None
             entry = f"{owner}.{label or '?'}"
-            if name is None or name.type != "property_identifier" or (value is not None and value.type == "new_expression"):
+            if name is None or name.type != "property_identifier":
                 refused.append(xk.refusal(path, member, xk.UNSUPPORTED_FORM, source, entry))
+                continue
+            if value is not None and value.type == "new_expression":
+                # A constructed holder (`new FeatureFlag("<key>")`) is read as
+                # `Owner.FIELD.key`: provable when its class keeps the key in
+                # a field it names (`key_const.ts_static_holder_fields`),
+                # otherwise named as before.
+                fields = key_const.ts_static_holder_fields(root, value, path)
+                first = _first_argument(value)
+                if fields is None or _literal_key(first) != flag_key:
+                    refused.append(xk.refusal(path, member, xk.UNSUPPORTED_FORM, source, entry))
+                elif not provable or spelled.count(_text(name)) != 1:
+                    refused.append(xk.refusal(path, member, xk.ENUM_UNPROVEN, source, entry))
+                else:
+                    found.append(
+                        xk.KeyDeclaration(
+                            path, _text(name), owner, path, kind=xk.ENUM_ENTRY, accessors=fields,
+                            holder=True, key=flag_key,
+                        )
+                    )
                 continue
             if not provable or spelled.count(_text(name)) != 1 or _literal_key(value) != flag_key:
                 refused.append(xk.refusal(path, member, xk.ENUM_UNPROVEN, source, entry))
                 continue
             found.append(
                 xk.KeyDeclaration(
-                    path, _text(name), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""}), key=flag_key
+                    path, _text(name), owner, path, kind=xk.ENUM_ENTRY, accessors=frozenset({""}), key=flag_key, mutable_owner=True
                 )
             )
+    _loose_classes(root, held, tops, source, path, refused)
+
+
+def _loose_classes(
+    root: Node, held, tops: list, source: str, path: str, refused: list[xk.Refusal]
+) -> None:
+    """A class expression holding the key that is not a top-level class or
+    the initialiser of a binding (``mixin(class { ... })``, ``(class { ... })``,
+    ``export default (class { ... })``): its fields are named and refused,
+    never passed over. Function bodies are not entered."""
+    seen = {t[0].id for t in tops}
+    for statement in root.named_children:
+        stack = [statement]
+        while stack:
+            node = stack.pop()
+            if node.type in ("function_declaration", "function_expression", "arrow_function", "generator_function", "method_definition"):
+                continue
+            if node.type == "class" and node.id not in seen:
+                body = node.child_by_field_name("body")
+                holding = [
+                    m
+                    for m in (body.named_children if body is not None else [])
+                    if m.type == "public_field_definition"
+                    and m.child_by_field_name("value") is not None
+                    and held.search(_text(m.child_by_field_name("value")))
+                ]
+                owner_node = node.parent
+                while owner_node is not None and owner_node.type != "variable_declarator":
+                    owner_node = owner_node.parent if owner_node.type not in ("program",) else None
+                named = owner_node.child_by_field_name("name") if owner_node is not None else None
+                owner = _text(named) if named is not None and named.type == "identifier" else "?"
+                for member in holding:
+                    label = _key_name(member.child_by_field_name("name"))
+                    refused.append(
+                        xk.refusal(path, member, xk.UNSUPPORTED_FORM, source, f"{owner}.{label or '?'}")
+                    )
+            stack.extend(node.children)
+
+
+def _first_argument(value: Node) -> Node | None:
+    """The first argument of a ``new C(…)``."""
+    arguments = value.child_by_field_name("arguments")
+    listed = [c for c in arguments.named_children if c.type != "comment"] if arguments is not None else []
+    return listed[0] if listed else None
 
 
 def _literal_key(value: Node | None) -> str | None:
@@ -515,12 +654,14 @@ def _literal_key(value: Node | None) -> str | None:
     return _string_value(value) if value is not None and value.type == "string" else None
 
 
-def _inert_member(member: Node) -> bool:
+def _inert_member(member: Node, built: Callable[[Node], bool] | None = None) -> bool:
     """Whether a class member can neither run code nor be anything but a
     field fixed when the class is defined: a ``static readonly`` field with
     no decorator, ``declare``, ``accessor``, ``override``, ``?`` or ``!``,
     whose value is a literal (:func:`_inert_field`), or a constructor with no
-    parameters and an empty body (which only ``new``, an escape, runs)."""
+    parameters and an empty body (which only ``new``, an escape, runs). With
+    ``built``, a value that is a ``new C(…)`` it proves inert (a class that
+    only stores its inert arguments) is one too."""
     tokens = {c.type for c in member.children}
     if member.type == "method_definition":
         name = member.child_by_field_name("name")
@@ -539,7 +680,10 @@ def _inert_member(member: Node) -> bool:
         return False
     if not {"static", "readonly"} <= tokens or tokens & {"decorator", "declare", "accessor", "override_modifier", "?", "!"}:
         return False
-    return _inert_field(member.child_by_field_name("value"))
+    value = member.child_by_field_name("value")
+    if built is not None and value is not None and value.type == "new_expression":
+        return built(value)
+    return _inert_field(value)
 
 
 def _inert_field(value: Node | None) -> bool:
@@ -685,7 +829,7 @@ def entry_findings(path: str, source: str, flag_key: str) -> list[xk.Refusal]:
     # instead, which names each importer and keeps the constant's own reads.
     data = source.encode("utf-8")
     if not key_const.key_consts(root, data, _language(path), flag_key):
-        for node in _default_exports_of_key(root, set(), flag_key):
+        for node in _default_exports_of_key(root, _string_consts(root, writable=True), flag_key):
             refused.append(xk.refusal(path, node, xk.UNSUPPORTED_FORM, source))
     for decl in found:
         spellings = _member_spellings(root, decl.name) + [
@@ -708,15 +852,18 @@ _NOT_KEY_VALUES = frozenset({"class", "function_expression", "arrow_function", "
 _COMMONJS_DEFAULTS = frozenset({"module.exports", "exports.default", "module.exports.default"})
 
 
-def _string_consts(root: Node) -> set[str]:
+def _string_consts(root: Node, writable: bool = False) -> set[str]:
     """The names of the file's top-level ``const`` declarators bound to a plain
-    string, whatever it holds (a key constant among them)."""
+    string, whatever it holds (a key constant among them). ``writable``: the
+    ``let`` and ``var`` ones too."""
     found: set[str] = set()
     for statement in root.named_children:
         declaration = statement
         if statement.type == "export_statement":
             declaration = statement.child_by_field_name("declaration")
-        if declaration is None or declaration.type != "lexical_declaration" or _text(declaration).split()[0] != "const":
+        if declaration is None or declaration.type not in ("lexical_declaration", "variable_declaration"):
+            continue
+        if not writable and (declaration.type != "lexical_declaration" or _text(declaration).split()[0] != "const"):
             continue
         for declarator in declaration.named_children:
             if declarator.type != "variable_declarator":
@@ -1780,8 +1927,21 @@ def _import_bindings(
         if part.type != "import_clause":
             continue
         for clause in part.named_children:
-            if clause.type == "identifier":  # a default import: out of scope
-                found.append(_Binding(clause, _text(clause), None, None, False))
+            if clause.type == "identifier":  # a default import
+                decl = declared.get((module, DEFAULT_NAME)) if module is not None else None
+                if decl is None and through is not None and module is not None:
+                    decl = through(module, DEFAULT_NAME)
+                found.append(
+                    _Binding(
+                        clause,
+                        _text(clause),
+                        decl,
+                        None,
+                        top and not type_only and decl is not None,
+                        type_only,
+                        module=module,
+                    )
+                )
             elif clause.type == "namespace_import":
                 name = next((c for c in clause.named_children if c.type == "identifier"), None)
                 if name is None:
@@ -2093,6 +2253,75 @@ _OBJECT_MEMBERS = frozenset(
         "__lookupSetter__",
     }
 )
+
+
+#: Calls that only read the object they are handed, with it as their one argument.
+_READ_ONLY_CALLEES = frozenset(
+    {
+        "Object.values", "Object.keys", "Object.entries", "Object.freeze", "Object.isFrozen",
+        "Object.getOwnPropertyNames", "JSON.stringify",
+    }
+)
+
+
+def _global_unbound(node: Node, name: str) -> bool:
+    """Whether the file binds ``name`` nowhere (a declaration, import,
+    parameter or destructuring), so that ``name.x`` is the global's."""
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    if any(_text(b) == name for b in ts_syntax.binding_nodes(root)):
+        return False
+    return not any(
+        n.type in ("import_statement", "import_alias", "ambient_declaration")
+        and re.search(rf"\b{name}\b", _text(n))
+        for n in _walk(root)
+    )
+
+
+def _read_only_use(node: Node) -> bool:
+    """Whether the whole-object use at ``node`` provably cannot write the
+    object: ``Object.values/keys/entries/getOwnPropertyNames/freeze/isFrozen``
+    or ``JSON.stringify`` of it alone (the global ``Object``/``JSON``, bound
+    nowhere in the file, and no second argument: a replacer runs code), a
+    spread into an object literal, ``typeof``, ``'k' in``. Everything else
+    (``new``, ``extends`` and ``instanceof`` included: an instance or subclass
+    reaches the owner without naming it) may rewrite its entries."""
+    cur = node
+    while cur.parent is not None and cur.parent.type in _TRANSPARENT:
+        cur = cur.parent
+    parent = cur.parent
+    if parent is None:
+        return False
+    if parent.type == "arguments":
+        call = parent.parent
+        callee = call.child_by_field_name("function") if call is not None else None
+        args = [c for c in parent.named_children if c.type != "comment"]
+        return (
+            call is not None
+            and call.type == "call_expression"
+            and callee is not None
+            and callee.type == "member_expression"
+            and _text(callee) in _READ_ONLY_CALLEES
+            and args == [cur]
+            and _global_unbound(call, _text(callee).split(".")[0])
+        )
+    if parent.type == "spread_element":
+        return parent.parent is not None and parent.parent.type == "object"
+    if parent.type == "unary_expression":
+        operator = parent.child_by_field_name("operator")
+        return operator is not None and _text(operator) == "typeof"
+    if parent.type == "binary_expression":
+        operator = parent.child_by_field_name("operator")
+        left = parent.child_by_field_name("left")
+        return (
+            operator is not None
+            and _text(operator) == "in"
+            and parent.child_by_field_name("right") == cur
+            and left is not None
+            and left.type == "string"
+        )
+    return False
 
 
 def _hands_on_member(member: Node) -> bool:
@@ -2427,7 +2656,8 @@ def references(
     # Enum entries are judged apart from the constants: every name, module
     # and binding below the split is a constant's.
     entries = tuple(d for d in declarations if d.kind == xk.ENUM_ENTRY)
-    declarations = tuple(d for d in declarations if d.kind != xk.ENUM_ENTRY)
+    default_exports = tuple(d for d in declarations if d.kind == xk.DEFAULT_EXPORT)
+    declarations = tuple(d for d in declarations if d.kind not in (xk.ENUM_ENTRY, xk.DEFAULT_EXPORT))
     enums: dict[tuple[str, str], dict[str, xk.KeyDeclaration]] = {}
     for decl in entries:
         enums.setdefault((decl.module, decl.owner), {})[decl.name] = decl
@@ -2455,9 +2685,13 @@ def references(
         return [], refused
 
     declared = {(d.module, d.name): d for d in declarations}
+    # A module's default export is declared under the name `default`, which an
+    # importer reaches by `import F from`, `import { default as F }` or a
+    # barrel's `export { default as F } from`, and binds under its own name.
+    declared.update({(d.module, d.name): d for d in default_exports})
     # A namespace import of the enum's file is a namespace binding too, so
     # that `ns.Flags.EnableX` is judged instead of skipped.
-    constant_modules = frozenset(d.module for d in declarations)
+    constant_modules = frozenset(d.module for d in (*declarations, *default_exports))
     modules = constant_modules | frozenset(m for m, _owner in enums)
     stop = _stop_for(repo_dir)
     resolved: dict[str, str | None] = {}
@@ -2474,6 +2708,8 @@ def references(
     # barrel renames them to. Any other import is never followed.
     owners = frozenset(owner for _module, owner in enums)
     wanted = names | owners | _aliases_of(repo_dir, owners)
+    if default_exports:
+        wanted |= {DEFAULT_NAME} | _aliases_of(repo_dir, frozenset({DEFAULT_NAME}))
 
     def provider(module: str | None, name: str) -> tuple[str, str] | None:
         """``(module, name)`` of the declaration ``module`` re-exports as ``name``."""
@@ -2751,7 +2987,7 @@ def references(
                     refuse(node, xk.IMPORT_UNRESOLVED, decl.entry)
             elif member in enum:
                 decl = enum[member]
-                if not plain or _within(node, _NAMESPACE_BLOCKS) is not None:
+                if not plain or decl.holder or _within(node, _NAMESPACE_BLOCKS) is not None:
                     refuse(node, xk.UNSUPPORTED_FORM, decl.entry)
                 elif (
                     _is_plain_member(node.parent)
@@ -2790,6 +3026,27 @@ def references(
                 refuse(node, xk.UNSUPPORTED_FORM, decl.entry)
             elif not plain:
                 refuse(node, xk.UNSUPPORTED_FORM, decl.entry)
+            elif decl.holder:
+                # A constructed holder: only `Owner.X.<key field>` in the key
+                # position is the key. The holder itself, and every other
+                # member of it, is an object a read can change.
+                outer = node.parent.parent if node.parent is not None else None
+                field = outer.child_by_field_name("property") if outer is not None else None
+                if (
+                    foldable
+                    and outer is not None
+                    and outer.type == "member_expression"
+                    and outer.child_by_field_name("object") == node.parent
+                    and field is not None
+                    and field.type == "property_identifier"
+                    and _text(field) in decl.accessors
+                    and _is_plain_member(outer)
+                    and _is_read(outer, accessors, positioned=False)
+                ):
+                    reads.append(xk.KeyReference(path, local, member, _text(field), decl))
+                    judged.add(node.id)
+                else:
+                    refuse(node, xk.NOT_A_READ, decl.entry)
             elif foldable and _is_read(node.parent, accessors, positioned=False):
                 reads.append(xk.KeyReference(path, local, member, "", decl))
                 judged.add(node.id)
@@ -4252,11 +4509,12 @@ def _enum_escapes(
 
     escapes: dict[tuple[int, str], xk.Refusal] = {}
 
-    def escape(node: Node, decls: list[xk.KeyDeclaration]) -> None:
+    def escape(node: Node, decls: list[xk.KeyDeclaration], harmless: bool = False) -> None:
         for decl in decls:
+            found = xk.refusal(path, node, xk.UNSUPPORTED_FORM, source, decl.entry)
             escapes.setdefault(
                 (node.start_point[0], decl.entry),
-                xk.refusal(path, node, xk.UNSUPPORTED_FORM, source, decl.entry),
+                replace(found, harmless=True) if harmless else found,
             )
 
     root = ts_syntax._parse(source, language)
@@ -4323,7 +4581,7 @@ def _enum_escapes(
             member = _member_of(node)
             if _in_type(node) or (member is not None and _hands_on_member(member) and not read(member, decls)):
                 continue
-            escape(node, decls)
+            escape(node, decls, member is None and _read_only_use(node))
 
     def follow_module(local: str, binder: Node | None, module: str) -> None:
         """``local`` is the module object: only ``local.<export>`` may use it."""
@@ -4335,7 +4593,7 @@ def _enum_escapes(
                 continue
             member = _member_of(node)
             if member is None:
-                escape(node, every(module))
+                escape(node, every(module), _read_only_use(node))
                 continue
             owner = _text(member.child_by_field_name("property"))
             if owner not in owners and owner in _OBJECT_MEMBERS:
@@ -5135,6 +5393,55 @@ def constant_module_escapes(path: str, repo_dir: str) -> list[xk.Refusal]:
     ] + _default_takers(path, repo_dir)
 
 
+def _default_barrels(modules: set[str], repo_dir: str) -> set[str]:
+    """Every file that re-exports from one of ``modules`` or from another such
+    file (``export { ... } from``, ``export * from``), however it names what
+    it hands on: the files an importer of a default export can name instead of
+    its module. Over-approximate by design: a file found wrongly is only read."""
+    stop = _stop_for(repo_dir)
+    suffixes = {Path(e).suffix for e in _PLAIN_EXTENSIONS} & set(source_index.all_suffixes())
+    candidates = [
+        f for f in source_index.files(repo_dir, suffixes, with_ignored=True) if "export" in _file_text(f.resolved)
+    ]
+    found: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for candidate in candidates:
+            if candidate.resolved in modules or candidate.resolved in found:
+                continue
+            text = _file_text(candidate.resolved)
+            if "from" not in text:
+                continue
+            tree = ts_syntax._parse(text, _language(candidate.resolved))
+            for statement in tree.named_children:
+                if statement.type != "export_statement":
+                    continue
+                spec = _string_value(statement.child_by_field_name("source"))
+                if spec is None:
+                    continue
+                target = _resolve(candidate.resolved, spec, stop, workspace=True)
+                if target is not None and str(Path(target).resolve()) in modules | found:
+                    found.add(candidate.resolved)
+                    changed = True
+                    break
+    return found
+
+
+def _file_text(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def default_importers(declarations: tuple[xk.KeyDeclaration, ...], repo_dir: str) -> re.Pattern[str]:
+    """What a file's text holds when it can import one of the default exports
+    ``declarations``: the module's own specifier and every barrel's."""
+    modules = {d.module for d in declarations}
+    return module_pattern(modules | _default_barrels(modules, repo_dir), repo_dir)
+
+
 def _default_takers(path: str, repo_dir: str) -> list[xk.Refusal]:
     """When the module at ``path`` makes its default export hold a key
     constant (``export default K``, ``export { K as default }``,
@@ -5153,12 +5460,15 @@ def _default_takers(path: str, repo_dir: str) -> list[xk.Refusal]:
     except (OSError, UnicodeDecodeError):
         return []
     root = ts_syntax._parse(source, _language(path))
-    if not _default_exports_of_key(root, _string_consts(root), None):
+    exports = _default_exports_of_key(root, _string_consts(root), None)
+    if not exports:
         return []
     from flag_cleanup import ts_scope
 
     module = str(Path(path).resolve())
     found: list[xk.Refusal] = []
+    stop = _stop_for(repo_dir)
+    folded = False
     for importer in xk.mention_files(repo_dir, (), exclude=(path,), also=module_pattern({module}, repo_dir)):
         if not importer.endswith(ts_scope.FAMILY_EXTENSIONS):  # a component is judged by `handed_on`
             continue
@@ -5173,8 +5483,28 @@ def _default_takers(path: str, repo_dir: str) -> list[xk.Refusal]:
             target = resolve_specifier(importer, spec, repo_dir) if spec is not None else None
             if target is not None and str(Path(target).resolve()) != module:
                 continue
+            if _judged_by_references(site, spec, importer, module, stop) and not tree.has_error:
+                # A default import of the module itself: `references` judges
+                # the binding, folds the reads it proves and names every
+                # mention it cannot. Only the export it leaves is reported.
+                folded = True
+                continue
             found.append(xk.refusal(importer, site, xk.UNSUPPORTED_FORM, text))
+    if folded:
+        found.extend(xk.refusal(path, node, xk.UNSUPPORTED_FORM, source) for node in exports)
     return found
+
+
+def _judged_by_references(site: Node, spec: str | None, importer: str, module: str, stop: Path) -> bool:
+    """Whether ``site`` is a plain default import (``import F from``, ``import
+    { default as F } from``, not ``import * as m``) of ``module`` itself, which
+    :func:`references` judges at its binding."""
+    if site.type != "import_statement" or spec is None:
+        return False
+    if any(c.type == "namespace_import" for part in site.named_children for c in part.named_children):
+        return False
+    target = _resolve(importer, spec, stop, workspace=True)
+    return target is not None and str(Path(target).resolve()) == module
 
 
 def _takes_default(root: Node, text: str) -> list[tuple[Node, Node | None]]:
@@ -5264,6 +5594,7 @@ _PROFILE = xk.Profile(
     enum_unparsed_escapes=component_escapes,
     module_escapes=constant_module_escapes,
     reexport_aliases=ts_barrels.alias_names,
+    default_importers=default_importers,
 )
 for _language_name in ("ts", "tsx", "js"):
     xk.register(_language_name, _PROFILE)

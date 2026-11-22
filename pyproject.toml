@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.21.0"
+version = "2.22.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -607,6 +607,24 @@ dependencies = [
     # stalled; 0.64.0's grammar builds the same trees with that cost back at
     # upstream's.
     #
+    # 0.65.0. Swift: the grammar moves to canopy-labs/tree-sitter-swift
+    # 735da3b, and the Swift wheel below with it to `+canopy.5`. A line that
+    # starts with `[` or `(` after a condition's block is a new statement;
+    # before, the block was read as a trailing closure of the condition and
+    # the bracket as its subscript or call, so the file was refused. Every
+    # other parse tree is unchanged. A dead `if`/`while` in top-level code
+    # (`main.swift`, scripts) is deleted like one in a function; a
+    # declaration that binds several names keeps standing instead of being
+    # deleted to inline one of them. Every language: the dead code after a
+    # jump is deleted only when the fold wrote that jump, so code the
+    # customer wrote after a `return` of their own stays. C#: a folded `if`
+    # in top-level statements is spliced or deleted, not left as `{ }`.
+    # ERB: a fold is withheld unless every statement tag it deletes or
+    # changes stands alone on its line in one marker form. Blade: colon
+    # event attributes (`@update:model-value`) stay attributes, and a
+    # directive name before `=` stays a directive. The engine also compiles
+    # fewer queries per run (no output change). No other grammar rev moved.
+    #
     # 0.60.0. Python: deleting an entry no longer turns a one-element set
     # `{k}` into the dict `{}` or a subscript `x[a, k]` into the scalar index
     # `x[a]`; Swift: nor a tuple `(a, k)` into the scalar `(a)` (each is
@@ -757,7 +775,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.64.0",
+    "polyglot-piranha==0.65.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -839,12 +857,15 @@ dependencies = [
     # `canopy/swift-try-await-bare-name-2`, sent upstream): `try`/`await` on a
     # bare name or member before the `{` of an `if`, `while` or `switch` is
     # the condition, not a call with a trailing closure, so a file using
-    # `if let d = try? await detailTask {` is no longer one ERROR. The wheel
+    # `if let d = try? await detailTask {` is no longer one ERROR. `+canopy.5`
+    # adds a second, in the scanner only (sent upstream): a `(` or `[`
+    # starting the line after a condition's block is a new statement, not a
+    # call or subscript of that block read as a trailing closure. The wheel
     # also carries the generated parser upstream does not commit, so it is the
     # only way to get that grammar until upstream releases. Resolves only from
     # wheels/ (PEP 440 local segment), filled by scripts/fetch_piranha_wheels.py.
     # Bump the segment when the engine's pin moves.
-    "tree-sitter-swift==0.7.4+canopy.4",
+    "tree-sitter-swift==0.7.4+canopy.5",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the

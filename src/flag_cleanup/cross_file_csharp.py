@@ -805,7 +805,7 @@ def _applies(using: _Using, reader: str, projects: frozenset[Path]) -> _Using | 
     """``using`` as it applies to ``reader``, or None when it does not.
 
     A ``global using`` is per compilation, so one in a ``.cs`` file reaches
-    only files of the same project; so does a ``.csproj`` item. A
+    only files of the same project (a file-based app: itself); so does a ``.csproj`` item. A
     ``Directory.Build.props``/``.targets`` reaches every project below it. Any
     other ``.props``/``.targets`` may be imported by any project, so its item
     comes back uncertain: it can refuse a read, never prove or skip one.
@@ -813,11 +813,16 @@ def _applies(using: _Using, reader: str, projects: frozenset[Path]) -> _Using | 
     source = Path(using.path)
     if source.suffix == ".cs" or source.name.endswith(_PROJECT_SUFFIX):
         home = source.parent if source.name.endswith(_PROJECT_SUFFIX) else None
-        same = (
-            _project_of(reader, projects) == home
-            if home is not None
-            else _project_of(reader, projects) == _project_of(using.path, projects)
-        )
+        from flag_cleanup import csharp_family
+
+        if home is not None:
+            same = _project_of(reader, projects) == home
+        elif csharp_family.is_app_file(reader) or csharp_family.is_app_file(using.path):
+            # A file-based app is a compilation of its own: only its own
+            # `global using` applies to it, and it reaches no other file.
+            same = Path(reader).resolve() == Path(using.path).resolve()
+        else:
+            same = _project_of(reader, projects) == _project_of(using.path, projects)
         return using if same else None
     if source.name.startswith("Directory.Build.") and source.parent in Path(reader).parents:
         return using

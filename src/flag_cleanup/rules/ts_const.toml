@@ -78,6 +78,7 @@
 # names against the seed rules in `ts.toml` so the two lists cannot drift.
 [[rules]]
 name = "inline_flag_const_usage"
+# negated-const-clone: yes
 query = """((identifier) @identifier)"""
 replace_node = "identifier"
 replace = "@treated"
@@ -196,6 +197,7 @@ not_contains = ["""(
 # not even in the candidate set — we cannot see, let alone update, them.
 [[rules]]
 name = "delete_flag_const_declaration"
+# negated-const-clone: yes
 query = """(
   [(statement_block
     (lexical_declaration kind: "const" . (variable_declarator
@@ -217,6 +219,19 @@ query = """(
 replace_node = "declaration"
 replace = ""
 holes = ["stale_flag_name"]
+
+# SOUND BY CONSTRUCTION: the declaration goes only when its own name is the
+# ONLY identifier of that spelling left in the enclosing scope. The re-binding
+# guards below answer "may the uses be inlined?"; they say nothing once the
+# rebinder is gone, and a rebinder can be folded away by another rule in this
+# same run (a name bound to a read the guard does not know, then removed), after
+# which this rule would delete a declaration whose uses were never inlined.
+# Counting identifiers does not depend on the order the rules fire in. The
+# declarator's own name is the one match.
+[[rules.filters]]
+enclosing_node = """([(function_declaration) (function_expression) (arrow_function) (method_definition) (program)] @enclosing)"""
+contains = """((identifier) @sole (#eq? @sole "@variable_name"))"""
+at_most = 1
 
 [[rules.filters]]
 enclosing_node = """([(function_declaration) (function_expression) (arrow_function) (method_definition) (program)] @enclosing)"""

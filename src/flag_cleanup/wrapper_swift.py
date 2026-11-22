@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tree_sitter import Node
@@ -594,6 +594,11 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     """The wrapper, or why it does not qualify."""
     if index.unreadable:
         return None, wi.NAME_NOT_UNIQUE
+    if _GLOBAL_ACTOR in wrapper.annotations and not _main_actor_redefined(index.repo_dir):
+        # The attribute decides who may read the member synchronously, not
+        # what it returns; a reader off the main actor awaits it, and an
+        # `await` of the read alone goes with the read (`_judge`).
+        wrapper = replace(wrapper, annotations=tuple(a for a in wrapper.annotations if a != _GLOBAL_ACTOR))
     if any(w.startswith("@") for w in wrapper.annotations):
         return None, wi.ANNOTATED
     if wrapper.annotations:
@@ -613,6 +618,40 @@ def qualify(wrapper: wi.Wrapper, index: Index) -> tuple[wi.Wrapper | None, str |
     if len(index.declarations) != 1:
         return None, wi.NAME_NOT_UNIQUE
     return wrapper, None
+
+
+_GLOBAL_ACTOR = "@MainActor"
+#: A declaration of ``MainActor`` in the checkout: a macro or a type of that
+#: name wins over the standard library's global actor (swiftc 6.0), so the
+#: attribute could be anything.
+_MAIN_ACTOR_DECLARED = re.compile(
+    r"(?<![\w.])(?:macro|struct|class|enum|actor|protocol|typealias)\s+MainActor\b"
+)
+
+
+#: Per checkout root: the run's listing (by identity) and the answer found
+#: while it was current, as :func:`swift_modules._projects` keeps its own.
+_MAIN_ACTOR: dict[str, tuple[object, bool]] = {}
+
+
+def _main_actor_redefined(repo_dir: str) -> bool:
+    from flag_cleanup import source_index
+
+    listing = source_index.run_listing(repo_dir)
+    cached = _MAIN_ACTOR.get(repo_dir)
+    if listing is not None and cached is not None and cached[0] is listing:  # identity: one listing per run
+        return cached[1]
+    found = False
+    for path in cross_file_keys.mention_files(repo_dir, ["MainActor"], exclude=()):
+        if not path.endswith(EXTENSIONS):
+            continue
+        text = _read(path)
+        if text is None or _MAIN_ACTOR_DECLARED.search(text):
+            found = True
+            break
+    if listing is not None:
+        _MAIN_ACTOR[repo_dir] = (listing, found)
+    return found
 
 
 def _unwitnessable(wrapper: wi.Wrapper, index: Index) -> bool:
@@ -961,19 +1000,100 @@ def _judge(path: str, node: Node, root: Node, wrapper: wi.Wrapper, index: Index)
     shown = expression
     if _text(expression).startswith("!!") or _text(head).startswith("!!"):
         return _occurrence(path, node, shown, wi.RECEIVER_UNPROVEN)
+    awaited = _awaited(expression)
+    if awaited is not None and (expression.parent is None or awaited.id != expression.parent.id):
+        # `await (read && ready())`: what is left may not suspend at all.
+        return _occurrence(path, node, awaited, wi.AWAITED)
     if (call is None) != (wrapper.kind == "property") or (call is not None and _reference(call)):
         # A method named without a call, or by its labels (`Flags.check(_:)`),
         # hands it on; a property is never called.
         return _occurrence(path, node, shown, wi.RECEIVER_UNPROVEN)
-    if not _value_position(expression):
+    if awaited is not None:
+        # `await read`: the literal needs no `await`, and `await true` warns
+        # that nothing is awaited (an error under warnings-as-errors). Only
+        # where the body says `async` itself: an untyped closure is async
+        # because of its `await`s, so dropping the last one turns it
+        # synchronous and its own caller's `await` then waits for nothing.
+        if _text(head).startswith("!"):
+            return _occurrence(path, node, awaited, wi.RECEIVER_UNPROVEN)
+        if not _written_async(awaited):
+            return _occurrence(path, node, awaited, wi.AWAITED)
+        shown = awaited
+    position = awaited if awaited is not None else expression
+    if not _value_position(position):
         return _occurrence(path, node, shown, wi.RECEIVER_UNPROVEN)
+    declaration = position.parent
+    if declaration is not None and declaration.type == "property_declaration":
+        if any(c.type == "async" for c in declaration.children):
+            # `async let a = read` is read as `await a`, which the inlined
+            # literal leaves with nothing to wait for.
+            return _occurrence(path, node, shown, wi.AWAITED)
+        if sum(1 for c in declaration.named_children if c.type == "pattern") > 1:
+            # `let a = read, b = other()`: the inliner deletes the whole
+            # declaration, and `b` with it.
+            return _occurrence(path, node, shown, wi.MULTI_BINDING)
     reason = _receiver_reason(path, node, receiver, root, wrapper, index)
     if reason is None and call is not None and not _plain_arguments(xs._code(call)[-1]):
         reason = wi.ARGUMENT_HAS_CALL
     if reason is not None:
         return _occurrence(path, node, shown, reason)
     start = head.start_byte + (1 if _text(head).startswith("!") else 0)
+    if awaited is not None:
+        start = awaited.start_byte
     return _occurrence(path, node, shown, None, (start, node.end_byte), "" if call is not None else "()")
+
+
+#: Where an ``await`` around a read stops mattering: a new statement or body.
+_AWAIT_BOUNDARIES = frozenset({"statements", "lambda_literal", "function_body", "source_file", "computed_property", "computed_getter"})
+
+
+def _written_async(node: Node) -> bool:
+    """Whether the body ``node`` is evaluated in says ``async`` itself.
+
+    The nearest function, initializer, accessor or closure: a ``func`` or
+    ``init`` with ``async`` in its signature, a ``get async`` accessor, or a
+    closure with ``async`` in its own type (``{ () async -> T in … }``) or
+    bound by a ``let``/``var`` written with an ``async`` function type. Any
+    other closure (untyped, or passed to a parameter this pass does not
+    resolve) answers no.
+    """
+    for scope in _ancestors(node):
+        if scope.type in ("function_declaration", "init_declaration"):
+            return any(c.type == "async" for c in scope.children)
+        if scope.type == "computed_getter":
+            specifier = next((c for c in scope.children if c.type == "getter_specifier"), None)
+            return specifier is not None and any(c.type == "async" for c in specifier.children)
+        if scope.type in ("computed_property", "computed_setter", "computed_modify", "willset_clause", "didset_clause", "subscript_declaration", "deinit_declaration"):
+            return False
+        if scope.type == "lambda_literal":
+            own = next((c for c in scope.named_children if c.type == "lambda_function_type"), None)
+            if own is not None and any(c.type == "async" for c in own.children):
+                return True
+            holder = scope.parent
+            value = _field(holder, "value") if holder is not None and holder.type == "property_declaration" else None
+            if value is not None and value.id == scope.id:
+                annotation = next((c for c in holder.named_children if c.type == "type_annotation"), None)
+                kind = _field(annotation, "name") if annotation is not None else None
+                return kind is not None and kind.type == "function_type" and any(c.type == "async" for c in kind.children)
+            return False
+    return False
+
+
+def _awaited(expression: Node) -> Node | None:
+    """The ``await_expression`` the read is evaluated under, if any.
+
+    It is ``expression.parent`` when the read is its whole operand
+    (``await Flags.on``); any other is an ``await`` over more than the read.
+    """
+    parent = expression.parent
+    if parent is not None and parent.type == "await_expression" and [c.id for c in xs._code(parent)] == [expression.id]:
+        return parent
+    for ancestor in _ancestors(expression):
+        if ancestor.type in _AWAIT_BOUNDARIES:
+            return None
+        if ancestor.type == "await_expression":
+            return ancestor
+    return None
 
 
 def _ancestors(node: Node) -> Iterable[Node]:

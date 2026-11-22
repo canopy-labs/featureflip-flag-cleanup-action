@@ -3954,6 +3954,9 @@ def reset_cache() -> None:
     _GLOBAL_STATICS.clear()
     _LIBRARY_BASED.clear()
     _COCLASSES.clear()
+    _APPS.clear()
+    _SYMLINKS.clear()
+    _APP_FILES.clear()
 
 
 def _enclosing(path: str, projects: frozenset[Path], repo_dir: str | None = None) -> list[Path]:
@@ -3973,7 +3976,294 @@ def _enclosing(path: str, projects: frozenset[Path], repo_dir: str | None = None
 #: of its own, which no project file names. Matched on any line, which only
 #: errs toward a file-based app, and after a byte-order mark, which the file
 #: is read with.
-_APP_DIRECTIVE = re.compile(r"^\ufeff?[ \t]*#:", re.MULTILINE)
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\u0085\u2028\u2029]")
+_DIRECTIVE_LINE = re.compile(r"#:(\S*)\s*(.*)", re.DOTALL)
+#: Whitespace other than a space or a tab, inside a directive.
+_ODD_SPACE = re.compile(r"[^\S \t]")
+
+
+def _has_directive(source: str) -> bool:
+    """Whether any line of ``source``, split as Roslyn splits lines (``\\r\\n``,
+    ``\\r``, ``\\n``, U+0085, U+2028, U+2029), starts with ``#:`` after any
+    C# whitespace (``str.strip`` covers every Unicode space and ``\\f``,
+    ``\\v``). Matched on any line, which only errs toward a file-based app."""
+    return any(line.strip().startswith("#:") for line in _LINE_BREAK.split(source.removeprefix("\ufeff")))
+
+#: MSBuild property, item and metadata expressions: a value computed at build.
+_EXPRESSION = re.compile(r"[$@%]\(")
+_APP_PROJECT_SUFFIXES = (".csproj", ".vbproj", ".fsproj")
+_PACKAGE_DIRECTIVE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*(?:@\S+)?")
+_PROPERTY_DIRECTIVE = re.compile(r"([A-Za-z_][A-Za-z0-9_.\-]*)=(.*)")
+#: The properties a ``#:property`` may set that change neither what the file
+#: compiles with nor what a name in it binds to, lower-cased (MSBuild's names
+#: are case-insensitive). Anything else, ``ImplicitUsings``, ``RootNamespace``,
+#: ``DefineConstants`` and ``EnableDefaultCompileItems`` among them, is not
+#: modelled and keeps the wrapper.
+_APP_PROPERTIES = frozenset(
+    p.lower()
+    for p in (
+        "Nullable", "PublishAot", "PublishTrimmed", "TargetFramework", "LangVersion", "TreatWarningsAsErrors",
+        "WarningsAsErrors", "NoWarn", "AllowUnsafeBlocks", "InvariantGlobalization", "OutputType", "Optimize",
+        "AssemblyName", "Version", "UserSecretsId", "ServerGarbageCollector", "ConcurrentGarbageCollection",
+        "TieredPGO", "TieredCompilation", "Deterministic", "EnableNETAnalyzers", "AnalysisLevel",
+    )
+)
+#: What ``Microsoft.NET.Sdk`` imports for a project by default (``ImplicitUsings``
+#: is on for a file-based app): a wrapper declared in one of them is seen
+#: unspelled, which no directive says.
+_IMPLICIT_NAMESPACES = frozenset(
+    {
+        "System", "System.IO", "System.Collections.Generic", "System.Linq", "System.Net.Http", "System.Threading",
+        "System.Threading.Tasks",
+    }
+)
+_BUILD_FILES = frozenset({"directory.build.props", "directory.build.targets", "directory.build.rsp"})
+
+
+@dataclass(frozen=True)
+class FileApp:
+    """A file-based app as a project of its own: the directories of the
+    projects its ``#:project`` directives name, and why this is not an exact
+    model (``None`` when it is)."""
+
+    refs: frozenset[Path]
+    refusal: str | None
+
+
+_APPS: dict[tuple[str, str], FileApp | None] = {}
+
+
+def _leading_directives(source: str) -> tuple[list[str], list[str]]:
+    """``(leading, stray)``: the ``#:`` lines before the file's first token,
+    after any ``#!`` line, blanks and comments, and every other ``#:`` line."""
+    leading: list[str] = []
+    stray: list[str] = []
+    in_header = True
+    in_comment = False
+    for number, line in enumerate(_LINE_BREAK.split(source.removeprefix("\ufeff"))):
+        text = line.strip()
+        if in_comment:
+            if "*/" not in text:
+                continue
+            in_comment = False
+            text = text.split("*/", 1)[1].strip()
+        if in_header and (not text or text.startswith("//") or (number == 0 and text.startswith("#!"))):
+            continue
+        if in_header and text.startswith("/*"):
+            if "*/" not in text:
+                in_comment = True
+                continue
+            if not text.split("*/", 1)[1].strip():
+                continue
+        if text.startswith("#:"):
+            (leading if in_header else stray).append(text)
+            continue
+        in_header = False
+    return leading, stray
+
+
+def file_app(repo_dir: str, path: str) -> FileApp | None:
+    """``path`` modelled as a file-based app, or ``None`` when it holds no
+    ``#:`` directive. ``dotnet run app.cs`` builds it as a project whose
+    only source is the file, which references what its directives name:
+
+    - ``#:project`` is a project reference, to a directory holding exactly one
+      project file or to a project file, of the checkout and read by
+      :func:`project_graph`; the walk is :func:`_reaches_projects`' own;
+    - ``#:package`` is opaque, as a ``<PackageReference>`` is: a type it
+      brings in is another assembly's, never the checkout's source;
+    - ``#:sdk`` is ``Microsoft.NET.Sdk`` only; ``#:property`` one of
+      :data:`_APP_PROPERTIES` only.
+
+    Everything else is ``refusal``: any other directive, a malformed one, a
+    project that is not exactly one the graph knows, a ``#:`` line after code,
+    a ``Directory.Build`` file above (an app imports it), a project directory
+    the file is also in (the project compiles it, and ``#:`` is an error
+    there), and the file's name for each says which. Cached per ``repo_dir``;
+    a run edits no directive."""
+    key = (repo_dir, path)
+    if key not in _APPS:
+        _APPS[key] = _file_app(repo_dir, path)
+    return _APPS[key]
+
+
+_SYMLINKS: dict[str, bool] = {}
+_APP_FILES: dict[str, bool] = {}
+_WALK_SKIPS = frozenset({".git", "node_modules"})
+
+
+def _symlinked_source(repo_dir: str) -> bool:
+    """Whether the checkout holds any symbolic link (file or directory)
+    whose target is, or contains, a ``.cs`` file. The Action judges a file by
+    its resolved path, so through such a link a ``#:project`` would resolve
+    from a different directory than ``dotnet`` resolves it from. Walked once
+    per ``repo_dir``; a link that cannot be read counts."""
+    if repo_dir not in _SYMLINKS:
+        import os
+
+        from flag_cleanup import source_index
+
+        found = False
+        try:
+            for here, dirs, files in os.walk(source_index.checkout_root(repo_dir)):
+                dirs[:] = [d for d in dirs if d not in _WALK_SKIPS]
+                for name in (*dirs, *files):
+                    link = Path(here, name)
+                    if not link.is_symlink():
+                        continue
+                    target = link.resolve()
+                    if target.is_file():
+                        found |= target.suffix.lower() == ".cs"
+                    elif target.is_dir():
+                        found |= any(target.rglob("*.cs"))
+                    if found:
+                        break
+                if found:
+                    break
+        except (OSError, RuntimeError):
+            # Python 3.12's Path.resolve() raises RuntimeError on a symlink
+            # loop; a link that cannot be followed counts as one to C# source.
+            found = True
+        _SYMLINKS[repo_dir] = found
+    return _SYMLINKS[repo_dir]
+
+
+def is_app_file(path: str) -> bool:
+    """Whether the file holds a ``#:`` directive: a compilation of its own,
+    which sees no other loose file's declarations or ``global using``."""
+    from flag_cleanup import wrapper_csharp as wc
+
+    key = str(Path(path).resolve())
+    if key not in _APP_FILES:
+        source = wc._read(key)
+        _APP_FILES[key] = source is not None and _has_directive(source)
+    return _APP_FILES[key]
+
+
+def _file_app(repo_dir: str, path: str) -> FileApp | None:
+    from flag_cleanup import source_index
+    from flag_cleanup import wrapper_csharp as wc
+
+    source = wc._read(path)
+    if source is None or not _has_directive(source):
+        return None
+    if not xcs._project_dirs(repo_dir):
+        # Without a project file nothing says what a type in the checkout
+        # belongs to, so no `#:project` or `#:package` can be resolved
+        # against it: the app keeps master's refusal.
+        return FileApp(frozenset(), "the checkout holds no project file to model the app against")
+    if _symlinked_source(repo_dir):
+        return FileApp(frozenset(), "the checkout holds a symbolic link to C# source, so no path here is exactly the one dotnet builds")
+    leading, stray = _leading_directives(source)
+    if stray:
+        return FileApp(frozenset(), f"{stray[0]}: a directive after code is not modelled")
+    if Path(path).is_symlink():
+        # `#:project` resolves from the link's own directory, not its target's.
+        return FileApp(frozenset(), "the app is a symbolic link, whose directives resolve from the link")
+    here = Path(path).resolve()
+    root = Path(source_index.checkout_root(repo_dir)).resolve()
+    graph = project_graph(repo_dir)
+    refs: set[Path] = set()
+    for line in leading:
+        match = _DIRECTIVE_LINE.match(line)
+        kind, rest = (match.group(1), match.group(2).strip()) if match else ("", "")
+        why: str | None = None
+        if _ODD_SPACE.search(line):
+            why = "whitespace other than a space or tab is not modelled"
+        elif kind == "sdk":
+            if rest.split("@", 1)[0].lower() != "microsoft.net.sdk":
+                why = "only Microsoft.NET.Sdk is modelled"
+        elif kind == "package":
+            if _PACKAGE_DIRECTIVE.fullmatch(rest) is None:
+                why = "not a package name and version"
+        elif kind == "property":
+            prop = _PROPERTY_DIRECTIVE.fullmatch(rest)
+            if prop is None:
+                why = "not a Name=Value property"
+            elif _EXPRESSION.search(prop.group(2)):
+                why = "an MSBuild expression is not modelled"
+            elif prop.group(1).lower() not in _APP_PROPERTIES:
+                why = "this property may change what the file compiles or binds"
+        elif kind == "project":
+            target, why = _app_project(rest, here.parent, root, graph)
+            if target is not None:
+                refs.add(target)
+        else:
+            why = "this directive is not modelled"
+        if why is not None:
+            return FileApp(frozenset(), f"{line}: {why}")
+    projects = xcs._project_dirs(repo_dir)
+    inside = _enclosing(str(here), projects, repo_dir)
+    if inside:
+        return FileApp(frozenset(), f"the file is inside the project directory {_shown(inside[0], root)}, which compiles it")
+    for directory in (here.parent, *here.parent.parents):
+        if cross_file_keys.within(directory, root):
+            try:
+                names = {f.name.lower(): f.name for f in directory.iterdir()}
+            except OSError:
+                return FileApp(frozenset(), f"{_shown(directory, root)} cannot be read for a Directory.Build file")
+            for name in sorted(_BUILD_FILES & names.keys()):
+                return FileApp(frozenset(), f"{names[name]} in {_shown(directory, root)} applies to the app")
+        if directory == root:
+            break
+    return FileApp(frozenset(refs), None)
+
+
+def _shown(directory: Path, root: Path) -> str:
+    try:
+        return str(directory.relative_to(root)) or "."
+    except ValueError:
+        return str(directory)
+
+
+def _app_project(
+    value: str, base: Path, root: Path, graph: dict[Path, frozenset[Path]] | None
+) -> tuple[Path | None, str | None]:
+    """The project directory a ``#:project`` value names, or why it is not
+    exactly one."""
+    if not value or any(c in value for c in "$@%*?;") or value.startswith("~"):
+        return None, "not a plain path"
+    target = (base / value.replace("\\", "/")).resolve()
+    if not cross_file_keys.within(target, root):
+        return None, "outside the repository"
+    if target.is_dir():
+        found = sorted(f for f in target.iterdir() if f.is_file() and f.suffix.lower() in _APP_PROJECT_SUFFIXES)
+        if len(found) != 1:
+            return None, f"{len(found)} project files in the directory, not exactly one"
+        directory = target
+    elif target.is_file() and target.suffix.lower() in _APP_PROJECT_SUFFIXES:
+        directory = target.parent
+    else:
+        return None, "not a project file or a directory holding one"
+    if graph is not None and directory not in graph:
+        return None, "a project this run has not read"
+    return directory, None
+
+
+def app_refusal(
+    repo_dir: str, path: str, full_names: Iterable[str] = (), wrapper_path: str | None = None, homeless: bool = False
+) -> str | None:
+    """Why a read in a file-based app cannot be proven, or ``None`` for a
+    file that is not one or whose model is exact. ``full_names`` are the
+    wrapper's class and interface: one declared in a namespace the SDK
+    imports unspelled would bind in the app by a name nothing here resolves."""
+    app = file_app(repo_dir, path)
+    if app is None:
+        return None
+    if app.refusal is not None:
+        return app.refusal
+    # An app is modelled only against a wrapper that belongs to a project: a
+    # type outside every project is "seen anywhere" by `sees`, and a loose
+    # file's type is no app's unless its own.
+    if homeless or (
+        wrapper_path is not None
+        and not _enclosing(str(Path(wrapper_path).resolve()), xcs._project_dirs(repo_dir), repo_dir)
+    ):
+        return "the wrapper is declared outside every project, so what the app sees of it is not modelled"
+    for name in full_names:
+        if name.rsplit(".", 1)[0] in _IMPLICIT_NAMESPACES:
+            return f"{name} is in a namespace the SDK imports implicitly"
+    return None
 
 
 def _file_based_app(path: str) -> bool:
@@ -3983,13 +4273,14 @@ def _file_based_app(path: str) -> bool:
     from flag_cleanup import wrapper_csharp as wc
 
     source = wc._read(path)
-    return source is not None and _APP_DIRECTIVE.search(source) is not None
+    return source is not None and _has_directive(source)
 
 
 def reaches(repo_dir: str, path: str, family: Family) -> bool:
     """Whether the file ``path`` may hold a value of a family type: its
-    project reaches a family project, or it is a file-based app, whose
-    references no project file says."""
+    project reaches a family project, or it is a file-based app whose
+    ``#:project`` directives do (:func:`file_app`), or one this tool does not
+    model."""
     return family.homeless or _reaches_projects(repo_dir, path, family.projects)
 
 
@@ -3998,17 +4289,24 @@ def sees(repo_dir: str, path: str, declared: str) -> bool:
     ``declared``, by :func:`reaches`' walk. A type outside every project
     may be seen anywhere."""
     homes = frozenset(_enclosing(str(Path(declared).resolve()), xcs._project_dirs(repo_dir), repo_dir))
+    app = file_app(repo_dir, path)
+    if app is not None and app.refusal is None:
+        # A compilation of its own: its own declarations, and those of the
+        # projects its directives reach; never a loose file's.
+        return Path(declared).resolve() == Path(path).resolve() or (bool(homes) and _reaches_projects(repo_dir, path, homes))
     return not homes or _reaches_projects(repo_dir, path, homes)
 
 
 def _reaches_projects(repo_dir: str, path: str, targets: frozenset[Path]) -> bool:
     """Whether a project holding ``path`` is, or references, one of
-    ``targets``, or ``path`` is a file-based app. An unreadable project
-    graph reaches everything."""
+    ``targets``, or ``path`` is a file-based app, a project of its own made
+    from its directives (:func:`file_app`; one not modelled reaches
+    everything). An unreadable project graph reaches everything."""
     graph = project_graph(repo_dir)
     if graph is None:
         return True
-    pending = _enclosing(str(Path(path).resolve()), xcs._project_dirs(repo_dir), repo_dir)
+    app = file_app(repo_dir, path)
+    pending = list(app.refs) if app is not None and app.refusal is None else _enclosing(str(Path(path).resolve()), xcs._project_dirs(repo_dir), repo_dir)
     seen: set[Path] = set()
     while pending:
         current = pending.pop()
@@ -4018,7 +4316,7 @@ def _reaches_projects(repo_dir: str, path: str, targets: frozenset[Path]) -> boo
             continue
         seen.add(current)
         pending.extend(graph.get(current, ()))
-    return _file_based_app(path)
+    return app is not None and app.refusal is not None
 
 
 # --- family-free files --------------------------------------------------------
@@ -4081,7 +4379,7 @@ def free_members(source: str, root: Node, family: Family, repo_dir: str) -> list
     (:func:`exposed_spans`)."""
     from flag_cleanup import wrapper_csharp as wc
 
-    if family.opaque or family.dynamic_anywhere or root.has_error or _APP_DIRECTIVE.search(source):
+    if family.opaque or family.dynamic_anywhere or root.has_error or _has_directive(source):
         return []
     reaching = family.tainting if family.reaching is None else family.reaching
     family_types = {n.removeprefix("@") for n in family.simple_names}
@@ -4166,7 +4464,7 @@ def family_free(source: str, root: Node, family: Family) -> bool:
     judged all the same (:func:`exposed_spans`).
     """
     del root
-    if family.opaque or _DYNAMIC.search(source) or _APP_DIRECTIVE.search(source):
+    if family.opaque or _DYNAMIC.search(source) or _has_directive(source):
         return False
     reaching = family.tainting if family.reaching is None else family.reaching
     if _spells(source, family.simple_names | reaching | _returning_outside(family, source)):

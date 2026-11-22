@@ -346,7 +346,26 @@ def _spelling(text: str, language: str) -> str:
     identifier's backticks in its text, and `` `count` `` reads ``count``."""
     if language in {"kt", "swift"} and len(text) > 2 and text[0] == text[-1] == "`":
         return text[1:-1]
+    if language == "csharp" and ("@" in text or "\\" in text):
+        # `@Old` and `\u004fld` are other spellings of the identifier `Old`.
+        if text.startswith("@"):
+            text = text[1:]
+        if "\\" in text:
+            text = _CSHARP_UNICODE_ESCAPE.sub(
+                lambda m: _decode_escape(m.group(1) or m.group(2)), text
+            )
+        return text
     return text
+
+
+_CSHARP_UNICODE_ESCAPE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+
+
+def _decode_escape(digits: str) -> str:
+    try:
+        return chr(int(digits, 16))
+    except (ValueError, OverflowError):
+        return "\ufffd"
 
 
 def _read_by_words(leaf: Node, language: str) -> bool:
@@ -5039,6 +5058,30 @@ def _is_class_private_method(node: Node, language: str) -> bool:
     return "private" in words and "native" not in words
 
 
+def _is_plain_local_function(node: Node) -> bool:
+    """Whether a C# local function can be deleted on the name count alone.
+
+    Its reach is the block (or the top-level statements) it is declared in, so
+    no `partial` question arises. Refused: an attribute (`[Conditional]` and
+    the open-ended rest), `extern` (no body to reason about), and any
+    declaration inside or beside a preprocessor directive, where the other
+    build's text is not in the tree.
+    """
+    if any(child.type == "attribute_list" for child in node.children):
+        return False
+    if "extern" in _csharp_modifiers(node):
+        return False
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type.startswith("preproc_"):
+            return False
+        ancestor = ancestor.parent
+    for sibling in (node.prev_sibling, node.next_sibling):
+        if sibling is not None and sibling.type.startswith("preproc_"):
+            return False
+    return True
+
+
 def _method_candidates(source: str, language: str) -> list[Candidate]:
     """Every class-private method in ``source`` whose name no other method
     declaration in the file shares.
@@ -5054,20 +5097,32 @@ def _method_candidates(source: str, language: str) -> list[Candidate]:
         return []
     root = _parse(source, language)
     source_bytes = source.encode("utf-8")
-    methods = [n for n in _walk(root) if n.type == "method_declaration"]
+    # A C# local function shares the namespace of the file's methods for this
+    # pass: its name must be unique among BOTH, because a same-named member
+    # method is a different binding the name count cannot tell it from.
+    kinds = {"method_declaration"}
+    if language == "csharp":
+        kinds.add("local_function_statement")
+    methods = [n for n in _walk(root) if n.type in kinds]
     names: dict[str, int] = {}
     for method in methods:
         name_node = method.child_by_field_name("name")
         if name_node is not None:
-            key = name_node.text.decode("utf-8")
+            key = _spelling(name_node.text.decode("utf-8"), language)
             names[key] = names.get(key, 0) + 1
     candidates = []
     for method in methods:
         name_node = method.child_by_field_name("name")
         if name_node is None:
             continue
-        name = name_node.text.decode("utf-8")
-        if names[name] != 1 or not _is_class_private_method(method, language):
+        name = _spelling(name_node.text.decode("utf-8"), language)
+        local = method.type == "local_function_statement"
+        if names[name] != 1:
+            continue
+        if local:
+            if not _is_plain_local_function(method):
+                continue
+        elif not _is_class_private_method(method, language):
             continue
         start = method.start_byte
         previous = method.prev_sibling
@@ -5084,7 +5139,7 @@ def _method_candidates(source: str, language: str) -> list[Candidate]:
                 name=name,
                 start=start,
                 end=method.end_byte,
-                kind="private method",
+                kind="local function" if local else "private method",
                 text=source_bytes[method.start_byte:method.end_byte].decode(
                     "utf-8", "replace"
                 ),
@@ -5170,7 +5225,8 @@ def _csharp_method_strands_a_field(source: str, candidate: Candidate) -> bool:
     method = next(
         (
             n for n in _walk(root)
-            if n.type == "method_declaration" and n.end_byte == candidate.end
+            if n.type in ("method_declaration", "local_function_statement")
+            and n.end_byte == candidate.end
         ),
         None,
     )
@@ -5188,7 +5244,9 @@ def _csharp_method_strands_a_field(source: str, candidate: Candidate) -> bool:
             for declarator in declaration.named_children:
                 name = declarator.child_by_field_name("name")
                 if declarator.type == "variable_declarator" and name is not None:
-                    fields.setdefault(name.text.decode("utf-8"), []).append(declarator)
+                    fields.setdefault(
+                        _spelling(name.text.decode("utf-8"), "csharp"), []
+                    ).append(declarator)
     if not fields:
         return False
     # name -> [read inside, written inside, read outside, written outside]
@@ -5197,7 +5255,7 @@ def _csharp_method_strands_a_field(source: str, candidate: Candidate) -> bool:
     for node in _walk(root):
         if node.type != "identifier":
             continue
-        name = node.text.decode("utf-8")
+        name = _spelling(node.text.decode("utf-8"), "csharp")
         if name not in uses:
             continue
         parent = node.parent
@@ -5768,7 +5826,7 @@ def remove_stranded_bindings(
                 key_constants=blind,
             )
         ):
-            if candidate.kind == "private method":
+            if candidate.kind in ("private method", "local function"):
                 before_count = _method_references(before, candidate.name, language)
                 current_count = _method_references(current, candidate.name, language)
                 if not before_count or current_count != 0:

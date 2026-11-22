@@ -42,7 +42,9 @@ __all__ = [
     "accessors_for",
     "cross_file_key_rules",
     "generated_rule_names",
+    "is_negated",
     "negating",
+    "with_negated_const_rules",
     "with_accessors",
     "with_accessor_const_rules",
     "with_accessor_guards",
@@ -167,6 +169,11 @@ def _for_accessor(block: str, accessor: str) -> str:
 
 
 _NEGATED: ContextVar[frozenset[str]] = ContextVar("negated_accessors", default=frozenset())
+
+
+def is_negated(accessor: str) -> bool:
+    """Whether ``accessor`` is being read as the flag's opposite (:func:`negating`)."""
+    return plain_name(accessor) in _NEGATED.get()
 
 
 @contextlib.contextmanager
@@ -737,6 +744,63 @@ def with_accessor_guards(const_rules_text: str, accessors: tuple[str, ...]) -> s
         return block + additions
 
     return pattern.sub(extend, const_rules_text)
+
+
+#: A const-rules block carrying this is a READ-const rule a NEGATED accessor
+#: gets its own copy of. Written inside the block, below its ``name`` line, for
+#: the same reason :data:`_NO_ACCESSOR_TEMPLATE_MARKER` is.
+_NEGATED_CONST_CLONE_MARKER = re.compile(r"^#\s*negated-const-clone:\s*yes\b", re.MULTILINE)
+_GUARD_RUN = re.compile(r'(?:^[ \t]*\(#not-eq\? @callee "[^"]*"\)\n)+', re.MULTILINE)
+_NOT_OPTIONAL_CALL = re.compile(r'^([ \t]*)\(#not-match\? @sdk_callee "\[\?\]\[\.\]"\)\n', re.MULTILINE)
+
+
+def with_negated_const_rules(const_rules_text: str, negated: tuple[str, ...]) -> str:
+    """``const_rules_text`` plus, per negated accessor, a copy of each READ-const
+    rule that propagates the read's OPPOSITE.
+
+    ``const DISABLED = isDisabled('k')`` is a binding of the flag's opposite.
+    The const rules inline every use of such a name with the TREATED literal, so
+    the ordinary ones are held back from it (:func:`with_accessor_guards` never
+    lists a negated name) and the binding was left ``const DISABLED = false;``
+    with its uses standing, where the positive form is inlined whole. Each copy
+    is the template with three changes: it matches only a binding whose callee
+    IS the negated accessor, its guard blocks every OTHER callee (so a name
+    bound to anything else, the SDK's own read included, is left to its own
+    rules), and it writes the UNTREATED literal.
+    """
+    names = tuple(dict.fromkeys(plain_name(name) for name in negated))
+    if not names or not const_rules_text:
+        return const_rules_text
+    blocks = _split_blocks(const_rules_text)
+    templates = [b for b in blocks[1:] if _NEGATED_CONST_CLONE_MARKER.search(b) is not None]
+    if not templates:
+        return const_rules_text
+    out = [blocks[0]]
+    for block in blocks[1:]:
+        out.append(block)
+        if block not in templates:
+            continue
+        for name in names:
+            out.append(_negated_const_clone(block, name))
+    return "\n".join(out)
+
+
+def _negated_const_clone(block: str, name: str) -> str:
+    clone = re.sub(r'^name = "([^"]*)"$', lambda m: f'name = "{m[1]}__accessor_{name}"', block, count=1, flags=re.MULTILINE)
+    # The clone's own commentary is the template's: keep the rule, drop the prose.
+    clone = _strip_comments(clone)
+    if clone.count('replace = "@treated"') > 1 or "@sdk_callee" not in clone:
+        raise SynthesisError(f"the const rule cannot be cloned for the negated accessor {name!r}")
+    if 'replace = "@treated"' in clone:
+        clone = clone.replace('replace = "@treated"', 'replace = "@untreated"')
+        clone = re.sub(r'^holes = \[(.*)\]$', lambda m: "holes = [" + m[1].replace('"treated"', '"untreated"') + "]", clone, count=1, flags=re.MULTILINE)
+    clone, narrowed = _NOT_OPTIONAL_CALL.subn(lambda m: f'{m[0]}{m[1]}(#eq? @sdk_fn "{name}")\n', clone, count=1)
+    if not narrowed:
+        raise SynthesisError(f"the const rule cannot be cloned for the negated accessor {name!r}")
+    clone, guarded = _GUARD_RUN.subn(lambda m: f'{re.match(r"[ \t]*", m[0])[0]}(#not-eq? @callee "{name}")\n', clone)
+    if not guarded:
+        raise SynthesisError(f"the const rule cannot be cloned for the negated accessor {name!r}")
+    return "\n" + clone + "\n"
 
 
 _HOLES_LINE = re.compile(r"^holes = \[(.*)\]$", re.MULTILINE)

@@ -3249,7 +3249,21 @@ def _co_used(at: Node, name: str, family, repo_dir: str) -> bool:
     return False
 
 
+#: A line break the grammar and Roslyn may not agree on: a lone CR, NEL, LS or
+#: PS. tree-sitter reads `#!/usr/bin/env dotnet\r#:project …\r…` as ONE shebang
+#: line, hiding every read below it.
+_ODD_BREAK = re.compile(r"\r(?!\n)|[\u0085\u2028\u2029]")
+
+
 def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> list[wi.Occurrence]:
+    if _ODD_BREAK.search(source):
+        # Not parsed with certainty: every textual mention of the name is
+        # refused, so the wrapper stays and nothing in the file is rewritten.
+        spelled = re.compile(r"(?<![\w])@?" + re.escape(wrapper.name) + r"(?!\w)")
+        return [
+            wi.Occurrence(path, source.count("\n", 0, m.start()) + 1, wrapper.name, None, wi.UNPARSED_MENTION)
+            for m in spelled.finditer(source)
+        ]
     root = parse(source)
     data = source.encode("utf-8")
     reader = xcs._Reader(root, path, index.repo_dir)
@@ -3400,16 +3414,20 @@ def occurrences(path: str, source: str, wrapper: wi.Wrapper, index: Index) -> li
         for n in reader.occurrences("@" + wrapper.name)
         if n.type == "identifier" and not names_only(n) and judged(n)
     ]
-    if csharp_family._file_based_app(path):
+    if (refusal := csharp_family.app_refusal(
+        index.repo_dir, path, targets, wrapper.path, family is None or family.homeless
+    )) is not None:
         # `dotnet run app.cs` builds a file-based app (`#:project …`,
         # `#:package …`) as a project of its own, from what its directives
-        # name. No project file says what its `using`s import, so no read in
-        # it is proven and the wrapper stays. (Grammars before C# 14's `#:`
-        # support read the directive as an ERROR, which left the `using`s
-        # unresolved to the same effect.) Such a file is never family-free,
-        # so the cref, knob and verbatim mentions above are all of its own.
+        # name. `csharp_family.file_app` models that project; a directive it
+        # does not model (or a file it cannot place) says no read in the app
+        # is proven, and the wrapper stays. The finding names it. Such a file
+        # is never family-free, so the cref, knob and verbatim mentions above
+        # are all of its own.
         return found + [
-            wi.Occurrence(path, wi.line_of(n), wi.text_of(n.parent or n), None, wi.IMPORT_UNRESOLVED)
+            wi.Occurrence(
+                path, wi.line_of(n), f"{wi.text_of(n.parent or n)} [{refusal}]", None, wi.IMPORT_UNRESOLVED
+            )
             for n in reader.occurrences(wrapper.name)
             if n.type == "identifier" and not names_only(n) and not xcs._in_directive(n)
         ]
