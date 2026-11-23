@@ -963,14 +963,29 @@ def setup_files(repo_dir: str) -> frozenset[str] | None:
     which callers take as "any file may be one"."""
     from flag_cleanup.piranha_runner import _SKIP_DIRS, checkout_root, source_files
 
+    listed = source_files(Path(checkout_root(repo_dir)), (*_CONFIG_SUFFIXES, ".yml", ".yaml", ".jsonc"), _SKIP_DIRS)
     configs = {
         *config_files(repo_dir),
-        *(
-            p for p in source_files(Path(checkout_root(repo_dir)), _CONFIG_SUFFIXES, _SKIP_DIRS)
-            if ts_mock_config._CONFIG_NAME.match(p.name)
-        ),
+        *(p for p in listed if ts_mock_config._CONFIG_NAME.match(p.name) and p.suffix in _CONFIG_SUFFIXES),
     }
     tails: set[str] = set()
+    mocharcs = {p for p in listed if _MOCHARC.match(p.name)}
+    # A runner started with `--config <path>` from a `package.json` script
+    # reads a config of any name; Mocha's `--require`/`--file` name setup
+    # files outright.
+    for manifest in sorted(p for p in configs if p.name == "package.json"):
+        found = _script_setups(manifest)
+        if found is None:
+            return None
+        named, more = found
+        configs |= {p for p, runner in named if runner != "mocha" and p.suffix in _CONFIG_SUFFIXES and p.is_file()}
+        mocharcs |= {p for p, runner in named if runner == "mocha" and p.is_file()}
+        tails |= more
+    for rc in sorted(mocharcs):
+        more = _mocharc_setups(rc)
+        if more is None:
+            return None
+        tails |= more
     for config in sorted(configs):
         text = _read(str(config))
         if text is None:
@@ -987,6 +1002,114 @@ def setup_files(repo_dir: str) -> frozenset[str] | None:
                 elif spec.startswith("../"):
                     tails.add(re.sub(r"^(\.\./)+", "", spec))
     return frozenset(t for t in tails if t)
+
+
+#: Mocha's config files: ``.mocharc.json``, ``.mocharc.yml``, ``.mocharc.cjs``…
+_MOCHARC = re.compile(r"^\.mocharc\.(?:json|jsonc|ya?ml|[cm]?js)$")
+#: A test runner started by a ``package.json`` script, and what follows it.
+_RUNNER_SCRIPT = re.compile(r"(?:^|[\s;&|(])(?:[\w./-]*/)?(vitest|jest|mocha)\b([^;&|]*)")
+#: The script options that name a config, or a file run before the tests.
+_SCRIPT_CONFIG = re.compile(r"(?:^|\s)(?:--config|-c)(?:=|\s+)(\S+)")
+_SCRIPT_SETUP = re.compile(r"(?:^|\s)(?:--require|-r|--file|--setupFiles|--setupFilesAfterEnv|--globalSetup)(?:=|\s+)(\S+)")
+#: Mocha's options naming files run before the tests.
+_MOCHA_OPTIONS = ("require", "file")
+
+
+def _tail(spec: str) -> str:
+    """A setup path as :func:`_setup_file` matches it: no ``./``, ``<rootDir>/`` or ``../``."""
+    spec = spec.strip().strip("'\"").replace("\\", "/")
+    spec = re.sub(r"^(<rootDir>/|\./)+", "", spec).strip("/")
+    return re.sub(r"^(\.\./)+", "", spec)
+
+
+def _script_setups(manifest: Path) -> tuple[set[tuple[Path, str]], set[str]] | None:
+    """``({(a config file a script's --config names, its runner)}, the setup
+    tails its options name)`` for one ``package.json``: a ``vitest``/``jest``/``mocha`` run
+    with ``--config``/``-c``, ``--require``/``-r``/``--file``/
+    ``--setupFiles``, and the ``"mocha"`` key's ``require``/``file``. A config
+    path is read relative to the manifest. ``None`` when the manifest names
+    setup files in a form this cannot read."""
+    import json
+
+    text = _read(str(manifest))
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return set(), set()  # not JSON: no scripts to read (the regex scan still runs)
+    if not isinstance(data, dict):
+        return set(), set()
+    configs: set[tuple[Path, str]] = set()
+    tails: set[str] = set()
+    scripts = data.get("scripts")
+    for script in scripts.values() if isinstance(scripts, dict) else ():
+        if not isinstance(script, str):
+            continue
+        for run in _RUNNER_SCRIPT.finditer(script):
+            rest = run.group(2)
+            for named in _SCRIPT_CONFIG.finditer(rest):
+                value = named.group(1).strip("'\"")
+                if "$" in value:
+                    return None
+                configs.add(((manifest.parent / value).resolve(), run.group(1)))
+            for named in _SCRIPT_SETUP.finditer(rest):
+                value = named.group(1).strip("'\"")
+                if "$" in value:
+                    return None
+                tails.add(_tail(value))
+    mocha = data.get("mocha")
+    if isinstance(mocha, dict):
+        for option in _MOCHA_OPTIONS:
+            value = mocha.get(option)
+            if value is None:
+                continue
+            values = [value] if isinstance(value, str) else value
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                return None
+            tails |= {_tail(v) for v in values}
+    return configs, {t for t in tails if t}
+
+
+def _mocharc_setups(rc: Path) -> set[str] | None:
+    """The setup tails a ``.mocharc.*`` names (``require``, ``file``), or
+    ``None`` when one is given in a form this cannot read."""
+    text = _read(str(rc))
+    if text is None:
+        return None
+    tails: set[str] = set()
+    if rc.suffix in (".yml", ".yaml"):
+        lines = text.splitlines()
+        for index, line in enumerate(lines):
+            match = re.match(rf"^({'|'.join(_MOCHA_OPTIONS)})\s*:\s*(.*?)\s*(?:#.*)?$", line)
+            if match is None:
+                continue
+            value = match.group(2)
+            if value.startswith("["):
+                items = [v.strip() for v in value.strip("[]").split(",") if v.strip()]
+            elif value:
+                items = [value]
+            else:
+                items = []
+                for following in lines[index + 1:]:
+                    item = re.match(r"^\s+-\s*(.+?)\s*(?:#.*)?$", following)
+                    if item is None:
+                        if following.strip():
+                            break
+                        continue
+                    items.append(item.group(1))
+            if any(re.search(r"[\s${}*]", i.strip("'\"")) for i in items):
+                return None
+            tails |= {_tail(i) for i in items}
+        return {t for t in tails if t}
+    for option in re.finditer(rf"[\"']?\b({'|'.join(_MOCHA_OPTIONS)})\b", text):
+        value = _SETUP_VALUE.match(text, option.end())
+        if value is None:
+            if re.match(r"[\"']?\s*:", text[option.end():]):
+                return None  # spelled as an option, valued by code
+            continue
+        tails |= {_tail(m.group(0)[1:-1]) for m in re.finditer(_STRING, value.group(1))}
+    return {t for t in tails if t}
 
 
 def _setup_file(path: str, tails: frozenset[str]) -> bool:
@@ -3406,6 +3529,86 @@ def _literal_operand(node: Node) -> bool:
     )
 
 
+@dataclass
+class Route:
+    """What a read's receiver chain reaches, recorded by the walk below
+    (:func:`module_receiver`) while :func:`recording` is on: every in-repo
+    module that declares or re-exports a binding on the way, the npm
+    packages it ends in, and the globals it reads (``("process", "env")``,
+    ``("globalThis", "posthog")``; the member is ``None`` when none is spelled)."""
+
+    modules: set[str] = field(default_factory=set)
+    packages: set[str] = field(default_factory=set)
+    globals: set[tuple[str, str | None]] = field(default_factory=set)
+    #: Every name the route takes from a module of the repository (an import,
+    #: a re-export or a top-level binding it reads): what a mock factory
+    #: must leave alone.
+    names: set[str] = field(default_factory=set)
+
+
+#: The names one global object goes by.
+_GLOBAL_OBJECTS = frozenset({"window", "globalThis", "global", "self"})
+
+
+def global_root(name: str) -> str:
+    """``globalThis`` for each name of the global object, else ``name``."""
+    return "globalThis" if name in _GLOBAL_OBJECTS else name
+
+
+#: React's own hooks and namespace: a route through them reads a context or
+#: a state the RENDER chooses, not a client package (``React.useContext``).
+_REACT_BUILT_IN = re.compile(
+    r"\A(?:React|use|useContext|useMemo|useState|useRef|useCallback|useReducer|useSyncExternalStore)\Z"
+)
+
+
+def recording(files: ts_scope.Files, route: Route | None) -> None:
+    """Make every walk over ``files`` record into ``route`` (``None`` stops).
+    While recording, the walk goes on past a step it cannot prove wherever it
+    can (both operands, every root, every ``export *`` source, a hook's own
+    function, a package it does not judge), so what it records is every
+    module the route may touch. Its answer is not used then."""
+    files.__dict__["_route"] = route
+
+
+def _route(files: ts_scope.Files) -> Route | None:
+    return files.__dict__.get("_route")
+
+
+def _every(results: Iterable[bool], files: ts_scope.Files) -> bool:
+    """``all(results)``, evaluating every one while recording."""
+    if _route(files) is None:
+        return all(results)
+    return all([*results])
+
+
+def _global_name(file: ts_scope.File, name: str) -> bool:
+    """Whether ``name`` in ``file`` means a global: nothing binds it, or only
+    an ambient ``declare`` does (``declare const process: …``)."""
+    found = ts_scope.bindings(file.root, name)
+    return all(any(a.type == "ambient_declaration" for a in _ancestors(b)) for b in found)
+
+
+def _record_module(files: ts_scope.Files, path: str) -> None:
+    route = _route(files)
+    if route is not None:
+        route.modules.add(str(Path(path).resolve()))
+
+
+def _record_global(files: ts_scope.Files, node: Node, member: str | None = None) -> None:
+    """Record the unbound name ``node`` spells, with the member read off it
+    (``process.env``), as a global the route reads."""
+    route = _route(files)
+    if route is None:
+        return
+    if member is None:
+        parent = node.parent
+        if parent is not None and parent.type == "member_expression" and parent.child_by_field_name("object") == node:
+            prop = parent.child_by_field_name("property")
+            member = _text(prop) if prop is not None else None
+    route.globals.add((global_root(_text(node)), member))
+
+
 def module_receiver(
     node: Node | None,
     home: ts_scope.File,
@@ -3415,6 +3618,9 @@ def module_receiver(
     accessors: tuple[str, ...] = (),
     key: str = "",
     depth: int = 0,
+    *,
+    through: tuple[Step, ...] = (),
+    callee: bool = True,
 ) -> bool:
     """Whether a read's callee chain is PROVEN to start from a module-level
     binding of ``home`` or an import (``client.isEnabled``, ``getClient()
@@ -3432,11 +3638,22 @@ def module_receiver(
     into that function: what it returns must be such a chain too, judged in
     its own file with its own parameters (:func:`_stable_name`'s
     ``called``), so a getter over a ``let`` a setter assigns, or over a
-    React context it reads, is not a module client."""
+    React context it reads, is not a module client.
+
+    The same goes for every step between the root and the accessor
+    (``flags.get().isEnabled``, ``Flags.client.isEnabled``): an in-repo
+    root's member runs code too (a method, a getter), so the steps are
+    handed to :func:`_stable_name` as ``through`` and each is followed into
+    what the root's declaration holds there (:func:`_stable_value`).
+
+    ``through``: steps applied to ``node``'s value after it (root first).
+    ``callee``: ``node`` is the read's callee, whose last member is the
+    accessor itself rather than a step."""
     if depth > 16:
         return False
     seen = 0
-    called = False
+    path: list[Step] = []  # outermost first
+    accessor = callee
     while node is not None and seen < 64:
         seen += 1
         if node.type in _TRANSPARENT:
@@ -3444,11 +3661,16 @@ def module_receiver(
         elif node.type == "await_expression":
             node = next((c for c in node.named_children if c.type != "comment"), None)
         elif node.type == "member_expression":
+            if not accessor:
+                prop = node.child_by_field_name("property")
+                path.append(("member", _text(prop) if prop is not None else None))
             node = node.child_by_field_name("object")
         elif node.type == "subscript_expression":
             index = node.child_by_field_name("index")
             if index is None or not _literal_operand(index):
                 return False
+            if not accessor:
+                path.append(("member", ts_mock_config.plain_string(index)))
             node = node.child_by_field_name("object")
         elif node.type == "call_expression":
             arguments = node.child_by_field_name("arguments")
@@ -3456,24 +3678,34 @@ def module_receiver(
                 _literal_operand(a) for a in arguments.named_children if a.type != "comment"
             ):
                 return False
+            path.append(("call", None))
             node = node.child_by_field_name("function")
-            if _calls_a_hook(node):
+            if _calls_a_hook(node) and _route(files) is None:
                 return False
-            called = node is not None and node.type == "identifier"
-            continue
         elif node.type == "identifier":
             name = _text(node)
             if name in params:
                 return False
             if name in locals_:
                 node = locals_.pop(name)  # each body binding followed once
-                called = False
                 continue
-            return _stable_name(home, name, files, depth + 1, accessors, key=key, called=called)
+            steps = (*reversed(path), *through)
+            if _route(files) is not None and _global_name(home, name):
+                _record_global(files, node, steps[0][1] if steps and steps[0][0] == "member" else None)
+            called = bool(steps) and steps[0][0] == "call"
+            return _stable_name(
+                home, name, files, depth + 1, accessors, key=key, called=called, through=steps[1:] if called else steps
+            )
         else:
             return False
-        called = False
+        accessor = False
     return False
+
+
+#: One step from a value to what a read reaches through it: ``("member",
+#: name)`` (``.name``, ``["name"]``; ``None`` when the name is not a plain
+#: string) or ``("call", None)``.
+Step = tuple[str, "str | None"]
 
 
 #: A React hook's name: ``useFeatureIsOn``, ``useLDClient``, ``React.useContext``.
@@ -3535,7 +3767,8 @@ def _value_roots(value: Node | None) -> list[tuple[Node, bool]] | None:
     """:func:`_value_root` for every value an expression may yield, through
     both operands of ``??``, ``||`` and ``&&`` and both branches of a
     ternary, wherever they sit in the chain (``globalThis`` and ``fallback``
-    for ``globalThis.__flags ?? fallback``), each with whether it is called
+    for ``globalThis.__flags ?? fallback``), and every name a ternary's
+    condition reads, since it picks the branch, each with whether it is called
     (``getClient`` in ``getClient().x``). An operand that starts from no name
     adds nothing; ``None`` when the walk is too long to finish."""
     roots: list[tuple[Node, bool]] = []
@@ -3566,6 +3799,14 @@ def _value_roots(value: Node | None) -> list[tuple[Node, bool]] | None:
             if operator is not None and _text(operator) in _EITHER:
                 pending += [(node.child_by_field_name("left"), False), (node.child_by_field_name("right"), False)]
         elif node.type == "ternary_expression":
+            # The condition decides which arm is the value, so every name it
+            # reads is a root too: `process.env.X === "1" ? on : fixed` is as
+            # driveable as `process` is.
+            condition = node.child_by_field_name("condition")
+            roots += [
+                (n, False) for n in (cross_file_keys.walk(condition) if condition is not None else ())
+                if n.type == "identifier"
+            ]
             pending += [
                 (node.child_by_field_name("consequence"), False),
                 (node.child_by_field_name("alternative"), False),
@@ -3573,7 +3814,11 @@ def _value_roots(value: Node | None) -> list[tuple[Node, bool]] | None:
     return roots
 
 
-def _calls_any_hook(node: Node | None) -> bool:
+def _calls_any_hook(node: Node | None, files: ts_scope.Files | None = None) -> bool:
+    """Whether ``node`` calls a React hook anywhere. Never while ``files``
+    is recording (:func:`recording`): the walk goes on into what it reads."""
+    if files is not None and _route(files) is not None:
+        return False
     return node is not None and any(
         n.type == "call_expression" and _calls_a_hook(n.child_by_field_name("function")) for n in cross_file_keys.walk(node)
     )
@@ -3602,6 +3847,7 @@ def _stable_name(
     *,
     key: str = "",
     called: bool = False,
+    through: tuple[Step, ...] = (),
 ) -> bool:
     """Whether ``name`` in ``file`` is bound, once and at the top, to a
     ``const``, a function or a class, or imported as one (followed through
@@ -3614,20 +3860,57 @@ def _stable_name(
     what the call returns. An in-repo function must return a chain
     :func:`module_receiver` proves, judged with its own parameters; any
     other in-repo binding called is not proven (its value was made by code
-    this does not read)."""
+    this does not read).
+
+    ``through``: the steps a read takes from what ``name`` holds (or, when
+    ``called``, from what the call returns) to its client: each is followed
+    into the declaration by :func:`_stable_value`, and anything it cannot
+    place is not proven. A package's members are the package rule's."""
     if depth > 16:
         return False
+    if through and through[0][0] == "call" and not called:
+        called, through = True, through[1:]
     bound = file.binding(name)
     if bound is None:
         return False
     imported = file.import_of(name)
+    route = _route(files)
     if imported is not None:
         if _npm_package(imported.specifier, imported.module, file.path, files.repo_dir):
+            if route is not None:
+                package = _package_name(imported.specifier) if imported.specifier else None
+                if package is not None and not _REACT_BUILT_IN.match(name):
+                    route.packages.add(package)
+                return True
             return not _package_driven(imported.specifier, files, accessors, key)
-        return _stable_export(imported.module, imported.imported, files, depth + 1, accessors, key=key, called=called)
+        if route is not None and imported.module is None and imported.specifier:
+            # In-repo, by a path this cannot resolve: `?<reader>\0<specifier>\0<name>`,
+            # for the caller to resolve another way and walk on from.
+            route.modules.add("?" + "\0".join((file.path, imported.specifier, imported.imported or "")))
+        return _stable_export(
+            imported.module, imported.imported, files, depth + 1, accessors, key=key, called=called, through=through
+        )
+    if _top_level_binding(bound):
+        _record_module(files, file.path)
+        if route is not None:
+            route.names.add(name)
     if not (_top_level_binding(bound) and _stable_declaration(bound)):
         return False
     declarator = bound.parent
+    if through and not called:
+        # A member of a class or of a `const`'s value: what that member holds,
+        # unless some code writes members of it (`Flags.set(c)` assigning a
+        # static, `flags.client = c`, `Object.assign(flags, …)`, a spy).
+        if declarator is None or declarator.type not in ("class_declaration", "variable_declarator"):
+            return False
+        if route is None and _members_written(file, name, declarator, files):
+            return False
+        if declarator.type == "class_declaration":
+            return _stable_class_member(file, declarator, through, files, depth, accessors, key)
+        value = declarator.child_by_field_name("value")
+        if value is None or _calls_any_hook(value, files):
+            return False
+        return _stable_value(file, value, through, set(), name, files, depth, accessors, key)
     if called:
         # What the call returns: a function of this checkout returning a
         # value whose every root is stable, judged with its own parameters.
@@ -3635,7 +3918,7 @@ def _stable_name(
         if function is None:
             return False
         returned = _returned(function.child_by_field_name("body"))
-        if returned is None or _calls_any_hook(returned):
+        if returned is None or _calls_any_hook(returned, files):
             return False
         parameters = function.child_by_field_name("parameters") or function.child_by_field_name("parameter")
         names = {
@@ -3643,14 +3926,14 @@ def _stable_name(
             for n in (cross_file_keys.walk(parameters) if parameters is not None else ())
             if n.type in ("identifier", "shorthand_property_identifier_pattern")
         }
-        return _stable_roots(file, _value_roots(returned), names, name, files, depth, accessors, key)
+        return _stable_value(file, returned, through, names, name, files, depth, accessors, key)
     # A `const` holds what its initialiser named: `const ph = posthog` and
     # `const client = OpenFeature.getClient()` are as driveable as
     # `posthog` and `OpenFeature` are.
     if declarator is None or declarator.type != "variable_declarator":
         return True
     value = declarator.child_by_field_name("value")
-    if _calls_any_hook(value):
+    if _calls_any_hook(value, files):
         return False
     # Every operand a `??`, `||`, `&&` or a ternary may yield is the value:
     # `globalThis.__flags ?? fallback` is as driveable as `globalThis` is.
@@ -3676,15 +3959,341 @@ def _stable_roots(
     ``own``, the binding being judged."""
     if roots is None:
         return False
+    route = _route(files)
+    stable = True
     for root, called in roots:
         name = _text(root)
         if name in params:
             return False
         if name == own and not called:
             continue
+        if route is not None and _global_name(file, name):
+            _record_global(files, root)
         if not _stable_name(file, name, files, depth + 1, accessors, key=key, called=called):
+            stable = False
+            if route is None:
+                return False
+    return stable
+
+
+def _parameter_names(function: Node) -> set[str]:
+    parameters = function.child_by_field_name("parameters") or function.child_by_field_name("parameter")
+    return {
+        _text(n)
+        for n in (cross_file_keys.walk(parameters) if parameters is not None else ())
+        if n.type in ("identifier", "shorthand_property_identifier_pattern")
+    }
+
+
+def _stable_value(
+    file: ts_scope.File,
+    value: Node | None,
+    through: tuple[Step, ...],
+    params: Set[str],
+    own: str,
+    files: ts_scope.Files,
+    depth: int,
+    accessors: tuple[str, ...],
+    key: str,
+) -> bool:
+    """Whether what a read reaches from ``value`` through the steps
+    ``through`` is proven stable (see :func:`module_receiver`).
+
+    With no step, every root of ``value`` must be stable
+    (:func:`_stable_roots`). Otherwise the first step is followed into
+    ``value``: a member of an object literal (a property's value, a
+    shorthand's name, a method or getter's one returned expression; a spread
+    or computed key, a setter, or a name found twice is not proven), both
+    operands of ``??``/``||``/``&&`` and both ternary arms, or the chain
+    :func:`module_receiver` walks. WHITELIST: anything else is not proven."""
+    if depth > 16 or value is None:
+        return False  # no value written (`static client!: Client`): whatever assigns it later
+    if not through:
+        return _stable_roots(file, _value_roots(value), params, own, files, depth, accessors, key)
+    seen = 0
+    while value is not None and seen < 64 and (value.type in _TRANSPARENT or value.type == "await_expression"):
+        seen += 1
+        value = _operand(value) if value.type in _TRANSPARENT else next(
+            (c for c in value.named_children if c.type != "comment"), None
+        )
+    if value is None:
+        return False
+    if value.type == "object":
+        return _stable_object_member(file, value, through, params, files, depth, accessors, key)
+    if value.type == "binary_expression":
+        operator = value.child_by_field_name("operator")
+        if operator is None or _text(operator) not in _EITHER:
             return False
-    return True
+        return _every(
+            (
+                _stable_value(file, value.child_by_field_name(side), through, params, own, files, depth + 1, accessors, key)
+                for side in ("left", "right")
+            ),
+            files,
+        )
+    if value.type == "ternary_expression":
+        # The condition picks the arm, so every name it reads must be stable too.
+        condition = value.child_by_field_name("condition")
+        names = [
+            (n, False) for n in (cross_file_keys.walk(condition) if condition is not None else ()) if n.type == "identifier"
+        ]
+        return _every(
+            (
+                _stable_roots(file, names, params, own, files, depth, accessors, key),
+                *(
+                    _stable_value(
+                        file, value.child_by_field_name(side), through, params, own, files, depth + 1, accessors, key
+                    )
+                    for side in ("consequence", "alternative")
+                ),
+            ),
+            files,
+        )
+    if value.type == "identifier" and _text(value) == own:
+        return False  # a value naming itself: nothing to follow
+    return module_receiver(
+        value, file, params, {}, files, accessors, key, depth + 1, through=through, callee=False
+    )
+
+
+def _member_body(function: Node, rest: tuple[Step, ...]) -> tuple[Node | None, tuple[Step, ...]] | None:
+    """What calling ``function`` returns, and the steps after the call:
+    ``rest`` must start with the call. None when it does not."""
+    if not rest or rest[0][0] != "call":
+        return None
+    return _returned(function.child_by_field_name("body")), rest[1:]
+
+
+def _stable_object_member(
+    file: ts_scope.File,
+    literal: Node,
+    through: tuple[Step, ...],
+    params: Set[str],
+    files: ts_scope.Files,
+    depth: int,
+    accessors: tuple[str, ...],
+    key: str,
+) -> bool:
+    """:func:`_stable_value` of the member ``through[0]`` names in an object literal."""
+    kind, name = through[0]
+    if kind != "member" or name is None:
+        return False
+    rest = through[1:]
+    found: list[Node] = []
+    for entry in literal.named_children:
+        if entry.type == "comment":
+            continue
+        if entry.type == "spread_element":
+            return False  # it may hold the name too
+        if entry.type == "shorthand_property_identifier":
+            if _text(entry) == name:
+                found.append(entry)
+            continue
+        if entry.type in ("pair", "method_definition"):
+            label = entry.child_by_field_name("key") if entry.type == "pair" else entry.child_by_field_name("name")
+            if label is None or label.type == "computed_property_name":
+                return False  # it may be the name
+            spelled = ts_mock_config.plain_string(label) if label.type == "string" else _text(label)
+            if spelled == name:
+                found.append(entry)
+            continue
+        return False  # a form this does not read
+    if len(found) != 1:
+        return False
+    entry = found[0]
+    if entry.type == "shorthand_property_identifier":
+        if _text(entry) in params:
+            return False
+        return _stable_name(file, _text(entry), files, depth + 1, accessors, key=key, through=rest)
+    if entry.type == "pair":
+        return _stable_held(file, entry.child_by_field_name("value"), rest, params, files, depth, accessors, key)
+    return _stable_method(file, entry, rest, params, files, depth, accessors, key)
+
+
+def _stable_held(
+    file: ts_scope.File,
+    held: Node | None,
+    rest: tuple[Step, ...],
+    params: Set[str],
+    files: ts_scope.Files,
+    depth: int,
+    accessors: tuple[str, ...],
+    key: str,
+) -> bool:
+    """:func:`_stable_value` of what a property or field holds: a function's
+    result when it is called next, else the value itself."""
+    function = held
+    while function is not None and function.type in _TRANSPARENT:
+        function = _operand(function)
+    if function is not None and function.type in ("arrow_function", "function_expression", "function"):
+        body = _member_body(function, rest)
+        if body is None or body[0] is None or _calls_any_hook(body[0], files):
+            return False
+        return _stable_value(
+            file, body[0], body[1], set(params) | _parameter_names(function), "", files, depth + 1, accessors, key
+        )
+    return _stable_value(file, held, rest, params, "", files, depth + 1, accessors, key)
+
+
+def _stable_method(
+    file: ts_scope.File,
+    method: Node,
+    rest: tuple[Step, ...],
+    params: Set[str],
+    files: ts_scope.Files,
+    depth: int,
+    accessors: tuple[str, ...],
+    key: str,
+) -> bool:
+    """:func:`_stable_value` of a method or getter's result: a getter's when
+    it is read, a method's when it is called. A setter, or a body that is not
+    one ``return``, is not proven."""
+    kinds = {c.type for c in method.children}
+    if "set" in kinds or "*" in kinds or "async" in kinds:
+        return False
+    if "get" in kinds:
+        returned, after = _returned(method.child_by_field_name("body")), rest
+    else:
+        body = _member_body(method, rest)
+        if body is None:
+            return False
+        returned, after = body
+    if returned is None or _calls_any_hook(returned, files):
+        return False
+    return _stable_value(
+        file, returned, after, set(params) | _parameter_names(method), "", files, depth + 1, accessors, key
+    )
+
+
+def _members_written(file: ts_scope.File, name: str, declaration: Node, files: ts_scope.Files) -> bool:
+    """Whether any code may write a member of the object or class ``name``
+    declares in ``file`` (``declaration``): inside it, an assignment,
+    update or ``delete`` through ``this``; in any file that spells ``name``,
+    one whose target is a member chain through ``name`` (or a local name an
+    import gives it, or a ``ns.name``), or a call that writes or stubs
+    members (``Object.assign``, ``Object.defineProperty``, ``vi.spyOn``,
+    ``sinon.stub``…) or any other call handed it whole as an argument.
+    Over-approximate by design: a name is matched by its text, and a file
+    that cannot be read writes it. Cached per run on ``files``."""
+    cache: dict[tuple[str, str], bool] = files.__dict__.setdefault("_members_written", {})
+    asked = (file.path, name)
+    if asked not in cache:
+        cache[asked] = _scan_member_writes(file, name, declaration, files)
+    return cache[asked]
+
+
+def _writes_through(node: Node, names: Set[str], name: str) -> bool:
+    """Whether a target expression is a member chain whose root is one of
+    ``names``, or which passes through a property spelled ``name``."""
+    seen = 0
+    if node.type not in ("member_expression", "subscript_expression"):
+        return False
+    while node is not None and seen < 64:
+        seen += 1
+        if node.type in ("member_expression", "subscript_expression"):
+            prop = node.child_by_field_name("property")
+            if prop is not None and _text(prop) == name:
+                return True
+            node = node.child_by_field_name("object")
+        elif node.type in _TRANSPARENT:
+            node = _operand(node)
+        elif node.type == "call_expression":
+            node = node.child_by_field_name("function")
+        else:
+            break
+    return node is not None and node.type in ("identifier", "this") and _text(node) in names
+
+
+def _scan_member_writes(file: ts_scope.File, name: str, declaration: Node, files: ts_scope.Files) -> bool:
+    body = declaration.child_by_field_name("body") if declaration.type == "class_declaration" else declaration
+    for node in cross_file_keys.walk(body) if body is not None else ():
+        target = _write_target(node)
+        if target is not None and _writes_through(target, {"this", name}, name):
+            return True
+    for path in cross_file_keys.mention_files(files.repo_dir, (name,), exclude=(), extra_suffixes=source_index_suffixes()):
+        if not path.endswith(ts_scope.FAMILY_EXTENSIONS):
+            text = _read(path)
+            if text is None or re.search(rf"(?<![\w$.]){re.escape(name)}\s*(?:\.\s*[\w$#]+\s*|\[[^\]]*\]\s*)+(?:[-+*/%&|^]|\*\*|<<|>>>?|\?\?|&&|\|\|)?=(?!=)", text):
+                return True  # a component's code writing it, by text
+            continue
+        source = _read(path)
+        other = files.file(path, source) if source is not None else None
+        if other is None:
+            return True
+        names = {name} | {i.local for i in other.imports if i.imported == name}
+        for node in cross_file_keys.walk(other.root):
+            target = _write_target(node)
+            if target is not None and _writes_through(target, names, name):
+                return True
+            if node.type != "call_expression":
+                continue
+            arguments = mock_stubs.ts_arguments(node)
+            callee = mock_stubs.ts_callee(node)
+            for index, argument in enumerate(arguments):
+                rooted = _root_identifier(argument) in names or _writes_through(argument, names, name)
+                bare = argument.type == "identifier" and _text(argument) in names
+                if (index == 0 and rooted and callee in _MEMBER_STUBS) or bare:
+                    return True  # stubbed, or handed on whole
+    return False
+
+
+def _write_target(node: Node) -> Node | None:
+    """What an assignment, update or ``delete`` writes, else None."""
+    if node.type in ("assignment_expression", "augmented_assignment_expression"):
+        return node.child_by_field_name("left")
+    if node.type == "update_expression":
+        return node.child_by_field_name("argument")
+    if node.type == "unary_expression" and any(c.type == "delete" for c in node.children):
+        return next((c for c in node.named_children if c.type != "comment"), None)
+    return None
+
+
+def _stable_class_member(
+    file: ts_scope.File,
+    declaration: Node,
+    through: tuple[Step, ...],
+    files: ts_scope.Files,
+    depth: int,
+    accessors: tuple[str, ...],
+    key: str,
+) -> bool:
+    """:func:`_stable_value` of the static member ``through[0]`` names on a
+    class: a static method or getter (see :func:`_stable_method`), or a
+    static field's initialiser. A class that extends another (the member may
+    be inherited), a member declared twice (a getter and a setter) or not at
+    all, and an instance or abstract member are not proven."""
+    kind, name = through[0]
+    if kind != "member" or name is None:
+        return False
+    heritage = next((c for c in declaration.named_children if c.type == "class_heritage"), None)
+    if heritage is not None and any(c.type == "extends_clause" for c in heritage.named_children):
+        return False  # the member may be inherited (`implements` only types it)
+    body = declaration.child_by_field_name("body")
+    found: list[Node] = []
+    for member in body.named_children if body is not None else ():
+        label = member.child_by_field_name("name") or member.child_by_field_name("property")
+        if label is None:
+            if member.type not in ("comment", "class_static_block"):
+                continue
+            if member.type == "class_static_block":
+                return False  # it may define the name at class init
+            continue
+        if label.type == "computed_property_name":
+            return False
+        spelled = ts_mock_config.plain_string(label) if label.type == "string" else _text(label)
+        if spelled == name:
+            found.append(member)
+    if len(found) != 1:
+        return False
+    member = found[0]
+    if not any(c.type == "static" for c in member.children) or any(c.type == "abstract" for c in member.children):
+        return False
+    rest = through[1:]
+    if member.type == "method_definition":
+        return _stable_method(file, member, rest, set(), files, depth, accessors, key)
+    if member.type == "public_field_definition":
+        return _stable_held(file, member.child_by_field_name("value"), rest, set(), files, depth, accessors, key)
+    return False
 
 
 def _declared_function(bound: Node) -> Node | None:
@@ -3713,6 +4322,7 @@ def _stable_export(
     *,
     key: str = "",
     called: bool = False,
+    through: tuple[Step, ...] = (),
 ) -> bool:
     """:func:`_stable_name` for what ``module`` exports as ``name``."""
     if module is None or name in (None, "default", "=") or depth > 16:
@@ -3720,6 +4330,10 @@ def _stable_export(
     held = files.file(module)
     if held is None:
         return False
+    _record_module(files, held.path)
+    route = _route(files)
+    if route is not None and name is not None:
+        route.names.add(name)
     stars: list[str | None] = []
     for statement in held.root.named_children:
         if statement.type != "export_statement":
@@ -3742,14 +4356,22 @@ def _stable_export(
             if source is not None:
                 spec_text = cross_file_ts._string_value(source)
                 if _npm_package(spec_text, target, held.path, files.repo_dir):
+                    if route is not None:
+                        package = _package_name(spec_text) if spec_text else None
+                        if package is not None:
+                            route.packages.add(package)
+                        return True
                     return not _package_driven(spec_text, files, accessors, key)
-                return _stable_export(target, _text(local), files, depth + 1, accessors, key=key, called=called)
-            return _stable_name(held, _text(local), files, depth + 1, accessors, key=key, called=called)
+                return _stable_export(
+                    target, _text(local), files, depth + 1, accessors, key=key, called=called, through=through
+                )
+            return _stable_name(held, _text(local), files, depth + 1, accessors, key=key, called=called, through=through)
     if held.binding(name) is not None and ts_scope._exports_directly(held.root, name):
-        return _stable_name(held, name, files, depth + 1, accessors, key=key, called=called)
+        return _stable_name(held, name, files, depth + 1, accessors, key=key, called=called, through=through)
     # Only through `export *`: each source that may hold it must hold a stable one.
-    return bool(stars) and all(
-        _stable_export(t, name, files, depth + 1, accessors, key=key, called=called) for t in stars
+    return bool(stars) and _every(
+        (_stable_export(t, name, files, depth + 1, accessors, key=key, called=called, through=through) for t in stars),
+        files,
     )
 
 
@@ -3805,7 +4427,9 @@ def _package_driven(spec: str | None, files: ts_scope.Files, accessors: tuple[st
     ``key`` other than as a read's argument (a test utility calling
     ``posthog.init({ bootstrap: { featureFlags: { "<key>": true } } })``);
 (e) in a test file, the package loaded by ``import("<package>")`` or a
-    ``require("<package>")`` no declaration binds, which no import list holds.
+    ``require("<package>")`` no declaration binds, which no import list holds;
+(f) (c) or (e) in a module only test code loads (:func:`_test_support`): a
+    helper a setup file or a test calls, whatever it spells.
 
     Any of these, or a package name this cannot read, is driven. Asked once
     per package and run (cached on ``files``)."""
@@ -3855,10 +4479,14 @@ def _scan_package_doubles(name: str, files: ts_scope.Files, accessors: frozenset
             return True  # unreadable: assume the worst
         test = _stubs(path, source) or setups is None or _setup_file(path, setups)
         bound = _package_bindings(file, name)
-        if bound and _mentions_beyond_reads(file, bound, accessors) and (test or _spells_key(file, key, accessors)):
-            return True  # (c), (d)
-        if test and _loads_package(file, name, bound):
-            return True  # (e)
+        if (
+            bound
+            and _mentions_beyond_reads(file, bound, accessors)
+            and (test or _spells_key(file, key, accessors) or _test_support(path, files, setups))
+        ):
+            return True  # (c), (d), (f)
+        if _loads_package(file, name, bound) and (test or _test_support(path, files, setups)):
+            return True  # (e), (f)
         for node in cross_file_keys.walk(file.root):
             if node.type == "call_expression":
                 callee = mock_stubs.ts_callee(node)
@@ -3883,6 +4511,131 @@ def _scan_package_doubles(name: str, files: ts_scope.Files, accessors: frozenset
                 if operand is not None and _root_identifier(operand) in bound:
                     return True  # (b)
     return False
+
+
+#: Every specifier a file loads by text: an import or ``export ... from``, a
+#: ``require``/``import()`` of a literal. Read in component files too.
+_LOADS = re.compile(r"""(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\1""")
+
+
+def _test_support(path: str, files: ts_scope.Files, setups: frozenset[str] | None) -> bool:
+    """Whether only test code loads the module at ``path``: every file that
+    loads it (an import, ``export ... from``, a literal ``require`` or
+    ``import()``; ``import type`` loads nothing) is a test or support file
+    (:func:`_stubs`), a setup file a runner config names, or itself only
+    loaded by test code, to a fixed point (a cycle counts as test code).
+
+    A module nothing loads is not: it is an entry point (``main.ts``), or
+    loaded by a path this cannot see. A production module a test imports too
+    (``analytics.ts`` calling ``posthog.init``) is not either. Importers are
+    found by the module's last path segment (its directory's for an
+    ``index``), read by text and resolved, so a component file counts too
+    (as production code). Cached on ``files``."""
+    cache: dict[str, bool] = files.__dict__.setdefault("_test_support", {})
+    resolved = str(Path(path).resolve())
+    if resolved in cache:
+        return cache[resolved]
+    cache[resolved] = True  # a cycle through this module: test code only
+    found = _only_test_loaders(resolved, files, setups)
+    cache[resolved] = found
+    return found
+
+
+def _only_test_loaders(resolved: str, files: ts_scope.Files, setups: frozenset[str] | None) -> bool:
+    index, unresolved = _loader_index(files)
+    module = Path(resolved)
+    stem = re.sub(r"\.(?:d\.)?[cm]?[jt]sx?$", "", module.name)
+    segment = module.parent.name if stem == "index" else stem
+
+    def test_code(loader: str) -> bool:
+        if not loader.endswith(ts_scope.FAMILY_EXTENSIONS):
+            return False  # a component: production code
+        text = _read(loader) or ""
+        return _stubs(loader, text) or (setups is not None and _setup_file(loader, setups))
+
+    loaders = sorted(index.get(resolved, ()))
+    # A specifier this cannot resolve (a bundler alias, `moduleNameMapper`)
+    # ending in the module's name may load it: from test code it counts.
+    maybe = [loader for loader in sorted(unresolved.get(segment, ())) if test_code(loader)]
+    if not loaders and not maybe:
+        return False
+    for loader in loaders:
+        if loader == resolved or test_code(loader):
+            continue
+        if not _test_support(loader, files, setups):
+            return False
+    return True
+
+
+def _loader_index(files: ts_scope.Files) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """``(loaders by resolved module, loaders by the last segment of a
+    specifier that resolves to nothing)``, read once per run (cached on
+    ``files``). A file's loads: every ``import``/``export … from`` (``import
+    type``/``export type`` statements load nothing), and every ``require``,
+    ``import()``, ``jest.requireActual``/``vi.importActual`` of a literal,
+    read from the parsed tree; a component file's by text. A file that
+    cannot be read loads nothing here (it only makes a module look loaded by
+    test code alone, which refuses more)."""
+    cached = files.__dict__.get("_loader_index")
+    if cached is not None:
+        return cached
+    index: dict[str, set[str]] = {}
+    unresolved: dict[str, set[str]] = {}
+    for loader in cross_file_keys.mention_files(
+        files.repo_dir, (), exclude=(), also=re.compile(r"\b(?:from|require|import|importActual|requireActual)\b"),
+        extra_suffixes=source_index_suffixes(),
+    ):
+        text = _read(loader)
+        if text is None:
+            continue
+        if loader.endswith(ts_scope.FAMILY_EXTENSIONS):
+            parsed = files.file(loader, text)
+            specs = _loaded_specifiers(parsed.root) if parsed is not None else []
+        else:
+            specs = [m.group(2) for m in _LOADS.finditer(text)]
+        resolved_loader = str(Path(loader).resolve())
+        for spec in specs:
+            target = ts_scope.resolve(loader, spec, files.repo_dir)
+            if target is not None:
+                index.setdefault(str(Path(target).resolve()), set()).add(resolved_loader)
+            else:
+                segment = re.sub(r"\.(?:[cm]?[jt]sx?)$", "", spec.rstrip("/").rsplit("/", 1)[-1])
+                unresolved.setdefault(segment, set()).add(resolved_loader)
+    files.__dict__["_loader_index"] = (index, unresolved)
+    return index, unresolved
+
+
+_LOAD_CALLS = frozenset({"require", "import", "jest.requireActual", "vi.importActual", "jest.requireMock", "vi.importMock"})
+
+
+def _loaded_specifiers(root: Node) -> list[str]:
+    found: list[str] = []
+    for node in cross_file_keys.walk(root):
+        if node.type in ("import_statement", "export_statement"):
+            if any(c.type == "type" for c in node.children):
+                continue  # `import type`, `export type … from`: elided
+            source = node.child_by_field_name("source")
+            spec = cross_file_ts._string_value(source) if source is not None else None
+            if spec is not None:
+                found.append(spec)
+            clause = next((c for c in node.named_children if c.type == "import_require_clause"), None)
+            if clause is not None:
+                string = next((c for c in clause.named_children if c.type == "string"), None)
+                spec = cross_file_ts._string_value(string) if string is not None else None
+                if spec is not None:
+                    found.append(spec)
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            name = "import" if function is not None and function.type == "import" else (
+                _text(function) if function is not None else ""
+            )
+            if name not in _LOAD_CALLS:
+                continue
+            arguments = mock_stubs.ts_arguments(node)
+            spec = ts_mock_config.plain_string(arguments[0]) if arguments else None
+            if spec is not None:
+                found.append(spec)
+    return found
 
 
 def _spells_key(file: ts_scope.File, key: str, accessors: Set[str]) -> bool:

@@ -39,17 +39,29 @@ from flag_cleanup.wrapper_go import _is_read
 _FUNCTIONS = frozenset({"function_declaration", "method_declaration"})
 
 
-def refusal_reason(source: str, names: Iterable[str]) -> str | None:
+def refusal_reason(
+    source: str, names: Iterable[str], folded_calls: Iterable[str] = ()
+) -> str | None:
     """Why inlining the locals ``names`` in ``source`` would rewrite something else.
 
     ``names`` are the locals the engine inlined in this file, read off its
     rule matches. ``None`` when every identifier it rewrote was a read of the
-    local it inlined.
+    local it inlined. ``folded_calls`` are the texts of the calls the engine
+    replaced with a literal: a spelling inside one (``&fallback`` in the
+    arguments of the flag read) goes with the call, so it is neither rewritten
+    nor read.
     """
+    folded = frozenset(folded_calls)
     names = frozenset(names)
     if not names:
         return None
-    for node in sorted(_walk(_parse(source, "go")), key=lambda n: n.start_byte):
+    root = _parse(source, "go")
+    gone = [
+        (n.start_byte, n.end_byte)
+        for n in _walk(root)
+        if n.type == "call_expression" and n.text.decode("utf-8", "replace") in folded
+    ]
+    for node in sorted(_walk(root), key=lambda n: n.start_byte):
         if node.type != "short_var_declaration":
             continue
         left = node.child_by_field_name("left")
@@ -62,7 +74,7 @@ def refusal_reason(source: str, names: Iterable[str]) -> str | None:
                 function = function.parent
             if function is None:
                 continue
-            other = _other_mention(function, binder, name)
+            other = _other_mention(function, binder, name, gone)
             if other is not None:
                 return (
                     f"the local `{name}` on line {binder.start_point[0] + 1} is "
@@ -73,11 +85,31 @@ def refusal_reason(source: str, names: Iterable[str]) -> str | None:
     return None
 
 
-def _other_mention(function: Node, binder: Node, name: str) -> Node | None:
-    """The first identifier ``name`` in ``function`` that is not a read of ``binder``."""
+def _other_mention(
+    function: Node, binder: Node, name: str, gone: list[tuple[int, int]] = ()
+) -> Node | None:
+    """The first identifier ``name`` in ``function`` that is not a read of ``binder``.
+
+    A spelling inside a span of ``gone`` (a call the fold replaced) is excused ONLY when the
+    local has no other mention anywhere in the function: the fold then leaves it stranded and
+    it is deleted, never inlined. With any other mention (a read, a write, a closure, a
+    ``defer``, a goroutine, another ``&name``) the engine would write the literal there, and the
+    callee may have written through the address the call took (``*o.Fallback = false``), so
+    every spelling counts, the ones inside the call included.
+    """
     key = [(binder.start_byte, binder.end_byte)]
-    for leaf in sorted(_walk(function), key=lambda n: n.start_byte):
-        if leaf.type != "identifier" or leaf == binder or leaf.text.decode("utf-8", "replace") != name:
+    leaves = [
+        leaf
+        for leaf in sorted(_walk(function), key=lambda n: n.start_byte)
+        if leaf.type == "identifier" and leaf != binder and leaf.text.decode("utf-8", "replace") == name
+    ]
+
+    def inside(leaf: Node) -> bool:
+        return any(start <= leaf.start_byte and leaf.end_byte <= end for start, end in gone)
+
+    excuse = all(inside(leaf) for leaf in leaves)
+    for leaf in leaves:
+        if excuse and inside(leaf):
             continue
         if (
             not _is_read(leaf)

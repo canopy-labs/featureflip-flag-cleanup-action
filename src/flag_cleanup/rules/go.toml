@@ -136,19 +136,19 @@ name = "delete_discarded_boolvariation_statement"
 query = """(
   [(expression_statement
      (call_expression
-       function: [(selector_expression field: (field_identifier) @sdk_fn)
-                  (identifier) @sdk_fn]
-       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))))
+       function: [(selector_expression field: (field_identifier) @sdk_fn) @callee
+                  (identifier) @sdk_fn @callee]
+       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .)) @args))
    (go_statement
      (call_expression
-       function: [(selector_expression field: (field_identifier) @sdk_fn)
-                  (identifier) @sdk_fn]
-       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))))
+       function: [(selector_expression field: (field_identifier) @sdk_fn) @callee
+                  (identifier) @sdk_fn @callee]
+       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .)) @args))
    (defer_statement
      (call_expression
-       function: [(selector_expression field: (field_identifier) @sdk_fn)
-                  (identifier) @sdk_fn]
-       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .))))] @statement
+       function: [(selector_expression field: (field_identifier) @sdk_fn) @callee
+                  (identifier) @sdk_fn @callee]
+       arguments: (argument_list . (interpreted_string_literal . (_) @flag_name .)) @args))] @statement
   (#eq? @sdk_fn "BoolVariation")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -156,9 +156,20 @@ replace_node = "statement"
 replace = ""
 holes = ["stale_flag_name"]
 
+# The read's own arguments and receiver may hold no call, except the two the standard library
+# documents as no-ops: `context.Background()` and `context.TODO()`. A call that does other work
+# is refused, and so is one of those spelled through a shadowed `context` (`go_read_effects`
+# judges the name, as it does for a read in value position).
 [[rules.filters]]
-contains = """((argument_list) @arg_list)"""
-at_most = 1
+on_capture = "args"
+not_contains = ['''(
+  (call_expression) @arg_call
+  (#not-match? @arg_call "^context\\.(Background|TODO)\\(\\)$")
+)''']
+
+[[rules.filters]]
+on_capture = "callee"
+not_contains = ["(call_expression) @receiver_call"]
 
 [[rules.filters]]
 not_contains = ["""((unary_expression) @receive_or_negation)"""]
@@ -229,25 +240,25 @@ name = "delete_discarded_openfeature_boolean_statement"
 query = """(
   [(expression_statement
      (call_expression
-       function: [(selector_expression field: (field_identifier) @sdk_fn)
-                  (identifier) @sdk_fn]
+       function: [(selector_expression field: (field_identifier) @sdk_fn) @callee
+                  (identifier) @sdk_fn @callee]
        arguments: (argument_list
          . (_)
-         . (interpreted_string_literal . (_) @flag_name .))))
+         . (interpreted_string_literal . (_) @flag_name .)) @args))
    (go_statement
      (call_expression
-       function: [(selector_expression field: (field_identifier) @sdk_fn)
-                  (identifier) @sdk_fn]
+       function: [(selector_expression field: (field_identifier) @sdk_fn) @callee
+                  (identifier) @sdk_fn @callee]
        arguments: (argument_list
          . (_)
-         . (interpreted_string_literal . (_) @flag_name .))))
+         . (interpreted_string_literal . (_) @flag_name .)) @args))
    (defer_statement
      (call_expression
-       function: [(selector_expression field: (field_identifier) @sdk_fn)
-                  (identifier) @sdk_fn]
+       function: [(selector_expression field: (field_identifier) @sdk_fn) @callee
+                  (identifier) @sdk_fn @callee]
        arguments: (argument_list
          . (_)
-         . (interpreted_string_literal . (_) @flag_name .))))] @statement
+         . (interpreted_string_literal . (_) @flag_name .)) @args))] @statement
   (#eq? @sdk_fn "Boolean")
   (#eq? @flag_name "@stale_flag_name")
 )"""
@@ -255,9 +266,20 @@ replace_node = "statement"
 replace = ""
 holes = ["stale_flag_name"]
 
+# The read's own arguments and receiver may hold no call, except the two the standard library
+# documents as no-ops: `context.Background()` and `context.TODO()`. A call that does other work
+# is refused, and so is one of those spelled through a shadowed `context` (`go_read_effects`
+# judges the name, as it does for a read in value position).
 [[rules.filters]]
-contains = """((argument_list) @arg_list)"""
-at_most = 1
+on_capture = "args"
+not_contains = ['''(
+  (call_expression) @arg_call
+  (#not-match? @arg_call "^context\\.(Background|TODO)\\(\\)$")
+)''']
+
+[[rules.filters]]
+on_capture = "callee"
+not_contains = ["(call_expression) @receiver_call"]
 
 [[rules.filters]]
 not_contains = ["""((unary_expression) @receive_or_negation)"""]

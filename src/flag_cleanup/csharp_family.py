@@ -3935,6 +3935,7 @@ def reset_cache() -> None:
     wrapper_csharp._LOCATOR_DECLARED.clear()
     wrapper_csharp._EXTENSION_NAMES.clear()
     _GRAPHS.clear()
+    _ISOLATED.clear()
     _LINKED.clear()
     _SCANS.clear()
     _METHOD_NAMES.clear()
@@ -4284,11 +4285,54 @@ def reaches(repo_dir: str, path: str, family: Family) -> bool:
     return family.homeless or _reaches_projects(repo_dir, path, family.projects)
 
 
+_ISOLATED: dict[str, bool] = {}
+_FILE_BASED_PROGRAM = re.compile(r"FileBasedProgram", re.IGNORECASE)
+
+
+def apps_isolated(repo_dir: str) -> bool:
+    """Whether a file-based app's types can be taken as invisible to every
+    other file. They can when every project's compile set is known (the
+    project graph parsed: a wildcard or property in a ``<Compile Include>``
+    may bring an app into a project, which then binds its types) and no
+    project, ``.props`` or ``.targets`` file of the checkout names
+    ``FileBasedProgram`` (the feature that lets a project compile one). Any
+    file that cannot be read counts against it."""
+    if repo_dir not in _ISOLATED:
+        from flag_cleanup import source_index
+
+        isolated = project_graph(repo_dir) is not None
+        if isolated:
+            for f in source_index.files(repo_dir, {".csproj", ".props", ".targets"}, with_ignored=True):
+                try:
+                    text = Path(f.resolved).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    isolated = False
+                    break
+                if _FILE_BASED_PROGRAM.search(text):
+                    isolated = False
+                    break
+        _ISOLATED[repo_dir] = isolated
+    return _ISOLATED[repo_dir]
+
+
+def hides_types(repo_dir: str, declared: str) -> bool:
+    """Whether the types the file ``declared`` holds are visible only inside
+    it: it is a modelled file-based app (:func:`file_app`) and
+    :func:`apps_isolated` holds."""
+    app = file_app(repo_dir, declared)
+    return app is not None and app.refusal is None and apps_isolated(repo_dir)
+
+
 def sees(repo_dir: str, path: str, declared: str) -> bool:
     """Whether the file ``path`` may see a type declared in the file
     ``declared``, by :func:`reaches`' walk. A type outside every project
-    may be seen anywhere."""
+    may be seen anywhere, unless it is a file-based app's: that is seen
+    only from its own file."""
     homes = frozenset(_enclosing(str(Path(declared).resolve()), xcs._project_dirs(repo_dir), repo_dir))
+    if hides_types(repo_dir, declared):
+        # A type a file-based app declares is its compilation's own: no other
+        # file can name it, a global-namespace one included.
+        return Path(declared).resolve() == Path(path).resolve()
     app = file_app(repo_dir, path)
     if app is not None and app.refusal is None:
         # A compilation of its own: its own declarations, and those of the

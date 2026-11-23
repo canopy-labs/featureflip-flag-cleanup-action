@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flag-cleanup"
-version = "2.22.0"
+version = "2.23.0"
 description = "Featureflip Flag Cleanup Action — deterministic dead/stale flag removal via Piranha (runs in the customer's CI)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -625,6 +625,30 @@ dependencies = [
     # directive name before `=` stays a directive. The engine also compiles
     # fewer queries per run (no output change). No other grammar rev moved.
     #
+    # 0.66.0. Swift: the grammar moves to canopy-labs/tree-sitter-swift
+    # 4f5ecff, and the Swift wheel below with it to `+canopy.8`. A dotted
+    # name ends at a newline before a line-start bracket (`let p = o.q`
+    # NEWLINE `(a ?? b).run()` was the call `o.q(a ?? b)`), never after an
+    # attribute's name. `try`/`await`/`try!` go only around a whole folded
+    # literal; only a literal the fold wrote is folded further, so a
+    # customer's own literal beside the read stays; a ternary nested in
+    # another without parentheses is declined. Java: the dead tail after a
+    # fold-made jump goes after a `try` whose every path returns, a
+    # `finally` that folds, an always-stopping loop, an `if`/`else`, a
+    # `switch` and a bare block, and an old-style `switch` case group is a
+    # statement list (spliced, its tail and `throw` handled); javac rejected
+    # the kept tail as unreachable. C#/Kotlin/PHP: a fold-made `return`,
+    # `break`, `continue` or `throw` deletes its whole unreachable tail,
+    # top-level statements and switch sections included, and a C# local
+    # function whose last call the run deleted goes too (CS8321). PHP: only
+    # the fold's own nested block is unwrapped. Ruby: a promoted `elsif`
+    # keeps the dead `if`'s column for `else`/`elsif`/`end` and is one span
+    # edit; every folding rule folds only a literal the fold wrote; a
+    # heredoc is edited whole or not at all; a fold-made `elsif false` goes.
+    # Python: an `elif` is promoted over a dead `if` in one edit, and a lifted
+    # `else` body keeps the comments between the dead `if` and the `else`.
+    # No other grammar rev moved.
+    #
     # 0.60.0. Python: deleting an entry no longer turns a one-element set
     # `{k}` into the dict `{}` or a subscript `x[a, k]` into the scalar index
     # `x[a]`; Swift: nor a tuple `(a, k)` into the scalar `(a)` (each is
@@ -775,7 +799,7 @@ dependencies = [
     # holding an `#else`/`#elif`/`#endif` it did not open is an ERROR: in a
     # branch the compiler skips, that line ends the branch. Outside every
     # `#if` block nothing is skipped and nothing is refused.
-    "polyglot-piranha==0.65.0",
+    "polyglot-piranha==0.66.0",
     # Featureflip public API client (removal-candidates fetch). Floated on
     # major version only — this tool has no other httpx-version-sensitive
     # surface to pin against.
@@ -860,12 +884,20 @@ dependencies = [
     # `if let d = try? await detailTask {` is no longer one ERROR. `+canopy.5`
     # adds a second, in the scanner only (sent upstream): a `(` or `[`
     # starting the line after a condition's block is a new statement, not a
-    # call or subscript of that block read as a trailing closure. The wheel
+    # call or subscript of that block read as a trailing closure. `+canopy.7`
+    # extends that scanner rule (canopy-labs/tree-sitter-swift
+    # `canopy/swift-dotted-name-newline`, sent upstream) to a dotted name, so
+    # `let p = o.q` NEWLINE `(a ?? b).run()` is two statements, not a
+    # constructor call. `+canopy.8` gives an attribute's name its own dots
+    # (`canopy/swift-attribute-name-newline`, sent upstream), so that rule never
+    # applies after an attribute: `@Sendable` NEWLINE `(Int) -> Void` stays a
+    # function type and `{ @MainActor` NEWLINE `[weak self] (x: Int) in` a
+    # closure. The wheel
     # also carries the generated parser upstream does not commit, so it is the
     # only way to get that grammar until upstream releases. Resolves only from
     # wheels/ (PEP 440 local segment), filled by scripts/fetch_piranha_wheels.py.
     # Bump the segment when the engine's pin moves.
-    "tree-sitter-swift==0.7.4+canopy.5",
+    "tree-sitter-swift==0.7.4+canopy.8",
     "tree-sitter-kotlin>=1.1,<2",
     "tree-sitter-python>=0.23,<0.26",
     # PHP. Capped on minor like the others. NOT pinned exactly to what the

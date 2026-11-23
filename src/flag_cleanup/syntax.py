@@ -2064,13 +2064,15 @@ def _swift_line_start_arguments(source: str) -> str | None:
     Swift never continues an expression into a ``(`` or ``[`` at the start of a
     line: there it begins a new statement. A parse tree that hangs such a
     bracket on the line above as its arguments is therefore not the program
-    swiftc reads. It happens after a condition's block, read as a trailing
-    closure (``if ready() { return }`` NEWLINE ``[1].forEach { … }`` becomes one
-    ``if`` subscripting the closure), and after a dotted name bound by a
-    declaration (``let p = a.b`` NEWLINE ``(c ?? d).run()``). A rewrite of that
-    tree folds the wrong statement, so the check is NOT differential: a file
-    holding one on either side of the rewrite is refused when the run changes
-    it. Returns the bracketed line's text.
+    swiftc reads. The grammar used to build one after a condition's block,
+    read as a trailing closure (``if ready() { return }`` NEWLINE
+    ``[1].forEach { … }`` became one ``if`` subscripting the closure), and after
+    a dotted name (``let p = a.b`` NEWLINE ``(c ?? d).run()`` became a
+    constructor call); it now reads both as new statements, so this stands
+    for any other tree that still does. A rewrite of that tree folds the wrong
+    statement, so the check is NOT differential: a file holding one on either
+    side of the rewrite is refused when the run changes it. Returns the
+    bracketed line's text.
     """
     data = source.encode("utf-8")
     for node in _walk(_parse(source, "swift")):
@@ -2461,6 +2463,41 @@ def _literal_statements(source: str, language: str) -> int:
         and node.named_child_count == 1
         and node.named_children[0].type in _BOOLEAN_LITERALS
     )
+
+
+#: The call nodes of the languages :func:`_literal_statements` judges.
+_CALL_NODES = frozenset({"call_expression", "method_invocation"})
+
+#: What running code inside a call's receiver or arguments looks like: a call, or a Java `new`.
+_RUNS_CODE = _CALL_NODES | {"object_creation_expression"}
+
+
+def _discarded_read_holding_call(
+    source: str, language: str, read_markers: tuple[str, ...]
+) -> tuple[int, str] | None:
+    """The first statement of ``source`` that is nothing but a call reading the flag,
+    whose receiver or arguments hold another call: ``(line, text)``, else ``None``.
+
+    The cause of a literal left standing as a statement when the read's value is
+    discarded: the fold itself only deletes such a statement when nothing in it
+    runs code, so one that calls something is kept as a literal and refused here.
+    Names it, instead of the symptom, in the reason.
+    """
+    if not _PROFILES[language].literal_statement_is_fatal:
+        return None
+    for node in sorted(_walk(_parse(source, language)), key=lambda n: n.start_byte):
+        if node.type not in _LITERAL_HOLDING_STATEMENTS or node.named_child_count != 1:
+            continue
+        call = node.named_children[0]
+        if call.type not in _CALL_NODES:
+            continue
+        text = call.text.decode("utf-8", "replace")
+        if not reads_flag(text, read_markers):
+            continue
+        if any(inner.type in _RUNS_CODE and inner.id != call.id for inner in _walk(call)):
+            flat = " ".join(text.split())
+            return node.start_point[0] + 1, flat if len(flat) <= 100 else flat[:97] + "..."
+    return None
 
 
 #: Statements whose whole content may be the read, and so the literal after a
@@ -4035,6 +4072,15 @@ def refusal_reason(
             "branch the flag made dead could not be removed"
         )
     if _literal_statements(after, language) > _literal_statements(before, language):
+        held = _discarded_read_holding_call(before, language, read_markers)
+        if held is not None:
+            line, text = held
+            return (
+                f"the flag read on line {line} (`{text}`) is a statement whose value is "
+                "discarded, and its receiver or arguments run code (a call or a `new`), so deleting the "
+                "statement would drop that call and folding the read to a literal leaves a "
+                "statement that does not compile"
+            )
         return "a boolean literal was left standing as a statement"
     if _null_literal_comparisons(after, language) > _null_literal_comparisons(
         before, language

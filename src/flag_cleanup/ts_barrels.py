@@ -492,8 +492,10 @@ def public_entry(path: str) -> bool:
     any of ``main``, ``module``, ``types``, ``typings``, ``exports``,
     ``browser`` or ``bin`` publishes something, and a build can map any source
     file to it (``dist/esm/index.js`` from ``src/index.ts``, ``./*`` subpath
-    patterns, a directory ``main``), so every barrel under it is public. One
-    that cannot be read counts as public.
+    patterns, a directory ``main``), so every file under it is public. So does
+    one that names a package (``name``) and none of those: npm publishes its
+    ``index.js`` by default, and with no ``exports`` every file of it can be
+    imported by path. One that cannot be read counts as public.
     """
     import json
 
@@ -509,7 +511,7 @@ def public_entry(path: str) -> bool:
             return True
         if data.get("private") is True:
             return False
-        return any(field in data for field in _PUBLIC_FIELDS)
+        return "name" in data or any(field in data for field in _PUBLIC_FIELDS)
     return False
 
 

@@ -2101,6 +2101,9 @@ class _Repo:
         self.async_at: dict[str, tuple[str, int]] = {}
         #: The same, of bindings only: all a bare ``name(...)`` read can call.
         self.binding_async: dict[str, tuple[str, int]] = {}
+        #: The same, of declarations that SAY so (an `async` token, a Promise-naming return type or
+        #: JSDoc): the evidence a key-index read refuses on, not the conservative "could be".
+        self.declared_promise: dict[str, tuple[str, int]] = {}
         self.trees: dict[str, Node] = {}
         #: Per accessor name, what each declaration in the repository says it returns.
         self.declared_kinds: dict[str, set[str]] = defaultdict(set)
@@ -2145,6 +2148,9 @@ class _Repo:
                             verdict = None  # a fake in test support code that only reads
                         if verdict:
                             note(name, node, node.type in _BINDING_KINDS)
+                            if _declares_promise(node):
+                                at = (shown, node.start_point[0] + 1)
+                                self.declared_promise[name] = min(self.declared_promise.get(name, at), at)
                         kind = "async" if verdict else (_member_kind(node) or "other")
                         self.declared_kinds[name].add(kind)
                         if node.type in _BINDING_KINDS:
@@ -2585,12 +2591,14 @@ def _parameter_type(call: Node, name: str) -> str | None:
     return None
 
 
-def _first_argument(call: Node) -> tuple[str | None, bool]:
-    """``(the key literal, whether the argument could name some key)``."""
+def _first_argument(call: Node, index: int = 0) -> tuple[str | None, bool]:
+    """``(the key literal, whether the argument could name some key)``, of the
+    argument at ``index`` (the first by default)."""
     args = call.child_by_field_name("arguments")
-    if args is None or not args.named_children:
+    named = [a for a in args.named_children if a.type != "comment"] if args is not None else []
+    if len(named) <= index:
         return None, False
-    first = args.named_children[0]
+    first = named[index]
     if first.type == "string":
         if first.child_count == 3 and first.children[1].type == "string_fragment":
             return _text(first.children[1]), False
@@ -3712,9 +3720,13 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
     """Every un-awaited accessor read in ``paths`` that is, or may be, of ``flag_key``, with its decision."""
     if language not in ("ts", "tsx", "js") or not accessors:
         return []
-    props = {n: p for n, p in rule_synthesis.positions_of(accessors).items() if isinstance(p, str)}
+    positions = rule_synthesis.positions_of(accessors)
+    props = {n: p for n, p in positions.items() if isinstance(p, str)}
+    # `isOff[1]`: the key at an argument index. Its reads are decided like a
+    # first-argument accessor's, and only a literal may fold.
+    indexes = {n: i for n, i in positions.items() if isinstance(i, int)}
     names = frozenset(a for a in accessors if rule_synthesis.plain_name(a) == a)
-    repo = _Repo(repo_dir, names | frozenset(props), flag_key)
+    repo = _Repo(repo_dir, names | frozenset(props) | frozenset(indexes), flag_key)
     sites: list[Site] = []
     for path in dict.fromkeys(paths):
         if _EXTENSIONS.get(Path(path).suffix) is None:
@@ -3723,7 +3735,7 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
             source = mock_stubs._read_exact(path)
         except (OSError, UnicodeDecodeError):
             continue
-        if not any(n in source for n in (*names, *props)):
+        if not any(n in source for n in (*names, *props, *indexes)):
             continue
         tree = repo.tree(path)
         if tree is None:
@@ -3744,8 +3756,11 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
             if _is_optional(node, callee):
                 continue
             prop = props.get(name) if name not in names else None
+            index = indexes.get(name) if name not in names and prop is None else None
             if prop is not None:
                 literal, could_name_key = _property_argument(node, prop)
+            elif index is not None:
+                literal, could_name_key = _first_argument(node, index)
             elif name in names:
                 literal, could_name_key = _first_argument(node)
             else:
@@ -3754,6 +3769,20 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
                 continue
             top, _cast = _unwrap(node)
             if top.parent is not None and top.parent.type == "await_expression":
+                continue
+            if index is not None:
+                # A key-position read (`get(state.flags, "key", false)`) is
+                # folded by its positional clone alone, as it always was. What
+                # it must never do is fold where a Promise would decide the
+                # code's path: in a condition (a Promise is always truthy) or
+                # where the result is used as a Promise. Those refuse.
+                why = _index_read_hazard(repo, path, node, callee, name)
+                if why is None:
+                    continue
+                sites.append(
+                    Site(path, name, (callee.start_byte, callee.end_byte), (node.start_byte, node.end_byte),
+                         LEAVE, literal == flag_key, why, False, False)
+                )
                 continue
             decision, why = decide(repo, path, node, callee, name)
             if prop is not None and decision == LITERAL and not _sync_evidence(repo, path, node, callee, name):
@@ -3770,6 +3799,46 @@ def plan(repo_dir: str, paths: list[str], flag_key: str, accessors: tuple[str, .
                      decision, literal == flag_key or const_key, why, prop is not None, const_key)
             )
     return sites
+
+
+def _declares_promise(node: Node) -> bool:
+    """Whether a declaration says its result is a Promise: an ``async`` token,
+    a Promise-naming JSDoc, or a return type or annotation naming one (a union
+    with a Promise, an alias such as ``MaybePromise``, an overload signature)."""
+    value = node.child_by_field_name("value")
+    subject = value if value is not None and value.type in _FUNCTION_VALUES else node
+    if _has_async_token(subject) or _jsdoc_promise(node):
+        return True
+    for owner in (subject, node):
+        rtype = owner.child_by_field_name("return_type")
+        if rtype is not None and _PROMISE_NAMED.search(_text(rtype)):
+            return True
+    annotation = node.child_by_field_name("type")
+    return annotation is not None and _PROMISE_NAMED.search(_text(annotation)) is not None
+
+
+def _index_read_hazard(repo: "_Repo", path: str, call: Node, callee: Node, accessor: str) -> str | None:
+    """Why a key-position read may not become a literal: a declaration of
+    ``accessor`` says it is async or returns a Promise (any use refuses); else
+    a condition where one could be, or a Promise use. None otherwise."""
+    # Closed by construction: an accessor with ANY declaration that is async or
+    # Promise-returning (a receiver typed so, or an in-repo / `.d.ts` one: a
+    # union, an overload, a re-export) is folded only as the direct operand of
+    # `await` (those reads never reach here). No use of the un-awaited result
+    # is enumerated. An accessor with no such declaration (lodash `get[1]`)
+    # keeps the narrow rule below.
+    if repo.receiver_kind(path, call, callee, accessor) == "promise":
+        return "its result is a Promise (the receiver's declared type), and only an awaited read may fold"
+    at = repo.declared_promise.get(accessor)
+    if at is not None:
+        return f"a declaration of {accessor} in the repository is async or returns a Promise ({at[0]}:{at[1]}), and only an awaited read may fold"
+    top, _cast = _unwrap(call)
+    if _boolean_consumed(top):
+        evidence = _promise_evidence(repo, path, call, callee, accessor)
+        return f"a Promise in a condition is always truthy, and {evidence}" if evidence is not None else None
+    if _use_site_kind(top) == PROMISE_USE:
+        return "its result is used as a Promise"
+    return None
 
 
 def _key_constant(tree: Node, call: Node, prop: str, flag_key: str) -> bool:

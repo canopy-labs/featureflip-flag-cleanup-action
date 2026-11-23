@@ -1332,8 +1332,15 @@ read is not inlined by name (the read is folded where it is bound; in TypeScript
 TSX, JavaScript and JSX a program-level or function-level `const` bound to the
 read is inlined whole, as the opposite literal, like the same `const` bound to
 an ordinary accessor), a read
-whose key is held in a constant the run cannot prove removable is left, and a
-test double of one is not resolved. So once a removal has changed anything,
+whose key is held in a constant the run cannot prove removable is left (in
+TypeScript, TSX, JavaScript and JSX a constant imported from another file,
+directly or through a barrel, is followed like an ordinary accessor's, and
+its read folds to the opposite literal; in Python a constant of the same file
+read only by negated accessors goes like one an ordinary accessor reads), and
+a test double of one is not resolved. In TypeScript, TSX, JavaScript and JSX
+an un-awaited negated read that may return a Promise refuses the flag where
+the same read of an ordinary accessor would not become a plain literal (a
+Promise in a condition is always truthy). So once a removal has changed anything,
 every source file of the checkout is checked: any file that still names a
 negated accessor (in any spelling: `isDisabled`, `is_disabled`, `:disabled?`,
 or as a string such as `spyOn(flags, 'isDisabled')`) together with the flag's
@@ -1550,6 +1557,18 @@ package you depend on is read as synchronous, so an async accessor from a
 package folds to the literal unless the read is returned from an `async` or
 annotated function. An awaited read through a key constant is not folded for an
 accessor that has any un-awaited read decided this way.
+
+**In Python, an `async def` accessor folds only when it is awaited.** A coroutine
+is always truthy, so `if is_on(ctx, "old-checkout"):` took the true branch
+whatever the flag served, and removing the flag would have changed that. A read
+you name in `accessors` that sits directly under `await` (parentheses allowed)
+folds as usual. Any other read of an accessor that is an `async def`, found
+in the same file, through `from m import f [as g]`, as a module attribute
+(`sdk.is_on`) or as a method of a class of the repository, refuses the flag
+with the file and line (`an un-awaited read of is_on ... whose result may be a
+coroutine`), and so does a read whose callee the run cannot resolve when the
+file defines or imports an `async def` of that name. A callee declared only in
+a package you depend on is read as synchronous.
 
 A read returned from a function nothing annotates (`function isRbac(svc) { return
 svc.getFlag("key"); }`) folds to a literal only on evidence that the read is
@@ -2313,7 +2332,17 @@ client` at the top); an `export let client` with a setter or a `var` is not
 proven. A call of a function of your repository (`getClient().isEnabled(...)`)
 is proven only when that function's body is one `return` of a value proven
 the same way: a getter returning a `let` that `setClient` assigns, or one
-reading a React context (`return useContext(ClientContext)`), is not. A client imported from an npm
+reading a React context (`return useContext(ClientContext)`), is not. A member
+between that name and the read is followed the same way: `flags.get()` and
+`flags.client` into the property, method or getter of the object literal
+`flags` is declared with, and `Flags.get()` or `Flags.client` into the class's
+static method, getter or field, each proven only when what it returns or holds
+is. A spread or computed key in the object, a getter with a setter, a subclass
+(the member may be inherited), a static field with no value, a value made by
+`new` or by a call that is not followed, and an object or class whose members
+any code may write (`this.client = …` inside it, `Flags.set(c)` assigning a
+field, `flags.client = …`, `Object.assign(flags, …)`, a spy on it, or the
+object handed whole to another call) are not proven. A client imported from an npm
 package (`import posthog from "posthog-js"`, `import * as ld from ...`) is
 proven unless something in the repository lets a test change it: a module
 mock of the package (`vi.mock("posthog-js", ...)` and the like), a
@@ -2331,7 +2360,13 @@ file, and so does every file when a configuration gives one of those options
 a value that is not a string or a list of strings. Any other file counts too
 when it also spells the flag's key, except as a read's argument (a test
 utility calling `posthog.init(..., { bootstrap: { featureFlags: { "foo":
-true } } })`). So does a test file loading the package with `import("...")`,
+true } } })`), and when only test code loads it: every file that imports
+it is a test file, a setup file, or itself loaded only by test code (a helper
+`enableAllFlags()` a setup file calls, whatever it spells). A module nothing
+imports, or one production code imports too (`analytics.ts`), is not, even
+when the part of it that changes the client is called only by tests: keep
+such a helper in a module of its own. So does
+a test file loading the package with `import("...")`,
 or with a `require("...")` that is not the whole value of a declaration. A bare
 specifier counts as an npm package only when it can be nothing else: it
 resolves into `node_modules`, or no `paths` entry, workspace package or
@@ -2341,7 +2376,8 @@ declares it (or it is installed). So `@lib/client` aliased by a
 initialised from a name (`const ph = posthog`, `const client =
 OpenFeature.getClient()`) is proven only when that name is, and one
 initialised with `??`, `||`, `&&` or a ternary only when every name either
-side may yield is (`globalThis.__flags ?? fallback` is not). A caller may
+side may yield is, and every name a ternary's condition reads (`globalThis.__flags ?? fallback` and
+`flagsOn ? on : fixed` over a variable a test sets are not). A caller may
 always choose for `client.isEnabled` on a parameter, `(client ??
 fallback).isEnabled`, `pick(ctx).isEnabled`, `this.client.isEnabled`, and a
 read through a React hook (`useFeatureIsOn("foo")`,
@@ -2361,6 +2397,85 @@ under its own name (`export { isFooEnabled }`, `module.exports = {
 isFooEnabled }`, `exports.isFooEnabled = isFooEnabled`) and `typeof
 isFooEnabled` in a type are not uses as a value. The refusal names the test
 and its line. Delete or rewrite that test, then run the removal again.
+
+A test that drives the client a read goes through refuses the flag too, for a
+read in your own code and for a keyless wrapper's read alike, and nothing is
+changed: the fold answers the flag's value whatever the client says, so a test
+that chose the answer itself would assert what the read used to return. The
+read's route is every module of your repository its receiver passes through:
+the module declaring the client (or the object, class, getter or function
+holding it), every module those getters, returned functions and initialisers
+read, and every module re-exporting one of them (a barrel, `export { flags as
+cfg }`). The module declaring the flag's key constant, and every barrel
+forwarding it, is on the route too. In a test file, a support file, a setup
+file your test runner names, or a module only test code loads, each of these
+refuses:
+
+- a module mock of a route module (`mock`, `doMock`, `unstable_mockModule`,
+  `setMock`, with or without a factory), however the mock object is reached
+  (`vi`, `jest`, `vitest`, `import { vi as v }`, `const { mock } = vi`,
+  `vi.mock<typeof import("./client")>(...)`, Bun's `mock.module`), and
+  `enableAutomock()`. A
+  factory returning an object that only spreads the real module
+  (`...(await importOriginal())`, `...jest.requireActual(...)`) and replaces
+  exports the read does not go through is fine, and so is a factory that
+  answers your accessor with the value the removal keeps (`useFlag: () =>
+  true` when removing toward `true`). A mock of the key constant's module
+  with no factory and no `__mocks__` file keeps the key and is fine too;
+- a load of a route module other than into a declaration
+  (`(await import("./client")).client`);
+- a load that replaces what the code under test imports or holds:
+  `proxyquire("./route", { "./keys": stub })` (also through a configured copy,
+  `require("proxyquire").noCallThru()`) with a stub for a route module, and
+  `rewire`'s `__set__`/`__with__` or `babel-plugin-rewire`'s `__Rewire__` on
+  a file holding the read or on a route module;
+- any use of what a test loads from a client's route module other than calling
+  one of your `accessors` on it (`client.isEnabled(...)`), calling a
+  declaration of your code that holds the read (`handler()`), `typeof` or a
+  type: `vi.spyOn(client, "isEnabled")`, `Object.assign(client, …)`, `holder.c
+  = fake`, `client.override(...)`, `setClient(fake)`, `const F = Flags`, a
+  cast, a spread or an argument;
+- from the key constant's module, a spy on the constant (`vi.spyOn(keys,
+  "K", "get")`, `jest.replaceProperty`), a write through it, or the module
+  object or an object of keys handed on. Reading a constant is fine;
+- from the module of a React hook the read goes through (`useFlag("foo")`,
+  `useFlags().isEnabled("foo")`), a spy on the hook or on what it reads, or a
+  write through it.
+  Rendering its provider or calling its other hooks is fine: a provider sets
+  the flag by its key, which the removal strips from the test as before.
+
+When your test runner gives each test file a module registry of its own
+(Jest, and Vitest unless `isolate: false`), a mock, a spy or a use in a test
+file counts only when that file's imports may reach the read, through files of
+your repository; an import this cannot resolve (that is not an npm package), a
+computed one, `import.meta.glob` and `require.context` count as reaching. A
+bare name counts as an npm package only when nothing in the repository can
+read it as one of your files: a `baseUrl` or `paths` entry, a workspace package
+(`"workspace:*"`, or a `node_modules` link into the repository), a Jest, Babel
+or bundler alias. So `events/client` under `"baseUrl": "src"` is your
+`src/events/client.ts`, even though `events` is also a Node built-in, and a
+name you also depend on or have installed is no different.
+Under Mocha, Bun's runner or `isolate: false` every test file counts. A setup
+file always counts, and so does a write to a global.
+
+A runner configuration counts as well: `automock: true`, and a
+`moduleNameMapper` or `resolve.alias` entry that maps a specifier naming a
+route module to another file (a stub). An alias that points at a route module
+(`"@flags": "/src/keys.ts"`) makes a mock of the alias a mock of that module. A
+global the route reads (an environment variable behind a ternary in a getter,
+`globalThis.__flags`) refuses when a test or setup file writes it (an
+assignment, `delete`, `vi.stubEnv`, `vi.stubGlobal`, a spy). An npm package
+client refuses when a setup file, or a module only test code loads that a
+setup file loads, mocks the package or uses it other than by a read
+(`posthog.featureFlags.override(true)`): a setup file runs before every test.
+A setup file is one your Jest or Vitest configuration names, including a
+configuration a `package.json` script loads with `--config` or `-c`, and
+Mocha's `require` and `file` (in a `.mocharc.*`, the `mocha` key of a
+`package.json`, or `--require`/`--file` in a script). This refuses more than
+it must, by design: a test that calls a helper from the client's module
+refuses the flag even when the helper cannot touch the client, so keep test
+helpers in a module of their own. The refusal names the file, its line and
+the route module.
 
 A factory's member may also return the read's Promise: one of your
 `accessors` whose read there becomes `Promise.resolve(<value>)` (see "A
@@ -5069,6 +5184,16 @@ object the file holds: code the file runs through `eval`, and a setter for the
 slot's name installed on `Object.prototype`, which the write itself would
 call.
 
+A test that replaces the module declaring a TypeScript or JavaScript key
+constant, or a module re-exporting from it, refuses the flag (`unsafe-rewrite`,
+naming the call): `vi.mock("./keys", () => ({ K: "other" }))`, the same with
+`vi.doMock`, `jest.mock`, `jest.doMock` or `jest.unstable_mockModule`,
+`jest.setMock`, a mock of a specifier that is not a literal, and a mock with no
+factory that loads a `__mocks__` file beside the module. Under such a test the
+read sees another key, so folding it as this flag's would change what the test
+exercises. A mock with no factory and no `__mocks__` file keeps the constant's
+value and changes nothing.
+
 A TypeScript or JavaScript key constant imported through a barrel, by
 `import { NAME }` or by a destructuring `const { NAME } = require("./barrel")`
 (`const` only, no rest element, no default value, no renaming `{ NAME: X }`), is folded
@@ -5125,9 +5250,14 @@ itself, a type-only re-export, a barrel in CommonJS or that does not parse, and
 a barrel in a file the run does not rewrite, a barrel with a `@ts-expect-error`,
 `@ts-ignore` or `eslint-disable-next-line` comment anywhere in the run of
 comments above the line, and any barrel under a `package.json` that is not
-`private` and declares `main`, `module`, `types`, `typings`, `exports`,
-`browser` or `bin` (a published package: the nearest manifest decides, and no
-file name is matched) stay `import-unresolved`, with the reads and the declaration kept. A
+`private` and declares `name`, `main`, `module`, `types`, `typings`,
+`exports`, `browser` or `bin` (a published package: the nearest manifest
+decides, and no file name is matched; npm publishes a named package's
+`index.js` by default, and without `exports` any of its files can be imported
+by path) stay `import-unresolved`, with the reads and the declaration kept.
+The same goes for a key constant declared in such a package: its reads fold,
+its declaration stays, listed as `unsupported-form` (mark an internal
+workspace package `"private": true` to let it go). A
 comment after the removed line goes with it, and a CRLF file stays CRLF.
 
 **Workspace packages** (opt-in: `workspace-packages: follow`). In a monorepo,
@@ -7989,7 +8119,9 @@ function also spells that name for something other than a read of it (a
 `range` variable, an `if` initializer, a function literal's parameter, a later
 `n, useNew := …`, an assignment, a struct literal key, or `&useNew`), the local
 is not inlined: `useNew := true` is left standing with its reads, which is
-valid Go and the same program. One shape is **refused** instead, and the run
+valid Go and the same program. A spelling inside the read's own arguments
+(`fallback := true` passed on as `Opts{Fallback: &fallback}`) goes with the read and
+does not count; the local is then deleted with it. One shape is **refused** instead, and the run
 exits 1 naming the file: a read of an outer `useNew` (a package-level variable,
 say) **above** the local's declaration, which inlining would rewrite too.
 Rename one of them and the next run cleans the file. A read bound beside
@@ -8680,20 +8812,35 @@ the file is refused rather than rewritten. The check reads the rewritten file as
 it is, so a file the removal changes is refused as well when it already had a
 statement after a bare `return` that Swift warns will never be executed.
 
-A line that starts with `(` or `[` begins a new statement in Swift. After the
-block of an `if` or `while` condition (`if legacy { return }` followed by
-`["cart", "payment"].forEach { … }`) the grammar reads it that way too, and the
-check is removed like any other. After a `let` bound to a dotted name
-(`let p = settings.path` followed by `(a ?? b).run()`) the grammar still reads
-it as the arguments of the line above, so a file the removal would change is
-refused when the grammar reads such a line that way, before or after the
-rewrite, since the rewrite would be planned on the wrong statements.
+A line that starts with `(` or `[` begins a new statement in Swift, and the
+grammar reads it that way too, after the block of an `if` or `while` condition
+(`if legacy { return }` followed by `["cart", "payment"].forEach { … }`) and
+after a dotted name (`let p = settings.path` followed by `(a ?? b).run()`), so
+the check is removed like any other. A file the removal would change is still
+refused if the grammar reads such a line as the arguments of the line above,
+before or after the rewrite, since the rewrite would be planned on the wrong
+statements.
 
-Two more Swift shapes are refused rather than rewritten: a flag read bound by
-a `let` or `var` that declares several names (`let legacy = <read>, count =
-other()`), where the read's name cannot be inlined without deleting the others
-with it, and a read bound by an `async let` (`async let legacy = <read>`),
-where the removal used to leave `await true`.
+Where the fold leaves only a literal under an `await` or a plain `try`
+(`await false`), the keyword goes with it when the `await` or `try` is a whole
+expression of its own (a statement, a condition, a value bound, returned or
+passed), in a function, initializer or getter written `async` (or, for `try`,
+in any function), or in a closure whose type says `async` (or `throws`): it
+waits for nothing, and Swift warns about it. Where it covers more than the
+literal, or in an untyped closure (asynchronous only because of it), it
+stays, and a file left with `await true` is refused. A `try!` around the
+literal goes in the same places, in any function or closure: a literal cannot
+throw, so it changes nothing (`try?` stays, since it makes the value optional).
+An `await` over an
+operator expression in a condition (`if await store.isReady && <read> {`) is
+not read by the grammar, so a file holding one is skipped.
+
+A flag read bound by a `let` or `var` that declares several names (`let
+legacy = <read>, count = other()`) is refused rather than rewritten: the read's
+name cannot be inlined without deleting the others with it. A read bound by an
+`async let` (`async let legacy = <read>`) is inlined into each `await legacy`,
+and the `await` goes with it by the rule above; in an untyped closure that
+would leave `await true`, and the file is refused.
 
 A read bound to a `let` is inlined, and the `if useLegacy` reading it is folded
 the same way.
@@ -8883,7 +9030,7 @@ means no PR.
 | `{ on }` shorthand or `export { on }` | that reference is left; the declaration is kept |
 | Folding an `if` whose branch declares a `const`/`let`/`class`/`function`/`enum`/`interface`/`type` | the branch keeps its `{ … }` so the declaration stays scoped |
 | Folding an `if` that sits in an `else`, or as a braceless `if`/`while`/`for` body | the branch keeps its `{ … }`. Only a position that can hold several statements gets them spliced in flat |
-| A **Java, Go or C# read that is a whole statement** and holds **another call** — `verify(client).boolVariation("KEY", ctx, false);` (Mockito), `client.boolVariation("KEY", buildCtx(), false);`, `new Ctx()`, `contexts[index()]`, Go's `<-ready`, or C#'s `ctxs[i++]` | **the whole flag is refused**, and the run exits 1 naming the file — except a mock verification of the read, which is deleted when the run folds a real read (see "Tests that mock the flag read"). Deleting the statement would delete that call with it — the mock's assertion, or a context the customer builds — and replacing only the read leaves `true;` standing alone, which none of the three accepts (javac: `not a statement`; `go build`: an unused constant expression; C#: CS0201). Delete or rewrite that line yourself, or add the key to `ignore`. A discarded read holding **no** other call is rewritten: see the row below |
+| A **Java, Go or C# read that is a whole statement** and holds **another call** — `verify(client).boolVariation("KEY", ctx, false);` (Mockito), `client.boolVariation("KEY", buildCtx(), false);`, `new Ctx()`, `contexts[index()]`, Go's `<-ready`, or C#'s `ctxs[i++]` | **the whole flag is refused**, and the run exits 1 naming the file — except a mock verification of the read, which is deleted when the run folds a real read (see "Tests that mock the flag read"). Deleting the statement would delete that call with it — the mock's assertion, or a context the customer builds — and replacing only the read leaves `true;` standing alone, which none of the three accepts (javac: `not a statement`; `go build`: an unused constant expression; C#: CS0201). Delete or rewrite that line yourself, or add the key to `ignore`. The refusal names the statement and says its receiver or arguments run code. In Go, `context.Background()` and `context.TODO()` (when `context` is the standard library's) do nothing a reader needs to see and do not count as another call: such a statement, a `go` or `defer` one included, is deleted. A discarded read holding **no** other call is rewritten: see the row below |
 | A **Java, Go or C# read that is a whole statement** and holds no other call — a warm-up call made for the SDK's exposure event, `client.boolVariation("KEY", ctx, false);` | **the whole statement is deleted.** Its value is discarded by definition, so there is nothing to fold it into and nothing to lose. Any receiver works, including a static import with no receiver and a field chain; the argument list may hold names and literals (and, in Go, composite literals, which have no constructors to run). The key may be a literal or hoisted to a constant — see the row below. In C# the awaited OpenFeature read is covered too, while an un-awaited one is left alone; in Go the OpenFeature `client.Boolean(ctx, "KEY", …)` read and in Java the OpenFeature `client.getBooleanValue("KEY", …)` read are covered the same way. A project's own wrapper named in `accessors` is covered the same way, whether the key is a **literal** or hoisted to a constant |
 | A discarded read whose **key is hoisted to a constant** (`client.boolVariation(FLAG_KEY, ctx, false);`) | **the whole statement is deleted**, and the declaration with it, exactly as for a literal key. The constant may be declared at file scope or local to the method, and must meet the same four conditions as any other hoisted key — see [The key hoisted to a constant](#the-key-hoisted-to-a-constant). A statement holding another call is refused here too: the row above applies unchanged, because the safety rule does not depend on how the key is spelled |
 | A **PHP template written in the alternative syntax** (`<?php if (<read>): ?> … <?php else: ?> … <?php endif; ?>`) | **rewritten**, markup and all: the arm that runs stays, the guard and the dead arm go, and a `<?php … ?>` pair left bracketing nothing goes with them. The rendered HTML keeps the same markup; only insignificant whitespace around the removed lines moves, because the whole `<?php … ?>` line is taken rather than an empty tag pair left behind. `elseif` chains are handled in the same way, in any position |

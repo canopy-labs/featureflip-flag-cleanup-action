@@ -208,7 +208,7 @@ from flag_cleanup.unused import MODULE_MARKER, go_import_facts, remove_stranded_
 logger = logging.getLogger(__name__)
 
 from flag_cleanup import rule_synthesis
-from flag_cleanup import ts_async_reads
+from flag_cleanup import py_async_reads, ts_async_reads
 
 RULES_DIR = Path(__file__).parent / "rules"
 
@@ -1635,6 +1635,27 @@ def _engine_inlined(summaries) -> dict[str, frozenset[str]]:
     return inlined
 
 
+def _engine_folded_calls(summaries) -> dict[str, frozenset[str]]:
+    """``{path: texts}`` for each call the engine replaced with a boolean literal.
+
+    By the edit's shape, like :func:`_engine_bound_reads`: what was written for
+    it is ``true`` or ``false`` and what it replaced is a call, not a bare name.
+    Whatever such a call spelled in its arguments is gone with it. See
+    :mod:`flag_cleanup.go_inline`.
+    """
+    found: dict[str, frozenset[str]] = {}
+    for summary in summaries:
+        texts = {
+            edit.p_match.matched_string.strip()
+            for edit in getattr(summary, "rewrites", ())
+            if (edit.replacement_string or "").strip().lower() in ("true", "false")
+            and edit.p_match.matched_string.strip().endswith(")")
+        }
+        if texts:
+            found[summary.path] = frozenset(texts)
+    return found
+
+
 #: An identifier, as the engine's match of a local's use spells it (``$on``
 #: in PHP).
 _BOUND_NAME = re.compile(r"\$?[A-Za-z_]\w*")
@@ -2441,6 +2462,12 @@ def _transform_flag(
     # The key-constant passes read the index back (`rule_synthesis.positions_of`).
     all_accessors = accessors
     accessors = rule_synthesis.encode_positions(accessors, key_positions)
+    # The negated accessors the cross-file key-constant pass is told: its
+    # reads are proven by position, and its reader rules are cloned through
+    # `rule_synthesis.negating` like the seeds. TypeScript and JavaScript only.
+    xconst_negated = (
+        rule_synthesis.encode_positions(negated_accessors, key_positions) if language in ("ts", "tsx", "js") else ()
+    )
     spec = _language_spec(language)
     piranha_language, base = spec.piranha_id, spec.rule_base
 
@@ -2499,6 +2526,14 @@ def _transform_flag(
     # A read that cannot be folded safely cannot stay while the others go: the
     # flag is refused, before anything is written.
     refused_reads = ts_async_reads.refusal(first_sites)
+    if language == "python" and refused_reads is None:
+        refused_reads = py_async_reads.refusal(
+            py_async_reads.plan(
+                repo_dir, paths + sibling_readers, flag_key,
+                tuple(rule_synthesis.plain_name(a) for a in (*all_accessors, *negated_accessors)),
+                dict(key_positions or {}),
+            )
+        )
     async_names = ts_async_reads.managed_accessors(first_sites)
     accessors = tuple(a for a in accessors if rule_synthesis.plain_name(a) not in async_names)
 
@@ -2680,8 +2715,18 @@ def _transform_flag(
     # what makes `kt.toml` match it — so a gate consulted afterwards could not
     # withhold anything. Every other language has no pre-pass, so the file bytes
     # here are identical either way and moving this changes nothing for them.
+    # Gate 2 asks of the same accessors the const rules are cloned for, the
+    # negated ones included where its answer is about positions alone
+    # (Python: no dead-branch reasoning, which would take the read for the
+    # served value): a negated read of `K` is then a read, not a mention
+    # that keeps `K` declared.
+    gate_accessors = (
+        (*accessors, *rule_synthesis.encode_positions(negated_accessors, key_positions))
+        if language == "python"
+        else accessors
+    )
     with_const, without_const = _partition_by_const_safety(
-        paths, language, flag_key, accessors, repo_dir=repo_dir, treatment=treatment, marked=const_marked
+        paths, language, flag_key, gate_accessors, repo_dir=repo_dir, treatment=treatment, marked=const_marked
     )
 
     # CROSS-FILE KEY CONSTANTS -- also before the pre-pass, which has to see
@@ -2705,7 +2750,25 @@ def _transform_flag(
         with_const,
         without_const,
         treatment=treatment,
+        negated=xconst_negated,
     )
+
+    # A test that replaces the module declaring a key constant (`vi.mock` with
+    # a factory) reads another key under it: folding the read as this flag's
+    # changes what that test exercises. Refused before the engine writes.
+    if language in ("ts", "tsx", "js") and resolution.declarations:
+        from flag_cleanup import ts_key_mocks
+
+        mocked = ts_key_mocks.refusals(repo_dir, {d.module for d in resolution.declarations})
+        if mocked:
+            raise UnsafeRewriteError(
+                f"the {spec.display_name} transform refused flag {flag_key!r}: a test replaces a module "
+                "declaring its key constant ("
+                + "; ".join(f"{os.path.relpath(path, repo_dir)}: {why}" for path, why in sorted(mocked.items())) + ")",
+                refused=sorted(mocked),
+                discarded=[],
+                reasons=mocked,
+            )
 
     # The lines of a barrel that re-export a key constant by name
     # (`export { X } from "./x"`), which `cross_file_ts` lets the run remove
@@ -2888,6 +2951,30 @@ def _transform_flag(
     # Kept apart from `wrappers.spans`, which feeds the wrapper counts and
     # reports: these marks are not wrappers, and exist only to be consumed.
     read_marks: dict[str, list] = {}
+    # A NEGATED read is folded by its complemented clone and nothing else, so
+    # it is decided like any accessor's read, by every polarity-blind rule
+    # of `ts_async_reads` (a Promise in a condition is always truthy, a
+    # returned read keeps its type), and only one decided to become the bare
+    # literal may fold: anything else refuses the flag.
+    if language in ("ts", "tsx", "js") and negated_accessors:
+        negated_sites = ts_async_reads.plan(
+            repo_dir,
+            [*paths, *sibling_readers, *reader_paths],
+            flag_key,
+            rule_synthesis.encode_positions(negated_accessors, key_positions),
+            language,
+        )
+        unfoldable = [site for site in negated_sites if site.decision != ts_async_reads.LITERAL]
+        if unfoldable:
+            first = unfoldable[0]
+            raise UnsafeRewriteError(
+                f"the {spec.display_name} transform refused flag {flag_key!r}: an un-awaited read of the "
+                f"negated accessor {first.accessor} that may not become a literal: "
+                f"{first.why or 'its result may be a Promise'} ({len(unfoldable)} such read"
+                f"{'s' if len(unfoldable) != 1 else ''})",
+                refused=sorted({site.path for site in unfoldable}),
+                discarded=[],
+            )
     if language in ("ts", "tsx", "js") and (
         async_names or reader_paths or any(isinstance(v, str) for v in (key_positions or {}).values())
     ):
@@ -2920,6 +3007,17 @@ def _transform_flag(
                 read_marks[site_path] = found
         grouped = set(with_const) | set(without_const) | set(kept_declarations) | set(reader_paths)
         without_const = without_const + [p for p in read_marks if p not in grouped and p not in wrappers.spans]
+
+    # A test, support or setup file that drives the client a read goes through
+    # (a spy, a write, a module mock, any non-read use of the client's module)
+    # asserts what the read used to return: refused before the engine writes,
+    # after every other pre-engine refusal of a read, whose reasons are more precise.
+    # See :mod:`flag_cleanup.ts_driven_clients`.
+    if language in ("ts", "tsx", "js"):
+        _refuse_driven_clients(
+            repo_dir, spec, flag_key, planned_accessors, [*paths, *sibling_readers, *reader_paths], resolution,
+            frozenset(w.name for w in wrappers.wrappers), treatment,
+        )
 
     # A COMPOSER DEPENDENCY (a `vendor/` beside a `composer.json`) is never
     # rewritten: `composer install` puts it back, and a team that commits
@@ -2990,9 +3088,10 @@ def _transform_flag(
         map_accounting = True
         _refuse_map_writes(spec, repo_dir, flag_key)
 
-    reader_rules = _reader_rules(
-        spec, flag_key, rules_file, accessors, resolution, reader_paths, reader_const
-    )
+    with rule_synthesis.negating(xconst_negated):
+        reader_rules = _reader_rules(
+            spec, flag_key, rules_file, (*accessors, *xconst_negated), resolution, reader_paths, reader_const
+        )
 
     run_groups = partial(
         _execute_groups,
@@ -3131,6 +3230,7 @@ def _transform_flag(
         engine_stranded = list(_engine_stranded(summaries, language, repo_dir))
         engine_assertions = list(_engine_assertions(summaries, repo_dir))
         engine_inlined = _engine_inlined(summaries)
+        engine_folded_calls = _engine_folded_calls(summaries)
         engine_bound_reads: dict[str, set[str]] = {
             path: set(names) for path, names in _engine_bound_reads(summaries).items()
         }
@@ -3862,7 +3962,9 @@ def _transform_flag(
         # customer's source, where the names are still there to resolve.
         if reason is None and _grammar_of(s.path, language) == "go":
             reason = go_inline.refusal_reason(
-                s.original_content, engine_inlined.get(s.path, ())
+                s.original_content,
+                engine_inlined.get(s.path, ()),
+                engine_folded_calls.get(s.path, ()),
             )
         # A local the fold stranded that neither the engine nor the stranded-
         # binding pass could remove: Go rejects it as `declared and not used`.
@@ -3951,7 +4053,7 @@ def _transform_flag(
             text = ""
         with go_setters.suspended():
             survived = cross_file_keys.still_mentions(
-                path, text, language, resolution, accessors, repo_dir
+                path, text, language, resolution, (*accessors, *xconst_negated), repo_dir
             )
         if survived:
             reasons[path] = (
@@ -4340,6 +4442,35 @@ def _plan_wrappers(
     plan.spans = {by_resolved[r]: spans for r, spans in plan.spans.items()}
     plan.receivers = {by_resolved[r]: names for r, names in plan.receivers.items() if r in by_resolved}
     return plan
+
+
+def _refuse_driven_clients(
+    repo_dir: str,
+    spec: _Language,
+    flag_key: str,
+    accessors: tuple[str, ...],
+    paths: list[str],
+    resolution: cross_file_keys.Resolution,
+    wrappers: frozenset[str],
+    treatment: bool,
+) -> None:
+    """Refuse the flag when a TS/JS test, support or setup file drives a
+    client one of its reads goes through (:func:`ts_driven_clients.refusals`)."""
+    from flag_cleanup import ts_driven_clients
+
+    driven = ts_driven_clients.refusals(repo_dir, paths, flag_key, accessors, resolution, wrappers, treatment)
+    if not driven:
+        return
+    refused = sorted(driven)
+    named = "; ".join(f"{os.path.relpath(p, repo_dir)}: {driven[p]}" for p in refused)
+    logger.warning("refusing to transform for flag %r: %s", flag_key, named)
+    raise UnsafeRewriteError(
+        f"the {spec.display_name} transform refused flag {flag_key!r}: a test drives a client or key its read "
+        f"goes through, so folding the read would change what that test exercises ({named})",
+        refused=refused,
+        discarded=[],
+        reasons=driven,
+    )
 
 
 def _refuse_driven_wrappers(
@@ -6064,6 +6195,7 @@ def _resolve_cross_file(
     without_const: list[str],
     *,
     treatment: bool | None = None,
+    negated: tuple[str, ...] = (),
 ) -> tuple[
     cross_file_keys.Resolution,
     list[str],
@@ -6102,9 +6234,13 @@ def _resolve_cross_file(
     # constant can be removed (see :mod:`flag_cleanup.ts_barrels`).
     editable = ts_barrels.editable.set(frozenset(str(Path(p).resolve()) for p in paths))
     ts_barrels.judged.set(set())  # read back by `ts_barrels.apply`
+    # A negated accessor's read is proven like any other here; its reader
+    # rule writes the opposite literal (`_reader_rules`), and the dead-branch
+    # reasoning leaves its branches alone (`cross_file_keys.NEGATED_READS`).
+    negating = cross_file_keys.NEGATED_READS.set(frozenset(rule_synthesis.plain_name(n) for n in negated))
     try:
         resolution = cross_file_keys.resolve(
-            repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
+            repo_dir, language, flag_key, key_paths, (*accessors, *negated), treatment=treatment
         )
         if language == "go" and resolution.blocked and go_setters.declared() and not resolution.kept_by_setters:
             # A declaration some refusal keeps (a `.Fallback()` read, say)
@@ -6116,6 +6252,7 @@ def _resolve_cross_file(
                     repo_dir, language, flag_key, key_paths, accessors, treatment=treatment
                 )
     finally:
+        cross_file_keys.NEGATED_READS.reset(negating)
         ts_barrels.editable.reset(editable)
     proven = _proven_readers(resolution, paths)
     template = RULES_DIR / f"{_language_spec(language).rule_base}_xconst.toml"

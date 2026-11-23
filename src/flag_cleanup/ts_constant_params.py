@@ -997,8 +997,6 @@ def _aliased_package(resolver, package: str) -> bool:
     that is not named like a config and is loaded by ``--config``, and
     ``.storybook/main.*``, are not read.
     """
-    from flag_cleanup import source_index
-    from flag_cleanup.piranha_runner import _SKIP_DIRS, source_files
     from flag_cleanup.ts_default_arguments import _grammar
     from flag_cleanup.ts_tests import is_test_file
 
@@ -1032,29 +1030,10 @@ def _aliased_package(resolver, package: str) -> bool:
 
     aliased = False
     if resolver.repo_dir is not None:
-        suffixes = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
-        candidates: list[tuple[Path, str]] = []
-        for listed in source_index.files(resolver.repo_dir, suffixes):
-            name = listed.path.name.lower()
-            if "config" in name or "workspace" in name or name.startswith(".babelrc"):
-                candidates.append((listed.path, "code"))
-        root_dir = Path(source_index.checkout_root(resolver.repo_dir))
-        for found in source_files(root_dir, {".json", ".patch", ""}, _SKIP_DIRS):
-            name = found.name.lower()
-            if name.endswith(".patch"):
-                if name.startswith(("@featureflip+react", "@featureflip__react")):
-                    aliased = True
-            elif name == "package.json":
-                candidates.append((found, "jest"))
-            elif name.startswith("tsconfig"):
-                candidates.append((found, "paths"))
-            elif "config" in name or "workspace" in name or name.startswith(".babelrc"):
-                candidates.append((found, "all"))
-        for path, kind in [] if aliased else candidates:
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
+        patched, candidates = _alias_candidates(resolver)
+        aliased = patched
+        parsed: dict[Path, tuple[str, Node | None, bytes]] = resolver.__dict__.setdefault("_alias_parsed", {})
+        for path, kind, text in [] if aliased else candidates:
             if kind == "jest" and _vendored(text, package):
                 aliased = True
                 break
@@ -1063,13 +1042,17 @@ def _aliased_package(resolver, package: str) -> bool:
                 kind != "paths" and any(w in text for w in ("moduleNameMapper", "alias", "find"))
             ):
                 continue
-            json_like = path.suffix == ".json" or path.suffix == ""
-            grammar = "tsx" if json_like else _grammar(str(path))
-            source = f"({text}\n)" if json_like else text
-            if kind == "code" and is_test_file(text, grammar):
-                continue
-            tree = _parse(source, grammar)
-            body = source.encode("utf-8")
+            if path not in parsed:
+                json_like = path.suffix == ".json" or path.suffix == ""
+                grammar = "tsx" if json_like else _grammar(str(path))
+                source = f"({text}\n)" if json_like else text
+                if kind == "code" and is_test_file(text, grammar):
+                    parsed[path] = (source, None, b"")
+                else:
+                    parsed[path] = (source, _parse(source, grammar), source.encode("utf-8"))
+            _source, tree, body = parsed[path]
+            if tree is None:
+                continue  # a test file
             if tree.has_error:
                 aliased = True  # cannot read it, and it names the package
             elif kind in ("code", "all"):
@@ -1081,6 +1064,45 @@ def _aliased_package(resolver, package: str) -> bool:
     cached[package] = aliased
     return aliased
 
+
+
+def _alias_candidates(resolver) -> tuple[bool, list[tuple[Path, str, str]]]:
+    """``(a patch of the SDK exists, [(config path, kind, text)])`` for
+    :func:`_aliased_package`: the checkout is walked once per ``resolver``,
+    whatever package is asked about."""
+    from flag_cleanup import source_index
+    from flag_cleanup.piranha_runner import _SKIP_DIRS, source_files
+
+    kept = resolver.__dict__.get("_alias_candidates")
+    if kept is not None:
+        return kept
+    patched = False
+    listed: list[tuple[Path, str]] = []
+    suffixes = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+    for found in source_index.files(resolver.repo_dir, suffixes):
+        name = found.path.name.lower()
+        if "config" in name or "workspace" in name or name.startswith(".babelrc"):
+            listed.append((found.path, "code"))
+    root_dir = Path(source_index.checkout_root(resolver.repo_dir))
+    for found in source_files(root_dir, {".json", ".patch", ""}, _SKIP_DIRS):
+        name = found.name.lower()
+        if name.endswith(".patch"):
+            if name.startswith(("@featureflip+react", "@featureflip__react")):
+                patched = True
+        elif name == "package.json":
+            listed.append((found, "jest"))
+        elif name.startswith("tsconfig"):
+            listed.append((found, "paths"))
+        elif "config" in name or "workspace" in name or name.startswith(".babelrc"):
+            listed.append((found, "all"))
+    candidates: list[tuple[Path, str, str]] = []
+    for path, kind in listed:
+        try:
+            candidates.append((path, kind, path.read_text(encoding="utf-8")))
+        except (OSError, UnicodeDecodeError):
+            continue
+    kept = resolver.__dict__["_alias_candidates"] = (patched, candidates)
+    return kept
 
 def _identity_free(resolver, attribute: Node, data: bytes, repo_dir: str | None, depth: int) -> bool:
     """Whether the component ``attribute`` goes to uses the prop only to hand

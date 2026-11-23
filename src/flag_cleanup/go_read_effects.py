@@ -610,18 +610,31 @@ def _kept_nodes(node: Node, shadowed: frozenset[str], inert: frozenset[str]) -> 
 
 def _working_parts(call: Node, shadowed: frozenset[str], inert: frozenset[str] = frozenset()) -> list[Node]:
     """The receiver and arguments of ``call`` that do work, in evaluation order.
-    A spread argument (``opts()...``) is its operand."""
+    A spread argument (``opts()...``) is its operand.
+
+    ``context.Background()`` and ``context.TODO()`` do no work, so a read holding nothing else is
+    deleted whole and takes the ``context`` import with it. When something else IS kept, they are
+    kept too (``_ = context.Background()``): the statement stays in the file, and so must the
+    name that the import it needs."""
     parts: list[Node] = []
+    inert_calls: list[Node] = []
     function = call.child_by_field_name("function")
     if function is not None and function.type == "selector_expression":
         operand = function.child_by_field_name("operand")
-        if operand is not None and does_work(operand, shadowed, inert):
-            parts.append(operand)
+        if operand is not None:
+            if does_work(operand, shadowed, inert):
+                parts.append(operand)
+            elif operand.type == "call_expression" and _is_inert_stdlib_call(operand, inert):
+                inert_calls.append(operand)
     arguments = call.child_by_field_name("arguments")
     for argument in (c for c in (arguments.named_children if arguments is not None else []) if c.type != "comment"):
         if does_work(argument, shadowed, inert):
             parts.extend(_kept_nodes(_operand(argument), shadowed, inert))
-    return parts
+        elif _operand(argument).type == "call_expression" and _is_inert_stdlib_call(_operand(argument), inert):
+            inert_calls.append(_operand(argument))
+    if not parts:
+        return parts
+    return sorted(parts + inert_calls, key=lambda n: n.start_byte)
 
 
 def _left_of(parent: Node, child: Node) -> list[Node]:

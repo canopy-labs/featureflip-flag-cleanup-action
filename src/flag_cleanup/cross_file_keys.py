@@ -29,8 +29,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import stat
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
@@ -814,6 +816,12 @@ def _searchable_text(path: Path, names: list[str]) -> str | None:
     told whether it spells one. A file in a legacy encoding (a Latin-1 data
     fixture) spells an ASCII name as UTF-8 would. A wide encoding does not, and
     every other character of one is a NUL."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        return ""  # a FIFO, socket or device: opening one may block, and it holds no source
     try:
         data = path.read_bytes()
     except OSError:
@@ -1744,7 +1752,13 @@ def without_dead_blocks(
         return source
     root = (ts_syntax._parse if language in ("ts", "tsx", "js") else syntax._parse)(source, language)
 
+    negated = NEGATED_READS.get()
+
     def is_read(call: Node) -> bool:
+        if negated and _callee_name(call) in negated:
+            # It returns the served value's opposite: the block it deletes is
+            # not the one `dead_blocks` would compute, so nothing is set aside.
+            return False
         stack = [call]
         while stack:
             node = stack.pop()
@@ -1763,6 +1777,22 @@ def without_dead_blocks(
         # the opposite treatment is the one this treatment leaves.
         blocks += dead_branches.dead_blocks(root, language, not treatment, is_read)
     return dead_branches.blank(source, blocks) if blocks else source
+
+
+#: The NEGATED accessors of the run (``!isDisabled``), for a profile told
+#: them (TypeScript's): their reads are proven like any accessor's, but return
+#: the opposite of the served value, so :func:`without_dead_blocks` never takes
+#: one to decide which block the fold deletes. Set by the runner around the
+#: resolution.
+NEGATED_READS: ContextVar[frozenset[str]] = ContextVar("negated_reads", default=frozenset())
+
+
+def _callee_name(call: Node) -> str | None:
+    """The name a call calls: ``f`` for ``f(...)`` and ``a.b.f(...)``."""
+    function = call.child_by_field_name("function")
+    while function is not None and function.type in ("member_expression", "selector_expression", "field_expression"):
+        function = function.child_by_field_name("property") or function.child_by_field_name("field")
+    return function.text.decode("utf-8", "replace") if function is not None else None
 
 
 def still_mentions(

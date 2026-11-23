@@ -1065,6 +1065,7 @@ class _Reader:
     def __init__(self, root: Node, path: str, repo_dir: str):
         self.root = root
         self.path = path
+        self.repo_dir = repo_dir
         self.index = csharp_index(repo_dir)
         project_items, self.projects_readable = msbuild_usings(repo_dir)
         self.projects = _project_dirs(repo_dir)
@@ -1118,11 +1119,21 @@ class _Reader:
 
     def _types_named(self, namespace: str, name: str) -> tuple[_TypeInfo, ...]:
         """The types a simple ``name`` with no type arguments can mean in
-        ``namespace``: never a generic one, and a ``file`` type only here."""
+        ``namespace``: never a generic one, a ``file`` type only here, and
+        a type of a file-based app only in that app."""
+        from flag_cleanup import csharp_family
+
+        def hidden(info: _TypeInfo) -> bool:
+            # A modelled file-based app is a compilation of its own: nothing
+            # outside the file can name a type it declares.
+            if info.path == self.path:
+                return False
+            return csharp_family.hides_types(self.repo_dir, info.path)
+
         return tuple(
             info
             for info in self.index.by_qualified.get((namespace, name), ())
-            if not info.generic and (not info.file_local or info.path == self.path)
+            if not info.generic and (not info.file_local or info.path == self.path) and not hidden(info)
         )
 
     def resolve(self, name: str, levels: list[_Level]) -> tuple[str, str] | None:

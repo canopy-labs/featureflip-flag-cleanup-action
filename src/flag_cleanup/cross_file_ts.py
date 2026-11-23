@@ -87,7 +87,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -107,6 +108,9 @@ _PLAIN_EXTENSIONS = (
     ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".d.mts", ".d.cts",
     ".js", ".jsx", ".mjs", ".cjs",
 )
+#: :data:`_PLAIN_EXTENSIONS` by last suffix, as a listing compares them
+#: (``Path(".js").suffix`` is empty: a dot name has none).
+_PLAIN_SUFFIXES = frozenset("." + e.rsplit(".", 1)[-1] for e in _PLAIN_EXTENSIONS)
 #: A specifier written with a JavaScript extension names the TypeScript source
 #: it compiles from, or the JavaScript file itself.
 _WRITTEN_EXTENSIONS = {
@@ -2395,6 +2399,32 @@ def _is_plain_member(node: Node) -> bool:
     )
 
 
+#: The answers :func:`package_outside` keeps while a caller holds a store
+#: open (:func:`keeping_package_answers`), innermost last.
+_KEPT_ANSWERS: list[dict] = []
+
+
+@contextmanager
+def keeping_package_answers(store: dict) -> Iterator[None]:
+    """Keep :func:`package_outside`'s answers in ``store`` (by reader,
+    specifier and ``declared_only``), and the alias scan it runs, while the
+    block runs. The answers read the checkout's configs, manifests and
+    ``node_modules``, so the caller empties ``store`` whenever one of those
+    may have changed; nothing else does."""
+    _KEPT_ANSWERS.append(store)
+    try:
+        yield
+    finally:
+        _KEPT_ANSWERS.pop()
+
+
+class _AliasReader:
+    """What :func:`ts_constant_params._aliased_package` asks of a resolver."""
+
+    def __init__(self, repo_dir: str) -> None:
+        self.repo_dir = repo_dir
+
+
 def package_outside(reader_path: str, specifier: str, repo_dir: str, *, declared_only: bool = False) -> bool:
     """Whether bare ``specifier``, which resolves to no file, names a package
     that cannot be a file of the checkout, so an ``export *`` from it supplies
@@ -2415,14 +2445,27 @@ def package_outside(reader_path: str, specifier: str, repo_dir: str, *, declared
       only the declaration: an install alone proves nothing, since a bundler
       config nobody here reads can alias an installed name.
     """
-    import json
-
-    from flag_cleanup import ts_constant_params
-
     if specifier.startswith("node:"):
         return True
     if not specifier or specifier.startswith((".", "/", "#")):
         return False
+    if not _KEPT_ANSWERS:
+        return _package_outside(reader_path, specifier, repo_dir, declared_only, _AliasReader(repo_dir))
+    store = _KEPT_ANSWERS[-1]
+    asked = (reader_path, specifier, declared_only, repo_dir)
+    if asked not in store:
+        reader = store.setdefault(("aliases", repo_dir), _AliasReader(repo_dir))
+        store[asked] = _package_outside(reader_path, specifier, repo_dir, declared_only, reader)
+    return store[asked]
+
+
+def _package_outside(
+    reader_path: str, specifier: str, repo_dir: str, declared_only: bool, aliases: _AliasReader
+) -> bool:
+    import json
+
+    from flag_cleanup import ts_constant_params
+
     if not names_package(reader_path, specifier, repo_dir):
         return False
     parts = specifier.split("/")
@@ -2441,12 +2484,7 @@ def package_outside(reader_path: str, specifier: str, repo_dir: str, *, declared
         if (isinstance(jest, dict) and "moduleNameMapper" in jest) or "babel" in data or _linked_override(data, package):
             return False
 
-    class _Stub:
-        pass
-
-    stub = _Stub()
-    stub.repo_dir = repo_dir
-    if ts_constant_params._aliased_package(stub, specifier):
+    if ts_constant_params._aliased_package(aliases, specifier):
         return False
     directory = Path(reader_path).resolve().parent
     installed = False
@@ -4304,7 +4342,7 @@ def enum_module_pattern(entries: tuple[xk.KeyDeclaration, ...], repo_dir: str) -
     tokens = {_stem(m) for m in modules}
     literals: set[str] = set()
     indexes = False
-    suffixes = {Path(e).suffix for e in _PLAIN_EXTENSIONS} & set(source_index.all_suffixes())
+    suffixes = _PLAIN_SUFFIXES & set(source_index.all_suffixes())
     suffixes |= source_index.COMPONENT_SUFFIXES
     stop = _stop_for(repo_dir)
     directories: set[Path] = set()
@@ -5390,7 +5428,23 @@ def constant_module_escapes(path: str, repo_dir: str) -> list[xk.Refusal]:
     return [
         xk.Refusal(where, line, xk.UNSUPPORTED_FORM, text)
         for where, line, text in wrapper_ts.handed_on(repo_dir, path, named=True, holders=True)
-    ] + _default_takers(path, repo_dir)
+    ] + _default_takers(path, repo_dir) + _published(path)
+
+
+def _published(path: str) -> list[xk.Refusal]:
+    """The module's first export, when a published package holds it
+    (:func:`flag_cleanup.ts_barrels.public_entry`): its consumers import it
+    by path, by name or through an entry this run cannot see, so its
+    declarations stay (their reads in the checkout still fold)."""
+    if not ts_barrels.public_entry(path):
+        return []
+    try:
+        source = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return [xk.Refusal(path, 1, xk.UNSUPPORTED_FORM, "")]
+    root = ts_syntax._parse(source, _language(path))
+    first = next((s for s in root.named_children if s.type == "export_statement"), None)
+    return [xk.refusal(path, first if first is not None else root, xk.UNSUPPORTED_FORM, source)]
 
 
 def _default_barrels(modules: set[str], repo_dir: str) -> set[str]:
@@ -5399,7 +5453,7 @@ def _default_barrels(modules: set[str], repo_dir: str) -> set[str]:
     it hands on: the files an importer of a default export can name instead of
     its module. Over-approximate by design: a file found wrongly is only read."""
     stop = _stop_for(repo_dir)
-    suffixes = {Path(e).suffix for e in _PLAIN_EXTENSIONS} & set(source_index.all_suffixes())
+    suffixes = _PLAIN_SUFFIXES & set(source_index.all_suffixes())
     candidates = [
         f for f in source_index.files(repo_dir, suffixes, with_ignored=True) if "export" in _file_text(f.resolved)
     ]

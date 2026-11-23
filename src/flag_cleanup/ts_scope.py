@@ -597,9 +597,13 @@ class Files:
     Keyed by path AND content: a file another pass has edited since it was
     cached is parsed again, so a span is never computed on stale bytes."""
 
-    def __init__(self, repo_dir: str) -> None:
+    def __init__(self, repo_dir: str, trees: dict[tuple[str, str], Node] | None = None) -> None:
         self.repo_dir = repo_dir
         self._cache: dict[str, File] = {}
+        #: Parse trees by ``(path, text)``, which an owner may share between
+        #: instances: a tree depends on the text alone, where a :class:`File`'s
+        #: imports also depend on what the resolver finds on disk.
+        self._trees = trees
 
     def file(self, path: str, source: str | None = None) -> File | None:
         key = _resolved(path)
@@ -616,7 +620,11 @@ class Files:
                 return None
         if cached is not None and cached.source == source:
             return cached
-        root = parse(source, key)
+        root = self._trees.get((key, source)) if self._trees is not None else None
+        if root is None:
+            root = parse(source, key)
+            if self._trees is not None:
+                self._trees[(key, source)] = root
         made = File(key, source, root, _imports_of(root, key, self.repo_dir))
         self._cache[key] = made
         return made
